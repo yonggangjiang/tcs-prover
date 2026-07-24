@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCS Prover</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- The shell stays minimal before a problem is submitted. -->
+  <div id="page" class="app-shell">
+    <header class="topbar">
+      <a id="homeLink" class="brand" href="/" aria-label="TCS Prover home">
+        <span class="brand-mark" aria-hidden="true">T</span>
+        <span>TCS Prover</span>
+      </a>
+      <div class="topbar-status">
+        <span id="liveDot" class="live-dot" aria-hidden="true"></span>
+        <span id="globalStatus">Ready</span>
+        <span id="elapsed" class="elapsed"></span>
+      </div>
+      <button id="activityToggle" class="ghost compact"
+        aria-controls="activityPanel" aria-expanded="false">Show details</button>
+    </header>
+
+    <div class="workspace">
+      <!-- This rail summarizes the runtime stages without cluttering the form. -->
+      <aside id="workflowRail" class="workflow-rail" hidden>
+        <p class="rail-kicker">Workflow</p>
+        <ol id="workflowNodes" class="workflow-nodes"></ol>
+      </aside>
+
+      <main class="work-pane">
+        <p id="notice" class="notice" role="alert" hidden></p>
+
+        <!-- The first screen intentionally contains only one obvious task. -->
+        <section id="inputPanel" class="input-view">
+          <div class="intro">
+            <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
+            <h1>What should we solve?</h1>
+            <p>Start with a rough TCS problem. The agent will clarify it,
+              ask for approval, solve it, audit it, and produce clean LaTeX.</p>
+          </div>
+          <div class="composer">
+            <label for="problem">Problem statement</label>
+            <textarea id="problem" rows="12"
+              placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
+            <details class="advanced">
+              <summary>Advanced</summary>
+              <div class="model-grid">
+                <div class="round-setting model-setting">
+                  <label for="reviewModel">Statement reviewer</label>
+                  <select id="reviewModel">
+                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-terra">Terra — balanced</option>
+                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                  </select>
+                  <label class="effort-label" for="reviewEffort">Reasoning</label>
+                  <select id="reviewEffort">
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max">Max</option>
+                    <option value="xhigh">Extra high</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+                <div class="round-setting model-setting">
+                  <label for="authorModel">Proof author</label>
+                  <select id="authorModel">
+                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-terra">Terra — balanced</option>
+                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                  </select>
+                  <label class="effort-label" for="authorEffort">Reasoning</label>
+                  <select id="authorEffort">
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max">Max</option>
+                    <option value="xhigh">Extra high</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+                <div class="round-setting model-setting">
+                  <label for="criticModel">Independent critic</label>
+                  <select id="criticModel">
+                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-terra">Terra — balanced</option>
+                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                  </select>
+                  <label class="effort-label" for="criticEffort">Reasoning</label>
+                  <select id="criticEffort">
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max">Max</option>
+                    <option value="xhigh">Extra high</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+                <div class="round-setting model-setting">
+                  <label for="writerModel">LaTeX writer</label>
+                  <select id="writerModel">
+                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-terra">Terra — balanced</option>
+                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                  </select>
+                  <label class="effort-label" for="writerEffort">Reasoning</label>
+                  <select id="writerEffort">
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max">Max</option>
+                    <option value="xhigh">Extra high</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+              </div>
+              <p id="modelHelp" class="help model-help">
+                Ultra is the default for every role. Sol is the default model.
+              </p>
+              <input id="reasoningEffort" type="hidden" value="ultra">
+              <div class="prompt-setting">
+                <div>
+                  <strong>Role prompts</strong>
+                  <span>Saved edits are reused for future jobs</span>
+                </div>
+                <button id="editPromptsButton" class="secondary compact"
+                  type="button">Edit prompts</button>
+              </div>
+              <div class="round-setting">
+                <label for="criticRounds">Critic round limit</label>
+                <input id="criticRounds" type="number" min="1" max="100"
+                  step="1" value="4" aria-describedby="roundHelp">
+                <p id="roundHelp" class="help">
+                  Up to 4 rounds by default. LaTeX editing requires a clean
+                  critic PASS.
+                </p>
+              </div>
+              <div class="round-setting">
+                <label for="thinkingHours">Author time limit (hours)</label>
+                <input id="thinkingHours" type="number" min="0.01" max="168"
+                  step="0.25" value="8" aria-describedby="timeHelp">
+                <p id="timeHelp" class="help">
+                  Default 8 hours. Blocked attempts continue until this limit;
+                  then the author stops and returns a failure summary.
+                </p>
+              </div>
+            </details>
+            <div class="composer-actions">
+              <span id="modelSummary">Sol/Ultra review · Sol/Ultra author, critic, writer</span>
+              <button id="checkButton">Check statement</button>
+            </div>
+          </div>
+          <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
+            <div class="jobs-heading">
+              <div>
+                <p class="eyebrow">PARALLEL WORK</p>
+                <h2 id="jobsHeading">Your jobs</h2>
+              </div>
+              <span id="jobsCount"></span>
+            </div>
+            <ol id="jobsList" class="jobs-list"></ol>
+          </section>
+        </section>
+
+        <!-- The author can edit or explain a rejected statement here. -->
+        <section id="reviewPanel" class="review-view surface" hidden>
+          <p class="eyebrow">REVIEW COMPLETE</p>
+          <h1 id="reviewHeading" tabindex="-1">Approve the precise statement</h1>
+          <p class="section-copy">Edit it directly and approve it, or explain what
+            should change and ask for another independent review.</p>
+          <label for="proposed">Proposed statement</label>
+          <textarea id="proposed" rows="14"></textarea>
+          <div class="review-notes">
+            <span>Reviewer notes</span>
+            <p id="notes" class="notes"></p>
+          </div>
+          <label for="feedback">Feedback for the next review <span>(optional)</span></label>
+          <textarea id="feedback" rows="4" aria-describedby="feedbackHelp"
+            placeholder="For example: keep the original time bound and clarify the graph model."></textarea>
+          <p id="feedbackHelp" class="help">
+            Feedback is editing guidance, not part of the statement.
+          </p>
+          <p id="editHint" class="hint" hidden>
+            Your edits will be approved exactly as written.
+          </p>
+          <div class="actions">
+            <button id="reviewHomeButton" class="ghost">Return home</button>
+            <button id="recheckButton" class="secondary">Retry with feedback</button>
+            <button id="approveButton">Approve and start</button>
+          </div>
+        </section>
+
+        <!-- During work, readable summaries are primary and raw JSON is optional. -->
+        <section id="runPanel" class="run-view" hidden aria-busy="true">
+          <div class="run-heading">
+            <div>
+              <p id="runLabel" class="eyebrow">CODEX IS WORKING</p>
+              <h1 id="runTitle" tabindex="-1">Checking the statement…</h1>
+              <p id="runDescription" class="section-copy"></p>
+            </div>
+            <span id="roundBadge" class="round-badge" hidden></span>
+          </div>
+
+          <section class="timeline-surface" aria-labelledby="activityHeading">
+            <div class="timeline-head">
+              <div>
+                <h2 id="activityHeading">Live activity</h2>
+                <p id="lastActivity">Waiting for the first update…</p>
+              </div>
+              <div id="filters" class="filters" aria-label="Activity filters">
+                <button class="filter active" data-filter="all">All</button>
+                <button class="filter" data-filter="reasoning">Reasoning</button>
+                <button class="filter" data-filter="agent">Agents</button>
+                <button class="filter" data-filter="tool">Tools</button>
+                <button class="filter" data-filter="prompt">Prompts</button>
+              </div>
+            </div>
+            <ol id="timelineList" class="timeline" role="log"
+              aria-live="off" aria-relevant="additions text"></ol>
+            <button id="jumpLatest" class="jump-latest secondary compact" hidden>
+              Jump to latest
+            </button>
+          </section>
+
+          <div class="run-actions">
+            <button id="stopButton" class="danger">Stop</button>
+            <button id="homeButton" class="secondary">Return home</button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Advanced prompt editing stays out of the main problem form. -->
+    <dialog id="promptDialog" class="prompt-dialog">
+      <form method="dialog">
+        <div class="prompt-dialog-head">
+          <div>
+            <p class="eyebrow">ADVANCED</p>
+            <h2>Edit role prompts</h2>
+          </div>
+          <button id="closePromptsButton" class="ghost compact"
+            value="cancel">Close</button>
+        </div>
+        <div id="promptTabs" class="prompt-tabs" role="tablist"
+          aria-label="Choose a role prompt">
+          <button type="button" class="prompt-tab active"
+            data-prompt="review">Reviewer</button>
+          <button type="button" class="prompt-tab"
+            data-prompt="author">Author</button>
+          <button type="button" class="prompt-tab"
+            data-prompt="critic">Critic</button>
+          <button type="button" class="prompt-tab"
+            data-prompt="final">Final writer</button>
+        </div>
+        <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>
+        <textarea id="promptEditor" rows="18" spellcheck="false"></textarea>
+        <p id="promptEditorHelp" class="help">
+          The author prompt must contain exactly one [STATEMENT].
+        </p>
+        <div class="prompt-dialog-actions">
+          <button id="resetPromptButton" class="ghost" type="button">
+            Reset this prompt
+          </button>
+          <button id="savePromptsButton" type="button">Save prompts</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Only the application's exact OpenAI conversation appears here. -->
+    <div id="drawerScrim" class="drawer-scrim" hidden></div>
+    <aside id="activityPanel" class="audit-drawer"
+      aria-labelledby="auditTitle" hidden>
+      <div class="drawer-head">
+        <div>
+          <p class="eyebrow">RUN DETAILS</p>
+          <h2 id="auditTitle">Prompts and responses</h2>
+        </div>
+        <button id="activityClose" class="ghost compact">Close</button>
+      </div>
+      <p class="drawer-copy">
+        Only the exact prompt TCS Prover sends to OpenAI and the returned text are
+        shown. Private chain-of-thought is unavailable.
+      </p>
+      <ol id="activityList" class="audit-list" aria-label="OpenAI prompts and responses"></ol>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
