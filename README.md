@@ -4,6 +4,8 @@ A local web UI that turns an informal theoretical-computer-science problem into
 a checked statement, runs a persistent Codex proof search, independently audits
 and repairs the candidate, then produces clean LaTeX.
 
+Compared with more complex harnesses such as [ProofCouncil](https://arxiv.org/pdf/2607.09474) and [Danus](https://arxiv.org/pdf/2607.06447), TCS Prover is designed to be lightweight, cost-friendly, and tailored to GPT-5.6 and theoretical computer science. Every component in its workflow has a specific, evidence-supported purpose. New components are welcome, but should be justified by evidence to avoid unnecessary heuristic complexity and cost. Suggestions and feedback are encouraged—please contact the project maintainer.
+
 ## Install and run
 
 Requires Python 3.9+, Node.js/npm, and a Codex account with access to the models
