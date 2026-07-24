@@ -61,37 +61,24 @@ Thanks to Chao Xu for publishing it. His prompt in turn credits OpenAI's
 and [Danus](https://github.com/frenzymath/Danus).
 
 There is not yet controlled evidence that this prompt is better than the CDC
-prompt. There are several personal cases where a carefully crafted prompt run succeeded after
-one-shot ChatGPT attempts did not; this is useful evidence.
+prompt. However, there are several personal cases where a carefully crafted prompt run succeeded after
+one-shot ChatGPT attempts did not, so at least it is better than nothing.
 
-TCS Prover keeps the Goal active: a blocked or prematurely ended author turn is
+The author keeps the Goal active: a blocked or prematurely ended author turn is
 continued until it returns a solution or reaches the user-set time limit.
 
 ### 3. Independent critic
 
-Instructions inside the author prompt do not guarantee that the resulting proof
-survives a fresh check. The critic therefore collects three fresh hostile
-audits, repairs every issue it can, and sends repaired mathematics to another
+Although in the author prompt there are already instructions on indepent audit checking, there are cases where these instructions do not guarantee that the resulting proof
+survives a fresh check. The critic therefore do the job again and repairs every issue it can, sends repaired mathematics to another
 fresh critic. Unresolved bugs go back to the author. Only a clean pass exits the
-loop. This catches both structural gaps and the small errors that accumulate in
-long proofs.
+loop. This catches both structural gaps and also fixable bugs.
 
-“Independent” here means fresh contexts and subagents; same-family models may
-still share blind spots. A human or different-family review remains advisable.
+“Independent” here means fresh contexts and subagents. A human or different-family review remains advisable.
 
 ### 4. LaTeX editor
 
 Correct-looking generated proofs are often repetitive, poorly ordered, or hard
 to read. After—and only after—a clean critic pass, this node preserves the
 mathematics while rewriting it as a compact, structured TCS-style LaTeX proof.
-In practice this often makes a candidate substantially easier to inspect.
-
-## Development
-
-```bash
-python3 -m unittest discover -s tests -q
-```
-
-The proof output is not a formal certificate. Review important results
-independently. Source code is MIT-licensed; the adapted author prompt has the
-separate attribution described in [LICENSE](LICENSE).
+In practice this often makes the output substantially easier to read.
