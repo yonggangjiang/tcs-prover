@@ -33,16 +33,16 @@ outputs are stored under `runs/`.
 ## Workflow
 
 ```mermaid
-flowchart TD
+flowchart LR
     S["1. Statement reviewer"] --> H{"Human approves?"}
-    H -- "feedback / direct edit" --> S
-    H -- "yes" --> A["2. Proof author"]
-    A -- "blocked / gives up before time limit: continue" --> A
-    A -- "time limit" --> F["Failure summary"]
-    A -- "candidate or revised proof" --> C["3. Independent critic"]
-    C -- "reject: unresolved bugs" --> A
-    C -- "critic repaired proof" --> C
-    C -- "clean PASS only" --> L["4. LaTeX editor"]
+    H -- "revise" --> S
+    H -- "approve" --> A["2. Proof author"]
+    A -- "blocked: continue" --> A
+    A -- "deadline" --> F["Failure summary"]
+    A -- "proof" --> C["3. Independent critic"]
+    C -- "reject" --> A
+    C -- "fixed: recheck" --> C
+    C -- "clean pass" --> L["4. LaTeX editor"]
 ```
 
 ### 1. Statement reviewer
