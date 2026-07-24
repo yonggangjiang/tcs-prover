@@ -26,7 +26,7 @@ Enter a rough problem, review or edit the precise statement, and approve it.
 **Advanced** controls each node's model, reasoning effort, prompt, author time
 limit, and critic-round limit. Jobs run in parallel. **Show details** displays
 the exact application prompts and returned model text. Private records and
-outputs are stored under `runs/`, which Git ignores.
+outputs are stored under `runs/`.
 
 ## Workflow
 
@@ -45,15 +45,11 @@ flowchart TD
 ### 1. Statement reviewer
 
 This node lets the user start with convenient informal language while preventing
-a model from silently solving a different problem. It makes quantifiers,
-encodings, promises, parameters, and community conventions explicit, then asks
-for human approval.
+a model from silently solving a different problem. 
 
 For example, graph-algorithm papers commonly write a bound such as
 `m log² n`. A literal model may object that `m` can be smaller than `n` and call
-the target impossible, while the intended convention may exclude isolated
-vertices, concern a reachable subgraph, or suppress an input-reading term. The
-review step states the intended convention instead of letting that mismatch
+the target impossible. The review step states the intended convention and write it as `(m+n) log² n`instead of letting that mismatch
 derail the proof search.
 
 ### 2. Proof author
@@ -65,8 +61,9 @@ Thanks to Chao Xu for publishing it. His prompt in turn credits OpenAI's
 and [Danus](https://github.com/frenzymath/Danus).
 
 There is not yet controlled evidence that this prompt is better than the CDC
-prompt. Chao reports a personal case where a long agent run succeeded after
-one-shot ChatGPT attempts did not; this is useful evidence, not a benchmark.
+prompt. There are several personal cases where a carefully crafted prompt run succeeded after
+one-shot ChatGPT attempts did not; this is useful evidence.
+
 TCS Prover keeps the Goal active: a blocked or prematurely ended author turn is
 continued until it returns a solution or reaches the user-set time limit.
 
