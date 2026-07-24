@@ -37,6 +37,7 @@ flowchart TD
     S["1. Statement reviewer"] --> H{"Human approves?"}
     H -- "feedback / direct edit" --> S
     H -- "yes" --> A["2. Proof author"]
+    A -- "blocked / gives up before time limit: continue" --> A
     A -- "time limit" --> F["Failure summary"]
     A -- "candidate or revised proof" --> C["3. Independent critic"]
     C -- "reject: unresolved bugs" --> A
