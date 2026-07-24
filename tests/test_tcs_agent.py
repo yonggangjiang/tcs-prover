@@ -63,6 +63,8 @@ class AgentTests(unittest.TestCase):
         self.assertIn(
             f'model_reasoning_effort="{agent.REVIEW_EFFORT}"', command
         )
+        self.assertIn(f'service_tier="{agent.SERVICE_TIER}"', command)
+        self.assertIn("fast_mode", command)
         self.assertIn('model_reasoning_summary="detailed"', command)
         self.assertIn("--json", command)
         records = [json.loads(line) for line in output.getvalue().splitlines()]
@@ -70,6 +72,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(records[0]["text"].endswith("DRAFT:\ndraft"))
         self.assertEqual(records[0]["model"], agent.REVIEW_MODEL)
         self.assertEqual(records[0]["reasoningEffort"], agent.REVIEW_EFFORT)
+        self.assertEqual(records[0]["serviceTier"], "fast")
         self.assertEqual(records[-1]["kind"], "review_result")
 
     def test_feedback_prompt_changes_only_rewrite_to_revise(self):
@@ -486,7 +489,7 @@ class AgentTests(unittest.TestCase):
 
         with mock.patch.object(agent, "codex", return_value="codex"), mock.patch.object(
             agent.subprocess, "Popen", return_value=process
-        ), mock.patch.object(agent, "RPC", side_effect=make_rpc), mock.patch.object(
+        ) as popen, mock.patch.object(agent, "RPC", side_effect=make_rpc), mock.patch.object(
             agent, "criticize"
         ) as criticize, mock.patch.object(
             agent, "finalize"
@@ -613,7 +616,7 @@ class AgentTests(unittest.TestCase):
 
         with mock.patch.object(agent, "codex", return_value="codex"), mock.patch.object(
             agent.subprocess, "Popen", return_value=process
-        ), mock.patch.object(agent, "RPC", side_effect=make_rpc), mock.patch.object(
+        ) as popen, mock.patch.object(agent, "RPC", side_effect=make_rpc), mock.patch.object(
             agent, "criticize", side_effect=[failed, fixed, passed]
         ) as criticize, mock.patch.object(
             agent, "finalize", return_value="LATEX"
@@ -649,6 +652,13 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(calls[3][1]["input"][0]["text"], "FULL PROMPT")
         self.assertEqual(calls[4][1]["status"], "active")
         self.assertEqual(calls[1][1]["cwd"], str(Path.cwd()))
+        self.assertEqual(
+            calls[1][1]["config"]["service_tier"], agent.SERVICE_TIER
+        )
+        self.assertTrue(calls[1][1]["config"]["features"]["fast_mode"])
+        command = popen.call_args.args[0]
+        self.assertIn(f'service_tier="{agent.SERVICE_TIER}"', command)
+        self.assertIn("fast_mode", command)
         self.assertIn("Gap at line 2.", calls[5][1]["input"][0]["text"])
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(records[0]["text"], "FULL PROMPT")
@@ -790,7 +800,8 @@ class AgentTests(unittest.TestCase):
         ) as popen, mock.patch("sys.stdout", io.StringIO()):
             agent.structured("prompt", {}, "critic")
         command = popen.call_args.args[0]
-        self.assertEqual(command[command.index("--enable") + 1], "multi_agent")
+        self.assertIn("multi_agent", command)
+        self.assertIn("fast_mode", command)
 
     def test_final_editor_emits_the_latex_output(self):
         report = {"latex": "\\begin{proof}Done.\\end{proof}"}

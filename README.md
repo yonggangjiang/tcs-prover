@@ -23,6 +23,7 @@ On macOS, `Start TCS Prover.command` is an alternative launcher. Codex can use
 an eligible ChatGPT plan; see OpenAI's
 [Codex CLI guide](https://help.openai.com/en/articles/11096431) and
 [ChatGPT-plan guide](https://help.openai.com/en/articles/11369540).
+Every model call forces Codex Fast mode (1.5× speed), which uses more credits.
 
 Enter a rough problem, review or edit the precise statement, and approve it.
 **Advanced** controls each node's model, reasoning effort, prompt, author time

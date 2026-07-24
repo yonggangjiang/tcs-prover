@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 MODEL, EFFORT = "gpt-5.6-sol", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+SERVICE_TIER = "fast"
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 
 # Every role defaults to Sol and Ultra; both choices are configurable.
@@ -261,6 +262,7 @@ def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
     emit(
         "request", stage, label=f"Exact {stage} input", text=prompt,
         model=model, reasoningEffort=effort, reasoningSummary="detailed",
+        serviceTier=SERVICE_TIER,
         responseSchema=schema_value,
     )
     with tempfile.TemporaryDirectory() as folder:
@@ -270,6 +272,7 @@ def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         command = [
             codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            "-c", f'service_tier="{SERVICE_TIER}"', "--enable", "fast_mode",
             "-c", 'model_reasoning_summary="detailed"',
             *(["--enable", "multi_agent"] if stage == "critic" else []),
             "-C", str(folder), "-s", "read-only", "-a", "never", "exec",
@@ -507,12 +510,17 @@ def run_goal(
     emit(
         "request", "solve", label="Exact solve input", text=prompt,
         model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
+        serviceTier=SERVICE_TIER,
     )
     emit(
         "request", "solve", label="Goal continuation instruction", text=GOAL,
         model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
+        serviceTier=SERVICE_TIER,
     )
-    command = [codex(), "app-server", "--enable", "goals"]
+    command = [
+        codex(), "app-server", "--enable", "goals", "--enable", "fast_mode",
+        "-c", f'service_tier="{SERVICE_TIER}"',
+    ]
     process = subprocess.Popen(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, bufsize=1, env=environment(),
@@ -556,6 +564,8 @@ def run_goal(
             "config": {
                 "model_reasoning_effort": author_effort,
                 "model_reasoning_summary": "detailed",
+                "service_tier": SERVICE_TIER,
+                "features": {"fast_mode": True},
             },
         })
         thread = started["thread"]["id"]
@@ -662,6 +672,7 @@ def run_goal(
                     "request", "solve", label="Author continuation",
                     text=CONTINUE_PROMPT, model=author_model,
                     reasoningEffort=author_effort,
+                    serviceTier=SERVICE_TIER,
                     reasoningSummary="detailed",
                 )
                 # Explicit turns start while Goal mode is paused.
@@ -712,6 +723,7 @@ def run_goal(
                 "request", "failure", label="Failure summary request",
                 text=summary_prompt, model=author_model,
                 reasoningEffort=author_effort,
+                serviceTier=SERVICE_TIER,
                 reasoningSummary="detailed",
             )
             summary_stop, summary_expired = threading.Event(), threading.Event()
@@ -813,6 +825,7 @@ def run_goal(
                     label=f"Proof author revision {round_number}",
                     text=instruction, model=author_model,
                     reasoningEffort=author_effort,
+                    serviceTier=SERVICE_TIER,
                     reasoningSummary="detailed",
                 )
                 rpc.call("turn/start", {
