@@ -203,6 +203,15 @@ def environment():
     return env
 
 
+def configure_standard_streams():
+    """Use UTF-8 for the machine-readable CLI protocol on every platform."""
+
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def stop_process(process):
     """Stop a child promptly, escalating only when termination is ignored."""
 
@@ -281,7 +290,8 @@ def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
         ]
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, env=environment(),
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            errors="replace", env=environment(),
         )
         try:
             process.stdin.write(prompt)
@@ -523,7 +533,8 @@ def run_goal(
     ]
     process = subprocess.Popen(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True, bufsize=1, env=environment(),
+        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+        errors="replace", bufsize=1, env=environment(),
     )
 
     # Keep the latest complete answer from the original author thread.
@@ -905,6 +916,7 @@ def run_goal(
 def main():
     """Read one statement from stdin and perform the requested action."""
 
+    configure_standard_streams()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["review", "solve"])
     parser.add_argument(

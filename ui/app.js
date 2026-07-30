@@ -14,9 +14,16 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   input: $("inputPanel"), review: $("reviewPanel"), run: $("runPanel"),
   notice: $("notice"), problem: $("problem"), proposed: $("proposed"),
+  introDescription: $("introDescription"),
+  statementFields: $("statementFields"),
+  algorithmicFields: $("algorithmicFields"),
+  modelOfComputation: $("modelOfComputation"),
+  problemDescription: $("problemDescription"), goal: $("goal"),
+  modelPresets: $("modelPresets"), problemPresets: $("problemPresets"),
   feedback: $("feedback"), notes: $("notes"), editHint: $("editHint"),
   reviewModel: $("reviewModel"), authorModel: $("authorModel"),
   criticModel: $("criticModel"), writerModel: $("writerModel"),
+  reviewModelSetting: $("reviewModelSetting"),
   reviewEffort: $("reviewEffort"), authorEffort: $("authorEffort"),
   criticEffort: $("criticEffort"), writerEffort: $("writerEffort"),
   criticRounds: $("criticRounds"),
@@ -25,6 +32,7 @@ const ui = {
   promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
   promptEditorLabel: $("promptEditorLabel"),
   resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
+  reviewPromptTab: $("reviewPromptTab"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
@@ -41,8 +49,12 @@ const ui = {
   drawerScrim: $("drawerScrim"), activityList: $("activityList"),
   reviewHeading: $("reviewHeading"),
 };
+ui.problemModes = document.querySelectorAll('input[name="problemMode"]');
 
-let state = { phase: "input", trace: [], traceVersion: 0, workflow: { nodes: {}, edges: [] } };
+let state = {
+  phase: "input", problemMode: "statement", trace: [], traceVersion: 0,
+  workflow: { nodes: {}, edges: [] },
+};
 let previousPhase = "";
 let timer;
 let clock;
@@ -99,7 +111,10 @@ function jobUrl(runId, token = false) {
 
 function clearJobView() {
   previousPhase = "";
-  state = { phase: "input", trace: [], traceVersion: 0, workflow: { nodes: {}, edges: [] } };
+  state = {
+    phase: "input", problemMode: "statement", trace: [], traceVersion: 0,
+    workflow: { nodes: {}, edges: [] },
+  };
   timelineRows.clear();
   detailRows.clear();
   ui.timeline.replaceChildren();
@@ -159,7 +174,8 @@ function renderJobs(jobs) {
     item.dataset.job = job.runId;
     const copy = document.createElement("div");
     const title = document.createElement("strong");
-    title.textContent = job.draft?.trim().split("\n")[0] || "Untitled problem";
+    title.textContent = job.title || job.draft?.trim().split("\n")[0]
+      || "Untitled problem";
     const status = document.createElement("span");
     status.className = `job-status ${job.phase}`;
     const labels = {
@@ -203,12 +219,73 @@ async function loadJobs() {
   if (!currentJob) jobsTimer = setTimeout(loadJobs, 1500);
 }
 
+function selectedProblemMode() {
+  return [...ui.problemModes].find((input) => input.checked)?.value || "statement";
+}
+
+function setProblemMode(mode) {
+  const algorithmic = mode === "algorithmic";
+  for (const input of ui.problemModes) input.checked = input.value === mode;
+  show(ui.statementFields, !algorithmic);
+  show(ui.algorithmicFields, algorithmic);
+  show(ui.reviewModelSetting, !algorithmic);
+  show(ui.reviewPromptTab, !algorithmic);
+  ui.problem.required = !algorithmic;
+  for (const field of [
+    ui.modelOfComputation, ui.problemDescription, ui.goal,
+  ]) field.required = algorithmic;
+  ui.check.textContent = algorithmic ? "Start proof" : "Check statement";
+  ui.introDescription.textContent = algorithmic
+    ? "Define the computational model, problem, and asymptotic goal. The proof "
+      + "author will start immediately, followed by independent audit and LaTeX editing."
+    : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
+      + "solve it, audit it, and produce clean LaTeX.";
+  if (algorithmic && activePrompt === "review" && ui.promptDialog.open) {
+    selectPrompt("author");
+  }
+  updateModelSummary();
+}
+
+function renderPresetOptions(container, entries, field) {
+  const buttons = (entries || []).map((entry) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "preset-option";
+    button.textContent = entry.name;
+    button.setAttribute("aria-label", `${entry.name}: fill this description`);
+    button.onclick = () => {
+      field.value = entry.description;
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+      field.focus();
+    };
+    button._description = entry.description;
+    return button;
+  });
+  const syncSelection = () => {
+    for (const button of buttons) {
+      const selected = field.value === button._description;
+      button.classList.toggle("selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
+    }
+  };
+  field.oninput = syncSelection;
+  container.replaceChildren(...buttons);
+  syncSelection();
+}
+
+function renderAlgorithmicPresets(source) {
+  const presets = source.workflow?.settings?.algorithmic_presets || {};
+  renderPresetOptions(ui.modelPresets, presets.models, ui.modelOfComputation);
+  renderPresetOptions(ui.problemPresets, presets.problems, ui.problemDescription);
+}
+
 // Keep the compact footer label synchronized with every model setting.
 function updateModelSummary() {
   const name = (model) => model.split("-").at(-1)
     .replace(/^./, (letter) => letter.toUpperCase());
-  ui.modelSummary.textContent =
-    `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `
+  const review = selectedProblemMode() === "algorithmic" ? ""
+    : `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `;
+  ui.modelSummary.textContent = review
     + `${name(ui.authorModel.value)}/${name(ui.authorEffort.value)} author · `
     + `${name(ui.criticModel.value)}/${name(ui.criticEffort.value)} critic · `
     + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
@@ -256,7 +333,7 @@ function selectPrompt(name) {
 function openPromptEditor() {
   if (!promptValues.review) syncPrompts();
   promptDrafts = { ...promptValues };
-  activePrompt = "review";
+  activePrompt = selectedProblemMode() === "algorithmic" ? "author" : "review";
   selectPrompt(activePrompt);
   ui.promptDialog.showModal();
 }
@@ -621,6 +698,7 @@ function ingest(entries, reset = false) {
 // Render the critic/repair cycle as a real loop, not five linear steps.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
+  const algorithmic = state.problemMode === "algorithmic";
   const seen = new Set((state.trace || []).map(
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
@@ -682,12 +760,14 @@ function renderWorkflow() {
   const failureRoute = document.createElement("li");
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
-    "aria-label", "At the time limit, step 2 stops and returns a failure summary",
+    "aria-label",
+    `At the time limit, step ${algorithmic ? 1 : 2} stops and returns a failure summary`,
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";
   rejectRoute.setAttribute(
-    "aria-label", "On rejection, step 3 returns unresolved bugs to step 2",
+    "aria-label",
+    `On rejection, step ${algorithmic ? 2 : 3} returns unresolved bugs to step ${algorithmic ? 1 : 2}`,
   );
   const rejectLabel = document.createElement("span");
   rejectLabel.textContent = "REJECT";
@@ -695,8 +775,8 @@ function renderWorkflow() {
   const selfRoute = document.createElement("li");
   selfRoute.className = "loop-self";
   selfRoute.textContent = "↻ Critic fixes → fresh critic";
-  const author = makeNode("author", "2");
-  const critic = makeNode("critic", "3");
+  const author = makeNode("author", algorithmic ? "1" : "2");
+  const critic = makeNode("critic", algorithmic ? "2" : "3");
   const passStem = document.createElement("li");
   passStem.className = "critic-pass-stem";
   passStem.setAttribute("aria-hidden", "true");
@@ -710,15 +790,19 @@ function renderWorkflow() {
   branch.className = "workflow-branch";
   const passRoute = arrow("Clean PASS only", true);
   passRoute.classList.add("critic-pass");
-  const editor = makeNode("latex_editor", "4");
+  const editor = makeNode("latex_editor", algorithmic ? "3" : "4");
   editor.classList.add("post-loop");
   branch.append(failureNode, failureRoute, loop, passRoute, editor);
 
-  const reviewer = makeNode("statement_reviewer", "1");
-  reviewer.classList.add("pre-loop");
-  const approved = arrow("Approved");
-  approved.classList.add("pre-loop-arrow");
-  ui.workflowNodes.replaceChildren(reviewer, approved, branch);
+  if (algorithmic) {
+    ui.workflowNodes.replaceChildren(branch);
+  } else {
+    const reviewer = makeNode("statement_reviewer", "1");
+    reviewer.classList.add("pre-loop");
+    const approved = arrow("Approved");
+    approved.classList.add("pre-loop-arrow");
+    ui.workflowNodes.replaceChildren(reviewer, approved, branch);
+  }
 }
 
 function renderClock() {
@@ -757,6 +841,10 @@ function render(next) {
     const rounds = state.workflow?.settings?.critic_rounds || {};
     const hours = state.workflow?.settings?.thinking_hours || {};
     ui.problem.value = state.draft || "";
+    ui.modelOfComputation.value = state.modelOfComputation || "";
+    ui.problemDescription.value = state.problemDescription || "";
+    ui.goal.value = state.goal || "";
+    renderAlgorithmicPresets(state);
     ui.reviewModel.value = state.reviewModel || "gpt-5.6-sol";
     ui.authorModel.value = state.authorModel || "gpt-5.6-sol";
     ui.criticModel.value = state.criticModel || "gpt-5.6-sol";
@@ -773,6 +861,7 @@ function render(next) {
     ui.thinkingHours.value = state.thinkingHours || 8;
     ui.thinkingHours.min = hours.minimum || 0.01;
     ui.thinkingHours.max = hours.maximum || 168;
+    setProblemMode(state.problemMode || "statement");
   }
   if (phase === "reviewed" && (previousPhase !== "reviewed" || reviewPending)) {
     ui.reviewModel.value = state.reviewModel || "gpt-5.6-sol";
@@ -891,6 +980,48 @@ async function startReview(statement, feedback = "") {
   }
 }
 
+async function startAlgorithmic() {
+  const fields = [
+    [ui.modelOfComputation, "model of computation"],
+    [ui.problemDescription, "problem description"],
+    [ui.goal, "asymptotic upper- or lower-bound goal"],
+  ];
+  const missing = fields.find(([field]) => !field.value.trim());
+  if (missing) {
+    ui.notice.textContent = `Enter the ${missing[1]}.`;
+    show(ui.notice, true);
+    missing[0].focus();
+    return;
+  }
+  clearTimeout(timer);
+  clearTimeout(jobsTimer);
+  if (!promptValues.author) syncPrompts();
+  try {
+    const next = await request("/algorithmic", {
+      modelOfComputation: ui.modelOfComputation.value,
+      problemDescription: ui.problemDescription.value,
+      goal: ui.goal.value,
+      authorModel: ui.authorModel.value,
+      criticModel: ui.criticModel.value,
+      writerModel: ui.writerModel.value,
+      authorEffort: ui.authorEffort.value,
+      criticEffort: ui.criticEffort.value,
+      writerEffort: ui.writerEffort.value,
+      authorPrompt: promptValues.author,
+      criticPrompt: promptValues.critic,
+      finalPrompt: promptValues.final,
+      criticRounds: Number(ui.criticRounds.value),
+      thinkingHours: Number(ui.thinkingHours.value),
+    });
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
 async function act(path, body = {}) {
   clearTimeout(timer);
   const job = currentJob;
@@ -945,7 +1076,8 @@ ui.homeLink.onclick = (event) => {
   event.preventDefault();
   goHome();
 };
-ui.check.onclick = () => startReview(ui.problem.value);
+ui.check.onclick = () => selectedProblemMode() === "algorithmic"
+  ? startAlgorithmic() : startReview(ui.problem.value);
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
@@ -957,6 +1089,9 @@ ui.reviewEffort.onchange = updateModelSummary;
 ui.authorEffort.onchange = updateModelSummary;
 ui.criticEffort.onchange = updateModelSummary;
 ui.writerEffort.onchange = updateModelSummary;
+for (const input of ui.problemModes) {
+  input.onchange = () => setProblemMode(input.value);
+}
 ui.editPrompts.onclick = openPromptEditor;
 ui.promptTabs.onclick = (event) => {
   const tab = event.target.closest("[data-prompt]");

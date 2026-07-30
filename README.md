@@ -1,8 +1,9 @@
 # TCS Prover
 
-A local web UI that turns an informal theoretical-computer-science problem into
-a checked statement, runs a persistent Codex proof search, independently audits
-and repairs the candidate, then produces clean LaTeX.
+A local web UI that turns either an informal theoretical-computer-science
+statement or a structured algorithmic problem into a persistent Codex proof
+search, independently audits and repairs the candidate, then produces clean
+LaTeX.
 
 Compared with more complex harnesses such as [ProofCouncil](https://arxiv.org/pdf/2607.09474) and [Danus](https://arxiv.org/pdf/2607.06447), TCS Prover is designed to be lightweight, cost-friendly, and tailored to GPT-5.6 and theoretical computer science. Every component in its workflow has a specific, evidence-supported purpose. New components are welcome, but should be justified by evidence to avoid unnecessary heuristic complexity and cost. Suggestions and feedback are encouraged—please contact the project maintainer.
 
@@ -25,7 +26,10 @@ an eligible ChatGPT plan; see OpenAI's
 [ChatGPT-plan guide](https://help.openai.com/en/articles/11369540).
 Every model call forces Codex Fast mode (1.5× speed), which uses more credits.
 
-Enter a rough problem, review or edit the precise statement, and approve it.
+Choose **Statement** to review or edit a rough problem before approval. Choose
+**Algorithmic** to specify the model of computation, problem description, and
+asymptotic upper- or lower-bound goal; these fields go directly to the proof
+author without a statement-review step.
 **Advanced** controls each node's model, reasoning effort, prompt, author time
 limit, and critic-round limit. Jobs run in parallel. **Show details** displays
 the exact application prompts and returned model text. Private records and
@@ -35,15 +39,16 @@ outputs are stored under `runs/`.
 
 ```mermaid
 flowchart LR
-    S["1. Statement reviewer"] --> H{"Human approves?"}
+    S["Statement reviewer"] --> H{"Human approves?"}
     H -- "revise" --> S
-    H -- "approve" --> A["2. Proof author"]
+    H -- "approve" --> A["Proof author"]
+    I["Algorithmic setup: model + problem + goal"] --> A
     A -- "blocked: continue" --> A
     A -- "deadline" --> F["Failure summary"]
-    A -- "proof" --> C["3. Independent critic"]
+    A -- "proof" --> C["Independent critic"]
     C -- "reject" --> A
     C -- "fixed: recheck" --> C
-    C -- "clean pass" --> L["4. LaTeX editor"]
+    C -- "clean pass" --> L["LaTeX editor"]
 ```
 
 ### 1. Statement reviewer
@@ -55,6 +60,19 @@ For example, graph-algorithm papers commonly write a bound such as
 `m log² n`. A literal model may object that `m` can be smaller than `n` and call
 the target impossible. The review step states the intended convention and write it as `(m+n) log² n`instead of letting that mismatch
 derail the proof search.
+
+### Algorithmic mode
+
+This mode skips the statement reviewer. The server trims and combines the three
+required fields under explicit `MODEL OF COMPUTATION`, `PROBLEM DESCRIPTION`,
+and `GOAL (ASYMPTOTIC UPPER OR LOWER BOUND)` headings, saves both the source
+fields and the combined task in the run folder, and sends that exact task through
+the normal proof-author pipeline.
+
+The model and problem fields also show reusable presets loaded from
+`algorithmic/model.json` and `algorithmic/problem.json`. Each catalog entry has
+only a `name` and `description`; selecting its name copies the description into
+the corresponding field. Restart the local server after editing a catalog.
 
 ### 2. Proof author
 

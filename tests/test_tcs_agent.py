@@ -16,6 +16,17 @@ import tcs_agent as agent
 class AgentTests(unittest.TestCase):
     """Check local logic without calling the subscription."""
 
+    def test_standard_streams_use_fault_tolerant_utf8(self):
+        streams = [mock.Mock(), mock.Mock(), mock.Mock()]
+        with mock.patch.object(agent.sys, "stdin", streams[0]), mock.patch.object(
+            agent.sys, "stdout", streams[1]
+        ), mock.patch.object(agent.sys, "stderr", streams[2]):
+            agent.configure_standard_streams()
+        for stream in streams:
+            stream.reconfigure.assert_called_once_with(
+                encoding="utf-8", errors="replace"
+            )
+
     def test_empty_statement_is_rejected(self):
         with self.assertRaises(agent.Error):
             agent.text("  ")
@@ -67,6 +78,8 @@ class AgentTests(unittest.TestCase):
         self.assertIn("fast_mode", command)
         self.assertIn('model_reasoning_summary="detailed"', command)
         self.assertIn("--json", command)
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(records[0]["kind"], "request")
         self.assertTrue(records[0]["text"].endswith("DRAFT:\ndraft"))
@@ -659,6 +672,8 @@ class AgentTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertIn(f'service_tier="{agent.SERVICE_TIER}"', command)
         self.assertIn("fast_mode", command)
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertIn("Gap at line 2.", calls[5][1]["input"][0]["text"])
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(records[0]["text"], "FULL PROMPT")

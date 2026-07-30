@@ -38,17 +38,65 @@
           <div class="intro">
             <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
             <h1>What should we solve?</h1>
-            <p>Start with a rough TCS problem. The agent will clarify it,
+            <p id="introDescription">Start with a rough TCS problem. The agent will clarify it,
               ask for approval, solve it, audit it, and produce clean LaTeX.</p>
           </div>
           <div class="composer">
-            <label for="problem">Problem statement</label>
-            <textarea id="problem" rows="12"
-              placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
+            <fieldset class="problem-mode">
+              <legend>Problem setup</legend>
+              <div class="mode-options">
+                <label class="mode-option">
+                  <input type="radio" name="problemMode" value="statement" checked>
+                  <span>
+                    <strong>Statement</strong>
+                    <small>Review and approve a rough problem statement</small>
+                  </span>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="problemMode" value="algorithmic">
+                  <span>
+                    <strong>Algorithmic</strong>
+                    <small>Define a model, problem, and asymptotic goal</small>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+            <div id="statementFields">
+              <label for="problem">Problem statement</label>
+              <textarea id="problem" rows="12" required
+                placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
+            </div>
+            <div id="algorithmicFields" class="algorithmic-fields" hidden>
+              <div>
+                <label for="modelOfComputation">Model of computation</label>
+                <div class="preset-picker">
+                  <span>Use a default model</span>
+                  <div id="modelPresets" class="preset-options" role="group"
+                    aria-label="Default models of computation"></div>
+                </div>
+                <textarea id="modelOfComputation" rows="4"
+                  placeholder="For example: word-RAM with w = Θ(log n)-bit words…"></textarea>
+              </div>
+              <div>
+                <label for="problemDescription">Problem description</label>
+                <div class="preset-picker">
+                  <span>Use a default problem</span>
+                  <div id="problemPresets" class="preset-options" role="group"
+                    aria-label="Default algorithmic problems"></div>
+                </div>
+                <textarea id="problemDescription" rows="7"
+                  placeholder="Define the input, output, parameters, and assumptions…"></textarea>
+              </div>
+              <div>
+                <label for="goal">Goal (asymptotic upper or lower bound)</label>
+                <textarea id="goal" rows="4"
+                  placeholder="For example: prove an O(m log n) upper bound…"></textarea>
+              </div>
+            </div>
             <details class="advanced">
               <summary>Advanced</summary>
               <div class="model-grid">
-                <div class="round-setting model-setting">
+                <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
                   <select id="reviewModel">
                     <option value="gpt-5.6-sol">Sol — strongest</option>
@@ -246,7 +294,7 @@
         </div>
         <div id="promptTabs" class="prompt-tabs" role="tablist"
           aria-label="Choose a role prompt">
-          <button type="button" class="prompt-tab active"
+          <button id="reviewPromptTab" type="button" class="prompt-tab active"
             data-prompt="review">Reviewer</button>
           <button type="button" class="prompt-tab"
             data-prompt="author">Author</button>

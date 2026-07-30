@@ -25,6 +25,7 @@ import tcs_agent
 ROOT = Path(__file__).resolve().parent
 UI = ROOT / "ui"
 RUNS = ROOT / "runs"
+ALGORITHMIC = ROOT / "algorithmic"
 HOST, PORT = "127.0.0.1", 8765
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
 DEFAULT_THINKING_HOURS, MAX_THINKING_HOURS = 8, 168
@@ -33,6 +34,53 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 DEFAULT_REVIEW_MODEL = "gpt-5.6-sol"
 DEFAULT_AUTHOR_MODEL = DEFAULT_CRITIC_MODEL = DEFAULT_WRITER_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "ultra"
+
+
+def load_algorithmic_catalog(path):
+    """Load one strict list of named algorithmic-mode descriptions."""
+
+    try:
+        values = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read algorithmic preset file {path}: {exc}") from exc
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"Algorithmic preset file {path} must be a nonempty list.")
+    result, names = [], set()
+    for index, value in enumerate(values, 1):
+        if not isinstance(value, dict) or set(value) != {"name", "description"}:
+            raise ValueError(
+                f"Entry {index} in {path} must contain only name and description."
+            )
+        name, description = value["name"], value["description"]
+        if not all(isinstance(item, str) and item.strip() for item in (
+            name, description,
+        )):
+            raise ValueError(
+                f"Entry {index} in {path} needs a nonempty name and description."
+            )
+        name, description = name.strip(), description.strip()
+        if "\0" in name or "\0" in description:
+            raise ValueError(f"Entry {index} in {path} cannot contain NUL characters.")
+        name_key = name.casefold()
+        if name_key in names:
+            raise ValueError(f"Algorithmic preset name {name!r} is duplicated in {path}.")
+        names.add(name_key)
+        result.append({"name": name, "description": description})
+    return result
+
+
+def optional_algorithmic_catalog(path):
+    """Keep manual algorithmic input usable if a local preset file is broken."""
+
+    try:
+        return load_algorithmic_catalog(path)
+    except ValueError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
+        return []
+
+
+MODEL_PRESETS = optional_algorithmic_catalog(ALGORITHMIC / "model.json")
+PROBLEM_PRESETS = optional_algorithmic_catalog(ALGORITHMIC / "problem.json")
 DEFAULT_PROMPTS = {
     "review": tcs_agent.REVIEW_PROMPT,
     "author": tcs_agent.TEMPLATE.read_text(encoding="utf-8"),
@@ -76,6 +124,10 @@ PUBLIC_GRAPH = {
         "review_reasoning_effort": DEFAULT_REASONING_EFFORT,
         "revision_reasoning_effort": DEFAULT_REASONING_EFFORT,
         "prompts": DEFAULT_PROMPTS,
+        "algorithmic_presets": {
+            "models": MODEL_PRESETS,
+            "problems": PROBLEM_PRESETS,
+        },
         "model_summary": "Sol/Ultra review · Sol/Ultra author, critic, writer",
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
@@ -148,13 +200,52 @@ PUBLIC_GRAPH = {
     ],
 }
 
+ALGORITHMIC_GRAPH = {
+    "settings": PUBLIC_GRAPH["settings"],
+    "nodes": {
+        name: node for name, node in PUBLIC_GRAPH["nodes"].items()
+        if name != "statement_reviewer"
+    },
+    "edges": [
+        edge for edge in PUBLIC_GRAPH["edges"]
+        if edge["from"] != "statement_reviewer"
+    ],
+}
+
+
+def algorithmic_statement(model_of_computation, problem_description, goal):
+    """Validate and combine the three fields that define an algorithmic task."""
+
+    values = []
+    for value, message in (
+        (model_of_computation, "Enter the model of computation."),
+        (problem_description, "Enter the problem description."),
+        (goal, "Enter the asymptotic upper- or lower-bound goal."),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(message)
+        value = value.strip()
+        if "\0" in value:
+            raise ValueError("Algorithmic problem fields cannot contain NUL characters.")
+        values.append(value)
+    model_of_computation, problem_description, goal = values
+    return (
+        f"MODEL OF COMPUTATION:\n{model_of_computation}\n\n"
+        f"PROBLEM DESCRIPTION:\n{problem_description}\n\n"
+        f"GOAL (ASYMPTOTIC UPPER OR LOWER BOUND):\n{goal}"
+    )
+
 
 def empty_state(trace=None, trace_version=0):
     """Return the complete, intentionally small UI state."""
 
     return {
         "phase": "input",
+        "problemMode": "statement",
         "draft": "",
+        "modelOfComputation": "",
+        "problemDescription": "",
+        "goal": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
         "authorModel": DEFAULT_AUTHOR_MODEL,
@@ -208,13 +299,14 @@ class App:
         logs = self.runs.glob("*/transcript.jsonl")
         return max(logs, key=lambda path: path.stat().st_mtime, default=None)
 
-    def _new_run(self, statement):
+    def _new_run(self, statement, slug_source=None):
         """Create a private, readable folder name for one problem."""
 
         if self.fixed_trace:
             self.run_dir = self.trace_file.parent
         else:
-            slug = re.sub(r"[^a-z0-9]+", "-", statement.lower()).strip("-")
+            slug_text = statement if slug_source is None else slug_source
+            slug = re.sub(r"[^a-z0-9]+", "-", slug_text.lower()).strip("-")
             slug = slug[:48].rstrip("-") or "problem"
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             self.runs.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -326,23 +418,21 @@ class App:
                 state["trace"], state["traceFrom"] = self.retained_trace(), first
             return state
 
-    def start_review(
-        self, statement, feedback="", critic_rounds=DEFAULT_CRITIC_ROUNDS,
-        review_model=DEFAULT_REVIEW_MODEL,
+    @staticmethod
+    def _workflow_options(
+        critic_rounds=DEFAULT_CRITIC_ROUNDS,
         thinking_hours=DEFAULT_THINKING_HOURS,
         author_model=DEFAULT_AUTHOR_MODEL,
         critic_model=DEFAULT_CRITIC_MODEL,
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
-        review_effort=None, author_effort=None,
-        critic_effort=None, writer_effort=None,
-        review_prompt=None, author_prompt=None,
-        critic_prompt=None, final_prompt=None,
+        author_effort=None, critic_effort=None, writer_effort=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
+        review_model=DEFAULT_REVIEW_MODEL, review_effort=None,
+        review_prompt=None, include_review=True,
     ):
-        """Start the review and return immediately so the page can poll."""
+        """Normalize and validate settings shared by both input modes."""
 
-        statement = str(statement).strip()
-        feedback = str(feedback or "").strip()
         review_model = str(review_model or "")
         author_model = str(author_model or "")
         critic_model = str(critic_model or "")
@@ -362,21 +452,22 @@ class App:
             ).strip()
             for name, value in supplied_prompts.items()
         }
-        if review_model not in REVIEW_MODELS:
+        if include_review and review_model not in REVIEW_MODELS:
             raise ValueError("Choose Sol, Terra, or Luna for statement review.")
         if any(
             model not in MODELS
             for model in (author_model, critic_model, writer_model)
         ):
             raise ValueError("Choose Sol, Terra, or Luna for every proof stage.")
-        if any(
-            effort not in EFFORTS
-            for effort in (
-                review_effort, author_effort, critic_effort, writer_effort
-            )
-        ):
+        efforts = [author_effort, critic_effort, writer_effort]
+        if include_review:
+            efforts.append(review_effort)
+        if any(effort not in EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
-        if any(not prompt for prompt in prompts.values()):
+        required_prompts = [prompts[name] for name in ("author", "critic", "final")]
+        if include_review:
+            required_prompts.append(prompts["review"])
+        if any(not prompt for prompt in required_prompts):
             raise ValueError("Every role prompt must contain instructions.")
         if prompts["author"].count(tcs_agent.MARKER) != 1:
             raise ValueError(
@@ -396,6 +487,62 @@ class App:
             raise ValueError(
                 f"Choose more than 0 and at most {MAX_THINKING_HOURS} hours."
             )
+        return {
+            "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
+            "authorModel": author_model,
+            "criticModel": critic_model,
+            "writerModel": writer_model,
+            "reasoningEffort": author_effort,
+            "reviewEffort": (
+                review_effort if include_review else DEFAULT_REASONING_EFFORT
+            ),
+            "authorEffort": author_effort,
+            "criticEffort": critic_effort,
+            "writerEffort": writer_effort,
+            "reviewPrompt": (
+                prompts["review"] if include_review else DEFAULT_PROMPTS["review"]
+            ),
+            "authorPrompt": prompts["author"],
+            "criticPrompt": prompts["critic"],
+            "finalPrompt": prompts["final"],
+            "criticRounds": critic_rounds,
+            "thinkingHours": thinking_hours,
+        }
+
+    def start_review(
+        self, statement, feedback="", critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        review_model=DEFAULT_REVIEW_MODEL,
+        thinking_hours=DEFAULT_THINKING_HOURS,
+        author_model=DEFAULT_AUTHOR_MODEL,
+        critic_model=DEFAULT_CRITIC_MODEL,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        review_effort=None, author_effort=None,
+        critic_effort=None, writer_effort=None,
+        review_prompt=None, author_prompt=None,
+        critic_prompt=None, final_prompt=None,
+    ):
+        """Start the review and return immediately so the page can poll."""
+
+        statement = str(statement).strip()
+        feedback = str(feedback or "").strip()
+        options = self._workflow_options(
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            author_model=author_model,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            author_effort=author_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            author_prompt=author_prompt,
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            review_model=review_model,
+            review_effort=review_effort,
+            review_prompt=review_prompt,
+        )
         if not statement:
             raise ValueError("Enter a problem statement.")
         with self.lock:
@@ -407,29 +554,15 @@ class App:
                 self._new_run(statement)
                 if not self.fixed_trace:
                     self.pinned = []
-            for name, prompt in prompts.items():
-                self._save(f"prompts/{name}.txt", prompt + "\n")
+            for name in ("review", "author", "critic", "final"):
+                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             trace = self.state["trace"] if retry or self.fixed_trace else []
             version = self.state["traceVersion"] if retry or self.fixed_trace else 0
             self.state = {
                 **empty_state(trace, version),
                 "phase": "reviewing",
                 "draft": statement,
-                "reviewModel": review_model,
-                "authorModel": author_model,
-                "criticModel": critic_model,
-                "writerModel": writer_model,
-                "reasoningEffort": author_effort,
-                "reviewEffort": review_effort,
-                "authorEffort": author_effort,
-                "criticEffort": critic_effort,
-                "writerEffort": writer_effort,
-                "reviewPrompt": prompts["review"],
-                "authorPrompt": prompts["author"],
-                "criticPrompt": prompts["critic"],
-                "finalPrompt": prompts["final"],
-                "criticRounds": critic_rounds,
-                "thinkingHours": thinking_hours,
+                **options,
                 "activeNode": "statement_reviewer",
                 "stage": "review",
                 "startedAt": datetime.now(timezone.utc).isoformat(),
@@ -437,7 +570,11 @@ class App:
             }
         threading.Thread(
             target=self._review,
-            args=(statement, feedback, review_model, review_effort), daemon=True
+            args=(
+                statement, feedback, options["reviewModel"],
+                options["reviewEffort"],
+            ),
+            daemon=True,
         ).start()
 
     def _review(
@@ -465,7 +602,8 @@ class App:
                     str(self.run_dir / "prompts/review.txt"),
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=ROOT,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", bufsize=1, cwd=ROOT,
             )
             with self.lock:
                 self.process = process
@@ -545,6 +683,133 @@ class App:
             elif problem:
                 self.state["phase"], self.state["error"] = "input", problem
 
+    def _launch_solver_locked(self, statement):
+        """Attach the existing proof pipeline; the caller holds ``self.lock``."""
+
+        process = subprocess.Popen(
+            [
+                sys.executable, "-u", str(ROOT / "tcs_agent.py"), "solve",
+                "--author-model", self.state["authorModel"],
+                "--critic-model", self.state["criticModel"],
+                "--writer-model", self.state["writerModel"],
+                "--reasoning-effort", self.state["reasoningEffort"],
+                "--author-effort", self.state["authorEffort"],
+                "--critic-effort", self.state["criticEffort"],
+                "--writer-effort", self.state["writerEffort"],
+                "--author-prompt-file",
+                str(self.run_dir / "prompts/author.txt"),
+                "--critic-prompt-file",
+                str(self.run_dir / "prompts/critic.txt"),
+                "--final-prompt-file",
+                str(self.run_dir / "prompts/final.txt"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            # Goal mode writes its durable proof files into this run only.
+            cwd=self.run_dir,
+        )
+        self.process = process
+        try:
+            process.stdin.write(
+                f"{statement}\0{self.state['criticRounds']}"
+                f"\0{self.state['thinkingHours']}"
+            )
+            process.stdin.close()
+        except (OSError, TypeError, ValueError):
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            except OSError:
+                pass
+            if self.process is process:
+                self.process = None
+            raise
+        self.state.update(
+            phase="running", stage="solve",
+            activeNode="author", round=0, output="",
+        )
+        return process
+
+    def start_algorithmic(
+        self, model_of_computation, problem_description, goal,
+        critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        thinking_hours=DEFAULT_THINKING_HOURS,
+        author_model=DEFAULT_AUTHOR_MODEL,
+        critic_model=DEFAULT_CRITIC_MODEL,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        author_effort=None, critic_effort=None, writer_effort=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
+    ):
+        """Start an algorithmic task directly at the proof-author stage."""
+
+        statement = algorithmic_statement(
+            model_of_computation, problem_description, goal
+        )
+        fields = {
+            "modelOfComputation": model_of_computation.strip(),
+            "problemDescription": problem_description.strip(),
+            "goal": goal.strip(),
+        }
+        options = self._workflow_options(
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            author_model=author_model,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            author_effort=author_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            author_prompt=author_prompt,
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            include_review=False,
+        )
+        with self.lock:
+            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+                raise ValueError("Codex is already working.")
+            self._new_run(statement, fields["problemDescription"])
+            if not self.fixed_trace:
+                self.pinned = []
+            for name in ("author", "critic", "final"):
+                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save("algorithmic-problem.md", statement + "\n")
+            self._save(
+                "algorithmic-input.json",
+                json.dumps(fields, ensure_ascii=False, indent=2) + "\n",
+            )
+            trace = self.state["trace"] if self.fixed_trace else []
+            version = self.state["traceVersion"] if self.fixed_trace else 0
+            self.state = {
+                **empty_state(trace, version),
+                "problemMode": "algorithmic",
+                "draft": statement,
+                **fields,
+                **options,
+                "workflow": ALGORITHMIC_GRAPH,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "runId": self.run_dir.name,
+            }
+            process = self._launch_solver_locked(statement)
+        threading.Thread(
+            target=self._read_output, args=(process,), daemon=True
+        ).start()
+
     def approve(self, edited_statement=None):
         """Solve the reviewed statement, including any direct author edit."""
 
@@ -565,41 +830,7 @@ class App:
                     f"{self.state['review']['notes'] or 'None.'}\n\n"
                     "# Author action\n\nEdited and directly approved by the author.\n",
                 )
-            process = subprocess.Popen(
-                [
-                    sys.executable, "-u", str(ROOT / "tcs_agent.py"), "solve",
-                    "--author-model", self.state["authorModel"],
-                    "--critic-model", self.state["criticModel"],
-                    "--writer-model", self.state["writerModel"],
-                    "--reasoning-effort", self.state["reasoningEffort"],
-                    "--author-effort", self.state["authorEffort"],
-                    "--critic-effort", self.state["criticEffort"],
-                    "--writer-effort", self.state["writerEffort"],
-                    "--author-prompt-file",
-                    str(self.run_dir / "prompts/author.txt"),
-                    "--critic-prompt-file",
-                    str(self.run_dir / "prompts/critic.txt"),
-                    "--final-prompt-file",
-                    str(self.run_dir / "prompts/final.txt"),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                # Goal mode writes its durable proof files into this run only.
-                cwd=self.run_dir,
-            )
-            process.stdin.write(
-                f"{statement}\0{self.state['criticRounds']}"
-                f"\0{self.state['thinkingHours']}"
-            )
-            process.stdin.close()
-            self.process = process
-            self.state.update(
-                phase="running", stage="solve",
-                activeNode="author", round=0, output="",
-            )
+            process = self._launch_solver_locked(statement)
         threading.Thread(target=self._read_output, args=(process,), daemon=True).start()
 
     def _read_output(self, process):
@@ -812,6 +1043,37 @@ class Server(ThreadingHTTPServer):
         self.app = app  # Preserve the small single-app testing interface.
         return app
 
+    def start_algorithmic_job(self, body, run_id=""):
+        """Create an algorithmic job that starts directly with the author."""
+
+        if run_id and not self.fixed_app:
+            raise ValueError("Start an algorithmic problem from the home screen.")
+        app = self.get_job(run_id) if run_id else (
+            self.app if self.fixed_app else App(runs=self.runs)
+        )
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        app.start_algorithmic(
+            model_of_computation=body.get("modelOfComputation", ""),
+            problem_description=body.get("problemDescription", ""),
+            goal=body.get("goal", ""),
+            critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
+            author_model=body.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
+            writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
+            reasoning_effort=legacy_effort,
+            author_effort=body.get("authorEffort", legacy_effort),
+            critic_effort=body.get("criticEffort", legacy_effort),
+            writer_effort=body.get("writerEffort", legacy_effort),
+            author_prompt=body.get("authorPrompt"),
+            critic_prompt=body.get("criticPrompt"),
+            final_prompt=body.get("finalPrompt"),
+        )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
     def job_list(self):
         """Return only the fields needed by the home-page job switcher."""
 
@@ -820,12 +1082,18 @@ class Server(ThreadingHTTPServer):
         jobs = []
         for app in apps:
             state = app.snapshot()
-            jobs.append({
+            job = {
                 key: state[key] for key in (
                     "runId", "phase", "draft", "activeNode", "startedAt",
-                    "lastActivityAt", "error",
+                    "lastActivityAt", "error", "problemMode",
                 )
-            })
+            }
+            job["title"] = (
+                state["problemDescription"].strip().split("\n", 1)[0]
+                if state["problemMode"] == "algorithmic"
+                else state["draft"].strip().split("\n", 1)[0]
+            )
+            jobs.append(job)
         return sorted(jobs, key=lambda job: job["startedAt"], reverse=True)
 
     def delete_job(self, run_id):
@@ -973,6 +1241,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.delete_job(run_id))
             if request.path == "/review":
                 app = self.server.start_job(body, run_id)
+            elif request.path == "/algorithmic":
+                app = self.server.start_algorithmic_job(body, run_id)
             else:
                 app = self.server.get_job(run_id)
             if request.path == "/approve":
@@ -983,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
                 app.reset()
             elif request.path == "/clear-trace":
                 app.clear_trace()
-            elif request.path != "/review":
+            elif request.path not in {"/review", "/algorithmic"}:
                 return self.send({"error": "Not found."}, status=404)
             self.send(app.snapshot())
         except (OSError, TypeError, ValueError) as exc:

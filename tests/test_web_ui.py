@@ -27,6 +27,119 @@ class AppTests(unittest.TestCase):
     def app(self):
         return web_ui.App(self.trace)
 
+    def test_algorithmic_catalogs_have_only_names_and_descriptions(self):
+        for filename, presets in (
+            ("model.json", web_ui.MODEL_PRESETS),
+            ("problem.json", web_ui.PROBLEM_PRESETS),
+        ):
+            raw = json.loads(
+                (web_ui.ALGORITHMIC / filename).read_text(encoding="utf-8")
+            )
+            self.assertEqual(raw, presets)
+            self.assertGreaterEqual(len(presets), 3)
+            self.assertEqual(len({entry["name"] for entry in presets}), len(presets))
+            for entry in presets:
+                self.assertEqual(set(entry), {"name", "description"})
+                self.assertTrue(entry["name"].strip())
+                self.assertTrue(entry["description"].strip())
+
+    def test_algorithmic_catalog_loader_rejects_extra_metadata(self):
+        path = Path(self.folder.name) / "bad.json"
+        path.write_text(
+            json.dumps([{"name": "RAM", "description": "Words.", "id": 1}]),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "only name and description"):
+            web_ui.load_algorithmic_catalog(path)
+        path.write_text(
+            json.dumps([
+                {"name": "RAM", "description": "Words."},
+                {"name": "ram", "description": "Duplicate."},
+            ]),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            web_ui.load_algorithmic_catalog(path)
+
+    def test_algorithmic_statement_is_canonical_and_trimmed(self):
+        self.assertEqual(
+            web_ui.algorithmic_statement(
+                "  word-RAM  ", "  Sort n integers.  ", "  Prove O(n log n).  "
+            ),
+            "MODEL OF COMPUTATION:\nword-RAM\n\n"
+            "PROBLEM DESCRIPTION:\nSort n integers.\n\n"
+            "GOAL (ASYMPTOTIC UPPER OR LOWER BOUND):\nProve O(n log n).",
+        )
+
+    def test_algorithmic_statement_requires_every_field(self):
+        cases = (
+            ("", "Problem", "Goal", "model of computation"),
+            ("Model", "  ", "Goal", "problem description"),
+            ("Model", "Problem", None, "upper- or lower-bound goal"),
+        )
+        for model, problem, goal, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                web_ui.algorithmic_statement(model, problem, goal)
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            web_ui.algorithmic_statement("word\0RAM", "Problem", "Goal")
+
+    def test_algorithmic_mode_starts_the_author_without_review(self):
+        app = self.app()
+        process = SimpleNamespace(stdin=mock.Mock(), stdout=mock.Mock())
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(web_ui.threading, "Thread") as thread, \
+                mock.patch.object(app, "_review") as review:
+            app.start_algorithmic(
+                "  word-RAM  ", "  Sort n integers.  ", "  Prove O(n log n).  ",
+                critic_rounds=6, thinking_hours=1.5,
+                author_model="gpt-5.6-terra",
+                critic_model="gpt-5.6-luna",
+                writer_model="gpt-5.6-sol",
+                author_effort="high", critic_effort="max",
+                writer_effort="medium",
+            )
+        statement = web_ui.algorithmic_statement(
+            "word-RAM", "Sort n integers.", "Prove O(n log n)."
+        )
+        review.assert_not_called()
+        process.stdin.write.assert_called_once_with(f"{statement}\0{6}\0{1.5}")
+        process.stdin.close.assert_called_once()
+        thread.assert_called_once_with(
+            target=app._read_output, args=(process,), daemon=True
+        )
+        thread.return_value.start.assert_called_once()
+        state = app.snapshot()
+        self.assertEqual(state["phase"], "running")
+        self.assertEqual(state["problemMode"], "algorithmic")
+        self.assertEqual(state["activeNode"], "author")
+        self.assertEqual(state["stage"], "solve")
+        self.assertIsNone(state["review"])
+        self.assertEqual(state["modelOfComputation"], "word-RAM")
+        self.assertEqual(state["problemDescription"], "Sort n integers.")
+        self.assertEqual(state["goal"], "Prove O(n log n).")
+        self.assertNotIn("statement_reviewer", state["workflow"]["nodes"])
+        self.assertEqual(state["authorModel"], "gpt-5.6-terra")
+        self.assertEqual(state["criticEffort"], "max")
+        self.assertEqual(
+            (app.run_dir / "algorithmic-problem.md").read_text(encoding="utf-8"),
+            statement + "\n",
+        )
+        self.assertEqual(
+            json.loads((app.run_dir / "algorithmic-input.json").read_text(
+                encoding="utf-8"
+            )),
+            {
+                "modelOfComputation": "word-RAM",
+                "problemDescription": "Sort n integers.",
+                "goal": "Prove O(n log n).",
+            },
+        )
+        self.assertFalse((app.run_dir / "checked-statement.md").exists())
+        self.assertEqual(popen.call_args.kwargs["cwd"], app.run_dir)
+
     def test_review_starts_in_the_background(self):
         app = self.app()
         with mock.patch.object(web_ui.threading, "Thread") as thread:
@@ -108,9 +221,13 @@ class AppTests(unittest.TestCase):
             wait=mock.Mock(return_value=0),
             poll=mock.Mock(return_value=0),
         )
-        with mock.patch.object(web_ui.subprocess, "Popen", return_value=process):
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ) as popen:
             app._review("draft", "clarify it")
         process.stdin.write.assert_called_once_with("draft\0clarify it")
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertEqual(app.snapshot()["review"], report)
         self.assertIn(
             "Rigorous", (self.trace.parent / "checked-statement.md").read_text()
@@ -197,7 +314,28 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--reasoning-effort") + 1], "ultra"
         )
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertEqual(popen.call_args.kwargs["cwd"], self.trace.parent)
+
+    def test_solver_is_reaped_if_initial_input_breaks(self):
+        app = self.app()
+        app.state.update(
+            phase="reviewed",
+            review={"statement": "Rigorous", "notes": "Sound."},
+        )
+        process = mock.Mock()
+        process.stdin.write.side_effect = BrokenPipeError("closed")
+        process.poll.return_value = None
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ):
+            with self.assertRaises(BrokenPipeError):
+                app.approve()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=2)
+        self.assertIsNone(app.process)
+        self.assertEqual(app.snapshot()["phase"], "reviewed")
 
     def test_solver_receives_each_selected_proof_model(self):
         app = self.app()
@@ -475,6 +613,14 @@ class HttpTests(unittest.TestCase):
         page = body.decode()
         self.assertEqual(response.status, 200)
         self.assertIn("Problem statement", page)
+        self.assertIn('name="problemMode" value="statement" checked', page)
+        self.assertIn('name="problemMode" value="algorithmic"', page)
+        self.assertIn('id="algorithmicFields" class="algorithmic-fields" hidden', page)
+        self.assertIn('for="modelOfComputation">Model of computation', page)
+        self.assertIn('for="problemDescription">Problem description', page)
+        self.assertIn('id="modelPresets" class="preset-options"', page)
+        self.assertIn('id="problemPresets" class="preset-options"', page)
+        self.assertIn("Goal (asymptotic upper or lower bound)", page)
         self.assertIn("<summary>Advanced</summary>", page)
         self.assertIn('label for="reviewModel"', page)
         self.assertIn('value="gpt-5.6-terra"', page)
@@ -512,9 +658,12 @@ class HttpTests(unittest.TestCase):
         self.assertIn('"Returned text from OpenAI"', script)
         self.assertIn('"Repeat until a clean PASS"', script)
         self.assertIn('"loop-back"', script)
-        self.assertIn(
-            '"On rejection, step 3 returns unresolved bugs to step 2"', script
-        )
+        self.assertIn("state.problemMode === \"algorithmic\"", script)
+        self.assertIn('request("/algorithmic"', script)
+        self.assertIn("ui.workflowNodes.replaceChildren(branch)", script)
+        self.assertIn("button.textContent = entry.name", script)
+        self.assertIn("field.value = entry.description", script)
+        self.assertIn("renderAlgorithmicPresets(state)", script)
         self.assertIn('"Clean PASS only"', script)
         self.assertIn("{ statement: ui.proposed.value }", script)
         self.assertIn("hasFeedback || !ui.proposed.value.trim()", script)
@@ -556,12 +705,17 @@ class HttpTests(unittest.TestCase):
         self.assertIn(".critic-pass-stem", styles)
         self.assertIn(".pre-loop-arrow", styles)
         self.assertIn(".post-loop", styles)
+        self.assertIn(".mode-options", styles)
+        self.assertIn(".algorithmic-fields", styles)
+        self.assertIn(".preset-options", styles)
+        self.assertIn(".preset-option.selected", styles)
 
     def test_state_starts_at_input(self):
         response, body = self.get("/state")
         self.assertEqual(response.status, 200)
         state = json.loads(body)
         self.assertEqual(state["phase"], "input")
+        self.assertEqual(state["problemMode"], "statement")
         self.assertEqual(state["criticRounds"], 4)
         self.assertEqual(state["thinkingHours"], 8)
         self.assertEqual(state["reviewModel"], "gpt-5.6-sol")
@@ -570,6 +724,9 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(state["writerModel"], "gpt-5.6-sol")
         self.assertEqual(state["reasoningEffort"], "ultra")
         self.assertEqual(state["workflow"]["settings"]["reasoning_effort"], "ultra")
+        presets = state["workflow"]["settings"]["algorithmic_presets"]
+        self.assertEqual(presets["models"], web_ui.MODEL_PRESETS)
+        self.assertEqual(presets["problems"], web_ui.PROBLEM_PRESETS)
         self.assertIn("critic", state["workflow"]["nodes"])
         self.assertIn("failure_summary", state["workflow"]["nodes"])
         self.assertNotIn("author_repair", state["workflow"]["nodes"])
@@ -636,6 +793,43 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(options["critic_effort"], "high")
         self.assertEqual(options["writer_effort"], "max")
         self.assertEqual(options["author_prompt"], "Solve [STATEMENT].")
+
+    def test_algorithmic_endpoint_forwards_fields_and_proof_settings(self):
+        values = {
+            "modelOfComputation": "word-RAM",
+            "problemDescription": "Sort integers.",
+            "goal": "Prove O(n log n).",
+            "criticRounds": 5, "thinkingHours": 2.5,
+            "authorModel": "gpt-5.6-terra",
+            "criticModel": "gpt-5.6-luna",
+            "writerModel": "gpt-5.6-sol",
+            "authorEffort": "high", "criticEffort": "max",
+            "writerEffort": "medium",
+            "authorPrompt": "Solve [STATEMENT].",
+            "criticPrompt": "Audit it.", "finalPrompt": "Write LaTeX.",
+        }
+        with mock.patch.object(
+            self.server.app, "start_algorithmic"
+        ) as start:
+            response, _ = self.post("/algorithmic", values)
+        self.assertEqual(response.status, 200)
+        options = start.call_args.kwargs
+        self.assertEqual(options["model_of_computation"], "word-RAM")
+        self.assertEqual(options["problem_description"], "Sort integers.")
+        self.assertEqual(options["goal"], "Prove O(n log n).")
+        self.assertEqual(options["critic_rounds"], 5)
+        self.assertEqual(options["author_model"], "gpt-5.6-terra")
+        self.assertEqual(options["critic_effort"], "max")
+        self.assertEqual(options["author_prompt"], "Solve [STATEMENT].")
+
+    def test_algorithmic_endpoint_rejects_a_missing_field(self):
+        response, body = self.post("/algorithmic", {
+            "modelOfComputation": "word-RAM",
+            "problemDescription": "",
+            "goal": "Prove O(n log n).",
+        })
+        self.assertEqual(response.status, 400)
+        self.assertIn("problem description", json.loads(body)["error"])
 
     def test_review_rejects_an_unknown_model(self):
         response, body = self.post("/review", {
