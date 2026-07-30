@@ -5,7 +5,6 @@ statement or a structured algorithmic problem into a persistent Codex proof
 search, independently audits and repairs the candidate, then produces clean
 LaTeX.
 
-Compared with more complex harnesses such as [ProofCouncil](https://arxiv.org/pdf/2607.09474) and [Danus](https://arxiv.org/pdf/2607.06447), TCS Prover is designed to be lightweight, cost-friendly, and tailored to GPT-5.6 and theoretical computer science. Every component in its workflow has a specific, evidence-supported purpose. New components are welcome, but should be justified by evidence to avoid unnecessary heuristic complexity and cost. Suggestions and feedback are encouraged—please contact the project maintainer.
 
 ## Install and run
 
@@ -76,15 +75,8 @@ the corresponding field. Restart the local server after editing a catalog.
 
 ### 2. Proof author
 
-The author uses the durable-state, multi-agent prompt adapted from
-[Chao Xu's “AI Agents for the Working Mathematician”](https://chaoxu.prof/posts/2026-07-18-ai-agents-for-the-working-mathematician.html).
-Thanks to Chao Xu for publishing it. His prompt in turn credits OpenAI's
-[Cycle Double Cover prompt](https://cdn.openai.com/pdf/04d1d1e4-bc75-476a-97cf-49055cd98d31/cdc_prompt.pdf)
-and [Danus](https://github.com/frenzymath/Danus).
-
-There is not yet controlled evidence that this prompt is better than the CDC
-prompt. However, there are several personal cases where a carefully crafted prompt run succeeded after
-one-shot ChatGPT attempts did not, so at least it is better than nothing.
+The author uses the durable-state, multi-agent prompt adapted from OpenAI's
+[Cycle Double Cover prompt](https://cdn.openai.com/pdf/04d1d1e4-bc75-476a-97cf-49055cd98d31/cdc_prompt.pdf).
 
 The author keeps the Goal active: a blocked or prematurely ended author turn is
 continued until it returns a solution or reaches the user-set time limit.
