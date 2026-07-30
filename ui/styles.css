@@ -541,6 +541,10 @@ textarea:focus, input:focus, select:focus {
   border-radius: 8px;
   outline: 0;
 }
+#speedMode {
+  width: min(100%, 260px);
+  background: #fcfcfb;
+}
 .model-setting select { width: min(100%, 260px); background: #fcfcfb; }
 .model-setting .effort-label {
   margin-top: 10px;

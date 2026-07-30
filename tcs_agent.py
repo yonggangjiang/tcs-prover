@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parent
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 MODEL, EFFORT = "gpt-5.6-sol", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
-SERVICE_TIER = "fast"
+SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
+# Kept as the default-tier name for older callers and trace consumers.
+SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 
 # Every role defaults to Sol and Ultra; both choices are configurable.
@@ -31,7 +33,7 @@ REVIEW_EFFORT = EFFORT
 MARKER, TEMPLATE = "[STATEMENT]", ROOT / "prompt.txt"
 GOAL = "Complete the task supplied in the first turn and continue until done."
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
-DEFAULT_AUTHOR_HOURS, MAX_AUTHOR_HOURS = 8, 168
+DEFAULT_AUTHOR_HOURS, MAX_AUTHOR_HOURS = 24, 168
 INTERRUPT_GRACE_SECONDS = 30
 SUMMARY_GRACE_SECONDS = 300
 CONTINUE_PROMPT = """
@@ -175,6 +177,23 @@ def chosen_effort(value):
     return value
 
 
+def chosen_speed(value):
+    """Require Standard or OpenAI's 1.5x Fast mode."""
+
+    if value not in SPEEDS:
+        raise Error("Choose Standard or Fast speed.")
+    return value
+
+
+def speed_arguments(speed):
+    """Return explicit Codex flags for one selected speed mode."""
+
+    speed = chosen_speed(speed)
+    if speed == "fast":
+        return ["-c", 'service_tier="fast"', "--enable", "fast_mode"]
+    return ["--disable", "fast_mode"]
+
+
 def prompt_file(path, default):
     """Read an optional per-job prompt, or use the built-in default."""
 
@@ -265,13 +284,16 @@ def review_prompt(draft, feedback="", instructions=REVIEW_PROMPT):
     return f"{instructions}\n\nDRAFT:\n{text(draft)}"
 
 
-def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
+def structured(
+    prompt, schema_value, stage, model=MODEL, effort=EFFORT,
+    speed=DEFAULT_SPEED,
+):
     """Run one read-only structured Codex call and relay its visible events."""
 
     emit(
         "request", stage, label=f"Exact {stage} input", text=prompt,
         model=model, reasoningEffort=effort, reasoningSummary="detailed",
-        serviceTier=SERVICE_TIER,
+        serviceTier=chosen_speed(speed),
         responseSchema=schema_value,
     )
     with tempfile.TemporaryDirectory() as folder:
@@ -281,7 +303,7 @@ def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         command = [
             codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
-            "-c", f'service_tier="{SERVICE_TIER}"', "--enable", "fast_mode",
+            *speed_arguments(speed),
             "-c", 'model_reasoning_summary="detailed"',
             *(["--enable", "multi_agent"] if stage == "critic" else []),
             "-C", str(folder), "-s", "read-only", "-a", "never", "exec",
@@ -317,7 +339,7 @@ def structured(prompt, schema_value, stage, model=MODEL, effort=EFFORT):
 
 def review(
     draft, feedback="", model=REVIEW_MODEL, effort=REVIEW_EFFORT,
-    instructions=REVIEW_PROMPT,
+    instructions=REVIEW_PROMPT, speed=DEFAULT_SPEED,
 ):
     """Review with the user's chosen model."""
 
@@ -326,7 +348,7 @@ def review(
         effort = chosen_effort(effort)
         report, raw = structured(
             review_prompt(draft, feedback, instructions), SCHEMA, "review",
-            model=model, effort=effort,
+            model=model, effort=effort, speed=speed,
         )
         report = {
             "statement": text(report["statement"]),
@@ -355,7 +377,7 @@ def make_prompt(statement, template=None):
 
 def criticize(
     statement, solution, round_number, model=CRITIC_MODEL, effort=EFFORT,
-    instructions=CRITIC_PROMPT,
+    instructions=CRITIC_PROMPT, speed=DEFAULT_SPEED,
 ):
     """Have independent auditors guide one critic repair attempt."""
 
@@ -365,7 +387,7 @@ def criticize(
     )
     report, raw = structured(
         prompt, CRITIC_SCHEMA, "critic", model=chosen_model(model),
-        effort=chosen_effort(effort),
+        effort=chosen_effort(effort), speed=speed,
     )
     checks = report.get("checks")
     if (
@@ -420,7 +442,7 @@ CRITIC BUGS:
 
 def finalize(
     statement, solution, model=WRITER_MODEL, effort=EFFORT,
-    instructions=FINAL_PROMPT,
+    instructions=FINAL_PROMPT, speed=DEFAULT_SPEED,
 ):
     """Use a fresh final editor to turn the latest solution into LaTeX."""
 
@@ -430,7 +452,7 @@ def finalize(
     )
     report, raw = structured(
         prompt, FINAL_SCHEMA, "final", model=chosen_model(model),
-        effort=chosen_effort(effort),
+        effort=chosen_effort(effort), speed=speed,
     )
     try:
         latex = text(report["latex"])
@@ -506,6 +528,7 @@ def run_goal(
     writer_model=WRITER_MODEL, effort=EFFORT,
     author_effort=None, critic_effort=None, writer_effort=None,
     critic_prompt=CRITIC_PROMPT, final_prompt=FINAL_PROMPT,
+    speed=DEFAULT_SPEED,
 ):
     """Solve, require a clean critic pass, then LaTeX-edit the result."""
 
@@ -517,20 +540,18 @@ def run_goal(
     author_effort = chosen_effort(author_effort or effort)
     critic_effort = chosen_effort(critic_effort or effort)
     writer_effort = chosen_effort(writer_effort or effort)
+    speed = chosen_speed(speed)
     emit(
         "request", "solve", label="Exact solve input", text=prompt,
         model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
-        serviceTier=SERVICE_TIER,
+        serviceTier=speed,
     )
     emit(
         "request", "solve", label="Goal continuation instruction", text=GOAL,
         model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
-        serviceTier=SERVICE_TIER,
+        serviceTier=speed,
     )
-    command = [
-        codex(), "app-server", "--enable", "goals", "--enable", "fast_mode",
-        "-c", f'service_tier="{SERVICE_TIER}"',
-    ]
+    command = [codex(), "app-server", "--enable", "goals", *speed_arguments(speed)]
     process = subprocess.Popen(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
@@ -575,8 +596,8 @@ def run_goal(
             "config": {
                 "model_reasoning_effort": author_effort,
                 "model_reasoning_summary": "detailed",
-                "service_tier": SERVICE_TIER,
-                "features": {"fast_mode": True},
+                **({"service_tier": "fast"} if speed == "fast" else {}),
+                "features": {"fast_mode": speed == "fast"},
             },
         })
         thread = started["thread"]["id"]
@@ -683,7 +704,7 @@ def run_goal(
                     "request", "solve", label="Author continuation",
                     text=CONTINUE_PROMPT, model=author_model,
                     reasoningEffort=author_effort,
-                    serviceTier=SERVICE_TIER,
+                    serviceTier=speed,
                     reasoningSummary="detailed",
                 )
                 # Explicit turns start while Goal mode is paused.
@@ -734,7 +755,7 @@ def run_goal(
                 "request", "failure", label="Failure summary request",
                 text=summary_prompt, model=author_model,
                 reasoningEffort=author_effort,
-                serviceTier=SERVICE_TIER,
+                serviceTier=speed,
                 reasoningSummary="detailed",
             )
             summary_stop, summary_expired = threading.Event(), threading.Event()
@@ -808,7 +829,7 @@ def run_goal(
             if critic_prompt != CRITIC_PROMPT:
                 critic_options["instructions"] = critic_prompt
             report = criticize(
-                statement, solution, round_number, **critic_options
+                statement, solution, round_number, speed=speed, **critic_options
             )
             solution = report["solution"].strip()
 
@@ -836,7 +857,7 @@ def run_goal(
                     label=f"Proof author revision {round_number}",
                     text=instruction, model=author_model,
                     reasoningEffort=author_effort,
-                    serviceTier=SERVICE_TIER,
+                    serviceTier=speed,
                     reasoningSummary="detailed",
                 )
                 rpc.call("turn/start", {
@@ -884,7 +905,7 @@ def run_goal(
         final_options = {"model": writer_model, "effort": writer_effort}
         if final_prompt != FINAL_PROMPT:
             final_options["instructions"] = final_prompt
-        return finalize(statement, solution, **final_options)
+        return finalize(statement, solution, speed=speed, **final_options)
     except KeyboardInterrupt:
         confirmed = []
         if thread:
@@ -931,6 +952,7 @@ def main():
     parser.add_argument("--author-effort", choices=EFFORTS)
     parser.add_argument("--critic-effort", choices=EFFORTS)
     parser.add_argument("--writer-effort", choices=EFFORTS)
+    parser.add_argument("--speed", choices=SPEEDS, default=DEFAULT_SPEED)
     parser.add_argument("--review-prompt-file")
     parser.add_argument("--author-prompt-file")
     parser.add_argument("--critic-prompt-file")
@@ -946,10 +968,12 @@ def main():
                 review(
                     statement, feedback, args.review_model, args.review_effort,
                     prompt_file(args.review_prompt_file, REVIEW_PROMPT),
+                    speed=args.speed,
                 )
             else:
                 review(
-                    statement, feedback, args.review_model, args.review_effort
+                    statement, feedback, args.review_model, args.review_effort,
+                    speed=args.speed,
                 )
         else:
             # The web UI appends critic rounds and author hours with NULs.
@@ -983,9 +1007,10 @@ def main():
                     final_prompt=prompt_file(
                         args.final_prompt_file, FINAL_PROMPT
                     ),
+                    speed=args.speed,
                 )
             else:
-                run_goal(*common)
+                run_goal(*common, speed=args.speed)
         return 0
     except KeyboardInterrupt:
         message = (

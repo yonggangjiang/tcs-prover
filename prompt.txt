@@ -2,71 +2,32 @@ Current task statement
 
 [STATEMENT]
 
-## Success criteria
+Assume for purposes of this task that a complete solution exists. A complete solution must resolve exactly the statement above, without additional assumptions, restrictions, or changes to the required conclusion.
 
-Partial progress does not count unless it implies exactly the resolution above. In particular, proofs for special classes, reductions to another unproved conjecture, computational verification through any fixed size, and candidate counterexamples without a complete nonexistence certificate are insufficient. If the statement above is ambiguous about what counts as an answer, ask before starting; never resolve ambiguity silently.
+Partial progress does not count unless it implies exactly the resolution above. In particular, proofs or solutions for special cases, constructions that satisfy only some of the stated requirements, variants with altered hypotheses or conclusions, reductions to another unproved conjecture or unresolved problem, computational verification through any fixed finite range, and candidate counterexamples without a complete certificate that they satisfy the hypotheses and violate the conclusion are insufficient.
 
-## Durable state — create these files before searching
+Use multiagent v2 aggressively and dynamically. You have up to 64 concurrent agents available. Do not use a fixed assignment such as "N agents for strategy X." Instead, manage the search using the following heuristics:
 
-- STATEMENT.md — the exact statement, conventions, and success criteria. Fixed for the whole run; never edit it to fit a result.
-- REGISTRY.md — one row per approach family: family name, exact claim attempted, exact remaining gap, smallest known obstruction, next decisive test, status.
-- FAILED.md — every closed route: what was tried, the exact obstruction, the evidence for it, and what would make a retry materially new.
-- PROVED.md — promoted results only, each with its status label and proof or certificate.
+- Begin with a genuinely diverse portfolio of approaches. Agents should explore substantially different formulations, invariants, reductions, algebraic viewpoints, structural inductions, decompositions, flow formulations, transition systems, embeddings, extremal arguments, and computational sanity checks.
 
-All mathematical work products land in these files, not only in conversation. After any context compaction, re-read these files before continuing; they are the memory, the conversation is not.
+- Do not tell most agents the currently favored approach. Preserve independence during early rounds so that agents do not all converge to the same attractive but incomplete reduction.
 
-## Status vocabulary — literal, never inflated
+- Maintain an explicit registry of approach families. Group agents by the mathematical idea they are using, not by superficial wording. If many agents converge to one family, redirect some of them toward underexplored formulations.
 
-Every claim carries exactly one label, with these exact meanings:
+- Do not allow one approach to dominate merely because it gives elegant reductions. A route that ends at a lemma equivalent in strength to the original statement is not close to completion unless it supplies a genuinely new proof of that lemma.
 
-- candidate — produced by an agent; no checks yet.
-- self-audited — re-checked only by its own author or context. For building on, this counts the same as candidate.
-- verifier-backed — survived both steps of the verification cadence below: a hostile audit by a fresh agent that tried to refute it, and an independent end-to-end reconstruction by an agent that never saw the proof.
-- promoted — verifier-backed and recorded in PROVED.md; later work may cite it, and anything built on it carries at most this label.
-- independently audited — additionally checked from outside the producing model family: a different-family model or a human. Present final answers at this label when possible.
+- When an approach stalls at a theorem-strength missing lemma, mark that route as blocked. Only continue assigning agents to it if someone proposes a materially new mechanism, invariant, or construction.
 
-If no different-family model is available in this environment, do not simulate independence with another instance of the same family — that is label inflation. Instead deliver the final answer at promoted status, state prominently that the cross-family audit has not run, and list the specific claims an outside model or human referee should check first, in order of risk.
+- Keep several incompatible proof or solution routes alive through multiple rounds. Cross-pollinate ideas only after independent agents have developed them far enough to expose their real strengths and gaps.
 
-A claim's label only advances through the verification steps below. A later argument never inherits more certainty than its weakest premise's label. Never call a mismatched case, a global compatibility assertion, or a polynomial recurrence "routine" — those are where proofs hide their hard step.
+- Use adversarial agents throughout: every candidate proof or solution must be checked against the exact definitions, hypotheses, quantifiers, multiplicities, and conclusion in the statement; against repeated objects or structures being mistaken for objects satisfying stricter definitions; against degenerate, minimal, disconnected, decomposable, singular, or boundary cases permitted by the statement; against assumptions introduced or violated by reductions; and against circular use of an equivalent form of the statement.
 
-## Orchestration
+- Require agents to return concrete lemmas, constructions, equations, or counterexamples to proposed sublemmas. Reject status reports, vague optimism, and claims that an unproved global compatibility statement is "routine."
 
-Use subagents aggressively and dynamically, at most 6 concurrent. Work in waves: agents push the frontier, then fresh agents verify what came back. Do not use a fixed assignment such as "N agents for strategy X."
+- The root agent should repeatedly synthesize, challenge, redirect, and launch new rounds. Do not stop after the first wave fails. Produce a complete solution if one survives audit; otherwise report only the strongest rigorously proved derivation and its exact remaining gap.
 
-- Begin with a genuinely diverse portfolio: substantially different formulations, invariants, reductions, algebraic viewpoints, structural inductions, decompositions, embeddings, extremal arguments.
-- Do not tell most agents the currently favored approach; preserve independence during early rounds so they do not converge on the same attractive but incomplete reduction. Agents may be assigned a direction, but never shown another agent's partial proof of it.
-- Group approaches in REGISTRY.md by the mathematical mechanism and by their terminal missing lemma, not by terminology. If several agents converge to one family, redirect the surplus toward underexplored formulations.
-- A route that ends at a missing lemma as strong as the original conjecture is blocked, not "one lemma away." Record it in FAILED.md. Reopen a blocked route only for a materially new mechanism, invariant, or construction, and say in REGISTRY.md what is new.
-- Before starting any route, check FAILED.md and state either: "no close prior route" or "closest prior route is X; this differs materially because of <new lemma / source / witness / certificate / scope>."
-- Require every agent to return a proved lemma, an explicit construction, or a counterexample. Reject status reports, vague optimism, and claims that an unproved global compatibility statement is routine.
+Do not return merely because current approaches fail or agents report theorem-strength gaps. Continue launching new rounds, reopening blocked approaches only when there is a genuinely new mechanism, and searching for fresh formulations.
 
-## Stalled routes
-
-When a route stalls, classify it explicitly in REGISTRY.md as either (a) method failure or (b) evidence against the target statement. If (b), redirect part of the effort of that family to counterexample search. Every stalled route must carry one of these two classifications; "still working" is not a classification.
-
-## Verification cadence
-
-Every candidate proof gets, in order: one focused hostile audit round (a subagent instructed to refute it: find any gap, unsupported claim, quantifier slip, or misapplied citation, and be skeptical), then one independent end-to-end reconstruction by a fresh agent that has not seen the proof, working only from the statement and the claimed key ideas. Only after both does the label advance to verifier-backed. Do not re-audit after prose-only edits; re-audit only when the mathematical content changes. Final candidate results should additionally be checked by a model from a different family before being presented as the answer.
-
-## Reporting gate
-
-Report a result to me only on a significant update: a complete proof or certified counterexample; a proved lemma that removes a named dependency; a minimal obstruction that closes a route; or a strictly stronger or simpler theorem with proof. New notation, restructuring, another finite computation, or a reduction to a theorem-strength lemma is not significant and goes in the files, not in a report.
-
-## Computation rules
-
-Only write programs when essential; most work here should be proofs. When a computation is justified, it is a named finite question whose output is a small witness, certificate, or table. Never run computation through inline stdin. Every run gets a named source file, the approach-family ID it serves, a timeout, a log, and an output location, recorded in REGISTRY.md. A computation can refute a lemma or discover a certificate; it cannot prove an unbounded theorem — preserve the smallest exact certificate and then prove the resulting claim.
-
-## Web policy
+Return only when a complete solution has been found and survives adversarial audit. Do not return a reduction, partial result, isolated missing lemma, "best effort" summary, or explanation of why the problem is difficult.
 
 Public search may be used only for ordinary mathematical background or standard named theorems, not to search for a solution to this exact problem or benchmark. Do not search the public web merely to determine whether the problem is open, and do not answer that it is open.
-
-## Persistence
-
-Do not return merely because current approaches fail or agents report theorem-strength gaps. Continue launching new rounds, reopening blocked approaches only under the reopen rule above, and searching for fresh formulations. Return only when a complete affirmative resolution has survived the full verification cadence; otherwise keep FAILED.md and REGISTRY.md as the honest record and continue.
-
-
-Register this task as a persistent goal (create_goal) with the success criteria above as the completion condition, so the objective survives context compaction and session restarts. If goal tooling is unavailable, say so at the start of the run.
-
-## On stop
-
-When I end the run: apply the reporting gate to what you present. Then append to a LESSONS.md: what you learned this session that would make future runs more efficient — preferring lessons transferable to other mathematical problems, plus any environment issues that wasted time.

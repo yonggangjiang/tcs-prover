@@ -128,6 +128,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(structured.call_args.kwargs, {
             "model": agent.REVIEW_MODEL,
             "effort": agent.REVIEW_EFFORT,
+            "speed": agent.DEFAULT_SPEED,
         })
 
     def test_user_can_choose_sol_for_statement_review(self):
@@ -139,6 +140,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(structured.call_args.kwargs, {
             "model": "gpt-5.6-sol",
             "effort": agent.REVIEW_EFFORT,
+            "speed": agent.DEFAULT_SPEED,
         })
 
     def test_user_can_choose_luna_for_statement_review(self):
@@ -158,6 +160,7 @@ class AgentTests(unittest.TestCase):
             agent.review("Draft", model="gpt-5.6-sol", effort="high")
         self.assertEqual(structured.call_args.kwargs, {
             "model": "gpt-5.6-sol", "effort": "high",
+            "speed": agent.DEFAULT_SPEED,
         })
 
     def test_unknown_review_model_is_rejected_before_codex_runs(self):
@@ -219,7 +222,8 @@ class AgentTests(unittest.TestCase):
         ), mock.patch.object(agent, "review") as review:
             self.assertEqual(agent.main(), 0)
         review.assert_called_once_with(
-            "claim", "clarify it", agent.REVIEW_MODEL, agent.REVIEW_EFFORT
+            "claim", "clarify it", agent.REVIEW_MODEL, agent.REVIEW_EFFORT,
+            speed=agent.DEFAULT_SPEED,
         )
 
     def test_main_sends_the_ui_critic_limit_to_the_goal(self):
@@ -232,7 +236,7 @@ class AgentTests(unittest.TestCase):
         run_goal.assert_called_once_with(
             "FULL", "claim", "7", agent.DEFAULT_AUTHOR_HOURS,
             agent.AUTHOR_MODEL, agent.CRITIC_MODEL, agent.WRITER_MODEL,
-            agent.EFFORT,
+            agent.EFFORT, speed=agent.DEFAULT_SPEED,
         )
 
     def test_main_sends_the_ui_author_limit_to_the_goal(self):
@@ -245,7 +249,7 @@ class AgentTests(unittest.TestCase):
         run_goal.assert_called_once_with(
             "FULL", "claim", "7", "1.5",
             agent.AUTHOR_MODEL, agent.CRITIC_MODEL, agent.WRITER_MODEL,
-            agent.EFFORT,
+            agent.EFFORT, speed=agent.DEFAULT_SPEED,
         )
 
     def test_main_sends_each_selected_proof_model_to_the_goal(self):
@@ -265,7 +269,7 @@ class AgentTests(unittest.TestCase):
             "FULL", "claim", agent.DEFAULT_CRITIC_ROUNDS,
             agent.DEFAULT_AUTHOR_HOURS,
             "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol",
-            agent.EFFORT,
+            agent.EFFORT, speed=agent.DEFAULT_SPEED,
         )
 
     def test_main_sends_the_selected_reasoning_effort_to_every_role(self):
@@ -277,6 +281,27 @@ class AgentTests(unittest.TestCase):
         ), mock.patch.object(agent, "run_goal") as run_goal:
             self.assertEqual(agent.main(), 0)
         self.assertEqual(run_goal.call_args.args[-1], "high")
+
+    def test_main_sends_standard_speed_to_the_goal(self):
+        argv = ["tcs_agent.py", "solve", "--speed", "standard"]
+        with mock.patch("sys.argv", argv), mock.patch(
+            "sys.stdin", io.StringIO("claim")
+        ), mock.patch.object(
+            agent, "make_prompt", return_value="FULL"
+        ), mock.patch.object(agent, "run_goal") as run_goal:
+            self.assertEqual(agent.main(), 0)
+        self.assertEqual(run_goal.call_args.kwargs["speed"], "standard")
+
+    def test_speed_arguments_switch_fast_mode_explicitly(self):
+        self.assertEqual(
+            agent.speed_arguments("fast"),
+            ["-c", 'service_tier="fast"', "--enable", "fast_mode"],
+        )
+        self.assertEqual(
+            agent.speed_arguments("standard"), ["--disable", "fast_mode"]
+        )
+        with self.assertRaises(agent.Error):
+            agent.speed_arguments("turbo")
 
     def test_main_sends_independent_efforts_and_custom_prompts(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -313,8 +338,8 @@ class AgentTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(agent.Error):
                 agent.critic_limit(value)
 
-    def test_author_limit_defaults_to_eight_hours_and_is_bounded(self):
-        self.assertEqual(agent.author_hours(agent.DEFAULT_AUTHOR_HOURS), 8)
+    def test_author_limit_defaults_to_twenty_four_hours_and_is_bounded(self):
+        self.assertEqual(agent.author_hours(agent.DEFAULT_AUTHOR_HOURS), 24)
         for value in (0, 169, "not-a-number"):
             with self.subTest(value=value), self.assertRaises(agent.Error):
                 agent.author_hours(value)
@@ -646,7 +671,7 @@ class AgentTests(unittest.TestCase):
         )
         finalize.assert_called_once_with(
             "STATEMENT", "Critic-corrected solution", model=agent.WRITER_MODEL,
-            effort=agent.EFFORT,
+            effort=agent.EFFORT, speed=agent.DEFAULT_SPEED,
         )
         calls = rpc.calls
         methods = [method for method, _ in calls]
@@ -780,6 +805,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(structured.call_args.kwargs, {
             "model": agent.CRITIC_MODEL,
             "effort": "ultra",
+            "speed": agent.DEFAULT_SPEED,
         })
 
     def test_critic_can_fix_minor_bugs_before_the_next_round(self):
@@ -830,6 +856,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(structured.call_args.kwargs, {
             "model": "gpt-5.6-terra",
             "effort": "ultra",
+            "speed": agent.DEFAULT_SPEED,
         })
         record = json.loads(output.getvalue())
         self.assertEqual(record["kind"], "final_result")

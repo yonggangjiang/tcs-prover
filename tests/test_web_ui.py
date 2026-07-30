@@ -13,6 +13,8 @@ from unittest import mock
 
 import web_ui
 
+REAL_GRANT_WINDOWS_ACCESS = web_ui.grant_windows_access
+
 
 class AppTests(unittest.TestCase):
     """Check that approval uses the server-stored review."""
@@ -20,6 +22,9 @@ class AppTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.trace = Path(self.folder.name) / "transcript.jsonl"
+        self.access_patcher = mock.patch.object(web_ui, "grant_windows_access")
+        self.access = self.access_patcher.start()
+        self.addCleanup(self.access_patcher.stop)
 
     def tearDown(self):
         self.folder.cleanup()
@@ -36,7 +41,7 @@ class AppTests(unittest.TestCase):
                 (web_ui.ALGORITHMIC / filename).read_text(encoding="utf-8")
             )
             self.assertEqual(raw, presets)
-            self.assertGreaterEqual(len(presets), 3)
+            self.assertTrue(presets)
             self.assertEqual(len({entry["name"] for entry in presets}), len(presets))
             for entry in presets:
                 self.assertEqual(set(entry), {"name", "description"})
@@ -100,6 +105,7 @@ class AppTests(unittest.TestCase):
                 writer_model="gpt-5.6-sol",
                 author_effort="high", critic_effort="max",
                 writer_effort="medium",
+                speed_mode="standard",
             )
         statement = web_ui.algorithmic_statement(
             "word-RAM", "Sort n integers.", "Prove O(n log n)."
@@ -107,9 +113,11 @@ class AppTests(unittest.TestCase):
         review.assert_not_called()
         process.stdin.write.assert_called_once_with(f"{statement}\0{6}\0{1.5}")
         process.stdin.close.assert_called_once()
-        thread.assert_called_once_with(
-            target=app._read_output, args=(process,), daemon=True
-        )
+        self.assertIs(thread.call_args.kwargs["target"].__self__, app)
+        self.assertEqual(thread.call_args.kwargs["target"].__func__, app._read_output.__func__)
+        self.assertIs(thread.call_args.kwargs["args"][0], process)
+        self.assertIs(thread.call_args.kwargs["args"][1], app.active_token)
+        self.assertTrue(thread.call_args.kwargs["daemon"])
         thread.return_value.start.assert_called_once()
         state = app.snapshot()
         self.assertEqual(state["phase"], "running")
@@ -123,6 +131,9 @@ class AppTests(unittest.TestCase):
         self.assertNotIn("statement_reviewer", state["workflow"]["nodes"])
         self.assertEqual(state["authorModel"], "gpt-5.6-terra")
         self.assertEqual(state["criticEffort"], "max")
+        self.assertEqual(state["speedMode"], "standard")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--speed") + 1], "standard")
         self.assertEqual(
             (app.run_dir / "algorithmic-problem.md").read_text(encoding="utf-8"),
             statement + "\n",
@@ -146,17 +157,20 @@ class AppTests(unittest.TestCase):
             app.start_review("draft", "clarify it", 7)
         self.assertEqual(app.snapshot()["phase"], "reviewing")
         self.assertEqual(app.snapshot()["criticRounds"], 7)
-        self.assertEqual(app.snapshot()["thinkingHours"], 8)
+        self.assertEqual(app.snapshot()["thinkingHours"], 24)
+        self.assertEqual(app.snapshot()["speedMode"], "fast")
         self.assertEqual(app.snapshot()["authorModel"], "gpt-5.6-sol")
         self.assertEqual(app.snapshot()["criticModel"], "gpt-5.6-sol")
         self.assertEqual(app.snapshot()["writerModel"], "gpt-5.6-sol")
+        args = thread.call_args.kwargs["args"]
         self.assertEqual(
-            thread.call_args.kwargs["args"],
+            args[:4],
             (
                 "draft", "clarify it", web_ui.DEFAULT_REVIEW_MODEL,
                 web_ui.DEFAULT_REASONING_EFFORT,
             ),
         )
+        self.assertIs(args[4], app.active_token)
         thread.return_value.start.assert_called_once()
 
     def test_each_role_effort_and_prompt_is_saved_for_the_job(self):
@@ -194,10 +208,42 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app.run_dir.parent, runs)
         self.assertEqual(app.trace_file, app.run_dir / "transcript.jsonl")
         self.assertIn("Shortest paths", (app.run_dir / "draft.md").read_text())
-        self.assertEqual(stat.S_IMODE(app.run_dir.stat().st_mode), 0o700)
+        if web_ui.os.name != "nt":
+            self.assertEqual(stat.S_IMODE(app.run_dir.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE((app.run_dir / "draft.md").stat().st_mode), 0o600
+            )
+
+    def test_windows_runs_parent_allows_traversal_without_inheriting_access(self):
+        runs = Path(self.folder.name) / "runs"
+        with mock.patch.object(web_ui.os, "name", "nt"), mock.patch.object(
+            web_ui, "current_windows_account", return_value="DOMAIN\\user"
+        ):
+            web_ui.prepare_runs_directory(runs)
+        self.assertTrue(runs.is_dir())
         self.assertEqual(
-            stat.S_IMODE((app.run_dir / "draft.md").stat().st_mode), 0o600
+            self.access.call_args_list,
+            [
+                mock.call(runs, "DOMAIN\\user", "(OI)(CI)(F)"),
+                mock.call(runs, web_ui.WINDOWS_EVERYONE_SID, "(RX)"),
+            ],
         )
+        parent_permission = self.access.call_args_list[-1].args[-1]
+        self.assertNotIn("(OI)", parent_permission)
+        self.assertNotIn("(CI)", parent_permission)
+
+    def test_windows_acl_command_is_explicit_and_noninteractive(self):
+        completed = SimpleNamespace(returncode=0, stderr="")
+        path = Path("runs")
+        with mock.patch.object(
+            web_ui.subprocess, "run", return_value=completed
+        ) as run:
+            REAL_GRANT_WINDOWS_ACCESS(path, "DOMAIN\\user", "(RX)")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["icacls", str(path), "/grant:r", "DOMAIN\\user:(RX)"],
+        )
+        self.assertFalse(run.call_args.kwargs["check"])
 
     def test_feedback_retry_stays_in_the_same_problem_folder(self):
         runs = Path(self.folder.name) / "runs"
@@ -236,6 +282,7 @@ class AppTests(unittest.TestCase):
     def test_stop_before_review_attaches_preserves_visible_output(self):
         app = self.app()
         app.state["phase"] = "reviewing"
+        token = app.active_token = object()
         record = {
             "kind": "codex_event",
             "event": {
@@ -248,7 +295,6 @@ class AppTests(unittest.TestCase):
             stdout=io.StringIO(json.dumps(record) + "\n"),
             wait=mock.Mock(return_value=130),
             poll=mock.Mock(return_value=130),
-            send_signal=mock.Mock(),
         )
 
         def attach_after_stop(*_, **__):
@@ -257,11 +303,11 @@ class AppTests(unittest.TestCase):
 
         with mock.patch.object(
             web_ui.subprocess, "Popen", side_effect=attach_after_stop
-        ):
-            app._review("draft")
-        process.send_signal.assert_called_once_with(web_ui.signal.SIGINT)
+        ), mock.patch.object(web_ui, "stop_process_tree") as stop_tree:
+            app._review("draft", token=token)
+        self.assertEqual(stop_tree.call_args_list, [mock.call(None), mock.call(process)])
         self.assertEqual(app.snapshot()["phase"], "done")
-        self.assertIn("Checked corner cases.", app.snapshot()["output"])
+        self.assertEqual(app.snapshot()["error"], "Stopped.")
 
     def test_review_reaps_a_child_after_broken_stdin(self):
         app = self.app()
@@ -270,20 +316,41 @@ class AppTests(unittest.TestCase):
         process.stdin.write.side_effect = BrokenPipeError("closed")
         process.poll.return_value = None
         process.wait.return_value = 130
-        with mock.patch.object(web_ui.subprocess, "Popen", return_value=process):
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ), mock.patch.object(web_ui, "stop_process_tree") as stop_tree:
             app._review("draft")
-        process.terminate.assert_called_once()
-        process.wait.assert_called_once_with(timeout=2)
+        stop_tree.assert_called_once_with(process)
         self.assertEqual(app.snapshot()["phase"], "input")
 
     def test_stop_is_safe_to_click_twice(self):
         app = self.app()
         process = mock.Mock()
         app.state["phase"], app.process = "running", process
-        app.stop()
-        app.stop()
-        process.send_signal.assert_called_once_with(web_ui.signal.SIGINT)
-        self.assertEqual(app.snapshot()["phase"], "stopping")
+        with mock.patch.object(web_ui, "stop_process_tree") as stop_tree:
+            app.stop()
+            app.stop()
+        stop_tree.assert_called_once_with(process)
+        self.assertEqual(app.snapshot()["phase"], "done")
+        self.assertEqual(app.snapshot()["error"], "Stopped.")
+
+    def test_windows_stop_force_kills_the_complete_process_tree(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = None
+        process.wait.return_value = 1
+        with mock.patch.object(web_ui.os, "name", "nt"), mock.patch.object(
+            web_ui.subprocess, "run"
+        ) as run:
+            web_ui.stop_process_tree(process)
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            stdin=web_ui.subprocess.DEVNULL,
+            stdout=web_ui.subprocess.DEVNULL,
+            stderr=web_ui.subprocess.DEVNULL,
+            timeout=web_ui.STOP_TIMEOUT_SECONDS,
+            check=False,
+        )
+        process.wait.assert_called_once_with(timeout=web_ui.STOP_TIMEOUT_SECONDS)
 
     def test_solver_receives_the_reviewed_statement_and_critic_limit(self):
         app = self.app()
@@ -300,7 +367,7 @@ class AppTests(unittest.TestCase):
             web_ui.subprocess, "Popen", return_value=process
         ) as popen, mock.patch.object(web_ui.threading, "Thread"):
             app.approve()
-        process.stdin.write.assert_called_once_with("Rigorous\0" + "7\0" + "8")
+        process.stdin.write.assert_called_once_with("Rigorous\0" + "7\0" + "24")
         command = popen.call_args.args[0]
         self.assertEqual(
             command[command.index("--author-model") + 1], "gpt-5.6-sol"
@@ -314,6 +381,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--reasoning-effort") + 1], "ultra"
         )
+        self.assertEqual(command[command.index("--speed") + 1], "fast")
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertEqual(popen.call_args.kwargs["cwd"], self.trace.parent)
@@ -329,11 +397,10 @@ class AppTests(unittest.TestCase):
         process.poll.return_value = None
         with mock.patch.object(
             web_ui.subprocess, "Popen", return_value=process
-        ):
+        ), mock.patch.object(web_ui, "stop_process_tree") as stop_tree:
             with self.assertRaises(BrokenPipeError):
                 app.approve()
-        process.terminate.assert_called_once()
-        process.wait.assert_called_once_with(timeout=2)
+        stop_tree.assert_called_once_with(process)
         self.assertIsNone(app.process)
         self.assertEqual(app.snapshot()["phase"], "reviewed")
 
@@ -391,7 +458,7 @@ class AppTests(unittest.TestCase):
         ), mock.patch.object(web_ui.threading, "Thread"):
             app.approve("  Author's final version  ")
         process.stdin.write.assert_called_once_with(
-            "Author's final version\0" + "4\0" + "8"
+            "Author's final version\0" + "4\0" + "24"
         )
         self.assertEqual(
             app.snapshot()["review"]["statement"], "Author's final version"
@@ -435,8 +502,9 @@ class AppTests(unittest.TestCase):
     def test_transcript_is_private_and_recovers_before_a_bad_tail(self):
         app = self.app()
         app.add_trace({"kind": "status", "stage": "review", "text": "Kept"})
-        self.assertEqual(stat.S_IMODE(self.trace.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(self.trace.parent.stat().st_mode), 0o700)
+        if web_ui.os.name != "nt":
+            self.assertEqual(stat.S_IMODE(self.trace.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(self.trace.parent.stat().st_mode), 0o700)
         with self.trace.open("a", encoding="utf-8") as stream:
             stream.write("{unfinished\n")
         self.assertEqual(web_ui.App(self.trace).snapshot()["trace"][0]["text"], "Kept")
@@ -640,8 +708,11 @@ class HttpTests(unittest.TestCase):
         self.assertNotIn("Download all JSONL", page)
         self.assertIn('id="criticRounds"', page)
         self.assertIn('id="thinkingHours"', page)
+        self.assertIn('id="speedMode"', page)
+        self.assertIn('value="standard"', page)
+        self.assertIn('value="fast"', page)
         self.assertIn("Saved edits are reused for future jobs", page)
-        self.assertIn('value="8"', page)
+        self.assertIn('value="24"', page)
         self.assertIn('id="feedback"', page)
         self.assertIn('id="workflowNodes"', page)
         self.assertIn('id="timelineList"', page)
@@ -709,6 +780,8 @@ class HttpTests(unittest.TestCase):
         self.assertIn(".algorithmic-fields", styles)
         self.assertIn(".preset-options", styles)
         self.assertIn(".preset-option.selected", styles)
+        self.assertIn("#speedMode", styles)
+        self.assertIn("width: min(100%, 260px)", styles)
 
     def test_state_starts_at_input(self):
         response, body = self.get("/state")
@@ -717,7 +790,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(state["phase"], "input")
         self.assertEqual(state["problemMode"], "statement")
         self.assertEqual(state["criticRounds"], 4)
-        self.assertEqual(state["thinkingHours"], 8)
+        self.assertEqual(state["thinkingHours"], 24)
+        self.assertEqual(state["speedMode"], "fast")
         self.assertEqual(state["reviewModel"], "gpt-5.6-sol")
         self.assertEqual(state["authorModel"], "gpt-5.6-sol")
         self.assertEqual(state["criticModel"], "gpt-5.6-sol")
@@ -773,7 +847,7 @@ class HttpTests(unittest.TestCase):
         start.assert_called_once_with(
             "draft", "clarify", 6, "gpt-5.6-sol", 1.5,
             "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol",
-            "high",
+            "high", speed_mode="fast",
         )
 
     def test_review_endpoint_forwards_role_efforts_and_prompts(self):
@@ -807,6 +881,7 @@ class HttpTests(unittest.TestCase):
             "writerEffort": "medium",
             "authorPrompt": "Solve [STATEMENT].",
             "criticPrompt": "Audit it.", "finalPrompt": "Write LaTeX.",
+            "speedMode": "standard",
         }
         with mock.patch.object(
             self.server.app, "start_algorithmic"
@@ -821,6 +896,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(options["author_model"], "gpt-5.6-terra")
         self.assertEqual(options["critic_effort"], "max")
         self.assertEqual(options["author_prompt"], "Solve [STATEMENT].")
+        self.assertEqual(options["speed_mode"], "standard")
 
     def test_algorithmic_endpoint_rejects_a_missing_field(self):
         response, body = self.post("/algorithmic", {
@@ -852,6 +928,13 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(response.status, 400)
         self.assertIn("reasoning effort", json.loads(body)["error"])
 
+    def test_review_rejects_an_unknown_speed(self):
+        response, body = self.post("/review", {
+            "statement": "draft", "speedMode": "turbo",
+        })
+        self.assertEqual(response.status, 400)
+        self.assertIn("Standard or Fast", json.loads(body)["error"])
+
     def test_review_rejects_an_invalid_critic_limit(self):
         response, body = self.post("/review", {
             "statement": "draft", "criticRounds": 0,
@@ -870,7 +953,9 @@ class HttpTests(unittest.TestCase):
         self.server.app.state["phase"] = "reviewing"
         response, body = self.post("/stop", {})
         self.assertEqual(response.status, 200)
-        self.assertEqual(json.loads(body)["phase"], "stopping")
+        state = json.loads(body)
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual(state["error"], "Stopped.")
 
     def test_state_rejects_a_request_without_the_launch_session(self):
         other = http.client.HTTPConnection(

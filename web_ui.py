@@ -3,7 +3,9 @@
 
 import argparse
 import errno
+import getpass
 import json
+import os
 import re
 import signal
 import secrets
@@ -28,12 +30,109 @@ RUNS = ROOT / "runs"
 ALGORITHMIC = ROOT / "algorithmic"
 HOST, PORT = "127.0.0.1", 8765
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
-DEFAULT_THINKING_HOURS, MAX_THINKING_HOURS = 8, 168
+DEFAULT_THINKING_HOURS, MAX_THINKING_HOURS = 24, 168
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+SPEEDS, DEFAULT_SPEED = tcs_agent.SPEEDS, tcs_agent.DEFAULT_SPEED
 DEFAULT_REVIEW_MODEL = "gpt-5.6-sol"
 DEFAULT_AUTHOR_MODEL = DEFAULT_CRITIC_MODEL = DEFAULT_WRITER_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "ultra"
+STOP_TIMEOUT_SECONDS = 2
+WINDOWS_EVERYONE_SID = "*S-1-1-0"
+
+
+def isolated_process_options():
+    """Put each Codex wrapper in a group that can be stopped as one unit."""
+
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def stop_process_tree(process):
+    """Force-stop one Codex wrapper and every process it launched."""
+
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        # Popen.terminate() only kills the Python wrapper on Windows. taskkill /T
+        # also stops its Codex app-server, MCP helpers, and delegated agents.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=STOP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # This fallback is only for a failed platform tree-stop operation.
+        process.kill()
+        process.wait()
+
+
+def grant_windows_access(path, identity, permissions):
+    """Add one explicit Windows ACL entry and surface configuration failures."""
+
+    result = subprocess.run(
+        ["icacls", str(path), "/grant:r", f"{identity}:{permissions}"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or "icacls failed").strip()
+        raise OSError(f"Cannot prepare the runs directory for Codex: {detail}")
+
+
+def current_windows_account():
+    """Return the account name accepted by icacls for the server process."""
+
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN")
+    return f"{domain}\\{user}" if domain else user
+
+
+def prepare_private_directory(path):
+    """Create a private directory that still works with a restricted token."""
+
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    if os.name == "nt":
+        # OWNER RIGHTS alone is insufficient for Windows restricted-token
+        # access checks; retain a concrete allow entry for the signed-in user.
+        grant_windows_access(
+            path, current_windows_account(), "(OI)(CI)(F)"
+        )
+
+
+def prepare_runs_directory(path):
+    """Keep run contents private while allowing sandbox traversal on Windows."""
+
+    prepare_private_directory(path)
+    if os.name != "nt":
+        return
+    # Each unelevated Codex session receives access to its selected run folder,
+    # but Windows must first let that sandbox identity traverse the parent.
+    # RX applies only to ``runs`` itself (no OI/CI), so other run contents keep
+    # their protected per-directory ACLs.
+    grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
 
 
 def load_algorithmic_catalog(path):
@@ -118,6 +217,8 @@ PUBLIC_GRAPH = {
         "model": "gpt-5.6-sol",
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "reasoning_efforts": list(EFFORTS),
+        "speeds": list(SPEEDS),
+        "speed": DEFAULT_SPEED,
         "review_model": DEFAULT_REVIEW_MODEL,
         "review_models": list(REVIEW_MODELS),
         "models": list(MODELS),
@@ -257,6 +358,7 @@ def empty_state(trace=None, trace_version=0):
         "writerEffort": DEFAULT_REASONING_EFFORT,
         # Kept for old clients; new clients send one effort per role.
         "reasoningEffort": DEFAULT_REASONING_EFFORT,
+        "speedMode": DEFAULT_SPEED,
         "reviewPrompt": DEFAULT_PROMPTS["review"],
         "authorPrompt": DEFAULT_PROMPTS["author"],
         "criticPrompt": DEFAULT_PROMPTS["critic"],
@@ -289,6 +391,7 @@ class App:
         self.state = empty_state(trace, total)
         self.state["runId"] = self.run_dir.name if self.run_dir else ""
         self.process = None
+        self.active_token = None
         self.lock = threading.RLock()
 
     def _latest_trace(self):
@@ -309,8 +412,7 @@ class App:
             slug = re.sub(r"[^a-z0-9]+", "-", slug_text.lower()).strip("-")
             slug = slug[:48].rstrip("-") or "problem"
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self.runs.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.runs.chmod(0o700)
+            prepare_runs_directory(self.runs)
             self.run_dir = self.runs / f"{stamp}_{slug}"
             number = 2
             while self.run_dir.exists():
@@ -318,7 +420,7 @@ class App:
                 number += 1
             self.run_dir.mkdir(mode=0o700)
             self.trace_file = self.run_dir / "transcript.jsonl"
-        self.run_dir.chmod(0o700)
+        prepare_private_directory(self.run_dir)
         self._save("draft.md", f"# Draft problem\n\n{statement}\n")
 
     def _save(self, name, content):
@@ -430,6 +532,7 @@ class App:
         author_prompt=None, critic_prompt=None, final_prompt=None,
         review_model=DEFAULT_REVIEW_MODEL, review_effort=None,
         review_prompt=None, include_review=True,
+        speed_mode=DEFAULT_SPEED,
     ):
         """Normalize and validate settings shared by both input modes."""
 
@@ -442,6 +545,7 @@ class App:
         author_effort = str(author_effort or reasoning_effort)
         critic_effort = str(critic_effort or reasoning_effort)
         writer_effort = str(writer_effort or reasoning_effort)
+        speed_mode = str(speed_mode or "")
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "final": final_prompt,
@@ -464,6 +568,8 @@ class App:
             efforts.append(review_effort)
         if any(effort not in EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
+        if speed_mode not in SPEEDS:
+            raise ValueError("Choose Standard or Fast speed.")
         required_prompts = [prompts[name] for name in ("author", "critic", "final")]
         if include_review:
             required_prompts.append(prompts["review"])
@@ -507,6 +613,7 @@ class App:
             "finalPrompt": prompts["final"],
             "criticRounds": critic_rounds,
             "thinkingHours": thinking_hours,
+            "speedMode": speed_mode,
         }
 
     def start_review(
@@ -521,6 +628,7 @@ class App:
         critic_effort=None, writer_effort=None,
         review_prompt=None, author_prompt=None,
         critic_prompt=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -542,6 +650,7 @@ class App:
             review_model=review_model,
             review_effort=review_effort,
             review_prompt=review_prompt,
+            speed_mode=speed_mode,
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -568,29 +677,26 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            token = self.active_token = object()
         threading.Thread(
             target=self._review,
             args=(
                 statement, feedback, options["reviewModel"],
-                options["reviewEffort"],
+                options["reviewEffort"], token,
             ),
             daemon=True,
         ).start()
 
     def _review(
         self, statement, feedback="", review_model=DEFAULT_REVIEW_MODEL,
-        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        reasoning_effort=DEFAULT_REASONING_EFFORT, token=None,
     ):
         """Stream the review transcript and keep its final structured result."""
 
         process, report, problem, visible = None, None, "", []
         # A stop click can arrive before this background thread starts.
         with self.lock:
-            if self.state["phase"] == "stopping":
-                self.state.update(
-                    phase="done", error="Stopped.",
-                    output="Codex was stopped before it produced a checked statement.",
-                )
+            if self.active_token is not token:
                 return
         try:
             process = subprocess.Popen(
@@ -598,24 +704,24 @@ class App:
                     sys.executable, str(ROOT / "tcs_agent.py"), "review",
                     "--review-model", review_model,
                     "--review-effort", reasoning_effort,
+                    "--speed", self.state["speedMode"],
                     "--review-prompt-file",
                     str(self.run_dir / "prompts/review.txt"),
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                 errors="replace", bufsize=1, cwd=ROOT,
+                **isolated_process_options(),
             )
             with self.lock:
-                self.process = process
-                stop_now = self.state["phase"] == "stopping"
+                stop_now = self.active_token is not token
+                if not stop_now:
+                    self.process = process
+            if stop_now:
+                stop_process_tree(process)
+                return
             process.stdin.write(statement + ("\0" + feedback if feedback else ""))
             process.stdin.close()
-            # Honor a stop that arrived while Popen was attaching.
-            if stop_now:
-                try:
-                    process.send_signal(signal.SIGINT)
-                except OSError:
-                    pass
             for line in process.stdout:
                 record = self.parse_line(line, "review")
                 self.add_trace(record)
@@ -652,15 +758,12 @@ class App:
             # Reap a child even if a quick stop breaks its stdin or transcript.
             try:
                 if process and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                    stop_process_tree(process)
             except OSError:
                 pass
         with self.lock:
+            if self.active_token is not token:
+                return
             if self.process is process:
                 self.process = None
             valid = isinstance(report, dict) and all(
@@ -686,6 +789,7 @@ class App:
     def _launch_solver_locked(self, statement):
         """Attach the existing proof pipeline; the caller holds ``self.lock``."""
 
+        token = self.active_token = object()
         process = subprocess.Popen(
             [
                 sys.executable, "-u", str(ROOT / "tcs_agent.py"), "solve",
@@ -696,6 +800,7 @@ class App:
                 "--author-effort", self.state["authorEffort"],
                 "--critic-effort", self.state["criticEffort"],
                 "--writer-effort", self.state["writerEffort"],
+                "--speed", self.state["speedMode"],
                 "--author-prompt-file",
                 str(self.run_dir / "prompts/author.txt"),
                 "--critic-prompt-file",
@@ -712,6 +817,7 @@ class App:
             bufsize=1,
             # Goal mode writes its durable proof files into this run only.
             cwd=self.run_dir,
+            **isolated_process_options(),
         )
         self.process = process
         try:
@@ -727,22 +833,19 @@ class App:
                 pass
             try:
                 if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                    stop_process_tree(process)
             except OSError:
                 pass
             if self.process is process:
                 self.process = None
+            if self.active_token is token:
+                self.active_token = None
             raise
         self.state.update(
             phase="running", stage="solve",
             activeNode="author", round=0, output="",
         )
-        return process
+        return process, token
 
     def start_algorithmic(
         self, model_of_computation, problem_description, goal,
@@ -754,6 +857,7 @@ class App:
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
         author_prompt=None, critic_prompt=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
     ):
         """Start an algorithmic task directly at the proof-author stage."""
 
@@ -778,6 +882,7 @@ class App:
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
             final_prompt=final_prompt,
+            speed_mode=speed_mode,
             include_review=False,
         )
         with self.lock:
@@ -805,9 +910,9 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
-            process = self._launch_solver_locked(statement)
+            process, token = self._launch_solver_locked(statement)
         threading.Thread(
-            target=self._read_output, args=(process,), daemon=True
+            target=self._read_output, args=(process, token), daemon=True
         ).start()
 
     def approve(self, edited_statement=None):
@@ -830,10 +935,12 @@ class App:
                     f"{self.state['review']['notes'] or 'None.'}\n\n"
                     "# Author action\n\nEdited and directly approved by the author.\n",
                 )
-            process = self._launch_solver_locked(statement)
-        threading.Thread(target=self._read_output, args=(process,), daemon=True).start()
+            process, token = self._launch_solver_locked(statement)
+        threading.Thread(
+            target=self._read_output, args=(process, token), daemon=True
+        ).start()
 
-    def _read_output(self, process):
+    def _read_output(self, process, token=None):
         """Store tagged solver events and build the visible final answer."""
 
         problem, answers, order, final = "", {}, [], False
@@ -915,11 +1022,14 @@ class App:
             code = process.wait()
         except OSError as exc:
             problem = str(exc)
-            process.terminate()
-            code = process.wait()
+            stop_process_tree(process)
+            code = process.poll()
         with self.lock:
+            if self.active_token is not token:
+                return
             stopped = self.state["phase"] == "stopping"
             self.process = None
+            self.active_token = None
             self.state["phase"] = "done"
             if stopped and code:
                 self.state["error"] = "Stopped."
@@ -944,19 +1054,26 @@ class App:
                 self.trace_file.unlink(missing_ok=True)
 
     def stop(self):
-        """Stop either Codex stage while retaining its visible output."""
+        """Immediately stop Codex and all of its descendants."""
 
         with self.lock:
-            if self.state["phase"] == "stopping":
+            if self.state["phase"] == "stopping" or (
+                self.state["phase"] == "done"
+                and self.state["error"] == "Stopped."
+            ):
                 return
             if self.state["phase"] not in {"reviewing", "running"}:
                 raise ValueError("Codex is not working.")
             process, self.state["phase"] = self.process, "stopping"
-        if process:
-            try:
-                process.send_signal(signal.SIGINT)
-            except OSError:
-                pass
+            self.active_token = None
+            self.process = None
+        stop_process_tree(process)
+        with self.lock:
+            if self.state["phase"] == "stopping":
+                self.state.update(phase="done", error="Stopped.")
+                self.state["output"] = self.state["output"] or (
+                    "Codex was stopped before it produced an answer."
+                )
 
     def reset(self):
         """Return to the first screen when no child is active."""
@@ -1003,6 +1120,7 @@ class Server(ThreadingHTTPServer):
         new_settings = any(key in body for key in (
             "reviewEffort", "authorEffort", "criticEffort", "writerEffort",
             "reviewPrompt", "authorPrompt", "criticPrompt", "finalPrompt",
+            "speedMode",
         ))
         if not new_settings:
             app.start_review(
@@ -1014,6 +1132,7 @@ class Server(ThreadingHTTPServer):
                 body.get("criticModel", DEFAULT_CRITIC_MODEL),
                 body.get("writerModel", DEFAULT_WRITER_MODEL),
                 legacy_effort,
+                speed_mode=body.get("speedMode", DEFAULT_SPEED),
             )
             with self.jobs_lock:
                 self.jobs[app.state["runId"]] = app
@@ -1037,6 +1156,7 @@ class Server(ThreadingHTTPServer):
             author_prompt=body.get("authorPrompt"),
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
+            speed_mode=body.get("speedMode", DEFAULT_SPEED),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -1068,6 +1188,7 @@ class Server(ThreadingHTTPServer):
             author_prompt=body.get("authorPrompt"),
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
+            speed_mode=body.get("speedMode", DEFAULT_SPEED),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app

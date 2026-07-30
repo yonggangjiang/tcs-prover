@@ -28,6 +28,7 @@ const ui = {
   criticEffort: $("criticEffort"), writerEffort: $("writerEffort"),
   criticRounds: $("criticRounds"),
   thinkingHours: $("thinkingHours"),
+  speedMode: $("speedMode"),
   editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
   promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
   promptEditorLabel: $("promptEditorLabel"),
@@ -285,7 +286,9 @@ function updateModelSummary() {
     .replace(/^./, (letter) => letter.toUpperCase());
   const review = selectedProblemMode() === "algorithmic" ? ""
     : `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `;
-  ui.modelSummary.textContent = review
+  const speed = ui.speedMode.value === "standard"
+    ? "Standard speed" : "Fast 1.5×";
+  ui.modelSummary.textContent = `${speed} · ` + review
     + `${name(ui.authorModel.value)}/${name(ui.authorEffort.value)} author · `
     + `${name(ui.criticModel.value)}/${name(ui.criticEffort.value)} critic · `
     + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
@@ -853,12 +856,13 @@ function render(next) {
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    ui.speedMode.value = state.speedMode || "fast";
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 4;
     ui.criticRounds.min = rounds.minimum || 1;
     ui.criticRounds.max = rounds.maximum || 100;
-    ui.thinkingHours.value = state.thinkingHours || 8;
+    ui.thinkingHours.value = state.thinkingHours || 24;
     ui.thinkingHours.min = hours.minimum || 0.01;
     ui.thinkingHours.max = hours.maximum || 168;
     setProblemMode(state.problemMode || "statement");
@@ -872,6 +876,7 @@ function render(next) {
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    ui.speedMode.value = state.speedMode || "fast";
     syncPrompts(state);
     updateModelSummary();
     ui.proposed.value = state.review.statement;
@@ -879,7 +884,7 @@ function render(next) {
     appendFormattedText(ui.notes, state.review.notes);
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 4;
-    ui.thinkingHours.value = state.thinkingHours || 8;
+    ui.thinkingHours.value = state.thinkingHours || 24;
     checkEdited();
     reviewPending = false;
   }
@@ -968,6 +973,7 @@ async function startReview(statement, feedback = "") {
       finalPrompt: promptValues.final,
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
+      speedMode: ui.speedMode.value,
     });
     if (job !== currentJob) return;
     currentJob = next.runId;
@@ -1012,6 +1018,7 @@ async function startAlgorithmic() {
       finalPrompt: promptValues.final,
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
+      speedMode: ui.speedMode.value,
     });
     currentJob = next.runId;
     history.pushState(null, "", jobUrl(currentJob));
@@ -1089,6 +1096,7 @@ ui.reviewEffort.onchange = updateModelSummary;
 ui.authorEffort.onchange = updateModelSummary;
 ui.criticEffort.onchange = updateModelSummary;
 ui.writerEffort.onchange = updateModelSummary;
+ui.speedMode.onchange = updateModelSummary;
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }

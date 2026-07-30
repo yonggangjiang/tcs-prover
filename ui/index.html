@@ -178,6 +178,16 @@
                   type="button">Edit prompts</button>
               </div>
               <div class="round-setting">
+                <label for="speedMode">Generation speed</label>
+                <select id="speedMode" aria-describedby="speedHelp">
+                  <option value="fast">Fast &mdash; 1.5&times; speed</option>
+                  <option value="standard">Standard &mdash; normal speed</option>
+                </select>
+                <p id="speedHelp" class="help">
+                  Fast is the default and uses credits at a higher rate.
+                </p>
+              </div>
+              <div class="round-setting">
                 <label for="criticRounds">Critic round limit</label>
                 <input id="criticRounds" type="number" min="1" max="100"
                   step="1" value="4" aria-describedby="roundHelp">
@@ -189,9 +199,9 @@
               <div class="round-setting">
                 <label for="thinkingHours">Author time limit (hours)</label>
                 <input id="thinkingHours" type="number" min="0.01" max="168"
-                  step="0.25" value="8" aria-describedby="timeHelp">
+                  step="0.25" value="24" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
-                  Default 8 hours. Blocked attempts continue until this limit;
+                  Default 24 hours. Blocked attempts continue until this limit;
                   then the author stops and returns a failure summary.
                 </p>
               </div>

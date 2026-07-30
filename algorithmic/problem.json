@@ -1,22 +1,6 @@
 [
   {
-    "name": "Comparison sorting",
-    "description": "Given n keys from a totally ordered universe, output all input keys in nondecreasing order, preserving multiplicities. The algorithm must be correct for every ordering and for inputs containing equal keys."
-  },
-  {
-    "name": "Static predecessor",
-    "description": "Given a static set S of n keys from the universe {0, …, 2^w - 1}, preprocess S so that a query key x returns the largest y in S with y ≤ x, or reports that no such key exists. Account separately for preprocessing time, space, and query time."
-  },
-  {
-    "name": "Single-source shortest paths",
-    "description": "Given a directed graph G = (V, E) with n vertices, m edges, nonnegative edge weights, and a source vertex s, compute the exact distance from s to every vertex, reporting infinity for unreachable vertices. State how edge weights are represented."
-  },
-  {
-    "name": "Fully dynamic connectivity",
-    "description": "Maintain an undirected graph on a fixed set of n vertices under an online sequence of edge insertions and deletions. A connectivity query for vertices u and v must report whether they are in the same connected component. Distinguish worst-case from amortized and deterministic from randomized guarantees."
-  },
-  {
-    "name": "Maximum s-t flow",
-    "description": "Given a directed graph G = (V, E), nonnegative integral edge capacities, a source s, and a sink t, compute the value and an explicit representation of a maximum feasible s-t flow. State the capacity encoding and whether arithmetic cost depends on capacity size."
+    "name": "APSP",
+    "description": "A valid instance is an explicitly encoded attributed directed graph G=(V,E,w) with |V| ≤ n, non-negative integer edge weights satisfying 0 ≤ w(e) ≤ n^c, and total encoding size O(n^2) machine words. Parallel edges, self-loops, and disconnected graphs are allowed. For u,v ∈ V, let D_G(u,v) be the minimum total weight of a directed u-to-v path, with D_G(u,v)=+∞ if no such path exists."
   }
 ]
