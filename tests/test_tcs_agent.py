@@ -74,7 +74,11 @@ class AgentTests(unittest.TestCase):
         self.assertIn(
             f'model_reasoning_effort="{agent.REVIEW_EFFORT}"', command
         )
-        self.assertIn(f'service_tier="{agent.SERVICE_TIER}"', command)
+        if agent.DEFAULT_SPEED == "fast":
+            self.assertIn('service_tier="fast"', command)
+        else:
+            self.assertNotIn('service_tier="fast"', command)
+            self.assertIn("--disable", command)
         self.assertIn("fast_mode", command)
         self.assertIn('model_reasoning_summary="detailed"', command)
         self.assertIn("--json", command)
@@ -85,7 +89,7 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(records[0]["text"].endswith("DRAFT:\ndraft"))
         self.assertEqual(records[0]["model"], agent.REVIEW_MODEL)
         self.assertEqual(records[0]["reasoningEffort"], agent.REVIEW_EFFORT)
-        self.assertEqual(records[0]["serviceTier"], "fast")
+        self.assertEqual(records[0]["serviceTier"], agent.DEFAULT_SPEED)
         self.assertEqual(records[-1]["kind"], "review_result")
 
     def test_feedback_prompt_changes_only_rewrite_to_revise(self):
@@ -291,6 +295,23 @@ class AgentTests(unittest.TestCase):
         ), mock.patch.object(agent, "run_goal") as run_goal:
             self.assertEqual(agent.main(), 0)
         self.assertEqual(run_goal.call_args.kwargs["speed"], "standard")
+
+    def test_main_can_run_only_the_final_latex_editor(self):
+        argv = [
+            "tcs_agent.py", "finalize",
+            "--writer-model", "gpt-5.6-terra",
+            "--writer-effort", "high",
+            "--speed", "standard",
+        ]
+        with mock.patch("sys.argv", argv), mock.patch(
+            "sys.stdin", io.StringIO("Theorem statement\n\nExisting proof")
+        ), mock.patch.object(agent, "polish") as polish:
+            self.assertEqual(agent.main(), 0)
+        polish.assert_called_once_with(
+            "Theorem statement\n\nExisting proof",
+            model="gpt-5.6-terra", effort="high",
+            instructions=agent.FINAL_PROMPT, speed="standard",
+        )
 
     def test_speed_arguments_switch_fast_mode_explicitly(self):
         self.assertEqual(
@@ -659,7 +680,7 @@ class AgentTests(unittest.TestCase):
         ) as criticize, mock.patch.object(
             agent, "finalize", return_value="LATEX"
         ) as finalize, mock.patch("sys.stdout", output):
-            result = agent.run_goal("FULL PROMPT", "STATEMENT", 3)
+            result = agent.run_goal("FULL PROMPT", "STATEMENT", 2)
         self.assertEqual(result, "LATEX")
         self.assertEqual(
             [call.args[1] for call in criticize.call_args_list],
@@ -668,6 +689,9 @@ class AgentTests(unittest.TestCase):
                 "Corrected solution",
                 "Critic-corrected solution",
             ],
+        )
+        self.assertEqual(
+            [call.args[2] for call in criticize.call_args_list], [1, 1, 2]
         )
         finalize.assert_called_once_with(
             "STATEMENT", "Critic-corrected solution", model=agent.WRITER_MODEL,
@@ -691,11 +715,19 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(calls[4][1]["status"], "active")
         self.assertEqual(calls[1][1]["cwd"], str(Path.cwd()))
         self.assertEqual(
-            calls[1][1]["config"]["service_tier"], agent.SERVICE_TIER
+            calls[1][1]["config"].get("service_tier"),
+            "fast" if agent.DEFAULT_SPEED == "fast" else None,
         )
-        self.assertTrue(calls[1][1]["config"]["features"]["fast_mode"])
+        self.assertEqual(
+            calls[1][1]["config"]["features"]["fast_mode"],
+            agent.DEFAULT_SPEED == "fast",
+        )
         command = popen.call_args.args[0]
-        self.assertIn(f'service_tier="{agent.SERVICE_TIER}"', command)
+        if agent.DEFAULT_SPEED == "fast":
+            self.assertIn('service_tier="fast"', command)
+        else:
+            self.assertNotIn('service_tier="fast"', command)
+            self.assertIn("--disable", command)
         self.assertIn("fast_mode", command)
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
@@ -704,6 +736,8 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(records[0]["text"], "FULL PROMPT")
         self.assertEqual(records[1]["text"], agent.GOAL)
         self.assertEqual(records[0]["model"], agent.MODEL)
+        repair = next(record for record in records if record["stage"] == "repair")
+        self.assertEqual((repair["node"], repair["round"]), ("author", 0))
 
     def test_goal_never_finalizes_without_a_clean_critic_pass(self):
         class FakeRPC:

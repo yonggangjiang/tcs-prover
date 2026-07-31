@@ -1,6 +1,6 @@
 [
   {
     "name": "APSP",
-    "description": "A valid instance is an explicitly encoded attributed directed graph G=(V,E,w) with |V| ≤ n, non-negative integer edge weights satisfying 0 ≤ w(e) ≤ n^c, and total encoding size O(n^2) machine words. Parallel edges, self-loops, and disconnected graphs are allowed. For u,v ∈ V, let D_G(u,v) be the minimum total weight of a directed u-to-v path, with D_G(u,v)=+∞ if no such path exists."
+    "description": "The input is a simple directed graph G=(V,E) with non-negative integer edge weights w satisfying 0 ≤ w(e) ≤ n^(O(1)). For u,v ∈ V, let D_G(u,v) be the minimum total weight of a directed u-to-v path, with D_G(u,v)=+∞ if no such path exists. The output of the problem is D_G(u,v) for every pair of u,v in V."
   }
 ]

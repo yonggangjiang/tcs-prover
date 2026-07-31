@@ -119,7 +119,10 @@ FINAL_PROMPT = """
 Act as the TCS editor and turn the solution below into a latex proof. Preserve its mathematical
 content while removing repetition and process commentary. Produce a
 cleaned-up, self-contained, organized, rigorous, readable LaTeX proof
-with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper.
+with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper in a tree-lick structure:
+(1) Use definitions and terminologys following the convention of previous works, if there are any,
+(2) For algorithmic tasks, split the proof into algorithm description, correctness proof, and complexity analysis,
+(3) Each section and subsectionstarts with a clear statement of the theorem or lemma being proved, followed by a detailed proof also well-structures into lemmas and corollaries if necessary.
 Return only the requested JSON.
 """.strip()
 
@@ -449,6 +452,31 @@ def finalize(
     prompt = (
         f"{text(instructions)}\n\nSTATEMENT:\n{text(statement)}"
         f"\n\nLATEST SOLUTION:\n{text(solution)}"
+    )
+    report, raw = structured(
+        prompt, FINAL_SCHEMA, "final", model=chosen_model(model),
+        effort=chosen_effort(effort), speed=speed,
+    )
+    try:
+        latex = text(report["latex"])
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise Error("Codex returned an invalid final proof.") from exc
+    emit(
+        "final_result", "final", label="Final LaTeX proof",
+        text=raw, output=latex,
+    )
+    return latex
+
+
+def polish(
+    source, model=WRITER_MODEL, effort=EFFORT,
+    instructions=FINAL_PROMPT, speed=DEFAULT_SPEED,
+):
+    """Turn one combined theorem-and-proof input into polished LaTeX."""
+
+    prompt = (
+        f"{text(instructions)}\n\n"
+        f"THEOREM AND PROOF TO POLISH:\n{text(source)}"
     )
     report, raw = structured(
         prompt, FINAL_SCHEMA, "final", model=chosen_model(model),
@@ -819,10 +847,12 @@ def run_goal(
         solution = answers[-1]
         emit(
             "status", "critic", label="Critic loop started",
-            text=f"Maximum rounds: {critic_rounds}.",
+            text=f"Maximum rounds per author candidate: {critic_rounds}.",
         )
         approved = False
-        for round_number in range(1, critic_rounds + 1):
+        round_number, revision_number = 0, 0
+        while not approved:
+            round_number += 1
             critic_options = {
                 "model": critic_model, "effort": critic_effort,
             }
@@ -848,17 +878,19 @@ def run_goal(
                 )
             else:
                 # Only unresolved bugs return to the persistent author thread.
+                revision_number += 1
                 instruction = repair_prompt(
-                    statement, solution, report["bugs"], round_number
+                    statement, solution, report["bugs"], revision_number
                 )
                 stage, answers[:] = "repair", []
                 emit(
                     "request", "repair",
-                    label=f"Proof author revision {round_number}",
+                    label=f"Proof author revision {revision_number}",
                     text=instruction, model=author_model,
                     reasoningEffort=author_effort,
                     serviceTier=speed,
                     reasoningSummary="detailed",
+                    node="author", round=0,
                 )
                 rpc.call("turn/start", {
                     "threadId": thread,
@@ -882,15 +914,22 @@ def run_goal(
                 solution = answers[-1]
                 emit(
                     "author_result", "repair",
-                    label=f"Revised solution {round_number}", text=solution,
+                    label=f"Revised solution {revision_number}", text=solution,
+                    node="author", round=0,
                 )
+                # The configured critic limit applies to one author candidate.
+                # A complete replacement proof starts a fresh critic budget.
+                round_number = 0
 
             # Record that the next call is a new independent critic.
             if round_number < critic_rounds:
                 emit(
                     "status", "critic", label="Fresh critic requested",
                     text=f"Starting independent critic round {round_number + 1}.",
+                    node="critic",
                 )
+            else:
+                break
 
         if not approved:
             # Preserve the latest candidate, but never present it as final.
@@ -899,7 +938,8 @@ def run_goal(
                 text=solution, output=solution,
             )
             raise Error(
-                f"Reached {critic_rounds} critic rounds without a clean pass."
+                f"Reached {critic_rounds} critic rounds for the current "
+                "author candidate without a clean pass."
             )
 
         final_options = {"model": writer_model, "effort": writer_effort}
@@ -939,7 +979,7 @@ def main():
 
     configure_standard_streams()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["review", "solve"])
+    parser.add_argument("action", choices=["review", "solve", "finalize"])
     parser.add_argument(
         "--review-model", choices=REVIEW_MODELS, default=REVIEW_MODEL,
     )
@@ -975,6 +1015,19 @@ def main():
                     statement, feedback, args.review_model, args.review_effort,
                     speed=args.speed,
                 )
+        elif action == "finalize":
+            if not statement.strip():
+                raise Error("Final LaTeX mode requires a theorem and proof.")
+            final_effort = args.writer_effort or args.reasoning_effort
+            final_instructions = (
+                prompt_file(args.final_prompt_file, FINAL_PROMPT)
+                if args.final_prompt_file else FINAL_PROMPT
+            )
+            polish(
+                statement, model=args.writer_model,
+                effort=final_effort, instructions=final_instructions,
+                speed=args.speed,
+            )
         else:
             # The web UI appends critic rounds and author hours with NULs.
             statement, separator, settings = statement.partition("\0")
@@ -1015,6 +1068,7 @@ def main():
     except KeyboardInterrupt:
         message = (
             "Stopped review." if action == "review"
+            else "Stopped LaTeX editing." if action == "finalize"
             else "Stopped. A goal pause was requested."
         )
         print(f"\n{message}", file=sys.stderr)

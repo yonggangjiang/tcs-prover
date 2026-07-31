@@ -17,6 +17,7 @@ const ui = {
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
   algorithmicFields: $("algorithmicFields"),
+  latexFields: $("latexFields"), latexInput: $("latexInput"),
   modelOfComputation: $("modelOfComputation"),
   problemDescription: $("problemDescription"), goal: $("goal"),
   modelPresets: $("modelPresets"), problemPresets: $("problemPresets"),
@@ -24,16 +25,26 @@ const ui = {
   reviewModel: $("reviewModel"), authorModel: $("authorModel"),
   criticModel: $("criticModel"), writerModel: $("writerModel"),
   reviewModelSetting: $("reviewModelSetting"),
+  authorModelSetting: $("authorModelSetting"),
+  criticModelSetting: $("criticModelSetting"),
+  writerModelSetting: $("writerModelSetting"),
   reviewEffort: $("reviewEffort"), authorEffort: $("authorEffort"),
   criticEffort: $("criticEffort"), writerEffort: $("writerEffort"),
   criticRounds: $("criticRounds"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
+  skipReviewSetting: $("skipReviewSetting"),
+  skipStatementReview: $("skipStatementReview"),
+  criticRoundSetting: $("criticRoundSetting"),
+  thinkingHoursSetting: $("thinkingHoursSetting"),
   editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
   promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
   promptEditorLabel: $("promptEditorLabel"),
   resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
   reviewPromptTab: $("reviewPromptTab"),
+  authorPromptTab: $("authorPromptTab"),
+  criticPromptTab: $("criticPromptTab"),
+  finalPromptTab: $("finalPromptTab"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
@@ -53,7 +64,8 @@ const ui = {
 ui.problemModes = document.querySelectorAll('input[name="problemMode"]');
 
 let state = {
-  phase: "input", problemMode: "statement", trace: [], traceVersion: 0,
+  phase: "input", problemMode: "statement", skipStatementReview: false,
+  trace: [], traceVersion: 0,
   workflow: { nodes: {}, edges: [] },
 };
 let previousPhase = "";
@@ -113,7 +125,8 @@ function jobUrl(runId, token = false) {
 function clearJobView() {
   previousPhase = "";
   state = {
-    phase: "input", problemMode: "statement", trace: [], traceVersion: 0,
+    phase: "input", problemMode: "statement", skipStatementReview: false,
+    trace: [], traceVersion: 0,
     workflow: { nodes: {}, edges: [] },
   };
   timelineRows.clear();
@@ -226,23 +239,47 @@ function selectedProblemMode() {
 
 function setProblemMode(mode) {
   const algorithmic = mode === "algorithmic";
+  const latexOnly = mode === "latex";
+  const skipReview = !algorithmic && !latexOnly
+    && ui.skipStatementReview.checked;
   for (const input of ui.problemModes) input.checked = input.value === mode;
-  show(ui.statementFields, !algorithmic);
+  show(ui.statementFields, !algorithmic && !latexOnly);
   show(ui.algorithmicFields, algorithmic);
-  show(ui.reviewModelSetting, !algorithmic);
-  show(ui.reviewPromptTab, !algorithmic);
-  ui.problem.required = !algorithmic;
+  show(ui.latexFields, latexOnly);
+  show(ui.reviewModelSetting, !algorithmic && !latexOnly);
+  show(ui.authorModelSetting, !latexOnly);
+  show(ui.criticModelSetting, !latexOnly);
+  show(ui.writerModelSetting, true);
+  show(ui.reviewPromptTab, !algorithmic && !latexOnly);
+  show(ui.authorPromptTab, !latexOnly);
+  show(ui.criticPromptTab, !latexOnly);
+  show(ui.finalPromptTab, true);
+  show(ui.skipReviewSetting, !algorithmic && !latexOnly);
+  show(ui.criticRoundSetting, !latexOnly);
+  show(ui.thinkingHoursSetting, !latexOnly);
+  ui.problem.required = !algorithmic && !latexOnly;
   for (const field of [
     ui.modelOfComputation, ui.problemDescription, ui.goal,
   ]) field.required = algorithmic;
-  ui.check.textContent = algorithmic ? "Start proof" : "Check statement";
-  ui.introDescription.textContent = algorithmic
+  ui.latexInput.required = latexOnly;
+  ui.check.textContent = latexOnly ? "Polish LaTeX"
+    : algorithmic ? "Start proof"
+    : skipReview ? "Start proof author" : "Check statement";
+  ui.introDescription.textContent = latexOnly
+    ? "Provide an existing theorem and proof. Only the final LaTeX editor will run."
+    : algorithmic
     ? "Define the computational model, problem, and asymptotic goal. The proof "
       + "author will start immediately, followed by independent audit and LaTeX editing."
-    : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
-      + "solve it, audit it, and produce clean LaTeX.";
+    : skipReview
+      ? "Enter the exact statement to send directly to the proof author, followed "
+        + "by independent audit and LaTeX editing."
+      : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
+        + "solve it, audit it, and produce clean LaTeX.";
   if (algorithmic && activePrompt === "review" && ui.promptDialog.open) {
     selectPrompt("author");
+  }
+  if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
+    selectPrompt("final");
   }
   updateModelSummary();
 }
@@ -284,10 +321,17 @@ function renderAlgorithmicPresets(source) {
 function updateModelSummary() {
   const name = (model) => model.split("-").at(-1)
     .replace(/^./, (letter) => letter.toUpperCase());
-  const review = selectedProblemMode() === "algorithmic" ? ""
+  const review = (
+    selectedProblemMode() === "algorithmic" || ui.skipStatementReview.checked
+  ) ? ""
     : `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `;
   const speed = ui.speedMode.value === "standard"
     ? "Standard speed" : "Fast 1.5×";
+  if (selectedProblemMode() === "latex") {
+    ui.modelSummary.textContent = `${speed} · `
+      + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
+    return;
+  }
   ui.modelSummary.textContent = `${speed} · ` + review
     + `${name(ui.authorModel.value)}/${name(ui.authorEffort.value)} author · `
     + `${name(ui.criticModel.value)}/${name(ui.criticEffort.value)} critic · `
@@ -336,7 +380,8 @@ function selectPrompt(name) {
 function openPromptEditor() {
   if (!promptValues.review) syncPrompts();
   promptDrafts = { ...promptValues };
-  activePrompt = selectedProblemMode() === "algorithmic" ? "author" : "review";
+  activePrompt = selectedProblemMode() === "latex" ? "final"
+    : selectedProblemMode() === "algorithmic" ? "author" : "review";
   selectPrompt(activePrompt);
   ui.promptDialog.showModal();
 }
@@ -701,7 +746,9 @@ function ingest(entries, reset = false) {
 // Render the critic/repair cycle as a real loop, not five linear steps.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
-  const algorithmic = state.problemMode === "algorithmic";
+  const latexOnly = state.problemMode === "latex";
+  const startsAtAuthor = state.problemMode === "algorithmic"
+    || state.skipStatementReview;
   const seen = new Set((state.trace || []).map(
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
@@ -741,6 +788,11 @@ function renderWorkflow() {
     row.append(dot, copy);
     return row;
   };
+  if (latexOnly) {
+    const editor = makeNode("latex_editor", "1");
+    ui.workflowNodes.replaceChildren(editor);
+    return;
+  }
   const arrow = (text, pass = false) => {
     const row = document.createElement("li");
     row.className = `flow-arrow${pass ? " pass" : ""}`;
@@ -764,13 +816,13 @@ function renderWorkflow() {
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
     "aria-label",
-    `At the time limit, step ${algorithmic ? 1 : 2} stops and returns a failure summary`,
+    `At the time limit, step ${startsAtAuthor ? 1 : 2} stops and returns a failure summary`,
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";
   rejectRoute.setAttribute(
     "aria-label",
-    `On rejection, step ${algorithmic ? 2 : 3} returns unresolved bugs to step ${algorithmic ? 1 : 2}`,
+    `On rejection, step ${startsAtAuthor ? 2 : 3} returns unresolved bugs to step ${startsAtAuthor ? 1 : 2}`,
   );
   const rejectLabel = document.createElement("span");
   rejectLabel.textContent = "REJECT";
@@ -778,8 +830,8 @@ function renderWorkflow() {
   const selfRoute = document.createElement("li");
   selfRoute.className = "loop-self";
   selfRoute.textContent = "↻ Critic fixes → fresh critic";
-  const author = makeNode("author", algorithmic ? "1" : "2");
-  const critic = makeNode("critic", algorithmic ? "2" : "3");
+  const author = makeNode("author", startsAtAuthor ? "1" : "2");
+  const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
   passStem.className = "critic-pass-stem";
   passStem.setAttribute("aria-hidden", "true");
@@ -793,11 +845,11 @@ function renderWorkflow() {
   branch.className = "workflow-branch";
   const passRoute = arrow("Clean PASS only", true);
   passRoute.classList.add("critic-pass");
-  const editor = makeNode("latex_editor", algorithmic ? "3" : "4");
+  const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");
   branch.append(failureNode, failureRoute, loop, passRoute, editor);
 
-  if (algorithmic) {
+  if (startsAtAuthor) {
     ui.workflowNodes.replaceChildren(branch);
   } else {
     const reviewer = makeNode("statement_reviewer", "1");
@@ -847,6 +899,7 @@ function render(next) {
     ui.modelOfComputation.value = state.modelOfComputation || "";
     ui.problemDescription.value = state.problemDescription || "";
     ui.goal.value = state.goal || "";
+    ui.latexInput.value = state.latexInput || "";
     renderAlgorithmicPresets(state);
     ui.reviewModel.value = state.reviewModel || "gpt-5.6-sol";
     ui.authorModel.value = state.authorModel || "gpt-5.6-sol";
@@ -857,6 +910,7 @@ function render(next) {
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
     ui.speedMode.value = state.speedMode || "fast";
+    ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 4;
@@ -954,11 +1008,12 @@ function checkEdited() {
 async function startReview(statement, feedback = "") {
   clearTimeout(timer);
   clearTimeout(jobsTimer);
-  if (!promptValues.review) syncPrompts();
-  reviewPending = true;
+  const skipReview = !feedback && ui.skipStatementReview.checked;
+  if (!(skipReview ? promptValues.author : promptValues.review)) syncPrompts();
+  reviewPending = !skipReview;
   const job = currentJob;
   try {
-    const next = await request(jobPath("/review"), {
+    const next = await request(jobPath(skipReview ? "/direct" : "/review"), {
       statement, feedback, reviewModel: ui.reviewModel.value,
       authorModel: ui.authorModel.value,
       criticModel: ui.criticModel.value,
@@ -1029,6 +1084,33 @@ async function startAlgorithmic() {
   }
 }
 
+async function startLatexOnly() {
+  if (!ui.latexInput.value.trim()) {
+    ui.notice.textContent = "Enter the theorem and proof.";
+    show(ui.notice, true);
+    ui.latexInput.focus();
+    return;
+  }
+  clearTimeout(timer);
+  clearTimeout(jobsTimer);
+  if (!promptValues.final) syncPrompts();
+  try {
+    const next = await request("/finalize", {
+      content: ui.latexInput.value,
+      writerModel: ui.writerModel.value,
+      writerEffort: ui.writerEffort.value,
+      finalPrompt: promptValues.final,
+      speedMode: ui.speedMode.value,
+    });
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
 async function act(path, body = {}) {
   clearTimeout(timer);
   const job = currentJob;
@@ -1084,7 +1166,8 @@ ui.homeLink.onclick = (event) => {
   goHome();
 };
 ui.check.onclick = () => selectedProblemMode() === "algorithmic"
-  ? startAlgorithmic() : startReview(ui.problem.value);
+  ? startAlgorithmic() : selectedProblemMode() === "latex"
+    ? startLatexOnly() : startReview(ui.problem.value);
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
@@ -1097,6 +1180,7 @@ ui.authorEffort.onchange = updateModelSummary;
 ui.criticEffort.onchange = updateModelSummary;
 ui.writerEffort.onchange = updateModelSummary;
 ui.speedMode.onchange = updateModelSummary;
+ui.skipStatementReview.onchange = () => setProblemMode(selectedProblemMode());
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }

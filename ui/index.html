@@ -59,6 +59,13 @@
                     <small>Define a model, problem, and asymptotic goal</small>
                   </span>
                 </label>
+                <label class="mode-option">
+                  <input type="radio" name="problemMode" value="latex">
+                  <span>
+                    <strong>LaTeX polish</strong>
+                    <small>Polish an existing theorem and proof only</small>
+                  </span>
+                </label>
               </div>
             </fieldset>
             <div id="statementFields">
@@ -93,6 +100,13 @@
                   placeholder="For example: prove an O(m log n) upper bound…"></textarea>
               </div>
             </div>
+            <div id="latexFields" class="algorithmic-fields" hidden>
+              <div>
+                <label for="latexInput">Theorem and proof</label>
+                <textarea id="latexInput" rows="18"
+                  placeholder="Paste the theorem and its complete proof…"></textarea>
+              </div>
+            </div>
             <details class="advanced">
               <summary>Advanced</summary>
               <div class="model-grid">
@@ -113,7 +127,7 @@
                     <option value="low">Low</option>
                   </select>
                 </div>
-                <div class="round-setting model-setting">
+                <div id="authorModelSetting" class="round-setting model-setting">
                   <label for="authorModel">Proof author</label>
                   <select id="authorModel">
                     <option value="gpt-5.6-sol">Sol — strongest</option>
@@ -130,7 +144,7 @@
                     <option value="low">Low</option>
                   </select>
                 </div>
-                <div class="round-setting model-setting">
+                <div id="criticModelSetting" class="round-setting model-setting">
                   <label for="criticModel">Independent critic</label>
                   <select id="criticModel">
                     <option value="gpt-5.6-sol">Sol — strongest</option>
@@ -147,7 +161,7 @@
                     <option value="low">Low</option>
                   </select>
                 </div>
-                <div class="round-setting model-setting">
+                <div id="writerModelSetting" class="round-setting model-setting">
                   <label for="writerModel">LaTeX writer</label>
                   <select id="writerModel">
                     <option value="gpt-5.6-sol">Sol — strongest</option>
@@ -177,7 +191,15 @@
                 <button id="editPromptsButton" class="secondary compact"
                   type="button">Edit prompts</button>
               </div>
-              <div class="round-setting">
+              <label id="skipReviewSetting" class="advanced-toggle"
+                for="skipStatementReview">
+                <input id="skipStatementReview" type="checkbox">
+                <span>
+                  <strong>Skip statement review</strong>
+                  <small>Send the statement directly to the proof author.</small>
+                </span>
+              </label>
+              <div id="criticRoundSetting" class="round-setting">
                 <label for="speedMode">Generation speed</label>
                 <select id="speedMode" aria-describedby="speedHelp">
                   <option value="fast">Fast &mdash; 1.5&times; speed</option>
@@ -187,13 +209,14 @@
                   Fast is the default and uses credits at a higher rate.
                 </p>
               </div>
-              <div class="round-setting">
+              <div id="thinkingHoursSetting" class="round-setting">
                 <label for="criticRounds">Critic round limit</label>
                 <input id="criticRounds" type="number" min="1" max="100"
                   step="1" value="4" aria-describedby="roundHelp">
                 <p id="roundHelp" class="help">
-                  Up to 4 rounds by default. LaTeX editing requires a clean
-                  critic PASS.
+                  Up to 4 consecutive rounds per author proof by default. The
+                  count resets after an author rewrite. LaTeX editing requires
+                  a clean critic PASS.
                 </p>
               </div>
               <div class="round-setting">
@@ -306,11 +329,11 @@
           aria-label="Choose a role prompt">
           <button id="reviewPromptTab" type="button" class="prompt-tab active"
             data-prompt="review">Reviewer</button>
-          <button type="button" class="prompt-tab"
+          <button id="authorPromptTab" type="button" class="prompt-tab"
             data-prompt="author">Author</button>
-          <button type="button" class="prompt-tab"
+          <button id="criticPromptTab" type="button" class="prompt-tab"
             data-prompt="critic">Critic</button>
-          <button type="button" class="prompt-tab"
+          <button id="finalPromptTab" type="button" class="prompt-tab"
             data-prompt="final">Final writer</button>
         </div>
         <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>

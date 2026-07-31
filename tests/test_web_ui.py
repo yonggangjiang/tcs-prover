@@ -151,6 +151,73 @@ class AppTests(unittest.TestCase):
         self.assertFalse((app.run_dir / "checked-statement.md").exists())
         self.assertEqual(popen.call_args.kwargs["cwd"], app.run_dir)
 
+    def test_statement_can_start_the_author_without_review(self):
+        app = self.app()
+        process = SimpleNamespace(stdin=mock.Mock(), stdout=mock.Mock())
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(web_ui.threading, "Thread") as thread, \
+                mock.patch.object(app, "_review") as review:
+            app.start_direct_statement(
+                "  Exact theorem statement.  ", critic_rounds=3,
+                thinking_hours=2, author_effort="high",
+            )
+        review.assert_not_called()
+        process.stdin.write.assert_called_once_with(
+            "Exact theorem statement.\0" + "3\0" + "2.0"
+        )
+        state = app.snapshot()
+        self.assertEqual(state["phase"], "running")
+        self.assertEqual(state["problemMode"], "statement")
+        self.assertTrue(state["skipStatementReview"])
+        self.assertEqual(state["activeNode"], "author")
+        self.assertNotIn("statement_reviewer", state["workflow"]["nodes"])
+        self.assertEqual(state["authorEffort"], "high")
+        self.assertIn(
+            "Skipped by the user.",
+            (app.run_dir / "checked-statement.md").read_text(encoding="utf-8"),
+        )
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--author-effort") + 1], "high")
+        self.assertIs(thread.call_args.kwargs["args"][1], app.active_token)
+
+    def test_latex_mode_runs_only_the_final_editor(self):
+        app = self.app()
+        process = SimpleNamespace(stdin=mock.Mock(), stdout=mock.Mock())
+        with mock.patch.object(
+            web_ui.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(web_ui.threading, "Thread") as thread, \
+                mock.patch.object(app, "_review") as review, \
+                mock.patch.object(app, "_launch_solver_locked") as solver:
+            app.start_latex_only(
+                "  Theorem statement.\n\nExisting proof.  ",
+                writer_model="gpt-5.6-terra", writer_effort="high",
+                speed_mode="standard",
+            )
+        review.assert_not_called()
+        solver.assert_not_called()
+        process.stdin.write.assert_called_once_with(
+            "Theorem statement.\n\nExisting proof."
+        )
+        command = popen.call_args.args[0]
+        self.assertIn("finalize", command)
+        self.assertNotIn("solve", command)
+        self.assertEqual(
+            command[command.index("--writer-model") + 1], "gpt-5.6-terra"
+        )
+        state = app.snapshot()
+        self.assertEqual(state["problemMode"], "latex")
+        self.assertEqual(state["activeNode"], "latex_editor")
+        self.assertEqual(set(state["workflow"]["nodes"]), {"latex_editor"})
+        self.assertEqual(
+            state["latexInput"], "Theorem statement.\n\nExisting proof."
+        )
+        self.assertEqual(
+            (app.run_dir / "latex-input.md").read_text(encoding="utf-8"),
+            "Theorem statement.\n\nExisting proof.\n",
+        )
+        self.assertIs(thread.call_args.kwargs["args"][1], app.active_token)
+
     def test_review_starts_in_the_background(self):
         app = self.app()
         with mock.patch.object(web_ui.threading, "Thread") as thread:
@@ -158,7 +225,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app.snapshot()["phase"], "reviewing")
         self.assertEqual(app.snapshot()["criticRounds"], 7)
         self.assertEqual(app.snapshot()["thinkingHours"], 24)
-        self.assertEqual(app.snapshot()["speedMode"], "fast")
+        self.assertEqual(app.snapshot()["speedMode"], web_ui.DEFAULT_SPEED)
         self.assertEqual(app.snapshot()["authorModel"], "gpt-5.6-sol")
         self.assertEqual(app.snapshot()["criticModel"], "gpt-5.6-sol")
         self.assertEqual(app.snapshot()["writerModel"], "gpt-5.6-sol")
@@ -381,7 +448,9 @@ class AppTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("--reasoning-effort") + 1], "ultra"
         )
-        self.assertEqual(command[command.index("--speed") + 1], "fast")
+        self.assertEqual(
+            command[command.index("--speed") + 1], web_ui.DEFAULT_SPEED
+        )
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertEqual(popen.call_args.kwargs["cwd"], self.trace.parent)
@@ -610,14 +679,18 @@ class AppTests(unittest.TestCase):
 
     def test_revision_stage_uses_the_same_proof_author_node(self):
         app = self.app()
-        app.state["phase"] = "running"
-        record = {"kind": "request", "stage": "repair", "text": "Fix this gap."}
+        app.state.update(phase="running", activeNode="critic", round=2)
+        record = {
+            "kind": "request", "stage": "repair", "node": "author",
+            "round": 0, "text": "Fix this gap.",
+        }
         process = SimpleNamespace(
             stdout=io.StringIO(json.dumps(record) + "\n"),
             wait=mock.Mock(return_value=0),
         )
         app._read_output(process)
         self.assertEqual(app.snapshot()["activeNode"], "author")
+        self.assertEqual(app.snapshot()["round"], 0)
 
     def test_author_deadline_saves_a_failure_summary(self):
         app = self.app()
@@ -683,9 +756,13 @@ class HttpTests(unittest.TestCase):
         self.assertIn("Problem statement", page)
         self.assertIn('name="problemMode" value="statement" checked', page)
         self.assertIn('name="problemMode" value="algorithmic"', page)
+        self.assertIn('name="problemMode" value="latex"', page)
         self.assertIn('id="algorithmicFields" class="algorithmic-fields" hidden', page)
         self.assertIn('for="modelOfComputation">Model of computation', page)
         self.assertIn('for="problemDescription">Problem description', page)
+        self.assertIn('id="latexInput"', page)
+        self.assertNotIn('id="latexTheorem"', page)
+        self.assertNotIn('id="latexProof"', page)
         self.assertIn('id="modelPresets" class="preset-options"', page)
         self.assertIn('id="problemPresets" class="preset-options"', page)
         self.assertIn("Goal (asymptotic upper or lower bound)", page)
@@ -704,11 +781,14 @@ class HttpTests(unittest.TestCase):
         self.assertIn("Private chain-of-thought", page)
         self.assertIn("Show details", page)
         self.assertIn("Prompts and responses", page)
-        self.assertIn("LaTeX editing requires a clean", page)
+        self.assertIn("count resets after an author rewrite", page)
+        self.assertIn("LaTeX editing requires", page)
         self.assertNotIn("Download all JSONL", page)
         self.assertIn('id="criticRounds"', page)
         self.assertIn('id="thinkingHours"', page)
         self.assertIn('id="speedMode"', page)
+        self.assertIn('id="skipStatementReview"', page)
+        self.assertIn("Send the statement directly to the proof author", page)
         self.assertIn('value="standard"', page)
         self.assertIn('value="fast"', page)
         self.assertIn("Saved edits are reused for future jobs", page)
@@ -731,6 +811,9 @@ class HttpTests(unittest.TestCase):
         self.assertIn('"loop-back"', script)
         self.assertIn("state.problemMode === \"algorithmic\"", script)
         self.assertIn('request("/algorithmic"', script)
+        self.assertIn('request("/finalize"', script)
+        self.assertIn('skipReview ? "/direct" : "/review"', script)
+        self.assertIn("state.skipStatementReview", script)
         self.assertIn("ui.workflowNodes.replaceChildren(branch)", script)
         self.assertIn("button.textContent = entry.name", script)
         self.assertIn("field.value = entry.description", script)
@@ -782,6 +865,7 @@ class HttpTests(unittest.TestCase):
         self.assertIn(".preset-option.selected", styles)
         self.assertIn("#speedMode", styles)
         self.assertIn("width: min(100%, 260px)", styles)
+        self.assertIn(".advanced-toggle", styles)
 
     def test_state_starts_at_input(self):
         response, body = self.get("/state")
@@ -789,9 +873,11 @@ class HttpTests(unittest.TestCase):
         state = json.loads(body)
         self.assertEqual(state["phase"], "input")
         self.assertEqual(state["problemMode"], "statement")
+        self.assertFalse(state["skipStatementReview"])
+        self.assertEqual(state["latexInput"], "")
         self.assertEqual(state["criticRounds"], 4)
         self.assertEqual(state["thinkingHours"], 24)
-        self.assertEqual(state["speedMode"], "fast")
+        self.assertEqual(state["speedMode"], web_ui.DEFAULT_SPEED)
         self.assertEqual(state["reviewModel"], "gpt-5.6-sol")
         self.assertEqual(state["authorModel"], "gpt-5.6-sol")
         self.assertEqual(state["criticModel"], "gpt-5.6-sol")
@@ -847,7 +933,7 @@ class HttpTests(unittest.TestCase):
         start.assert_called_once_with(
             "draft", "clarify", 6, "gpt-5.6-sol", 1.5,
             "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol",
-            "high", speed_mode="fast",
+            "high", speed_mode=web_ui.DEFAULT_SPEED,
         )
 
     def test_review_endpoint_forwards_role_efforts_and_prompts(self):
@@ -896,6 +982,49 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(options["author_model"], "gpt-5.6-terra")
         self.assertEqual(options["critic_effort"], "max")
         self.assertEqual(options["author_prompt"], "Solve [STATEMENT].")
+        self.assertEqual(options["speed_mode"], "standard")
+
+    def test_direct_endpoint_starts_author_with_proof_settings(self):
+        values = {
+            "statement": "Exact theorem.",
+            "criticRounds": 5, "thinkingHours": 2.5,
+            "authorModel": "gpt-5.6-terra",
+            "criticModel": "gpt-5.6-luna",
+            "writerModel": "gpt-5.6-sol",
+            "authorEffort": "high", "criticEffort": "max",
+            "writerEffort": "medium",
+            "authorPrompt": "Solve [STATEMENT].",
+            "criticPrompt": "Audit it.", "finalPrompt": "Write LaTeX.",
+            "speedMode": "standard",
+        }
+        with mock.patch.object(
+            self.server.app, "start_direct_statement"
+        ) as start:
+            response, _ = self.post("/direct", values)
+        self.assertEqual(response.status, 200)
+        options = start.call_args.kwargs
+        self.assertEqual(options["statement"], "Exact theorem.")
+        self.assertEqual(options["critic_rounds"], 5)
+        self.assertEqual(options["author_model"], "gpt-5.6-terra")
+        self.assertEqual(options["critic_effort"], "max")
+        self.assertEqual(options["speed_mode"], "standard")
+
+    def test_finalize_endpoint_forwards_theorem_proof_and_writer_settings(self):
+        values = {
+            "content": "Theorem.\n\nProof.",
+            "writerModel": "gpt-5.6-terra", "writerEffort": "high",
+            "finalPrompt": "Polish carefully.", "speedMode": "standard",
+        }
+        with mock.patch.object(
+            self.server.app, "start_latex_only"
+        ) as start:
+            response, _ = self.post("/finalize", values)
+        self.assertEqual(response.status, 200)
+        options = start.call_args.kwargs
+        self.assertEqual(options["source"], "Theorem.\n\nProof.")
+        self.assertEqual(options["writer_model"], "gpt-5.6-terra")
+        self.assertEqual(options["writer_effort"], "high")
+        self.assertEqual(options["final_prompt"], "Polish carefully.")
         self.assertEqual(options["speed_mode"], "standard")
 
     def test_algorithmic_endpoint_rejects_a_missing_field(self):

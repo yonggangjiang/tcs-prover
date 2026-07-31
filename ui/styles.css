@@ -416,7 +416,11 @@ label span { color: var(--muted); font-weight: 450; }
   border: 0;
 }
 .problem-mode legend { margin-bottom: 8px; font-weight: 650; }
-.mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.mode-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+}
 .mode-option {
   display: flex;
   align-items: flex-start;
@@ -564,6 +568,37 @@ textarea:focus, input:focus, select:focus {
 .prompt-setting strong, .prompt-setting span { display: block; }
 .prompt-setting strong { color: var(--ink); font-size: 0.82rem; }
 .prompt-setting span { margin-top: 2px; font-size: 0.72rem; }
+.advanced-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 16px 0 0 20px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafaf8;
+  cursor: pointer;
+}
+.advanced-toggle:has(input:checked) {
+  border-color: var(--accent);
+  background: #f2faf7;
+}
+.advanced-toggle input {
+  width: auto;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+.advanced-toggle span, .advanced-toggle strong, .advanced-toggle small {
+  display: block;
+}
+.advanced-toggle strong { color: var(--ink); font-size: 0.82rem; }
+.advanced-toggle small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 450;
+  line-height: 1.35;
+}
 
 .prompt-dialog {
   width: min(760px, calc(100vw - 32px));

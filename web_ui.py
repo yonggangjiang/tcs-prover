@@ -313,6 +313,17 @@ ALGORITHMIC_GRAPH = {
     ],
 }
 
+LATEX_GRAPH = {
+    "settings": PUBLIC_GRAPH["settings"],
+    "nodes": {
+        "latex_editor": {
+            **PUBLIC_GRAPH["nodes"]["latex_editor"],
+            "description": "Polishes the supplied theorem and proof into clean LaTeX.",
+        },
+    },
+    "edges": [],
+}
+
 
 def algorithmic_statement(model_of_computation, problem_description, goal):
     """Validate and combine the three fields that define an algorithmic task."""
@@ -343,10 +354,12 @@ def empty_state(trace=None, trace_version=0):
     return {
         "phase": "input",
         "problemMode": "statement",
+        "skipStatementReview": False,
         "draft": "",
         "modelOfComputation": "",
         "problemDescription": "",
         "goal": "",
+        "latexInput": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
         "authorModel": DEFAULT_AUTHOR_MODEL,
@@ -847,6 +860,54 @@ class App:
         )
         return process, token
 
+    def _launch_final_locked(self, source):
+        """Launch only the final LaTeX editor; the caller holds ``self.lock``."""
+
+        token = self.active_token = object()
+        process = subprocess.Popen(
+            [
+                sys.executable, "-u", str(ROOT / "tcs_agent.py"), "finalize",
+                "--writer-model", self.state["writerModel"],
+                "--reasoning-effort", self.state["reasoningEffort"],
+                "--writer-effort", self.state["writerEffort"],
+                "--speed", self.state["speedMode"],
+                "--final-prompt-file", str(self.run_dir / "prompts/final.txt"),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self.run_dir,
+            **isolated_process_options(),
+        )
+        self.process = process
+        try:
+            process.stdin.write(source)
+            process.stdin.close()
+        except (OSError, TypeError, ValueError):
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                if process.poll() is None:
+                    stop_process_tree(process)
+            except OSError:
+                pass
+            if self.process is process:
+                self.process = None
+            if self.active_token is token:
+                self.active_token = None
+            raise
+        self.state.update(
+            phase="running", stage="final",
+            activeNode="latex_editor", round=0, output="",
+        )
+        return process, token
+
     def start_algorithmic(
         self, model_of_computation, problem_description, goal,
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
@@ -911,6 +972,118 @@ class App:
                 "runId": self.run_dir.name,
             }
             process, token = self._launch_solver_locked(statement)
+        threading.Thread(
+            target=self._read_output, args=(process, token), daemon=True
+        ).start()
+
+    def start_direct_statement(
+        self, statement,
+        critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        thinking_hours=DEFAULT_THINKING_HOURS,
+        author_model=DEFAULT_AUTHOR_MODEL,
+        critic_model=DEFAULT_CRITIC_MODEL,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        author_effort=None, critic_effort=None, writer_effort=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
+    ):
+        """Send a statement directly to the proof author without review."""
+
+        statement = str(statement).strip()
+        if not statement:
+            raise ValueError("Enter a problem statement.")
+        if "\0" in statement:
+            raise ValueError("The problem statement cannot contain NUL characters.")
+        options = self._workflow_options(
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            author_model=author_model,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            author_effort=author_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            author_prompt=author_prompt,
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            speed_mode=speed_mode,
+            include_review=False,
+        )
+        with self.lock:
+            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+                raise ValueError("Codex is already working.")
+            self._new_run(statement)
+            if not self.fixed_trace:
+                self.pinned = []
+            for name in ("author", "critic", "final"):
+                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save(
+                "checked-statement.md",
+                "# Statement sent directly to the proof author\n\n"
+                f"{statement}\n\n# Statement review\n\nSkipped by the user.\n",
+            )
+            trace = self.state["trace"] if self.fixed_trace else []
+            version = self.state["traceVersion"] if self.fixed_trace else 0
+            self.state = {
+                **empty_state(trace, version),
+                "problemMode": "statement",
+                "skipStatementReview": True,
+                "draft": statement,
+                **options,
+                "workflow": ALGORITHMIC_GRAPH,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "runId": self.run_dir.name,
+            }
+            process, token = self._launch_solver_locked(statement)
+        threading.Thread(
+            target=self._read_output, args=(process, token), daemon=True
+        ).start()
+
+    def start_latex_only(
+        self, source,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        writer_effort=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
+    ):
+        """Polish one combined theorem-and-proof input without earlier stages."""
+
+        source = str(source).strip()
+        if not source:
+            raise ValueError("Enter the theorem and proof.")
+        if "\0" in source:
+            raise ValueError("The theorem and proof cannot contain NUL characters.")
+        options = self._workflow_options(
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            writer_effort=writer_effort,
+            final_prompt=final_prompt,
+            speed_mode=speed_mode,
+            include_review=False,
+        )
+        with self.lock:
+            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+                raise ValueError("Codex is already working.")
+            self._new_run(source)
+            if not self.fixed_trace:
+                self.pinned = []
+            self._save("prompts/final.txt", options["finalPrompt"] + "\n")
+            self._save("latex-input.md", source + "\n")
+            trace = self.state["trace"] if self.fixed_trace else []
+            version = self.state["traceVersion"] if self.fixed_trace else 0
+            self.state = {
+                **empty_state(trace, version),
+                "problemMode": "latex",
+                "draft": source,
+                "latexInput": source,
+                **options,
+                "workflow": LATEX_GRAPH,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "runId": self.run_dir.name,
+            }
+            process, token = self._launch_final_locked(source)
         threading.Thread(
             target=self._read_output, args=(process, token), daemon=True
         ).start()
@@ -1195,6 +1368,58 @@ class Server(ThreadingHTTPServer):
         self.app = app
         return app
 
+    def start_direct_job(self, body, run_id=""):
+        """Create a statement job that starts directly with the author."""
+
+        if run_id and not self.fixed_app:
+            raise ValueError("Start a direct proof from the home screen.")
+        app = self.get_job(run_id) if run_id else (
+            self.app if self.fixed_app else App(runs=self.runs)
+        )
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        app.start_direct_statement(
+            statement=body.get("statement", ""),
+            critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
+            author_model=body.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
+            writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
+            reasoning_effort=legacy_effort,
+            author_effort=body.get("authorEffort", legacy_effort),
+            critic_effort=body.get("criticEffort", legacy_effort),
+            writer_effort=body.get("writerEffort", legacy_effort),
+            author_prompt=body.get("authorPrompt"),
+            critic_prompt=body.get("criticPrompt"),
+            final_prompt=body.get("finalPrompt"),
+            speed_mode=body.get("speedMode", DEFAULT_SPEED),
+        )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
+    def start_latex_job(self, body, run_id=""):
+        """Create a job that runs only the final LaTeX editor."""
+
+        if run_id and not self.fixed_app:
+            raise ValueError("Start LaTeX-only editing from the home screen.")
+        app = self.get_job(run_id) if run_id else (
+            self.app if self.fixed_app else App(runs=self.runs)
+        )
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        app.start_latex_only(
+            source=body.get("content", ""),
+            writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
+            reasoning_effort=legacy_effort,
+            writer_effort=body.get("writerEffort", legacy_effort),
+            final_prompt=body.get("finalPrompt"),
+            speed_mode=body.get("speedMode", DEFAULT_SPEED),
+        )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
     def job_list(self):
         """Return only the fields needed by the home-page job switcher."""
 
@@ -1362,8 +1587,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.delete_job(run_id))
             if request.path == "/review":
                 app = self.server.start_job(body, run_id)
+            elif request.path == "/direct":
+                app = self.server.start_direct_job(body, run_id)
             elif request.path == "/algorithmic":
                 app = self.server.start_algorithmic_job(body, run_id)
+            elif request.path == "/finalize":
+                app = self.server.start_latex_job(body, run_id)
             else:
                 app = self.server.get_job(run_id)
             if request.path == "/approve":
@@ -1374,7 +1603,9 @@ class Handler(BaseHTTPRequestHandler):
                 app.reset()
             elif request.path == "/clear-trace":
                 app.clear_trace()
-            elif request.path not in {"/review", "/algorithmic"}:
+            elif request.path not in {
+                "/review", "/direct", "/algorithmic", "/finalize",
+            }:
                 return self.send({"error": "Not found."}, status=404)
             self.send(app.snapshot())
         except (OSError, TypeError, ValueError) as exc:
