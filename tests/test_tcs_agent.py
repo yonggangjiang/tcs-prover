@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,9 @@ import tcs_agent as agent
 
 class AgentTests(unittest.TestCase):
     """Check local logic without calling the subscription."""
+
+    def test_default_speed_is_fast(self):
+        self.assertEqual(agent.DEFAULT_SPEED, "fast")
 
     def test_standard_streams_use_fault_tolerant_utf8(self):
         streams = [mock.Mock(), mock.Mock(), mock.Mock()]
@@ -287,7 +291,10 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(run_goal.call_args.args[-1], "high")
 
     def test_main_sends_standard_speed_to_the_goal(self):
-        argv = ["tcs_agent.py", "solve", "--speed", "standard"]
+        argv = [
+            "tcs_agent.py", "solve", "--speed", "standard",
+            "--author-limit-file", "author-limit.json",
+        ]
         with mock.patch("sys.argv", argv), mock.patch(
             "sys.stdin", io.StringIO("claim")
         ), mock.patch.object(
@@ -295,6 +302,10 @@ class AgentTests(unittest.TestCase):
         ), mock.patch.object(agent, "run_goal") as run_goal:
             self.assertEqual(agent.main(), 0)
         self.assertEqual(run_goal.call_args.kwargs["speed"], "standard")
+        self.assertEqual(
+            run_goal.call_args.kwargs["author_limit_file"],
+            "author-limit.json",
+        )
 
     def test_main_can_run_only_the_final_latex_editor(self):
         argv = [
@@ -364,6 +375,20 @@ class AgentTests(unittest.TestCase):
         for value in (0, 169, "not-a-number"):
             with self.subTest(value=value), self.assertRaises(agent.Error):
                 agent.author_hours(value)
+
+    def test_live_author_limit_can_replace_a_valid_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "author-limit.json"
+            path.write_text(json.dumps({"hours": 30}), encoding="utf-8")
+            self.assertEqual(agent.controlled_author_hours(path, 24), 30)
+            path.write_text(json.dumps({"hours": 12}), encoding="utf-8")
+            self.assertEqual(agent.controlled_author_hours(path, 24), 12)
+            for value in ({"hours": 200}, {"hours": "bad"}, {}, []):
+                with self.subTest(value=value):
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    self.assertEqual(agent.controlled_author_hours(path, 24), 24)
+            path.write_text("not json", encoding="utf-8")
+            self.assertEqual(agent.controlled_author_hours(path, 24), 24)
 
     def test_blocked_author_is_continued_before_the_deadline(self):
         class FakeRPC:
@@ -468,7 +493,7 @@ class AgentTests(unittest.TestCase):
             record.get("text") == agent.CONTINUE_PROMPT for record in records
         ))
 
-    def test_author_deadline_interrupts_and_returns_a_failure_summary(self):
+    def test_lowered_author_deadline_interrupts_and_returns_a_failure_summary(self):
         gate = threading.Event()
 
         class FakeRPC:
@@ -546,14 +571,34 @@ class AgentTests(unittest.TestCase):
             holder["rpc"] = FakeRPC(child, record)
             return holder["rpc"]
 
-        with mock.patch.object(agent, "codex", return_value="codex"), mock.patch.object(
-            agent.subprocess, "Popen", return_value=process
-        ) as popen, mock.patch.object(agent, "RPC", side_effect=make_rpc), mock.patch.object(
-            agent, "criticize"
-        ) as criticize, mock.patch.object(
-            agent, "finalize"
-        ) as finalize, mock.patch("sys.stdout", output):
-            result = agent.run_goal("FULL", "STATEMENT", thinking_hours=0.000001)
+        with tempfile.TemporaryDirectory() as folder:
+            limit = Path(folder) / "author-limit.json"
+            limit.write_text(json.dumps({"hours": 1}), encoding="utf-8")
+
+            def lower_limit():
+                time.sleep(0.05)
+                limit.write_text(
+                    json.dumps({"hours": 0.000001}), encoding="utf-8"
+                )
+
+            setter = threading.Thread(target=lower_limit)
+            with mock.patch.object(
+                agent, "codex", return_value="codex"
+            ), mock.patch.object(
+                agent.subprocess, "Popen", return_value=process
+            ) as popen, mock.patch.object(
+                agent, "RPC", side_effect=make_rpc
+            ), mock.patch.object(
+                agent, "criticize"
+            ) as criticize, mock.patch.object(
+                agent, "finalize"
+            ) as finalize, mock.patch("sys.stdout", output):
+                setter.start()
+                result = agent.run_goal(
+                    "FULL", "STATEMENT", thinking_hours=1,
+                    author_limit_file=limit,
+                )
+            setter.join(timeout=1)
 
         self.assertEqual(result, "Progress summary")
         self.assertEqual(holder["rpc"].requests[0][0], "thread/goal/set")

@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 MODEL, EFFORT = "gpt-5.6-sol", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
-SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
+SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
 # Kept as the default-tier name for older callers and trace consumers.
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
@@ -34,6 +34,7 @@ MARKER, TEMPLATE = "[STATEMENT]", ROOT / "prompt.txt"
 GOAL = "Complete the task supplied in the first turn and continue until done."
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
 DEFAULT_AUTHOR_HOURS, MAX_AUTHOR_HOURS = 24, 168
+AUTHOR_LIMIT_POLL_SECONDS = 0.25
 INTERRUPT_GRACE_SECONDS = 30
 SUMMARY_GRACE_SECONDS = 300
 CONTINUE_PROMPT = """
@@ -122,7 +123,10 @@ cleaned-up, self-contained, organized, rigorous, readable LaTeX proof
 with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper in a tree-lick structure:
 (1) Use definitions and terminologys following the convention of previous works, if there are any,
 (2) For algorithmic tasks, split the proof into algorithm description, correctness proof, and complexity analysis,
-(3) Each section and subsectionstarts with a clear statement of the theorem or lemma being proved, followed by a detailed proof also well-structures into lemmas and corollaries if necessary.
+(3) Each section and subsectionstarts with a clear statement of the theorem or lemma being proved, the proof should also be well-structures and splits into lemmas if necessary.
+(4) Each new definition and lemma should have a short explanation of motivation and context before introducing it.
+(5) Expand on any ambiguous or underspecified details in the proof, and provide clear explanations for any non-trivial steps or reasoning.
+The final output should be a complete LaTeX document that can be compiled without errors.
 Return only the requested JSON.
 """.strip()
 
@@ -162,6 +166,22 @@ def author_hours(value):
     if not 0 < value <= MAX_AUTHOR_HOURS:
         raise Error(f"Choose more than 0 and at most {MAX_AUTHOR_HOURS} hours.")
     return value
+
+
+def controlled_author_hours(path, current):
+    """Read an optional live total, ignoring incomplete or invalid updates."""
+
+    if not path:
+        return current
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        requested = author_hours(value["hours"])
+    except (
+        Error, OSError, UnicodeError, KeyError, TypeError,
+        json.JSONDecodeError,
+    ):
+        return current
+    return requested
 
 
 def chosen_model(value):
@@ -556,12 +576,14 @@ def run_goal(
     writer_model=WRITER_MODEL, effort=EFFORT,
     author_effort=None, critic_effort=None, writer_effort=None,
     critic_prompt=CRITIC_PROMPT, final_prompt=FINAL_PROMPT,
-    speed=DEFAULT_SPEED,
+    speed=DEFAULT_SPEED, author_limit_file=None,
 ):
     """Solve, require a clean critic pass, then LaTeX-edit the result."""
 
     critic_rounds = critic_limit(critic_rounds)
-    thinking_hours = author_hours(thinking_hours)
+    thinking_hours = controlled_author_hours(
+        author_limit_file, author_hours(thinking_hours)
+    )
     author_model = chosen_model(author_model)
     critic_model = chosen_model(critic_model)
     writer_model = chosen_model(writer_model)
@@ -642,28 +664,49 @@ def run_goal(
         current_turn = {"id": (started_turn.get("turn") or {}).get("id")}
         timed_out, stop_timer = threading.Event(), threading.Event()
         deadline_lock = threading.Lock()
-        deadline = time.monotonic() + thinking_hours * 3600
+        deadline_started = time.monotonic()
+        deadline_state = {
+            "hours": thinking_hours,
+            "at": deadline_started + thinking_hours * 3600,
+        }
+
+        def refresh_deadline():
+            """Apply the latest total author limit from the web control file."""
+
+            hours = controlled_author_hours(
+                author_limit_file, deadline_state["hours"]
+            )
+            if hours != deadline_state["hours"]:
+                deadline_state["hours"] = hours
+                deadline_state["at"] = deadline_started + hours * 3600
 
         # Pause Goal mode first, then interrupt the active author turn.
         def enforce_deadline():
-            if stop_timer.wait(max(0, deadline - time.monotonic())):
-                return
-            with deadline_lock:
-                timed_out.set()
-                try:
-                    rpc.request("thread/goal/set", {
-                        **goal, "status": "paused",
-                    })
-                except (Error, OSError):
-                    pass
-                turn_id = current_turn["id"]
-                if turn_id:
-                    try:
-                        rpc.request("turn/interrupt", {
-                            "threadId": thread, "turnId": turn_id,
-                        })
-                    except (Error, OSError):
-                        pass
+            # Short waits let a live limit change take effect promptly. They also
+            # avoid one Windows wait whose timeout stops counting during sleep.
+            while True:
+                with deadline_lock:
+                    refresh_deadline()
+                    remaining = deadline_state["at"] - time.monotonic()
+                    if remaining <= 0:
+                        timed_out.set()
+                        try:
+                            rpc.request("thread/goal/set", {
+                                **goal, "status": "paused",
+                            })
+                        except (Error, OSError):
+                            pass
+                        turn_id = current_turn["id"]
+                        if turn_id:
+                            try:
+                                rpc.request("turn/interrupt", {
+                                    "threadId": thread, "turnId": turn_id,
+                                })
+                            except (Error, OSError):
+                                pass
+                        break
+                if stop_timer.wait(min(AUTHOR_LIMIT_POLL_SECONDS, remaining)):
+                    return
             # If interruption itself hangs, unblock the reader for a fallback.
             if (
                 not stop_timer.wait(INTERRUPT_GRACE_SECONDS)
@@ -722,9 +765,11 @@ def run_goal(
                 status == "blocked"
                 or (status == "complete" and not answers)
             ) and not running:
-                if time.monotonic() >= deadline:
-                    timed_out.set()
-                    break
+                with deadline_lock:
+                    refresh_deadline()
+                    if time.monotonic() >= deadline_state["at"]:
+                        timed_out.set()
+                        break
                 if answers:
                     last_author_output = answers[-1]
                     answers.clear()
@@ -767,8 +812,10 @@ def run_goal(
         if timed_out.is_set() or status in {
             "turnFailed", "usageLimited", "budgetLimited"
         }:
+            with deadline_lock:
+                final_author_hours = deadline_state["hours"]
             reason = (
-                f"The {thinking_hours:g}-hour author limit was reached."
+                f"The {final_author_hours:g}-hour author limit was reached."
                 if timed_out.is_set()
                 else f"The author stopped because its state became {status}."
             )
@@ -997,6 +1044,7 @@ def main():
     parser.add_argument("--author-prompt-file")
     parser.add_argument("--critic-prompt-file")
     parser.add_argument("--final-prompt-file")
+    parser.add_argument("--author-limit-file")
     args = parser.parse_args()
     action = args.action
     try:
@@ -1045,6 +1093,10 @@ def main():
                 args.author_model, args.critic_model, args.writer_model,
                 args.reasoning_effort,
             ]
+            limit_option = (
+                {"author_limit_file": args.author_limit_file}
+                if args.author_limit_file else {}
+            )
             if any((
                 args.author_effort, args.critic_effort, args.writer_effort,
                 args.critic_prompt_file, args.final_prompt_file,
@@ -1061,9 +1113,13 @@ def main():
                         args.final_prompt_file, FINAL_PROMPT
                     ),
                     speed=args.speed,
+                    **limit_option,
                 )
             else:
-                run_goal(*common, speed=args.speed)
+                run_goal(
+                    *common, speed=args.speed,
+                    **limit_option,
+                )
         return 0
     except KeyboardInterrupt:
         message = (

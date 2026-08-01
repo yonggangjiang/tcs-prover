@@ -49,6 +49,10 @@ const ui = {
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   stop: $("stopButton"),
+  authorTimeLimitControl: $("authorTimeLimitControl"),
+  authorLimitSummary: $("authorLimitSummary"),
+  authorLimitHours: $("authorLimitHours"),
+  setAuthorTimeLimit: $("setAuthorTimeLimitButton"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
@@ -960,6 +964,22 @@ function render(next) {
       : (node.description || ""));
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
+  const authorLimit = Number(state.thinkingHours || 24);
+  const maximumAuthorLimit = Number(
+    state.workflow?.settings?.thinking_hours?.maximum || 168
+  );
+  const canSetAuthorLimit = phase === "running"
+    && state.stage === "solve" && state.activeNode === "author";
+  show(ui.authorTimeLimitControl, canSetAuthorLimit);
+  const authorLimitText = authorLimit.toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  });
+  ui.authorLimitSummary.textContent = `Author limit: ${authorLimitText} hours`;
+  ui.authorLimitHours.max = String(maximumAuthorLimit);
+  if (canSetAuthorLimit && document.activeElement !== ui.authorLimitHours) {
+    ui.authorLimitHours.value = String(authorLimit);
+  }
+  ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
   show(ui.stop, !done);
   ui.stop.disabled = phase === "stopping";
   ui.run.setAttribute("aria-busy", String(!done));
@@ -1196,6 +1216,17 @@ ui.resetPrompt.onclick = () => {
 };
 ui.savePrompts.onclick = savePrompts;
 ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
+ui.setAuthorTimeLimit.onclick = () => {
+  const hours = Number(ui.authorLimitHours.value);
+  const maximum = Number(ui.authorLimitHours.max || 168);
+  if (!(hours > 0 && hours <= maximum)) {
+    ui.notice.textContent = `Set the limit above 0 and at most ${maximum} hours.`;
+    show(ui.notice, true);
+    ui.authorLimitHours.focus();
+    return;
+  }
+  act("/set-author-time-limit", { hours });
+};
 ui.stop.onclick = () => act("/stop");
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;

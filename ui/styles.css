@@ -813,12 +813,39 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   position: sticky;
   bottom: 14px;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 9px;
   margin-top: 18px;
   pointer-events: none;
 }
 .run-actions button { box-shadow: 0 8px 24px #20211f18; pointer-events: auto; }
+.author-time-limit-control {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-right: auto;
+  padding: 7px 9px;
+  border: 1px solid #b8dfd2;
+  border-radius: 10px;
+  color: #365d52;
+  background: #f7fcfa;
+  box-shadow: 0 8px 24px #20211f12;
+  pointer-events: auto;
+  font-size: 0.76rem;
+}
+.author-time-limit-control label { color: var(--muted); white-space: nowrap; }
+.author-time-limit-control input {
+  width: 68px;
+  padding: 7px 8px;
+  border: 1px solid #b9c8c2;
+  border-radius: 7px;
+  outline: 0;
+  color: var(--ink);
+  background: var(--surface);
+}
+.author-limit-summary { font-weight: 700; white-space: nowrap; }
 
 /* Exact prompts and model responses live in an optional right-side drawer. */
 .drawer-scrim {
@@ -906,6 +933,13 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   .filters { justify-content: flex-start; overflow-x: auto; }
   .actions, .run-actions { flex-direction: column-reverse; }
   .actions button, .run-actions button { width: 100%; }
+  .author-time-limit-control {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    margin-right: 0;
+  }
+  .author-limit-summary { width: 100%; }
   .job-card { align-items: stretch; flex-direction: column; }
   .job-card strong { max-width: 100%; }
   .job-actions button { flex: 1; }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the small local browser interface for TCS Prover."""
+"""Serve the TCS Prover UI or prove one or more Markdown statements."""
 
 import argparse
 import errno
@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from collections import deque
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ DEFAULT_AUTHOR_MODEL = DEFAULT_CRITIC_MODEL = DEFAULT_WRITER_MODEL = "gpt-5.6-so
 DEFAULT_REASONING_EFFORT = "ultra"
 STOP_TIMEOUT_SECONDS = 2
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
+AUTHOR_LIMIT_FILENAME = "author-limit.json"
 
 
 def isolated_process_options():
@@ -395,9 +397,10 @@ def empty_state(trace=None, trace_version=0):
 class App:
     """Own one review-and-solve workflow."""
 
-    def __init__(self, trace_file=None, runs=RUNS):
+    def __init__(self, trace_file=None, runs=RUNS, output_stream=None):
         # Tests may supply one fixed log; the real app uses one folder per run.
         self.runs, self.fixed_trace = Path(runs), trace_file is not None
+        self.output_stream = output_stream
         self.trace_file = Path(trace_file) if trace_file else self._latest_trace()
         self.run_dir = self.trace_file.parent if self.trace_file else None
         trace, total, self.pinned = self._load_trace()
@@ -443,6 +446,22 @@ class App:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.write_text(content, encoding="utf-8")
         path.chmod(0o600)
+
+    def _write_author_limit(self, hours):
+        """Atomically publish the total author limit to the active solver."""
+
+        path = self.run_dir / AUTHOR_LIMIT_FILENAME
+        temporary = path.with_name(f".{AUTHOR_LIMIT_FILENAME}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps({"hours": hours}), encoding="utf-8"
+            )
+            temporary.chmod(0o600)
+            temporary.replace(path)
+            path.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return path
 
     def _load_trace(self):
         """Restore the append-only local transcript after a restart."""
@@ -803,6 +822,9 @@ class App:
         """Attach the existing proof pipeline; the caller holds ``self.lock``."""
 
         token = self.active_token = object()
+        author_limit_file = self._write_author_limit(
+            self.state["thinkingHours"]
+        )
         process = subprocess.Popen(
             [
                 sys.executable, "-u", str(ROOT / "tcs_agent.py"), "solve",
@@ -820,6 +842,7 @@ class App:
                 str(self.run_dir / "prompts/critic.txt"),
                 "--final-prompt-file",
                 str(self.run_dir / "prompts/final.txt"),
+                "--author-limit-file", str(author_limit_file),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1119,6 +1142,13 @@ class App:
         problem, answers, order, final = "", {}, [], False
         try:
             for line in process.stdout:
+                if self.output_stream is not None:
+                    try:
+                        self.output_stream.write(line)
+                        self.output_stream.flush()
+                    except (OSError, UnicodeError):
+                        # Losing terminal output must not terminate a proof run.
+                        self.output_stream = None
                 # Untagged errors belong to the most recently active stage.
                 record = self.parse_line(line, self.state["stage"] or "solve")
                 self.add_trace(record)
@@ -1247,6 +1277,41 @@ class App:
                 self.state["output"] = self.state["output"] or (
                     "Codex was stopped before it produced an answer."
                 )
+
+    def set_author_time_limit(self, hours):
+        """Replace the live proof-author deadline with a chosen total."""
+
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("The author limit must be a number of hours.") from exc
+        if not 0 < hours <= MAX_THINKING_HOURS:
+            raise ValueError(
+                f"Set the author limit above 0 and at most "
+                f"{MAX_THINKING_HOURS} hours."
+            )
+        with self.lock:
+            if not (
+                self.state["phase"] == "running"
+                and self.state["stage"] == "solve"
+                and self.state["activeNode"] == "author"
+            ):
+                raise ValueError(
+                    "Author time can only be extended while the initial proof "
+                    "author is running."
+                )
+            if self.process is None or self.process.poll() is not None:
+                raise ValueError("The proof author is no longer running.")
+            hours = round(hours, 10)
+            self._write_author_limit(hours)
+            self.state["thinkingHours"] = hours
+            self.add_trace({
+                "kind": "status", "stage": "solve", "node": "author",
+                "label": "Author time limit set",
+                "text": f"The author time limit is now {hours:g} hours.",
+                "authorLimitHours": hours,
+            })
+            return hours
 
     def reset(self):
         """Return to the first screen when no child is active."""
@@ -1597,6 +1662,8 @@ class Handler(BaseHTTPRequestHandler):
                 app = self.server.get_job(run_id)
             if request.path == "/approve":
                 app.approve(body.get("statement"))
+            elif request.path == "/set-author-time-limit":
+                app.set_author_time_limit(body.get("hours"))
             elif request.path == "/stop":
                 app.stop()
             elif request.path == "/reset":
@@ -1612,12 +1679,289 @@ class Handler(BaseHTTPRequestHandler):
             self.send({"error": str(exc)}, status=400)
 
 
+ACTIVE_PHASES = {"reviewing", "running", "stopping"}
+
+
+class TaggedJsonlOutput:
+    """Serialize one batch job's terminal events with its input filename."""
+
+    def __init__(self, stream, lock, input_file):
+        self.stream, self.lock = stream, lock
+        self.input_file = input_file
+
+    def write(self, line):
+        if not line:
+            return 0
+        try:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
+            record = {"kind": "diagnostic", "text": line.rstrip("\r\n")}
+        record["inputFile"] = self.input_file
+        rendered = json.dumps(record, ensure_ascii=False) + "\n"
+        with self.lock:
+            self.stream.write(rendered)
+            self.stream.flush()
+        return len(line)
+
+    def flush(self):
+        with self.lock:
+            self.stream.flush()
+
+
+def markdown_inputs(path):
+    """Resolve one Markdown file or the top-level Markdown files in a folder."""
+
+    source = Path(path).expanduser().resolve()
+    if source.is_file():
+        if source.suffix.lower() != ".md":
+            raise ValueError(f"The input file must end in .md: {source}")
+        return [source]
+    if source.is_dir():
+        files = sorted(
+            (
+                item for item in source.iterdir()
+                if item.is_file() and item.suffix.lower() == ".md"
+            ),
+            key=lambda item: (item.name.casefold(), item.name),
+        )
+        if not files:
+            raise ValueError(f"The input folder contains no .md files: {source}")
+        return files
+    raise ValueError(f"The input path does not exist: {source}")
+
+
+def read_utf8(path, purpose):
+    """Read one required UTF-8 text file with a useful CLI error."""
+
+    source = Path(path).expanduser().resolve()
+    try:
+        value = source.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Cannot read {purpose} {source}: {exc}") from exc
+    if not value.strip():
+        raise ValueError(f"The {purpose} is empty: {source}")
+    if "\0" in value:
+        raise ValueError(f"The {purpose} contains a NUL character: {source}")
+    return value
+
+
+def direct_cli_options(
+    critic_rounds=DEFAULT_CRITIC_ROUNDS,
+    thinking_hours=DEFAULT_THINKING_HOURS,
+    author_model=DEFAULT_AUTHOR_MODEL,
+    critic_model=DEFAULT_CRITIC_MODEL,
+    writer_model=DEFAULT_WRITER_MODEL,
+    reasoning_effort=DEFAULT_REASONING_EFFORT,
+    author_effort=None, critic_effort=None, writer_effort=None,
+    speed_mode=DEFAULT_SPEED,
+    author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
+):
+    """Load optional prompt files and validate direct-workflow CLI settings."""
+
+    prompt_files = {
+        "author": author_prompt_file,
+        "critic": critic_prompt_file,
+        "final": final_prompt_file,
+    }
+    prompts = {
+        name: read_utf8(path, f"{name} prompt") if path else None
+        for name, path in prompt_files.items()
+    }
+    options = App._workflow_options(
+        critic_rounds=critic_rounds,
+        thinking_hours=thinking_hours,
+        author_model=author_model,
+        critic_model=critic_model,
+        writer_model=writer_model,
+        reasoning_effort=reasoning_effort,
+        author_effort=author_effort,
+        critic_effort=critic_effort,
+        writer_effort=writer_effort,
+        author_prompt=prompts["author"],
+        critic_prompt=prompts["critic"],
+        final_prompt=prompts["final"],
+        speed_mode=speed_mode,
+        include_review=False,
+    )
+    return {
+        "critic_rounds": options["criticRounds"],
+        "thinking_hours": options["thinkingHours"],
+        "author_model": options["authorModel"],
+        "critic_model": options["criticModel"],
+        "writer_model": options["writerModel"],
+        "reasoning_effort": options["reasoningEffort"],
+        "author_effort": options["authorEffort"],
+        "critic_effort": options["criticEffort"],
+        "writer_effort": options["writerEffort"],
+        "author_prompt": options["authorPrompt"],
+        "critic_prompt": options["criticPrompt"],
+        "final_prompt": options["finalPrompt"],
+        "speed_mode": options["speedMode"],
+    }
+
+
+def _stop_headless_apps(apps):
+    """Stop several independent jobs concurrently after Ctrl-C or launch failure."""
+
+    def stop_one(app):
+        try:
+            app.stop()
+        except ValueError:
+            pass
+
+    threads = [threading.Thread(target=stop_one, args=(app,)) for _, app in apps]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def run_headless_markdown(
+    path, runs=RUNS, output_stream=None, error_stream=None, **settings
+):
+    """Run one Markdown proof or all top-level Markdown proofs in a folder."""
+
+    output_stream = sys.stdout if output_stream is None else output_stream
+    error_stream = sys.stderr if error_stream is None else error_stream
+    files = markdown_inputs(path)
+    statements = [(source, read_utf8(source, "statement")) for source in files]
+    options = direct_cli_options(**settings)
+    batch = Path(path).expanduser().resolve().is_dir()
+    output_lock = threading.Lock()
+    apps = []
+    try:
+        for source, statement in statements:
+            job_output = (
+                TaggedJsonlOutput(output_stream, output_lock, source.name)
+                if batch else output_stream
+            )
+            app = App(runs=runs, output_stream=job_output)
+            apps.append((source, app))
+            app.start_direct_statement(statement=statement, **options)
+            print(
+                f"[{source.name}] Proof started in {app.run_dir}",
+                file=error_stream, flush=True,
+            )
+    except KeyboardInterrupt:
+        _stop_headless_apps(apps)
+        print("All active proofs stopped.", file=error_stream, flush=True)
+        return 130
+    except Exception:
+        _stop_headless_apps(apps)
+        raise
+
+    try:
+        while any(app.snapshot()["phase"] in ACTIVE_PHASES for _, app in apps):
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        _stop_headless_apps(apps)
+        print("All active proofs stopped.", file=error_stream, flush=True)
+        return 130
+
+    failed = False
+    for source, app in apps:
+        state = app.snapshot()
+        error = state.get("error", "")
+        if error:
+            failed = True
+            print(
+                f"[{source.name}] Proof failed: {error}",
+                file=error_stream, flush=True,
+            )
+        else:
+            print(
+                f"[{source.name}] Proof finished in {app.run_dir}",
+                file=error_stream, flush=True,
+            )
+    return 1 if failed else 0
+
+
 def main():
-    """Start locally and open the user's default browser."""
+    """Run Markdown proofs from the terminal or start the browser interface."""
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "input_path", nargs="?",
+        help="UTF-8 .md statement file or folder of top-level .md files",
+    )
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "-criticRounds", "--criticRounds", "--critic-rounds",
+        dest="critic_rounds", type=int, default=DEFAULT_CRITIC_ROUNDS,
+        metavar="N",
+        help=(
+            f"critic rounds per author proof (default: {DEFAULT_CRITIC_ROUNDS})"
+        ),
+    )
+    parser.add_argument(
+        "-thinkingHours", "--thinkingHours", "--thinking-hours",
+        dest="thinking_hours", type=float, default=DEFAULT_THINKING_HOURS,
+        metavar="HOURS",
+        help=f"total author time limit (default: {DEFAULT_THINKING_HOURS})",
+    )
+    model_defaults = {
+        "author": DEFAULT_AUTHOR_MODEL,
+        "critic": DEFAULT_CRITIC_MODEL,
+        "writer": DEFAULT_WRITER_MODEL,
+    }
+    for role in ("author", "critic", "writer"):
+        camel = f"{role}Model"
+        parser.add_argument(
+            f"-{camel}", f"--{camel}", f"--{role}-model",
+            dest=f"{role}_model", choices=MODELS,
+            default=model_defaults[role],
+            help=f"{role} model",
+        )
+    parser.add_argument(
+        "-reasoningEffort", "--reasoningEffort", "--reasoning-effort",
+        dest="reasoning_effort", choices=EFFORTS,
+        default=DEFAULT_REASONING_EFFORT,
+        help="fallback reasoning effort for every proof role",
+    )
+    for role in ("author", "critic", "writer"):
+        camel = f"{role}Effort"
+        parser.add_argument(
+            f"-{camel}", f"--{camel}", f"--{role}-effort",
+            dest=f"{role}_effort", choices=EFFORTS, default=None,
+            help=f"override the {role} reasoning effort",
+        )
+    parser.add_argument(
+        "-speedMode", "--speedMode", "--speed-mode",
+        dest="speed_mode", choices=SPEEDS, default=DEFAULT_SPEED,
+        help=f"generation speed (default: {DEFAULT_SPEED})",
+    )
+    for role in ("author", "critic", "final"):
+        camel = f"{role}PromptFile"
+        parser.add_argument(
+            f"-{camel}", f"--{camel}", f"--{role}-prompt-file",
+            dest=f"{role}_prompt_file", metavar="PATH",
+            help=f"UTF-8 file containing the custom {role} prompt",
+        )
     args = parser.parse_args()
+    if args.input_path:
+        tcs_agent.configure_standard_streams()
+        try:
+            return run_headless_markdown(
+                args.input_path,
+                critic_rounds=args.critic_rounds,
+                thinking_hours=args.thinking_hours,
+                author_model=args.author_model,
+                critic_model=args.critic_model,
+                writer_model=args.writer_model,
+                reasoning_effort=args.reasoning_effort,
+                author_effort=args.author_effort,
+                critic_effort=args.critic_effort,
+                writer_effort=args.writer_effort,
+                speed_mode=args.speed_mode,
+                author_prompt_file=args.author_prompt_file,
+                critic_prompt_file=args.critic_prompt_file,
+                final_prompt_file=args.final_prompt_file,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Cannot start headless proof: {exc}", file=sys.stderr)
+            return 1
     try:
         server = Server((HOST, PORT))
     except OSError as exc:

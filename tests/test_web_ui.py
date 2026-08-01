@@ -90,6 +90,83 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NUL"):
             web_ui.algorithmic_statement("word\0RAM", "Problem", "Goal")
 
+    def test_markdown_inputs_accept_a_file_or_sorted_top_level_folder(self):
+        folder = Path(self.folder.name)
+        alpha = folder / "Alpha.MD"
+        zeta = folder / "zeta.md"
+        alpha.write_text("Alpha theorem.", encoding="utf-8")
+        zeta.write_text("Zeta theorem.", encoding="utf-8")
+        (folder / "notes.txt").write_text("Ignore me.", encoding="utf-8")
+        nested = folder / "nested"
+        nested.mkdir()
+        (nested / "nested.md").write_text("Not recursive.", encoding="utf-8")
+
+        self.assertEqual(web_ui.markdown_inputs(alpha), [alpha.resolve()])
+        self.assertEqual(
+            web_ui.markdown_inputs(folder), [alpha.resolve(), zeta.resolve()]
+        )
+
+    def test_markdown_inputs_reject_missing_non_markdown_and_empty_paths(self):
+        folder = Path(self.folder.name)
+        text = folder / "statement.txt"
+        text.write_text("Theorem.", encoding="utf-8")
+        empty = folder / "empty"
+        empty.mkdir()
+
+        with self.assertRaisesRegex(ValueError, "must end in .md"):
+            web_ui.markdown_inputs(text)
+        with self.assertRaisesRegex(ValueError, "contains no .md"):
+            web_ui.markdown_inputs(empty)
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            web_ui.markdown_inputs(folder / "missing.md")
+
+    def test_utf8_statement_preserves_paragraphs_quotes_and_backslashes(self):
+        source = Path(self.folder.name) / "statement.md"
+        statement = 'First paragraph with "quotes".\n\n\\alpha + \\beta.\n'
+        source.write_text(statement, encoding="utf-8")
+
+        self.assertEqual(web_ui.read_utf8(source, "statement"), statement)
+
+        source.write_text(" \n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "statement is empty"):
+            web_ui.read_utf8(source, "statement")
+        source.write_text("Theorem\0invalid", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "NUL"):
+            web_ui.read_utf8(source, "statement")
+        source.write_bytes(b"Theorem \x9d")
+        with self.assertRaisesRegex(ValueError, "Cannot read statement"):
+            web_ui.read_utf8(source, "statement")
+
+    def test_direct_cli_options_use_defaults_and_load_prompt_files(self):
+        author = Path(self.folder.name) / "author.txt"
+        author.write_text("Prove this:\n[STATEMENT]", encoding="utf-8")
+
+        values = web_ui.direct_cli_options(
+            critic_rounds=7,
+            thinking_hours=36,
+            author_model="gpt-5.6-terra",
+            critic_model="gpt-5.6-luna",
+            reasoning_effort="high",
+            critic_effort="max",
+            speed_mode="standard",
+            author_prompt_file=author,
+        )
+
+        self.assertEqual(values["critic_rounds"], 7)
+        self.assertEqual(values["thinking_hours"], 36)
+        self.assertEqual(values["author_model"], "gpt-5.6-terra")
+        self.assertEqual(values["critic_model"], "gpt-5.6-luna")
+        self.assertEqual(values["author_effort"], "high")
+        self.assertEqual(values["critic_effort"], "max")
+        self.assertEqual(values["writer_effort"], "high")
+        self.assertEqual(values["speed_mode"], "standard")
+        self.assertEqual(values["author_prompt"], "Prove this:\n[STATEMENT]")
+
+        defaults = web_ui.direct_cli_options()
+        self.assertEqual(defaults["speed_mode"], "fast")
+        self.assertEqual(defaults["critic_rounds"], 4)
+        self.assertEqual(defaults["thinking_hours"], 24)
+
     def test_algorithmic_mode_starts_the_author_without_review(self):
         app = self.app()
         process = SimpleNamespace(stdin=mock.Mock(), stdout=mock.Mock())
@@ -401,6 +478,48 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app.snapshot()["phase"], "done")
         self.assertEqual(app.snapshot()["error"], "Stopped.")
 
+    def test_author_time_limit_can_be_replaced_while_initial_author_runs(self):
+        app = self.app()
+        process = mock.Mock()
+        process.poll.return_value = None
+        app.process = process
+        app.state.update(
+            phase="running", stage="solve", activeNode="author",
+            thinkingHours=24,
+        )
+        app._write_author_limit(24)
+
+        self.assertEqual(app.set_author_time_limit("6.5"), 6.5)
+
+        state = app.snapshot()
+        self.assertEqual(state["thinkingHours"], 6.5)
+        self.assertEqual(
+            json.loads((self.trace.parent / web_ui.AUTHOR_LIMIT_FILENAME).read_text(
+                encoding="utf-8"
+            )),
+            {"hours": 6.5},
+        )
+        self.assertEqual(state["trace"][-1]["label"], "Author time limit set")
+        self.assertIn("now 6.5 hours", state["trace"][-1]["text"])
+
+    def test_author_time_setting_is_limited_to_the_active_initial_author(self):
+        app = self.app()
+        process = mock.Mock()
+        process.poll.return_value = None
+        app.process = process
+        app.state.update(
+            phase="running", stage="critic", activeNode="critic",
+            thinkingHours=24,
+        )
+        with self.assertRaisesRegex(ValueError, "initial proof author"):
+            app.set_author_time_limit(1)
+        app.state.update(stage="solve", activeNode="author")
+        for value in (0, 169):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "at most 168"
+            ):
+                app.set_author_time_limit(value)
+
     def test_windows_stop_force_kills_the_complete_process_tree(self):
         process = mock.Mock(pid=1234)
         process.poll.return_value = None
@@ -450,6 +569,11 @@ class AppTests(unittest.TestCase):
         )
         self.assertEqual(
             command[command.index("--speed") + 1], web_ui.DEFAULT_SPEED
+        )
+        limit_path = Path(command[command.index("--author-limit-file") + 1])
+        self.assertEqual(limit_path, self.trace.parent / web_ui.AUTHOR_LIMIT_FILENAME)
+        self.assertEqual(
+            json.loads(limit_path.read_text(encoding="utf-8")), {"hours": 24}
         )
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
@@ -602,6 +726,178 @@ class AppTests(unittest.TestCase):
         )
         app._read_output(process)
         self.assertEqual(app.snapshot()["output"], "Complete answer")
+
+    def test_headless_solver_tees_public_jsonl_to_the_terminal(self):
+        terminal = io.StringIO()
+        app = web_ui.App(self.trace, output_stream=terminal)
+        app.state["phase"] = "running"
+        record = {
+            "kind": "status", "stage": "solve", "text": "Author started."
+        }
+        line = json.dumps(record) + "\n"
+        process = SimpleNamespace(
+            stdout=io.StringIO(line), wait=mock.Mock(return_value=0),
+        )
+
+        app._read_output(process)
+
+        self.assertEqual(terminal.getvalue(), line)
+
+    def test_tagged_jsonl_output_identifies_each_batch_input(self):
+        terminal, lock = io.StringIO(), threading.Lock()
+        output = web_ui.TaggedJsonlOutput(terminal, lock, "alpha.md")
+
+        output.write(json.dumps({"kind": "status", "text": "Started."}) + "\n")
+        output.write("plain diagnostic\n")
+
+        records = [json.loads(line) for line in terminal.getvalue().splitlines()]
+        self.assertEqual(records[0]["inputFile"], "alpha.md")
+        self.assertEqual(records[0]["kind"], "status")
+        self.assertEqual(records[1], {
+            "kind": "diagnostic",
+            "text": "plain diagnostic",
+            "inputFile": "alpha.md",
+        })
+
+    def test_headless_runner_uses_the_direct_markdown_pipeline(self):
+        folder = Path(self.folder.name)
+        statement = folder / "proof.md"
+        statement.write_text("Exact theorem.\n", encoding="utf-8")
+        options = {
+            "thinking_hours": 12,
+            "author_effort": "high",
+            "speed_mode": "fast",
+        }
+        fake = mock.Mock()
+        fake.run_dir = folder / "run"
+        fake.snapshot.return_value = {"phase": "done", "error": ""}
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            web_ui, "direct_cli_options", return_value=options
+        ) as normalize, mock.patch.object(
+            web_ui, "App", return_value=fake
+        ) as app_type:
+            code = web_ui.run_headless_markdown(
+                statement, runs=folder / "runs",
+                output_stream=output, error_stream=errors,
+                thinking_hours=12, author_effort="high",
+            )
+
+        self.assertEqual(code, 0)
+        normalize.assert_called_once_with(thinking_hours=12, author_effort="high")
+        app_type.assert_called_once_with(
+            runs=folder / "runs", output_stream=output
+        )
+        call = fake.start_direct_statement.call_args.kwargs
+        self.assertEqual(call["statement"], "Exact theorem.\n")
+        self.assertEqual(call["thinking_hours"], 12)
+        self.assertEqual(call["author_effort"], "high")
+        self.assertIn("[proof.md] Proof started", errors.getvalue())
+        self.assertIn("[proof.md] Proof finished", errors.getvalue())
+
+    def test_folder_runner_starts_every_markdown_job_before_polling(self):
+        folder = Path(self.folder.name)
+        (folder / "b.md").write_text("Theorem B.", encoding="utf-8")
+        (folder / "a.md").write_text("Theorem A.", encoding="utf-8")
+        started = []
+        first, second = mock.Mock(), mock.Mock()
+        first.run_dir, second.run_dir = folder / "run-a", folder / "run-b"
+        first.start_direct_statement.side_effect = lambda **_: started.append("a")
+        second.start_direct_statement.side_effect = lambda **_: started.append("b")
+
+        def first_state():
+            self.assertEqual(started, ["a", "b"])
+            return {"phase": "done", "error": ""}
+
+        first.snapshot.side_effect = first_state
+        second.snapshot.return_value = {"phase": "done", "error": "failed B"}
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            web_ui, "direct_cli_options", return_value={}
+        ), mock.patch.object(
+            web_ui, "App", side_effect=[first, second]
+        ) as app_type:
+            code = web_ui.run_headless_markdown(
+                folder, runs=folder / "runs",
+                output_stream=output, error_stream=errors,
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(app_type.call_count, 2)
+        for call in app_type.call_args_list:
+            self.assertIsInstance(
+                call.kwargs["output_stream"], web_ui.TaggedJsonlOutput
+            )
+        self.assertEqual(
+            first.start_direct_statement.call_args.kwargs["statement"],
+            "Theorem A.",
+        )
+        self.assertEqual(
+            second.start_direct_statement.call_args.kwargs["statement"],
+            "Theorem B.",
+        )
+        self.assertIn("[b.md] Proof failed: failed B", errors.getvalue())
+
+    def test_ctrl_c_stops_every_active_folder_job(self):
+        folder = Path(self.folder.name)
+        (folder / "a.md").write_text("A.", encoding="utf-8")
+        (folder / "b.md").write_text("B.", encoding="utf-8")
+        apps = [mock.Mock(), mock.Mock()]
+        for number, app in enumerate(apps):
+            app.run_dir = folder / f"run-{number}"
+            app.snapshot.return_value = {"phase": "running", "error": ""}
+        with mock.patch.object(
+            web_ui, "direct_cli_options", return_value={}
+        ), mock.patch.object(
+            web_ui, "App", side_effect=apps
+        ), mock.patch.object(
+            web_ui.time, "sleep", side_effect=KeyboardInterrupt
+        ):
+            code = web_ui.run_headless_markdown(
+                folder, output_stream=io.StringIO(), error_stream=io.StringIO()
+            )
+
+        self.assertEqual(code, 130)
+        for app in apps:
+            app.stop.assert_called_once_with()
+
+    def test_ctrl_c_during_folder_startup_stops_already_created_jobs(self):
+        folder = Path(self.folder.name)
+        (folder / "a.md").write_text("A.", encoding="utf-8")
+        app = mock.Mock()
+        app.start_direct_statement.side_effect = KeyboardInterrupt
+        with mock.patch.object(
+            web_ui, "direct_cli_options", return_value={}
+        ), mock.patch.object(web_ui, "App", return_value=app):
+            code = web_ui.run_headless_markdown(
+                folder, output_stream=io.StringIO(), error_stream=io.StringIO()
+            )
+
+        self.assertEqual(code, 130)
+        app.stop.assert_called_once_with()
+
+    def test_markdown_positional_argument_and_overrides_select_headless_mode(self):
+        with mock.patch(
+            "sys.argv", [
+                "web_ui.py", "statement.md",
+                "-criticRounds", "6", "-authorEffort", "high",
+                "-speedMode", "standard",
+            ]
+        ), mock.patch.object(
+            web_ui.tcs_agent, "configure_standard_streams"
+        ) as configure, mock.patch.object(
+            web_ui, "run_headless_markdown", return_value=0
+        ) as run, mock.patch.object(web_ui, "Server") as server:
+            self.assertEqual(web_ui.main(), 0)
+
+        configure.assert_called_once_with()
+        call = run.call_args
+        self.assertEqual(call.args, ("statement.md",))
+        self.assertEqual(call.kwargs["critic_rounds"], 6)
+        self.assertEqual(call.kwargs["author_effort"], "high")
+        self.assertEqual(call.kwargs["speed_mode"], "standard")
+        self.assertEqual(call.kwargs["thinking_hours"], 24)
+        server.assert_not_called()
 
     def test_final_latex_replaces_the_working_solution(self):
         app = self.app()
@@ -797,6 +1093,9 @@ class HttpTests(unittest.TestCase):
         self.assertIn('id="workflowNodes"', page)
         self.assertIn('id="timelineList"', page)
         self.assertIn('id="stopButton" class="danger">Stop</button>', page)
+        self.assertIn('id="authorTimeLimitControl"', page)
+        self.assertIn('id="authorLimitHours"', page)
+        self.assertIn('id="setAuthorTimeLimitButton"', page)
         self.assertIn('id="homeButton" class="secondary">Return home</button>', page)
         self.assertIn('id="jobsList" class="jobs-list"', page)
         self.assertNotIn("Latest complete output", page)
@@ -843,6 +1142,8 @@ class HttpTests(unittest.TestCase):
         self.assertIn('jobPath("/state"', script)
         self.assertIn('"tcs-prover-role-prompts"', script)
         self.assertIn("localStorage.setItem(promptStorageKey", script)
+        self.assertIn('act("/set-author-time-limit", { hours })', script)
+        self.assertIn('state.stage === "solve"', script)
 
     def test_hidden_workflow_rail_cannot_collapse_the_input_form(self):
         response, body = self.get("/styles.css")
@@ -1085,6 +1386,23 @@ class HttpTests(unittest.TestCase):
         state = json.loads(body)
         self.assertEqual(state["phase"], "done")
         self.assertEqual(state["error"], "Stopped.")
+
+    def test_set_author_time_limit_endpoint_replaces_the_live_limit(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        self.server.app.process = process
+        self.server.app.state.update(
+            phase="running", stage="solve", activeNode="author",
+            thinkingHours=24,
+        )
+        self.server.app._write_author_limit(24)
+
+        response, body = self.post("/set-author-time-limit", {"hours": 12})
+
+        self.assertEqual(response.status, 200)
+        state = json.loads(body)
+        self.assertEqual(state["thinkingHours"], 12)
+        self.assertEqual(state["trace"][-1]["label"], "Author time limit set")
 
     def test_state_rejects_a_request_without_the_launch_session(self):
         other = http.client.HTTPConnection(

@@ -23,7 +23,79 @@ On macOS, `Start TCS Prover.command` is an alternative launcher. Codex can use
 an eligible ChatGPT plan; see OpenAI's
 [Codex CLI guide](https://help.openai.com/en/articles/11096431) and
 [ChatGPT-plan guide](https://help.openai.com/en/articles/11369540).
-Every model call forces Codex Fast mode (1.5× speed), which uses more credits.
+Generation speed is selectable; Fast is the default and uses credits at a
+higher rate.
+
+### Terminal runs from Markdown
+
+On a server without a browser, put the complete statement in any UTF-8 Markdown
+file. Paragraphs, quotes, mathematical backslashes, and line breaks can be
+copied into the file without escaping. Then pass the file directly to
+`web_ui.py`:
+
+```bash
+python3 web_ui.py statement.md
+```
+
+This sends the entire file directly to the proof author, exactly like enabling
+**Skip statement review** in Statement mode. It does not start an HTTP server or
+open a browser. With no command-line overrides, it uses the same defaults as the
+web UI: 4 critic rounds, a 24-hour author limit, Sol and Ultra for all proof
+roles, the built-in role prompts, and Fast generation speed.
+
+#### Optional settings
+
+Put overrides after the file or folder. The requested single-dash spelling,
+double-dash camelCase spelling, and conventional double-dash kebab-case spelling
+are all accepted. For example:
+
+```bash
+python3 web_ui.py statement.md -criticRounds 6 -thinkingHours 36
+python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standard
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `-criticRounds N` | `4` | Critic rounds per author proof; `1` to `100`. |
+| `-thinkingHours HOURS` | `24` | Total initial-author time limit; greater than `0` and at most `168`. |
+| `-authorModel MODEL` | `gpt-5.6-sol` | Author model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
+| `-criticModel MODEL` | `gpt-5.6-sol` | Critic model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
+| `-writerModel MODEL` | `gpt-5.6-sol` | LaTeX writer model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
+| `-reasoningEffort LEVEL` | `ultra` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. |
+| `-authorEffort LEVEL` | shared effort | Override only the author effort. |
+| `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
+| `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
+| `-speedMode MODE` | `fast` | `fast` for 1.5x generation or `standard` for normal speed. Fast uses credits at a higher rate. |
+| `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
+| `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
+| `-finalPromptFile PATH` | built-in prompt | Load a UTF-8 LaTeX prompt. |
+
+Prompt-file paths are resolved from the terminal's current working directory.
+Run `python3 web_ui.py --help` to see every spelling and allowed value.
+
+#### Parallel folder runs
+
+Passing a folder starts an independent proof for every top-level `.md` file in
+that folder:
+
+```bash
+python3 web_ui.py statements/
+python3 web_ui.py statements/ -criticRounds 6 -authorEffort max
+```
+
+The lookup is case-insensitive (`.md` and `.MD` both work), deterministic, and
+non-recursive. All matching files and shared settings are validated before any
+job starts. The jobs then run concurrently, and every override applies to every
+file. Be aware that a large folder can therefore use many simultaneous Codex
+jobs and credits.
+
+Public JSONL events are written to standard output. In folder mode, every event
+also has an `inputFile` field identifying its statement. Start, finish, and
+failure notices go to standard error. Each proof keeps its normal transcript and
+artifacts in a separate directory under `runs/`; a failed job does not cancel
+its siblings. The exit status is `0` when every proof succeeds, `1` for invalid
+input or any failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder
+jobs and their subprocess trees.
 
 Choose **Statement** to review or edit a rough problem before approval. Choose
 **Algorithmic** to specify the model of computation, problem description, and

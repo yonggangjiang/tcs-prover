@@ -307,6 +307,18 @@
           </section>
 
           <div class="run-actions">
+            <div id="authorTimeLimitControl" class="author-time-limit-control" hidden>
+              <span id="authorLimitSummary" class="author-limit-summary">
+                Author limit: 24 hours
+              </span>
+              <label for="authorLimitHours">Set limit to</label>
+              <input id="authorLimitHours" type="number" min="0.01"
+                max="168" step="0.5" value="24" inputmode="decimal">
+              <span>hours</span>
+              <button id="setAuthorTimeLimitButton" class="secondary compact">
+                Set limit
+              </button>
+            </div>
             <button id="stopButton" class="danger">Stop</button>
             <button id="homeButton" class="secondary">Return home</button>
           </div>
