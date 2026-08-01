@@ -1730,6 +1730,96 @@ class Handler(BaseHTTPRequestHandler):
 ACTIVE_PHASES = {"reviewing", "running", "stopping"}
 
 
+class ConciseHeadlessOutput:
+    """Print only headless workflow transitions and diagnostics."""
+
+    STAGE_NODES = {
+        "review": ("review", "Statement reviewer"),
+        "solve": ("author", "Proof author"),
+        "repair": ("author", "Proof author"),
+        "critic": ("critic", "Independent critic"),
+        "final": ("final", "LaTeX editor"),
+        "failure": ("failure", "Failure summary"),
+    }
+    IMPORTANT_STATUSES = {"Goal paused", "Pause not confirmed"}
+
+    def __init__(self, stream, lock, input_file):
+        self.stream, self.lock = stream, lock
+        self.input_file = input_file
+        self.node = None
+        self.critic_round = 0
+
+    @staticmethod
+    def _record(line):
+        """Parse one child line without exposing malformed payloads verbatim."""
+
+        try:
+            record = json.loads(line)
+            if isinstance(record, dict):
+                return record
+        except json.JSONDecodeError:
+            pass
+        detail = line.rstrip("\r\n")
+        if detail.lstrip().startswith(("{", "[")):
+            detail = "Malformed solver event."
+        return {"kind": "diagnostic", "text": detail}
+
+    def _message(self, record):
+        """Return one short terminal message, or None for verbose events."""
+
+        kind = record.get("kind")
+        if kind == "diagnostic":
+            detail = str(record.get("text", "")).strip()
+            if not detail:
+                return None
+            if detail.lower().startswith("error:"):
+                detail = detail[6:].strip()
+                return f"Error: {detail}"
+            return f"Diagnostic: {detail}"
+
+        if kind == "status" and record.get("label") in self.IMPORTANT_STATUSES:
+            label = record["label"]
+            detail = str(record.get("text", "")).strip()
+            return f"{label}: {detail}" if detail else label
+
+        if kind != "request":
+            return None
+        stage = record.get("stage")
+        step = self.STAGE_NODES.get(stage)
+        if step is None:
+            return None
+        node, title = step
+
+        # Every request to the critic is a new independent round. A replacement
+        # author proof resets that per-candidate count.
+        if node == "critic":
+            self.critic_round = self.critic_round + 1 if self.node == node else 1
+            self.node = node
+            return f"Current step: {title} (round {self.critic_round})"
+        if node == self.node:
+            return None
+        self.node = node
+        if node == "author":
+            self.critic_round = 0
+            if stage == "repair" and record.get("label"):
+                title = str(record["label"])
+        return f"Current step: {title}"
+
+    def write(self, line):
+        if not line:
+            return 0
+        message = self._message(self._record(line))
+        if message:
+            with self.lock:
+                self.stream.write(f"[{self.input_file}] {message}\n")
+                self.stream.flush()
+        return len(line)
+
+    def flush(self):
+        with self.lock:
+            self.stream.flush()
+
+
 class TaggedJsonlOutput:
     """Serialize one batch job's terminal events with its input filename."""
 
@@ -1867,7 +1957,8 @@ def _stop_headless_apps(apps):
 
 
 def run_headless_markdown(
-    path, runs=RUNS, output_stream=None, error_stream=None, **settings
+    path, runs=RUNS, output_stream=None, error_stream=None,
+    verbose_events=False, **settings
 ):
     """Run one Markdown proof or all top-level Markdown proofs in a folder."""
 
@@ -1881,10 +1972,15 @@ def run_headless_markdown(
     apps = []
     try:
         for source, statement in statements:
-            job_output = (
-                TaggedJsonlOutput(output_stream, output_lock, source.name)
-                if batch else output_stream
-            )
+            if verbose_events:
+                job_output = (
+                    TaggedJsonlOutput(output_stream, output_lock, source.name)
+                    if batch else output_stream
+                )
+            else:
+                job_output = ConciseHeadlessOutput(
+                    output_stream, output_lock, source.name
+                )
             app = App(runs=runs, output_stream=job_output)
             apps.append((source, app))
             app.start_direct_statement(statement=statement, **options)
@@ -1935,6 +2031,10 @@ def main():
         help="UTF-8 .md statement file or folder of top-level .md files",
     )
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--verbose-events", action="store_true",
+        help="print every public JSONL event during a Markdown terminal run",
+    )
     parser.add_argument(
         "-criticRounds", "--criticRounds", "--critic-rounds",
         dest="critic_rounds", type=int, default=DEFAULT_CRITIC_ROUNDS,
@@ -2006,6 +2106,7 @@ def main():
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
+                verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
             print(f"Cannot start headless proof: {exc}", file=sys.stderr)

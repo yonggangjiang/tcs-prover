@@ -777,7 +777,7 @@ class AppTests(unittest.TestCase):
         app._read_output(process)
         self.assertEqual(app.snapshot()["output"], "Complete answer")
 
-    def test_headless_solver_tees_public_jsonl_to_the_terminal(self):
+    def test_app_output_stream_receives_original_events_before_filtering(self):
         terminal = io.StringIO()
         app = web_ui.App(self.trace, output_stream=terminal)
         app.state["phase"] = "running"
@@ -793,7 +793,59 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(terminal.getvalue(), line)
 
-    def test_tagged_jsonl_output_identifies_each_batch_input(self):
+    def test_concise_headless_output_reports_only_steps_and_diagnostics(self):
+        terminal = io.StringIO()
+        output = web_ui.ConciseHeadlessOutput(
+            terminal, threading.Lock(), "alpha.md"
+        )
+        records = [
+            {
+                "kind": "request", "stage": "solve",
+                "label": "Exact solve input", "text": "SECRET PROMPT",
+            },
+            {
+                "kind": "request", "stage": "solve",
+                "label": "Goal continuation instruction", "text": "SECRET GOAL",
+            },
+            {
+                "kind": "codex_event", "stage": "solve",
+                "event": {"method": "item/reasoning", "text": "SECRET REASONING"},
+            },
+            {"kind": "request", "stage": "critic", "text": "SECRET CRITIC"},
+            {
+                "kind": "critic_result", "stage": "critic",
+                "text": "SECRET CRITIC RESULT",
+            },
+            {
+                "kind": "request", "stage": "repair",
+                "label": "Proof author revision 1", "text": "SECRET REPAIR",
+            },
+            {"kind": "request", "stage": "critic", "text": "SECRET CRITIC"},
+            {"kind": "request", "stage": "critic", "text": "SECRET CRITIC"},
+            {"kind": "request", "stage": "final", "text": "SECRET FINAL"},
+            {
+                "kind": "final_result", "stage": "final",
+                "output": "SECRET PROOF",
+            },
+            {"kind": "diagnostic", "stage": "final", "text": "error: disk full"},
+        ]
+        for record in records:
+            output.write(json.dumps(record) + "\n")
+        output.write('{"text":"SECRET MALFORMED"\n')
+
+        self.assertEqual(terminal.getvalue().splitlines(), [
+            "[alpha.md] Current step: Proof author",
+            "[alpha.md] Current step: Independent critic (round 1)",
+            "[alpha.md] Current step: Proof author revision 1",
+            "[alpha.md] Current step: Independent critic (round 1)",
+            "[alpha.md] Current step: Independent critic (round 2)",
+            "[alpha.md] Current step: LaTeX editor",
+            "[alpha.md] Error: disk full",
+            "[alpha.md] Diagnostic: Malformed solver event.",
+        ])
+        self.assertNotIn("SECRET", terminal.getvalue())
+
+    def test_verbose_jsonl_output_identifies_each_batch_input(self):
         terminal, lock = io.StringIO(), threading.Lock()
         output = web_ui.TaggedJsonlOutput(terminal, lock, "alpha.md")
 
@@ -835,9 +887,12 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         normalize.assert_called_once_with(thinking_hours=12, author_effort="high")
-        app_type.assert_called_once_with(
-            runs=folder / "runs", output_stream=output
-        )
+        app_type.assert_called_once()
+        app_output = app_type.call_args.kwargs["output_stream"]
+        self.assertIsInstance(app_output, web_ui.ConciseHeadlessOutput)
+        self.assertIs(app_output.stream, output)
+        self.assertEqual(app_output.input_file, "proof.md")
+        self.assertEqual(app_type.call_args.kwargs["runs"], folder / "runs")
         call = fake.start_direct_statement.call_args.kwargs
         self.assertEqual(call["statement"], "Exact theorem.\n")
         self.assertEqual(call["thinking_hours"], 12)
@@ -876,7 +931,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(app_type.call_count, 2)
         for call in app_type.call_args_list:
             self.assertIsInstance(
-                call.kwargs["output_stream"], web_ui.TaggedJsonlOutput
+                call.kwargs["output_stream"], web_ui.ConciseHeadlessOutput
             )
         self.assertEqual(
             first.start_direct_statement.call_args.kwargs["statement"],
@@ -947,6 +1002,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(call.kwargs["author_effort"], "high")
         self.assertEqual(call.kwargs["speed_mode"], "standard")
         self.assertEqual(call.kwargs["thinking_hours"], 24)
+        self.assertFalse(call.kwargs["verbose_events"])
         server.assert_not_called()
 
     def test_final_latex_replaces_the_working_solution(self):

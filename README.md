@@ -89,13 +89,16 @@ job starts. The jobs then run concurrently, and every override applies to every
 file. Be aware that a large folder can therefore use many simultaneous Codex
 jobs and credits.
 
-Public JSONL events are written to standard output. In folder mode, every event
-also has an `inputFile` field identifying its statement. Start, finish, and
-failure notices go to standard error. Each proof keeps its normal transcript and
-artifacts in a separate directory under `runs/`; a failed job does not cancel
-its siblings. The exit status is `0` when every proof succeeds, `1` for invalid
-input or any failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder
-jobs and their subprocess trees.
+Terminal output is concise by default: it reports only the current workflow
+step, diagnostics, errors, and the start/finish result for each input file.
+Prompts, model events, reasoning summaries, tool activity, and proof bodies are
+not printed. They remain available in each proof's complete `transcript.jsonl`
+and other artifacts under its separate directory in `runs/`. Pass
+`--verbose-events` to restore the full public JSONL event stream; folder events
+then include an `inputFile` field. A failed job does not cancel its siblings.
+The exit status is `0` when every proof succeeds, `1` for invalid input or any
+failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder jobs and
+their subprocess trees.
 
 Choose **Statement** to review or edit a rough problem before approval. Choose
 **Algorithmic** to specify the model of computation, problem description, and
