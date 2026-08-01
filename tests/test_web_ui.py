@@ -419,9 +419,59 @@ class AppTests(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         self.assertEqual(app.snapshot()["review"], report)
+        self.assertEqual(app.snapshot()["phase"], "reviewed")
         self.assertIn(
             "Rigorous", (self.trace.parent / "checked-statement.md").read_text()
         )
+
+    def test_statement_review_only_finishes_without_proof_stages(self):
+        app = self.app()
+        with mock.patch.object(web_ui.threading, "Thread"):
+            app.start_review(
+                "Rough theorem.",
+                author_model="unsupported-but-unused",
+                author_prompt="Unused prompt without a marker.",
+                critic_rounds=9,
+                thinking_hours=72,
+                review_only=True,
+            )
+
+        state = app.snapshot()
+        self.assertEqual(state["phase"], "reviewing")
+        self.assertTrue(state["statementReviewOnly"])
+        self.assertEqual(set(state["workflow"]["nodes"]), {"statement_reviewer"})
+        self.assertEqual(state["workflow"]["edges"], [])
+        self.assertEqual(state["criticRounds"], web_ui.DEFAULT_CRITIC_ROUNDS)
+        self.assertEqual(state["thinkingHours"], web_ui.DEFAULT_THINKING_HOURS)
+        self.assertTrue((self.trace.parent / "prompts/review.txt").exists())
+        self.assertFalse((self.trace.parent / "prompts/author.txt").exists())
+
+        report = {"statement": "Checked theorem.", "notes": "Now precise."}
+        process = SimpleNamespace(
+            stdin=mock.Mock(),
+            stdout=io.StringIO(json.dumps({
+                "kind": "review_result", "stage": "review", "review": report,
+            }) + "\n"),
+            wait=mock.Mock(return_value=0),
+            poll=mock.Mock(return_value=0),
+        )
+        with mock.patch.object(web_ui.subprocess, "Popen", return_value=process):
+            app._review("Rough theorem.", token=app.active_token)
+
+        state = app.snapshot()
+        self.assertEqual(state["phase"], "done")
+        self.assertEqual(state["review"], report)
+        self.assertEqual(state["output"], "Checked theorem.")
+        self.assertIn(
+            "Checked theorem.",
+            (self.trace.parent / "checked-statement.md").read_text(encoding="utf-8"),
+        )
+        with self.assertRaisesRegex(ValueError, "review only"):
+            app.approve()
+
+    def test_statement_review_only_requires_a_boolean(self):
+        with self.assertRaisesRegex(ValueError, "enabled or disabled"):
+            self.app().start_review("Draft.", review_only="true")
 
     def test_stop_before_review_attaches_preserves_visible_output(self):
         app = self.app()
@@ -1085,6 +1135,9 @@ class HttpTests(unittest.TestCase):
         self.assertIn('id="speedMode"', page)
         self.assertIn('id="skipStatementReview"', page)
         self.assertIn("Send the statement directly to the proof author", page)
+        self.assertIn('id="statementReviewOnly"', page)
+        self.assertIn("Statement review only", page)
+        self.assertIn("The proof\n                    author, critic, and LaTeX editor will not run", page)
         self.assertIn('value="standard"', page)
         self.assertIn('value="fast"', page)
         self.assertIn("Saved edits are reused for future jobs", page)
@@ -1113,6 +1166,21 @@ class HttpTests(unittest.TestCase):
         self.assertIn('request("/finalize"', script)
         self.assertIn('skipReview ? "/direct" : "/review"', script)
         self.assertIn("state.skipStatementReview", script)
+        self.assertIn("statementReviewOnly: reviewOnly", script)
+        self.assertIn(
+            'ui.workflowNodes.replaceChildren(makeNode("statement_reviewer", "1"))',
+            script,
+        )
+        self.assertIn("show(ui.approve, !reviewOnlyResult)", script)
+        self.assertIn(
+            "show(ui.authorModelSetting, !latexOnly && !reviewOnly)", script
+        )
+        self.assertIn(
+            "show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly)", script
+        )
+        self.assertIn(
+            "ui.skipStatementReview.checked = false", script
+        )
         self.assertIn("ui.workflowNodes.replaceChildren(branch)", script)
         self.assertIn("button.textContent = entry.name", script)
         self.assertIn("field.value = entry.description", script)
@@ -1175,6 +1243,7 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(state["phase"], "input")
         self.assertEqual(state["problemMode"], "statement")
         self.assertFalse(state["skipStatementReview"])
+        self.assertFalse(state["statementReviewOnly"])
         self.assertEqual(state["latexInput"], "")
         self.assertEqual(state["criticRounds"], 4)
         self.assertEqual(state["thinkingHours"], 24)
@@ -1236,6 +1305,23 @@ class HttpTests(unittest.TestCase):
             "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol",
             "high", speed_mode=web_ui.DEFAULT_SPEED,
         )
+
+    def test_review_endpoint_forwards_statement_review_only(self):
+        with mock.patch.object(self.server.app, "start_review") as start:
+            response, _ = self.post("/review", {
+                "statement": "draft", "statementReviewOnly": True,
+            })
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(start.call_args.kwargs["review_only"])
+
+    def test_review_endpoint_rejects_non_boolean_review_only(self):
+        response, body = self.post("/review", {
+            "statement": "draft", "statementReviewOnly": "true",
+        })
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("enabled or disabled", json.loads(body)["error"])
 
     def test_review_endpoint_forwards_role_efforts_and_prompts(self):
         values = {

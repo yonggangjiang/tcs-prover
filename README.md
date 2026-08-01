@@ -102,15 +102,19 @@ Choose **Statement** to review or edit a rough problem before approval. Choose
 asymptotic upper- or lower-bound goal; these fields go directly to the proof
 author without a statement-review step.
 **Advanced** controls each node's model, reasoning effort, prompt, author time
-limit, and critic-round limit. Jobs run in parallel. **Show details** displays
-the exact application prompts and returned model text. Private records and
-outputs are stored under `runs/`.
+limit, and critic-round limit. Its **Statement review only** option runs just the
+reviewer, saves the checked statement and reviewer notes, and finishes without
+starting the proof author, critic, or LaTeX editor. This option and **Skip
+statement review** are mutually exclusive. Jobs run in parallel. **Show
+details** displays the exact application prompts and returned model text.
+Private records and outputs are stored under `runs/`.
 
 ## Workflow
 
 ```mermaid
 flowchart LR
     S["Statement reviewer"] --> H{"Human approves?"}
+    S -- "review only" --> R["Checked statement and notes"]
     H -- "revise" --> S
     H -- "approve" --> A["Proof author"]
     I["Algorithmic setup: model + problem + goal"] --> A
@@ -125,7 +129,12 @@ flowchart LR
 ### 1. Statement reviewer
 
 This node lets the user start with convenient informal language while preventing
-a model from silently solving a different problem. 
+a model from silently solving a different problem. To use it without requesting
+a proof, open **Advanced**, enable **Statement review only**, and submit the
+statement. The completed result remains available to copy from the review page
+and is saved as `checked-statement.md` in that job's run directory. Only the
+reviewer model, reviewer reasoning effort, reviewer prompt, and generation speed
+apply in this mode.
 
 For example, graph-algorithm papers commonly write a bound such as
 `m log² n`. A literal model may object that `m` can be smaller than `n` and call

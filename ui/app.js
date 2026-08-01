@@ -35,6 +35,9 @@ const ui = {
   speedMode: $("speedMode"),
   skipReviewSetting: $("skipReviewSetting"),
   skipStatementReview: $("skipStatementReview"),
+  reviewOnlySetting: $("reviewOnlySetting"),
+  statementReviewOnly: $("statementReviewOnly"),
+  speedModeSetting: $("speedModeSetting"),
   criticRoundSetting: $("criticRoundSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
   editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
@@ -63,12 +66,15 @@ const ui = {
   activityToggle: $("activityToggle"), activityPanel: $("activityPanel"),
   activityClose: $("activityClose"),
   drawerScrim: $("drawerScrim"), activityList: $("activityList"),
-  reviewHeading: $("reviewHeading"),
+  reviewEyebrow: $("reviewEyebrow"), reviewHeading: $("reviewHeading"),
+  reviewDescription: $("reviewDescription"),
+  reviewFeedbackControls: $("reviewFeedbackControls"),
 };
 ui.problemModes = document.querySelectorAll('input[name="problemMode"]');
 
 let state = {
   phase: "input", problemMode: "statement", skipStatementReview: false,
+  statementReviewOnly: false,
   trace: [], traceVersion: 0,
   workflow: { nodes: {}, edges: [] },
 };
@@ -130,6 +136,7 @@ function clearJobView() {
   previousPhase = "";
   state = {
     phase: "input", problemMode: "statement", skipStatementReview: false,
+    statementReviewOnly: false,
     trace: [], traceVersion: 0,
     workflow: { nodes: {}, edges: [] },
   };
@@ -244,23 +251,27 @@ function selectedProblemMode() {
 function setProblemMode(mode) {
   const algorithmic = mode === "algorithmic";
   const latexOnly = mode === "latex";
-  const skipReview = !algorithmic && !latexOnly
+  const statement = !algorithmic && !latexOnly;
+  const reviewOnly = statement && ui.statementReviewOnly.checked;
+  if (reviewOnly) ui.skipStatementReview.checked = false;
+  const skipReview = statement && !reviewOnly
     && ui.skipStatementReview.checked;
   for (const input of ui.problemModes) input.checked = input.value === mode;
   show(ui.statementFields, !algorithmic && !latexOnly);
   show(ui.algorithmicFields, algorithmic);
   show(ui.latexFields, latexOnly);
-  show(ui.reviewModelSetting, !algorithmic && !latexOnly);
-  show(ui.authorModelSetting, !latexOnly);
-  show(ui.criticModelSetting, !latexOnly);
-  show(ui.writerModelSetting, true);
-  show(ui.reviewPromptTab, !algorithmic && !latexOnly);
-  show(ui.authorPromptTab, !latexOnly);
-  show(ui.criticPromptTab, !latexOnly);
-  show(ui.finalPromptTab, true);
-  show(ui.skipReviewSetting, !algorithmic && !latexOnly);
-  show(ui.criticRoundSetting, !latexOnly);
-  show(ui.thinkingHoursSetting, !latexOnly);
+  show(ui.reviewModelSetting, statement && !skipReview);
+  show(ui.authorModelSetting, !latexOnly && !reviewOnly);
+  show(ui.criticModelSetting, !latexOnly && !reviewOnly);
+  show(ui.writerModelSetting, !reviewOnly);
+  show(ui.reviewPromptTab, statement && !skipReview);
+  show(ui.authorPromptTab, !latexOnly && !reviewOnly);
+  show(ui.criticPromptTab, !latexOnly && !reviewOnly);
+  show(ui.finalPromptTab, !reviewOnly);
+  show(ui.skipReviewSetting, statement);
+  show(ui.reviewOnlySetting, statement);
+  show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
+  show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
   ui.problem.required = !algorithmic && !latexOnly;
   for (const field of [
     ui.modelOfComputation, ui.problemDescription, ui.goal,
@@ -268,18 +279,24 @@ function setProblemMode(mode) {
   ui.latexInput.required = latexOnly;
   ui.check.textContent = latexOnly ? "Polish LaTeX"
     : algorithmic ? "Start proof"
+    : reviewOnly ? "Review statement only"
     : skipReview ? "Start proof author" : "Check statement";
   ui.introDescription.textContent = latexOnly
     ? "Provide an existing theorem and proof. Only the final LaTeX editor will run."
     : algorithmic
     ? "Define the computational model, problem, and asymptotic goal. The proof "
       + "author will start immediately, followed by independent audit and LaTeX editing."
+    : reviewOnly
+      ? "Check and rewrite the statement, save the result and reviewer notes, then "
+        + "stop without starting the proof author."
     : skipReview
       ? "Enter the exact statement to send directly to the proof author, followed "
         + "by independent audit and LaTeX editing."
       : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
         + "solve it, audit it, and produce clean LaTeX.";
-  if (algorithmic && activePrompt === "review" && ui.promptDialog.open) {
+  if (reviewOnly && activePrompt !== "review" && ui.promptDialog.open) {
+    selectPrompt("review");
+  } else if (algorithmic && activePrompt === "review" && ui.promptDialog.open) {
     selectPrompt("author");
   }
   if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
@@ -331,6 +348,13 @@ function updateModelSummary() {
     : `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `;
   const speed = ui.speedMode.value === "standard"
     ? "Standard speed" : "Fast 1.5×";
+  const reviewOnly = selectedProblemMode() === "statement"
+    && ui.statementReviewOnly.checked;
+  if (reviewOnly) {
+    ui.modelSummary.textContent = `${speed} \u00b7 `
+      + `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review only`;
+    return;
+  }
   if (selectedProblemMode() === "latex") {
     ui.modelSummary.textContent = `${speed} · `
       + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
@@ -792,6 +816,10 @@ function renderWorkflow() {
     row.append(dot, copy);
     return row;
   };
+  if (state.statementReviewOnly) {
+    ui.workflowNodes.replaceChildren(makeNode("statement_reviewer", "1"));
+    return;
+  }
   if (latexOnly) {
     const editor = makeNode("latex_editor", "1");
     ui.workflowNodes.replaceChildren(editor);
@@ -888,9 +916,16 @@ function render(next) {
 
   const phase = state.phase;
   const working = ["reviewing", "running", "stopping"].includes(phase);
+  const reviewOnlyResult = phase === "done"
+    && state.statementReviewOnly && Boolean(state.review);
+  const reviewReady = phase === "reviewed" || reviewOnlyResult;
   show(ui.input, phase === "input");
-  show(ui.review, phase === "reviewed");
-  show(ui.run, ["reviewing", "running", "stopping", "done"].includes(phase));
+  show(ui.review, reviewReady);
+  show(
+    ui.run,
+    ["reviewing", "running", "stopping", "done"].includes(phase)
+      && !reviewOnlyResult,
+  );
   show(ui.workflowRail, phase !== "input");
   show(ui.activityToggle, Boolean(currentJob));
   ui.notice.textContent = state.error || "";
@@ -915,6 +950,7 @@ function render(next) {
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
     ui.speedMode.value = state.speedMode || "fast";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
+    ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 4;
@@ -925,7 +961,7 @@ function render(next) {
     ui.thinkingHours.max = hours.maximum || 168;
     setProblemMode(state.problemMode || "statement");
   }
-  if (phase === "reviewed" && (previousPhase !== "reviewed" || reviewPending)) {
+  if (reviewReady && (previousPhase !== phase || reviewPending)) {
     ui.reviewModel.value = state.reviewModel || "gpt-5.6-sol";
     ui.authorModel.value = state.authorModel || "gpt-5.6-sol";
     ui.criticModel.value = state.criticModel || "gpt-5.6-sol";
@@ -946,6 +982,19 @@ function render(next) {
     checkEdited();
     reviewPending = false;
   }
+
+  ui.reviewEyebrow.textContent = reviewOnlyResult
+    ? "REVIEW ONLY COMPLETE" : "REVIEW COMPLETE";
+  ui.reviewHeading.textContent = reviewOnlyResult
+    ? "Statement review complete" : "Approve the precise statement";
+  ui.reviewDescription.textContent = reviewOnlyResult
+    ? "The checked statement and reviewer notes are saved. No proof stages were started."
+    : "Edit it directly and approve it, or explain what should change and ask for "
+      + "another independent review.";
+  ui.proposed.readOnly = reviewOnlyResult;
+  show(ui.reviewFeedbackControls, !reviewOnlyResult);
+  show(ui.recheck, !reviewOnlyResult);
+  show(ui.approve, !reviewOnlyResult);
 
   const node = state.workflow?.nodes?.[state.activeNode] || {};
   const done = phase === "done";
@@ -987,7 +1036,7 @@ function render(next) {
   renderWorkflow();
   renderClock();
   if (phase !== previousPhase) {
-    const heading = phase === "reviewed" ? ui.reviewHeading
+    const heading = reviewReady ? ui.reviewHeading
       : (phase !== "input" ? ui.runTitle : null);
     heading?.focus({ preventScroll: true });
   }
@@ -1016,6 +1065,11 @@ async function refresh() {
 }
 
 function checkEdited() {
+  if (state.statementReviewOnly) {
+    ui.approve.disabled = true;
+    show(ui.editHint, false);
+    return;
+  }
   const edited = ui.proposed.value !== state.review?.statement;
   const hasFeedback = Boolean(ui.feedback.value.trim());
   ui.approve.disabled = hasFeedback || !ui.proposed.value.trim();
@@ -1028,7 +1082,8 @@ function checkEdited() {
 async function startReview(statement, feedback = "") {
   clearTimeout(timer);
   clearTimeout(jobsTimer);
-  const skipReview = !feedback && ui.skipStatementReview.checked;
+  const reviewOnly = !feedback && ui.statementReviewOnly.checked;
+  const skipReview = !reviewOnly && !feedback && ui.skipStatementReview.checked;
   if (!(skipReview ? promptValues.author : promptValues.review)) syncPrompts();
   reviewPending = !skipReview;
   const job = currentJob;
@@ -1049,6 +1104,7 @@ async function startReview(statement, feedback = "") {
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
       speedMode: ui.speedMode.value,
+      statementReviewOnly: reviewOnly,
     });
     if (job !== currentJob) return;
     currentJob = next.runId;
@@ -1200,7 +1256,14 @@ ui.authorEffort.onchange = updateModelSummary;
 ui.criticEffort.onchange = updateModelSummary;
 ui.writerEffort.onchange = updateModelSummary;
 ui.speedMode.onchange = updateModelSummary;
-ui.skipStatementReview.onchange = () => setProblemMode(selectedProblemMode());
+ui.skipStatementReview.onchange = () => {
+  if (ui.skipStatementReview.checked) ui.statementReviewOnly.checked = false;
+  setProblemMode(selectedProblemMode());
+};
+ui.statementReviewOnly.onchange = () => {
+  if (ui.statementReviewOnly.checked) ui.skipStatementReview.checked = false;
+  setProblemMode(selectedProblemMode());
+};
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }

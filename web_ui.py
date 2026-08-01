@@ -326,6 +326,17 @@ LATEX_GRAPH = {
     "edges": [],
 }
 
+REVIEW_ONLY_GRAPH = {
+    "settings": PUBLIC_GRAPH["settings"],
+    "nodes": {
+        "statement_reviewer": {
+            **PUBLIC_GRAPH["nodes"]["statement_reviewer"],
+            "description": "Produces and saves a checked statement, then stops.",
+        },
+    },
+    "edges": [],
+}
+
 
 def algorithmic_statement(model_of_computation, problem_description, goal):
     """Validate and combine the three fields that define an algorithmic task."""
@@ -357,6 +368,7 @@ def empty_state(trace=None, trace_version=0):
         "phase": "input",
         "problemMode": "statement",
         "skipStatementReview": False,
+        "statementReviewOnly": False,
         "draft": "",
         "modelOfComputation": "",
         "problemDescription": "",
@@ -661,11 +673,25 @@ class App:
         review_prompt=None, author_prompt=None,
         critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
+        review_only=False,
     ):
         """Start the review and return immediately so the page can poll."""
 
         statement = str(statement).strip()
         feedback = str(feedback or "").strip()
+        if not isinstance(review_only, bool):
+            raise ValueError("Statement review only must be enabled or disabled.")
+        if review_only:
+            # Proof-stage settings are irrelevant to this terminal workflow.
+            author_model = DEFAULT_AUTHOR_MODEL
+            critic_model = DEFAULT_CRITIC_MODEL
+            writer_model = DEFAULT_WRITER_MODEL
+            author_effort = DEFAULT_REASONING_EFFORT
+            critic_effort = DEFAULT_REASONING_EFFORT
+            writer_effort = DEFAULT_REASONING_EFFORT
+            author_prompt = critic_prompt = final_prompt = None
+            critic_rounds = DEFAULT_CRITIC_ROUNDS
+            thinking_hours = DEFAULT_THINKING_HOURS
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -695,7 +721,10 @@ class App:
                 self._new_run(statement)
                 if not self.fixed_trace:
                     self.pinned = []
-            for name in ("review", "author", "critic", "final"):
+            prompt_names = ("review",) if review_only else (
+                "review", "author", "critic", "final"
+            )
+            for name in prompt_names:
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             trace = self.state["trace"] if retry or self.fixed_trace else []
             version = self.state["traceVersion"] if retry or self.fixed_trace else 0
@@ -703,7 +732,9 @@ class App:
                 **empty_state(trace, version),
                 "phase": "reviewing",
                 "draft": statement,
+                "statementReviewOnly": review_only,
                 **options,
+                "workflow": REVIEW_ONLY_GRAPH if review_only else PUBLIC_GRAPH,
                 "activeNode": "statement_reviewer",
                 "stage": "review",
                 "startedAt": datetime.now(timezone.utc).isoformat(),
@@ -808,8 +839,15 @@ class App:
                     f"# Checked statement\n\n{report['statement']}\n\n"
                     f"# Reviewer notes\n\n{report['notes'] or 'None.'}\n",
                 )
-                # A completed review wins a stop/exit race.
-                self.state.update(phase="reviewed", review=report, error="", output="")
+                # A completed review wins a stop/exit race. Review-only jobs
+                # finish here and cannot enter the proof-author pipeline.
+                review_only = self.state.get("statementReviewOnly", False)
+                self.state.update(
+                    phase="done" if review_only else "reviewed",
+                    review=report,
+                    error="",
+                    output=report["statement"] if review_only else "",
+                )
             elif stopped:
                 self.state["phase"], self.state["error"] = "done", "Stopped."
                 self.state["output"] = self.state["output"] or (
@@ -1115,6 +1153,10 @@ class App:
         """Solve the reviewed statement, including any direct author edit."""
 
         with self.lock:
+            if self.state.get("statementReviewOnly", False):
+                raise ValueError(
+                    "This job was configured for statement review only."
+                )
             if self.state["phase"] != "reviewed":
                 raise ValueError("There is no reviewed statement to approve.")
             statement = self.state["review"]["statement"] if edited_statement is None else (
@@ -1355,6 +1397,10 @@ class Server(ThreadingHTTPServer):
             self.app if self.fixed_app else App(runs=self.runs)
         )
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        review_only_option = (
+            {"review_only": body.get("statementReviewOnly")}
+            if "statementReviewOnly" in body else {}
+        )
         new_settings = any(key in body for key in (
             "reviewEffort", "authorEffort", "criticEffort", "writerEffort",
             "reviewPrompt", "authorPrompt", "criticPrompt", "finalPrompt",
@@ -1371,6 +1417,7 @@ class Server(ThreadingHTTPServer):
                 body.get("writerModel", DEFAULT_WRITER_MODEL),
                 legacy_effort,
                 speed_mode=body.get("speedMode", DEFAULT_SPEED),
+                **review_only_option,
             )
             with self.jobs_lock:
                 self.jobs[app.state["runId"]] = app
@@ -1395,6 +1442,7 @@ class Server(ThreadingHTTPServer):
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
+            **review_only_option,
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app

@@ -199,7 +199,16 @@
                   <small>Send the statement directly to the proof author.</small>
                 </span>
               </label>
-              <div id="criticRoundSetting" class="round-setting">
+              <label id="reviewOnlySetting" class="advanced-toggle"
+                for="statementReviewOnly">
+                <input id="statementReviewOnly" type="checkbox">
+                <span>
+                  <strong>Statement review only</strong>
+                  <small>Check and rewrite the statement, then stop. The proof
+                    author, critic, and LaTeX editor will not run.</small>
+                </span>
+              </label>
+              <div id="speedModeSetting" class="round-setting">
                 <label for="speedMode">Generation speed</label>
                 <select id="speedMode" aria-describedby="speedHelp">
                   <option value="fast">Fast &mdash; 1.5&times; speed</option>
@@ -209,7 +218,7 @@
                   Fast is the default and uses credits at a higher rate.
                 </p>
               </div>
-              <div id="thinkingHoursSetting" class="round-setting">
+              <div id="criticRoundSetting" class="round-setting">
                 <label for="criticRounds">Critic round limit</label>
                 <input id="criticRounds" type="number" min="1" max="100"
                   step="1" value="4" aria-describedby="roundHelp">
@@ -219,7 +228,7 @@
                   a clean critic PASS.
                 </p>
               </div>
-              <div class="round-setting">
+              <div id="thinkingHoursSetting" class="round-setting">
                 <label for="thinkingHours">Author time limit (hours)</label>
                 <input id="thinkingHours" type="number" min="0.01" max="168"
                   step="0.25" value="24" aria-describedby="timeHelp">
@@ -248,25 +257,29 @@
 
         <!-- The author can edit or explain a rejected statement here. -->
         <section id="reviewPanel" class="review-view surface" hidden>
-          <p class="eyebrow">REVIEW COMPLETE</p>
+          <p id="reviewEyebrow" class="eyebrow">REVIEW COMPLETE</p>
           <h1 id="reviewHeading" tabindex="-1">Approve the precise statement</h1>
-          <p class="section-copy">Edit it directly and approve it, or explain what
-            should change and ask for another independent review.</p>
+          <p id="reviewDescription" class="section-copy">Edit it directly and
+            approve it, or explain what should change and ask for another
+            independent review.</p>
           <label for="proposed">Proposed statement</label>
           <textarea id="proposed" rows="14"></textarea>
           <div class="review-notes">
             <span>Reviewer notes</span>
             <p id="notes" class="notes"></p>
           </div>
-          <label for="feedback">Feedback for the next review <span>(optional)</span></label>
-          <textarea id="feedback" rows="4" aria-describedby="feedbackHelp"
-            placeholder="For example: keep the original time bound and clarify the graph model."></textarea>
-          <p id="feedbackHelp" class="help">
-            Feedback is editing guidance, not part of the statement.
-          </p>
-          <p id="editHint" class="hint" hidden>
-            Your edits will be approved exactly as written.
-          </p>
+          <div id="reviewFeedbackControls">
+            <label for="feedback">Feedback for the next review
+              <span>(optional)</span></label>
+            <textarea id="feedback" rows="4" aria-describedby="feedbackHelp"
+              placeholder="For example: keep the original time bound and clarify the graph model."></textarea>
+            <p id="feedbackHelp" class="help">
+              Feedback is editing guidance, not part of the statement.
+            </p>
+            <p id="editHint" class="hint" hidden>
+              Your edits will be approved exactly as written.
+            </p>
+          </div>
           <div class="actions">
             <button id="reviewHomeButton" class="ghost">Return home</button>
             <button id="recheckButton" class="secondary">Retry with feedback</button>
