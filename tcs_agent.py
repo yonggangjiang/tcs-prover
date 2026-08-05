@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -32,8 +33,9 @@ REVIEW_EFFORT = EFFORT
 # These values connect the approved statement to the user's prompt template.
 MARKER, TEMPLATE = "[STATEMENT]", ROOT / "prompt.txt"
 GOAL = "Complete the task supplied in the first turn and continue until done."
-DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
-DEFAULT_AUTHOR_HOURS, MAX_AUTHOR_HOURS = 24, 168
+DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 100, 100
+MAX_AUTHOR_HOURS = 168
+DEFAULT_AUTHOR_HOURS = MAX_AUTHOR_HOURS
 AUTHOR_LIMIT_POLL_SECONDS = 0.25
 INTERRUPT_GRACE_SECONDS = 30
 SUMMARY_GRACE_SECONDS = 300
@@ -162,9 +164,21 @@ def author_hours(value):
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
-        raise Error("The author time limit must be a number of hours.") from exc
+        raise Error("The total workflow time limit must be a number of hours.") from exc
     if not 0 < value <= MAX_AUTHOR_HOURS:
         raise Error(f"Choose more than 0 and at most {MAX_AUTHOR_HOURS} hours.")
+    return value
+
+
+def prior_elapsed_seconds(value):
+    """Require a finite nonnegative workflow runtime before the author starts."""
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise Error("The prior workflow runtime must be a number of seconds.") from exc
+    if not math.isfinite(value) or value < 0:
+        raise Error("The prior workflow runtime cannot be negative or infinite.")
     return value
 
 
@@ -447,10 +461,7 @@ def repair_prompt(statement, solution, bugs, round_number):
 
     return f"""
 The independent critic panel rejected candidate solution {round_number}.
-The critic already applied every fix it could do confidently. Fix every
-remaining bug below, then return a complete replacement solution rather than a
-patch or discussion. Do not change the problem statement. Recheck all affected
-steps and preserve correct details from the current candidate.
+The critic already applied every fix it could do confidently, but still have remaining bugs stated below.
 
 STATEMENT:
 {text(statement)}
@@ -576,7 +587,7 @@ def run_goal(
     writer_model=WRITER_MODEL, effort=EFFORT,
     author_effort=None, critic_effort=None, writer_effort=None,
     critic_prompt=CRITIC_PROMPT, final_prompt=FINAL_PROMPT,
-    speed=DEFAULT_SPEED, author_limit_file=None,
+    speed=DEFAULT_SPEED, author_limit_file=None, elapsed_seconds=0,
 ):
     """Solve, require a clean critic pass, then LaTeX-edit the result."""
 
@@ -591,6 +602,7 @@ def run_goal(
     critic_effort = chosen_effort(critic_effort or effort)
     writer_effort = chosen_effort(writer_effort or effort)
     speed = chosen_speed(speed)
+    elapsed_seconds = prior_elapsed_seconds(elapsed_seconds)
     emit(
         "request", "solve", label="Exact solve input", text=prompt,
         model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
@@ -663,15 +675,20 @@ def run_goal(
         rpc.call("thread/goal/set", {**goal, "status": "active"})
         current_turn = {"id": (started_turn.get("turn") or {}).get("id")}
         timed_out, stop_timer = threading.Event(), threading.Event()
+        author_active = threading.Event()
+        author_active.set()
         deadline_lock = threading.Lock()
-        deadline_started = time.monotonic()
+        # The web UI passes the runtime already shown by its elapsed clock, so
+        # review and approval time count toward the same total. Direct/headless
+        # callers leave this at zero and start counting here.
+        deadline_started = time.monotonic() - elapsed_seconds
         deadline_state = {
             "hours": thinking_hours,
             "at": deadline_started + thinking_hours * 3600,
         }
 
         def refresh_deadline():
-            """Apply the latest total author limit from the web control file."""
+            """Apply the latest total workflow limit from the web control file."""
 
             hours = controlled_author_hours(
                 author_limit_file, deadline_state["hours"]
@@ -680,7 +697,17 @@ def run_goal(
                 deadline_state["hours"] = hours
                 deadline_state["at"] = deadline_started + hours * 3600
 
-        # Pause Goal mode first, then interrupt the active author turn.
+        def deadline_expired():
+            """Refresh the live limit and report whether total time is spent."""
+
+            with deadline_lock:
+                refresh_deadline()
+                expired = time.monotonic() >= deadline_state["at"]
+                if expired:
+                    timed_out.set()
+                return expired
+
+        # At the deadline, interrupt an author but allow a critic to finish.
         def enforce_deadline():
             # Short waits let a live limit change take effect promptly. They also
             # avoid one Windows wait whose timeout stops counting during sleep.
@@ -690,26 +717,29 @@ def run_goal(
                     remaining = deadline_state["at"] - time.monotonic()
                     if remaining <= 0:
                         timed_out.set()
-                        try:
-                            rpc.request("thread/goal/set", {
-                                **goal, "status": "paused",
-                            })
-                        except (Error, OSError):
-                            pass
-                        turn_id = current_turn["id"]
-                        if turn_id:
+                        if author_active.is_set():
                             try:
-                                rpc.request("turn/interrupt", {
-                                    "threadId": thread, "turnId": turn_id,
+                                rpc.request("thread/goal/set", {
+                                    **goal, "status": "paused",
                                 })
                             except (Error, OSError):
                                 pass
+                            turn_id = current_turn["id"]
+                            if turn_id:
+                                try:
+                                    rpc.request("turn/interrupt", {
+                                        "threadId": thread, "turnId": turn_id,
+                                    })
+                                except (Error, OSError):
+                                    pass
                         break
                 if stop_timer.wait(min(AUTHOR_LIMIT_POLL_SECONDS, remaining)):
                     return
-            # If interruption itself hangs, unblock the reader for a fallback.
+            # A critic is allowed to run past the deadline. Only a stuck author
+            # interruption may force-stop the persistent app server.
             if (
-                not stop_timer.wait(INTERRUPT_GRACE_SECONDS)
+                author_active.is_set()
+                and not stop_timer.wait(INTERRUPT_GRACE_SECONDS)
                 and process.poll() is None
             ):
                 process.terminate()
@@ -718,7 +748,10 @@ def run_goal(
         timer.start()
         emit(
             "status", "solve", label="Goal started",
-            text=f"Thread {thread}; author limit {thinking_hours:g} hours.",
+            text=(
+                f"Thread {thread}; total workflow limit {thinking_hours:g} "
+                f"hours; {elapsed_seconds:g} seconds already elapsed."
+            ),
             threadId=thread,
         )
 
@@ -808,22 +841,26 @@ def run_goal(
             } and not running:
                 break
 
-        stop_timer.set()
-        if timed_out.is_set() or status in {
-            "turnFailed", "usageLimited", "budgetLimited"
-        }:
-            with deadline_lock:
-                final_author_hours = deadline_state["hours"]
-            reason = (
-                f"The {final_author_hours:g}-hour author limit was reached."
-                if timed_out.is_set()
-                else f"The author stopped because its state became {status}."
-            )
+        # Close the polling race where an author answer arrives just after the
+        # deadline but before the timer thread observes it.
+        deadline_expired()
+        author_active.clear()
+        current_turn["id"] = None
+
+        def summarize_failure(reason, previous=""):
+            """Ask the persistent author thread to preserve unfinished work."""
+
+            nonlocal stage
+            stop_timer.set()
+            author_active.clear()
+            current_turn["id"] = None
             try:
                 rpc.call("thread/goal/set", {**goal, "status": "paused"})
             except (Error, OSError):
                 pass
-            previous = answers[-1] if answers else last_author_output
+            previous = previous or (
+                answers[-1] if answers else last_author_output
+            )
             stage, answers[:] = "failure", []
             summary_prompt = f"{FAILURE_SUMMARY_PROMPT}\n\nSTOP REASON:\n{reason}"
             emit(
@@ -833,7 +870,8 @@ def run_goal(
                 serviceTier=speed,
                 reasoningSummary="detailed",
             )
-            summary_stop, summary_expired = threading.Event(), threading.Event()
+            summary_stop = threading.Event()
+            summary_expired = threading.Event()
             try:
                 summary_turn = rpc.call("turn/start", {
                     "threadId": thread,
@@ -881,10 +919,23 @@ def run_goal(
                 if previous else f"{reason}\n\nNo complete solution was produced."
             )
             emit(
-                "failure_result", "failure", label="Author failure summary",
+                "failure_result", "failure", label="Workflow failure summary",
                 text=summary, output=summary,
             )
             return summary
+
+        if timed_out.is_set() or status in {
+            "turnFailed", "usageLimited", "budgetLimited"
+        }:
+            with deadline_lock:
+                final_author_hours = deadline_state["hours"]
+            reason = (
+                f"The {final_author_hours:g}-hour total workflow limit was reached "
+                "while the proof author was running."
+                if timed_out.is_set()
+                else f"The author stopped because its state became {status}."
+            )
+            return summarize_failure(reason)
 
         emit(
             "status", "solve", label="Goal complete",
@@ -925,6 +976,15 @@ def run_goal(
                 )
             else:
                 # Only unresolved bugs return to the persistent author thread.
+                if deadline_expired():
+                    with deadline_lock:
+                        final_author_hours = deadline_state["hours"]
+                    return summarize_failure(
+                        f"The {final_author_hours:g}-hour total workflow limit "
+                        "was reached while the critic was running. The rejected "
+                        "candidate cannot be returned to the proof author.",
+                        previous=solution,
+                    )
                 revision_number += 1
                 instruction = repair_prompt(
                     statement, solution, report["bugs"], revision_number
@@ -939,23 +999,48 @@ def run_goal(
                     reasoningSummary="detailed",
                     node="author", round=0,
                 )
-                rpc.call("turn/start", {
+                author_active.set()
+                revision_turn = rpc.call("turn/start", {
                     "threadId": thread,
                     "input": [{"type": "text", "text": instruction}],
                     "summary": "detailed",
                 })
+                current_turn["id"] = (
+                    revision_turn.get("turn") or {}
+                ).get("id")
+                if deadline_expired() and current_turn["id"]:
+                    rpc.request("turn/interrupt", {
+                        "threadId": thread, "turnId": current_turn["id"],
+                    })
+                turn_status = None
                 while True:
-                    message = rpc.read()
+                    try:
+                        message = rpc.read()
+                    except Error:
+                        if timed_out.is_set():
+                            break
+                        raise
                     params = message.get("params", {})
                     if params.get("threadId") not in {None, thread}:
                         continue
                     if message.get("method") == "turn/completed":
                         turn_status = (params.get("turn") or {}).get("status")
-                        if turn_status != "completed":
+                        current_turn["id"] = None
+                        if turn_status != "completed" and not timed_out.is_set():
                             raise Error(
                                 f"Proof author revision {turn_status}; thread {thread}."
                             )
                         break
+                author_active.clear()
+                current_turn["id"] = None
+                if deadline_expired():
+                    with deadline_lock:
+                        final_author_hours = deadline_state["hours"]
+                    return summarize_failure(
+                        f"The {final_author_hours:g}-hour total workflow limit "
+                        "was reached while the proof author was revising a "
+                        "critic-rejected candidate."
+                    )
                 if not answers:
                     raise Error("The proof author returned no replacement solution.")
                 solution = answers[-1]
@@ -989,6 +1074,9 @@ def run_goal(
                 "author candidate without a clean pass."
             )
 
+        # A clean critic pass exits the timed author/critic loop. LaTeX editing
+        # is allowed to finish even when that pass arrived after the limit.
+        stop_timer.set()
         final_options = {"model": writer_model, "effort": writer_effort}
         if final_prompt != FINAL_PROMPT:
             final_options["instructions"] = final_prompt
@@ -1045,6 +1133,7 @@ def main():
     parser.add_argument("--critic-prompt-file")
     parser.add_argument("--final-prompt-file")
     parser.add_argument("--author-limit-file")
+    parser.add_argument("--elapsed-seconds", type=float, default=0)
     args = parser.parse_args()
     action = args.action
     try:
@@ -1097,6 +1186,8 @@ def main():
                 {"author_limit_file": args.author_limit_file}
                 if args.author_limit_file else {}
             )
+            if args.elapsed_seconds:
+                limit_option["elapsed_seconds"] = args.elapsed_seconds
             if any((
                 args.author_effort, args.critic_effort, args.writer_effort,
                 args.critic_prompt_file, args.final_prompt_file,

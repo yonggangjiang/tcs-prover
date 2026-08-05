@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCS Prover · Transcript Explorer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">TCS</span>
+      <div>
+        <p>PROOF WORKBENCH</p>
+        <h1>Transcript Explorer</h1>
+      </div>
+    </div>
+    <div class="run-state">
+      <span id="liveDot" class="live-dot"></span>
+      <span id="loadState">Opening transcript…</span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <aside class="sidebar" aria-label="Transcript controls">
+      <section class="run-card">
+        <p class="eyebrow">CURRENT RUN</p>
+        <h2 id="runName">Loading…</h2>
+        <p id="runPath" class="run-path"></p>
+        <div class="metrics">
+          <div><strong id="elapsed">—</strong><span>elapsed</span></div>
+          <div><strong id="entryCount">0</strong><span>entries loaded</span></div>
+          <div><strong id="fileSize">—</strong><span>source size</span></div>
+        </div>
+      </section>
+
+      <section class="control-group">
+        <div class="section-title">
+          <h3>Workflow</h3>
+          <button id="allStages" class="text-button" type="button">Show all</button>
+        </div>
+        <div id="stageList" class="stage-list"></div>
+      </section>
+
+      <section class="control-group">
+        <h3>Activity types</h3>
+        <div id="categoryList" class="category-list"></div>
+      </section>
+
+      <section class="control-group options">
+        <label><input id="rootOnly" type="checkbox"> Root model only</label>
+        <label><input id="compactMode" type="checkbox"> Compact cards</label>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <div class="hero">
+        <div>
+          <p class="eyebrow">PUBLIC MODEL ACTIVITY</p>
+          <h2>What the proof system tried</h2>
+          <p>Reasoning summaries, proof messages, delegated work, critic checks,
+            and outcomes—organized in execution order.</p>
+        </div>
+        <label class="search-box">
+          <span>Search transcript</span>
+          <input id="search" type="search" placeholder="lemma, counterexample, agent, bug…">
+        </label>
+      </div>
+
+      <div class="timeline-toolbar">
+        <p id="visibleSummary">No entries loaded yet.</p>
+        <button id="jumpLatest" class="secondary" type="button">Jump to latest</button>
+      </div>
+
+      <ol id="timeline" class="timeline" aria-live="polite"></ol>
+
+      <div id="emptyState" class="empty-state" hidden>
+        <strong>No activity matches these filters.</strong>
+        <span>Try another stage, activity type, or search term.</span>
+      </div>
+
+      <div class="load-row">
+        <button id="loadMore" type="button">Pause full-file loading</button>
+        <div class="scan-status">
+          <div class="scan-track" aria-hidden="true"><span id="scanBar"></span></div>
+          <span id="scanProgress">Preparing full transcript…</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <template id="entryTemplate">
+    <li class="entry-card">
+      <div class="entry-rail"><span></span></div>
+      <article>
+        <header class="entry-head">
+          <div class="entry-title-row">
+            <span class="category-badge"></span>
+            <h3></h3>
+            <span class="verdict-badge" hidden></span>
+          </div>
+          <div class="entry-meta">
+            <span class="stage-name"></span>
+            <span class="actor"></span>
+            <time></time>
+          </div>
+        </header>
+        <div class="model-meta" hidden></div>
+        <div class="entry-body"></div>
+        <ul class="critic-checks"></ul>
+      </article>
+    </li>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>

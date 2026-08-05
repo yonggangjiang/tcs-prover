@@ -229,12 +229,13 @@
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
-                <label for="thinkingHours">Author time limit (hours)</label>
+                <label for="thinkingHours">Total workflow time limit (hours)</label>
                 <input id="thinkingHours" type="number" min="0.01" max="168"
-                  step="0.25" value="24" aria-describedby="timeHelp">
+                  step="0.25" value="168" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
-                  Default 24 hours. Blocked attempts continue until this limit;
-                  then the author stops and returns a failure summary.
+                  Default 168 hours. This uses the elapsed clock at the top. At
+                  the limit an active author stops; an active critic finishes,
+                  but a rejection cannot start another author revision.
                 </p>
               </div>
             </details>
@@ -322,11 +323,11 @@
           <div class="run-actions">
             <div id="authorTimeLimitControl" class="author-time-limit-control" hidden>
               <span id="authorLimitSummary" class="author-limit-summary">
-                Author limit: 24 hours
+                Total limit: 168 hours
               </span>
               <label for="authorLimitHours">Set limit to</label>
               <input id="authorLimitHours" type="number" min="0.01"
-                max="168" step="0.5" value="24" inputmode="decimal">
+                max="168" step="0.5" value="168" inputmode="decimal">
               <span>hours</span>
               <button id="setAuthorTimeLimitButton" class="secondary compact">
                 Set limit

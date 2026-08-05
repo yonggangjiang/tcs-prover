@@ -30,8 +30,9 @@ UI = ROOT / "ui"
 RUNS = ROOT / "runs"
 ALGORITHMIC = ROOT / "algorithmic"
 HOST, PORT = "127.0.0.1", 8765
-DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 4, 100
-DEFAULT_THINKING_HOURS, MAX_THINKING_HOURS = 24, 168
+DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 100, 100
+MAX_THINKING_HOURS = 168
+DEFAULT_THINKING_HOURS = MAX_THINKING_HOURS
 MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 SPEEDS, DEFAULT_SPEED = tcs_agent.SPEEDS, tcs_agent.DEFAULT_SPEED
@@ -257,7 +258,7 @@ PUBLIC_GRAPH = {
         "failure_summary": {
             "label": "Failure summary", "short_label": "Summary",
             "stage": "failure",
-            "description": "Preserves progress when the author time limit is reached.",
+            "description": "Preserves progress when total time expires at an author step.",
         },
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
@@ -282,7 +283,7 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "author", "to": "failure_summary",
-            "label": "Summarize failure", "when": "author time limit is reached",
+            "label": "Summarize failure", "when": "total time expires at the author",
             "prompt_change": "Stop solving and summarize progress and obstacles.",
         },
         {
@@ -460,7 +461,7 @@ class App:
         path.chmod(0o600)
 
     def _write_author_limit(self, hours):
-        """Atomically publish the total author limit to the active solver."""
+        """Atomically publish the total workflow limit to the active solver."""
 
         path = self.run_dir / AUTHOR_LIMIT_FILENAME
         temporary = path.with_name(f".{AUTHOR_LIMIT_FILENAME}.tmp")
@@ -632,7 +633,7 @@ class App:
         try:
             thinking_hours = float(thinking_hours)
         except (TypeError, ValueError) as exc:
-            raise ValueError("The author time limit must be a number.") from exc
+            raise ValueError("The total workflow time limit must be a number.") from exc
         if not 0 < thinking_hours <= MAX_THINKING_HOURS:
             raise ValueError(
                 f"Choose more than 0 and at most {MAX_THINKING_HOURS} hours."
@@ -863,6 +864,15 @@ class App:
         author_limit_file = self._write_author_limit(
             self.state["thinkingHours"]
         )
+        try:
+            started_at = datetime.fromisoformat(self.state["startedAt"])
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            elapsed_seconds = max(
+                0.0, (datetime.now(timezone.utc) - started_at).total_seconds()
+            )
+        except (KeyError, TypeError, ValueError):
+            elapsed_seconds = 0.0
         process = subprocess.Popen(
             [
                 sys.executable, "-u", str(ROOT / "tcs_agent.py"), "solve",
@@ -881,6 +891,7 @@ class App:
                 "--final-prompt-file",
                 str(self.run_dir / "prompts/final.txt"),
                 "--author-limit-file", str(author_limit_file),
+                "--elapsed-seconds", str(elapsed_seconds),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1321,25 +1332,25 @@ class App:
                 )
 
     def set_author_time_limit(self, hours):
-        """Replace the live proof-author deadline with a chosen total."""
+        """Replace the live total-workflow deadline with a chosen total."""
 
         try:
             hours = float(hours)
         except (TypeError, ValueError) as exc:
-            raise ValueError("The author limit must be a number of hours.") from exc
+            raise ValueError("The total time limit must be a number of hours.") from exc
         if not 0 < hours <= MAX_THINKING_HOURS:
             raise ValueError(
-                f"Set the author limit above 0 and at most "
+                f"Set the total time limit above 0 and at most "
                 f"{MAX_THINKING_HOURS} hours."
             )
         with self.lock:
             if not (
                 self.state["phase"] == "running"
-                and self.state["stage"] == "solve"
                 and self.state["activeNode"] == "author"
+                and self.state["stage"] in {"solve", "repair"}
             ):
                 raise ValueError(
-                    "Author time can only be extended while the initial proof "
+                    "The total time limit can only be changed while the proof "
                     "author is running."
                 )
             if self.process is None or self.process.poll() is not None:
@@ -1348,9 +1359,9 @@ class App:
             self._write_author_limit(hours)
             self.state["thinkingHours"] = hours
             self.add_trace({
-                "kind": "status", "stage": "solve", "node": "author",
-                "label": "Author time limit set",
-                "text": f"The author time limit is now {hours:g} hours.",
+                "kind": "status", "stage": self.state["stage"], "node": "author",
+                "label": "Total time limit set",
+                "text": f"The total workflow time limit is now {hours:g} hours.",
                 "authorLimitHours": hours,
             })
             return hours
@@ -2047,7 +2058,7 @@ def main():
         "-thinkingHours", "--thinkingHours", "--thinking-hours",
         dest="thinking_hours", type=float, default=DEFAULT_THINKING_HOURS,
         metavar="HOURS",
-        help=f"total author time limit (default: {DEFAULT_THINKING_HOURS})",
+        help=f"total elapsed-workflow limit (default: {DEFAULT_THINKING_HOURS})",
     )
     model_defaults = {
         "author": DEFAULT_AUTHOR_MODEL,

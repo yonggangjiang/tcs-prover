@@ -810,7 +810,7 @@ function renderWorkflow() {
     if (name === "failure_summary") {
       const condition = document.createElement("span");
       condition.className = "failure-condition";
-      condition.textContent = "At time limit";
+      condition.textContent = "At total time limit";
       copy.append(condition);
     }
     row.append(dot, copy);
@@ -848,7 +848,7 @@ function renderWorkflow() {
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
     "aria-label",
-    `At the time limit, step ${startsAtAuthor ? 1 : 2} stops and returns a failure summary`,
+    "At the total time limit, an active author stops; an active critic finishes, but rejection returns a failure summary",
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";
@@ -956,7 +956,7 @@ function render(next) {
     ui.criticRounds.value = state.criticRounds || 4;
     ui.criticRounds.min = rounds.minimum || 1;
     ui.criticRounds.max = rounds.maximum || 100;
-    ui.thinkingHours.value = state.thinkingHours || 24;
+    ui.thinkingHours.value = state.thinkingHours || 168;
     ui.thinkingHours.min = hours.minimum || 0.01;
     ui.thinkingHours.max = hours.maximum || 168;
     setProblemMode(state.problemMode || "statement");
@@ -978,7 +978,7 @@ function render(next) {
     appendFormattedText(ui.notes, state.review.notes);
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 4;
-    ui.thinkingHours.value = state.thinkingHours || 24;
+    ui.thinkingHours.value = state.thinkingHours || 168;
     checkEdited();
     reviewPending = false;
   }
@@ -1013,17 +1013,17 @@ function render(next) {
       : (node.description || ""));
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
-  const authorLimit = Number(state.thinkingHours || 24);
+  const authorLimit = Number(state.thinkingHours || 168);
   const maximumAuthorLimit = Number(
     state.workflow?.settings?.thinking_hours?.maximum || 168
   );
   const canSetAuthorLimit = phase === "running"
-    && state.stage === "solve" && state.activeNode === "author";
+    && ["solve", "repair"].includes(state.stage) && state.activeNode === "author";
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
   const authorLimitText = authorLimit.toLocaleString(undefined, {
     maximumFractionDigits: 2,
   });
-  ui.authorLimitSummary.textContent = `Author limit: ${authorLimitText} hours`;
+  ui.authorLimitSummary.textContent = `Total limit: ${authorLimitText} hours`;
   ui.authorLimitHours.max = String(maximumAuthorLimit);
   if (canSetAuthorLimit && document.activeElement !== ui.authorLimitHours) {
     ui.authorLimitHours.value = String(authorLimit);

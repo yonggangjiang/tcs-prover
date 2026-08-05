@@ -40,7 +40,7 @@ python3 web_ui.py statement.md
 This sends the entire file directly to the proof author, exactly like enabling
 **Skip statement review** in Statement mode. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
-web UI: 4 critic rounds, a 24-hour author limit, Sol and Ultra for all proof
+web UI: 4 critic rounds, a 168-hour total workflow limit, Sol and Ultra for all proof
 roles, the built-in role prompts, and Fast generation speed.
 
 #### Optional settings
@@ -57,7 +57,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-criticRounds N` | `4` | Critic rounds per author proof; `1` to `100`. |
-| `-thinkingHours HOURS` | `24` | Total initial-author time limit; greater than `0` and at most `168`. |
+| `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. It interrupts an active author, but not an active critic or the final LaTeX editor. |
 | `-authorModel MODEL` | `gpt-5.6-sol` | Author model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
 | `-criticModel MODEL` | `gpt-5.6-sol` | Critic model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
 | `-writerModel MODEL` | `gpt-5.6-sol` | LaTeX writer model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
@@ -100,11 +100,45 @@ The exit status is `0` when every proof succeeds, `1` for invalid input or any
 failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder jobs and
 their subprocess trees.
 
+#### Read a transcript as a human narrative
+
+`transcript.jsonl` is the complete machine-readable event log and is deliberately
+verbose. The local browser viewer organizes workflow stages, public reasoning
+summaries, model messages, subagent/tool activity, critic checks, and final or
+failure results without app-server protocol noise:
+
+```bash
+python3 view_transcript.py runs/2026-08-03_16-20-24_example/
+python3 view_transcript.py runs/2026-08-03_16-20-24_example/transcript.jsonl
+python3 view_transcript.py                                 # newest run
+```
+
+The UI provides stage and activity filters, full-text search, root-only and
+compact views, expandable long entries, critic verdict cards, automatic
+full-file loading with pause/resume, and live updates. It binds only to local
+host and protects its local API with a random per-launch token.
+
+For terminal or file output, use the text mode:
+
+```bash
+python3 view_transcript.py RUN --text
+python3 view_transcript.py RUN --text --follow
+python3 view_transcript.py RUN --output readable.txt
+```
+
+In text mode, prompt bodies are hidden by default because they are long; add
+`--prompts` to show them. Use `--stage solve`, `--stage critic`, `--root-only`,
+`--no-tools`, or `--max-text 0` to adjust the view. Run
+`python3 view_transcript.py --help` for all options. Both views display the
+public reasoning summaries retained by TCS Prover, not private chain-of-thought.
+They read incrementally, so even very large transcripts do not need to fit in
+memory.
+
 Choose **Statement** to review or edit a rough problem before approval. Choose
 **Algorithmic** to specify the model of computation, problem description, and
 asymptotic upper- or lower-bound goal; these fields go directly to the proof
 author without a statement-review step.
-**Advanced** controls each node's model, reasoning effort, prompt, author time
+**Advanced** controls each node's model, reasoning effort, prompt, workflow time
 limit, and critic-round limit. Its **Statement review only** option runs just the
 reviewer, saves the checked statement and reviewer notes, and finishes without
 starting the proof author, critic, or LaTeX editor. This option and **Skip
@@ -163,7 +197,12 @@ The author uses the durable-state, multi-agent prompt adapted from OpenAI's
 [Cycle Double Cover prompt](https://cdn.openai.com/pdf/04d1d1e4-bc75-476a-97cf-49055cd98d31/cdc_prompt.pdf).
 
 The author keeps the Goal active: a blocked or prematurely ended author turn is
-continued until it returns a solution or reaches the user-set time limit.
+continued until it returns a solution or reaches the user-set total elapsed-time
+limit. The web limit uses the same clock displayed at the top of the page, so
+statement review and approval time count too. If the limit expires during a
+critic round, that critic work continues; a clean pass proceeds to LaTeX, while
+a rejection goes to the failure-summary node instead of starting another author
+revision.
 
 ### 3. Independent critic
 
