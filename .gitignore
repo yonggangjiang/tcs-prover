@@ -1,5 +1,6 @@
 # Private problem records and model transcripts
 runs/
+.codex-structured-workspace/
 
 # Python
 __pycache__/
