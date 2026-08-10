@@ -131,7 +131,7 @@ CRITIC_SCHEMA = {
         },
     },
     "required": [
-        "checks", "verdict", "fixed", "solution", "bugs",
+        "checks", "verdict", "fixed", "solution", "bugs", "memory_update",
     ],
     "additionalProperties": False,
 }

@@ -137,8 +137,8 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
                 )
 
     @staticmethod
-    def _passing_critic_report(memory_update_marker=None):
-        report = {
+    def _passing_critic_report():
+        return {
             "checks": [
                 {"focus": f"check {index}", "verdict": "pass", "report": "ok"}
                 for index in range(3)
@@ -147,41 +147,46 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
             "fixed": False,
             "solution": "complete proof",
             "bugs": "",
+            "memory_update": {
+                "approach_family": "induction",
+                "approach_result": "verified",
+                "blocked_routes": [],
+                "unresolved_obligations": [],
+            },
         }
-        if memory_update_marker is not None:
-            report["memory_update"] = memory_update_marker
-        return report
 
-    def test_critic_prompt_hides_round_number_and_memory_update_is_optional(self):
+    def test_critic_schema_requires_every_declared_property(self):
+        def check(schema):
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+                self.assertEqual(set(schema.get("required", [])), set(properties))
+                for value in properties.values():
+                    check(value)
+            if schema.get("type") == "array":
+                check(schema.get("items", {}))
+
+        check(tcs_agent.CRITIC_SCHEMA)
+
+    def test_critic_prompt_hides_round_number_and_requests_memory_update(self):
         round_number = 8675309
-        valid_update = {
-            "approach_family": "induction",
-            "approach_result": "verified",
-            "blocked_routes": [],
-            "unresolved_obligations": [],
-        }
-        self.assertNotIn("memory_update", tcs_agent.CRITIC_SCHEMA["required"])
+        report = self._passing_critic_report()
+        with mock.patch.object(
+            tcs_agent, "structured", return_value=(report, json.dumps(report)),
+        ) as mocked_structured, mock.patch.object(tcs_agent, "emit"):
+            returned = tcs_agent.criticize(
+                "exact theorem", "candidate proof", round_number,
+            )
 
-        for marker in (None, valid_update):
-            with self.subTest(memory_update=marker is not None):
-                report = self._passing_critic_report(marker)
-                with mock.patch.object(
-                    tcs_agent, "structured", return_value=(report, json.dumps(report)),
-                ) as mocked_structured, mock.patch.object(tcs_agent, "emit"):
-                    returned = tcs_agent.criticize(
-                        "exact theorem", "candidate proof", round_number,
-                    )
-
-                self.assertIs(returned, report)
-                mocked_structured.assert_called_once()
-                prompt, schema, stage = mocked_structured.call_args.args
-                self.assertIs(schema, tcs_agent.CRITIC_SCHEMA)
-                self.assertEqual(stage, "critic")
-                self.assertNotIn(str(round_number), prompt)
-                self.assertNotIn("critic round", prompt.lower())
-                self.assertIn("STATEMENT:\nexact theorem", prompt)
-                self.assertIn("CANDIDATE SOLUTION:\ncandidate proof", prompt)
-                self.assertEqual(prompt.count(tcs_agent.CRITIC_MEMORY_PROMPT), 1)
+        self.assertIs(returned, report)
+        mocked_structured.assert_called_once()
+        prompt, schema, stage = mocked_structured.call_args.args
+        self.assertIs(schema, tcs_agent.CRITIC_SCHEMA)
+        self.assertEqual(stage, "critic")
+        self.assertNotIn(str(round_number), prompt)
+        self.assertNotIn("critic round", prompt.lower())
+        self.assertIn("STATEMENT:\nexact theorem", prompt)
+        self.assertIn("CANDIDATE SOLUTION:\ncandidate proof", prompt)
+        self.assertEqual(prompt.count(tcs_agent.CRITIC_MEMORY_PROMPT), 1)
 
 
 class AuthorMemoryRegressionTests(unittest.TestCase):
@@ -251,8 +256,9 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
                 "initial proof", "initial_author",
             )
 
-            # Missing memory_update is valid. The critic's bug text becomes the
-            # fallback unresolved obligation for the author's revision.
+            # The API schema requires memory_update, but the durable ledger stays
+            # defensive for old or manually supplied reports that omit it. The
+            # critic's bug text becomes the fallback unresolved obligation.
             memory.record_critic_report({
                 "verdict": "reject",
                 "fixed": False,
@@ -279,8 +285,8 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
                 for item in memory.data["unresolvedObligations"]
             ))
 
-            # A malformed optional update is ignored without losing the critic
-            # state transition. A critic-fixed proof still needs a fresh pass.
+            # A malformed update is ignored without losing the critic state
+            # transition. A critic-fixed proof still needs a fresh pass.
             memory.record_critic_report({
                 "verdict": "pass",
                 "fixed": True,
