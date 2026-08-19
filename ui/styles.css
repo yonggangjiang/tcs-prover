@@ -750,7 +750,6 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .filter:hover, .filter.active { color: var(--ink); background: var(--soft); }
 
 .timeline {
-  max-height: min(60vh, 650px);
   min-height: 260px;
   overflow: auto;
   margin: 0;
