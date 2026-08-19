@@ -142,12 +142,12 @@ FINAL_SCHEMA = {
     "additionalProperties": False,
 }
 REVIEW_PROMPT = """
-Produce a rigorous, self-contained theoretical-computer-science
-problem statement without changing its intended claim. Check quantifiers,
-models, encodings, parameters, promises, asymptotics, and corner cases. Fix
-clear typos or omissions that make the goal trivial, impossible, or false. If
-the intended repair is uncertain, explain that plainly in notes so the author
-can edit and retry. Return only the requested JSON.
+Read the current statement below carefully and produce a rigorous, self-contained theoretical-computer-science
+problem statement without changing its intended claim. Then, check if the statement 
+is trivial or false. If so, first try to clear typos, fix any ambiguities, or add missing context or conventional assumptions to make the statement non-trivial. 
+If you can fix it, explain the fix in the note, and return the final statement. Remember to check the statement again until it passed your audit.
+If you cannot fix it, explain why in the notes and return the version you think is the best possible statement.
+Return only the requested JSON.
 """.strip()
 # Kept for callers that imported the former alias. Review mode now lives in the
 # trailing task block so the reusable instruction prefix remains byte-identical.
