@@ -85,7 +85,7 @@ button { min-height: 42px; }
 /* The workflow rail and work pane form one restrained desktop workspace. */
 .workspace {
   display: grid;
-  grid-template-columns: minmax(360px, 420px) minmax(0, 840px);
+  grid-template-columns: minmax(360px, 420px) minmax(0, 1260px);
   justify-content: center;
   min-height: calc(100vh - 58px);
 }
@@ -108,7 +108,7 @@ button { min-height: 42px; }
 /* Without the rail, let the input form use the whole centered workspace. */
 .workflow-rail[hidden] + .work-pane {
   grid-column: 1 / -1;
-  width: min(100%, 840px);
+  width: min(100%, 1260px);
   margin-inline: auto;
 }
 
@@ -386,7 +386,7 @@ button { min-height: 42px; }
 }
 
 /* The initial composer is spacious, but contains only the requested basics. */
-.input-view { max-width: 760px; margin: 4vh auto 0; }
+.input-view { max-width: 1260px; margin: 4vh auto 0; }
 .intro { max-width: 610px; margin-bottom: 28px; }
 .intro h1, .run-heading h1, .review-view h1 {
   margin: 0;
