@@ -8,23 +8,19 @@ LaTeX.
 
 ## Install and run
 
-Requires Python 3.9+, Node.js/npm, and a Codex account with access to the models
-configured in the UI.
+Requires Python 3.9+, and a Codex account with access to the models
+configured in the UI. Please install Codex CLI through this [official website](https://learn.chatgpt.com/docs/codex/cli).
 
 ```bash
-npm install -g @openai/codex
 codex login
 git clone https://github.com/yonggangjiang/tcs-prover.git
 cd tcs-prover
 python3 web_ui.py
 ```
 
-On macOS, `Start TCS Prover.command` is an alternative launcher. Codex can use
-an eligible ChatGPT plan; see OpenAI's
-[Codex CLI guide](https://help.openai.com/en/articles/11096431) and
-[ChatGPT-plan guide](https://help.openai.com/en/articles/11369540).
-Generation speed is selectable; Fast is the default and uses credits at a
-higher rate.
+You can type your open problem into the text box and click “Check Statement.” The system will first revise the statement to remove ambiguities and handle corner cases, then ask you to approve or reject the revised version.
+
+If you approve it, persistent reasoning will begin and continue until the time limit you set. The generated answer will then pass through a strict correctness-checking loop designed to catch errors. Finally, the output TeX file will be pruned for readability and returned as the final result.
 
 ### Terminal runs from Markdown
 
@@ -217,24 +213,6 @@ root-author context compaction, every explicit continuation, and every critic
 rejection. A compaction re-anchor is steered into the same active turn; it does
 not replace the author thread. Memory records repeated candidates but does not
 skip calls, end the search, or otherwise alter the proof workflow.
-
-### Prompt-cache management
-
-The long-running author remains one persistent Codex thread so its growing
-prefix can be reused. Automatic compaction is configured against the body after
-the carried prefix, avoiding unnecessary compactions caused by the stable
-prefix itself. The built-in author prompt now places the variable statement at
-the end, and reviewer/critic task metadata is also kept after reusable
-instructions, giving independent calls the longest practical byte-identical
-prefix.
-
-Fresh reviewer, critic, and LaTeX calls still receive independent contexts. They
-run from one stable, empty, private `.codex-structured-workspace` instead of a
-new random working directory, while their schema and answer files remain in
-private temporary directories. No review, critic, repair, or finalization call
-is removed or shared. Every available Codex usage report is copied into the
-transcript as input tokens, cached input tokens, cache-write tokens, and cache
-hit percentage so cache effectiveness can be checked per stage.
 
 ### 3. Independent critic
 
