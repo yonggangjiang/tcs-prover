@@ -8,23 +8,19 @@ LaTeX.
 
 ## Install and run
 
-Requires Python 3.9+, Node.js/npm, and a Codex account with access to the models
-configured in the UI.
+Requires Python 3.9+, and a Codex account with access to the models
+configured in the UI. Please install Codex CLI through this [official website](https://learn.chatgpt.com/docs/codex/cli).
 
 ```bash
-npm install -g @openai/codex
 codex login
 git clone https://github.com/yonggangjiang/tcs-prover.git
 cd tcs-prover
 python3 web_ui.py
 ```
 
-On macOS, `Start TCS Prover.command` is an alternative launcher. Codex can use
-an eligible ChatGPT plan; see OpenAI's
-[Codex CLI guide](https://help.openai.com/en/articles/11096431) and
-[ChatGPT-plan guide](https://help.openai.com/en/articles/11369540).
-Generation speed is selectable; Fast is the default and uses credits at a
-higher rate.
+You can type your open problem into the text box and click “Check Statement.” The system will first revise the statement to remove ambiguities and handle corner cases, then ask you to approve or reject the revised version.
+
+If you approve it, persistent reasoning will begin and continue until the time limit you set. The generated answer will then pass through a strict correctness-checking loop designed to catch errors. Finally, the output TeX file will be pruned for readability and returned as the final result.
 
 ### Terminal runs from Markdown
 
@@ -203,6 +199,20 @@ statement review and approval time count too. If the limit expires during a
 critic round, that critic work continues; a clean pass proceeds to LaTeX, while
 a rejection goes to the failure-summary node instead of starting another author
 revision.
+
+Each proof run also owns two private controller-written files in its `runs/...`
+directory. `author-anchor.md` contains the exact original author prompt and
+statement. `author-memory.json` is a bounded ledger of candidate fingerprints,
+approach outcomes, blocked routes, critic feedback, and unresolved obligations.
+Writes are atomic and best-effort private. The JSON file is capped at 64 KiB,
+and the historical snapshot placed in a model request is independently capped
+at 24 KiB; old records are folded into counters and a rolling digest.
+
+The controller re-injects the immutable anchor and current memory after every
+root-author context compaction, every explicit continuation, and every critic
+rejection. A compaction re-anchor is steered into the same active turn; it does
+not replace the author thread. Memory records repeated candidates but does not
+skip calls, end the search, or otherwise alter the proof workflow.
 
 ### 3. Independent critic
 
