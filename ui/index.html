@@ -113,13 +113,14 @@
                 <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
                   <select id="reviewModel">
-                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="reviewEffort">Reasoning</label>
                   <select id="reviewEffort">
-                    <option value="ultra">Ultra — highest</option>
+                    <option value="ultra" selected>Ultra — highest</option>
                     <option value="max">Max</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
@@ -130,13 +131,14 @@
                 <div id="authorModelSetting" class="round-setting model-setting">
                   <label for="authorModel">Proof author</label>
                   <select id="authorModel">
-                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="authorEffort">Reasoning</label>
                   <select id="authorEffort">
-                    <option value="ultra">Ultra — highest</option>
+                    <option value="ultra" selected>Ultra — highest</option>
                     <option value="max">Max</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
@@ -147,13 +149,14 @@
                 <div id="criticModelSetting" class="round-setting model-setting">
                   <label for="criticModel">Independent critic</label>
                   <select id="criticModel">
-                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="criticEffort">Reasoning</label>
                   <select id="criticEffort">
-                    <option value="ultra">Ultra — highest</option>
+                    <option value="ultra" selected>Ultra — highest</option>
                     <option value="max">Max</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
@@ -164,13 +167,14 @@
                 <div id="writerModelSetting" class="round-setting model-setting">
                   <label for="writerModel">LaTeX writer</label>
                   <select id="writerModel">
-                    <option value="gpt-5.6-sol">Sol — strongest</option>
+                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="writerEffort">Reasoning</label>
                   <select id="writerEffort">
-                    <option value="ultra">Ultra — highest</option>
+                    <option value="ultra" selected>Ultra — highest</option>
                     <option value="max">Max</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
@@ -180,7 +184,9 @@
                 </div>
               </div>
               <p id="modelHelp" class="help model-help">
-                Ultra is the default for every role. Sol is the default model.
+                Sol and Ultra are the defaults for every role. DeepSeek remains
+                available through the official API with DEEPSEEK_API_KEY and
+                always runs at standard speed.
               </p>
               <input id="reasoningEffort" type="hidden" value="ultra">
               <div class="prompt-setting">
@@ -211,11 +217,24 @@
               <div id="speedModeSetting" class="round-setting">
                 <label for="speedMode">Generation speed</label>
                 <select id="speedMode" aria-describedby="speedHelp">
-                  <option value="fast">Fast &mdash; 1.5&times; speed</option>
+                  <option value="fast" selected>Fast &mdash; 1.5&times; speed</option>
                   <option value="standard">Standard &mdash; normal speed</option>
                 </select>
                 <p id="speedHelp" class="help">
-                  Fast is the default and uses credits at a higher rate.
+                  Fast is the default for ChatGPT models and uses credits at a
+                  higher rate. DeepSeek always runs at standard speed.
+                </p>
+              </div>
+              <div id="reasoningSummarySetting" class="round-setting">
+                <label for="reasoningSummary">Activity log detail</label>
+                <select id="reasoningSummary" aria-describedby="reasoningSummaryHelp">
+                  <option value="none">Status only</option>
+                  <option value="concise" selected>Concise summaries &mdash; recommended</option>
+                  <option value="detailed">Detailed summaries</option>
+                </select>
+                <p id="reasoningSummaryHelp" class="help">
+                  Requests model-generated public reasoning summaries for every
+                  stage. Private chain-of-thought is never displayed or saved.
                 </p>
               </div>
               <div id="criticRoundSetting" class="round-setting">
@@ -247,8 +266,8 @@
           <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
             <div class="jobs-heading">
               <div>
-                <p class="eyebrow">PARALLEL WORK</p>
-                <h2 id="jobsHeading">Your jobs</h2>
+                <p class="eyebrow">SAVED WORK</p>
+                <h2 id="jobsHeading">Your jobs and checkpoints</h2>
               </div>
               <span id="jobsCount"></span>
             </div>
@@ -320,6 +339,14 @@
             </button>
           </section>
 
+          <div id="authorSteerControl" class="author-steer-control" hidden>
+            <label for="authorSteerInstruction">Guide the running proof author</label>
+            <textarea id="authorSteerInstruction" rows="3" maxlength="12000">Stop all computational experiments and code execution now. Do not write or run additional scripts. Continue this same task using symbolic mathematical reasoning, explicit lemmas, and proof construction only. Treat existing experimental output only as a source of conjectures, never as proof.</textarea>
+            <button id="sendAuthorSteerButton" class="secondary compact">
+              Send instruction now
+            </button>
+          </div>
+
           <div class="run-actions">
             <div id="authorTimeLimitControl" class="author-time-limit-control" hidden>
               <span id="authorLimitSummary" class="author-limit-summary">
@@ -376,7 +403,7 @@
       </form>
     </dialog>
 
-    <!-- Only the application's exact OpenAI conversation appears here. -->
+    <!-- Only the application's exact model conversation appears here. -->
     <div id="drawerScrim" class="drawer-scrim" hidden></div>
     <aside id="activityPanel" class="audit-drawer"
       aria-labelledby="auditTitle" hidden>
@@ -388,10 +415,10 @@
         <button id="activityClose" class="ghost compact">Close</button>
       </div>
       <p class="drawer-copy">
-        Only the exact prompt TCS Prover sends to OpenAI and the returned text are
+        Only the exact prompt TCS Prover sends to the selected model and its text are
         shown. Private chain-of-thought is unavailable.
       </p>
-      <ol id="activityList" class="audit-list" aria-label="OpenAI prompts and responses"></ol>
+      <ol id="activityList" class="audit-list" aria-label="Model prompts and responses"></ol>
     </aside>
   </div>
 

@@ -33,6 +33,7 @@ const ui = {
   criticRounds: $("criticRounds"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
+  reasoningSummary: $("reasoningSummary"),
   skipReviewSetting: $("skipReviewSetting"),
   skipStatementReview: $("skipStatementReview"),
   reviewOnlySetting: $("reviewOnlySetting"),
@@ -56,6 +57,9 @@ const ui = {
   authorLimitSummary: $("authorLimitSummary"),
   authorLimitHours: $("authorLimitHours"),
   setAuthorTimeLimit: $("setAuthorTimeLimitButton"),
+  authorSteerControl: $("authorSteerControl"),
+  authorSteerInstruction: $("authorSteerInstruction"),
+  sendAuthorSteer: $("sendAuthorSteerButton"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
@@ -180,6 +184,64 @@ async function deleteJob(job, title) {
   loadJobs();
 }
 
+async function resumeCritic(job, title) {
+  const question = `Start a new critic job from the complete saved proof for “${title}”?`;
+  if (!confirm(question)) return;
+  try {
+    const next = await request(
+      `/resume-critic?job=${encodeURIComponent(job.runId)}`, {}
+    );
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    clearTimeout(jobsTimer);
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
+async function resumeCheckpoint(job, checkpoint, title) {
+  const question = `Continue “${title}” from checkpoint “${checkpoint.label}”?\n\n`
+    + "The selected checkpoint will be copied into a new job.";
+  if (!confirm(question)) return;
+  try {
+    const next = await request(
+      `/resume-checkpoint?job=${encodeURIComponent(job.runId)}`,
+      { checkpoint: checkpoint.id },
+    );
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    clearTimeout(jobsTimer);
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
+async function continueStopped(job, title) {
+  const detail = job.continueStoppedDescription || "Restarts from saved state.";
+  const settingsWarning = job.settingsWarning
+    ? `\n\nLegacy settings warning: ${job.settingsWarning}` : "";
+  const question = `${job.continueStoppedLabel || "Continue stopped job"} for “${title}”?\n\n`
+    + `${detail}${settingsWarning}\n\nA new job will be created. The stopped source job will not be changed, `
+    + "and an interrupted model response or private reasoning cannot be resumed.";
+  if (!confirm(question)) return;
+  try {
+    const next = await request(
+      `/continue-stopped?job=${encodeURIComponent(job.runId)}`, {}
+    );
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    clearTimeout(jobsTimer);
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
 async function goHome() {
   currentJob = "";
   history.pushState(null, "", location.pathname);
@@ -198,6 +260,7 @@ function renderJobs(jobs) {
     item.className = "job-card";
     item.dataset.job = job.runId;
     const copy = document.createElement("div");
+    copy.className = "job-copy";
     const title = document.createElement("strong");
     title.textContent = job.title || job.draft?.trim().split("\n")[0]
       || "Untitled problem";
@@ -207,8 +270,61 @@ function renderJobs(jobs) {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
       running: "Running", stopping: "Stopping", done: "Finished",
     };
-    status.textContent = labels[job.phase] || job.phase;
-    copy.append(title, status);
+    status.textContent = job.manuallyStopped
+      ? `Stopped at ${job.stoppedStage || "saved stage"}`
+      : labels[job.phase] || job.phase;
+    const times = document.createElement("small");
+    times.className = "job-times";
+    const localTime = (value) => value
+      ? new Date(value).toLocaleString([], {
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit",
+      }) : "—";
+    const finished = job.finishedAt
+      || (job.phase === "done" ? job.lastActivityAt : "");
+    times.textContent = `Started: ${localTime(job.startedAt)} · `
+      + `Finished: ${finished ? localTime(finished) : "Not finished"}`;
+    copy.append(title, status, times);
+    const checkpoints = job.checkpoints || [];
+    if (checkpoints.length) {
+      const checkpointHeading = document.createElement("span");
+      checkpointHeading.className = "checkpoint-heading";
+      checkpointHeading.textContent = `Checkpoints (${checkpoints.length})`;
+      const checkpointList = document.createElement("ol");
+      checkpointList.className = "checkpoint-list";
+      for (const checkpoint of checkpoints) {
+        const checkpointItem = document.createElement("li");
+        checkpointItem.className = `checkpoint-row ${checkpoint.status || "ready"}`;
+        const checkpointCopy = document.createElement("div");
+        const checkpointLabel = document.createElement("span");
+        checkpointLabel.className = "checkpoint-label";
+        checkpointLabel.textContent = checkpoint.label;
+        const checkpointMeta = document.createElement("small");
+        checkpointMeta.className = "checkpoint-meta";
+        checkpointMeta.textContent = `${checkpoint.status || "ready"} · `
+          + localTime(checkpoint.completedAt);
+        const checkpointDescription = document.createElement("small");
+        checkpointDescription.className = "checkpoint-description";
+        checkpointDescription.textContent = checkpoint.description || "";
+        checkpointCopy.append(
+          checkpointLabel, checkpointMeta, checkpointDescription,
+        );
+        checkpointItem.append(checkpointCopy);
+        if (checkpoint.resumable) {
+          const continueButton = document.createElement("button");
+          continueButton.className = "secondary compact checkpoint-resume";
+          continueButton.textContent = checkpoint.resumeLabel || "Continue";
+          continueButton.disabled = ["reviewing", "running", "stopping"]
+            .includes(job.phase);
+          continueButton.onclick = () => resumeCheckpoint(
+            job, checkpoint, title.textContent,
+          );
+          checkpointItem.append(continueButton);
+        }
+        checkpointList.append(checkpointItem);
+      }
+      copy.append(checkpointHeading, checkpointList);
+    }
     const actions = document.createElement("div");
     actions.className = "job-actions";
     const open = document.createElement("button");
@@ -219,13 +335,25 @@ function renderJobs(jobs) {
     separate.className = "ghost compact";
     separate.textContent = "Open in new window";
     separate.onclick = () => window.open(jobUrl(job.runId, true), "_blank", "noopener");
+    const resume = document.createElement("button");
+    resume.className = "secondary compact";
+    resume.textContent = "Resume at critic";
+    resume.hidden = !job.canResumeCritic || checkpoints.length > 0;
+    resume.onclick = () => resumeCritic(job, title.textContent);
+    const continueButton = document.createElement("button");
+    continueButton.className = "secondary compact";
+    continueButton.textContent = job.continueStoppedLabel
+      || "Continue stopped job";
+    continueButton.hidden = !job.canContinueStopped;
+    continueButton.title = job.continueStoppedDescription || "";
+    continueButton.onclick = () => continueStopped(job, title.textContent);
     const remove = document.createElement("button");
     remove.className = "ghost compact job-delete";
     remove.textContent = "Delete";
     remove.disabled = ["reviewing", "running", "stopping"].includes(job.phase);
     remove.title = remove.disabled ? "Stop this job before deleting it." : "";
     remove.onclick = () => deleteJob(job, title.textContent);
-    actions.append(open, separate, remove);
+    actions.append(open, separate, continueButton, resume, remove);
     item.append(copy, actions);
     ui.jobsList.append(item);
   }
@@ -340,30 +468,49 @@ function renderAlgorithmicPresets(source) {
 
 // Keep the compact footer label synchronized with every model setting.
 function updateModelSummary() {
-  const name = (model) => model.split("-").at(-1)
-    .replace(/^./, (letter) => letter.toUpperCase());
+  const deepseekModel = "deepseek-v4-pro";
+  const name = (model) => model === "deepseek-v4-pro" ? "DeepSeek V4 Pro"
+    : model.split("-").at(-1).replace(/^./, (letter) => letter.toUpperCase());
+  const effectiveEffort = (model, effort) => model === deepseekModel
+    ? (["low", "medium", "high"].includes(effort) ? "high" : "max")
+    : effort;
+  const role = (model, effort) => `${name(model)}/${name(
+    effectiveEffort(model, effort)
+  )}`;
+  const mode = selectedProblemMode();
+  const reviewOnly = mode === "statement" && ui.statementReviewOnly.checked;
+  let selectedModels = reviewOnly ? [ui.reviewModel.value]
+    : mode === "latex" ? [ui.writerModel.value]
+    : [ui.authorModel.value, ui.criticModel.value, ui.writerModel.value];
+  if (mode === "statement" && !reviewOnly && !ui.skipStatementReview.checked) {
+    selectedModels.push(ui.reviewModel.value);
+  }
   const review = (
-    selectedProblemMode() === "algorithmic" || ui.skipStatementReview.checked
+    mode === "algorithmic" || ui.skipStatementReview.checked
   ) ? ""
-    : `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review · `;
+    : `${role(ui.reviewModel.value, ui.reviewEffort.value)} review · `;
   const speed = ui.speedMode.value === "standard"
-    ? "Standard speed" : "Fast 1.5×";
-  const reviewOnly = selectedProblemMode() === "statement"
-    && ui.statementReviewOnly.checked;
+    ? "Standard speed" : selectedModels.includes(deepseekModel)
+      ? "Fast for ChatGPT · Standard for DeepSeek" : "Fast 1.5×";
+  const log = {
+    none: "Status-only log",
+    concise: "Concise activity log",
+    detailed: "Detailed activity log",
+  }[ui.reasoningSummary.value] || "Concise activity log";
   if (reviewOnly) {
-    ui.modelSummary.textContent = `${speed} \u00b7 `
-      + `${name(ui.reviewModel.value)}/${name(ui.reviewEffort.value)} review only`;
+    ui.modelSummary.textContent = `${speed} · ${log} · `
+      + `${role(ui.reviewModel.value, ui.reviewEffort.value)} review only`;
     return;
   }
-  if (selectedProblemMode() === "latex") {
-    ui.modelSummary.textContent = `${speed} · `
-      + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
+  if (mode === "latex") {
+    ui.modelSummary.textContent = `${speed} · ${log} · `
+      + `${role(ui.writerModel.value, ui.writerEffort.value)} writer`;
     return;
   }
-  ui.modelSummary.textContent = `${speed} · ` + review
-    + `${name(ui.authorModel.value)}/${name(ui.authorEffort.value)} author · `
-    + `${name(ui.criticModel.value)}/${name(ui.criticEffort.value)} critic · `
-    + `${name(ui.writerModel.value)}/${name(ui.writerEffort.value)} writer`;
+  ui.modelSummary.textContent = `${speed} · ${log} · ` + review
+    + `${role(ui.authorModel.value, ui.authorEffort.value)} author · `
+    + `${role(ui.criticModel.value, ui.criticEffort.value)} critic · `
+    + `${role(ui.writerModel.value, ui.writerEffort.value)} writer`;
 }
 
 const promptLabels = {
@@ -484,10 +631,17 @@ function describe(entry) {
   const name = event.method || event.type || entry.kind || "";
   const params = event.params || {};
   const item = params.item || event.item || {};
-  const itemId = params.itemId || item.id || "";
+  const activityLabel = entry.activityLabel || "";
+  const rawItemId = params.itemId || item.id || "";
+  const itemId = activityLabel && rawItemId
+    ? `${activityLabel}:${rawItemId}` : rawItemId;
   const root = entry.root !== false;
   const keyBase = itemId || `${entry.time}:${entry.kind}:${name}`;
   const text = entry.text || "";
+  const scopedLabel = (label) => activityLabel
+    ? `${activityLabel} · ${label}` : label;
+  const turnKey = `${activityLabel ? `${activityLabel}:` : ""}`
+    + `${params.turn?.id || event.turn_id || entry.time}`;
 
   if (entry.kind === "request") {
     return {
@@ -534,25 +688,53 @@ function describe(entry) {
   }
   if (entry.kind !== "codex_event") return null;
 
+  if (["turn/started", "turn.started"].includes(name)) {
+    return {
+      key: `turn:${turnKey}`,
+      type: "status", label: scopedLabel(
+        root ? "Model request running" : "Subagent turn running",
+      ),
+      text: "The request has started and is waiting for the model's next public event.",
+      time: entry.time, replace: true,
+    };
+  }
+  if (
+    ["item/started", "item.started"].includes(name)
+    && item.type === "reasoning"
+  ) {
+    const summaryLevel = state.reasoningSummary || "concise";
+    const summaryMessage = summaryLevel === "none"
+      ? "Status-only logging is selected."
+      : `${summaryLevel === "detailed" ? "Detailed" : "Concise"} public `
+        + "summaries will appear when the provider returns them.";
+    return {
+      key: `reasoning:${itemId}`, type: "reasoning",
+      label: scopedLabel(root ? "Model is thinking" : "Subagent is thinking"),
+      text: `Reasoning has started. ${summaryMessage} `
+        + "Private chain-of-thought is not displayed.",
+      time: entry.time, replace: true,
+    };
+  }
   if (name === "item/reasoning/summaryTextDelta") {
     return {
       key: `reasoning:${itemId}`, type: "reasoning",
-      label: root ? "Reasoning summary" : "Subagent reasoning",
+      label: scopedLabel(root ? "Reasoning summary" : "Subagent reasoning"),
       text: params.delta || "", time: entry.time, append: true,
     };
   }
   if (["item/completed", "item.completed"].includes(name) && item.type === "reasoning") {
     return {
       key: `reasoning:${itemId}`, type: "reasoning",
-      label: root ? "Reasoning summary" : "Subagent reasoning",
-      text: item.text || (item.summary || []).join("\n"),
+      label: scopedLabel(root ? "Reasoning summary" : "Subagent reasoning"),
+      text: item.text || (item.summary || []).join("\n")
+        || "Reasoning step completed; no public summary was returned.",
       time: entry.time, replace: true,
     };
   }
   if (name === "item/agentMessage/delta") {
     return {
       key: `agent:${itemId}`, type: "agent",
-      label: root ? "Author" : "Subagent", text: params.delta || "",
+      label: scopedLabel(root ? "Author" : "Subagent"), text: params.delta || "",
       time: entry.time, append: true,
     };
   }
@@ -562,7 +744,7 @@ function describe(entry) {
   ) {
     return {
       key: `agent:${itemId}`, type: "agent",
-      label: root ? "Author" : "Subagent", text: item.text || "",
+      label: scopedLabel(root ? "Author" : "Subagent"), text: item.text || "",
       time: entry.time, replace: true, pinned: root,
     };
   }
@@ -578,7 +760,7 @@ function describe(entry) {
     const status = item.status || (name.includes("completed") ? "completed" : "started");
     return {
       key: `tool:${itemId || keyBase}`, type: "tool",
-      label: root ? "Tool activity" : "Subagent tool",
+      label: scopedLabel(root ? "Tool activity" : "Subagent tool"),
       text: `${action} · ${status}`, time: entry.time, replace: true,
     };
   }
@@ -589,10 +771,11 @@ function describe(entry) {
       text: goal.status || "updated", time: entry.time, replace: true,
     };
   }
-  if (name === "turn/completed") {
+  if (["turn/completed", "turn.completed"].includes(name)) {
     return {
-      key: `turn:${params.turn?.id || entry.time}`, type: "status",
-      label: "Turn completed", text: params.turn?.status || "completed",
+      key: `turn:${turnKey}`, type: "status",
+      label: scopedLabel("Turn completed"),
+      text: params.turn?.status || event.status || "completed",
       time: entry.time, replace: true,
     };
   }
@@ -702,7 +885,7 @@ function upsertTimeline(card) {
 function detailCard(entry) {
   if (entry.kind === "request" && entry.text) {
     return {
-      key: `detail-prompt:${entry.time}`, label: "Prompt to OpenAI",
+      key: `detail-prompt:${entry.time}`, label: "Prompt to model",
       text: entry.text,
     };
   }
@@ -711,7 +894,7 @@ function detailCard(entry) {
     && entry.text
   ) {
     return {
-      key: `detail-result:${entry.time}`, label: "Returned text from OpenAI",
+      key: `detail-result:${entry.time}`, label: "Returned text from model",
       text: entry.text,
     };
   }
@@ -719,10 +902,12 @@ function detailCard(entry) {
   const event = entry.event || {};
   const params = event.params || {};
   const item = params.item || {};
-  const itemId = params.itemId || item.id || entry.time;
+  const rawItemId = params.itemId || item.id || entry.time;
+  const itemId = entry.activityLabel
+    ? `${entry.activityLabel}:${rawItemId}` : rawItemId;
   if (event.method === "item/agentMessage/delta" && params.delta) {
     return {
-      key: `detail-response:${itemId}`, label: "Returned text from OpenAI",
+      key: `detail-response:${itemId}`, label: "Returned text from model",
       text: params.delta, append: true,
     };
   }
@@ -732,7 +917,7 @@ function detailCard(entry) {
     && item.text
   ) {
     return {
-      key: `detail-response:${itemId}`, label: "Returned text from OpenAI",
+      key: `detail-response:${itemId}`, label: "Returned text from model",
       text: item.text,
     };
   }
@@ -775,11 +960,17 @@ function ingest(entries, reset = false) {
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
   const latexOnly = state.problemMode === "latex";
+  const criticResume = state.problemMode === "critic-resume";
   const startsAtAuthor = state.problemMode === "algorithmic"
     || state.skipStatementReview;
-  const seen = new Set((state.trace || []).map(
+  const seenInThisJob = new Set((state.trace || []).map(
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
+  const seen = new Set(seenInThisJob);
+  if (criticResume) {
+    seen.add("statement_reviewer");
+    seen.add("author");
+  }
   const makeNode = (name, number) => {
     const item = nodes[name];
     const row = document.createElement("li");
@@ -806,6 +997,13 @@ function renderWorkflow() {
       round.className = "node-round";
       round.textContent = `Round ${state.round} of ${state.criticRounds}`;
       copy.append(round);
+    }
+    if (criticResume && (name === "statement_reviewer"
+      || (name === "author" && !seenInThisJob.has("author")))) {
+      const loaded = document.createElement("span");
+      loaded.className = "node-resume-note";
+      loaded.textContent = "Loaded from the source job";
+      copy.append(loaded);
     }
     if (name === "failure_summary") {
       const condition = document.createElement("span");
@@ -899,7 +1097,12 @@ function renderClock() {
     const ago = Math.max(0, Math.floor(
       (Date.now() - new Date(state.lastActivityAt)) / 1000
     ));
-    ui.lastActivity.textContent = `Updated ${ago < 2 ? "just now" : `${ago}s ago`} · `
+    const working = ["reviewing", "running", "stopping"].includes(state.phase);
+    const activity = working
+      ? (ago < 2 ? "Working · public activity now"
+        : `Still working · waiting ${ago}s for the next public event`)
+      : `Updated ${ago < 2 ? "just now" : `${ago}s ago`}`;
+    ui.lastActivity.textContent = `${activity} · `
       + `${state.traceVersion || 0} events recorded`;
   }
 }
@@ -944,11 +1147,12 @@ function render(next) {
     ui.authorModel.value = state.authorModel || "gpt-5.6-sol";
     ui.criticModel.value = state.criticModel || "gpt-5.6-sol";
     ui.writerModel.value = state.writerModel || "gpt-5.6-sol";
-    ui.reviewEffort.value = state.reviewEffort || state.reasoningEffort || "ultra";
+    ui.reviewEffort.value = state.reviewEffort || "ultra";
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
     ui.speedMode.value = state.speedMode || "fast";
+    ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
     syncPrompts(state);
@@ -966,11 +1170,12 @@ function render(next) {
     ui.authorModel.value = state.authorModel || "gpt-5.6-sol";
     ui.criticModel.value = state.criticModel || "gpt-5.6-sol";
     ui.writerModel.value = state.writerModel || "gpt-5.6-sol";
-    ui.reviewEffort.value = state.reviewEffort || state.reasoningEffort || "ultra";
+    ui.reviewEffort.value = state.reviewEffort || "ultra";
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
     ui.speedMode.value = state.speedMode || "fast";
+    ui.reasoningSummary.value = state.reasoningSummary || "concise";
     syncPrompts(state);
     updateModelSummary();
     ui.proposed.value = state.review.statement;
@@ -1019,6 +1224,8 @@ function render(next) {
   );
   const canSetAuthorLimit = phase === "running"
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author";
+  show(ui.authorSteerControl, canSetAuthorLimit);
+  ui.sendAuthorSteer.disabled = !canSetAuthorLimit;
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
   const authorLimitText = authorLimit.toLocaleString(undefined, {
     maximumFractionDigits: 2,
@@ -1104,6 +1311,7 @@ async function startReview(statement, feedback = "") {
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
       speedMode: ui.speedMode.value,
+      reasoningSummary: ui.reasoningSummary.value,
       statementReviewOnly: reviewOnly,
     });
     if (job !== currentJob) return;
@@ -1150,6 +1358,7 @@ async function startAlgorithmic() {
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
       speedMode: ui.speedMode.value,
+      reasoningSummary: ui.reasoningSummary.value,
     });
     currentJob = next.runId;
     history.pushState(null, "", jobUrl(currentJob));
@@ -1177,6 +1386,7 @@ async function startLatexOnly() {
       writerEffort: ui.writerEffort.value,
       finalPrompt: promptValues.final,
       speedMode: ui.speedMode.value,
+      reasoningSummary: ui.reasoningSummary.value,
     });
     currentJob = next.runId;
     history.pushState(null, "", jobUrl(currentJob));
@@ -1256,6 +1466,7 @@ ui.authorEffort.onchange = updateModelSummary;
 ui.criticEffort.onchange = updateModelSummary;
 ui.writerEffort.onchange = updateModelSummary;
 ui.speedMode.onchange = updateModelSummary;
+ui.reasoningSummary.onchange = updateModelSummary;
 ui.skipStatementReview.onchange = () => {
   if (ui.skipStatementReview.checked) ui.statementReviewOnly.checked = false;
   setProblemMode(selectedProblemMode());
@@ -1289,6 +1500,16 @@ ui.setAuthorTimeLimit.onclick = () => {
     return;
   }
   act("/set-author-time-limit", { hours });
+};
+ui.sendAuthorSteer.onclick = () => {
+  const instruction = ui.authorSteerInstruction.value.trim();
+  if (!instruction) {
+    ui.notice.textContent = "Enter an instruction for the proof author.";
+    show(ui.notice, true);
+    ui.authorSteerInstruction.focus();
+    return;
+  }
+  act("/steer-author", { instruction });
 };
 ui.stop.onclick = () => act("/stop");
 ui.home.onclick = goHome;

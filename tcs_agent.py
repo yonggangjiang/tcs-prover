@@ -13,20 +13,35 @@ import tempfile
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
-# Every role defaults to the strongest model and reasoning setting.
+# Preserve the original ChatGPT defaults; DeepSeek is an additional provider.
 ROOT = Path(__file__).resolve().parent
-MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+DEEPSEEK_MODEL_CATALOG = ROOT / "deepseek-models.json"
+DEEPSEEK_MODEL = "deepseek-v4-pro"
+MODELS = (
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    DEEPSEEK_MODEL,
+)
 MODEL, EFFORT = "gpt-5.6-sol", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
+REASONING_SUMMARIES = ("none", "concise", "detailed")
+DEFAULT_REASONING_SUMMARY = "concise"
 # Kept as the default-tier name for older callers and trace consumers.
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 
-# Every role defaults to Sol and Ultra; both choices are configurable.
+OPENAI_PROVIDER = "openai"
+DEEPSEEK_PROVIDER = "deepseek"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_TOKEN_ENV = "TCS_PROVER_DEEPSEEK_TOKEN"
+CUSTOM_PROVIDER_LOGIN_PLACEHOLDER = "tcs-prover-custom-provider"
+
+# Every role retains the original Sol/Ultra default and remains configurable.
 REVIEW_MODEL = MODEL
 REVIEW_MODELS = MODELS
 REVIEW_EFFORT = EFFORT
@@ -37,7 +52,24 @@ GOAL = "Complete the task supplied in the first turn and continue until done."
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 100, 100
 MAX_AUTHOR_HOURS = 168
 DEFAULT_AUTHOR_HOURS = MAX_AUTHOR_HOURS
+STRUCTURED_MAX_ATTEMPTS = 2
+STRUCTURED_RETRY_OUTPUT_CHARS = 12000
+STRUCTURED_ATTEMPT_TIMEOUT_SECONDS = {
+    "review": 300,
+    "critic": 900,
+    "final": 900,
+}
+STRUCTURED_HEARTBEAT_SECONDS = 30
+CRITIC_AUDIT_TIMEOUT_SECONDS = 1800
+CRITIC_COORDINATOR_TIMEOUT_SECONDS = 1800
+CRITIC_AUDIT_CHECKPOINT_FILENAME = "critic-audits.json"
+CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME = "fresh-critic-audits"
+CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION = 1
+SAVED_CANDIDATE_FILENAME = "saved-candidate.md"
+FINAL_INPUT_FILENAME = "final-input.json"
 AUTHOR_LIMIT_POLL_SECONDS = 0.25
+AUTHOR_STEER_POLL_SECONDS = 0.25
+AUTHOR_STEER_MAX_CHARS = 12000
 INTERRUPT_GRACE_SECONDS = 30
 SUMMARY_GRACE_SECONDS = 300
 AUTHOR_ANCHOR_FILENAME = "author-anchor.md"
@@ -54,6 +86,7 @@ AUTHOR_MEMORY_LIMITS = {
     "candidateFingerprints": 128,
 }
 STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
+EMIT_LOCK = threading.Lock()
 CONTINUE_PROMPT = """
 The previous author attempt ended without a complete solution. Continue working
 toward a complete rigorous solution. Do not stop, give up, or summarize while
@@ -135,6 +168,21 @@ CRITIC_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+CRITIC_CHECK_SCHEMA = CRITIC_SCHEMA["properties"]["checks"]["items"]
+CRITIC_AUDIT_FOCI = (
+    (
+        "Definitions, quantifiers, game semantics, and line-by-line "
+        "correctness of every construction and invariant."
+    ),
+    (
+        "Communication protocol implementability and complete accounting of "
+        "bits, rounds, synchronization, adaptivity, and hidden disclosures."
+    ),
+    (
+        "Hostile counterexample search: boundary cases, ownership mistakes, "
+        "sampling/deletion claims, circular lemmas, and theorem-strength gaps."
+    ),
+)
 FINAL_SCHEMA = {
     "type": "object",
     "properties": {"latex": {"type": "string"}},
@@ -159,10 +207,9 @@ routes this audit actually blocks, and list the proof obligations that remain.
 This metadata records the audit; it must not change the mathematical verdict.
 """.strip()
 CRITIC_PROMPT = """
-Act as a coordinating proof critic. Spawn fresh subagents in
-parallel and give each only the statement and candidate solution below. Keep
-their work independent and wait for all three. Make sure they are hostile
-line-by-line proof audits.
+Act as a coordinating proof critic. The controller will run three fresh,
+independent hostile auditors in parallel and provide their completed reports.
+Do not spawn or wait for subagents yourself.
 
 After collecting all three audits, read them and try to fix every reported bug
 yourself in a complete replacement solution. If you fix them all, return pass,
@@ -190,6 +237,10 @@ Return only the requested JSON.
 
 class Error(RuntimeError):
     """Show a short, understandable failure."""
+
+
+class StructuredAttemptTimeout(Error):
+    """One bounded structured request stopped waiting for its provider."""
 
 
 def text(value):
@@ -253,11 +304,31 @@ def controlled_author_hours(path, current):
     return requested
 
 
+def pending_author_steer(path, delivered_id=None):
+    """Read one new controller-authored live instruction, if available."""
+
+    if not path:
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        command_id = str(value["id"]).strip()
+        instruction = str(value["instruction"]).strip()
+    except (OSError, UnicodeError, KeyError, TypeError, ValueError,
+            json.JSONDecodeError):
+        return None
+    if (
+        not command_id or command_id == delivered_id or not instruction
+        or "\0" in instruction or len(instruction) > AUTHOR_STEER_MAX_CHARS
+    ):
+        return None
+    return command_id, instruction
+
+
 def chosen_model(value):
-    """Require one supported GPT-5.6 model."""
+    """Require one supported base model."""
 
     if value not in MODELS:
-        raise Error("Choose Sol, Terra, or Luna.")
+        raise Error("Choose Sol, Terra, Luna, or DeepSeek V4 Pro.")
     return value
 
 
@@ -277,10 +348,120 @@ def chosen_speed(value):
     return value
 
 
-def speed_arguments(speed):
-    """Return explicit Codex flags for one selected speed mode."""
+def model_provider(model):
+    """Return the Codex provider id for one supported model."""
+
+    model = chosen_model(model)
+    if model == DEEPSEEK_MODEL:
+        return DEEPSEEK_PROVIDER
+    return OPENAI_PROVIDER
+
+
+def is_deepseek_model(model):
+    """Return whether the official DeepSeek V4 Pro model is selected."""
+
+    return chosen_model(model) == DEEPSEEK_MODEL
+
+
+def provider_arguments(model):
+    """Define an isolated custom provider without editing user configuration."""
+
+    provider = model_provider(model)
+    if provider == OPENAI_PROVIDER:
+        return []
+    return [
+        # Keep ChatGPT login state from overriding custom-provider API auth.
+        "-c", (
+            "model_catalog_json="
+            f"{json.dumps(str(DEEPSEEK_MODEL_CATALOG))}"
+        ),
+        "-c", 'preferred_auth_method="apikey"',
+        "-c", 'forced_login_method="api"',
+        "-c", f'model_provider="{provider}"',
+        "-c", f'model_providers.{provider}.name="DeepSeek"',
+        "-c", (
+            f'model_providers.{provider}.base_url="{DEEPSEEK_BASE_URL}"'
+        ),
+        "-c", (
+            f'model_providers.{provider}.env_key="{DEEPSEEK_TOKEN_ENV}"'
+        ),
+        "-c", f'model_providers.{provider}.wire_api="responses"',
+        "-c", (
+            f'model_providers.{provider}.supports_websockets=false'
+        ),
+    ]
+
+
+def require_model_credentials(model):
+    """Fail before launching Codex when a third-party credential is missing."""
+
+    if model_provider(model) == DEEPSEEK_PROVIDER and not deepseek_key():
+        raise Error(
+            f"Set {DEEPSEEK_KEY_ENV} before using DeepSeek V4 Pro through "
+            "the official API."
+        )
+
+
+def normalized_key(environment_name):
+    """Return a normalized provider key without exposing it in diagnostics."""
+
+    value = os.environ.get(environment_name, "").strip()
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+    return value
+
+
+def deepseek_key():
+    """Return the official DeepSeek API key, if configured."""
+
+    return normalized_key(DEEPSEEK_KEY_ENV)
+
+
+def verify_model_credentials(model):
+    """Check locally that the selected model has its required credential."""
+
+    require_model_credentials(model)
+
+
+def effective_effort(model, effort):
+    """Map the shared effort menu to capabilities exposed by each provider."""
+
+    model = chosen_model(model)
+    effort = chosen_effort(effort)
+    if not is_deepseek_model(model):
+        return effort
+    # The official API/catalog names V4 Pro's maximum effort `max`.
+    if effort in {"low", "medium", "high"}:
+        return "high"
+    return "max"
+
+
+def chosen_reasoning_summary(value):
+    """Require one public reasoning-summary detail level."""
+
+    if value not in REASONING_SUMMARIES:
+        raise Error("Choose Status only, Concise summaries, or Detailed summaries.")
+    return value
+
+
+def reasoning_summary(model, requested=DEFAULT_REASONING_SUMMARY):
+    """Return the requested public summary level for one supported model."""
+
+    chosen_model(model)
+    return chosen_reasoning_summary(requested)
+
+
+def effective_speed(model, speed):
+    """Fast service tier is OpenAI-specific; custom-provider calls stay standard."""
 
     speed = chosen_speed(speed)
+    return speed if model_provider(model) == OPENAI_PROVIDER else "standard"
+
+
+def speed_arguments(speed, model=MODEL):
+    """Return explicit Codex flags for one selected speed mode and model."""
+
+    speed = effective_speed(model, speed)
     if speed == "fast":
         return ["-c", 'service_tier="fast"', "--enable", "fast_mode"]
     return ["--disable", "fast_mode"]
@@ -309,12 +490,28 @@ def codex():
     return path
 
 
-def environment():
-    """Use the saved ChatGPT login with quiet, predictable child logging."""
+def environment(model=None):
+    """Use inherited provider credentials with quiet, predictable child logging."""
 
     env = os.environ.copy()
     env.pop("OPENAI_API_KEY", None)
     env.pop("CODEX_API_KEY", None)
+    normalized_deepseek_key = deepseek_key()
+    env.pop(DEEPSEEK_KEY_ENV, None)
+    env.pop(DEEPSEEK_TOKEN_ENV, None)
+    # Do not leak credentials left behind by obsolete provider configurations.
+    env.pop("OPENROUTER_API_KEY", None)
+    env.pop("TCS_PROVER_OPENROUTER_TOKEN", None)
+    provider = model_provider(model) if model is not None else OPENAI_PROVIDER
+    if provider == DEEPSEEK_PROVIDER:
+        if normalized_deepseek_key:
+            # The custom provider reads this environment value and adds the
+            # Bearer scheme. The credential never appears in process arguments.
+            env[DEEPSEEK_TOKEN_ENV] = normalized_deepseek_key
+            # Forced API login requires a nonempty OPENAI_API_KEY before it
+            # initializes any custom provider. Use a public placeholder here;
+            # provider authentication still comes exclusively from the token.
+            env["OPENAI_API_KEY"] = CUSTOM_PROVIDER_LOGIN_PLACEHOLDER
     # Inherited debug logs could bypass the structured-event privacy filter.
     env["RUST_LOG"] = "error"
     env.pop("LOG_FORMAT", None)
@@ -390,7 +587,11 @@ def stop_process(process):
 def emit(kind, stage, **fields):
     """Write one machine-readable transcript record for the web UI."""
 
-    print(json.dumps({"kind": kind, "stage": stage, **fields}, ensure_ascii=False), flush=True)
+    record = json.dumps(
+        {"kind": kind, "stage": stage, **fields}, ensure_ascii=False,
+    )
+    with EMIT_LOCK:
+        print(record, flush=True)
 
 
 def public_event(value):
@@ -432,66 +633,426 @@ def review_prompt(draft, feedback="", instructions=REVIEW_PROMPT):
     )
 
 
-def structured(
-    prompt, schema_value, stage, model=MODEL, effort=EFFORT,
-    speed=DEFAULT_SPEED,
-):
-    """Run one read-only structured Codex call and relay its visible events."""
+def structured_prompt_for_model(prompt, schema_value, model):
+    """Expose the JSON contract when a model lacks schema enforcement."""
 
-    emit(
-        "request", stage, label=f"Exact {stage} input", text=prompt,
-        model=model, reasoningEffort=effort, reasoningSummary="detailed",
-        serviceTier=chosen_speed(speed),
-        responseSchema=schema_value,
+    if not is_deepseek_model(model):
+        return prompt
+    schema = json.dumps(schema_value, ensure_ascii=False, sort_keys=True)
+    return (
+        f"{prompt}\n\nOUTPUT JSON CONTRACT\n"
+        "Return exactly one JSON object and no markdown fences or commentary. "
+        "The object must match this JSON Schema exactly:\n"
+        f"{schema}"
     )
+
+
+def decoded_json_object(raw):
+    """Decode the final complete JSON object from one model response."""
+
+    value = raw.strip()
+    if not value:
+        raise Error("The model completed without a final structured response.")
+    if value.startswith("```") and value.endswith("```"):
+        lines = value.splitlines()
+        if len(lines) >= 3:
+            value = "\n".join(lines[1:-1]).strip()
+    try:
+        result = json.loads(value)
+        if not isinstance(result, dict):
+            raise Error(
+                "The model returned a structured value that is not an object."
+            )
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    # Prompt-only JSON contracts are not always obeyed byte-for-byte by custom
+    # providers. Recover a complete final object from harmless surrounding text
+    # while still validating its schema in the caller.
+    decoder = json.JSONDecoder()
+    objects = []
+    offset = 0
+    while True:
+        start = value.find("{", offset)
+        if start < 0:
+            break
+        try:
+            candidate, length = decoder.raw_decode(value[start:])
+        except json.JSONDecodeError:
+            offset = start + 1
+            continue
+        if isinstance(candidate, dict):
+            objects.append(candidate)
+        offset = start + max(length, 1)
+    if objects:
+        return objects[-1]
+    raise Error("The model returned malformed structured JSON.")
+
+
+def validate_json_schema(value, schema, path="$"):
+    """Validate the strict JSON-Schema subset used by this harness."""
+
+    expected = schema.get("type")
+    valid_type = {
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "string": lambda item: isinstance(item, str),
+        "boolean": lambda item: isinstance(item, bool),
+    }.get(expected)
+    if valid_type and not valid_type(value):
+        raise Error(f"Structured output field {path} must be {expected}.")
+    if "enum" in schema and value not in schema["enum"]:
+        raise Error(f"Structured output field {path} has an unsupported value.")
+    if expected == "object":
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        missing = required.difference(value)
+        if missing:
+            raise Error(
+                f"Structured output field {path} is missing "
+                f"{', '.join(sorted(missing))}."
+            )
+        if schema.get("additionalProperties") is False:
+            extras = set(value).difference(properties)
+            if extras:
+                raise Error(
+                    f"Structured output field {path} contains unsupported "
+                    f"properties: {', '.join(sorted(extras))}."
+                )
+        for key, item in value.items():
+            if key in properties:
+                validate_json_schema(item, properties[key], f"{path}.{key}")
+    elif expected == "array":
+        minimum = schema.get("minItems")
+        maximum = schema.get("maxItems")
+        if minimum is not None and len(value) < minimum:
+            raise Error(f"Structured output field {path} has too few items.")
+        if maximum is not None and len(value) > maximum:
+            raise Error(f"Structured output field {path} has too many items.")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(value):
+                validate_json_schema(item, item_schema, f"{path}[{index}]")
+    return value
+
+
+def output_schema_arguments(model, schema_path):
+    """Use provider enforcement only when the selected model supports it."""
+
+    if is_deepseek_model(model):
+        return []
+    return ["--output-schema", str(schema_path)]
+
+
+def structured_tool_arguments(stage):
+    """Keep strict structured stages focused on producing their final object."""
+
+    return [
+        "-c", 'web_search="disabled"',
+        "-c", "tools.web_search=false",
+        "-c", "tools.view_image=false",
+        "--disable", "shell_tool",
+        "--disable", "multi_agent",
+    ]
+
+
+def structured_retry_prompt(prompt, raw, schema_value):
+    """Request one clean recovery after an empty or invalid final response."""
+
+    previous = raw.strip()
+    if not previous:
+        previous = "(empty: the previous attempt produced no final message)"
+    elif len(previous) > STRUCTURED_RETRY_OUTPUT_CHARS:
+        half = STRUCTURED_RETRY_OUTPUT_CHARS // 2
+        previous = (
+            previous[:half]
+            + "\n...[middle of previous output omitted]...\n"
+            + previous[-half:]
+        )
+    schema = json.dumps(schema_value, ensure_ascii=False, sort_keys=True)
+    return (
+        f"{prompt}\n\nSTRUCTURED OUTPUT RECOVERY RETRY\n"
+        "The previous attempt did not produce one valid final JSON object. "
+        "Do not call tools, search the web, discuss the formatting failure, or "
+        "return a placeholder. Re-evaluate the task as needed and return the "
+        "complete substantive answer as exactly one JSON object matching this "
+        f"schema:\n{schema}\n\nPREVIOUS INVALID OUTPUT:\n{previous}"
+    )
+
+
+def run_structured_attempt(
+    prompt, schema_value, stage, model, effort, speed, summary,
+    timeout=None, activity_label=None,
+):
+    """Run one structured Codex process and return its last-message text."""
+
+    timeout = None if timeout is None else float(timeout)
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
         workspace = structured_workspace()
         schema = folder / "schema.json"
         answer = folder / "answer.json"
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
+        schema_arguments = output_schema_arguments(model, schema)
         command = [
             codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
-            *speed_arguments(speed), *context_cache_arguments(),
-            "-c", 'model_reasoning_summary="detailed"',
-            *(["--enable", "multi_agent"] if stage == "critic" else []),
+            *provider_arguments(model),
+            *speed_arguments(speed, model), *context_cache_arguments(),
+            "-c", f'model_reasoning_summary="{summary}"',
+            *structured_tool_arguments(stage),
             "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
-            "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
-            "--output-schema", str(schema), "-o", str(answer), "-",
+            "--json", "--ephemeral", "--skip-git-repo-check",
+            "--ignore-user-config", *schema_arguments, "-o", str(answer), "-",
         ]
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-            errors="replace", env=environment(),
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace", env=environment(model),
         )
+        timed_out = threading.Event()
+        heartbeat_stop = threading.Event()
+        progress_lock = threading.Lock()
+        stderr_lines = deque(maxlen=50)
+        provider_errors = deque(maxlen=10)
+        started_at = time.monotonic()
+        progress = {
+            "lastEventAt": started_at,
+            "eventCount": 0,
+            "contentEventCount": 0,
+        }
+
+        def enforce_timeout():
+            if process.poll() is None:
+                timed_out.set()
+                stop_process(process)
+
+        watchdog = (
+            threading.Timer(timeout, enforce_timeout)
+            if timeout is not None else None
+        )
+        if watchdog is not None:
+            watchdog.daemon = True
+
+        def relay_heartbeat():
+            while not heartbeat_stop.wait(STRUCTURED_HEARTBEAT_SECONDS):
+                now = time.monotonic()
+                with progress_lock:
+                    quiet = now - progress["lastEventAt"]
+                    count = progress["eventCount"]
+                    content_count = progress["contentEventCount"]
+                elapsed = now - started_at
+                label = activity_label or f"{stage.title()} model request"
+                alive = process.poll() is None
+                emit(
+                    "status", stage,
+                    label=f"{label} local request is alive",
+                    text=(
+                        f"Verified local Codex request process {process.pid} "
+                        f"is {'alive' if alive else 'not running'} after "
+                        f"{elapsed:.0f}s. The provider stream has returned "
+                        f"{count} public lifecycle event"
+                        f"{'s' if count != 1 else ''} and {content_count} "
+                        f"content event{'s' if content_count != 1 else ''}; "
+                        f"last public event {quiet:.0f}s ago. If content is "
+                        "still zero, the selected provider may be computing "
+                        "or queued server-side; its API does not expose which."
+                    ),
+                    heartbeat=True, elapsedSeconds=round(elapsed, 1),
+                    quietSeconds=round(quiet, 1), publicEventCount=count,
+                    contentEventCount=content_count, processAlive=alive,
+                    requestPid=process.pid, model=model,
+                    modelProvider=model_provider(model),
+                    reasoningEffort=effort,
+                )
+
+        heartbeat = threading.Thread(target=relay_heartbeat, daemon=True)
+
+        def read_stderr():
+            for stderr_line in process.stderr:
+                value = stderr_line.strip()
+                if value:
+                    stderr_lines.append(value)
+
+        stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+        stderr_reader.start()
         try:
             process.stdin.write(prompt)
             process.stdin.close()
+            if watchdog is not None:
+                watchdog.start()
+            heartbeat.start()
             for line in process.stdout:
                 try:
                     raw_event = json.loads(line)
+                    if raw_event.get("type") == "error":
+                        message = raw_event.get("message")
+                        if isinstance(message, str) and not message.startswith(
+                            "Reconnecting..."
+                        ):
+                            provider_errors.append(message)
+                    elif raw_event.get("type") == "turn.failed":
+                        failure = raw_event.get("error")
+                        message = (
+                            failure.get("message")
+                            if isinstance(failure, dict) else failure
+                        )
+                        if isinstance(message, str) and message.strip():
+                            provider_errors.append(message.strip())
                     event = public_event(raw_event)
                     if event is not None:
-                        emit("codex_event", stage, event=event)
+                        event_name = event.get("method") or event.get("type") or ""
+                        content_event = event_name.startswith("item/") or (
+                            event_name.startswith("item.")
+                            or event_name.startswith("item_")
+                        )
+                        with progress_lock:
+                            progress["lastEventAt"] = time.monotonic()
+                            progress["eventCount"] += 1
+                            if content_event:
+                                progress["contentEventCount"] += 1
+                        emit(
+                            "codex_event", stage, event=event,
+                            activityLabel=activity_label or "",
+                        )
                     if raw_event.get("type") == "turn.completed":
                         emit_cache_usage(stage, raw_event.get("usage"))
                 except json.JSONDecodeError:
-                    emit("diagnostic", stage, text="Codex returned a malformed event.")
+                    emit(
+                        "diagnostic", stage,
+                        text="Codex returned a malformed event.",
+                    )
             code = process.wait()
         finally:
+            heartbeat_stop.set()
+            if watchdog is not None:
+                watchdog.cancel()
             stop_process(process)
+            stderr_reader.join(timeout=1)
+            for stream in (process.stdout, process.stderr):
+                try:
+                    stream.close()
+                except (AttributeError, OSError):
+                    pass
+        if timed_out.is_set():
+            raise StructuredAttemptTimeout(
+                f"The {stage} model did not respond within {timeout:g} seconds."
+            )
         if code:
-            raise Error(f"Codex {stage} failed.")
-        raw = answer.read_text(encoding="utf-8")
-        result = json.loads(raw)
-        if not isinstance(result, dict):
-            raise Error(f"Codex returned an invalid {stage} result.")
-        return result, raw
+            detail = "\n".join((*provider_errors, *stderr_lines)).strip()
+            secret = deepseek_key()
+            if secret:
+                detail = detail.replace(secret, "[REDACTED]")
+            detail = _clipped(detail, 8000)
+            raise Error(
+                f"Codex {stage} failed: {detail}"
+                if detail else f"Codex {stage} failed without diagnostics."
+            )
+        return answer.read_text(encoding="utf-8") if answer.exists() else ""
+
+
+def structured(
+    prompt, schema_value, stage, model=MODEL, effort=EFFORT,
+    speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
+    timeout=None, attempts=STRUCTURED_MAX_ATTEMPTS,
+    request_label=None, activity_label=None,
+):
+    """Run one read-only structured Codex call and relay its visible events."""
+
+    model = chosen_model(model)
+    effort = effective_effort(model, effort)
+    speed = effective_speed(model, speed)
+    summary = reasoning_summary(model, summary)
+    require_model_credentials(model)
+    prompt = structured_prompt_for_model(prompt, schema_value, model)
+    if timeout is None and is_deepseek_model(model):
+        timeout = STRUCTURED_ATTEMPT_TIMEOUT_SECONDS.get(stage, 900)
+    try:
+        attempts = int(attempts)
+    except (TypeError, ValueError) as exc:
+        raise Error("Structured attempts must be a positive integer.") from exc
+    if attempts < 1:
+        raise Error("Structured attempts must be a positive integer.")
+    raw, attempt_effort = "", effort
+    for attempt in range(attempts):
+        attempt_prompt = (
+            prompt if attempt == 0
+            else structured_retry_prompt(prompt, raw, schema_value)
+        )
+        emit(
+            "request", stage,
+            label=(
+                (request_label or f"Exact {stage} input") if attempt == 0
+                else f"Exact {stage} structured-output retry"
+            ),
+            text=attempt_prompt, attempt=attempt + 1,
+            model=model, modelProvider=model_provider(model),
+            reasoningEffort=attempt_effort, reasoningSummary=summary,
+            serviceTier=speed, responseSchema=schema_value,
+        )
+        try:
+            raw = run_structured_attempt(
+                attempt_prompt, schema_value, stage, model, attempt_effort,
+                speed, summary, timeout=timeout,
+                activity_label=activity_label or request_label,
+            )
+        except StructuredAttemptTimeout as exc:
+            emit(
+                "diagnostic", stage,
+                text=f"Structured output attempt {attempt + 1} timed out: {exc}",
+            )
+            if attempt + 1 >= attempts:
+                suffix = (
+                    " The structured stage timed out twice."
+                    if attempts > 1 else ""
+                )
+                raise Error(f"{exc}{suffix}") from exc
+            if stage in {"review", "critic"} and is_deepseek_model(model):
+                attempt_effort = effective_effort(model, "medium")
+            emit(
+                "status", stage, label="Retrying timed-out model request",
+                text=(
+                    "Retrying once"
+                    + (
+                        f" at {attempt_effort} reasoning effort."
+                        if stage in {"review", "critic"}
+                        and is_deepseek_model(model)
+                        else "."
+                    )
+                ),
+            )
+            continue
+        try:
+            result = validate_json_schema(
+                decoded_json_object(raw), schema_value,
+            )
+            return result, raw
+        except Error as exc:
+            emit(
+                "diagnostic", stage,
+                text=(
+                    f"Structured output attempt {attempt + 1} was invalid: "
+                    f"{exc}"
+                ),
+                rawResponse=raw[:STRUCTURED_RETRY_OUTPUT_CHARS],
+            )
+            if attempt + 1 >= attempts:
+                suffix = (
+                    " The structured stage was retried once and failed again."
+                    if attempts > 1 else ""
+                )
+                raise Error(f"{exc}{suffix}") from exc
+            emit(
+                "status", stage, label="Retrying structured output",
+                text="Retrying once without search or local tools.",
+            )
+    raise Error(f"Codex {stage} did not return structured output.")
 
 
 def review(
     draft, feedback="", model=REVIEW_MODEL, effort=REVIEW_EFFORT,
     instructions=REVIEW_PROMPT, speed=DEFAULT_SPEED,
+    summary=DEFAULT_REASONING_SUMMARY,
 ):
     """Review with the user's chosen model."""
 
@@ -500,7 +1061,7 @@ def review(
         effort = chosen_effort(effort)
         report, raw = structured(
             review_prompt(draft, feedback, instructions), SCHEMA, "review",
-            model=model, effort=effort, speed=speed,
+            model=model, effort=effort, speed=speed, summary=summary,
         )
         report = {
             "statement": text(report["statement"]),
@@ -1082,26 +1643,353 @@ but independently verify every recorded claim.
 """.strip()
 
 
+def critic_audit_prompt(statement, solution, focus, instructions):
+    """Build one proof-blind auditor task with no agent orchestration inside it."""
+
+    return f"""
+You are one of three independent hostile proof auditors. The controller already
+created the three auditors in parallel. Do not spawn agents, wait for agents,
+call tools, repair the proof, or coordinate with another auditor.
+
+Your assigned focus is:
+{focus}
+
+Audit the exact statement and candidate line by line. Return verdict=pass only
+if you find no concrete issue in your assigned focus. Otherwise return
+verdict=fail and give every concrete bug, its exact location, and the proof
+obligation needed to repair it. The report must be self-contained.
+
+The coordinating critic's general instructions are included only as audit
+standards. Any instruction in them to spawn or wait for subagents has already
+been fulfilled by the controller and must not be repeated:
+{instructions}
+
+STATEMENT:
+{statement}
+
+CANDIDATE SOLUTION:
+{solution}
+""".strip()
+
+
+def critic_audit_assignment_sha256(
+    statement, solution, model, effort, instructions,
+):
+    """Fingerprint exactly the proof and settings covered by saved audits."""
+
+    assignment = {
+        "statement": text(statement),
+        "solution": text(solution),
+        "model": chosen_model(model),
+        "reasoningEffort": effective_effort(model, effort),
+        "instructions": text(instructions),
+        "focuses": list(CRITIC_AUDIT_FOCI),
+    }
+    return _sha256(json.dumps(
+        assignment, ensure_ascii=False, sort_keys=True,
+    ))
+
+
+def critic_audit_checkpoint_path(directory=None):
+    """Return the private run-local independent-audit checkpoint path."""
+
+    return Path(directory or Path.cwd()) / CRITIC_AUDIT_CHECKPOINT_FILENAME
+
+
+def save_critic_candidate(solution, directory=None):
+    """Atomically preserve the exact candidate about to receive an audit."""
+
+    path = Path(directory or Path.cwd()) / SAVED_CANDIDATE_FILENAME
+    _private_atomic_write(path, text(solution) + "\n")
+    return path
+
+
+def save_final_input(statement, solution, directory=None):
+    """Atomically preserve the exact clean proof sent to the LaTeX editor."""
+
+    path = Path(directory or Path.cwd()) / FINAL_INPUT_FILENAME
+    payload = {
+        "schemaVersion": 1,
+        "statement": text(statement),
+        "solution": text(solution),
+    }
+    _private_atomic_write(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+    return path
+
+
+def load_critic_audit_checkpoint(
+    statement, solution, model, effort, instructions, directory=None,
+):
+    """Restore only completed audits for this exact proof and configuration."""
+
+    path = critic_audit_checkpoint_path(directory)
+    empty = [None] * len(CRITIC_AUDIT_FOCI)
+    expected = critic_audit_assignment_sha256(
+        statement, solution, model, effort, instructions,
+    )
+    candidates = [path]
+    # A user may resume the original proof job instead of the latest failed
+    # critic job. Exact fingerprints make it safe to recover paid audits from
+    # sibling run folders without relying on the selected source folder.
+    runs_directory = path.parent.parent
+    recovery_disabled = (
+        path.parent / CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME
+    ).is_file()
+    if (
+        not recovery_disabled
+        and runs_directory.name == "runs"
+        and runs_directory.is_dir()
+    ):
+        siblings = sorted(
+            (
+                item for item in runs_directory.glob(
+                    f"*/{CRITIC_AUDIT_CHECKPOINT_FILENAME}"
+                )
+                if item != path
+            ),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(siblings)
+
+    restored = list(empty)
+    primary_problem = None
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            value = json.loads(candidate.read_text(encoding="utf-8"))
+            reports = value.get("reports") if isinstance(value, dict) else None
+            if (
+                not isinstance(value, dict)
+                or value.get("schemaVersion")
+                != CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION
+                or value.get("assignmentSha256") != expected
+                or not isinstance(reports, list)
+                or len(reports) != len(CRITIC_AUDIT_FOCI)
+            ):
+                raise ValueError("checkpoint belongs to another proof or setting")
+            added = 0
+            for index, report in enumerate(reports):
+                if report is None or restored[index] is not None:
+                    continue
+                validate_json_schema(report, CRITIC_CHECK_SCHEMA)
+                report = dict(report)
+                report["focus"] = CRITIC_AUDIT_FOCI[index]
+                restored[index] = report
+                added += 1
+            if added and candidate != path:
+                emit(
+                    "status", "critic",
+                    label="Prior exact-proof audits found",
+                    text=(
+                        f"Recovered {added} completed independent audit"
+                        f"{'s' if added != 1 else ''} from prior job "
+                        f"{candidate.parent.name}."
+                    ),
+                    checkpoint=True, checkpointSource=candidate.parent.name,
+                    recoveredAuditCount=added,
+                )
+            if all(report is not None for report in restored):
+                break
+        except (
+            OSError, UnicodeError, json.JSONDecodeError, ValueError, Error,
+        ) as exc:
+            if candidate == path:
+                primary_problem = exc
+    if primary_problem is not None and not any(restored):
+        emit(
+            "diagnostic", "critic",
+            text=(
+                "Ignored incompatible critic audit checkpoint: "
+                f"{primary_problem}"
+            ),
+        )
+    return restored
+
+
+def save_critic_audit_checkpoint(
+    reports, statement, solution, model, effort, instructions, directory=None,
+):
+    """Atomically preserve every completed independent auditor result."""
+
+    value = {
+        "schemaVersion": CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION,
+        "assignmentSha256": critic_audit_assignment_sha256(
+            statement, solution, model, effort, instructions,
+        ),
+        "model": chosen_model(model),
+        "reasoningEffort": effective_effort(model, effort),
+        "reports": reports,
+    }
+    _private_atomic_write(
+        critic_audit_checkpoint_path(directory),
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def independent_critic_audits(
+    statement, solution, model, effort, instructions, speed, summary,
+):
+    """Run three explicit controller-owned auditors concurrently."""
+
+    audit_effort = (
+        effective_effort(model, "high")
+        if is_deepseek_model(model) else effort
+    )
+    audit_timeout = (
+        CRITIC_AUDIT_TIMEOUT_SECONDS if is_deepseek_model(model) else None
+    )
+    checkpoint_directory = critic_audit_checkpoint_path().parent
+    save_critic_candidate(solution, directory=checkpoint_directory)
+    reports = load_critic_audit_checkpoint(
+        statement, solution, model, audit_effort, instructions,
+    )
+    restored = sum(report is not None for report in reports)
+    for index, report in enumerate(reports):
+        if report is not None:
+            emit(
+                "status", "critic",
+                label=f"Independent audit {index + 1} restored",
+                text=(
+                    "Loaded this completed audit from the exact-proof "
+                    "checkpoint; no new provider request will be charged for it."
+                ),
+                node="critic", auditIndex=index + 1,
+                auditVerdict=report["verdict"], checkpoint=True,
+            )
+    emit(
+        "status", "critic", label="Three independent audits started",
+        text=(
+            f"The controller restored {restored} completed audit"
+            f"{'s' if restored != 1 else ''} and is launching "
+            f"{len(reports) - restored} explicit parallel model request"
+            f"{'s' if len(reports) - restored != 1 else ''}. Each live "
+            "request receives the full proof and one distinct hostile-audit "
+            "focus. No model-managed spawning or payload delivery is used."
+        ),
+        node="critic", auditCount=len(CRITIC_AUDIT_FOCI),
+        restoredAuditCount=restored,
+        launchedAuditCount=len(reports) - restored,
+        reasoningEffort=audit_effort,
+        timeoutSeconds=audit_timeout,
+    )
+
+    def run_one(index, focus):
+        report, _ = structured(
+            critic_audit_prompt(
+                statement, solution, focus, instructions,
+            ),
+            CRITIC_CHECK_SCHEMA, "critic", model=model,
+            effort=audit_effort, speed=speed, summary=summary,
+            timeout=audit_timeout, attempts=1,
+            request_label=f"Independent critic audit {index + 1}",
+            activity_label=f"Independent audit {index + 1}",
+        )
+        report = dict(report)
+        report["focus"] = focus
+        return report
+
+    failures = []
+    missing = [
+        (index, focus) for index, focus in enumerate(CRITIC_AUDIT_FOCI)
+        if reports[index] is None
+    ]
+    with ThreadPoolExecutor(max_workers=max(1, len(missing))) as pool:
+        futures = {
+            pool.submit(run_one, index, focus): index
+            for index, focus in missing
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                reports[index] = future.result()
+                save_critic_audit_checkpoint(
+                    reports, statement, solution, model, audit_effort,
+                    instructions,
+                )
+                emit(
+                    "status", "critic",
+                    label=f"Independent audit {index + 1} complete",
+                    text=reports[index]["report"], node="critic",
+                    auditIndex=index + 1,
+                    auditVerdict=reports[index]["verdict"],
+                )
+            except Exception as exc:
+                failures.append((index, str(exc)))
+                emit(
+                    "diagnostic", "critic",
+                    text=f"Independent audit {index + 1} failed: {exc}",
+                    node="critic", auditIndex=index + 1,
+                )
+    if failures:
+        detail = "; ".join(
+            f"audit {index + 1}: {message}"
+            for index, message in sorted(failures)
+        )
+        raise Error(
+            "The controller could not complete all three independent audits. "
+            + detail
+        )
+    return reports
+
+
 def criticize(
     statement, solution, round_number, model=CRITIC_MODEL, effort=EFFORT,
     instructions=CRITIC_PROMPT, speed=DEFAULT_SPEED,
+    summary=DEFAULT_REASONING_SUMMARY,
 ):
     """Have independent auditors guide one critic repair attempt."""
 
     instructions = text(instructions)
     if CRITIC_MEMORY_PROMPT not in instructions:
         instructions = f"{instructions}\n\n{CRITIC_MEMORY_PROMPT}"
-    prompt = (
-        f"{instructions}\n\nSTATEMENT:\n{text(statement)}"
-        f"\n\nCANDIDATE SOLUTION:\n{text(solution)}"
+    statement, solution = text(statement), text(solution)
+    model = chosen_model(model)
+    effort = effective_effort(model, effort)
+    speed = chosen_speed(speed)
+    summary = chosen_reasoning_summary(summary)
+    checks = independent_critic_audits(
+        statement, solution, model, effort, instructions, speed, summary,
+    )
+    prompt = f"""
+CONTROLLER ORCHESTRATION OVERRIDE
+The controller has already completed exactly three fresh independent audits.
+Do not spawn, message, or wait for subagents. Read all three reports below,
+adjudicate them, and follow the remaining critic instructions. Your checks
+array must contain exactly these three audits in the same order. Try to repair
+every valid bug yourself; every changed proof will receive another completely
+fresh controller-run three-auditor round.
+
+CRITIC INSTRUCTIONS:
+{instructions}
+
+COMPLETED INDEPENDENT AUDITS:
+{json.dumps(checks, ensure_ascii=False, indent=2)}
+
+STATEMENT:
+{statement}
+
+CANDIDATE SOLUTION:
+{solution}
+""".strip()
+    coordinator_timeout = (
+        CRITIC_COORDINATOR_TIMEOUT_SECONDS
+        if is_deepseek_model(model) else None
     )
     report, raw = structured(
-        prompt, CRITIC_SCHEMA, "critic", model=chosen_model(model),
-        effort=chosen_effort(effort), speed=speed,
+        prompt, CRITIC_SCHEMA, "critic", model=model,
+        effort=effort, speed=speed, summary=summary,
+        timeout=coordinator_timeout, attempts=1,
+        request_label="Critic coordinator adjudication",
+        activity_label="Critic coordinator",
     )
-    checks = report.get("checks")
+    returned_checks = report.get("checks")
     if (
-        not isinstance(checks, list) or len(checks) != 3
+        not isinstance(returned_checks, list) or len(returned_checks) != 3
         or report.get("verdict") not in {"pass", "reject"}
         or not isinstance(report.get("fixed"), bool)
         or not isinstance(report.get("solution"), str)
@@ -1111,17 +1999,23 @@ def criticize(
             not isinstance(check, dict)
             or check.get("verdict") not in {"pass", "fail"}
             or not all(isinstance(check.get(key), str) for key in ("focus", "report"))
-            for check in checks
+            for check in returned_checks
         )
         or (report["verdict"] == "pass" and report["bugs"].strip())
         or (
             report["verdict"] == "pass" and not report["fixed"]
-            and any(check["verdict"] == "fail" for check in checks)
+            and (
+                any(check["verdict"] == "fail" for check in returned_checks)
+                or any(check["verdict"] == "fail" for check in checks)
+            )
         )
         or (report["verdict"] == "reject" and not report["bugs"].strip())
         or (report["verdict"] == "reject" and report["fixed"])
     ):
         raise Error("Codex returned an invalid critic result.")
+    # The controller-owned auditor outputs are canonical. The coordinator may
+    # format or paraphrase its copy, but cannot rewrite the independent record.
+    report["checks"] = checks
     emit(
         "critic_result", "critic", label=f"Critic round {round_number}",
         text=raw, report=report,
@@ -1160,6 +2054,7 @@ CRITIC BUGS:
 def finalize(
     statement, solution, model=WRITER_MODEL, effort=EFFORT,
     instructions=FINAL_PROMPT, speed=DEFAULT_SPEED,
+    summary=DEFAULT_REASONING_SUMMARY,
 ):
     """Use a fresh final editor to turn the latest solution into LaTeX."""
 
@@ -1169,7 +2064,7 @@ def finalize(
     )
     report, raw = structured(
         prompt, FINAL_SCHEMA, "final", model=chosen_model(model),
-        effort=chosen_effort(effort), speed=speed,
+        effort=chosen_effort(effort), speed=speed, summary=summary,
     )
     try:
         latex = text(report["latex"])
@@ -1185,6 +2080,7 @@ def finalize(
 def polish(
     source, model=WRITER_MODEL, effort=EFFORT,
     instructions=FINAL_PROMPT, speed=DEFAULT_SPEED,
+    summary=DEFAULT_REASONING_SUMMARY,
 ):
     """Turn one combined theorem-and-proof input into polished LaTeX."""
 
@@ -1194,7 +2090,7 @@ def polish(
     )
     report, raw = structured(
         prompt, FINAL_SCHEMA, "final", model=chosen_model(model),
-        effort=chosen_effort(effort), speed=speed,
+        effort=chosen_effort(effort), speed=speed, summary=summary,
     )
     try:
         latex = text(report["latex"])
@@ -1205,6 +2101,119 @@ def polish(
         text=raw, output=latex,
     )
     return latex
+
+
+def audit_candidate(
+    statement, solution, critic_rounds=DEFAULT_CRITIC_ROUNDS,
+    thinking_hours=DEFAULT_AUTHOR_HOURS,
+    author_model=AUTHOR_MODEL, critic_model=CRITIC_MODEL,
+    writer_model=WRITER_MODEL, effort=EFFORT,
+    author_effort=None, critic_effort=None, writer_effort=None,
+    author_prompt=None, critic_prompt=CRITIC_PROMPT,
+    final_prompt=FINAL_PROMPT,
+    speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
+    author_limit_file=None, author_steer_file=None,
+):
+    """Enter the normal proof loop at a fresh critic with a saved proof."""
+
+    audit_started = time.monotonic()
+    critic_rounds = critic_limit(critic_rounds)
+    thinking_hours = controlled_author_hours(
+        author_limit_file, author_hours(thinking_hours)
+    )
+    author_model = chosen_model(author_model)
+    critic_model = chosen_model(critic_model)
+    writer_model = chosen_model(writer_model)
+    author_effort = effective_effort(author_model, author_effort or effort)
+    critic_effort = effective_effort(critic_model, critic_effort or effort)
+    writer_effort = effective_effort(writer_model, writer_effort or effort)
+    speed = chosen_speed(speed)
+    summary = chosen_reasoning_summary(summary)
+    for selected_model in {author_model, critic_model, writer_model}:
+        require_model_credentials(selected_model)
+    statement, solution = text(statement), text(solution)
+    emit(
+        "status", "critic", label="Saved candidate audit started",
+        text=(
+            "The initial proof author is loaded from the source job. A fresh "
+            "critic is auditing the complete saved candidate; an author repair "
+            "runs only if the critic rejects it."
+        ),
+    )
+    for round_number in range(1, critic_rounds + 1):
+        report = criticize(
+            statement, solution, round_number,
+            model=critic_model, effort=critic_effort,
+            instructions=critic_prompt, speed=speed, summary=summary,
+        )
+        solution = report["solution"].strip()
+        if report["verdict"] == "pass" and not report["fixed"]:
+            emit(
+                "status", "critic", label="Saved candidate approved",
+                text=f"Round {round_number} found no bugs to fix.",
+            )
+            return finalize(
+                statement, solution, model=writer_model,
+                effort=writer_effort, instructions=final_prompt,
+                speed=speed, summary=summary,
+            )
+        if report["verdict"] == "pass":
+            emit(
+                "status", "critic", label="Critic repaired saved candidate",
+                text=(
+                    f"Round {round_number} repaired the proof; a fresh critic "
+                    "will recheck it."
+                ),
+            )
+            continue
+        emit(
+            "partial_result", "critic", label="Rejected saved candidate",
+            text=solution, output=solution,
+        )
+        emit(
+            "status", "repair", label="Returning saved proof to author",
+            text=(
+                "The entry critic rejected the saved candidate. A proof author "
+                "will repair that exact candidate before the normal critic loop "
+                "continues."
+            ),
+            node="author",
+        )
+        base = make_prompt(statement, author_prompt) if author_prompt else make_prompt(statement)
+        repair = repair_prompt(
+            statement, solution, report["bugs"], 1,
+            critic_round=round_number, include_statement=False,
+        )
+        resumed_prompt = (
+            f"{base}\n\nRECOVERY ENTRY FROM A SAVED CRITIC JOB:\n{repair}"
+        )
+        return run_goal(
+            resumed_prompt, statement,
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            author_model=author_model,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            effort=effort,
+            author_effort=author_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            speed=speed,
+            author_limit_file=author_limit_file,
+            elapsed_seconds=time.monotonic() - audit_started,
+            summary=summary,
+            author_steer_file=author_steer_file,
+        )
+    emit(
+        "partial_result", "critic", label="Unverified saved candidate",
+        text=solution, output=solution,
+    )
+    raise Error(
+        f"Reached {critic_rounds} critic rounds without a clean pass for the "
+        "saved candidate."
+    )
 
 
 class RPC:
@@ -1271,6 +2280,8 @@ def run_goal(
     author_effort=None, critic_effort=None, writer_effort=None,
     critic_prompt=CRITIC_PROMPT, final_prompt=FINAL_PROMPT,
     speed=DEFAULT_SPEED, author_limit_file=None, elapsed_seconds=0,
+    summary=DEFAULT_REASONING_SUMMARY,
+    author_steer_file=None,
 ):
     """Solve, require a clean critic pass, then LaTeX-edit the result."""
 
@@ -1281,10 +2292,14 @@ def run_goal(
     author_model = chosen_model(author_model)
     critic_model = chosen_model(critic_model)
     writer_model = chosen_model(writer_model)
-    author_effort = chosen_effort(author_effort or effort)
-    critic_effort = chosen_effort(critic_effort or effort)
-    writer_effort = chosen_effort(writer_effort or effort)
+    author_effort = effective_effort(author_model, author_effort or effort)
+    critic_effort = effective_effort(critic_model, critic_effort or effort)
+    writer_effort = effective_effort(writer_model, writer_effort or effort)
     speed = chosen_speed(speed)
+    author_speed = effective_speed(author_model, speed)
+    author_summary = reasoning_summary(author_model, summary)
+    for selected_model in {author_model, critic_model, writer_model}:
+        require_model_credentials(selected_model)
     elapsed_seconds = prior_elapsed_seconds(elapsed_seconds)
     original_prompt = str(prompt)
     statement = str(statement)
@@ -1305,22 +2320,25 @@ def run_goal(
     )
     emit(
         "request", "solve", label="Exact solve input", text=initial_author_input,
-        model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
-        serviceTier=speed,
+        model=author_model, modelProvider=model_provider(author_model),
+        reasoningEffort=author_effort, reasoningSummary=author_summary,
+        serviceTier=author_speed,
     )
     emit(
         "request", "solve", label="Goal continuation instruction", text=GOAL,
-        model=author_model, reasoningEffort=author_effort, reasoningSummary="detailed",
-        serviceTier=speed,
+        model=author_model, modelProvider=model_provider(author_model),
+        reasoningEffort=author_effort, reasoningSummary=author_summary,
+        serviceTier=author_speed,
     )
     command = [
         codex(), "app-server", "--enable", "goals", "--enable", "multi_agent",
-        *speed_arguments(speed), *context_cache_arguments(),
+        *provider_arguments(author_model),
+        *speed_arguments(author_speed, author_model), *context_cache_arguments(),
     ]
     process = subprocess.Popen(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-        errors="replace", bufsize=1, env=environment(),
+        errors="replace", bufsize=1, env=environment(author_model),
     )
 
     # Keep the latest complete answer from the original author thread.
@@ -1391,8 +2409,9 @@ def run_goal(
                     "request", stage,
                     label="Author context re-anchor after compaction",
                     text=anchored, model=author_model,
-                    reasoningEffort=author_effort, serviceTier=speed,
-                    reasoningSummary="detailed", node="author",
+                    modelProvider=model_provider(author_model),
+                    reasoningEffort=author_effort, serviceTier=author_speed,
+                    reasoningSummary=author_summary, node="author",
                     compactionId=compaction_id,
                 )
                 try:
@@ -1418,15 +2437,19 @@ def run_goal(
         })
         rpc.send({"method": "initialized", "params": {}})
         started = rpc.call("thread/start", {
-            "model": author_model, "modelProvider": "openai",
+            "model": author_model,
+            "modelProvider": model_provider(author_model),
             # The web app starts this process inside its private problem folder.
             "cwd": str(Path.cwd()), "ephemeral": False,
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {
                 "model_reasoning_effort": author_effort,
-                "model_reasoning_summary": "detailed",
-                **({"service_tier": "fast"} if speed == "fast" else {}),
-                "features": {"fast_mode": speed == "fast"},
+                "model_reasoning_summary": author_summary,
+                **(
+                    {"service_tier": "fast"}
+                    if author_speed == "fast" else {}
+                ),
+                "features": {"fast_mode": author_speed == "fast"},
             },
         })
         thread = started["thread"]["id"]
@@ -1438,7 +2461,7 @@ def run_goal(
         started_turn = rpc.call("turn/start", {
             "threadId": thread,
             "input": [{"type": "text", "text": initial_author_input}],
-            "summary": "detailed",
+            "summary": author_summary,
         })
         rpc.call("thread/goal/set", {**goal, "status": "active"})
         current_turn["id"] = (started_turn.get("turn") or {}).get("id")
@@ -1512,6 +2535,43 @@ def run_goal(
 
         timer = threading.Thread(target=enforce_deadline, daemon=True)
         timer.start()
+
+        def relay_author_steers():
+            """Forward live UI instructions into the active author turn."""
+
+            delivered_id = None
+            while not stop_timer.wait(AUTHOR_STEER_POLL_SECONDS):
+                command = pending_author_steer(
+                    author_steer_file, delivered_id
+                )
+                turn_id = current_turn["id"]
+                if not command or not author_active.is_set() or not turn_id:
+                    continue
+                command_id, instruction = command
+                try:
+                    request_id = rpc.request("turn/steer", {
+                        "threadId": thread,
+                        "expectedTurnId": turn_id,
+                        "input": [{"type": "text", "text": instruction}],
+                    })
+                    delivered_id = command_id
+                    emit(
+                        "request", stage, label="Live author instruction sent",
+                        text=instruction, model=author_model,
+                        modelProvider=model_provider(author_model),
+                        reasoningEffort=author_effort,
+                        reasoningSummary=author_summary,
+                        serviceTier=author_speed, node="author",
+                        steerId=command_id, requestId=request_id,
+                    )
+                except (Error, OSError) as exc:
+                    emit(
+                        "diagnostic", stage,
+                        text=f"Could not steer the active author: {exc}",
+                        node="author", steerId=command_id,
+                    )
+
+        threading.Thread(target=relay_author_steers, daemon=True).start()
         emit(
             "status", "solve", label="Goal started",
             text=(
@@ -1590,9 +2650,10 @@ def run_goal(
                 emit(
                     "request", "solve", label="Author continuation",
                     text=continuation, model=author_model,
+                    modelProvider=model_provider(author_model),
                     reasoningEffort=author_effort,
-                    serviceTier=speed,
-                    reasoningSummary="detailed",
+                    serviceTier=author_speed,
+                    reasoningSummary=author_summary,
                 )
                 # Explicit turns start while Goal mode is paused.
                 rpc.call("thread/goal/set", {**goal, "status": "paused"})
@@ -1601,7 +2662,7 @@ def run_goal(
                 resumed = rpc.call("turn/start", {
                     "threadId": thread,
                     "input": [{"type": "text", "text": continuation}],
-                    "summary": "detailed",
+                    "summary": author_summary,
                 })
                 current_turn["id"] = (resumed.get("turn") or {}).get("id")
                 # The deadline and activation serialize through this lock.
@@ -1652,9 +2713,10 @@ def run_goal(
             emit(
                 "request", "failure", label="Failure summary request",
                 text=summary_prompt, model=author_model,
+                modelProvider=model_provider(author_model),
                 reasoningEffort=author_effort,
-                serviceTier=speed,
-                reasoningSummary="detailed",
+                serviceTier=author_speed,
+                reasoningSummary=author_summary,
             )
             summary_stop = threading.Event()
             summary_expired = threading.Event()
@@ -1662,7 +2724,7 @@ def run_goal(
                 summary_turn = rpc.call("turn/start", {
                     "threadId": thread,
                     "input": [{"type": "text", "text": summary_prompt}],
-                    "summary": "detailed",
+                    "summary": author_summary,
                 })
                 summary_id = (summary_turn.get("turn") or {}).get("id")
 
@@ -1761,7 +2823,8 @@ def run_goal(
             audited_solution = solution
             audited_attempt = memory.data.get("currentAttemptId")
             report = criticize(
-                statement, solution, round_number, speed=speed, **critic_options
+                statement, solution, round_number, speed=speed,
+                summary=summary, **critic_options
             )
             solution = report["solution"].strip()
             changed = (
@@ -1835,16 +2898,17 @@ def run_goal(
                     "request", "repair",
                     label=f"Proof author revision {revision_number}",
                     text=instruction, model=author_model,
+                    modelProvider=model_provider(author_model),
                     reasoningEffort=author_effort,
-                    serviceTier=speed,
-                    reasoningSummary="detailed",
+                    serviceTier=author_speed,
+                    reasoningSummary=author_summary,
                     node="author", round=0,
                 )
                 author_active.set()
                 revision_turn = rpc.call("turn/start", {
                     "threadId": thread,
                     "input": [{"type": "text", "text": instruction}],
-                    "summary": "detailed",
+                    "summary": author_summary,
                 })
                 current_turn["id"] = (
                     revision_turn.get("turn") or {}
@@ -1939,7 +3003,9 @@ def run_goal(
         final_options = {"model": writer_model, "effort": writer_effort}
         if final_prompt != FINAL_PROMPT:
             final_options["instructions"] = final_prompt
-        return finalize(statement, solution, speed=speed, **final_options)
+        return finalize(
+            statement, solution, speed=speed, summary=summary, **final_options
+        )
     except KeyboardInterrupt:
         confirmed = []
         if thread:
@@ -1973,7 +3039,10 @@ def main():
 
     configure_standard_streams()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["review", "solve", "finalize"])
+    parser.add_argument(
+        "action",
+        choices=["review", "solve", "audit", "finalize", "finalize-proof"],
+    )
     parser.add_argument(
         "--review-model", choices=REVIEW_MODELS, default=REVIEW_MODEL,
     )
@@ -1987,11 +3056,16 @@ def main():
     parser.add_argument("--critic-effort", choices=EFFORTS)
     parser.add_argument("--writer-effort", choices=EFFORTS)
     parser.add_argument("--speed", choices=SPEEDS, default=DEFAULT_SPEED)
+    parser.add_argument(
+        "--reasoning-summary", choices=REASONING_SUMMARIES,
+        default=DEFAULT_REASONING_SUMMARY,
+    )
     parser.add_argument("--review-prompt-file")
     parser.add_argument("--author-prompt-file")
     parser.add_argument("--critic-prompt-file")
     parser.add_argument("--final-prompt-file")
     parser.add_argument("--author-limit-file")
+    parser.add_argument("--author-steer-file")
     parser.add_argument("--elapsed-seconds", type=float, default=0)
     args = parser.parse_args()
     action = args.action
@@ -2004,14 +3078,14 @@ def main():
                 review(
                     statement, feedback, args.review_model, args.review_effort,
                     prompt_file(args.review_prompt_file, REVIEW_PROMPT),
-                    speed=args.speed,
+                    speed=args.speed, summary=args.reasoning_summary,
                 )
             else:
                 review(
                     statement, feedback, args.review_model, args.review_effort,
-                    speed=args.speed,
+                    speed=args.speed, summary=args.reasoning_summary,
                 )
-        elif action == "finalize":
+        elif action in {"finalize", "finalize-proof"}:
             if not statement.strip():
                 raise Error("Final LaTeX mode requires a theorem and proof.")
             final_effort = args.writer_effort or args.reasoning_effort
@@ -2019,10 +3093,59 @@ def main():
                 prompt_file(args.final_prompt_file, FINAL_PROMPT)
                 if args.final_prompt_file else FINAL_PROMPT
             )
-            polish(
-                statement, model=args.writer_model,
-                effort=final_effort, instructions=final_instructions,
-                speed=args.speed,
+            if action == "finalize-proof":
+                exact_statement, separator, solution = statement.partition("\0")
+                if (
+                    not separator
+                    or not exact_statement.strip()
+                    or not solution.strip()
+                ):
+                    raise Error(
+                        "Saved final editing requires a statement and clean proof."
+                    )
+                finalize(
+                    exact_statement, solution, model=args.writer_model,
+                    effort=final_effort, instructions=final_instructions,
+                    speed=args.speed, summary=args.reasoning_summary,
+                )
+            else:
+                polish(
+                    statement, model=args.writer_model,
+                    effort=final_effort, instructions=final_instructions,
+                    speed=args.speed, summary=args.reasoning_summary,
+                )
+        elif action == "audit":
+            statement, separator, remainder = statement.partition("\0")
+            solution, rounds_separator, settings = remainder.partition("\0")
+            rounds, hours_separator, hours = settings.partition("\0")
+            if not separator or not statement.strip() or not solution.strip():
+                raise Error(
+                    "Saved-candidate audit requires a statement and proof."
+                )
+            audit_candidate(
+                statement, solution,
+                rounds if rounds_separator else DEFAULT_CRITIC_ROUNDS,
+                hours if hours_separator else DEFAULT_AUTHOR_HOURS,
+                author_model=args.author_model,
+                critic_model=args.critic_model,
+                writer_model=args.writer_model,
+                effort=args.reasoning_effort,
+                author_effort=args.author_effort,
+                critic_effort=args.critic_effort,
+                writer_effort=args.writer_effort,
+                author_prompt=(
+                    prompt_file(args.author_prompt_file, None)
+                    if args.author_prompt_file else None
+                ),
+                critic_prompt=prompt_file(
+                    args.critic_prompt_file, CRITIC_PROMPT
+                ),
+                final_prompt=prompt_file(
+                    args.final_prompt_file, FINAL_PROMPT
+                ),
+                speed=args.speed, summary=args.reasoning_summary,
+                author_limit_file=args.author_limit_file,
+                author_steer_file=args.author_steer_file,
             )
         else:
             # The web UI appends critic rounds and author hours with NULs.
@@ -2047,6 +3170,8 @@ def main():
             )
             if args.elapsed_seconds:
                 limit_option["elapsed_seconds"] = args.elapsed_seconds
+            if args.author_steer_file:
+                limit_option["author_steer_file"] = args.author_steer_file
             if any((
                 args.author_effort, args.critic_effort, args.writer_effort,
                 args.critic_prompt_file, args.final_prompt_file,
@@ -2063,18 +3188,21 @@ def main():
                         args.final_prompt_file, FINAL_PROMPT
                     ),
                     speed=args.speed,
+                    summary=args.reasoning_summary,
                     **limit_option,
                 )
             else:
                 run_goal(
-                    *common, speed=args.speed,
+                    *common, speed=args.speed, summary=args.reasoning_summary,
                     **limit_option,
                 )
         return 0
     except KeyboardInterrupt:
         message = (
             "Stopped review." if action == "review"
-            else "Stopped LaTeX editing." if action == "finalize"
+            else "Stopped LaTeX editing."
+            if action in {"finalize", "finalize-proof"}
+            else "Stopped saved-candidate audit." if action == "audit"
             else "Stopped. A goal pause was requested."
         )
         print(f"\n{message}", file=sys.stderr)

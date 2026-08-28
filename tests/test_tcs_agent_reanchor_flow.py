@@ -1,5 +1,7 @@
 import copy
+import os
 import tempfile
+import time
 import unittest
 from collections import deque
 from pathlib import Path
@@ -59,7 +61,13 @@ class FakeProcess:
 
 
 class ReanchorFlowTests(unittest.TestCase):
-    def run_scripted_goal(self, events, reports, on_critic=None):
+    def run_scripted_goal(
+        self, events, reports, on_critic=None, on_read=None, **goal_options,
+    ):
+        # Most re-anchor tests exercise provider-independent author behavior.
+        goal_options.setdefault("author_model", "gpt-5.6-sol")
+        goal_options.setdefault("critic_model", "gpt-5.6-sol")
+        goal_options.setdefault("writer_model", "gpt-5.6-sol")
         holder = {}
         traces = []
         critic_calls = []
@@ -95,6 +103,8 @@ class ReanchorFlowTests(unittest.TestCase):
                 self.calls.append(("notification", copy.deepcopy(message)))
 
             def read(self):
+                if on_read is not None:
+                    on_read(self)
                 if not self.events:
                     raise AssertionError("The fake app-server event script was exhausted.")
                 message = self.events.popleft()
@@ -117,12 +127,19 @@ class ReanchorFlowTests(unittest.TestCase):
         def capture_emit(kind, stage, **fields):
             traces.append({"kind": kind, "stage": stage, **copy.deepcopy(fields)})
 
+        def fake_popen(command, **options):
+            holder["command"] = copy.deepcopy(command)
+            holder["process_options"] = options
+            process.launch_command = copy.deepcopy(command)
+            process.launch_options = copy.deepcopy(options)
+            return process
+
         with tempfile.TemporaryDirectory() as folder:
             with (
                 patch.object(tcs_agent.Path, "cwd", return_value=Path(folder)),
                 patch.object(tcs_agent, "codex", return_value="codex-fake"),
                 patch.object(tcs_agent, "context_cache_arguments", return_value=[]),
-                patch.object(tcs_agent.subprocess, "Popen", return_value=process),
+                patch.object(tcs_agent.subprocess, "Popen", side_effect=fake_popen),
                 patch.object(tcs_agent, "RPC", FakeRPC),
                 patch.object(tcs_agent, "criticize", side_effect=fake_criticize),
                 patch.object(tcs_agent, "finalize", return_value="FINAL-LATEX"),
@@ -139,10 +156,140 @@ class ReanchorFlowTests(unittest.TestCase):
                     critic_rounds=3,
                     thinking_hours=1,
                     speed="standard",
+                    **goal_options,
                 )
 
         self.assertFalse(report_queue, "Every scripted critic report should be used.")
         return result, holder["rpc"], traces, critic_calls
+
+    def test_live_instruction_steers_the_active_author_turn(self):
+        events = [
+            item_event(
+                "item/completed", "root-thread", "turn-1", "agentMessage",
+                "answer-1", "CANDIDATE",
+            ),
+            goal_event("complete"),
+            turn_completed("turn-1"),
+        ]
+        reports = [{
+            "verdict": "pass", "fixed": False,
+            "solution": "CANDIDATE", "bugs": "",
+        }]
+
+        def wait_for_steer(rpc):
+            deadline = time.monotonic() + 1
+            while (
+                not any(method == "turn/steer" for method, _ in rpc.requests)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.005)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "author-steer.json"
+            path.write_text(
+                '{"id":"live-1","instruction":"Stop experiments now."}',
+                encoding="utf-8",
+            )
+            with patch.object(tcs_agent, "AUTHOR_STEER_POLL_SECONDS", 0.001):
+                result, rpc, traces, _ = self.run_scripted_goal(
+                    events, reports, on_read=wait_for_steer,
+                    author_steer_file=path,
+                )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        steers = [
+            params for method, params in rpc.requests
+            if method == "turn/steer"
+        ]
+        self.assertEqual(len(steers), 1)
+        self.assertEqual(steers[0]["expectedTurnId"], "turn-1")
+        self.assertEqual(
+            steers[0]["input"],
+            [{"type": "text", "text": "Stop experiments now."}],
+        )
+        self.assertTrue(any(
+            trace.get("label") == "Live author instruction sent"
+            for trace in traces
+        ))
+
+    def test_deepseek_author_keeps_goal_and_multi_agent_app_server(self):
+        events = [
+            item_event(
+                "item/completed", "root-thread", "turn-1", "agentMessage",
+                "answer-1", "DEEPSEEK-CANDIDATE",
+            ),
+            goal_event("complete"),
+            turn_completed("turn-1"),
+        ]
+        reports = [{
+            "verdict": "pass",
+            "fixed": False,
+            "solution": "DEEPSEEK-CANDIDATE",
+            "bugs": "",
+        }]
+        with patch.dict(
+            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-key"}, clear=False,
+        ):
+            result, rpc, traces, _ = self.run_scripted_goal(
+                events, reports, author_model=tcs_agent.DEEPSEEK_MODEL,
+            )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        command = next(
+            trace for trace in traces
+            if trace.get("label") == "Exact solve input"
+        )
+        self.assertEqual(command["modelProvider"], tcs_agent.DEEPSEEK_PROVIDER)
+        self.assertEqual(command["reasoningEffort"], "max")
+        self.assertEqual(command["reasoningSummary"], "concise")
+        self.assertEqual(command["serviceTier"], "standard")
+
+        launch = rpc.process.launch_command
+        self.assertEqual(launch[:2], ["codex-fake", "app-server"])
+        self.assertIn("multi_agent", launch)
+        self.assertIn('model_provider="deepseek"', launch)
+        self.assertIn(
+            'model_providers.deepseek.wire_api="responses"', launch,
+        )
+        self.assertIn(
+            'model_providers.deepseek.env_key='
+            '"TCS_PROVER_DEEPSEEK_TOKEN"',
+            launch,
+        )
+        self.assertIn('forced_login_method="api"', launch)
+        self.assertEqual(
+            rpc.process.launch_options["env"][tcs_agent.DEEPSEEK_TOKEN_ENV],
+            "test-key",
+        )
+        self.assertEqual(
+            rpc.process.launch_options["env"]["OPENAI_API_KEY"],
+            tcs_agent.CUSTOM_PROVIDER_LOGIN_PLACEHOLDER,
+        )
+        self.assertNotIn(
+            tcs_agent.DEEPSEEK_KEY_ENV, rpc.process.launch_options["env"],
+        )
+        self.assertNotIn("test-key", " ".join(launch))
+
+        thread_start = next(
+            params for method, params in rpc.calls if method == "thread/start"
+        )
+        self.assertEqual(thread_start["model"], tcs_agent.DEEPSEEK_MODEL)
+        self.assertEqual(
+            thread_start["modelProvider"], tcs_agent.DEEPSEEK_PROVIDER,
+        )
+        self.assertEqual(thread_start["config"]["model_reasoning_effort"], "max")
+        self.assertEqual(
+            thread_start["config"]["model_reasoning_summary"], "concise"
+        )
+        self.assertFalse(thread_start["config"]["features"]["fast_mode"])
+
+        goal_calls = [
+            params for method, params in rpc.calls if method == "thread/goal/set"
+        ]
+        self.assertEqual(
+            [params["status"] for params in goal_calls[:2]],
+            ["paused", "active"],
+        )
 
     def test_completed_root_author_compaction_steers_exactly_once(self):
         root_compaction = item_event(
