@@ -42,6 +42,7 @@ DEFAULT_REASONING_EFFORT = "ultra"
 STOP_TIMEOUT_SECONDS = 2
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
+CATALOGUE_FILENAME = "catalogue.json"
 
 
 def isolated_process_options():
@@ -136,6 +137,138 @@ def prepare_runs_directory(path):
     # RX applies only to ``runs`` itself (no OI/CI), so other run contents keep
     # their protected per-directory ACLs.
     grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
+
+
+class RunCatalogue:
+    """Durably retain the UI state needed to find and reopen prior runs."""
+
+    def __init__(self, runs):
+        self.runs = Path(runs)
+        self.path = self.runs / CATALOGUE_FILENAME
+        self.lock = threading.RLock()
+        self.entries = self._load()
+        if self._discover_unlisted_runs():
+            self._write_locked()
+
+    def _load(self):
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            entries = value.get("jobs") if isinstance(value, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("jobs is not a list")
+            return {
+                entry["runId"]: entry for entry in entries
+                if isinstance(entry, dict) and isinstance(entry.get("runId"), str)
+                and entry["runId"]
+            }
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            print(f"warning: ignoring unreadable run catalogue: {exc}", file=sys.stderr)
+            return {}
+
+    def _discover_unlisted_runs(self):
+        """Make runs created before catalogue support visible once upgraded."""
+
+        if not self.runs.is_dir():
+            return False
+        changed = False
+        for folder in self.runs.iterdir():
+            if not folder.is_dir() or folder.name.startswith("."):
+                continue
+            run_id = folder.name
+            if run_id in self.entries or not (folder / "transcript.jsonl").exists():
+                continue
+            draft = ""
+            for name, prefix in (
+                ("draft.md", "# Draft problem\n\n"),
+                ("algorithmic-problem.md", ""),
+                ("latex-input.md", ""),
+            ):
+                try:
+                    draft = (folder / name).read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeError):
+                    continue
+                if draft:
+                    if prefix and draft.startswith(prefix):
+                        draft = draft[len(prefix):]
+                    break
+            try:
+                started_at = datetime.strptime(
+                    run_id[:19], "%Y-%m-%d_%H-%M-%S"
+                ).replace(tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                started_at = datetime.fromtimestamp(
+                    folder.stat().st_mtime, timezone.utc
+                ).isoformat()
+            output = ""
+            for name in ("final.tex", "partial-output.md", "failure-summary.md"):
+                try:
+                    output = (folder / name).read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    continue
+                break
+            state = empty_state()
+            state.update(
+                runId=run_id, phase="done", draft=draft, output=output,
+                startedAt=started_at, activeNode="latex_editor",
+            )
+            self.entries[run_id] = self.state_for_storage(state)
+            changed = True
+        return changed
+
+    @staticmethod
+    def state_for_storage(state):
+        """Exclude the append-only transcript, which remains in each run folder."""
+
+        return {
+            key: value for key, value in state.items()
+            if key not in {"trace", "traceVersion"}
+        }
+
+    def _write_locked(self):
+        prepare_runs_directory(self.runs)
+        temporary = self.path.with_name(f".{CATALOGUE_FILENAME}.tmp")
+        payload = {
+            "version": 1,
+            "jobs": sorted(
+                self.entries.values(),
+                key=lambda entry: entry.get("startedAt", ""), reverse=True,
+            ),
+        }
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            temporary.replace(self.path)
+            self.path.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def save(self, state):
+        entry = self.state_for_storage(state)
+        run_id = entry.get("runId")
+        if not isinstance(run_id, str) or not run_id:
+            return
+        with self.lock:
+            self.entries[run_id] = entry
+            self._write_locked()
+
+    def remove(self, run_id):
+        with self.lock:
+            if self.entries.pop(run_id, None) is not None:
+                self._write_locked()
+
+    def get(self, run_id):
+        with self.lock:
+            entry = self.entries.get(run_id)
+            return dict(entry) if entry else None
+
+    def all(self):
+        with self.lock:
+            return [dict(entry) for entry in self.entries.values()]
 
 
 def load_algorithmic_catalog(path):
@@ -410,7 +543,10 @@ def empty_state(trace=None, trace_version=0):
 class App:
     """Own one review-and-solve workflow."""
 
-    def __init__(self, trace_file=None, runs=RUNS, output_stream=None):
+    def __init__(
+        self, trace_file=None, runs=RUNS, output_stream=None,
+        saved_state=None, save_state=None,
+    ):
         # Tests may supply one fixed log; the real app uses one folder per run.
         self.runs, self.fixed_trace = Path(runs), trace_file is not None
         self.output_stream = output_stream
@@ -418,10 +554,30 @@ class App:
         self.run_dir = self.trace_file.parent if self.trace_file else None
         trace, total, self.pinned = self._load_trace()
         self.state = empty_state(trace, total)
+        if isinstance(saved_state, dict):
+            self.state.update(self.state_for_restore(saved_state))
+        self.state["trace"], self.state["traceVersion"] = trace, total
         self.state["runId"] = self.run_dir.name if self.run_dir else ""
         self.process = None
         self.active_token = None
         self.lock = threading.RLock()
+        self.save_state = save_state
+
+    @staticmethod
+    def state_for_restore(saved_state):
+        """Accept only JSON-object state from the local run catalogue."""
+
+        return {
+            key: value for key, value in saved_state.items()
+            if key not in {"trace", "traceVersion", "runId"}
+        }
+
+    def persist(self):
+        """Publish the durable job summary after a meaningful state change."""
+
+        if self.save_state:
+            with self.lock:
+                self.save_state(dict(self.state))
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -539,6 +695,7 @@ class App:
                 self.state["activeNode"] = record["node"]
             if isinstance(record.get("round"), int):
                 self.state["round"] = record["round"]
+            self.persist()
 
     @staticmethod
     def parse_line(line, stage):
@@ -741,6 +898,7 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            self.persist()
             token = self.active_token = object()
         threading.Thread(
             target=self._review,
@@ -856,6 +1014,7 @@ class App:
                 )
             elif problem:
                 self.state["phase"], self.state["error"] = "input", problem
+            self.persist()
 
     def _launch_solver_locked(self, statement):
         """Attach the existing proof pipeline; the caller holds ``self.lock``."""
@@ -930,6 +1089,7 @@ class App:
             phase="running", stage="solve",
             activeNode="author", round=0, output="",
         )
+        self.persist()
         return process, token
 
     def _launch_final_locked(self, source):
@@ -978,6 +1138,7 @@ class App:
             phase="running", stage="final",
             activeNode="latex_editor", round=0, output="",
         )
+        self.persist()
         return process, token
 
     def start_algorithmic(
@@ -1043,6 +1204,7 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            self.persist()
             process, token = self._launch_solver_locked(statement)
         threading.Thread(
             target=self._read_output, args=(process, token), daemon=True
@@ -1108,6 +1270,7 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            self.persist()
             process, token = self._launch_solver_locked(statement)
         threading.Thread(
             target=self._read_output, args=(process, token), daemon=True
@@ -1155,6 +1318,7 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            self.persist()
             process, token = self._launch_final_locked(source)
         threading.Thread(
             target=self._read_output, args=(process, token), daemon=True
@@ -1296,6 +1460,7 @@ class App:
                 self.state["error"] = problem or f"The solver exited with code {code}."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
+            self.persist()
 
     def clear_trace(self):
         """Clear the saved transcript only when no request is active."""
@@ -1308,6 +1473,7 @@ class App:
             self.pinned = []
             if self.trace_file:
                 self.trace_file.unlink(missing_ok=True)
+            self.persist()
 
     def stop(self):
         """Immediately stop Codex and all of its descendants."""
@@ -1330,6 +1496,7 @@ class App:
                 self.state["output"] = self.state["output"] or (
                     "Codex was stopped before it produced an answer."
                 )
+            self.persist()
 
     def set_author_time_limit(self, hours):
         """Replace the live total-workflow deadline with a chosen total."""
@@ -1375,6 +1542,7 @@ class App:
             trace, version = self.state["trace"], self.state["traceVersion"]
             self.state = empty_state(trace, version)
             self.state["runId"] = self.run_dir.name if self.run_dir else ""
+            self.persist()
 
 
 class Server(ThreadingHTTPServer):
@@ -1382,13 +1550,34 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, trace_file=None, runs=RUNS):
         self.runs = Path(runs)
-        self.app = App(trace_file, self.runs)
+        self.catalogue = RunCatalogue(self.runs)
+        self._finish_interrupted_jobs()
+        self.app = self._make_app(trace_file)
         self.fixed_app = trace_file is not None
         self.jobs, self.jobs_lock = {}, threading.RLock()
         super().__init__(address, Handler)
         # Only the unguessable launch URL can create this server's session.
         self.token = secrets.token_urlsafe(32)
         self.origin = f"http://{HOST}:{self.server_port}"
+
+    def _make_app(self, trace_file=None, saved_state=None):
+        return App(
+            trace_file, self.runs, saved_state=saved_state,
+            save_state=self.catalogue.save,
+        )
+
+    def _finish_interrupted_jobs(self):
+        """A previous server cannot keep its child processes alive after restart."""
+
+        for entry in self.catalogue.all():
+            if entry.get("phase") in ACTIVE_PHASES:
+                entry.update(
+                    phase="done", error="Interrupted when TCS Prover stopped.",
+                    output=entry.get("output") or (
+                        "This run was interrupted when the local server stopped."
+                    ),
+                )
+                self.catalogue.save(entry)
 
     def get_job(self, run_id):
         """Return one exact job; tests may use their fixed single app."""
@@ -1397,15 +1586,27 @@ class Server(ThreadingHTTPServer):
             return self.app
         with self.jobs_lock:
             app = self.jobs.get(run_id)
+            if not app and run_id:
+                saved_state = self.catalogue.get(run_id)
+                folder = self.runs / run_id
+                if (
+                    saved_state
+                    and folder.is_dir()
+                    and folder.resolve().parent == self.runs.resolve()
+                ):
+                    app = self._make_app(
+                        folder / "transcript.jsonl", saved_state=saved_state
+                    )
+                    self.jobs[run_id] = app
         if not app:
-            raise ValueError("That job is not available in this TCS Prover session.")
+            raise ValueError("That job is not available in the run catalogue.")
         return app
 
     def start_job(self, body, run_id=""):
         """Create a new job, or revise the selected existing job."""
 
         app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
+            self.app if self.fixed_app else self._make_app()
         )
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         review_only_option = (
@@ -1466,7 +1667,7 @@ class Server(ThreadingHTTPServer):
         if run_id and not self.fixed_app:
             raise ValueError("Start an algorithmic problem from the home screen.")
         app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
+            self.app if self.fixed_app else self._make_app()
         )
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_algorithmic(
@@ -1498,7 +1699,7 @@ class Server(ThreadingHTTPServer):
         if run_id and not self.fixed_app:
             raise ValueError("Start a direct proof from the home screen.")
         app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
+            self.app if self.fixed_app else self._make_app()
         )
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_direct_statement(
@@ -1528,7 +1729,7 @@ class Server(ThreadingHTTPServer):
         if run_id and not self.fixed_app:
             raise ValueError("Start LaTeX-only editing from the home screen.")
         app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
+            self.app if self.fixed_app else self._make_app()
         )
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_latex_only(
@@ -1548,10 +1749,11 @@ class Server(ThreadingHTTPServer):
         """Return only the fields needed by the home-page job switcher."""
 
         with self.jobs_lock:
-            apps = list(self.jobs.values())
+            live = {run_id: app.snapshot() for run_id, app in self.jobs.items()}
+        states = {entry["runId"]: entry for entry in self.catalogue.all()}
+        states.update(live)
         jobs = []
-        for app in apps:
-            state = app.snapshot()
+        for state in states.values():
             job = {
                 key: state[key] for key in (
                     "runId", "phase", "draft", "activeNode", "startedAt",
@@ -1572,7 +1774,7 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             app = self.jobs.get(run_id)
             if not app:
-                raise ValueError("That job is not available in this TCS Prover session.")
+                app = self.get_job(run_id)
             with app.lock:
                 if app.state["phase"] in {"reviewing", "running", "stopping"}:
                     raise ValueError("Stop this job before deleting it.")
@@ -1588,6 +1790,7 @@ class Server(ThreadingHTTPServer):
                     number += 1
                 folder.rename(target)
                 del self.jobs[run_id]
+                self.catalogue.remove(run_id)
         return {"deleted": run_id}
 
     def stop_all(self):
@@ -1980,6 +2183,7 @@ def run_headless_markdown(
     options = direct_cli_options(**settings)
     batch = Path(path).expanduser().resolve().is_dir()
     output_lock = threading.Lock()
+    catalogue = RunCatalogue(runs)
     apps = []
     try:
         for source, statement in statements:
@@ -1992,7 +2196,10 @@ def run_headless_markdown(
                 job_output = ConciseHeadlessOutput(
                     output_stream, output_lock, source.name
                 )
-            app = App(runs=runs, output_stream=job_output)
+            app = App(
+                runs=runs, output_stream=job_output,
+                save_state=catalogue.save,
+            )
             apps.append((source, app))
             app.start_direct_statement(statement=statement, **options)
             print(
