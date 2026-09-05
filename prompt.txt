@@ -1,10 +1,6 @@
-Current task statement
+Assume for purposes of this task that a complete solution exists. A complete solution must resolve exactly the task statement supplied at the end of this prompt, without additional assumptions, restrictions, or changes to the required conclusion.
 
-[STATEMENT]
-
-Assume for purposes of this task that a complete solution exists. A complete solution must resolve exactly the statement above, without additional assumptions, restrictions, or changes to the required conclusion.
-
-Partial progress does not count unless it implies exactly the resolution above. In particular, proofs or solutions for special cases, constructions that satisfy only some of the stated requirements, variants with altered hypotheses or conclusions, reductions to another unproved conjecture or unresolved problem, computational verification through any fixed finite range, and candidate counterexamples without a complete certificate that they satisfy the hypotheses and violate the conclusion are insufficient.
+Partial progress does not count unless it implies exactly that resolution. In particular, proofs or solutions for special cases, constructions that satisfy only some of the stated requirements, variants with altered hypotheses or conclusions, reductions to another unproved conjecture or unresolved problem, computational verification through any fixed finite range, and candidate counterexamples without a complete certificate that they satisfy the hypotheses and violate the conclusion are insufficient.
 
 Use multiagent v2 aggressively and dynamically. You have up to 64 concurrent agents available. Do not use a fixed assignment such as "N agents for strategy X." Instead, manage the search using the following heuristics:
 
@@ -31,3 +27,7 @@ Do not return merely because current approaches fail or agents report theorem-st
 Return only when a complete solution has been found and survives adversarial audit. Do not return a reduction, partial result, isolated missing lemma, "best effort" summary, or explanation of why the problem is difficult.
 
 Public search may be used only for ordinary mathematical background or standard named theorems, not to search for a solution to this exact problem or benchmark. Do not search the public web merely to determine whether the problem is open, and do not answer that it is open.
+
+Current task statement (resolve exactly this statement)
+
+[STATEMENT]

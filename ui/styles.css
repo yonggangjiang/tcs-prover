@@ -172,6 +172,7 @@ button { min-height: 42px; }
 .node-copy strong { display: block; font-size: 0.88rem; font-weight: 680; }
 .node-copy span { display: block; margin-top: 2px; font-size: 0.72rem; line-height: 1.35; }
 .node-round { color: var(--accent) !important; font-weight: 680; }
+.node-resume-note { color: var(--accent) !important; font-weight: 680; }
 
 .flow-arrow {
   margin: 2px 0 2px 10px;
@@ -483,12 +484,13 @@ label span { color: var(--muted); font-weight: 450; }
 .jobs-heading > span { color: var(--muted); font-size: 0.78rem; }
 .jobs-list { display: grid; gap: 9px; margin: 12px 0 0; padding: 0; list-style: none; }
 .job-card {
+  align-items: flex-start;
   padding: 13px 14px;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: var(--surface);
 }
-.job-card > div:first-child { min-width: 0; }
+.job-copy { flex: 1 1 auto; min-width: 0; }
 .job-card strong {
   display: block;
   overflow: hidden;
@@ -496,12 +498,62 @@ label span { color: var(--muted); font-weight: 450; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.job-times {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
 .job-status { display: block; margin-top: 4px; color: var(--muted); font-size: 0.74rem; }
 .job-status.running, .job-status.reviewing { color: var(--accent); }
 .job-status.stopping { color: var(--danger); }
-.job-actions { display: flex; flex: 0 0 auto; gap: 5px; }
+.job-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 5px; }
 .job-delete { color: var(--danger); }
 .job-delete:hover { background: #fff1ef; }
+.checkpoint-heading {
+  display: block;
+  margin-top: 11px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.checkpoint-list {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.checkpoint-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 9px;
+  border: 1px solid #dedfda;
+  border-left: 3px solid #aeb2aa;
+  border-radius: 8px;
+  background: #fafaf8;
+}
+.checkpoint-row.complete { border-left-color: var(--accent); }
+.checkpoint-row.failed { border-left-color: var(--danger); }
+.checkpoint-row.partial, .checkpoint-row.interrupted {
+  border-left-color: #c38a2c;
+}
+.checkpoint-row > div { min-width: 0; }
+.checkpoint-label { display: block; font-size: 0.79rem; font-weight: 720; }
+.checkpoint-meta, .checkpoint-description {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+.checkpoint-meta { font-variant-numeric: tabular-nums; text-transform: capitalize; }
+.checkpoint-resume { flex: 0 0 auto; }
 
 textarea {
   width: 100%;
@@ -808,6 +860,28 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 .critic-check p { margin: 4px 0 0; color: #4c4e49; font-size: 0.77rem; }
 
 .jump-latest { position: absolute; right: 17px; bottom: 13px; box-shadow: 0 5px 16px #20211f1b; }
+.author-steer-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  margin-top: 18px;
+  padding: 11px;
+  border: 1px solid #b8dfd2;
+  border-radius: 12px;
+  background: #f7fcfa;
+}
+.author-steer-control label {
+  grid-column: 1 / -1;
+  color: #365d52;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+.author-steer-control textarea {
+  min-height: 66px;
+  resize: vertical;
+}
+.author-steer-control button { align-self: stretch; }
 .run-actions {
   position: sticky;
   bottom: 14px;
@@ -938,10 +1012,14 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
     justify-content: flex-end;
     margin-right: 0;
   }
+  .author-steer-control { grid-template-columns: 1fr; }
+  .author-steer-control button { width: 100%; }
   .author-limit-summary { width: 100%; }
   .job-card { align-items: stretch; flex-direction: column; }
   .job-card strong { max-width: 100%; }
   .job-actions button { flex: 1; }
+  .checkpoint-row { align-items: stretch; flex-direction: column; }
+  .checkpoint-resume { width: 100%; }
   .timeline { padding-inline: 14px; }
   .audit-drawer { padding: 17px; }
 }

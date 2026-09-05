@@ -19,7 +19,7 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import tcs_agent
 
@@ -33,12 +33,17 @@ HOST, PORT = "127.0.0.1", 8765
 DEFAULT_CRITIC_ROUNDS, MAX_CRITIC_ROUNDS = 100, 100
 MAX_THINKING_HOURS = 168
 DEFAULT_THINKING_HOURS = MAX_THINKING_HOURS
-MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+MODELS = tcs_agent.MODELS
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 SPEEDS, DEFAULT_SPEED = tcs_agent.SPEEDS, tcs_agent.DEFAULT_SPEED
-DEFAULT_REVIEW_MODEL = "gpt-5.6-sol"
-DEFAULT_AUTHOR_MODEL = DEFAULT_CRITIC_MODEL = DEFAULT_WRITER_MODEL = "gpt-5.6-sol"
+REASONING_SUMMARIES = tcs_agent.REASONING_SUMMARIES
+DEFAULT_REASONING_SUMMARY = tcs_agent.DEFAULT_REASONING_SUMMARY
+DEFAULT_REVIEW_MODEL = tcs_agent.REVIEW_MODEL
+DEFAULT_AUTHOR_MODEL = tcs_agent.AUTHOR_MODEL
+DEFAULT_CRITIC_MODEL = tcs_agent.CRITIC_MODEL
+DEFAULT_WRITER_MODEL = tcs_agent.WRITER_MODEL
 DEFAULT_REASONING_EFFORT = "ultra"
+DEFAULT_REVIEW_EFFORT = tcs_agent.REVIEW_EFFORT
 STOP_TIMEOUT_SECONDS = 2
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
@@ -350,22 +355,26 @@ def important_record(record):
 # UI-only labels mirror the four runtime stages and the statement review.
 PUBLIC_GRAPH = {
     "settings": {
-        "model": "gpt-5.6-sol",
+        "model": tcs_agent.MODEL,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "reasoning_efforts": list(EFFORTS),
+        "reasoning_summaries": list(REASONING_SUMMARIES),
+        "reasoning_summary": DEFAULT_REASONING_SUMMARY,
         "speeds": list(SPEEDS),
         "speed": DEFAULT_SPEED,
         "review_model": DEFAULT_REVIEW_MODEL,
         "review_models": list(REVIEW_MODELS),
         "models": list(MODELS),
-        "review_reasoning_effort": DEFAULT_REASONING_EFFORT,
-        "revision_reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
+        "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "prompts": DEFAULT_PROMPTS,
         "algorithmic_presets": {
             "models": MODEL_PRESETS,
             "problems": PROBLEM_PRESETS,
         },
-        "model_summary": "Sol/Ultra review · Sol/Ultra author, critic, writer",
+        "model_summary": (
+            "Sol/Ultra review · Sol/Ultra author, critic, writer"
+        ),
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
             "minimum": 1,
@@ -504,6 +513,10 @@ def empty_state(trace=None, trace_version=0):
         "skipStatementReview": False,
         "statementReviewOnly": False,
         "draft": "",
+        "reviewStatement": "",
+        "reviewFeedback": "",
+        "reviewInputRecorded": False,
+        "finalInputReady": False,
         "modelOfComputation": "",
         "problemDescription": "",
         "goal": "",
@@ -513,12 +526,13 @@ def empty_state(trace=None, trace_version=0):
         "authorModel": DEFAULT_AUTHOR_MODEL,
         "criticModel": DEFAULT_CRITIC_MODEL,
         "writerModel": DEFAULT_WRITER_MODEL,
-        "reviewEffort": DEFAULT_REASONING_EFFORT,
+        "reviewEffort": DEFAULT_REVIEW_EFFORT,
         "authorEffort": DEFAULT_REASONING_EFFORT,
         "criticEffort": DEFAULT_REASONING_EFFORT,
         "writerEffort": DEFAULT_REASONING_EFFORT,
         # Kept for old clients; new clients send one effort per role.
         "reasoningEffort": DEFAULT_REASONING_EFFORT,
+        "reasoningSummary": DEFAULT_REASONING_SUMMARY,
         "speedMode": DEFAULT_SPEED,
         "reviewPrompt": DEFAULT_PROMPTS["review"],
         "authorPrompt": DEFAULT_PROMPTS["author"],
@@ -530,14 +544,25 @@ def empty_state(trace=None, trace_version=0):
         "activeNode": "",
         "round": 0,
         "startedAt": "",
+        "finishedAt": "",
         "lastActivityAt": "",
         "output": "",
         "error": "",
+        "manuallyStopped": False,
+        "stoppedStage": "",
+        "settingsWarning": "",
         "runId": "",
+        "checkpoints": [],
         "workflow": PUBLIC_GRAPH,
         "trace": trace if trace is not None else [],
         "traceVersion": trace_version,
     }
+
+
+def restored_model(value):
+    """Map discontinued saved model routes to their supported replacement."""
+
+    return LEGACY_MODEL_ALIASES.get(value, value)
 
 
 class App:
@@ -560,6 +585,7 @@ class App:
         self.state["runId"] = self.run_dir.name if self.run_dir else ""
         self.process = None
         self.active_token = None
+        self.worker_token = None
         self.lock = threading.RLock()
         self.save_state = save_state
 
@@ -584,7 +610,11 @@ class App:
 
         if not self.runs.exists():
             return None
-        logs = self.runs.glob("*/transcript.jsonl")
+        logs = (
+            path for path in self.runs.glob("*/transcript.jsonl")
+            if not path.is_symlink()
+            and direct_run_directory(path.parent, self.runs)
+        )
         return max(logs, key=lambda path: path.stat().st_mtime, default=None)
 
     def _new_run(self, statement, slug_source=None):
@@ -616,6 +646,106 @@ class App:
         path.write_text(content, encoding="utf-8")
         path.chmod(0o600)
 
+    def _save_job_settings(self, options):
+        """Persist restart-safe workflow settings without prompt duplication."""
+
+        keys = (
+            "reviewModel", "authorModel", "criticModel", "writerModel",
+            "reasoningEffort", "reviewEffort", "authorEffort",
+            "criticEffort", "writerEffort", "criticRounds",
+            "thinkingHours", "speedMode", "reasoningSummary",
+            "problemMode", "skipStatementReview", "statementReviewOnly",
+        )
+        self._save(
+            JOB_SETTINGS_FILENAME,
+            json.dumps(
+                {key: options[key] for key in keys if key in options},
+                ensure_ascii=False, indent=2, sort_keys=True,
+            ) + "\n",
+        )
+
+    def _prepare_continuation(
+        self, source_run="", stopped_stage="", copy_author_memory=False,
+    ):
+        """Record immutable provenance and restore compatible author memory."""
+
+        if not source_run:
+            return
+        source = validated_continuation_source(source_run, self.runs)
+        copied = []
+        if copy_author_memory:
+            memory_path = source / tcs_agent.AUTHOR_MEMORY_FILENAME
+            try:
+                memory_ready = (
+                    memory_path.is_file()
+                    and memory_path.stat().st_size
+                    <= tcs_agent.AUTHOR_MEMORY_MAX_BYTES
+                )
+            except OSError:
+                memory_ready = False
+            if memory_ready:
+                try:
+                    self._save(
+                        tcs_agent.AUTHOR_MEMORY_FILENAME,
+                        memory_path.read_text(encoding="utf-8"),
+                    )
+                    copied.append(tcs_agent.AUTHOR_MEMORY_FILENAME)
+                except (OSError, UnicodeError):
+                    # The new author can still restart from the exact statement.
+                    pass
+        self._save(
+            CONTINUATION_SOURCE_FILENAME,
+            json.dumps({
+                "sourceRun": str(source),
+                "stoppedStage": str(stopped_stage),
+                "copiedArtifacts": copied,
+                "continuedAt": datetime.now(timezone.utc).isoformat(),
+            }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _clear_manual_stop(self):
+        """Let a completed terminal result win a concurrent stop request."""
+
+        if self.run_dir:
+            (self.run_dir / MANUAL_STOP_FILENAME).unlink(missing_ok=True)
+        self.state.update(manuallyStopped=False, stoppedStage="")
+
+    def _spawn_worker(self, target, args, token):
+        """Track one reader until all buffered output and artifacts settle."""
+
+        with self.lock:
+            self.worker_token = token
+        try:
+            worker = threading.Thread(target=target, args=args, daemon=True)
+            worker.start()
+            return worker
+        except Exception:
+            with self.lock:
+                if self.worker_token is token:
+                    self.worker_token = None
+            raise
+
+    def has_active_worker(self):
+        """Return whether a model reader can still mutate this run."""
+
+        with self.lock:
+            return self.worker_token is not None
+
+    def _finish_stopped_locked(self, token, message):
+        """Publish a stopped job only after its matching reader has settled."""
+
+        if self.worker_token is token:
+            self.worker_token = None
+        if self.active_token is token:
+            self.active_token = None
+        if self.state["phase"] == "stopping":
+            self.process = None
+            self.state.update(
+                phase="done", error="Stopped.",
+                finishedAt=datetime.now(timezone.utc).isoformat(),
+            )
+            self.state["output"] = self.state["output"] or message
+
     def _write_author_limit(self, hours):
         """Atomically publish the total workflow limit to the active solver."""
 
@@ -631,6 +761,25 @@ class App:
         finally:
             temporary.unlink(missing_ok=True)
         return path
+
+    def _write_author_steer(self, instruction):
+        """Atomically publish one live instruction to the active author."""
+
+        path = self.run_dir / AUTHOR_STEER_FILENAME
+        temporary = path.with_name(f".{AUTHOR_STEER_FILENAME}.tmp")
+        command_id = secrets.token_hex(12)
+        try:
+            temporary.write_text(json.dumps({
+                "id": command_id,
+                "instruction": instruction,
+                "createdAt": datetime.now(timezone.utc).isoformat(),
+            }, ensure_ascii=False), encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(path)
+            path.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return command_id
 
     def _load_trace(self):
         """Restore the append-only local transcript after a restart."""
@@ -709,11 +858,46 @@ class App:
             pass
         return {"kind": "diagnostic", "stage": stage, "text": line.rstrip()}
 
+    @staticmethod
+    def failure_text(record):
+        """Extract one safe user-facing failure from a tagged child record."""
+
+        if not isinstance(record, dict):
+            return ""
+        if record.get("kind") == "diagnostic":
+            value = record.get("text", "")
+            if isinstance(value, str) and value.startswith("error: "):
+                return value[7:].strip()
+            return ""
+        event = record.get("event")
+        if not isinstance(event, dict):
+            return ""
+        value = event.get("message") if event.get("type") == "error" else ""
+        if event.get("type") == "turn.failed":
+            failure = event.get("error")
+            value = (
+                failure.get("message", "")
+                if isinstance(failure, dict) else failure
+            )
+        return value.strip() if isinstance(value, str) else ""
+
     def snapshot(self, after=None):
         """Copy state, optionally returning only newly appended records."""
 
         with self.lock:
             state = dict(self.state)
+            include_transcript = state["phase"] not in {
+                "reviewing", "running", "stopping",
+            }
+            signature = checkpoint_artifact_signature(
+                self.run_dir, include_transcript=include_transcript,
+            )
+            if signature != self._checkpoint_cache_signature:
+                self._checkpoint_cache = (
+                    saved_run_checkpoints(self.run_dir) if self.run_dir else []
+                )
+                self._checkpoint_cache_signature = signature
+            state["checkpoints"] = list(self._checkpoint_cache)
             trace, version = self.state["trace"], self.state["traceVersion"]
             first = version - len(trace)
             if isinstance(after, int) and first <= after <= version:
@@ -735,6 +919,7 @@ class App:
         review_model=DEFAULT_REVIEW_MODEL, review_effort=None,
         review_prompt=None, include_review=True,
         speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
     ):
         """Normalize and validate settings shared by both input modes."""
 
@@ -743,11 +928,12 @@ class App:
         critic_model = str(critic_model or "")
         writer_model = str(writer_model or "")
         reasoning_effort = str(reasoning_effort or "")
-        review_effort = str(review_effort or reasoning_effort)
+        review_effort = str(review_effort or DEFAULT_REVIEW_EFFORT)
         author_effort = str(author_effort or reasoning_effort)
         critic_effort = str(critic_effort or reasoning_effort)
         writer_effort = str(writer_effort or reasoning_effort)
         speed_mode = str(speed_mode or "")
+        reasoning_summary = str(reasoning_summary or "")
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "final": final_prompt,
@@ -759,19 +945,41 @@ class App:
             for name, value in supplied_prompts.items()
         }
         if include_review and review_model not in REVIEW_MODELS:
-            raise ValueError("Choose Sol, Terra, or Luna for statement review.")
+            raise ValueError(
+                "Choose Sol, Terra, Luna, or DeepSeek V4 Pro for statement "
+                "review."
+            )
         if any(
             model not in MODELS
             for model in (author_model, critic_model, writer_model)
         ):
-            raise ValueError("Choose Sol, Terra, or Luna for every proof stage.")
+            raise ValueError(
+                "Choose Sol, Terra, Luna, or DeepSeek V4 Pro for every proof "
+                "stage."
+            )
         efforts = [author_effort, critic_effort, writer_effort]
         if include_review:
             efforts.append(review_effort)
         if any(effort not in EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
+        selected_models = [author_model, critic_model, writer_model]
+        if include_review:
+            selected_models.append(review_model)
+        try:
+            for selected_model in set(selected_models):
+                tcs_agent.verify_model_credentials(selected_model)
+        except tcs_agent.Error as exc:
+            raise ValueError(str(exc)) from exc
+        review_effort = tcs_agent.effective_effort(review_model, review_effort)
+        author_effort = tcs_agent.effective_effort(author_model, author_effort)
+        critic_effort = tcs_agent.effective_effort(critic_model, critic_effort)
+        writer_effort = tcs_agent.effective_effort(writer_model, writer_effort)
         if speed_mode not in SPEEDS:
             raise ValueError("Choose Standard or Fast speed.")
+        if reasoning_summary not in REASONING_SUMMARIES:
+            raise ValueError(
+                "Choose Status only, Concise summaries, or Detailed summaries."
+            )
         required_prompts = [prompts[name] for name in ("author", "critic", "final")]
         if include_review:
             required_prompts.append(prompts["review"])
@@ -802,7 +1010,7 @@ class App:
             "writerModel": writer_model,
             "reasoningEffort": author_effort,
             "reviewEffort": (
-                review_effort if include_review else DEFAULT_REASONING_EFFORT
+                review_effort if include_review else DEFAULT_REVIEW_EFFORT
             ),
             "authorEffort": author_effort,
             "criticEffort": critic_effort,
@@ -816,6 +1024,7 @@ class App:
             "criticRounds": critic_rounds,
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
+            "reasoningSummary": reasoning_summary,
         }
 
     def start_review(
@@ -831,12 +1040,16 @@ class App:
         review_prompt=None, author_prompt=None,
         critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
         review_only=False,
+        continuation_source="", stopped_stage="",
     ):
         """Start the review and return immediately so the page can poll."""
 
         statement = str(statement).strip()
         feedback = str(feedback or "").strip()
+        if "\0" in statement or "\0" in feedback:
+            raise ValueError("Statement review input cannot contain NUL characters.")
         if not isinstance(review_only, bool):
             raise ValueError("Statement review only must be enabled or disabled.")
         if review_only:
@@ -867,6 +1080,7 @@ class App:
             review_effort=review_effort,
             review_prompt=review_prompt,
             speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -879,17 +1093,37 @@ class App:
                 self._new_run(statement)
                 if not self.fixed_trace:
                     self.pinned = []
+                self._prepare_continuation(
+                    continuation_source, stopped_stage,
+                )
+            self._save(
+                REVIEW_INPUT_FILENAME,
+                json.dumps({
+                    "schemaVersion": 1,
+                    "statement": statement,
+                    "feedback": feedback,
+                }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            )
             prompt_names = ("review",) if review_only else (
                 "review", "author", "critic", "final"
             )
             for name in prompt_names:
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "statement",
+                "skipStatementReview": False,
+                "statementReviewOnly": review_only,
+            })
             trace = self.state["trace"] if retry or self.fixed_trace else []
             version = self.state["traceVersion"] if retry or self.fixed_trace else 0
             self.state = {
                 **empty_state(trace, version),
                 "phase": "reviewing",
                 "draft": statement,
+                "reviewStatement": statement,
+                "reviewFeedback": feedback,
+                "reviewInputRecorded": True,
                 "statementReviewOnly": review_only,
                 **options,
                 "workflow": REVIEW_ONLY_GRAPH if review_only else PUBLIC_GRAPH,
@@ -900,25 +1134,35 @@ class App:
             }
             self.persist()
             token = self.active_token = object()
-        threading.Thread(
-            target=self._review,
-            args=(
+            self.worker_token = token
+        self._spawn_worker(
+            self._review,
+            (
                 statement, feedback, options["reviewModel"],
                 options["reviewEffort"], token,
             ),
-            daemon=True,
-        ).start()
+            token,
+        )
 
     def _review(
         self, statement, feedback="", review_model=DEFAULT_REVIEW_MODEL,
-        reasoning_effort=DEFAULT_REASONING_EFFORT, token=None,
+        reasoning_effort=DEFAULT_REVIEW_EFFORT, token=None,
     ):
         """Stream the review transcript and keep its final structured result."""
 
-        process, report, problem, visible = None, None, "", []
+        process, report, problem = None, None, ""
+        failure_detail, visible = "", []
         # A stop click can arrive before this background thread starts.
         with self.lock:
             if self.active_token is not token:
+                if self.worker_token is token:
+                    self.worker_token = None
+                return
+            if self.state["phase"] == "stopping":
+                self._finish_stopped_locked(
+                    token,
+                    "Codex was stopped before it produced a checked statement.",
+                )
                 return
         try:
             process = subprocess.Popen(
@@ -926,6 +1170,7 @@ class App:
                     sys.executable, str(ROOT / "tcs_agent.py"), "review",
                     "--review-model", review_model,
                     "--review-effort", reasoning_effort,
+                    "--reasoning-summary", self.state["reasoningSummary"],
                     "--speed", self.state["speedMode"],
                     "--review-prompt-file",
                     str(self.run_dir / "prompts/review.txt"),
@@ -936,17 +1181,31 @@ class App:
                 **isolated_process_options(),
             )
             with self.lock:
-                stop_now = self.active_token is not token
+                stop_now = (
+                    self.active_token is not token
+                    or self.state["phase"] == "stopping"
+                )
                 if not stop_now:
                     self.process = process
             if stop_now:
                 stop_process_tree(process)
+                with self.lock:
+                    self._finish_stopped_locked(
+                        token,
+                        "Codex was stopped before it produced a checked statement.",
+                    )
                 return
             process.stdin.write(statement + ("\0" + feedback if feedback else ""))
             process.stdin.close()
             for line in process.stdout:
                 record = self.parse_line(line, "review")
                 self.add_trace(record)
+                failure = self.failure_text(record)
+                if failure and not failure.startswith("Reconnecting..."):
+                    # Prefer the precise provider error over the controller's
+                    # later generic nonzero-exit diagnostic.
+                    if record.get("kind") == "codex_event" or not failure_detail:
+                        failure_detail = failure
                 if record.get("kind") == "review_result":
                     report = record.get("review")
                 event = record.get("event") or {}
@@ -973,7 +1232,11 @@ class App:
             if code or not isinstance(report, dict) or not all(
                 isinstance(report.get(key), str) for key in ("statement", "notes")
             ):
-                problem = "Review failed. See the transcript for details."
+                problem = (
+                    f"Review failed: {failure_detail}"
+                    if failure_detail
+                    else "Review failed. See the transcript for details."
+                )
         except (OSError, TypeError, AttributeError) as exc:
             problem = str(exc)
         finally:
@@ -984,15 +1247,20 @@ class App:
             except OSError:
                 pass
         with self.lock:
-            if self.active_token is not token:
-                return
-            if self.process is process:
-                self.process = None
             valid = isinstance(report, dict) and all(
                 isinstance(report.get(key), str) for key in ("statement", "notes")
             )
+            if self.active_token is not token and not (
+                valid and self.state.get("manuallyStopped")
+            ):
+                if self.worker_token is token:
+                    self.worker_token = None
+                return
+            if self.process is process:
+                self.process = None
             stopped = self.state["phase"] == "stopping"
             if valid:
+                self._clear_manual_stop()
                 self._save(
                     "checked-statement.md",
                     f"# Checked statement\n\n{report['statement']}\n\n"
@@ -1006,11 +1274,15 @@ class App:
                     review=report,
                     error="",
                     output=report["statement"] if review_only else "",
+                    finishedAt=(
+                        datetime.now(timezone.utc).isoformat()
+                        if review_only else ""
+                    ),
                 )
             elif stopped:
-                self.state["phase"], self.state["error"] = "done", "Stopped."
-                self.state["output"] = self.state["output"] or (
-                    "Codex was stopped before it produced a checked statement."
+                self._finish_stopped_locked(
+                    token,
+                    "Codex was stopped before it produced a checked statement.",
                 )
             elif problem:
                 self.state["phase"], self.state["error"] = "input", problem
@@ -1023,6 +1295,8 @@ class App:
         author_limit_file = self._write_author_limit(
             self.state["thinkingHours"]
         )
+        author_steer_file = self.run_dir / AUTHOR_STEER_FILENAME
+        author_steer_file.unlink(missing_ok=True)
         try:
             started_at = datetime.fromisoformat(self.state["startedAt"])
             if started_at.tzinfo is None:
@@ -1042,6 +1316,7 @@ class App:
                 "--author-effort", self.state["authorEffort"],
                 "--critic-effort", self.state["criticEffort"],
                 "--writer-effort", self.state["writerEffort"],
+                "--reasoning-summary", self.state["reasoningSummary"],
                 "--speed", self.state["speedMode"],
                 "--author-prompt-file",
                 str(self.run_dir / "prompts/author.txt"),
@@ -1050,6 +1325,7 @@ class App:
                 "--final-prompt-file",
                 str(self.run_dir / "prompts/final.txt"),
                 "--author-limit-file", str(author_limit_file),
+                "--author-steer-file", str(author_steer_file),
                 "--elapsed-seconds", str(elapsed_seconds),
             ],
             stdin=subprocess.PIPE,
@@ -1063,6 +1339,7 @@ class App:
             cwd=self.run_dir,
             **isolated_process_options(),
         )
+        self.worker_token = token
         self.process = process
         try:
             process.stdin.write(
@@ -1084,6 +1361,8 @@ class App:
                 self.process = None
             if self.active_token is token:
                 self.active_token = None
+            if self.worker_token is token:
+                self.worker_token = None
             raise
         self.state.update(
             phase="running", stage="solve",
@@ -1092,16 +1371,17 @@ class App:
         self.persist()
         return process, token
 
-    def _launch_final_locked(self, source):
-        """Launch only the final LaTeX editor; the caller holds ``self.lock``."""
+    def _launch_final_action_locked(self, action, source):
+        """Launch one exact final-editor action while holding ``self.lock``."""
 
         token = self.active_token = object()
         process = subprocess.Popen(
             [
-                sys.executable, "-u", str(ROOT / "tcs_agent.py"), "finalize",
+                sys.executable, "-u", str(ROOT / "tcs_agent.py"), action,
                 "--writer-model", self.state["writerModel"],
                 "--reasoning-effort", self.state["reasoningEffort"],
                 "--writer-effort", self.state["writerEffort"],
+                "--reasoning-summary", self.state["reasoningSummary"],
                 "--speed", self.state["speedMode"],
                 "--final-prompt-file", str(self.run_dir / "prompts/final.txt"),
             ],
@@ -1115,6 +1395,7 @@ class App:
             cwd=self.run_dir,
             **isolated_process_options(),
         )
+        self.worker_token = token
         self.process = process
         try:
             process.stdin.write(source)
@@ -1133,12 +1414,92 @@ class App:
                 self.process = None
             if self.active_token is token:
                 self.active_token = None
+            if self.worker_token is token:
+                self.worker_token = None
             raise
         self.state.update(
             phase="running", stage="final",
             activeNode="latex_editor", round=0, output="",
         )
         self.persist()
+        return process, token
+
+    def _launch_final_locked(self, source):
+        """Launch LaTeX-only polishing; the caller holds ``self.lock``."""
+
+        return self._launch_final_action_locked("finalize", source)
+
+    def _launch_saved_final_locked(self, statement, solution):
+        """Launch normal finalization with its original two-part prompt."""
+
+        return self._launch_final_action_locked(
+            "finalize-proof", f"{statement}\0{solution}",
+        )
+
+    def _launch_critic_resume_locked(self, statement, solution):
+        """Start a saved proof at the critic; the caller holds ``self.lock``."""
+
+        token = self.active_token = object()
+        author_limit_file = self._write_author_limit(
+            self.state["thinkingHours"]
+        )
+        author_steer_file = self.run_dir / AUTHOR_STEER_FILENAME
+        author_steer_file.unlink(missing_ok=True)
+        process = subprocess.Popen(
+            [
+                sys.executable, "-u", str(ROOT / "tcs_agent.py"), "audit",
+                "--author-model", self.state["authorModel"],
+                "--critic-model", self.state["criticModel"],
+                "--writer-model", self.state["writerModel"],
+                "--reasoning-effort", self.state["reasoningEffort"],
+                "--author-effort", self.state["authorEffort"],
+                "--critic-effort", self.state["criticEffort"],
+                "--writer-effort", self.state["writerEffort"],
+                "--reasoning-summary", self.state["reasoningSummary"],
+                "--speed", self.state["speedMode"],
+                "--author-prompt-file",
+                str(self.run_dir / "prompts/author.txt"),
+                "--critic-prompt-file",
+                str(self.run_dir / "prompts/critic.txt"),
+                "--final-prompt-file",
+                str(self.run_dir / "prompts/final.txt"),
+                "--author-limit-file", str(author_limit_file),
+                "--author-steer-file", str(author_steer_file),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=self.run_dir,
+            **isolated_process_options(),
+        )
+        self.worker_token = token
+        self.process = process
+        try:
+            process.stdin.write(
+                f"{statement}\0{solution}\0{self.state['criticRounds']}"
+                f"\0{self.state['thinkingHours']}"
+            )
+            process.stdin.close()
+        except (OSError, TypeError, ValueError):
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            if process.poll() is None:
+                stop_process_tree(process)
+            self.process = None
+            self.active_token = None
+            if self.worker_token is token:
+                self.worker_token = None
+            raise
+        self.state.update(
+            phase="running", stage="critic",
+            activeNode="critic", round=0, output="",
+        )
         return process, token
 
     def start_algorithmic(
@@ -1152,6 +1513,8 @@ class App:
         author_effort=None, critic_effort=None, writer_effort=None,
         author_prompt=None, critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        continuation_source="", stopped_stage="",
     ):
         """Start an algorithmic task directly at the proof-author stage."""
 
@@ -1177,6 +1540,7 @@ class App:
             critic_prompt=critic_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
             include_review=False,
         )
         with self.lock:
@@ -1185,8 +1549,17 @@ class App:
             self._new_run(statement, fields["problemDescription"])
             if not self.fixed_trace:
                 self.pinned = []
+            self._prepare_continuation(
+                continuation_source, stopped_stage, copy_author_memory=True,
+            )
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "algorithmic",
+                "skipStatementReview": True,
+                "statementReviewOnly": False,
+            })
             self._save("algorithmic-problem.md", statement + "\n")
             self._save(
                 "algorithmic-input.json",
@@ -1206,9 +1579,7 @@ class App:
             }
             self.persist()
             process, token = self._launch_solver_locked(statement)
-        threading.Thread(
-            target=self._read_output, args=(process, token), daemon=True
-        ).start()
+        self._spawn_worker(self._read_output, (process, token), token)
 
     def start_direct_statement(
         self, statement,
@@ -1221,6 +1592,8 @@ class App:
         author_effort=None, critic_effort=None, writer_effort=None,
         author_prompt=None, critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        continuation_source="", stopped_stage="",
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -1243,6 +1616,7 @@ class App:
             critic_prompt=critic_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
             include_review=False,
         )
         with self.lock:
@@ -1251,8 +1625,17 @@ class App:
             self._new_run(statement)
             if not self.fixed_trace:
                 self.pinned = []
+            self._prepare_continuation(
+                continuation_source, stopped_stage, copy_author_memory=True,
+            )
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "statement",
+                "skipStatementReview": True,
+                "statementReviewOnly": False,
+            })
             self._save(
                 "checked-statement.md",
                 "# Statement sent directly to the proof author\n\n"
@@ -1272,9 +1655,7 @@ class App:
             }
             self.persist()
             process, token = self._launch_solver_locked(statement)
-        threading.Thread(
-            target=self._read_output, args=(process, token), daemon=True
-        ).start()
+        self._spawn_worker(self._read_output, (process, token), token)
 
     def start_latex_only(
         self, source,
@@ -1282,6 +1663,8 @@ class App:
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         writer_effort=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        continuation_source="", stopped_stage="",
     ):
         """Polish one combined theorem-and-proof input without earlier stages."""
 
@@ -1296,6 +1679,7 @@ class App:
             writer_effort=writer_effort,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
             include_review=False,
         )
         with self.lock:
@@ -1304,7 +1688,16 @@ class App:
             self._new_run(source)
             if not self.fixed_trace:
                 self.pinned = []
+            self._prepare_continuation(
+                continuation_source, stopped_stage,
+            )
             self._save("prompts/final.txt", options["finalPrompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "latex",
+                "skipStatementReview": False,
+                "statementReviewOnly": False,
+            })
             self._save("latex-input.md", source + "\n")
             trace = self.state["trace"] if self.fixed_trace else []
             version = self.state["traceVersion"] if self.fixed_trace else 0
@@ -1320,9 +1713,165 @@ class App:
             }
             self.persist()
             process, token = self._launch_final_locked(source)
-        threading.Thread(
-            target=self._read_output, args=(process, token), daemon=True
-        ).start()
+        self._spawn_worker(self._read_output, (process, token), token)
+
+    def start_final_resume(
+        self, statement, solution,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        writer_effort=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        continuation_source="", stopped_stage="final",
+    ):
+        """Retry normal finalization with its exact statement/proof contract."""
+
+        statement, solution = str(statement).strip(), str(solution).strip()
+        if not statement or not solution:
+            raise ValueError("A saved statement and clean proof are required.")
+        if "\0" in statement or "\0" in solution:
+            raise ValueError("Saved final input cannot contain NUL characters.")
+        options = self._workflow_options(
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            writer_effort=writer_effort,
+            final_prompt=final_prompt,
+            speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
+            include_review=False,
+        )
+        with self.lock:
+            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+                raise ValueError("Codex is already working.")
+            source_label = (
+                Path(continuation_source).name
+                if continuation_source else "saved-final"
+            )
+            self._new_run(statement, f"final-resume-{source_label}")
+            if not self.fixed_trace:
+                self.pinned = []
+            self._prepare_continuation(
+                continuation_source, stopped_stage,
+            )
+            self._save("prompts/final.txt", options["finalPrompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "final-resume",
+                "skipStatementReview": True,
+                "statementReviewOnly": False,
+            })
+            self._save(
+                "checked-statement.md", f"# Checked statement\n\n{statement}\n",
+            )
+            tcs_agent.save_final_input(statement, solution, directory=self.run_dir)
+            trace = self.state["trace"] if self.fixed_trace else []
+            version = self.state["traceVersion"] if self.fixed_trace else 0
+            self.state = {
+                **empty_state(trace, version),
+                "problemMode": "final-resume",
+                "skipStatementReview": True,
+                "finalInputReady": True,
+                "draft": statement,
+                "sourceRun": str(continuation_source),
+                **options,
+                "workflow": LATEX_GRAPH,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "runId": self.run_dir.name,
+            }
+            process, token = self._launch_saved_final_locked(
+                statement, solution,
+            )
+        self._spawn_worker(self._read_output, (process, token), token)
+
+    def start_critic_resume(
+        self, statement, solution, source_run="",
+        critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        thinking_hours=DEFAULT_THINKING_HOURS,
+        author_model=DEFAULT_AUTHOR_MODEL,
+        critic_model=DEFAULT_CRITIC_MODEL,
+        writer_model=DEFAULT_WRITER_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        author_effort=None, critic_effort=None, writer_effort=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
+        speed_mode=DEFAULT_SPEED,
+        reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        audit_checkpoint="",
+        recover_audit_checkpoint=True,
+    ):
+        """Create a new job that audits one complete saved candidate proof."""
+
+        statement, solution = str(statement).strip(), str(solution).strip()
+        if not statement or not solution:
+            raise ValueError("A saved statement and complete proof are required.")
+        if "\0" in statement or "\0" in solution:
+            raise ValueError("Saved critic inputs cannot contain NUL characters.")
+        options = self._workflow_options(
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            author_model=author_model,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            author_effort=author_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            author_prompt=author_prompt,
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
+            include_review=False,
+        )
+        with self.lock:
+            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+                raise ValueError("Codex is already working.")
+            source_label = Path(source_run).name if source_run else "saved-proof"
+            self._new_run(statement, f"critic-resume-{source_label}")
+            if not self.fixed_trace:
+                self.pinned = []
+            for name in ("author", "critic", "final"):
+                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            self._save_job_settings({
+                **options,
+                "problemMode": "critic-resume",
+                "skipStatementReview": True,
+                "statementReviewOnly": False,
+            })
+            self._save("checked-statement.md", f"# Checked statement\n\n{statement}\n")
+            self._save(tcs_agent.SAVED_CANDIDATE_FILENAME, solution + "\n")
+            if audit_checkpoint:
+                self._save(
+                    tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME,
+                    str(audit_checkpoint),
+                )
+            if not recover_audit_checkpoint:
+                self._save(
+                    tcs_agent.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME,
+                    (
+                        "This continuation starts from the saved proof and "
+                        "intentionally runs fresh independent audits.\n"
+                    ),
+                )
+            self._save(
+                "resume-source.json",
+                json.dumps({"sourceRun": str(source_run)}, indent=2) + "\n",
+            )
+            trace = self.state["trace"] if self.fixed_trace else []
+            version = self.state["traceVersion"] if self.fixed_trace else 0
+            self.state = {
+                **empty_state(trace, version),
+                "problemMode": "critic-resume",
+                "draft": statement,
+                "sourceRun": str(source_run),
+                **options,
+                "workflow": PUBLIC_GRAPH,
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "runId": self.run_dir.name,
+            }
+            process, token = self._launch_critic_resume_locked(
+                statement, solution
+            )
+        self._spawn_worker(self._read_output, (process, token), token)
 
     def approve(self, edited_statement=None):
         """Solve the reviewed statement, including any direct author edit."""
@@ -1349,9 +1898,7 @@ class App:
                     "# Author action\n\nEdited and directly approved by the author.\n",
                 )
             process, token = self._launch_solver_locked(statement)
-        threading.Thread(
-            target=self._read_output, args=(process, token), daemon=True
-        ).start()
+        self._spawn_worker(self._read_output, (process, token), token)
 
     def _read_output(self, process, token=None):
         """Store tagged solver events and build the visible final answer."""
@@ -1402,17 +1949,49 @@ class App:
                     order.clear()
                     with self.lock:
                         self.state["output"] = ""
+                report = record.get("report")
+                if (
+                    record.get("kind") == "critic_result"
+                    and isinstance(report, dict)
+                    and report.get("verdict") == "pass"
+                    and report.get("fixed") is False
+                    and isinstance(report.get("solution"), str)
+                    and report["solution"].strip()
+                ):
+                    try:
+                        tcs_agent.save_final_input(
+                            saved_statement(self.run_dir),
+                            report["solution"],
+                            directory=self.run_dir,
+                        )
+                        with self.lock:
+                            self.state["finalInputReady"] = True
+                    except (OSError, UnicodeError, TypeError, ValueError):
+                        # The clean critic record remains a legacy recovery path.
+                        pass
                 if record.get("kind") == "final_result":
                     with self.lock:
                         self.state["output"] = record.get("output", "")
                         final = True
                         self._save("final.tex", self.state["output"])
+                        if self.state.get("manuallyStopped"):
+                            self._clear_manual_stop()
+                            self.state.update(
+                                phase="done", error="",
+                                finishedAt=datetime.now(timezone.utc).isoformat(),
+                            )
                     continue
                 if record.get("kind") == "failure_result":
                     with self.lock:
                         self.state["output"] = record.get("output", "")
                         final = True
                         self._save("failure-summary.md", self.state["output"])
+                        if self.state.get("manuallyStopped"):
+                            self._clear_manual_stop()
+                            self.state.update(
+                                phase="done", error="",
+                                finishedAt=datetime.now(timezone.utc).isoformat(),
+                            )
                     continue
                 if record.get("kind") == "partial_result":
                     with self.lock:
@@ -1433,6 +2012,9 @@ class App:
                     item_id, answer = item.get("id", ""), item.get("text", "")
                 else:
                     continue
+                activity_label = record.get("activityLabel", "")
+                if activity_label:
+                    item_id = f"{activity_label}:{item_id}"
                 if item_id not in answers:
                     order.append(item_id)
                     answers[item_id] = ""
@@ -1445,13 +2027,30 @@ class App:
             stop_process_tree(process)
             code = process.poll()
         with self.lock:
-            if self.active_token is not token:
+            terminal_stop_race = (
+                final
+                and self.state.get("manuallyStopped")
+                and self.state["phase"] == "stopping"
+            )
+            if self.active_token is not token and not terminal_stop_race:
+                if self.worker_token is token:
+                    self.worker_token = None
                 return
             stopped = self.state["phase"] == "stopping"
-            self.process = None
-            self.active_token = None
+            if self.process is process:
+                self.process = None
+            if self.active_token is token:
+                self.active_token = None
+            if self.worker_token is token:
+                self.worker_token = None
             self.state["phase"] = "done"
-            if stopped and code:
+            self.state["finishedAt"] = datetime.now(timezone.utc).isoformat()
+            if final:
+                # A complete terminal record is durable and wins even when Stop
+                # killed the child before it closed stdout cleanly.
+                self._clear_manual_stop()
+                self.state["error"] = ""
+            elif stopped and code:
                 self.state["error"] = "Stopped."
                 self.state["output"] = self.state["output"] or (
                     "Codex was stopped before it produced an answer."
@@ -1486,15 +2085,40 @@ class App:
                 return
             if self.state["phase"] not in {"reviewing", "running"}:
                 raise ValueError("Codex is not working.")
+            self.add_trace({
+                "kind": "status", "stage": self.state["stage"],
+                "node": self.state["activeNode"],
+                "label": "Stop requested",
+                "text": "The running model and any subagents are being stopped.",
+            })
+            stopped_at = self.state.get("lastActivityAt", "")
+            try:
+                self._save(
+                    MANUAL_STOP_FILENAME,
+                    json.dumps({
+                        "schemaVersion": 1,
+                        "stage": self.state["stage"],
+                        "node": self.state["activeNode"],
+                        "problemMode": self.state["problemMode"],
+                        "stoppedAt": stopped_at,
+                    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                )
+            except (OSError, UnicodeError, TypeError, ValueError):
+                # The transcript entry remains a restart-safe legacy fallback.
+                pass
+            self.state.update(
+                manuallyStopped=True,
+                stoppedStage=self.state["stage"],
+            )
             process, self.state["phase"] = self.process, "stopping"
-            self.active_token = None
-            self.process = None
         stop_process_tree(process)
         with self.lock:
-            if self.state["phase"] == "stopping":
-                self.state.update(phase="done", error="Stopped.")
-                self.state["output"] = self.state["output"] or (
-                    "Codex was stopped before it produced an answer."
+            # Real jobs stay non-continuable until their reader has drained all
+            # buffered output. Synthetic/no-worker callers can settle here.
+            if self.state["phase"] == "stopping" and self.worker_token is None:
+                self._finish_stopped_locked(
+                    self.active_token,
+                    "Codex was stopped before it produced an answer.",
                 )
             self.persist()
 
@@ -1525,6 +2149,7 @@ class App:
             hours = round(hours, 10)
             self._write_author_limit(hours)
             self.state["thinkingHours"] = hours
+            self._save_job_settings(self.state)
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"], "node": "author",
                 "label": "Total time limit set",
@@ -1532,6 +2157,39 @@ class App:
                 "authorLimitHours": hours,
             })
             return hours
+
+    def steer_author(self, instruction):
+        """Queue one live instruction for the currently running author turn."""
+
+        instruction = str(instruction or "").strip()
+        if not instruction:
+            raise ValueError("Enter an instruction for the proof author.")
+        if "\0" in instruction:
+            raise ValueError("The live instruction cannot contain NUL characters.")
+        if len(instruction) > tcs_agent.AUTHOR_STEER_MAX_CHARS:
+            raise ValueError(
+                f"Keep the live instruction at or below "
+                f"{tcs_agent.AUTHOR_STEER_MAX_CHARS} characters."
+            )
+        with self.lock:
+            if not (
+                self.state["phase"] == "running"
+                and self.state["activeNode"] == "author"
+                and self.state["stage"] in {"solve", "repair"}
+            ):
+                raise ValueError(
+                    "Live instructions can only be sent while the proof author "
+                    "is running."
+                )
+            if self.process is None or self.process.poll() is not None:
+                raise ValueError("The proof author is no longer running.")
+            command_id = self._write_author_steer(instruction)
+            self.add_trace({
+                "kind": "status", "stage": self.state["stage"],
+                "node": "author", "label": "Live instruction queued",
+                "text": instruction, "steerId": command_id,
+            })
+            return command_id
 
     def reset(self):
         """Return to the first screen when no child is active."""
@@ -1545,6 +2203,661 @@ class App:
             self.persist()
 
 
+def _artifact_time(path):
+    """Return one artifact modification time as an ISO UTC timestamp."""
+
+    try:
+        return datetime.fromtimestamp(
+            Path(path).stat().st_mtime, timezone.utc,
+        ).isoformat()
+    except OSError:
+        return ""
+
+
+def _run_records(run_dir):
+    """Read valid records from one private append-only run transcript."""
+
+    path = Path(run_dir) / "transcript.jsonl"
+    records = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    value = json.loads(line)
+                    if isinstance(value, dict):
+                        records.append(value)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return records
+
+
+def saved_author_instructions(run_dir):
+    """Return bounded, deduplicated user steering from a stopped author run."""
+
+    records = _run_records(run_dir)
+    restored_ids = {
+        str(record.get("steerId") or "").strip()
+        for record in records
+        if record.get("label") == "Restored live instructions queued"
+        and str(record.get("steerId") or "").strip()
+    }
+    instructions, seen = [], set()
+    labels = {
+        "Live instruction queued", "Live author instruction sent",
+        "Restored live instructions queued",
+    }
+    for record in records:
+        if record.get("label") not in labels:
+            continue
+        steer_id = str(record.get("steerId") or "").strip()
+        if (
+            record.get("label") == "Live author instruction sent"
+            and steer_id in restored_ids
+        ):
+            continue
+        values = record.get("restoredInstructions")
+        values = values if isinstance(values, list) else [record.get("text")]
+        for value in values:
+            if not isinstance(value, str) or not value.strip() or "\0" in value:
+                continue
+            key = value.strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            instructions.append(key)
+
+    selected, size = [], 0
+    for instruction in reversed(instructions):
+        additional = len(instruction) + (2 if selected else 0)
+        if size + additional > tcs_agent.AUTHOR_STEER_MAX_CHARS:
+            continue
+        selected.append(instruction)
+        size += additional
+    return list(reversed(selected))
+
+
+def saved_manual_stop(run_dir, records=None):
+    """Return one durable manual-stop marker, including legacy transcripts."""
+
+    run_dir = Path(run_dir)
+    records = _run_records(run_dir) if records is None else records
+    marker = None
+    try:
+        value = json.loads(
+            (run_dir / MANUAL_STOP_FILENAME).read_text(encoding="utf-8")
+        )
+        if (
+            isinstance(value, dict)
+            and value.get("schemaVersion") == 1
+            and value.get("stage") in {
+                "review", "solve", "repair", "critic", "final", "failure",
+            }
+        ):
+            marker = dict(value)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+
+    legacy = None
+    for index, record in enumerate(records):
+        if (
+            record.get("kind") == "status"
+            and record.get("label") == "Stop requested"
+            and record.get("stage") in {
+                "review", "solve", "repair", "critic", "final", "failure",
+            }
+        ):
+            legacy = {
+                "schemaVersion": 0,
+                "stage": record["stage"],
+                "node": record.get("node", ""),
+                "stoppedAt": record.get("time", ""),
+            }
+    result = marker or legacy
+    if result is None:
+        return None
+
+    # A result for the latest request wins a legacy stop/result race. Review retries
+    # reuse one run, so a result from an earlier review must not hide a later
+    # stopped feedback request. Apply the same generation rule to durable markers:
+    # Stop can be written just after a complete result but before the reader sees
+    # EOF, and that completed generation must not be offered for continuation.
+    stage = result["stage"]
+    latest_request = max(
+        (
+            index for index, record in enumerate(records)
+            if record.get("kind") == "request"
+            and record.get("stage") == stage
+        ),
+        default=-1,
+    )
+    terminal_kinds = (
+        {"review_result"}
+        if stage == "review" else {"final_result", "failure_result"}
+    )
+    latest_result = max(
+        (
+            index for index, record in enumerate(records)
+            if record.get("kind") in terminal_kinds
+        ),
+        default=-1,
+    )
+    if latest_result >= 0 and latest_result > latest_request:
+        return None
+    return result
+
+
+def checkpoint_artifact_signature(run_dir, include_transcript=True):
+    """Return a cheap cache key for files that define durable checkpoints."""
+
+    if not run_dir:
+        return ()
+    run_dir = Path(run_dir)
+    signature = []
+    names = [
+        "checked-statement.md", tcs_agent.AUTHOR_ANCHOR_FILENAME,
+        "SOLUTION.md", tcs_agent.SAVED_CANDIDATE_FILENAME,
+        tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME,
+    ]
+    # The live transcript changes on every heartbeat. Candidate and audit files
+    # cover checkpoints that can appear while a job is active; scan the full
+    # transcript once the job becomes idle to discover coordinator failures.
+    if include_transcript:
+        names.append("transcript.jsonl")
+    for name in names:
+        try:
+            stat = (run_dir / name).stat()
+            signature.append((name, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            signature.append((name, 0, 0))
+    return tuple(signature)
+
+
+def valid_saved_audit_reports(run_dir, source):
+    """Return only audit reports the runner can actually restore."""
+
+    run_dir = Path(run_dir)
+    path = run_dir / tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        reports = value.get("reports") if isinstance(value, dict) else None
+        if (
+            not isinstance(value, dict)
+            or value.get("schemaVersion")
+            != tcs_agent.CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION
+            or not isinstance(reports, list)
+            or len(reports) != len(tcs_agent.CRITIC_AUDIT_FOCI)
+        ):
+            return []
+        settings = {}
+        try:
+            loaded = json.loads(
+                (run_dir / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8")
+            )
+            if isinstance(loaded, dict):
+                settings = loaded
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        model = restored_model(settings.get(
+            "criticModel", value.get("model", DEFAULT_CRITIC_MODEL),
+        ))
+        effort = settings.get(
+            "criticEffort",
+            settings.get(
+                "reasoningEffort",
+                value.get("reasoningEffort", DEFAULT_REASONING_EFFORT),
+            ),
+        )
+        model = tcs_agent.chosen_model(model)
+        effort = tcs_agent.chosen_effort(effort)
+        audit_effort = (
+            tcs_agent.effective_effort(model, "high")
+            if tcs_agent.is_deepseek_model(model)
+            else tcs_agent.effective_effort(model, effort)
+        )
+        instructions = tcs_agent.text(source["critic_prompt"])
+        if tcs_agent.CRITIC_MEMORY_PROMPT not in instructions:
+            instructions = f"{instructions}\n\n{tcs_agent.CRITIC_MEMORY_PROMPT}"
+        expected = tcs_agent.critic_audit_assignment_sha256(
+            source["statement"], source["solution"], model, audit_effort,
+            instructions,
+        )
+        if value.get("assignmentSha256") != expected:
+            return []
+        for report in reports:
+            if report is not None:
+                tcs_agent.validate_json_schema(
+                    report, tcs_agent.CRITIC_CHECK_SCHEMA,
+                )
+        return reports
+    except (
+        OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError,
+        tcs_agent.Error,
+    ):
+        return []
+
+
+def saved_run_checkpoints(run_dir):
+    """Describe every durable, resumable critic checkpoint in one run."""
+
+    run_dir = Path(run_dir)
+    statement_ready = bool(
+        (run_dir / "checked-statement.md").is_file()
+        or (run_dir / tcs_agent.AUTHOR_ANCHOR_FILENAME).is_file()
+    )
+    candidate_path = next(
+        (
+            path for path in (
+                run_dir / tcs_agent.SAVED_CANDIDATE_FILENAME,
+                run_dir / "SOLUTION.md",
+            )
+            if path.is_file()
+        ),
+        None,
+    )
+    source = None
+    if statement_ready and candidate_path is not None:
+        try:
+            source = saved_critic_source(run_dir)
+        except ValueError:
+            pass
+    checkpoints = []
+    if source is not None:
+        checkpoints.append({
+            "id": "candidate",
+            "label": "Saved proof candidate",
+            "stage": "critic",
+            "status": "ready",
+            "completedAt": _artifact_time(candidate_path),
+            "description": (
+                "Continue at independent critic review without rerunning the "
+                "proof author."
+            ),
+            "resumable": True,
+            "resumeLabel": "Continue at critic",
+        })
+
+    audit_path = run_dir / tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
+    reports = valid_saved_audit_reports(run_dir, source) if source else []
+    completed_audits = sum(report is not None for report in reports)
+    audit_verdicts = [
+        report["verdict"] for report in reports if report is not None
+    ]
+    if source is not None and completed_audits:
+        failures = audit_verdicts.count("fail")
+        checkpoints.append({
+            "id": "independent-audits",
+            "label": f"Independent audits {completed_audits}/3",
+            "stage": "critic",
+            "status": "complete" if completed_audits == 3 else "partial",
+            "completedAt": _artifact_time(audit_path),
+            "description": (
+                f"{completed_audits} audit"
+                f"{'s are' if completed_audits != 1 else ' is'} saved"
+                + (f"; {failures} reported proof issues." if failures else ".")
+                + (
+                    " Continue with only the missing audits."
+                    if completed_audits < 3
+                    else " Continue directly to coordinator adjudication."
+                )
+            ),
+            "resumable": True,
+            "resumeLabel": (
+                "Run missing audits" if completed_audits < 3
+                else "Continue coordinator"
+            ),
+            "completedAuditCount": completed_audits,
+            "failedAuditCount": failures,
+        })
+
+    coordinator_request, coordinator_result, coordinator_error = None, None, None
+    for record in _run_records(run_dir):
+        if (
+            record.get("kind") == "request"
+            and record.get("label") == "Critic coordinator adjudication"
+        ):
+            coordinator_request = record
+            coordinator_result = coordinator_error = None
+        elif coordinator_request is not None and record.get("kind") == "critic_result":
+            coordinator_result = record
+        elif (
+            coordinator_request is not None
+            and record.get("kind") == "diagnostic"
+            and str(record.get("text", "")).startswith("error: ")
+        ):
+            coordinator_error = record
+    if (
+        source is not None
+        and completed_audits == 3 and coordinator_request is not None
+        and coordinator_result is None
+    ):
+        stopped_at = coordinator_error or coordinator_request
+        checkpoints.append({
+            "id": "critic-coordinator",
+            "label": "Critic coordinator",
+            "stage": "critic",
+            "status": "failed" if coordinator_error else "interrupted",
+            "completedAt": stopped_at.get("time", ""),
+            "description": (
+                "All three independent audits are saved. Continue the "
+                "coordinator without rerunning them."
+            ),
+            "resumable": True,
+            "resumeLabel": "Retry coordinator",
+        })
+    return checkpoints
+
+
+def restore_saved_app(app):
+    """Reconstruct one idle historical job for a newly started Web UI."""
+
+    run_dir = app.run_dir
+    if not run_dir:
+        return app
+    records = _run_records(run_dir)
+    state = empty_state(app.state["trace"], app.state["traceVersion"])
+    state["runId"] = run_dir.name
+    draft_path = run_dir / "draft.md"
+    try:
+        draft = draft_path.read_text(encoding="utf-8").strip()
+        if draft.startswith("# Draft problem"):
+            draft = draft[len("# Draft problem"):].lstrip()
+        state["draft"] = draft
+        state["reviewStatement"] = draft
+    except (OSError, UnicodeError):
+        pass
+    try:
+        review_input = json.loads(
+            (run_dir / REVIEW_INPUT_FILENAME).read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(review_input, dict)
+            or review_input.get("schemaVersion") != 1
+            or not isinstance(review_input.get("statement"), str)
+            or not review_input["statement"].strip()
+            or not isinstance(review_input.get("feedback"), str)
+        ):
+            raise ValueError("invalid saved review input")
+        state["reviewStatement"] = review_input["statement"].strip()
+        state["reviewFeedback"] = review_input["feedback"].strip()
+        state["reviewInputRecorded"] = True
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        pass
+
+    settings_path = run_dir / JOB_SETTINGS_FILENAME
+    persisted_settings = set()
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        if isinstance(settings, dict):
+            for key in (
+                "reviewModel", "authorModel", "criticModel", "writerModel",
+                "reasoningEffort", "reviewEffort", "authorEffort",
+                "criticEffort", "writerEffort", "criticRounds",
+                "thinkingHours", "speedMode", "reasoningSummary",
+                "problemMode", "skipStatementReview", "statementReviewOnly",
+            ):
+                if key in settings:
+                    if key in {
+                        "skipStatementReview", "statementReviewOnly",
+                    } and not isinstance(settings[key], bool):
+                        continue
+                    if (
+                        key == "problemMode"
+                        and settings[key] not in {
+                            "statement", "algorithmic", "latex",
+                            "critic-resume", "final-resume",
+                        }
+                    ):
+                        continue
+                    persisted_settings.add(key)
+                    state[key] = (
+                        restored_model(settings[key])
+                        if key.endswith("Model") else settings[key]
+                    )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    for name in ("review", "author", "critic", "final"):
+        prompt_path = run_dir / "prompts" / f"{name}.txt"
+        try:
+            state[f"{name}Prompt"] = prompt_path.read_text(
+                encoding="utf-8"
+            ).strip()
+        except (OSError, UnicodeError):
+            pass
+
+    direct_statement = False
+    try:
+        direct_statement = (run_dir / "checked-statement.md").read_text(
+            encoding="utf-8"
+        ).lstrip().startswith("# Statement sent directly to the proof author")
+    except (OSError, UnicodeError):
+        pass
+    if "skipStatementReview" not in persisted_settings and direct_statement:
+        state["skipStatementReview"] = True
+    proof_prompts = [
+        run_dir / "prompts" / f"{name}.txt"
+        for name in ("author", "critic", "final")
+    ]
+    review_only_artifacts = (
+        (run_dir / "prompts" / "review.txt").is_file()
+        and not any(path.is_file() for path in proof_prompts)
+    )
+    if (
+        "statementReviewOnly" not in persisted_settings
+        and review_only_artifacts
+    ):
+        state["statementReviewOnly"] = True
+
+    if (run_dir / "resume-source.json").is_file():
+        state["problemMode"] = "critic-resume"
+        state["skipStatementReview"] = True
+    elif (run_dir / "algorithmic-input.json").is_file():
+        state["problemMode"] = "algorithmic"
+        state["skipStatementReview"] = True
+        state["workflow"] = ALGORITHMIC_GRAPH
+        try:
+            fields = json.loads(
+                (run_dir / "algorithmic-input.json").read_text(encoding="utf-8")
+            )
+            if isinstance(fields, dict):
+                for key in ("modelOfComputation", "problemDescription", "goal"):
+                    if isinstance(fields.get(key), str):
+                        state[key] = fields[key]
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    elif (run_dir / "latex-input.md").is_file():
+        state["problemMode"] = "latex"
+        state["workflow"] = LATEX_GRAPH
+    elif (
+        state["problemMode"] == "final-resume"
+        and (run_dir / tcs_agent.FINAL_INPUT_FILENAME).is_file()
+    ):
+        state["workflow"] = LATEX_GRAPH
+    elif state["statementReviewOnly"]:
+        state["workflow"] = REVIEW_ONLY_GRAPH
+    elif state["skipStatementReview"]:
+        state["workflow"] = ALGORITHMIC_GRAPH
+
+    transcript_speed = None
+    observed_role_settings = set()
+    post_review_request = False
+    for record in records:
+        stage = record.get("stage")
+        if stage:
+            state["stage"] = stage
+            state["activeNode"] = {
+                "review": "statement_reviewer", "solve": "author",
+                "repair": "author", "critic": "critic", "final": "latex_editor",
+                "failure": "failure_summary",
+            }.get(stage, state["activeNode"])
+        if isinstance(record.get("round"), int):
+            state["round"] = record["round"]
+        if record.get("kind") == "request":
+            model, effort = record.get("model"), record.get("reasoningEffort")
+            label = str(record.get("label", ""))
+            role = {
+                "review": "review", "solve": "author", "repair": "author",
+                "critic": "critic", "final": "writer",
+            }.get(stage)
+            if (
+                role and isinstance(model, str) and model
+                and isinstance(effort, str) and effort
+            ):
+                observed_role_settings.add(role)
+            if stage in {"solve", "repair", "critic", "final"}:
+                post_review_request = True
+            model_key = f"{role}Model" if role else ""
+            effort_key = f"{role}Effort" if role else ""
+            if (
+                role and isinstance(model, str)
+                and model_key not in persisted_settings
+            ):
+                state[f"{role}Model"] = restored_model(model)
+            if (
+                role and isinstance(effort, str)
+                and effort_key not in persisted_settings
+                and not (
+                    role == "critic"
+                    and label.startswith("Independent critic audit ")
+                )
+            ):
+                state[f"{role}Effort"] = effort
+            if (
+                "reasoningSummary" not in persisted_settings
+                and isinstance(record.get("reasoningSummary"), str)
+            ):
+                state["reasoningSummary"] = record["reasoningSummary"]
+            if (
+                "speedMode" not in persisted_settings
+                and record.get("serviceTier") in SPEEDS
+            ):
+                tier = record["serviceTier"]
+                if transcript_speed is None or tier == "fast":
+                    transcript_speed = tier
+        if record.get("kind") == "review_result" and isinstance(
+            record.get("review"), dict
+        ):
+            state["review"] = record["review"]
+        if (
+            record.get("kind") == "diagnostic"
+            and str(record.get("text", "")).startswith("error: ")
+        ):
+            state["error"] = str(record["text"])[7:]
+
+    if transcript_speed is not None:
+        state["speedMode"] = transcript_speed
+
+    if state["statementReviewOnly"]:
+        required_roles = {"review"}
+    elif state["problemMode"] in {"latex", "final-resume"}:
+        required_roles = {"writer"}
+    elif state["problemMode"] in {"algorithmic", "critic-resume"}:
+        required_roles = {"author", "critic", "writer"}
+    else:
+        required_roles = {"author", "critic", "writer"}
+        if not state["skipStatementReview"]:
+            required_roles.add("review")
+    unknown_roles = sorted(
+        role for role in required_roles
+        if f"{role}Model" not in persisted_settings
+        and role not in observed_role_settings
+    )
+    if unknown_roles:
+        labels = {
+            "review": "statement reviewer",
+            "author": "proof author",
+            "critic": "critic",
+            "writer": "LaTeX editor",
+        }
+        names = ", ".join(labels[role] for role in unknown_roles)
+        state["settingsWarning"] = (
+            f"This older run did not record the {names} model settings. "
+            "Those roles will use the current defaults if you continue."
+        )
+
+    first_time = records[0].get("time") if records else ""
+    last_time = records[-1].get("time") if records else ""
+    state["startedAt"] = (
+        first_time if isinstance(first_time, str) and first_time
+        else _artifact_time(run_dir)
+    )
+    state["lastActivityAt"] = last_time if isinstance(last_time, str) else ""
+    state["finishedAt"] = state["lastActivityAt"]
+    state["phase"] = "done"
+    for filename in ("final.tex", "failure-summary.md", "partial-output.md"):
+        path = run_dir / filename
+        if path.is_file():
+            try:
+                state["output"] = path.read_text(encoding="utf-8")
+                break
+            except (OSError, UnicodeError):
+                pass
+    if state["statementReviewOnly"] and state["review"]:
+        state["output"] = state["review"].get("statement", "")
+    elif (
+        state["problemMode"] == "statement"
+        and not state["skipStatementReview"]
+        and state["review"]
+        and not post_review_request
+    ):
+        state.update(
+            phase="reviewed", stage="review",
+            activeNode="statement_reviewer", finishedAt="", error="",
+        )
+    if state["problemMode"] != "latex":
+        try:
+            saved_final_input(run_dir, records=records)
+            state["finalInputReady"] = True
+        except ValueError:
+            pass
+    manual_stop = saved_manual_stop(run_dir, records)
+    if manual_stop is not None:
+        stopped_stage = manual_stop["stage"]
+        state.update(
+            phase="done",
+            error="Stopped.",
+            manuallyStopped=True,
+            stoppedStage=stopped_stage,
+            stage=stopped_stage,
+            activeNode={
+                "review": "statement_reviewer",
+                "solve": "author",
+                "repair": "author",
+                "critic": "critic",
+                "final": "latex_editor",
+                "failure": "failure_summary",
+            }[stopped_stage],
+            finishedAt=(
+                manual_stop.get("stoppedAt") or state["lastActivityAt"]
+            ),
+        )
+        if not state["output"]:
+            state["output"] = (
+                "This job was manually stopped. Continue it from the home page."
+            )
+    state["checkpoints"] = saved_run_checkpoints(run_dir)
+    app._checkpoint_cache = list(state["checkpoints"])
+    app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
+    app.state = state
+    app.fixed_trace = False
+    return app
+
+
+def restore_saved_jobs(runs):
+    """Load every historical run as an idle job after a Web UI restart."""
+
+    jobs = {}
+    for transcript in sorted(Path(runs).glob("*/transcript.jsonl")):
+        if transcript.is_symlink() or not direct_run_directory(
+            transcript.parent, runs
+        ):
+            continue
+        app = restore_saved_app(App(transcript, runs))
+        jobs[app.state["runId"]] = app
+    return jobs
+
+
 class Server(ThreadingHTTPServer):
     """Keep independent jobs alive while browser tabs come and go."""
 
@@ -1556,6 +2869,13 @@ class Server(ThreadingHTTPServer):
         self.fixed_app = trace_file is not None
         self.jobs, self.jobs_lock = {}, threading.RLock()
         super().__init__(address, Handler)
+        if not self.fixed_app:
+            self.jobs.update(restore_saved_jobs(self.runs))
+            if self.jobs:
+                self.app = max(
+                    self.jobs.values(),
+                    key=lambda item: item.state.get("lastActivityAt", ""),
+                )
         # Only the unguessable launch URL can create this server's session.
         self.token = secrets.token_urlsafe(32)
         self.origin = f"http://{HOST}:{self.server_port}"
@@ -1616,7 +2936,7 @@ class Server(ThreadingHTTPServer):
         new_settings = any(key in body for key in (
             "reviewEffort", "authorEffort", "criticEffort", "writerEffort",
             "reviewPrompt", "authorPrompt", "criticPrompt", "finalPrompt",
-            "speedMode",
+            "speedMode", "reasoningSummary",
         ))
         if not new_settings:
             app.start_review(
@@ -1629,6 +2949,9 @@ class Server(ThreadingHTTPServer):
                 body.get("writerModel", DEFAULT_WRITER_MODEL),
                 legacy_effort,
                 speed_mode=body.get("speedMode", DEFAULT_SPEED),
+                reasoning_summary=body.get(
+                    "reasoningSummary", DEFAULT_REASONING_SUMMARY
+                ),
                 **review_only_option,
             )
             with self.jobs_lock:
@@ -1645,7 +2968,7 @@ class Server(ThreadingHTTPServer):
             critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
             writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
             reasoning_effort=legacy_effort,
-            review_effort=body.get("reviewEffort", legacy_effort),
+            review_effort=body.get("reviewEffort", DEFAULT_REVIEW_EFFORT),
             author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
@@ -1654,6 +2977,9 @@ class Server(ThreadingHTTPServer):
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=body.get(
+                "reasoningSummary", DEFAULT_REASONING_SUMMARY
+            ),
             **review_only_option,
         )
         with self.jobs_lock:
@@ -1687,6 +3013,9 @@ class Server(ThreadingHTTPServer):
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=body.get(
+                "reasoningSummary", DEFAULT_REASONING_SUMMARY
+            ),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -1717,6 +3046,9 @@ class Server(ThreadingHTTPServer):
             critic_prompt=body.get("criticPrompt"),
             final_prompt=body.get("finalPrompt"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=body.get(
+                "reasoningSummary", DEFAULT_REASONING_SUMMARY
+            ),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -1739,7 +3071,344 @@ class Server(ThreadingHTTPServer):
             writer_effort=body.get("writerEffort", legacy_effort),
             final_prompt=body.get("finalPrompt"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=body.get(
+                "reasoningSummary", DEFAULT_REASONING_SUMMARY
+            ),
         )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
+    def start_saved_critic_job(
+        self, source_run, settings=None, include_audit_checkpoint=True,
+    ):
+        """Create a browser-visible job from one saved complete proof."""
+
+        settings = dict(settings or {})
+        source = saved_critic_source(source_run)
+        app = App(runs=self.runs)
+        app.start_critic_resume(
+            statement=source["statement"],
+            solution=source["solution"],
+            source_run=source["run_dir"],
+            critic_rounds=settings.get(
+                "criticRounds", DEFAULT_CRITIC_ROUNDS
+            ),
+            thinking_hours=settings.get(
+                "thinkingHours", DEFAULT_THINKING_HOURS
+            ),
+            author_model=settings.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            critic_model=settings.get("criticModel", DEFAULT_CRITIC_MODEL),
+            writer_model=settings.get("writerModel", DEFAULT_WRITER_MODEL),
+            reasoning_effort=settings.get(
+                "reasoningEffort", DEFAULT_REASONING_EFFORT
+            ),
+            author_effort=settings.get("authorEffort"),
+            critic_effort=settings.get("criticEffort"),
+            writer_effort=settings.get("writerEffort"),
+            author_prompt=settings.get(
+                "authorPrompt", source["author_prompt"]
+            ),
+            critic_prompt=settings.get(
+                "criticPrompt", source["critic_prompt"]
+            ),
+            final_prompt=settings.get("finalPrompt", source["final_prompt"]),
+            speed_mode=settings.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=settings.get(
+                "reasoningSummary", DEFAULT_REASONING_SUMMARY
+            ),
+            audit_checkpoint=(
+                source["audit_checkpoint"] if include_audit_checkpoint else ""
+            ),
+            recover_audit_checkpoint=include_audit_checkpoint,
+        )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
+    def resume_critic_job(self, run_id, include_audit_checkpoint=True):
+        """Resume an idle job from its saved proof using its role settings."""
+
+        source_app = self.get_job(run_id)
+        source_state = source_app.snapshot()
+        if source_state["phase"] in {"reviewing", "running", "stopping"}:
+            raise ValueError(
+                "Stop this job before starting another critic from its proof."
+            )
+        settings = {
+            key: source_state.get(key) for key in (
+                "criticRounds", "thinkingHours", "authorModel",
+                "criticModel", "writerModel", "reasoningEffort",
+                "authorEffort", "criticEffort", "writerEffort",
+                "speedMode", "reasoningSummary", "authorPrompt",
+            )
+        }
+        return self.start_saved_critic_job(
+            source_app.run_dir, settings,
+            include_audit_checkpoint=include_audit_checkpoint,
+        )
+
+    def resume_checkpoint_job(self, run_id, checkpoint_id):
+        """Continue one explicit durable checkpoint in a new browser job."""
+
+        source_app = self.get_job(run_id)
+        source_state = source_app.snapshot()
+        if source_state["phase"] in {"reviewing", "running", "stopping"}:
+            raise ValueError("Stop this job before continuing a checkpoint.")
+        checkpoint = next(
+            (
+                item for item in source_state.get("checkpoints", [])
+                if item.get("id") == checkpoint_id
+            ),
+            None,
+        )
+        if not checkpoint or not checkpoint.get("resumable"):
+            raise ValueError("That checkpoint is not available for continuation.")
+        return self.resume_critic_job(
+            run_id,
+            include_audit_checkpoint=checkpoint_id != "candidate",
+        )
+
+    @staticmethod
+    def _stopped_continuation_plan(source_app, state=None):
+        """Describe the safest available boundary for one manual stop."""
+
+        state = source_app.snapshot() if state is None else state
+        if (
+            not state.get("manuallyStopped")
+            or state.get("phase") in {"reviewing", "running", "stopping"}
+            or source_app.has_active_worker()
+        ):
+            return None
+        stage = state.get("stoppedStage") or state.get("stage")
+        if stage == "review" and state.get("reviewStatement", "").strip():
+            legacy_input_warning = (
+                " This older run did not separately save its exact review "
+                "feedback; continuation uses the saved draft with no feedback."
+                if not state.get("reviewInputRecorded") else ""
+            )
+            return {
+                "action": "review",
+                "label": "Retry statement review",
+                "description": (
+                    "Starts a new statement-review request with the saved draft, "
+                    "role settings, and prompt." + legacy_input_warning
+                ),
+            }
+        if (
+            stage in {"solve", "repair", "failure"}
+            and state.get("problemMode") == "critic-resume"
+        ):
+            if not state.get("checkpoints"):
+                return None
+            return {
+                "action": "critic",
+                "label": "Continue from critic",
+                "description": (
+                    "Restores the saved critic checkpoint so any required "
+                    "author repair receives its exact recovery assignment."
+                ),
+            }
+        if stage in {"solve", "repair", "failure"}:
+            author_ready = False
+            if state.get("problemMode") == "algorithmic":
+                author_ready = all(
+                    str(state.get(key, "")).strip()
+                    for key in (
+                        "modelOfComputation", "problemDescription", "goal",
+                    )
+                )
+            else:
+                try:
+                    saved_statement(source_app.run_dir)
+                    author_ready = True
+                except ValueError:
+                    pass
+            if author_ready:
+                return {
+                    "action": "author",
+                    "label": "Continue proof author",
+                    "description": (
+                        "Starts a new author thread from the exact checked "
+                        "statement and compatible durable author memory. "
+                        "Previously sent live instructions are queued again."
+                    ),
+                }
+        if stage == "critic" and state.get("checkpoints"):
+            return {
+                "action": "critic",
+                "label": "Continue critic",
+                "description": (
+                    "Continues from the latest compatible saved proof and "
+                    "independent-audit checkpoint."
+                ),
+            }
+        if stage == "final":
+            if state.get("problemMode") == "latex":
+                ready = (source_app.run_dir / "latex-input.md").is_file()
+            else:
+                ready = bool(state.get("finalInputReady"))
+            if ready:
+                return {
+                    "action": "final",
+                    "label": "Retry LaTeX editor",
+                    "description": (
+                        "Starts only a new LaTeX-editor request from the exact "
+                        "saved final input."
+                    ),
+                }
+            if state.get("checkpoints"):
+                return {
+                    "action": "critic",
+                    "label": "Continue from critic",
+                    "description": (
+                        "No exact final input was saved by this older job; "
+                        "continues from its latest safe critic checkpoint."
+                    ),
+                }
+        return None
+
+    @staticmethod
+    def _queue_saved_author_instructions(source_app, target_app):
+        """Replay prior user steering into a newly created author process."""
+
+        instructions = saved_author_instructions(source_app.run_dir)
+        if not instructions:
+            return
+        combined = (
+            "\n\n".join(instructions)
+        )
+        command_id = target_app._write_author_steer(combined)
+        target_app.add_trace({
+            "kind": "status",
+            "stage": target_app.state.get("stage") or "solve",
+            "node": "author",
+            "label": "Restored live instructions queued",
+            "text": combined,
+            "restoredInstructions": instructions,
+            "steerId": command_id,
+        })
+
+    def continue_stopped_job(self, run_id):
+        """Continue one manually stopped stage in a new immutable-source job."""
+
+        # Match delete_job's jobs -> app lock order. Keeping both locks through
+        # registration also prevents the immutable source from being moved or
+        # repurposed while its artifacts are copied.
+        with self.jobs_lock:
+            source_app = self.get_job(run_id)
+            with source_app.lock:
+                return self._continue_stopped_job_locked(source_app)
+
+    def _continue_stopped_job_locked(self, source_app):
+        """Create a continuation while holding the immutable source lock."""
+
+        validated_continuation_source(source_app.run_dir, self.runs)
+        source_state = source_app.snapshot()
+        plan = self._stopped_continuation_plan(source_app, source_state)
+        if plan is None:
+            raise ValueError(
+                "This job has no safe manually stopped stage to continue."
+            )
+        if plan["action"] == "critic":
+            continued = self.resume_critic_job(
+                source_state["runId"], include_audit_checkpoint=True,
+            )
+            if isinstance(continued, App):
+                self._queue_saved_author_instructions(source_app, continued)
+            return continued
+
+        app = App(runs=self.runs)
+        source_run = source_app.run_dir
+        common = {
+            "speed_mode": source_state["speedMode"],
+            "reasoning_summary": source_state["reasoningSummary"],
+            "continuation_source": source_run,
+            "stopped_stage": source_state["stoppedStage"],
+        }
+        if plan["action"] == "review":
+            app.start_review(
+                statement=source_state["reviewStatement"],
+                feedback=source_state["reviewFeedback"],
+                critic_rounds=source_state["criticRounds"],
+                thinking_hours=source_state["thinkingHours"],
+                review_model=source_state["reviewModel"],
+                author_model=source_state["authorModel"],
+                critic_model=source_state["criticModel"],
+                writer_model=source_state["writerModel"],
+                reasoning_effort=source_state["reasoningEffort"],
+                review_effort=source_state["reviewEffort"],
+                author_effort=source_state["authorEffort"],
+                critic_effort=source_state["criticEffort"],
+                writer_effort=source_state["writerEffort"],
+                review_prompt=source_state["reviewPrompt"],
+                author_prompt=source_state["authorPrompt"],
+                critic_prompt=source_state["criticPrompt"],
+                final_prompt=source_state["finalPrompt"],
+                review_only=source_state["statementReviewOnly"],
+                **common,
+            )
+        elif plan["action"] == "author":
+            author_options = {
+                "critic_rounds": source_state["criticRounds"],
+                "thinking_hours": source_state["thinkingHours"],
+                "author_model": source_state["authorModel"],
+                "critic_model": source_state["criticModel"],
+                "writer_model": source_state["writerModel"],
+                "reasoning_effort": source_state["reasoningEffort"],
+                "author_effort": source_state["authorEffort"],
+                "critic_effort": source_state["criticEffort"],
+                "writer_effort": source_state["writerEffort"],
+                "author_prompt": source_state["authorPrompt"],
+                "critic_prompt": source_state["criticPrompt"],
+                "final_prompt": source_state["finalPrompt"],
+                **common,
+            }
+            if source_state["problemMode"] == "algorithmic":
+                app.start_algorithmic(
+                    model_of_computation=source_state["modelOfComputation"],
+                    problem_description=source_state["problemDescription"],
+                    goal=source_state["goal"],
+                    **author_options,
+                )
+            else:
+                app.start_direct_statement(
+                    statement=saved_statement(source_run),
+                    **author_options,
+                )
+            self._queue_saved_author_instructions(source_app, app)
+        else:
+            if source_state["problemMode"] == "latex":
+                final_source = read_utf8(
+                    source_run / "latex-input.md", "saved LaTeX input",
+                )
+            else:
+                final_input = saved_final_input(source_run)
+                final_source = (
+                    f"STATEMENT:\n{final_input['statement']}\n\n"
+                    f"PROOF:\n{final_input['solution']}"
+                )
+            if source_state["problemMode"] == "latex":
+                app.start_latex_only(
+                    source=final_source,
+                    writer_model=source_state["writerModel"],
+                    reasoning_effort=source_state["reasoningEffort"],
+                    writer_effort=source_state["writerEffort"],
+                    final_prompt=source_state["finalPrompt"],
+                    **common,
+                )
+            else:
+                app.start_final_resume(
+                    statement=final_input["statement"],
+                    solution=final_input["solution"],
+                    writer_model=source_state["writerModel"],
+                    reasoning_effort=source_state["reasoningEffort"],
+                    writer_effort=source_state["writerEffort"],
+                    final_prompt=source_state["finalPrompt"],
+                    **common,
+                )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
         self.app = app
@@ -1757,13 +3426,38 @@ class Server(ThreadingHTTPServer):
             job = {
                 key: state[key] for key in (
                     "runId", "phase", "draft", "activeNode", "startedAt",
-                    "lastActivityAt", "error", "problemMode",
+                    "finishedAt", "lastActivityAt", "error", "problemMode",
+                    "manuallyStopped", "stoppedStage",
+                    "settingsWarning",
                 )
             }
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
                 if state["problemMode"] == "algorithmic"
                 else state["draft"].strip().split("\n", 1)[0]
+            )
+            run_dir = app.run_dir
+            checkpoints = state.get("checkpoints", [])
+            job["checkpoints"] = checkpoints
+            job["canResumeCritic"] = bool(
+                state["phase"] not in {"reviewing", "running", "stopping"}
+                and run_dir
+                and (
+                    (run_dir / "SOLUTION.md").is_file()
+                    or (run_dir / tcs_agent.SAVED_CANDIDATE_FILENAME).is_file()
+                )
+                and (
+                    (run_dir / "checked-statement.md").is_file()
+                    or (run_dir / tcs_agent.AUTHOR_ANCHOR_FILENAME).is_file()
+                )
+            )
+            continuation = self._stopped_continuation_plan(app, state)
+            job["canContinueStopped"] = continuation is not None
+            job["continueStoppedLabel"] = (
+                continuation["label"] if continuation else ""
+            )
+            job["continueStoppedDescription"] = (
+                continuation["description"] if continuation else ""
             )
             jobs.append(job)
         return sorted(jobs, key=lambda job: job["startedAt"], reverse=True)
@@ -1776,7 +3470,10 @@ class Server(ThreadingHTTPServer):
             if not app:
                 app = self.get_job(run_id)
             with app.lock:
-                if app.state["phase"] in {"reviewing", "running", "stopping"}:
+                if (
+                    app.state["phase"] in {"reviewing", "running", "stopping"}
+                    or app.worker_token is not None
+                ):
                     raise ValueError("Stop this job before deleting it.")
                 folder = app.run_dir
                 if not folder or folder.resolve().parent != self.runs.resolve():
@@ -1912,7 +3609,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object.")
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
-            if request.path == "/review":
+            if request.path == "/resume-critic":
+                app = self.server.resume_critic_job(run_id)
+            elif request.path == "/resume-checkpoint":
+                app = self.server.resume_checkpoint_job(
+                    run_id, str(body.get("checkpoint", "")),
+                )
+            elif request.path == "/continue-stopped":
+                app = self.server.continue_stopped_job(run_id)
+            elif request.path == "/review":
                 app = self.server.start_job(body, run_id)
             elif request.path == "/direct":
                 app = self.server.start_direct_job(body, run_id)
@@ -1926,6 +3631,8 @@ class Handler(BaseHTTPRequestHandler):
                 app.approve(body.get("statement"))
             elif request.path == "/set-author-time-limit":
                 app.set_author_time_limit(body.get("hours"))
+            elif request.path == "/steer-author":
+                app.steer_author(body.get("instruction"))
             elif request.path == "/stop":
                 app.stop()
             elif request.path == "/reset":
@@ -1934,6 +3641,7 @@ class Handler(BaseHTTPRequestHandler):
                 app.clear_trace()
             elif request.path not in {
                 "/review", "/direct", "/algorithmic", "/finalize",
+                "/resume-critic", "/resume-checkpoint", "/continue-stopped",
             }:
                 return self.send({"error": "Not found."}, status=404)
             self.send(app.snapshot())
@@ -2099,6 +3807,139 @@ def read_utf8(path, purpose):
     return value
 
 
+def saved_statement(path):
+    """Load the exact author assignment from one saved run."""
+
+    source = Path(path).expanduser().resolve()
+    run_dir = source if source.is_dir() else source.parent
+    if not run_dir.is_dir():
+        raise ValueError(f"The saved run does not exist: {run_dir}")
+    statement = ""
+    anchor_path = run_dir / tcs_agent.AUTHOR_ANCHOR_FILENAME
+    if anchor_path.exists():
+        try:
+            anchor = read_utf8(anchor_path, "saved author anchor")
+            marker = "## Exact statement (verbatim)"
+            if marker in anchor:
+                statement = anchor.split(marker, 1)[1].strip()
+        except ValueError:
+            pass
+    checked_path = run_dir / "checked-statement.md"
+    if not statement and checked_path.exists():
+        checked = read_utf8(checked_path, "saved checked statement")
+        reviewed_prefix = "# Checked statement"
+        direct_prefix = "# Statement sent directly to the proof author"
+        checked = checked.lstrip()
+        if checked.startswith(reviewed_prefix):
+            statement = checked[len(reviewed_prefix):].lstrip("\r\n")
+            statement = statement.split("\n# Reviewer notes", 1)[0].strip()
+        elif checked.startswith(direct_prefix):
+            statement = checked[len(direct_prefix):].lstrip("\r\n")
+            footer = "\n# Statement review\n\nSkipped by the user."
+            if footer in statement:
+                statement = statement.rsplit(footer, 1)[0].strip()
+        else:
+            raise ValueError(
+                f"Cannot locate the checked statement in {checked_path}."
+            )
+    elif not statement:
+        anchor = read_utf8(anchor_path, "saved author anchor")
+        marker = "## Exact statement (verbatim)"
+        if marker not in anchor:
+            raise ValueError(
+                f"Cannot locate the exact statement in {anchor_path}."
+            )
+        statement = anchor.split(marker, 1)[1].strip()
+    if not statement:
+        raise ValueError("The saved checked statement is empty.")
+    return statement
+
+
+def saved_final_input(path, records=None):
+    """Load the exact clean statement/proof pair sent to the final editor."""
+
+    source = Path(path).expanduser().resolve()
+    run_dir = source if source.is_dir() else source.parent
+    final_input_path = run_dir / tcs_agent.FINAL_INPUT_FILENAME
+    try:
+        value = json.loads(final_input_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(value, dict)
+            and value.get("schemaVersion") == 1
+            and isinstance(value.get("statement"), str)
+            and value["statement"].strip()
+            and isinstance(value.get("solution"), str)
+            and value["solution"].strip()
+        ):
+            return {
+                "statement": value["statement"].strip(),
+                "solution": value["solution"].strip(),
+            }
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+
+    # Backward compatibility for runs created before final-input.json. Only a
+    # clean, unchanged critic pass identifies the exact historical final input.
+    records = _run_records(run_dir) if records is None else records
+    for record in reversed(records):
+        report = record.get("report")
+        if (
+            record.get("kind") == "critic_result"
+            and isinstance(report, dict)
+            and report.get("verdict") == "pass"
+            and report.get("fixed") is False
+            and isinstance(report.get("solution"), str)
+            and report["solution"].strip()
+        ):
+            return {
+                "statement": saved_statement(run_dir),
+                "solution": report["solution"].strip(),
+            }
+    raise ValueError(
+        "This stopped final-editor job has no exact saved final input. "
+        "Continue it from its latest critic checkpoint instead."
+    )
+
+
+def saved_critic_source(path):
+    """Load the exact checked statement and complete proof from one saved run."""
+
+    source = Path(path).expanduser().resolve()
+    run_dir = source if source.is_dir() else source.parent
+    if not run_dir.is_dir():
+        raise ValueError(f"The saved run does not exist: {run_dir}")
+    solution_path = run_dir / tcs_agent.SAVED_CANDIDATE_FILENAME
+    if not solution_path.exists():
+        solution_path = run_dir / "SOLUTION.md"
+    solution = read_utf8(solution_path, "saved complete proof")
+    statement = saved_statement(run_dir)
+    prompts = {}
+    for name in ("author", "critic", "final"):
+        prompt_path = run_dir / "prompts" / f"{name}.txt"
+        prompts[name] = (
+            read_utf8(prompt_path, f"saved {name} prompt")
+            if prompt_path.exists() else DEFAULT_PROMPTS[name]
+        )
+    checkpoint_path = run_dir / tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
+    try:
+        audit_checkpoint = (
+            read_utf8(checkpoint_path, "saved critic audit checkpoint")
+            if checkpoint_path.exists() else ""
+        )
+    except ValueError:
+        # A corrupt optional audit must not hide the earlier valid candidate.
+        audit_checkpoint = ""
+    return {
+        "run_dir": run_dir,
+        "statement": statement,
+        "solution": solution,
+        "author_prompt": prompts["author"],
+        "critic_prompt": prompts["critic"],
+        "final_prompt": prompts["final"],
+        "audit_checkpoint": audit_checkpoint,
+    }
+
+
 def direct_cli_options(
     critic_rounds=DEFAULT_CRITIC_ROUNDS,
     thinking_hours=DEFAULT_THINKING_HOURS,
@@ -2108,6 +3949,7 @@ def direct_cli_options(
     reasoning_effort=DEFAULT_REASONING_EFFORT,
     author_effort=None, critic_effort=None, writer_effort=None,
     speed_mode=DEFAULT_SPEED,
+    reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings."""
@@ -2135,6 +3977,7 @@ def direct_cli_options(
         critic_prompt=prompts["critic"],
         final_prompt=prompts["final"],
         speed_mode=speed_mode,
+        reasoning_summary=reasoning_summary,
         include_review=False,
     )
     return {
@@ -2151,6 +3994,7 @@ def direct_cli_options(
         "critic_prompt": options["criticPrompt"],
         "final_prompt": options["finalPrompt"],
         "speed_mode": options["speedMode"],
+        "reasoning_summary": options["reasoningSummary"],
     }
 
 
@@ -2240,6 +4084,79 @@ def run_headless_markdown(
     return 1 if failed else 0
 
 
+def run_headless_critic_resume(
+    source_run, runs=RUNS, output_stream=None, error_stream=None,
+    verbose_events=False, critic_rounds=DEFAULT_CRITIC_ROUNDS,
+    critic_model=DEFAULT_CRITIC_MODEL, writer_model=DEFAULT_WRITER_MODEL,
+    reasoning_effort=DEFAULT_REASONING_EFFORT,
+    critic_effort=None, writer_effort=None,
+    speed_mode=DEFAULT_SPEED,
+    reasoning_summary=DEFAULT_REASONING_SUMMARY,
+    critic_prompt_file=None, final_prompt_file=None,
+):
+    """Audit a complete proof saved by an earlier author job."""
+
+    output_stream = sys.stdout if output_stream is None else output_stream
+    error_stream = sys.stderr if error_stream is None else error_stream
+    source = saved_critic_source(source_run)
+    critic_prompt = (
+        read_utf8(critic_prompt_file, "critic prompt")
+        if critic_prompt_file else source["critic_prompt"]
+    )
+    final_prompt = (
+        read_utf8(final_prompt_file, "final prompt")
+        if final_prompt_file else source["final_prompt"]
+    )
+    lock = threading.Lock()
+    job_output = (
+        output_stream if verbose_events
+        else ConciseHeadlessOutput(output_stream, lock, source["run_dir"].name)
+    )
+    app = App(runs=runs, output_stream=job_output)
+    try:
+        app.start_critic_resume(
+            statement=source["statement"],
+            solution=source["solution"],
+            source_run=source["run_dir"],
+            critic_rounds=critic_rounds,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            author_prompt=source["author_prompt"],
+            critic_prompt=critic_prompt,
+            final_prompt=final_prompt,
+            speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
+        )
+        print(
+            f"Saved-candidate audit started in {app.run_dir}",
+            file=error_stream, flush=True,
+        )
+        while app.snapshot()["phase"] in ACTIVE_PHASES:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        try:
+            app.stop()
+        except ValueError:
+            pass
+        print("Saved-candidate audit stopped.", file=error_stream, flush=True)
+        return 130
+    state = app.snapshot()
+    if state.get("error"):
+        print(
+            f"Saved-candidate audit failed: {state['error']}",
+            file=error_stream, flush=True,
+        )
+        return 1
+    print(
+        f"Saved-candidate audit finished in {app.run_dir}",
+        file=error_stream, flush=True,
+    )
+    return 0
+
+
 def main():
     """Run Markdown proofs from the terminal or start the browser interface."""
 
@@ -2247,6 +4164,13 @@ def main():
     parser.add_argument(
         "input_path", nargs="?",
         help="UTF-8 .md statement file or folder of top-level .md files",
+    )
+    parser.add_argument(
+        "--resume-critic", metavar="RUN",
+        help=(
+            "open the web UI at a fresh critic using RUN/SOLUTION.md or "
+            f"RUN/{tcs_agent.SAVED_CANDIDATE_FILENAME}"
+        ),
     )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
@@ -2298,6 +4222,12 @@ def main():
         dest="speed_mode", choices=SPEEDS, default=DEFAULT_SPEED,
         help=f"generation speed (default: {DEFAULT_SPEED})",
     )
+    parser.add_argument(
+        "-reasoningSummary", "--reasoningSummary", "--reasoning-summary",
+        dest="reasoning_summary", choices=REASONING_SUMMARIES,
+        default=DEFAULT_REASONING_SUMMARY,
+        help="public reasoning-summary detail shown in the activity log",
+    )
     for role in ("author", "critic", "final"):
         camel = f"{role}PromptFile"
         parser.add_argument(
@@ -2306,6 +4236,15 @@ def main():
             help=f"UTF-8 file containing the custom {role} prompt",
         )
     args = parser.parse_args()
+    resume_source = None
+    if args.resume_critic:
+        if args.input_path:
+            parser.error("Do not combine input_path with --resume-critic.")
+        try:
+            resume_source = saved_critic_source(args.resume_critic)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"Cannot resume saved critic: {exc}", file=sys.stderr)
+            return 1
     if args.input_path:
         tcs_agent.configure_standard_streams()
         try:
@@ -2321,6 +4260,7 @@ def main():
                 critic_effort=args.critic_effort,
                 writer_effort=args.writer_effort,
                 speed_mode=args.speed_mode,
+                reasoning_summary=args.reasoning_summary,
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
@@ -2340,8 +4280,46 @@ def main():
             file=sys.stderr,
         )
         return 1
+    resume_app = None
+    if resume_source:
+        try:
+            resume_settings = {
+                "criticRounds": args.critic_rounds,
+                "thinkingHours": args.thinking_hours,
+                "authorModel": args.author_model,
+                "criticModel": args.critic_model,
+                "writerModel": args.writer_model,
+                "reasoningEffort": args.reasoning_effort,
+                "authorEffort": args.author_effort,
+                "criticEffort": args.critic_effort,
+                "writerEffort": args.writer_effort,
+                "speedMode": args.speed_mode,
+                "reasoningSummary": args.reasoning_summary,
+            }
+            if args.author_prompt_file:
+                resume_settings["authorPrompt"] = read_utf8(
+                    args.author_prompt_file, "author prompt"
+                )
+            if args.critic_prompt_file:
+                resume_settings["criticPrompt"] = read_utf8(
+                    args.critic_prompt_file, "critic prompt"
+                )
+            if args.final_prompt_file:
+                resume_settings["finalPrompt"] = read_utf8(
+                    args.final_prompt_file, "final prompt"
+                )
+            resume_app = server.start_saved_critic_job(
+                resume_source["run_dir"], resume_settings
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            server.server_close()
+            print(f"Cannot resume saved critic: {exc}", file=sys.stderr)
+            return 1
     # A URL fragment stays in the browser; JavaScript sends it as a secret header.
-    url = f"{server.origin}/#{server.token}"
+    job_query = (
+        f"?job={quote(resume_app.state['runId'])}" if resume_app else ""
+    )
+    url = f"{server.origin}/{job_query}#{server.token}"
     print(f"TCS Prover is ready at {url}\nPress Ctrl-C to stop.")
     if not args.no_browser:
         webbrowser.open(url)
