@@ -293,7 +293,9 @@ and finishes without
 starting the proof author, critic, or LaTeX editor. This option and **Skip
 statement review** are mutually exclusive. Jobs run in parallel. **Show
 details** displays the exact application prompts and returned model text.
-Private records and outputs are stored under `runs/`.
+Private records and outputs are stored under `runs/`. The homepage keeps its
+run history in `runs/catalogue.json`, so saved jobs remain available after a
+restart; deleting a job removes its catalogue entry as well.
 
 Every job card shows its full local start and finish date and time, including
 seconds. Active jobs show that they have not finished yet, so repeated problem
