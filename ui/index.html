@@ -53,13 +53,6 @@
                   </span>
                 </label>
                 <label class="mode-option">
-                  <input type="radio" name="problemMode" value="algorithmic">
-                  <span>
-                    <strong>Algorithmic</strong>
-                    <small>Define a model, problem, and asymptotic goal</small>
-                  </span>
-                </label>
-                <label class="mode-option">
                   <input type="radio" name="problemMode" value="latex">
                   <span>
                     <strong>LaTeX polish</strong>
@@ -73,34 +66,7 @@
               <textarea id="problem" rows="12" required
                 placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
             </div>
-            <div id="algorithmicFields" class="algorithmic-fields" hidden>
-              <div>
-                <label for="modelOfComputation">Model of computation</label>
-                <div class="preset-picker">
-                  <span>Use a default model</span>
-                  <div id="modelPresets" class="preset-options" role="group"
-                    aria-label="Default models of computation"></div>
-                </div>
-                <textarea id="modelOfComputation" rows="4"
-                  placeholder="For example: word-RAM with w = Θ(log n)-bit words…"></textarea>
-              </div>
-              <div>
-                <label for="problemDescription">Problem description</label>
-                <div class="preset-picker">
-                  <span>Use a default problem</span>
-                  <div id="problemPresets" class="preset-options" role="group"
-                    aria-label="Default algorithmic problems"></div>
-                </div>
-                <textarea id="problemDescription" rows="7"
-                  placeholder="Define the input, output, parameters, and assumptions…"></textarea>
-              </div>
-              <div>
-                <label for="goal">Goal (asymptotic upper or lower bound)</label>
-                <textarea id="goal" rows="4"
-                  placeholder="For example: prove an O(m log n) upper bound…"></textarea>
-              </div>
-            </div>
-            <div id="latexFields" class="algorithmic-fields" hidden>
+            <div id="latexFields" hidden>
               <div>
                 <label for="latexInput">Theorem and proof</label>
                 <textarea id="latexInput" rows="18"
@@ -113,7 +79,8 @@
                 <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
                   <select id="reviewModel">
-                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
+                    <option value="gpt-6-astra" selected>Astra — default</option>
+                    <option value="gpt-5.6-sol">Sol</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
@@ -131,7 +98,8 @@
                 <div id="authorModelSetting" class="round-setting model-setting">
                   <label for="authorModel">Proof author</label>
                   <select id="authorModel">
-                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
+                    <option value="gpt-6-astra" selected>Astra — default</option>
+                    <option value="gpt-5.6-sol">Sol</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
@@ -149,7 +117,8 @@
                 <div id="criticModelSetting" class="round-setting model-setting">
                   <label for="criticModel">Independent critic</label>
                   <select id="criticModel">
-                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
+                    <option value="gpt-6-astra" selected>Astra — default</option>
+                    <option value="gpt-5.6-sol">Sol</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
@@ -167,7 +136,8 @@
                 <div id="writerModelSetting" class="round-setting model-setting">
                   <label for="writerModel">LaTeX writer</label>
                   <select id="writerModel">
-                    <option value="gpt-5.6-sol" selected>Sol — strongest</option>
+                    <option value="gpt-6-astra" selected>Astra — default</option>
+                    <option value="gpt-5.6-sol">Sol</option>
                     <option value="gpt-5.6-terra">Terra — balanced</option>
                     <option value="gpt-5.6-luna">Luna — fastest</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
@@ -184,7 +154,7 @@
                 </div>
               </div>
               <p id="modelHelp" class="help model-help">
-                Sol and Ultra are the defaults for every role. DeepSeek remains
+                Astra and Ultra are the defaults for every role. DeepSeek remains
                 available through the official API with DEEPSEEK_API_KEY and
                 always runs at standard speed.
               </p>
@@ -240,11 +210,12 @@
               <div id="criticRoundSetting" class="round-setting">
                 <label for="criticRounds">Critic round limit</label>
                 <input id="criticRounds" type="number" min="1" max="100"
-                  step="1" value="4" aria-describedby="roundHelp">
+                  step="1" value="2" aria-describedby="roundHelp">
                 <p id="roundHelp" class="help">
-                  Up to 4 consecutive rounds per author proof by default. The
-                  count resets after an author rewrite. LaTeX editing requires
-                  a clean critic PASS.
+                  Default 2 consecutive rounds without rejection. A clean PASS
+                  proceeds immediately. At the limit, a proof with all reported
+                  bugs fixed proceeds without another check. Rejection sends
+                  the proof back to the author and resets the count.
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
@@ -259,7 +230,7 @@
               </div>
             </details>
             <div class="composer-actions">
-              <span id="modelSummary">Sol/Ultra review · Sol/Ultra author, critic, writer</span>
+              <span id="modelSummary">Astra/Ultra review · Astra/Ultra author, critic, writer</span>
               <button id="checkButton">Check statement</button>
             </div>
           </div>

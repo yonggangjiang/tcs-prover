@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -7,16 +8,24 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
-import web_ui
+import workflow_runner as runner
+from ui import cli, server as web_ui
 
 
 class WebUiFailureTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        previous = os.getcwd()
+        os.chdir(directory.name)
+        self.addCleanup(os.chdir, previous)
+
     @staticmethod
     def save_valid_audits(run, statement, solution, verdicts):
         reports = [
             (
                 {
-                    "focus": web_ui.tcs_agent.CRITIC_AUDIT_FOCI[index],
+                    "focus": runner.CRITIC_AUDIT_FOCI[index],
                     "verdict": verdict,
                     "report": f"audit {index + 1} report",
                 }
@@ -25,9 +34,9 @@ class WebUiFailureTests(unittest.TestCase):
             for index, verdict in enumerate(verdicts)
         ]
         instructions = web_ui.DEFAULT_PROMPTS["critic"]
-        if web_ui.tcs_agent.CRITIC_MEMORY_PROMPT not in instructions:
-            instructions += "\n\n" + web_ui.tcs_agent.CRITIC_MEMORY_PROMPT
-        web_ui.tcs_agent.save_critic_audit_checkpoint(
+        if runner.CRITIC_MEMORY_PROMPT not in instructions:
+            instructions += "\n\n" + runner.CRITIC_MEMORY_PROMPT
+        runner.save_critic_audit_checkpoint(
             reports, statement, solution, web_ui.DEFAULT_CRITIC_MODEL,
             web_ui.DEFAULT_REASONING_EFFORT, instructions, directory=run,
         )
@@ -135,7 +144,7 @@ class WebUiFailureTests(unittest.TestCase):
     def test_saved_author_instruction_accepts_the_exact_size_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
-            instruction = "x" * web_ui.tcs_agent.AUTHOR_STEER_MAX_CHARS
+            instruction = "x" * runner.AUTHOR_STEER_MAX_CHARS
             (run / "transcript.jsonl").write_text(
                 json.dumps({
                     "kind": "status", "stage": "solve", "node": "author",
@@ -323,7 +332,7 @@ class WebUiFailureTests(unittest.TestCase):
             external = root / "external-memory.json"
             external.write_text("{}\n", encoding="utf-8")
             try:
-                (run / web_ui.tcs_agent.AUTHOR_MEMORY_FILENAME).symlink_to(external)
+                (run / runner.AUTHOR_MEMORY_FILENAME).symlink_to(external)
             except OSError as exc:
                 self.skipTest(f"file symlinks are unavailable: {exc}")
             server = object.__new__(web_ui.Server)
@@ -347,7 +356,7 @@ class WebUiFailureTests(unittest.TestCase):
                 "# Reviewer notes\n\nnotes\n\n# Reviewer notes\n\nmore notes\n",
                 encoding="utf-8",
             )
-            (run / web_ui.tcs_agent.AUTHOR_ANCHOR_FILENAME).write_text(
+            (run / runner.AUTHOR_ANCHOR_FILENAME).write_text(
                 "# Immutable author contract\n\n"
                 "## Exact statement (verbatim)\n\nEXACT STATEMENT\n",
                 encoding="utf-8",
@@ -382,7 +391,7 @@ class WebUiFailureTests(unittest.TestCase):
                 "# Checked statement\n\nEXACT STATEMENT\n", encoding="utf-8"
             )
             checkpoint = '{"schemaVersion": 1}\n'
-            (run / web_ui.tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text(
+            (run / runner.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text(
                 checkpoint, encoding="utf-8"
             )
 
@@ -392,7 +401,7 @@ class WebUiFailureTests(unittest.TestCase):
             self.assertEqual(source["audit_checkpoint"], checkpoint)
 
             (
-                run / web_ui.tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
+                run / runner.CRITIC_AUDIT_CHECKPOINT_FILENAME
             ).write_text("", encoding="utf-8")
             self.assertEqual(
                 web_ui.saved_critic_source(run)["audit_checkpoint"], "",
@@ -408,7 +417,7 @@ class WebUiFailureTests(unittest.TestCase):
             (run / "SOLUTION.md").write_text(
                 "STALE AGENT FILE\n", encoding="utf-8"
             )
-            (run / web_ui.tcs_agent.SAVED_CANDIDATE_FILENAME).write_text(
+            (run / runner.SAVED_CANDIDATE_FILENAME).write_text(
                 "CURRENT CONTROLLER CANDIDATE\n", encoding="utf-8"
             )
             (run / "checked-statement.md").write_text(
@@ -474,20 +483,20 @@ class WebUiFailureTests(unittest.TestCase):
                 "web_ui.py", "--resume-critic", str(source),
             ]))
             stack.enter_context(mock.patch.object(
-                web_ui, "saved_critic_source",
+                cli, "saved_critic_source",
                 return_value={"run_dir": source},
             ))
             stack.enter_context(mock.patch.object(
-                web_ui, "Server", return_value=fake_server
+                cli, "Server", return_value=fake_server
             ))
             open_browser = stack.enter_context(mock.patch.object(
-                web_ui.webbrowser, "open"
+                cli.webbrowser, "open"
             ))
             stack.enter_context(mock.patch.object(
-                web_ui, "run_headless_critic_resume",
+                cli, "run_headless_critic_resume",
                 side_effect=AssertionError("must use the browser UI"),
             ))
-            result = web_ui.main()
+            result = cli.main()
 
         self.assertEqual(result, 0)
         self.assertEqual(fake_server.source, source)
@@ -500,7 +509,7 @@ class WebUiFailureTests(unittest.TestCase):
             app = web_ui.App(runs=Path(directory))
             process, token = mock.Mock(), object()
             with mock.patch.object(
-                web_ui.tcs_agent, "verify_model_credentials"
+                runner, "verify_model_credentials"
             ), mock.patch.object(
                 app, "_launch_critic_resume_locked",
                 return_value=(process, token),
@@ -521,7 +530,7 @@ class WebUiFailureTests(unittest.TestCase):
             )
             self.assertTrue((app.run_dir / "prompts" / "author.txt").is_file())
             self.assertEqual(
-                (app.run_dir / web_ui.tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME)
+                (app.run_dir / runner.CRITIC_AUDIT_CHECKPOINT_FILENAME)
                 .read_text(encoding="utf-8"),
                 '{"schemaVersion": 1}\n',
             )
@@ -579,7 +588,7 @@ class WebUiFailureTests(unittest.TestCase):
             self.assertEqual(coordinator["resumeLabel"], "Retry coordinator")
 
             checkpoint_path = (
-                run / web_ui.tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
+                run / runner.CRITIC_AUDIT_CHECKPOINT_FILENAME
             )
             invalid = json.loads(checkpoint_path.read_text(encoding="utf-8"))
             invalid["assignmentSha256"] = "wrong-proof"
@@ -739,7 +748,7 @@ class WebUiFailureTests(unittest.TestCase):
                 "schemaVersion": 1,
                 "reports": [{"verdict": "pass"}, None, None],
             })
-            (source / web_ui.tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text(
+            (source / runner.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text(
                 checkpoint, encoding="utf-8"
             )
             server = object.__new__(web_ui.Server)
@@ -875,7 +884,48 @@ class WebUiFailureTests(unittest.TestCase):
 
             self.assertEqual(restored["thinkingHours"], 36)
             self.assertTrue(restored["skipStatementReview"])
-            self.assertIs(restored["workflow"], web_ui.ALGORITHMIC_GRAPH)
+            self.assertIs(restored["workflow"], web_ui.DIRECT_GRAPH)
+
+    def test_legacy_algorithmic_job_continues_from_its_saved_exact_statement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory)
+            source = runs / "legacy-algorithmic"
+            source.mkdir()
+            (source / "draft.md").write_text("Old preset title\n", encoding="utf-8")
+            (source / "checked-statement.md").write_text(
+                "# Checked statement\n\nEXACT COMPOSED CLAIM\n", encoding="utf-8",
+            )
+            (source / web_ui.JOB_SETTINGS_FILENAME).write_text(json.dumps({
+                "problemMode": "algorithmic", "skipStatementReview": False,
+            }), encoding="utf-8")
+            records = [
+                {"kind": "request", "stage": "solve"},
+                {"kind": "status", "stage": "solve", "node": "author", "label": "Stop requested"},
+            ]
+            (source / "transcript.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8",
+            )
+            server = object.__new__(web_ui.Server)
+            server.runs, server.fixed_app = runs, False
+            server.jobs = web_ui.restore_saved_jobs(runs)
+            server.jobs_lock = web_ui.threading.RLock()
+            state = server.jobs[source.name].snapshot()
+            self.assertEqual(state["problemMode"], "statement")
+            self.assertTrue(state["skipStatementReview"])
+            self.assertIs(state["workflow"], web_ui.DIRECT_GRAPH)
+            before = {path.name: path.read_bytes() for path in source.iterdir()}
+            with (
+                mock.patch.object(runner, "verify_model_credentials"),
+                mock.patch.object(
+                    web_ui.App, "_launch_solver_locked", return_value=(mock.Mock(), object()),
+                ) as launch,
+                mock.patch.object(web_ui.threading, "Thread"),
+            ):
+                continued = server.continue_stopped_job(source.name)
+            launch.assert_called_once_with("EXACT COMPOSED CLAIM")
+            self.assertEqual(continued.state["problemMode"], "statement")
+            self.assertTrue(continued.state["skipStatementReview"])
+            self.assertEqual({path.name: path.read_bytes() for path in source.iterdir()}, before)
 
     def test_legacy_manual_stop_is_restored_and_exposed_to_the_home_page(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1130,7 +1180,7 @@ class WebUiFailureTests(unittest.TestCase):
             }
 
             with mock.patch.object(
-                web_ui.tcs_agent, "verify_model_credentials"
+                runner, "verify_model_credentials"
             ), mock.patch.object(web_ui.threading, "Thread"):
                 continued = server.continue_stopped_job(source.name)
 
@@ -1173,10 +1223,10 @@ class WebUiFailureTests(unittest.TestCase):
             (source / "checked-statement.md").write_text(
                 f"# Checked statement\n\n{statement}\n", encoding="utf-8"
             )
-            original_prompt = web_ui.tcs_agent.make_prompt(
+            original_prompt = runner.make_prompt(
                 statement, web_ui.DEFAULT_PROMPTS["author"]
             )
-            memory = web_ui.tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 source, original_prompt, statement
             )
             memory.record_candidate(
@@ -1216,7 +1266,7 @@ class WebUiFailureTests(unittest.TestCase):
             process, token = mock.Mock(), object()
 
             with mock.patch.object(
-                web_ui.tcs_agent, "verify_model_credentials"
+                runner, "verify_model_credentials"
             ), mock.patch.object(
                 web_ui.App, "_launch_solver_locked",
                 return_value=(process, token),
@@ -1224,15 +1274,15 @@ class WebUiFailureTests(unittest.TestCase):
                 continued = server.continue_stopped_job(source.name)
 
             copied = (
-                continued.run_dir / web_ui.tcs_agent.AUTHOR_MEMORY_FILENAME
+                continued.run_dir / runner.AUTHOR_MEMORY_FILENAME
             ).read_text(encoding="utf-8")
             self.assertEqual(
                 copied,
-                (source / web_ui.tcs_agent.AUTHOR_MEMORY_FILENAME).read_text(
+                (source / runner.AUTHOR_MEMORY_FILENAME).read_text(
                     encoding="utf-8"
                 ),
             )
-            resumed_memory = web_ui.tcs_agent.AuthorMemory(
+            resumed_memory = runner.AuthorMemory(
                 continued.run_dir, original_prompt, statement
             )
             self.assertEqual(resumed_memory.data["sequence"], 1)
@@ -1245,7 +1295,7 @@ class WebUiFailureTests(unittest.TestCase):
             )
             self.assertEqual(
                 provenance["copiedArtifacts"],
-                [web_ui.tcs_agent.AUTHOR_MEMORY_FILENAME],
+                [runner.AUTHOR_MEMORY_FILENAME],
             )
             restored_steer = json.loads(
                 (continued.run_dir / web_ui.AUTHOR_STEER_FILENAME).read_text(
@@ -1275,7 +1325,7 @@ class WebUiFailureTests(unittest.TestCase):
             (source / "checked-statement.md").write_text(
                 "# Checked statement\n\nSTATEMENT\n", encoding="utf-8"
             )
-            (source / web_ui.tcs_agent.SAVED_CANDIDATE_FILENAME).write_text(
+            (source / runner.SAVED_CANDIDATE_FILENAME).write_text(
                 "PROOF\n", encoding="utf-8"
             )
             records = [
@@ -1315,7 +1365,7 @@ class WebUiFailureTests(unittest.TestCase):
             source = runs / "stopped-final"
             source.mkdir()
             (source / "draft.md").write_text("STATEMENT\n", encoding="utf-8")
-            web_ui.tcs_agent.save_final_input(
+            runner.save_final_input(
                 "EXACT STATEMENT", "CLEAN PROOF", directory=source
             )
             records = [
@@ -1345,7 +1395,7 @@ class WebUiFailureTests(unittest.TestCase):
             process, token = mock.Mock(), object()
 
             with mock.patch.object(
-                web_ui.tcs_agent, "verify_model_credentials"
+                runner, "verify_model_credentials"
             ), mock.patch.object(
                 web_ui.App, "_launch_saved_final_locked",
                 return_value=(process, token),
@@ -1360,33 +1410,40 @@ class WebUiFailureTests(unittest.TestCase):
             }
             self.assertEqual(after, before)
 
-    def test_finalize_proof_cli_keeps_the_original_two_part_prompt(self):
-        with ExitStack() as stack:
-            stack.enter_context(mock.patch.object(
-                sys, "argv", ["tcs_agent.py", "finalize-proof"]
-            ))
-            stack.enter_context(mock.patch.object(
-                sys, "stdin", io.StringIO("EXACT STATEMENT\0CLEAN PROOF")
-            ))
-            stack.enter_context(mock.patch.object(
-                web_ui.tcs_agent, "configure_standard_streams"
-            ))
-            finalize = stack.enter_context(mock.patch.object(
-                web_ui.tcs_agent, "finalize", return_value="LATEX"
-            ))
-            polish = stack.enter_context(mock.patch.object(
-                web_ui.tcs_agent, "polish",
-                side_effect=AssertionError("normal final must not use polish"),
-            ))
-
-            result = web_ui.tcs_agent.main()
+    def test_saved_final_cli_keeps_the_original_two_part_prompt(self):
+        report = {"latex": "LATEX"}
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            saved_state = Path(directory) / "final-input.json"
+            saved_state.write_text(json.dumps({
+                "statement": "EXACT STATEMENT", "solution": "CLEAN PROOF",
+            }), encoding="utf-8")
+            with (
+                mock.patch.object(runner, "configure_standard_streams"),
+                mock.patch.object(runner.Path, "cwd", return_value=Path(directory)),
+                mock.patch.object(sys, "stdin", io.StringIO("")),
+                mock.patch.object(sys, "stdout", output),
+                mock.patch.object(
+                    runner, "structured", return_value=(report, json.dumps(report)),
+                ) as structured,
+            ):
+                result = runner.main([
+                    str(runner.WORKFLOWS / "clean_up.yaml"),
+                    "--state-file", str(saved_state),
+                ])
 
         self.assertEqual(result, 0)
-        finalize.assert_called_once()
-        self.assertEqual(finalize.call_args.args[:2], (
-            "EXACT STATEMENT", "CLEAN PROOF",
+        structured.assert_called_once()
+        self.assertEqual(
+            structured.call_args.args[0],
+            runner.FINAL_PROMPT + "\n\nSTATEMENT:\nEXACT STATEMENT"
+            "\n\nLATEST SOLUTION:\nCLEAN PROOF",
+        )
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertTrue(any(
+            event.get("kind") == "final_result" and event.get("output") == "LATEX"
+            for event in events
         ))
-        polish.assert_not_called()
 
     def test_stopped_failure_summary_can_restart_the_proof_author(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1427,7 +1484,7 @@ class WebUiFailureTests(unittest.TestCase):
             (run / "checked-statement.md").write_text(
                 "# Checked statement\n\nSTATEMENT\n", encoding="utf-8"
             )
-            (run / web_ui.tcs_agent.SAVED_CANDIDATE_FILENAME).write_text(
+            (run / runner.SAVED_CANDIDATE_FILENAME).write_text(
                 "PROOF\n", encoding="utf-8"
             )
             (run / "resume-source.json").write_text(

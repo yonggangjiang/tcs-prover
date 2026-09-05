@@ -1,13 +1,12 @@
 # TCS Prover
 
-A local web UI that turns either an informal theoretical-computer-science
-statement or a structured algorithmic problem into a persistent Codex proof
-search, independently audits and repairs the candidate, then produces clean
-LaTeX.
+A local web UI that turns a theoretical-computer-science statement into a
+persistent Codex proof search, independently audits and repairs the candidate,
+then produces clean LaTeX. Algorithmic tasks can be entered as statements too.
 
 The Codex CLI is the local agent runtime for threads, goals, tools, and
-subagents. The original ChatGPT defaults remain in place: Sol with Ultra
-reasoning and Fast generation for every role. DeepSeek V4 Pro is an additional
+subagents. Astra with Ultra reasoning and Fast generation are the defaults for every
+role. DeepSeek V4 Pro is an additional
 model option that uses the same harness pipeline through DeepSeek's official
 API.
 
@@ -21,10 +20,11 @@ Requires Python 3.9+ and the Codex CLI. Install Codex CLI through this
 codex login
 git clone https://github.com/yonggangjiang/tcs-prover.git
 cd tcs-prover
+python3 -m pip install -r requirements.txt
 python3 web_ui.py
 ```
 
-The Web UI opens locally with the original Sol, Ultra, and Fast defaults for
+The Web UI opens locally with Astra, Ultra, and Fast defaults for
 the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
 is needed only when you select DeepSeek for one or more roles.
 
@@ -88,7 +88,12 @@ key and that no extra quotation marks were copied into its value.
 
 You can type your open problem into the text box and click “Check Statement.” The system will first revise the statement to remove ambiguities and handle corner cases, then ask you to approve or reject the revised version.
 
-If you approve it, persistent reasoning will begin and continue until the time limit you set. The generated answer will then pass through a strict correctness-checking loop designed to catch errors. Finally, the output TeX file will be pruned for readability and returned as the final result.
+If you approve it, persistent reasoning will begin and continue until a solution
+is found or the time limit is reached. The candidate passes through an
+independent critic loop. Accepted proofs are then pruned into readable LaTeX.
+
+Options for changing the default model, time limit, and other settings are under
+**Advanced**. Astra (`gpt-6-astra`) is the default model for every node.
 
 ## Terminal runs from Markdown
 
@@ -104,8 +109,8 @@ python3 web_ui.py statement.md
 This sends the entire file directly to the proof author, exactly like enabling
 **Skip statement review** in Statement mode. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
-web UI: 100 critic rounds, a 168-hour total workflow limit, Sol with Ultra
-reasoning for all roles, the built-in role prompts, and Fast generation. The
+web UI: 2 critic rounds, a 168-hour total workflow limit, Astra and Ultra for all proof
+roles, the built-in role prompts, and Fast generation speed. The
 activity log requests concise public reasoning summaries by default.
 
 ### Optional settings
@@ -121,11 +126,11 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-criticRounds N` | `100` | Critic rounds per author proof; `1` to `100`. |
+| `-criticRounds N` | `2` | Accept after N consecutive critic rounds that fix all reported bugs, without another audit; `1` to `100`. A clean pass accepts immediately; rejection resets the count. |
 | `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. It interrupts an active author, but not an active critic or the final LaTeX editor. |
-| `-authorModel MODEL` | `gpt-5.6-sol` | Author model: `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
-| `-criticModel MODEL` | `gpt-5.6-sol` | Critic model: the same four choices. |
-| `-writerModel MODEL` | `gpt-5.6-sol` | LaTeX writer model: the same four choices. |
+| `-authorModel MODEL` | `gpt-6-astra` | Author model: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
+| `-criticModel MODEL` | `gpt-6-astra` | Critic model; same choices as the author. |
+| `-writerModel MODEL` | `gpt-6-astra` | LaTeX writer model; same choices as the author. |
 | `-reasoningEffort LEVEL` | `ultra` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. |
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
@@ -168,7 +173,8 @@ speed, critic-round limit, and workflow time limit. Old saved model routes that
 are no longer selectable are migrated to the official DeepSeek model when the
 job is restored.
 
-Audit reuse requires an exact proof, model, effort, prompt, and schema match;
+Audit reuse requires a matching proof, model, effort, instructions, and audit
+focus assignment; restored reports must satisfy the current response schema;
 an incompatible audit file is ignored while the earlier proof-candidate
 checkpoint remains available. Very old runs that predate `job-settings.json`
 can restore only choices visible in their transcript. A role that never ran has
@@ -253,9 +259,9 @@ summaries, model messages, subagent/tool activity, critic checks, and final or
 failure results without app-server protocol noise:
 
 ```bash
-python3 view_transcript.py runs/2026-08-03_16-20-24_example/
-python3 view_transcript.py runs/2026-08-03_16-20-24_example/transcript.jsonl
-python3 view_transcript.py                                 # newest run
+python3 transcript/view_transcript.py runs/2026-08-03_16-20-24_example/
+python3 transcript/view_transcript.py runs/2026-08-03_16-20-24_example/transcript.jsonl
+python3 transcript/view_transcript.py                       # newest run
 ```
 
 The UI provides stage and activity filters, full-text search, root-only and
@@ -266,30 +272,27 @@ host and protects its local API with a random per-launch token.
 For terminal or file output, use the text mode:
 
 ```bash
-python3 view_transcript.py RUN --text
-python3 view_transcript.py RUN --text --follow
-python3 view_transcript.py RUN --output readable.txt
+python3 transcript/view_transcript.py RUN --text
+python3 transcript/view_transcript.py RUN --text --follow
+python3 transcript/view_transcript.py RUN --output readable.txt
 ```
 
 In text mode, prompt bodies are hidden by default because they are long; add
 `--prompts` to show them. Use `--stage solve`, `--stage critic`, `--root-only`,
 `--no-tools`, or `--max-text 0` to adjust the view. Run
-`python3 view_transcript.py --help` for all options. Both views display the
+`python3 transcript/view_transcript.py --help` for all options. Both views display the
 public reasoning summaries retained by TCS Prover, not private chain-of-thought.
 They read incrementally, so even very large transcripts do not need to fit in
 memory.
 
-Choose **Statement** to review or edit a rough problem before approval. Choose
-**Algorithmic** to specify the model of computation, problem description, and
-asymptotic upper- or lower-bound goal; these fields go directly to the proof
-author without a statement-review step.
-**Advanced** controls each node's model, reasoning effort, prompt, public
-activity-log detail, workflow time limit, and critic-round limit. The log can
-show status only or request concise or detailed model-generated summaries; a
-provider may not return a summary for every reasoning step. Private
-chain-of-thought is never displayed or saved. Its **Statement review only**
-option runs just the reviewer, saves the checked statement and reviewer notes,
-and finishes without
+Choose **Statement** to review or edit a rough problem before approval. Include
+the computational model, problem description, and asymptotic goal in the
+statement for algorithmic tasks. Choose **LaTeX polish** to edit an existing
+theorem and proof using only the final LaTeX node.
+**Advanced** controls each node's model, reasoning effort, prompt, public activity-log
+detail, workflow time limit, and critic-round limit. The log can show status
+only or request concise or detailed model-generated summaries. Its **Statement review only** option runs just the
+reviewer, saves the checked statement and reviewer notes, and finishes without
 starting the proof author, critic, or LaTeX editor. This option and **Skip
 statement review** are mutually exclusive. Jobs run in parallel. **Show
 details** displays the exact application prompts and returned model text.
@@ -314,13 +317,13 @@ flowchart LR
     S -- "review only" --> R["Checked statement and notes"]
     H -- "revise" --> S
     H -- "approve" --> A["Proof author"]
-    I["Algorithmic setup: model + problem + goal"] --> A
     A -- "blocked: continue" --> A
     A -- "deadline" --> F["Failure summary"]
     A -- "proof" --> C["Independent critic"]
     C -- "reject" --> A
-    C -- "fixed: recheck" --> C
+    C -- "fixed, below limit: recheck" --> C
     C -- "clean pass" --> L["LaTeX editor"]
+    C -- "all fixes at round limit" --> L
 ```
 
 ### 1. Statement reviewer
@@ -335,21 +338,9 @@ apply in this mode.
 
 For example, graph-algorithm papers commonly write a bound such as
 `m log² n`. A literal model may object that `m` can be smaller than `n` and call
-the target impossible. The review step states the intended convention and write it as `(m+n) log² n`instead of letting that mismatch
+the target impossible. The review step states the intended convention and writes
+it as `(m+n) log² n` instead of letting that mismatch
 derail the proof search.
-
-### Algorithmic mode
-
-This mode skips the statement reviewer. The server trims and combines the three
-required fields under explicit `MODEL OF COMPUTATION`, `PROBLEM DESCRIPTION`,
-and `GOAL (ASYMPTOTIC UPPER OR LOWER BOUND)` headings, saves both the source
-fields and the combined task in the run folder, and sends that exact task through
-the normal proof-author pipeline.
-
-The model and problem fields also show reusable presets loaded from
-`algorithmic/model.json` and `algorithmic/problem.json`. Each catalog entry has
-only a `name` and `description`; selecting its name copies the description into
-the corresponding field. Restart the local server after editing a catalog.
 
 ### 2. Proof author
 
@@ -366,9 +357,9 @@ The author keeps the Goal active: a blocked or prematurely ended author turn is
 continued until it returns a solution or reaches the user-set total elapsed-time
 limit. The web limit uses the same clock displayed at the top of the page, so
 statement review and approval time count too. If the limit expires during a
-critic round, that critic work continues; a clean pass proceeds to LaTeX, while
-a rejection goes to the failure-summary node instead of starting another author
-revision.
+critic round, that critic work continues; an accepted proof proceeds to LaTeX,
+while a rejection goes to the failure-summary node instead of starting another
+author revision.
 
 Each proof run also owns two private controller-written files in its `runs/...`
 directory. `author-anchor.md` contains the exact original author prompt and
@@ -386,10 +377,15 @@ skip calls, end the search, or otherwise alter the proof workflow.
 
 ### 3. Independent critic
 
-Although in the author prompt there are already instructions on indepent audit checking, there are cases where these instructions do not guarantee that the resulting proof
-survives a fresh check. The critic therefore do the job again and repairs every issue it can, sends repaired mathematics to another
-fresh critic. Unresolved bugs go back to the author. Only a clean pass exits the
-loop. This catches both structural gaps and also fixable bugs.
+The critic independently checks the author's proof and repairs every issue it
+can. A clean pass accepts the proof immediately. If every reported bug is
+fixable, the repaired proof goes to a fresh critic until the configured limit
+is reached. After 2 consecutive such rounds by default, the latest repaired
+proof is accepted without another check and sent to the LaTeX editor.
+
+Unresolved bugs cause rejection: the author resumes its existing thread with
+the critic's feedback, and the consecutive-round count resets. A rejection at
+the round limit still returns to the author; it never counts as acceptance.
 
 “Independent” here means fresh contexts. A human or different-family review
 remains advisable. The Python controller launches three explicit auditor model
@@ -414,6 +410,102 @@ output but does not natively enforce arbitrary JSON Schema.
 ### 4. LaTeX editor
 
 Correct-looking generated proofs are often repetitive, poorly ordered, or hard
-to read. After—and only after—a clean critic pass, this node preserves the
-mathematics while rewriting it as a compact, structured TCS-style LaTeX proof.
+to read. After critic acceptance, this node preserves the mathematics while
+rewriting it as a compact, structured TCS-style LaTeX proof. It also runs
+independently through **LaTeX polish**.
 In practice this often makes the output substantially easier to read.
+
+## Project structure
+
+The root has two Python entry points. `workflow_runner.py` contains the entire
+workflow engine, including Codex transport, persistent sessions, deadlines, and
+durable memory. `web_ui.py` launches the UI or Markdown proof jobs. The
+`workflows/` directory contains exactly two YAML definitions:
+
+```text
+workflow_runner.py          Complete workflow engine and workflow CLI
+web_ui.py                   UI and Markdown-job launcher
+workflows/
+  author_critic.yaml         Author/critic prompts, response schema, and logic
+  clean_up.yaml              LaTeX prompts, response schema, and logic
+transcript/
+  view_transcript.py         Transcript reader, CLI, and viewer server
+  transcript_ui/            Transcript viewer HTML, JavaScript, and CSS
+ui/
+  server.py                 HTTP endpoints, job state, and process management
+  review.py                 Independent statement-review procedure
+  cli.py                    UI startup and Markdown file/folder runs
+  index.html, app.js, styles.css
+docs/workflows.md           Workflow authoring guide and full YAML reference
+tests/                      Offline regression tests
+```
+
+The UI starts the root workflow runner in each job's private workspace and
+passes it the appropriate YAML files. Statement review remains independent of
+the workflow graphs. UI and Markdown-job artifacts still live under the
+repository's `runs/` folder, regardless of the launcher's working directory.
+
+## Workflow files and executor
+
+Each YAML file contains `nodes` and `prompts`. Node names are arbitrary; the
+first node is the entry point. `run: structured` makes a model call with a
+response shape, while `run: goal` starts or resumes a persistent task. The YAML
+defines inputs, result checks, state updates, and transitions, including the
+critic's repeat limit.
+
+A complete custom workflow can be as small as this `summarize.yaml`:
+
+```yaml
+nodes:
+  summarize:
+    run: structured
+    prompt: summarize
+    inputs:
+      content: state.input
+    response:
+      summary: string
+    after:
+      - set: {output: result.summary}
+    next: end
+prompts:
+  summarize: "Summarize this text in one sentence: {content}"
+```
+
+```bash
+python3 workflow_runner.py summarize.yaml < notes.md
+```
+
+The [workflow authoring guide](docs/workflows.md) explains every YAML entry,
+response shorthand and full schemas, branching and repeat limits, expressions,
+persistent-session prompts, model overrides, and offline validation. It includes
+a complete editing workflow with decisions and a configurable repeat limit.
+Keep custom definitions outside the bundled `workflows/` directory.
+
+Run the graphs directly with UTF-8 input on standard input:
+
+```bash
+python3 workflow_runner.py workflows/author_critic.yaml workflows/clean_up.yaml < statement.md
+python3 workflow_runner.py workflows/clean_up.yaml < theorem-and-proof.md
+```
+
+The first command runs proof search, criticism, and LaTeX cleanup; the second
+runs cleanup alone. Both skip statement review. Use
+`python3 workflow_runner.py --help` for model, reasoning, time-limit, critic-round,
+and prompt overrides. `--model` sets the fallback model for any workflow;
+`--set NAME=VALUE` supplies arbitrary named options and accepts JSON values.
+Node `role` settings can use options such as `editor_model` and `editor_effort`.
+
+The CLI initializes `state.input`, `state.statement`, and `state.source` with the
+same input after trimming surrounding whitespace. Chained graphs share state,
+and `state.failed` stops the chain. Output is JSONL events, ending with
+`workflow_result` on success and its
+`output` field from `state.output`. The Python API is
+`execute(path, state, options=...)` or `execute_workflows(paths, state, options)`.
+All graphs are validated before a chain starts. `requirements.txt` installs
+PyYAML for loading definitions and jsonschema for checking response schemas.
+
+Run the regression suite without making model calls:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

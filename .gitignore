@@ -20,3 +20,11 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Direct workflow runs also write private goal history
+goal-memory/
+author-anchor.md
+author-memory.json
+critic-audits.json
+final-input.json
+saved-candidate.md

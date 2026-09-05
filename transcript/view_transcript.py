@@ -13,8 +13,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 
-ROOT = Path(__file__).resolve().parent
-UI_ROOT = ROOT / "transcript_ui"
+ROOT = Path(__file__).resolve().parent.parent
+UI_ROOT = Path(__file__).resolve().parent / "transcript_ui"
 STAGE_LABELS = {
     "review": "STATEMENT REVIEWER",
     "solve": "PROOF AUTHOR",

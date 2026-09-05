@@ -7,23 +7,30 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import tcs_agent
-import web_ui
+import workflow_runner as runner
+from ui import review, server
 
 
 class DeepSeekProviderTests(unittest.TestCase):
-    def test_original_chatgpt_defaults_remain_global(self):
-        self.assertEqual(tcs_agent.MODEL, "gpt-5.6-sol")
-        self.assertEqual(tcs_agent.REVIEW_MODEL, "gpt-5.6-sol")
-        self.assertEqual(tcs_agent.AUTHOR_MODEL, "gpt-5.6-sol")
-        self.assertEqual(tcs_agent.CRITIC_MODEL, "gpt-5.6-sol")
-        self.assertEqual(tcs_agent.WRITER_MODEL, "gpt-5.6-sol")
-        self.assertEqual(tcs_agent.DEFAULT_SPEED, "fast")
-        self.assertEqual(tcs_agent.REVIEW_EFFORT, "ultra")
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        previous = os.getcwd()
+        os.chdir(directory.name)
+        self.addCleanup(os.chdir, previous)
 
-        state = web_ui.empty_state()
+    def test_astra_defaults_remain_global_with_optional_provider(self):
+        self.assertEqual(runner.MODEL, "gpt-6-astra")
+        self.assertEqual(server.DEFAULT_REVIEW_MODEL, "gpt-6-astra")
+        self.assertEqual(runner.AUTHOR_MODEL, "gpt-6-astra")
+        self.assertEqual(runner.CRITIC_MODEL, "gpt-6-astra")
+        self.assertEqual(runner.WRITER_MODEL, "gpt-6-astra")
+        self.assertEqual(runner.DEFAULT_SPEED, "fast")
+        self.assertEqual(server.DEFAULT_REVIEW_EFFORT, "ultra")
+
+        state = server.empty_state()
         for role in ("reviewModel", "authorModel", "criticModel", "writerModel"):
-            self.assertEqual(state[role], "gpt-5.6-sol")
+            self.assertEqual(state[role], "gpt-6-astra")
         self.assertEqual(state["speedMode"], "fast")
         self.assertEqual(state["reasoningSummary"], "concise")
         for role in (
@@ -31,27 +38,27 @@ class DeepSeekProviderTests(unittest.TestCase):
         ):
             self.assertEqual(state[role], "ultra")
         self.assertEqual(
-            web_ui.PUBLIC_GRAPH["settings"]["model"],
-            "gpt-5.6-sol",
+            server.PUBLIC_GRAPH["settings"]["model"],
+            "gpt-6-astra",
         )
-        self.assertEqual(web_ui.PUBLIC_GRAPH["settings"]["speed"], "fast")
+        self.assertEqual(server.PUBLIC_GRAPH["settings"]["speed"], "fast")
 
     def test_optional_deepseek_uses_official_responses_provider(self):
-        self.assertIn(tcs_agent.DEEPSEEK_MODEL, tcs_agent.MODELS)
+        self.assertIn(runner.DEEPSEEK_MODEL, runner.MODELS)
         self.assertEqual(
-            tcs_agent.MODELS,
+            runner.MODELS,
             (
-                "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-                tcs_agent.DEEPSEEK_MODEL,
+                "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                runner.DEEPSEEK_MODEL,
             ),
         )
         self.assertEqual(
-            tcs_agent.model_provider(tcs_agent.DEEPSEEK_MODEL),
-            tcs_agent.DEEPSEEK_PROVIDER,
+            runner.model_provider(runner.DEEPSEEK_MODEL),
+            runner.DEEPSEEK_PROVIDER,
         )
-        arguments = tcs_agent.provider_arguments(tcs_agent.DEEPSEEK_MODEL)
+        arguments = runner.provider_arguments(runner.DEEPSEEK_MODEL)
         self.assertIn(
-            f'model_catalog_json="{tcs_agent.DEEPSEEK_MODEL_CATALOG}"',
+            f'model_catalog_json="{runner.DEEPSEEK_MODEL_CATALOG}"',
             arguments,
         )
         self.assertIn('model_provider="deepseek"', arguments)
@@ -75,10 +82,10 @@ class DeepSeekProviderTests(unittest.TestCase):
 
     def test_bundled_catalog_declares_only_official_deepseek(self):
         catalog = json.loads(
-            tcs_agent.DEEPSEEK_MODEL_CATALOG.read_text(encoding="utf-8")
+            runner.DEEPSEEK_MODEL_CATALOG.read_text(encoding="utf-8")
         )
         models = {entry["slug"]: entry for entry in catalog["models"]}
-        self.assertEqual(set(models), {tcs_agent.DEEPSEEK_MODEL})
+        self.assertEqual(set(models), {runner.DEEPSEEK_MODEL})
         for model in models.values():
             self.assertEqual(model["context_window"], 1048576)
             self.assertEqual(model["multi_agent_version"], "v2")
@@ -87,7 +94,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual(
             [
                 level["effort"]
-                for level in models[tcs_agent.DEEPSEEK_MODEL][
+                for level in models[runner.DEEPSEEK_MODEL][
                     "supported_reasoning_levels"
                 ]
             ],
@@ -98,46 +105,46 @@ class DeepSeekProviderTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
-                tcs_agent.DEEPSEEK_KEY_ENV: "  test-secret  ",
-                tcs_agent.DEEPSEEK_TOKEN_ENV: "stale-value",
+                runner.DEEPSEEK_KEY_ENV: "  test-secret  ",
+                runner.DEEPSEEK_TOKEN_ENV: "stale-value",
                 "OPENROUTER_API_KEY": "obsolete-secret",
                 "TCS_PROVER_OPENROUTER_TOKEN": "obsolete-token",
             },
             clear=True,
         ):
-            child = tcs_agent.environment(tcs_agent.DEEPSEEK_MODEL)
-            openai_child = tcs_agent.environment("gpt-5.6-sol")
+            child = runner.environment(runner.DEEPSEEK_MODEL)
+            openai_child = runner.environment("gpt-5.6-sol")
 
             self.assertEqual(
-                child[tcs_agent.DEEPSEEK_TOKEN_ENV], "test-secret",
+                child[runner.DEEPSEEK_TOKEN_ENV], "test-secret",
             )
             self.assertEqual(
                 child["OPENAI_API_KEY"],
-                tcs_agent.CUSTOM_PROVIDER_LOGIN_PLACEHOLDER,
+                runner.CUSTOM_PROVIDER_LOGIN_PLACEHOLDER,
             )
             self.assertNotEqual(child["OPENAI_API_KEY"], "test-secret")
             self.assertEqual(
-                os.environ[tcs_agent.DEEPSEEK_KEY_ENV], "  test-secret  ",
+                os.environ[runner.DEEPSEEK_KEY_ENV], "  test-secret  ",
             )
 
-        self.assertNotIn(tcs_agent.DEEPSEEK_KEY_ENV, child)
-        self.assertNotIn(tcs_agent.DEEPSEEK_TOKEN_ENV, openai_child)
+        self.assertNotIn(runner.DEEPSEEK_KEY_ENV, child)
+        self.assertNotIn(runner.DEEPSEEK_TOKEN_ENV, openai_child)
         self.assertNotIn("OPENAI_API_KEY", openai_child)
         self.assertNotIn("OPENROUTER_API_KEY", child)
         self.assertNotIn("TCS_PROVER_OPENROUTER_TOKEN", child)
 
     def test_web_ui_lists_only_the_supported_deepseek_model(self):
-        index = (web_ui.UI / "index.html").read_text(encoding="utf-8")
+        index = (server.UI / "index.html").read_text(encoding="utf-8")
         self.assertEqual(index.count('value="deepseek-v4-pro"'), 4)
         self.assertEqual(
-            index.count('value="gpt-5.6-sol" selected'), 4,
+            index.count('value="gpt-6-astra" selected'), 4,
         )
         self.assertNotIn('value="deepseek-v4-pro" selected', index)
         self.assertIn('value="fast" selected', index)
         self.assertNotIn('value="standard" selected', index)
         self.assertNotIn('value="deepseek/', index)
 
-        script = (web_ui.UI / "app.js").read_text(encoding="utf-8")
+        script = (server.UI / "app.js").read_text(encoding="utf-8")
         self.assertIn("selectedModels.includes(deepseekModel)", script)
         self.assertNotIn("deepseekModels", script)
         self.assertNotIn("effort.value =", script)
@@ -145,28 +152,28 @@ class DeepSeekProviderTests(unittest.TestCase):
     def test_deepseek_key_accepts_and_removes_bearer_prefix(self):
         with mock.patch.dict(
             os.environ,
-            {tcs_agent.DEEPSEEK_KEY_ENV: "  Bearer deepseek-secret  "},
+            {runner.DEEPSEEK_KEY_ENV: "  Bearer deepseek-secret  "},
             clear=True,
         ):
-            self.assertEqual(tcs_agent.deepseek_key(), "deepseek-secret")
-            child = tcs_agent.environment(tcs_agent.DEEPSEEK_MODEL)
+            self.assertEqual(runner.deepseek_key(), "deepseek-secret")
+            child = runner.environment(runner.DEEPSEEK_MODEL)
         self.assertEqual(
-            child[tcs_agent.DEEPSEEK_TOKEN_ENV], "deepseek-secret",
+            child[runner.DEEPSEEK_TOKEN_ENV], "deepseek-secret",
         )
 
     def test_official_deepseek_requires_its_key(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            tcs_agent.require_model_credentials("gpt-5.6-sol")
+            runner.require_model_credentials("gpt-5.6-sol")
             with self.assertRaisesRegex(
-                tcs_agent.Error, "Set DEEPSEEK_API_KEY",
+                runner.Error, "Set DEEPSEEK_API_KEY",
             ):
-                tcs_agent.require_model_credentials(tcs_agent.DEEPSEEK_MODEL)
+                runner.require_model_credentials(runner.DEEPSEEK_MODEL)
 
         with mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"},
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"},
             clear=True,
         ):
-            tcs_agent.require_model_credentials(tcs_agent.DEEPSEEK_MODEL)
+            runner.require_model_credentials(runner.DEEPSEEK_MODEL)
 
     def test_deepseek_capabilities_normalize_effort_speed_and_summary(self):
         expected = {
@@ -176,41 +183,41 @@ class DeepSeekProviderTests(unittest.TestCase):
         for selected, effective in expected.items():
             with self.subTest(selected=selected):
                 self.assertEqual(
-                    tcs_agent.effective_effort(
-                        tcs_agent.DEEPSEEK_MODEL, selected
+                    runner.effective_effort(
+                        runner.DEEPSEEK_MODEL, selected
                     ),
                     effective,
                 )
         self.assertEqual(
-            tcs_agent.effective_speed(tcs_agent.DEEPSEEK_MODEL, "fast"),
+            runner.effective_speed(runner.DEEPSEEK_MODEL, "fast"),
             "standard",
         )
         self.assertEqual(
-            tcs_agent.speed_arguments("fast", tcs_agent.DEEPSEEK_MODEL),
+            runner.speed_arguments("fast", runner.DEEPSEEK_MODEL),
             ["--disable", "fast_mode"],
         )
         self.assertEqual(
-            tcs_agent.reasoning_summary(tcs_agent.DEEPSEEK_MODEL), "concise"
+            runner.reasoning_summary(runner.DEEPSEEK_MODEL), "concise"
         )
-        for level in tcs_agent.REASONING_SUMMARIES:
+        for level in runner.REASONING_SUMMARIES:
             self.assertEqual(
-                tcs_agent.reasoning_summary(tcs_agent.DEEPSEEK_MODEL, level),
+                runner.reasoning_summary(runner.DEEPSEEK_MODEL, level),
                 level,
             )
-        with self.assertRaisesRegex(tcs_agent.Error, "Choose Status only"):
-            tcs_agent.reasoning_summary(tcs_agent.DEEPSEEK_MODEL, "private")
+        with self.assertRaisesRegex(runner.Error, "Choose Status only"):
+            runner.reasoning_summary(runner.DEEPSEEK_MODEL, "private")
 
     def test_deepseek_prompt_carries_json_schema_contract(self):
-        prompt = tcs_agent.structured_prompt_for_model(
-            "Return the review.", tcs_agent.SCHEMA, tcs_agent.DEEPSEEK_MODEL,
+        prompt = runner.structured_prompt_for_model(
+            "Return the review.", review.REVIEW_SCHEMA, runner.DEEPSEEK_MODEL,
         )
         self.assertTrue(prompt.startswith("Return the review."))
         self.assertIn("OUTPUT JSON CONTRACT", prompt)
         self.assertIn('"statement"', prompt)
         self.assertIn('"additionalProperties": false', prompt)
         self.assertEqual(
-            tcs_agent.structured_prompt_for_model(
-                "unchanged", tcs_agent.SCHEMA, "gpt-5.6-sol",
+            runner.structured_prompt_for_model(
+                "unchanged", review.REVIEW_SCHEMA, "gpt-5.6-sol",
             ),
             "unchanged",
         )
@@ -219,33 +226,33 @@ class DeepSeekProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             schema_path = Path(temporary) / "schema.json"
             self.assertEqual(
-                tcs_agent.output_schema_arguments(
-                    tcs_agent.DEEPSEEK_MODEL, schema_path,
+                runner.output_schema_arguments(
+                    runner.DEEPSEEK_MODEL, schema_path,
                 ),
                 [],
             )
             self.assertEqual(
-                tcs_agent.output_schema_arguments("gpt-5.6-sol", schema_path),
+                runner.output_schema_arguments("gpt-5.6-sol", schema_path),
                 ["--output-schema", str(schema_path)],
             )
 
-        decoded = tcs_agent.decoded_json_object(
+        decoded = runner.decoded_json_object(
             '```json\n{"statement":"s","notes":"n"}\n```',
         )
         self.assertEqual(
-            tcs_agent.validate_json_schema(decoded, tcs_agent.SCHEMA), decoded,
+            runner.validate_json_schema(decoded, review.REVIEW_SCHEMA), decoded,
         )
-        with self.assertRaisesRegex(tcs_agent.Error, "unsupported properties"):
-            tcs_agent.validate_json_schema(
+        with self.assertRaisesRegex(runner.Error, "unsupported properties"):
+            runner.validate_json_schema(
                 {"statement": "s", "notes": "n", "extra": True},
-                tcs_agent.SCHEMA,
+                review.REVIEW_SCHEMA,
             )
-        with self.assertRaisesRegex(tcs_agent.Error, "malformed"):
-            tcs_agent.decoded_json_object("not-json")
-        with self.assertRaisesRegex(tcs_agent.Error, "without a final"):
-            tcs_agent.decoded_json_object("  \n")
+        with self.assertRaisesRegex(runner.Error, "malformed"):
+            runner.decoded_json_object("not-json")
+        with self.assertRaisesRegex(runner.Error, "without a final"):
+            runner.decoded_json_object("  \n")
         self.assertEqual(
-            tcs_agent.decoded_json_object(
+            runner.decoded_json_object(
                 'I checked the result.\n{"statement":"s","notes":"n"}\nDone.'
             ),
             {"statement": "s", "notes": "n"},
@@ -253,7 +260,7 @@ class DeepSeekProviderTests(unittest.TestCase):
 
     def test_structured_stages_disable_tools_and_retry_an_empty_answer(self):
         self.assertEqual(
-            tcs_agent.structured_tool_arguments("review"),
+            runner.structured_tool_arguments("review"),
             [
                 "-c", 'web_search="disabled"',
                 "-c", "tools.web_search=false",
@@ -263,18 +270,18 @@ class DeepSeekProviderTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            tcs_agent.structured_tool_arguments("critic"),
-            tcs_agent.structured_tool_arguments("review"),
+            runner.structured_tool_arguments("critic"),
+            runner.structured_tool_arguments("review"),
         )
         valid = '{"statement":"checked","notes":"complete"}'
         with mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
         ), mock.patch.object(
-            tcs_agent, "run_structured_attempt", side_effect=["", valid],
-        ) as run, mock.patch.object(tcs_agent, "emit"):
-            result, raw = tcs_agent.structured(
-                "Review this.", tcs_agent.SCHEMA, "review",
-                model=tcs_agent.DEEPSEEK_MODEL, effort="max",
+            runner, "run_structured_attempt", side_effect=["", valid],
+        ) as run, mock.patch.object(runner, "emit"):
+            result, raw = runner.structured(
+                "Review this.", review.REVIEW_SCHEMA, "review",
+                model=runner.DEEPSEEK_MODEL, effort="max",
             )
 
         self.assertEqual(result, {"statement": "checked", "notes": "complete"})
@@ -290,25 +297,25 @@ class DeepSeekProviderTests(unittest.TestCase):
     def test_structured_watchdog_is_deepseek_specific_by_default(self):
         valid = '{"statement":"checked","notes":"complete"}'
         with mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
         ), mock.patch.object(
-            tcs_agent, "run_structured_attempt", return_value=valid,
-        ) as run, mock.patch.object(tcs_agent, "emit"):
-            tcs_agent.structured(
-                "Review this.", tcs_agent.SCHEMA, "review",
+            runner, "run_structured_attempt", return_value=valid,
+        ) as run, mock.patch.object(runner, "emit"):
+            runner.structured(
+                "Review this.", review.REVIEW_SCHEMA, "review",
                 model="gpt-5.6-sol", effort="ultra",
             )
             openai_timeout = run.call_args.kwargs["timeout"]
-            tcs_agent.structured(
-                "Review this.", tcs_agent.SCHEMA, "review",
-                model=tcs_agent.DEEPSEEK_MODEL, effort="max",
+            runner.structured(
+                "Review this.", review.REVIEW_SCHEMA, "review",
+                model=runner.DEEPSEEK_MODEL, effort="max",
             )
             deepseek_timeout = run.call_args.kwargs["timeout"]
 
         self.assertIsNone(openai_timeout)
         self.assertEqual(
             deepseek_timeout,
-            tcs_agent.STRUCTURED_ATTEMPT_TIMEOUT_SECONDS["review"],
+            runner.STRUCTURED_ATTEMPT_TIMEOUT_SECONDS["review"],
         )
 
     def test_structured_attempt_timeout_stops_the_process(self):
@@ -326,20 +333,20 @@ class DeepSeekProviderTests(unittest.TestCase):
 
         try:
             with mock.patch.object(
-                tcs_agent.subprocess, "Popen", side_effect=sleeping_process,
+                runner.subprocess, "Popen", side_effect=sleeping_process,
             ), mock.patch.object(
-                tcs_agent, "codex", return_value="codex",
+                runner, "codex", return_value="codex",
             ), mock.patch.dict(
-                os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
+                os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
             ), mock.patch.object(
-                tcs_agent, "STRUCTURED_HEARTBEAT_SECONDS", 0.01,
-            ), mock.patch.object(tcs_agent, "emit") as emit:
+                runner, "STRUCTURED_HEARTBEAT_SECONDS", 0.01,
+            ), mock.patch.object(runner, "emit") as emit:
                 with self.assertRaisesRegex(
-                    tcs_agent.StructuredAttemptTimeout, "did not respond",
+                    runner.StructuredAttemptTimeout, "did not respond",
                 ):
-                    tcs_agent.run_structured_attempt(
-                        "Review this.", tcs_agent.SCHEMA, "review",
-                        tcs_agent.DEEPSEEK_MODEL, "max", "standard", "none",
+                    runner.run_structured_attempt(
+                        "Review this.", review.REVIEW_SCHEMA, "review",
+                        runner.DEEPSEEK_MODEL, "max", "standard", "none",
                         timeout=0.05,
                     )
                 self.assertTrue(any(
@@ -371,34 +378,34 @@ class DeepSeekProviderTests(unittest.TestCase):
             )
 
         with mock.patch.object(
-            tcs_agent.subprocess, "Popen", side_effect=failing_process,
+            runner.subprocess, "Popen", side_effect=failing_process,
         ), mock.patch.object(
-            tcs_agent, "codex", return_value="codex",
+            runner, "codex", return_value="codex",
         ), mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
         ):
             with self.assertRaisesRegex(
-                tcs_agent.Error, "provider quota exhausted",
+                runner.Error, "provider quota exhausted",
             ):
-                tcs_agent.run_structured_attempt(
-                    "Review this.", tcs_agent.SCHEMA, "critic",
-                    tcs_agent.DEEPSEEK_MODEL, "high", "standard", "none",
+                runner.run_structured_attempt(
+                    "Review this.", review.REVIEW_SCHEMA, "critic",
+                    runner.DEEPSEEK_MODEL, "high", "standard", "none",
                     timeout=2,
                 )
 
     def test_timed_out_deepseek_review_retries_at_lower_effort(self):
         valid = '{"statement":"checked","notes":"complete"}'
-        timeout = tcs_agent.StructuredAttemptTimeout(
+        timeout = runner.StructuredAttemptTimeout(
             "The review model did not respond within 300 seconds."
         )
         with mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"}, clear=True,
         ), mock.patch.object(
-            tcs_agent, "run_structured_attempt", side_effect=[timeout, valid],
-        ) as run, mock.patch.object(tcs_agent, "emit"):
-            result, _ = tcs_agent.structured(
-                "Review this.", tcs_agent.SCHEMA, "review",
-                model=tcs_agent.DEEPSEEK_MODEL, effort="max",
+            runner, "run_structured_attempt", side_effect=[timeout, valid],
+        ) as run, mock.patch.object(runner, "emit"):
+            result, _ = runner.structured(
+                "Review this.", review.REVIEW_SCHEMA, "review",
+                model=runner.DEEPSEEK_MODEL, effort="max",
             )
 
         self.assertEqual(result["statement"], "checked")
@@ -413,32 +420,29 @@ class DeepSeekProviderTests(unittest.TestCase):
                 "verdict": "pass",
                 "report": f"audit {index} complete",
             }
-            self.assertIs(schema, tcs_agent.CRITIC_CHECK_SCHEMA)
+            self.assertIs(schema, runner.CRITIC_CHECK_SCHEMA)
             return result, json.dumps(result)
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            tcs_agent, "critic_audit_checkpoint_path",
-            return_value=(
-                Path(directory) / tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
-            ),
+            runner.Path, "cwd", return_value=Path(directory),
         ), mock.patch.object(
-            tcs_agent, "structured", side_effect=fake_structured,
-        ) as structured, mock.patch.object(tcs_agent, "emit"):
-            reports = tcs_agent.independent_critic_audits(
-                "statement", "candidate", tcs_agent.DEEPSEEK_MODEL, "max",
-                tcs_agent.CRITIC_PROMPT, "standard", "concise",
+            runner, "structured", side_effect=fake_structured,
+        ) as structured, mock.patch.object(runner, "emit"):
+            reports = runner.independent_critic_audits(
+                "statement", "candidate", runner.DEEPSEEK_MODEL, "max",
+                runner.CRITIC_PROMPT, "standard", "concise",
             )
-            restored = tcs_agent.independent_critic_audits(
-                "statement", "candidate", tcs_agent.DEEPSEEK_MODEL, "max",
-                tcs_agent.CRITIC_PROMPT, "standard", "concise",
+            restored = runner.independent_critic_audits(
+                "statement", "candidate", runner.DEEPSEEK_MODEL, "max",
+                runner.CRITIC_PROMPT, "standard", "concise",
             )
-            replacement = tcs_agent.independent_critic_audits(
+            replacement = runner.independent_critic_audits(
                 "statement", "replacement candidate",
-                tcs_agent.DEEPSEEK_MODEL, "max", tcs_agent.CRITIC_PROMPT,
+                runner.DEEPSEEK_MODEL, "max", runner.CRITIC_PROMPT,
                 "standard", "concise",
             )
             candidate_contents = (
-                Path(directory) / tcs_agent.SAVED_CANDIDATE_FILENAME
+                Path(directory) / runner.SAVED_CANDIDATE_FILENAME
             ).read_text(encoding="utf-8")
 
         self.assertEqual(candidate_contents, "replacement candidate\n")
@@ -454,12 +458,12 @@ class DeepSeekProviderTests(unittest.TestCase):
             self.assertEqual(call.kwargs["attempts"], 1)
             self.assertEqual(
                 call.kwargs["timeout"],
-                tcs_agent.CRITIC_AUDIT_TIMEOUT_SECONDS,
+                runner.CRITIC_AUDIT_TIMEOUT_SECONDS,
             )
 
     def test_critic_checkpoint_only_reruns_missing_audits(self):
         saved = {
-            "focus": tcs_agent.CRITIC_AUDIT_FOCI[1],
+            "focus": runner.CRITIC_AUDIT_FOCI[1],
             "verdict": "fail",
             "report": "paid audit already complete",
         }
@@ -473,20 +477,17 @@ class DeepSeekProviderTests(unittest.TestCase):
             }, "{}"
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            tcs_agent, "critic_audit_checkpoint_path",
-            return_value=(
-                Path(directory) / tcs_agent.CRITIC_AUDIT_CHECKPOINT_FILENAME
-            ),
-        ), mock.patch.object(tcs_agent, "emit"), mock.patch.object(
-            tcs_agent, "structured", side_effect=fake_structured,
+            runner.Path, "cwd", return_value=Path(directory),
+        ), mock.patch.object(runner, "emit"), mock.patch.object(
+            runner, "structured", side_effect=fake_structured,
         ) as structured:
-            tcs_agent.save_critic_audit_checkpoint(
+            runner.save_critic_audit_checkpoint(
                 [None, saved, None], "statement", "candidate",
-                tcs_agent.DEEPSEEK_MODEL, "high", tcs_agent.CRITIC_PROMPT,
+                runner.DEEPSEEK_MODEL, "high", runner.CRITIC_PROMPT,
             )
-            reports = tcs_agent.independent_critic_audits(
-                "statement", "candidate", tcs_agent.DEEPSEEK_MODEL, "max",
-                tcs_agent.CRITIC_PROMPT, "standard", "concise",
+            reports = runner.independent_critic_audits(
+                "statement", "candidate", runner.DEEPSEEK_MODEL, "max",
+                runner.CRITIC_PROMPT, "standard", "concise",
             )
 
         self.assertEqual(structured.call_count, 2)
@@ -498,7 +499,7 @@ class DeepSeekProviderTests(unittest.TestCase):
 
     def test_critic_checkpoint_is_recovered_from_sibling_job(self):
         saved = {
-            "focus": tcs_agent.CRITIC_AUDIT_FOCI[0],
+            "focus": runner.CRITIC_AUDIT_FOCI[0],
             "verdict": "pass",
             "report": "prior paid audit",
         }
@@ -507,23 +508,23 @@ class DeepSeekProviderTests(unittest.TestCase):
             previous, current = runs / "previous-job", runs / "current-job"
             previous.mkdir(parents=True)
             current.mkdir()
-            tcs_agent.save_critic_audit_checkpoint(
+            runner.save_critic_audit_checkpoint(
                 [saved, None, None], "statement", "candidate",
-                tcs_agent.DEEPSEEK_MODEL, "high", tcs_agent.CRITIC_PROMPT,
+                runner.DEEPSEEK_MODEL, "high", runner.CRITIC_PROMPT,
                 directory=previous,
             )
-            with mock.patch.object(tcs_agent, "emit") as emit:
-                reports = tcs_agent.load_critic_audit_checkpoint(
-                    "statement", "candidate", tcs_agent.DEEPSEEK_MODEL,
-                    "high", tcs_agent.CRITIC_PROMPT, directory=current,
+            with mock.patch.object(runner, "emit") as emit:
+                reports = runner.load_critic_audit_checkpoint(
+                    "statement", "candidate", runner.DEEPSEEK_MODEL,
+                    "high", runner.CRITIC_PROMPT, directory=current,
                 )
             (
-                current / tcs_agent.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME
+                current / runner.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME
             ).write_text("fresh audits\n", encoding="utf-8")
-            with mock.patch.object(tcs_agent, "emit"):
-                fresh_reports = tcs_agent.load_critic_audit_checkpoint(
-                    "statement", "candidate", tcs_agent.DEEPSEEK_MODEL,
-                    "high", tcs_agent.CRITIC_PROMPT, directory=current,
+            with mock.patch.object(runner, "emit"):
+                fresh_reports = runner.load_critic_audit_checkpoint(
+                    "statement", "candidate", runner.DEEPSEEK_MODEL,
+                    "high", runner.CRITIC_PROMPT, directory=current,
                 )
 
         self.assertEqual(reports, [saved, None, None])
@@ -535,37 +536,37 @@ class DeepSeekProviderTests(unittest.TestCase):
 
     def test_web_workflow_accepts_deepseek_and_records_effective_settings(self):
         with mock.patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-secret"},
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-secret"},
             clear=False,
         ):
-            options = web_ui.App._workflow_options(
+            options = server.App._workflow_options(
                 include_review=False,
-                author_model=tcs_agent.DEEPSEEK_MODEL,
-                critic_model=tcs_agent.DEEPSEEK_MODEL,
-                writer_model=tcs_agent.DEEPSEEK_MODEL,
+                author_model=runner.DEEPSEEK_MODEL,
+                critic_model=runner.DEEPSEEK_MODEL,
+                writer_model=runner.DEEPSEEK_MODEL,
                 reasoning_effort="ultra",
                 reasoning_summary="detailed",
             )
 
-        self.assertEqual(options["authorModel"], tcs_agent.DEEPSEEK_MODEL)
+        self.assertEqual(options["authorModel"], runner.DEEPSEEK_MODEL)
         self.assertEqual(options["authorEffort"], "max")
         self.assertEqual(options["criticEffort"], "max")
         self.assertEqual(options["writerEffort"], "max")
         self.assertEqual(options["reasoningSummary"], "detailed")
-        self.assertIn(tcs_agent.DEEPSEEK_MODEL, web_ui.PUBLIC_GRAPH["settings"]["models"])
+        self.assertIn(runner.DEEPSEEK_MODEL, server.PUBLIC_GRAPH["settings"]["models"])
 
     def test_public_event_keeps_summaries_but_drops_private_reasoning(self):
         summary = {
             "method": "item/reasoning/summaryTextDelta",
             "params": {"delta": "Checking the boundary case."},
         }
-        self.assertEqual(tcs_agent.public_event(summary), summary)
-        self.assertIsNone(tcs_agent.public_event({
+        self.assertEqual(runner.public_event(summary), summary)
+        self.assertIsNone(runner.public_event({
             "method": "item/reasoning/textDelta",
             "params": {"delta": "private reasoning"},
         }))
         self.assertEqual(
-            tcs_agent.public_event({
+            runner.public_event({
                 "type": "reasoning", "summary": ["Public summary"],
                 "content": ["private reasoning"],
             }),
@@ -580,17 +581,38 @@ class DeepSeekProviderTests(unittest.TestCase):
                 "instruction": "Stop experiments and prove symbolically.",
             }), encoding="utf-8")
             self.assertEqual(
-                tcs_agent.pending_author_steer(path),
+                runner.pending_author_steer(path),
                 ("command-1", "Stop experiments and prove symbolically."),
             )
             self.assertIsNone(
-                tcs_agent.pending_author_steer(path, "command-1")
+                runner.pending_author_steer(path, "command-1")
             )
             path.write_text(json.dumps({
                 "id": "command-2",
-                "instruction": "x" * (tcs_agent.AUTHOR_STEER_MAX_CHARS + 1),
+                "instruction": "x" * (runner.AUTHOR_STEER_MAX_CHARS + 1),
             }), encoding="utf-8")
-            self.assertIsNone(tcs_agent.pending_author_steer(path))
+            self.assertIsNone(runner.pending_author_steer(path))
+
+    def test_saved_candidate_accepts_the_last_repair_at_the_round_limit(self):
+        reports = [
+            {"verdict": "pass", "fixed": True, "solution": f"REPAIR {number}", "bugs": ""}
+            for number in (1, 2)
+        ]
+        with (
+            mock.patch.object(runner, "criticize", side_effect=reports) as critic,
+            mock.patch.object(runner, "finalize", return_value="FINAL LATEX") as final,
+            mock.patch.object(runner, "run_goal") as author,
+            mock.patch.object(runner, "emit"),
+        ):
+            result = runner.audit_candidate("STATEMENT", "SAVED PROOF", critic_rounds=2)
+
+        self.assertEqual(result, "FINAL LATEX")
+        self.assertEqual(critic.call_count, 2)
+        self.assertEqual([call.args[:3] for call in critic.call_args_list], [
+            ("STATEMENT", "SAVED PROOF", 1), ("STATEMENT", "REPAIR 1", 2),
+        ])
+        self.assertEqual(final.call_args.args[:2], ("STATEMENT", "REPAIR 2"))
+        author.assert_not_called()
 
     def test_saved_candidate_starts_at_critic_and_then_finalizes(self):
         report = {
@@ -598,11 +620,11 @@ class DeepSeekProviderTests(unittest.TestCase):
             "solution": "AUDITED PROOF", "bugs": "",
         }
         with mock.patch.object(
-            tcs_agent, "criticize", return_value=report,
+            runner, "criticize", return_value=report,
         ) as critic, mock.patch.object(
-            tcs_agent, "finalize", return_value="FINAL LATEX",
-        ) as final, mock.patch.object(tcs_agent, "emit"):
-            result = tcs_agent.audit_candidate(
+            runner, "finalize", return_value="FINAL LATEX",
+        ) as final, mock.patch.object(runner, "emit"):
+            result = runner.audit_candidate(
                 "STATEMENT", "SAVED PROOF", critic_rounds=3,
                 author_model="gpt-5.6-luna",
                 critic_model="gpt-5.6-luna", writer_model="gpt-5.6-luna",
@@ -622,13 +644,13 @@ class DeepSeekProviderTests(unittest.TestCase):
             "solution": "SAFE PARTIAL FIX", "bugs": "missing lemma",
         }
         with mock.patch.object(
-            tcs_agent, "criticize", return_value=report,
-        ), mock.patch.object(tcs_agent, "finalize") as final, mock.patch.object(
-            tcs_agent, "emit"
+            runner, "criticize", return_value=report,
+        ), mock.patch.object(runner, "finalize") as final, mock.patch.object(
+            runner, "emit"
         ), mock.patch.object(
-            tcs_agent, "run_goal", return_value="REPAIRED FINAL"
+            runner, "run_goal", return_value="REPAIRED FINAL"
         ) as author_loop:
-            result = tcs_agent.audit_candidate(
+            result = runner.audit_candidate(
                 "STATEMENT", "SAVED PROOF", critic_rounds=3,
                 author_model="gpt-5.6-luna",
                 critic_model="gpt-5.6-luna",

@@ -1,4 +1,6 @@
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,17 +12,47 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import tcs_agent
+from ui import review
+import workflow_runner as runner
 
 
 class PromptAndCacheRegressionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        previous = os.getcwd()
+        os.chdir(directory.name)
+        self.addCleanup(os.chdir, previous)
+
+    def test_migrated_prompts_preserve_the_original_text_exactly(self):
+        # Preserve the original prompt text; the critic's orchestration text
+        # matches the merged main branch's controller-run independent audits.
+        expected = {
+            "AUTHOR_PROMPT": "aadfbc2e1bde5924266e5f482879f74657da2da9d139c238b31ef79a09115235",
+            "CRITIC_PROMPT": "6bf7f601ceb27ae8b82eccffb6fa908fa0e46239f166429dc55340de4b0cb461",
+            "CRITIC_MEMORY_PROMPT": "2013ec589184f56bf1403fb2e4deb194bb900ca66015927dc2a2efb18072e9d3",
+            "FINAL_PROMPT": "27a7c8c786ee51965ceb17d944ae51a8ff24f861860d48e618cd8be4212d409f",
+            "CONTINUE_PROMPT": "e2577468f5bbeddc370cb22e56d1634019edd1e3a12e0d3e38f26c81c7d35527",
+            "FAILURE_SUMMARY_PROMPT": "d8ca39494b4a0267f9918838130adaf0c6f85d9f2bceaefcc3a03bd114b4032a",
+        }
+        for name, fingerprint in expected.items():
+            with self.subTest(prompt=name):
+                self.assertEqual(
+                    hashlib.sha256(getattr(runner, name).encode("utf-8")).hexdigest(),
+                    fingerprint,
+                )
+        self.assertEqual(
+            hashlib.sha256(review.REVIEW_PROMPT.encode("utf-8")).hexdigest(),
+            "714f9ca9674917baba98567dc8ba53a2e4a04af01385196efc798b93f039d154",
+        )
+
     def test_reanchored_author_input_preserves_every_component_verbatim(self):
         original = "ORIGINAL prompt  \nwith trailing spaces λ"
         statement = "STATEMENT\n  exact indentation and Ω"
         snapshot = '{"history": "do not normalize  "}'
         instruction = "  CURRENT instruction\nkeep this line  "
 
-        actual = tcs_agent.reanchored_author_input(
+        actual = runner.reanchored_author_input(
             original, statement, snapshot, instruction,
         )
 
@@ -44,13 +76,13 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         self.assertIn(snapshot, actual)
 
     def test_default_prompt_has_stable_invariant_prefix_and_statement_suffix(self):
-        template = tcs_agent.TEMPLATE.read_text(encoding="utf-8")
-        prefix, suffix = template.split(tcs_agent.MARKER)
+        template = runner.AUTHOR_PROMPT
+        prefix, suffix = template.split(runner.MARKER)
         first_statement = "FIRST EXACT STATEMENT"
         second_statement = "SECOND EXACT STATEMENT"
 
-        first = tcs_agent.make_prompt(first_statement)
-        second = tcs_agent.make_prompt(second_statement)
+        first = runner.make_prompt(first_statement)
+        second = runner.make_prompt(second_statement)
 
         self.assertTrue(prefix.strip())
         self.assertGreater(len(prefix.encode("utf-8")), 1024)
@@ -63,10 +95,10 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
 
     def test_review_modes_share_the_exact_invariant_prefix(self):
         instructions = "STATIC REVIEW INSTRUCTIONS\nsecond stable line"
-        initial = tcs_agent.review_prompt(
+        initial = review.review_prompt(
             "initial draft", instructions=instructions,
         )
-        revision = tcs_agent.review_prompt(
+        revision = review.review_prompt(
             "checked statement", "author feedback", instructions=instructions,
         )
         invariant = f"{instructions}\n\nREVIEW TASK\nMODE: "
@@ -80,7 +112,7 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
 
     def test_context_cache_arguments_scope_compaction_after_prefix(self):
         self.assertEqual(
-            tcs_agent.context_cache_arguments(),
+            runner.context_cache_arguments(),
             ["-c", 'model_auto_compact_token_limit_scope="body_after_prefix"'],
         )
 
@@ -88,10 +120,10 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             expected = Path(temporary) / "stable-empty-workspace"
             with mock.patch.object(
-                tcs_agent, "STRUCTURED_WORKSPACE", expected,
+                runner, "STRUCTURED_WORKSPACE", expected,
             ):
-                first = tcs_agent.structured_workspace()
-                second = tcs_agent.structured_workspace()
+                first = runner.structured_workspace()
+                second = runner.structured_workspace()
 
             self.assertEqual(first, expected)
             self.assertEqual(second, expected)
@@ -119,9 +151,9 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         )
         for usage, expected in cases:
             with self.subTest(usage=usage), mock.patch.object(
-                tcs_agent, "emit",
+                runner, "emit",
             ) as mocked_emit:
-                tcs_agent.emit_cache_usage("critic", usage, label="Measured cache")
+                runner.emit_cache_usage("critic", usage, label="Measured cache")
 
                 mocked_emit.assert_called_once()
                 args, fields = mocked_emit.call_args
@@ -165,18 +197,17 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
             if schema.get("type") == "array":
                 check(schema.get("items", {}))
 
-        check(tcs_agent.CRITIC_SCHEMA)
+        check(runner.CRITIC_SCHEMA)
 
     def test_critic_prompt_hides_round_number_and_requests_memory_update(self):
         round_number = 8675309
         report = self._passing_critic_report()
         with mock.patch.object(
-            tcs_agent, "structured", return_value=(report, json.dumps(report)),
+            runner, "structured", return_value=(report, json.dumps(report)),
         ) as mocked_structured, mock.patch.object(
-            tcs_agent, "independent_critic_audits",
-            return_value=report["checks"],
-        ) as audits, mock.patch.object(tcs_agent, "emit"):
-            returned = tcs_agent.criticize(
+            runner, "independent_critic_audits", return_value=report["checks"],
+        ) as audits, mock.patch.object(runner, "emit"):
+            returned = runner.criticize(
                 "exact theorem", "candidate proof", round_number,
             )
 
@@ -184,15 +215,39 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         audits.assert_called_once()
         mocked_structured.assert_called_once()
         prompt, schema, stage = mocked_structured.call_args.args
-        self.assertIs(schema, tcs_agent.CRITIC_SCHEMA)
+        self.assertIs(schema, runner.CRITIC_SCHEMA)
         self.assertEqual(stage, "critic")
         self.assertNotIn(str(round_number), prompt)
         self.assertNotIn("critic round", prompt.lower())
         self.assertIn("STATEMENT:\nexact theorem", prompt)
         self.assertIn("CANDIDATE SOLUTION:\ncandidate proof", prompt)
-        self.assertEqual(prompt.count(tcs_agent.CRITIC_MEMORY_PROMPT), 1)
+        self.assertEqual(prompt.count(runner.CRITIC_MEMORY_PROMPT), 1)
         self.assertIn("COMPLETED INDEPENDENT AUDITS", prompt)
         self.assertEqual(mocked_structured.call_args.kwargs["attempts"], 1)
+
+    def test_cleanup_preserves_distinct_pipeline_and_standalone_inputs(self):
+        instructions = "Keep this custom editor prompt verbatim."
+        report = {"latex": "\\documentclass{article}\\begin{document}Proof\\end{document}"}
+        with mock.patch.object(
+            runner, "structured", return_value=(report, json.dumps(report)),
+        ) as structured, mock.patch.object(runner, "emit"):
+            runner.finalize(
+                "The exact theorem.", "The accepted proof.", instructions=instructions,
+            )
+            pipeline_prompt = structured.call_args.args[0]
+            runner.polish("A combined theorem and proof.", instructions=instructions)
+            standalone_prompt = structured.call_args.args[0]
+
+        self.assertEqual(
+            pipeline_prompt,
+            instructions + "\n\nSTATEMENT:\nThe exact theorem."
+            "\n\nLATEST SOLUTION:\nThe accepted proof.",
+        )
+        self.assertEqual(
+            standalone_prompt,
+            instructions + "\n\nTHEOREM AND PROOF TO POLISH:\n"
+            "A combined theorem and proof.",
+        )
 
 
 class AuthorMemoryRegressionTests(unittest.TestCase):
@@ -203,7 +258,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
             run_directory = temporary_path / "private-run"
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 run_directory, self.original_prompt, self.statement,
             )
 
@@ -213,18 +268,18 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
             self.assertTrue(memory.anchor_path.is_file())
             self.assertTrue(memory.memory_path.is_file())
             self.assertFalse(
-                (temporary_path / tcs_agent.AUTHOR_MEMORY_FILENAME).exists(),
+                (temporary_path / runner.AUTHOR_MEMORY_FILENAME).exists(),
             )
             self.assertEqual(
                 memory.anchor_path.read_text(encoding="utf-8"),
-                tcs_agent.author_anchor(self.original_prompt, self.statement),
+                runner.author_anchor(self.original_prompt, self.statement),
             )
 
             attempt_id = memory.record_candidate(
                 "candidate proof", "initial_author",
             )
             persisted = json.loads(memory.memory_path.read_text(encoding="utf-8"))
-            resumed = tcs_agent.AuthorMemory(
+            resumed = runner.AuthorMemory(
                 run_directory, self.original_prompt, self.statement,
             )
 
@@ -234,7 +289,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_duplicate_fingerprint_ignores_presentation_whitespace(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             first = memory.record_candidate(
@@ -255,7 +310,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_reject_revision_and_pass_transitions_tolerate_memory_update_variants(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             initial = memory.record_candidate(
@@ -315,7 +370,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_stress_keeps_file_and_snapshot_within_byte_caps(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             for index in range(30):
@@ -364,10 +419,10 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
                 memory.data, ensure_ascii=False, sort_keys=True,
             )
             self.assertLessEqual(
-                len(persisted), tcs_agent.AUTHOR_MEMORY_MAX_BYTES,
+                len(persisted), runner.AUTHOR_MEMORY_MAX_BYTES,
             )
             self.assertLessEqual(
-                len(snapshot), tcs_agent.AUTHOR_MEMORY_PROMPT_MAX_BYTES,
+                len(snapshot), runner.AUTHOR_MEMORY_PROMPT_MAX_BYTES,
             )
             self.assertIsInstance(json.loads(persisted.decode("utf-8")), dict)
             self.assertIsInstance(snapshot_document, dict)
@@ -385,7 +440,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_hard_file_cap_clips_public_labels_and_refuses_oversized_core(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             memory.record_candidate(
@@ -394,11 +449,11 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
             )
             safe_file = memory.memory_path.read_bytes()
             self.assertLessEqual(
-                len(safe_file), tcs_agent.AUTHOR_MEMORY_MAX_BYTES,
+                len(safe_file), runner.AUTHOR_MEMORY_MAX_BYTES,
             )
 
             memory._attempt()["source"] = "\U0001f9e0" * 20000
-            with mock.patch.object(tcs_agent, "emit") as mocked_emit:
+            with mock.patch.object(runner, "emit") as mocked_emit:
                 self.assertFalse(memory.save())
             self.assertEqual(memory.memory_path.read_bytes(), safe_file)
             self.assertTrue(any(
@@ -408,7 +463,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_changed_rejection_attaches_bugs_to_result_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             audited = memory.record_candidate(
@@ -450,7 +505,7 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
 
     def test_latest_critic_obligations_replace_stale_live_set(self):
         with tempfile.TemporaryDirectory() as temporary:
-            memory = tcs_agent.AuthorMemory(
+            memory = runner.AuthorMemory(
                 temporary, self.original_prompt, self.statement,
             )
             first = memory.record_candidate("proof one", "initial_author")
@@ -481,11 +536,11 @@ class AuthorMemoryRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run_directory = Path(temporary) / "run"
             run_directory.mkdir()
-            memory_path = run_directory / tcs_agent.AUTHOR_MEMORY_FILENAME
+            memory_path = run_directory / runner.AUTHOR_MEMORY_FILENAME
             memory_path.write_text("{ definitely not JSON", encoding="utf-8")
 
-            with mock.patch.object(tcs_agent, "emit") as mocked_emit:
-                memory = tcs_agent.AuthorMemory(
+            with mock.patch.object(runner, "emit") as mocked_emit:
+                memory = runner.AuthorMemory(
                     run_directory, self.original_prompt, self.statement,
                 )
 

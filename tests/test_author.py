@@ -1,13 +1,14 @@
 import copy
+import json
 import os
 import tempfile
 import time
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-import tcs_agent
+import workflow_runner as runner
 
 
 ORIGINAL_PROMPT = "IMMUTABLE-GUIDANCE-\u03a9\nSolve exactly the supplied theorem."
@@ -61,13 +62,17 @@ class FakeProcess:
 
 
 class ReanchorFlowTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        previous = os.getcwd()
+        os.chdir(directory.name)
+        self.addCleanup(os.chdir, previous)
+
     def run_scripted_goal(
-        self, events, reports, on_critic=None, on_read=None, **goal_options,
+        self, events, reports, on_critic=None, critic_rounds=3,
+        on_read=None, **goal_options,
     ):
-        # Most re-anchor tests exercise provider-independent author behavior.
-        goal_options.setdefault("author_model", "gpt-5.6-sol")
-        goal_options.setdefault("critic_model", "gpt-5.6-sol")
-        goal_options.setdefault("writer_model", "gpt-5.6-sol")
         holder = {}
         traces = []
         critic_calls = []
@@ -124,43 +129,82 @@ class ReanchorFlowTests(unittest.TestCase):
                 raise AssertionError("The fake critic report script was exhausted.")
             return report_queue.popleft()
 
+        finalizer = Mock(return_value="FINAL-LATEX")
+
+        def fake_model_call(node, prompts, state, options, visit):
+            if node["stage"] == "critic":
+                result = fake_criticize(
+                    state["statement"], state["solution"], visit, **options,
+                )
+                # Model responses now cross the YAML validation boundary.
+                result.setdefault("checks", [
+                    {"focus": f"check {number}", "verdict": "pass", "report": "ok"}
+                    for number in range(3)
+                ])
+            elif node["stage"] == "final":
+                result = {"latex": finalizer(state["statement"], state["solution"])}
+            else:
+                raise AssertionError(f"Unexpected model stage: {node['stage']}")
+            return result, json.dumps(result)
+
         def capture_emit(kind, stage, **fields):
             traces.append({"kind": kind, "stage": stage, **copy.deepcopy(fields)})
 
         def fake_popen(command, **options):
-            holder["command"] = copy.deepcopy(command)
-            holder["process_options"] = options
             process.launch_command = copy.deepcopy(command)
             process.launch_options = copy.deepcopy(options)
             return process
 
         with tempfile.TemporaryDirectory() as folder:
             with (
-                patch.object(tcs_agent.Path, "cwd", return_value=Path(folder)),
-                patch.object(tcs_agent, "codex", return_value="codex-fake"),
-                patch.object(tcs_agent, "context_cache_arguments", return_value=[]),
-                patch.object(tcs_agent.subprocess, "Popen", side_effect=fake_popen),
-                patch.object(tcs_agent, "RPC", FakeRPC),
-                patch.object(tcs_agent, "criticize", side_effect=fake_criticize),
-                patch.object(tcs_agent, "finalize", return_value="FINAL-LATEX"),
-                patch.object(tcs_agent, "emit", side_effect=capture_emit),
+                patch.object(runner.Path, "cwd", return_value=Path(folder)),
+                patch.object(runner, "codex", return_value="codex-fake"),
+                patch.object(runner, "context_cache_arguments", return_value=[]),
+                patch.object(runner.subprocess, "Popen", side_effect=fake_popen),
+                patch.object(runner, "RPC", FakeRPC),
+                patch.object(runner, "_model_call", side_effect=fake_model_call),
+                patch.object(runner, "emit", side_effect=capture_emit),
                 patch.object(
-                    tcs_agent.AuthorMemory,
+                    runner.AuthorMemory,
                     "snapshot",
                     return_value=MEMORY_SNAPSHOT,
                 ),
             ):
-                result = tcs_agent.run_goal(
+                result = runner.run_goal(
                     ORIGINAL_PROMPT,
                     EXACT_STATEMENT,
-                    critic_rounds=3,
+                    critic_rounds=critic_rounds,
                     thinking_hours=1,
                     speed="standard",
                     **goal_options,
                 )
+                self.finalizer_calls = finalizer.call_args_list
+                self.final_memory = json.loads(
+                    (Path(folder) / runner.AUTHOR_MEMORY_FILENAME).read_text()
+                )
 
         self.assertFalse(report_queue, "Every scripted critic report should be used.")
         return result, holder["rpc"], traces, critic_calls
+
+    @staticmethod
+    def completed_author_events(solution="INITIAL-CANDIDATE", turn="turn-1"):
+        return [
+            item_event(
+                "item/completed", "root-thread", turn, "agentMessage",
+                f"answer-{turn}", solution,
+            ),
+            goal_event("complete"),
+            turn_completed(turn),
+        ]
+
+    @staticmethod
+    def critic_report(solution, fixed=True, bugs=""):
+        return {
+            "verdict": "reject" if bugs else "pass",
+            "fixed": False if bugs else fixed,
+            "solution": solution,
+            "bugs": bugs,
+        }
 
     def test_live_instruction_steers_the_active_author_turn(self):
         events = [
@@ -190,7 +234,7 @@ class ReanchorFlowTests(unittest.TestCase):
                 '{"id":"live-1","instruction":"Stop experiments now."}',
                 encoding="utf-8",
             )
-            with patch.object(tcs_agent, "AUTHOR_STEER_POLL_SECONDS", 0.001):
+            with patch.object(runner, "AUTHOR_STEER_POLL_SECONDS", 0.001):
                 result, rpc, traces, _ = self.run_scripted_goal(
                     events, reports, on_read=wait_for_steer,
                     author_steer_file=path,
@@ -212,6 +256,7 @@ class ReanchorFlowTests(unittest.TestCase):
             for trace in traces
         ))
 
+
     def test_deepseek_author_keeps_goal_and_multi_agent_app_server(self):
         events = [
             item_event(
@@ -228,10 +273,10 @@ class ReanchorFlowTests(unittest.TestCase):
             "bugs": "",
         }]
         with patch.dict(
-            os.environ, {tcs_agent.DEEPSEEK_KEY_ENV: "test-key"}, clear=False,
+            os.environ, {runner.DEEPSEEK_KEY_ENV: "test-key"}, clear=False,
         ):
             result, rpc, traces, _ = self.run_scripted_goal(
-                events, reports, author_model=tcs_agent.DEEPSEEK_MODEL,
+                events, reports, author_model=runner.DEEPSEEK_MODEL,
             )
 
         self.assertEqual(result, "FINAL-LATEX")
@@ -239,7 +284,7 @@ class ReanchorFlowTests(unittest.TestCase):
             trace for trace in traces
             if trace.get("label") == "Exact solve input"
         )
-        self.assertEqual(command["modelProvider"], tcs_agent.DEEPSEEK_PROVIDER)
+        self.assertEqual(command["modelProvider"], runner.DEEPSEEK_PROVIDER)
         self.assertEqual(command["reasoningEffort"], "max")
         self.assertEqual(command["reasoningSummary"], "concise")
         self.assertEqual(command["serviceTier"], "standard")
@@ -258,24 +303,24 @@ class ReanchorFlowTests(unittest.TestCase):
         )
         self.assertIn('forced_login_method="api"', launch)
         self.assertEqual(
-            rpc.process.launch_options["env"][tcs_agent.DEEPSEEK_TOKEN_ENV],
+            rpc.process.launch_options["env"][runner.DEEPSEEK_TOKEN_ENV],
             "test-key",
         )
         self.assertEqual(
             rpc.process.launch_options["env"]["OPENAI_API_KEY"],
-            tcs_agent.CUSTOM_PROVIDER_LOGIN_PLACEHOLDER,
+            runner.CUSTOM_PROVIDER_LOGIN_PLACEHOLDER,
         )
         self.assertNotIn(
-            tcs_agent.DEEPSEEK_KEY_ENV, rpc.process.launch_options["env"],
+            runner.DEEPSEEK_KEY_ENV, rpc.process.launch_options["env"],
         )
         self.assertNotIn("test-key", " ".join(launch))
 
         thread_start = next(
             params for method, params in rpc.calls if method == "thread/start"
         )
-        self.assertEqual(thread_start["model"], tcs_agent.DEEPSEEK_MODEL)
+        self.assertEqual(thread_start["model"], runner.DEEPSEEK_MODEL)
         self.assertEqual(
-            thread_start["modelProvider"], tcs_agent.DEEPSEEK_PROVIDER,
+            thread_start["modelProvider"], runner.DEEPSEEK_PROVIDER,
         )
         self.assertEqual(thread_start["config"]["model_reasoning_effort"], "max")
         self.assertEqual(
@@ -290,6 +335,130 @@ class ReanchorFlowTests(unittest.TestCase):
             [params["status"] for params in goal_calls[:2]],
             ["paused", "active"],
         )
+
+
+    def test_fixable_round_limit_accepts_latest_repair_without_another_check(self):
+        for limit in (1, 2):
+            with self.subTest(limit=limit):
+                reports = [
+                    self.critic_report(f"REPAIRED-{number}")
+                    for number in range(1, limit + 1)
+                ]
+                result, rpc, traces, calls = self.run_scripted_goal(
+                    self.completed_author_events(), reports,
+                    critic_rounds=limit,
+                )
+
+                self.assertEqual(result, "FINAL-LATEX")
+                self.assertEqual(len(calls), limit)
+                self.assertEqual([call[2] for call in calls], list(range(1, limit + 1)))
+                self.assertEqual(len(self.finalizer_calls), 1)
+                self.assertEqual(self.finalizer_calls[0].args[1], f"REPAIRED-{limit}")
+                self.assertTrue(rpc.closed)
+                self.assertFalse(any(item["kind"] == "partial_result" for item in traces))
+                current = self.final_memory["currentAttemptId"]
+                attempt = next(
+                    item for item in self.final_memory["attempts"]
+                    if item["id"] == current
+                )
+                self.assertEqual(attempt["status"], "approved")
+
+    def test_clean_pass_exits_before_the_configured_round_limit(self):
+        result, _, _, calls = self.run_scripted_goal(
+            self.completed_author_events(),
+            [self.critic_report("INITIAL-CANDIDATE", fixed=False)],
+            critic_rounds=2,
+        )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.finalizer_calls[0].args[1], "INITIAL-CANDIDATE")
+
+    def test_rejection_at_limit_resets_rounds_after_author_revision(self):
+        events = self.completed_author_events()
+        events.extend(self.completed_author_events("AUTHOR-REVISION", "turn-2"))
+        reports = [
+            self.critic_report("FIRST-REPAIR"),
+            self.critic_report("SAFE-FIX", bugs="The main lemma has a gap."),
+            self.critic_report("REVISION-REPAIR-1"),
+            self.critic_report("REVISION-REPAIR-2"),
+        ]
+        result, rpc, _, calls = self.run_scripted_goal(
+            events, reports, critic_rounds=2,
+        )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        self.assertEqual([call[2] for call in calls], [1, 2, 1, 2])
+        self.assertEqual(calls[2][1], "AUTHOR-REVISION")
+        turns = [params for method, params in rpc.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        revision = turns[1]["input"][0]["text"]
+        self.assertIn("SAFE-FIX", revision)
+        self.assertIn("The main lemma has a gap.", revision)
+        self.assertEqual(self.finalizer_calls[0].args[1], "REVISION-REPAIR-2")
+
+    def test_stale_turn_completion_does_not_end_the_author_revision(self):
+        events = self.completed_author_events()
+        # A delayed completion from the original turn must not terminate the
+        # newly started repair before its replacement proof has arrived.
+        events.append(turn_completed("turn-1"))
+        events.extend(self.completed_author_events("ACTUAL-REVISION", "turn-2"))
+        result, _, _, calls = self.run_scripted_goal(
+            events,
+            [
+                self.critic_report("SAFE-FIX", bugs="The central lemma is false."),
+                self.critic_report("ACTUAL-REVISION", fixed=False),
+            ],
+            critic_rounds=2,
+        )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        self.assertEqual(calls[1][1], "ACTUAL-REVISION")
+        self.assertEqual(self.finalizer_calls[0].args[1], "ACTUAL-REVISION")
+
+    def test_accepted_critic_can_finish_after_author_deadline(self):
+        clock = [0.0]
+
+        def expire_during_critic(rpc, call_number):
+            clock[0] = 3601.0
+
+        with patch.object(runner.time, "monotonic", side_effect=lambda: clock[0]):
+            result, rpc, _, calls = self.run_scripted_goal(
+                self.completed_author_events(),
+                [self.critic_report("LATEST-REPAIR")],
+                on_critic=expire_during_critic, critic_rounds=1,
+            )
+
+        self.assertEqual(result, "FINAL-LATEX")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.finalizer_calls[0].args[1], "LATEST-REPAIR")
+        self.assertEqual(
+            len([method for method, _ in rpc.calls if method == "turn/start"]), 1,
+        )
+
+    def test_rejected_critic_after_deadline_summarizes_without_author_revision(self):
+        clock = [0.0]
+
+        def expire_during_critic(rpc, call_number):
+            clock[0] = 3601.0
+
+        events = self.completed_author_events()
+        events.extend(self.completed_author_events("UNSOLVED-SUMMARY", "turn-2"))
+        with patch.object(runner.time, "monotonic", side_effect=lambda: clock[0]):
+            result, rpc, traces, calls = self.run_scripted_goal(
+                events,
+                [self.critic_report("SAFE-FIX", bugs="Unresolved gap.")],
+                on_critic=expire_during_critic, critic_rounds=1,
+            )
+
+        self.assertEqual(result, "UNSOLVED-SUMMARY")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.finalizer_calls)
+        self.assertTrue(any(item["kind"] == "failure_result" for item in traces))
+        turns = [params for method, params in rpc.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        self.assertIn(runner.FAILURE_SUMMARY_PROMPT, turns[1]["input"][0]["text"])
+        self.assertNotIn("revision request", turns[1]["input"][0]["text"])
 
     def test_completed_root_author_compaction_steers_exactly_once(self):
         root_compaction = item_event(
@@ -407,7 +576,7 @@ class ReanchorFlowTests(unittest.TestCase):
         self.assertIn(ORIGINAL_PROMPT, continuation)
         self.assertIn(EXACT_STATEMENT, continuation)
         self.assertIn(MEMORY_SNAPSHOT, continuation)
-        self.assertIn(tcs_agent.CONTINUE_PROMPT, continuation)
+        self.assertIn(runner.CONTINUE_PROMPT, continuation)
 
     def test_critic_rejection_turn_is_self_contained(self):
         events = [
