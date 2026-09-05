@@ -37,9 +37,9 @@ nodes:
 # Model instructions and lifecycle prompts referenced by the nodes above.
 prompts:
   final: |-
-    Act as the TCS editor and turn the solution below into a latex proof. Preserve its mathematical
+    Act as the TCS editor and turn the solution below into a latex TCS paper. Preserve its mathematical
     content while removing repetition and process commentary. Produce a
-    cleaned-up, self-contained, organized, rigorous, readable LaTeX proof
+    cleaned-up, self-contained, organized, rigorous, readable LaTeX TCS paper
     with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper in a tree-like structure:
     (1) Use definitions and terminologys following the convention of previous works, if there are any,
     (2) For algorithmic tasks, split the proof into algorithm description, correctness proof, and complexity analysis,

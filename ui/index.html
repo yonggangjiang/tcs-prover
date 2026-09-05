@@ -56,7 +56,7 @@
                   <input type="radio" name="problemMode" value="latex">
                   <span>
                     <strong>LaTeX polish</strong>
-                    <small>Polish an existing theorem and proof only</small>
+                    <small>Polish an existing writing only</small>
                   </span>
                 </label>
               </div>
@@ -68,9 +68,9 @@
             </div>
             <div id="latexFields" hidden>
               <div>
-                <label for="latexInput">Theorem and proof</label>
+                <label for="latexInput">Writing</label>
                 <textarea id="latexInput" rows="18"
-                  placeholder="Paste the theorem and its complete proof…"></textarea>
+                  placeholder="Paste an AI generated writing…"></textarea>
               </div>
             </div>
             <details class="advanced">
@@ -162,7 +162,7 @@
               <div class="prompt-setting">
                 <div>
                   <strong>Role prompts</strong>
-                  <span>Saved edits are reused for future jobs</span>
+                  <span>Custom prompts override defaults for future jobs</span>
                 </div>
                 <button id="editPromptsButton" class="secondary compact"
                   type="button">Edit prompts</button>
@@ -367,7 +367,7 @@
         </p>
         <div class="prompt-dialog-actions">
           <button id="resetPromptButton" class="ghost" type="button">
-            Reset this prompt
+            Reset to default
           </button>
           <button id="savePromptsButton" type="button">Save prompts</button>
         </div>

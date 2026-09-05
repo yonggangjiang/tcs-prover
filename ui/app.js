@@ -40,6 +40,7 @@ const ui = {
   editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
   promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
   promptEditorLabel: $("promptEditorLabel"),
+  promptEditorHelp: $("promptEditorHelp"),
   resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
   reviewPromptTab: $("reviewPromptTab"),
   authorPromptTab: $("authorPromptTab"),
@@ -88,6 +89,7 @@ let activeFilter = "all";
 let activePrompt = "review";
 let promptValues = {};
 let promptDrafts = {};
+let promptStorageFallback = null;
 const promptStorageKey = "tcs-prover-role-prompts";
 const timelineRows = new Map();
 const detailRows = new Map();
@@ -401,7 +403,7 @@ function setProblemMode(mode) {
     : reviewOnly ? "Review statement only"
     : skipReview ? "Start proof author" : "Check statement";
   ui.introDescription.textContent = latexOnly
-    ? "Provide an existing theorem and proof. Only the final LaTeX editor will run."
+    ? "Provide an existing writing. Only the final LaTeX editor will run."
     : reviewOnly
       ? "Check and rewrite the statement, save the result and reviewer notes, then "
         + "stop without starting the proof author."
@@ -473,12 +475,20 @@ const promptLabels = {
   critic: "Critic prompt", final: "Final writer prompt",
 };
 
+const promptHelp = {
+  review: "The full request also includes the statement and any revision feedback.",
+  author: "Keep exactly one [STATEMENT]. The workflow inserts the statement and adds proof-history instructions.",
+  critic: "The workflow adds the proof, audit assignments, and completed audit reports to these instructions.",
+  final: "The full request also includes the statement and proof to polish.",
+};
+
 function syncPrompts(source = state) {
   const defaults = source.workflow?.settings?.prompts || {};
   let saved = {};
   if (source.phase === "input") {
     try {
-      saved = JSON.parse(localStorage.getItem(promptStorageKey) || "{}");
+      saved = promptStorageFallback
+        || JSON.parse(localStorage.getItem(promptStorageKey) || "{}");
     } catch (_) {
       saved = {};
     }
@@ -493,13 +503,23 @@ function syncPrompts(source = state) {
   };
 }
 
+function updatePromptHelp() {
+  const defaults = state.workflow?.settings?.prompts || {};
+  const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
+  ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
+    + (isDefault ? "current default" : "saved or edited prompt");
+  ui.promptEditorHelp.textContent = (isDefault ? "" :
+    "This overrides the current default. Reset restores the default; Save applies it. ")
+    + promptHelp[activePrompt];
+}
+
 function selectPrompt(name) {
   if (ui.promptDialog.open && promptDrafts[activePrompt] !== undefined) {
     promptDrafts[activePrompt] = ui.promptEditor.value;
   }
   activePrompt = name;
   ui.promptEditor.value = promptDrafts[name] || "";
-  ui.promptEditorLabel.textContent = promptLabels[name];
+  updatePromptHelp();
   for (const tab of ui.promptTabs.querySelectorAll(".prompt-tab")) {
     const selected = tab.dataset.prompt === name;
     tab.classList.toggle("active", selected);
@@ -532,10 +552,18 @@ function savePrompts() {
   promptValues = Object.fromEntries(
     Object.entries(promptDrafts).map(([name, prompt]) => [name, prompt.trim()])
   );
+  const defaults = state.workflow?.settings?.prompts || {};
+  // Persist only custom text so saving one role does not freeze every default.
+  // Legacy saved prompts remain available until the user explicitly resets them.
+  const overrides = Object.fromEntries(Object.entries(promptValues).filter(
+    ([name, prompt]) => prompt !== (defaults[name] || "").trim()
+  ));
   try {
-    localStorage.setItem(promptStorageKey, JSON.stringify(promptValues));
+    localStorage.setItem(promptStorageKey, JSON.stringify(overrides));
+    promptStorageFallback = null;
   } catch (_) {
-    // The current tab still retains them if browser storage is unavailable.
+    // Keep saved customizations across jobs in this tab when storage is blocked.
+    promptStorageFallback = overrides;
   }
   ui.notice.textContent = "";
   show(ui.notice, false);
@@ -1394,7 +1422,9 @@ ui.resetPrompt.onclick = () => {
   const defaults = state.workflow?.settings?.prompts || {};
   promptDrafts[activePrompt] = defaults[activePrompt] || "";
   ui.promptEditor.value = promptDrafts[activePrompt];
+  updatePromptHelp();
 };
+ui.promptEditor.oninput = updatePromptHelp;
 ui.savePrompts.onclick = savePrompts;
 ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
 ui.setAuthorTimeLimit.onclick = () => {
