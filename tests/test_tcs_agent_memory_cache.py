@@ -172,12 +172,16 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         report = self._passing_critic_report()
         with mock.patch.object(
             tcs_agent, "structured", return_value=(report, json.dumps(report)),
-        ) as mocked_structured, mock.patch.object(tcs_agent, "emit"):
+        ) as mocked_structured, mock.patch.object(
+            tcs_agent, "independent_critic_audits",
+            return_value=report["checks"],
+        ) as audits, mock.patch.object(tcs_agent, "emit"):
             returned = tcs_agent.criticize(
                 "exact theorem", "candidate proof", round_number,
             )
 
         self.assertIs(returned, report)
+        audits.assert_called_once()
         mocked_structured.assert_called_once()
         prompt, schema, stage = mocked_structured.call_args.args
         self.assertIs(schema, tcs_agent.CRITIC_SCHEMA)
@@ -187,6 +191,8 @@ class PromptAndCacheRegressionTests(unittest.TestCase):
         self.assertIn("STATEMENT:\nexact theorem", prompt)
         self.assertIn("CANDIDATE SOLUTION:\ncandidate proof", prompt)
         self.assertEqual(prompt.count(tcs_agent.CRITIC_MEMORY_PROMPT), 1)
+        self.assertIn("COMPLETED INDEPENDENT AUDITS", prompt)
+        self.assertEqual(mocked_structured.call_args.kwargs["attempts"], 1)
 
 
 class AuthorMemoryRegressionTests(unittest.TestCase):

@@ -5,11 +5,17 @@ statement or a structured algorithmic problem into a persistent Codex proof
 search, independently audits and repairs the candidate, then produces clean
 LaTeX.
 
+The Codex CLI is the local agent runtime for threads, goals, tools, and
+subagents. The original ChatGPT defaults remain in place: Sol with Ultra
+reasoning and Fast generation for every role. DeepSeek V4 Pro is an additional
+model option that uses the same harness pipeline through DeepSeek's official
+API.
+
 
 ## Install and run
 
-Requires Python 3.9+, and a Codex account with access to the models
-configured in the UI. Please install Codex CLI through this [official website](https://learn.chatgpt.com/docs/codex/cli).
+Requires Python 3.9+ and the Codex CLI. Install Codex CLI through this
+[official website](https://learn.chatgpt.com/docs/codex/cli).
 
 ```bash
 codex login
@@ -18,11 +24,73 @@ cd tcs-prover
 python3 web_ui.py
 ```
 
+The Web UI opens locally with the original Sol, Ultra, and Fast defaults for
+the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
+is needed only when you select DeepSeek for one or more roles.
+
+## How to use DeepSeek
+
+### 1. Obtain an official API key
+
+Create a key in your DeepSeek account. TCS Prover uses only
+`DEEPSEEK_API_KEY`; the key must belong to the official DeepSeek API account
+that will be billed for the model calls.
+
+### 2. Make the key available to TCS Prover
+
+In the same Terminal window where you will start the Web UI, run:
+
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+This lasts for the lifetime of that shell. Editing or updating TCS Prover does
+not erase the variable, so restarting from the same Terminal does not require
+another `export`. A newly opened Terminal does require it unless you add the
+same export to your shell startup configuration.
+
+To check the variable without printing the secret:
+
+```bash
+python3 -c 'import os; print("DeepSeek key is set" if os.environ.get("DEEPSEEK_API_KEY") else "DeepSeek key is missing")'
+```
+
+### 3. Start the Web UI
+
+From the repository directory:
+
+```bash
+python3 web_ui.py
+```
+
+Open **Advanced**, then select **DeepSeek V4 Pro — Official API** for any roles
+you want DeepSeek to handle. Selecting it for all four model roles means that
+the statement reviewer, author, three independent critic audits and
+coordinator, and LaTeX writer all use DeepSeek. A Codex/ChatGPT login is not
+required for roles that use DeepSeek.
+
+DeepSeek exposes `high` and `max` reasoning in this harness. The shared menu is
+normalized as follows: `low`, `medium`, and `high` run as DeepSeek `high`;
+`xhigh`, `max`, and `ultra` run as DeepSeek `max`. DeepSeek always uses Standard
+speed because the Fast service tier is specific to OpenAI models.
+
+The harness passes the selected key through environment-backed authentication
+to each relevant child process, injects an isolated
+Responses-provider configuration, and loads model metadata based on DeepSeek's
+[official Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/).
+It does not put the key in process arguments, edit `~/.codex/config.toml`, send
+the key through the UI, or save it in run artifacts.
+
+If the UI reports that `DEEPSEEK_API_KEY` is missing, stop the Web UI, export
+the key in the Terminal that will launch it, and start it again. If DeepSeek
+returns an authentication error, verify that this is an active official API
+key and that no extra quotation marks were copied into its value.
+
 You can type your open problem into the text box and click “Check Statement.” The system will first revise the statement to remove ambiguities and handle corner cases, then ask you to approve or reject the revised version.
 
 If you approve it, persistent reasoning will begin and continue until the time limit you set. The generated answer will then pass through a strict correctness-checking loop designed to catch errors. Finally, the output TeX file will be pruned for readability and returned as the final result.
 
-### Terminal runs from Markdown
+## Terminal runs from Markdown
 
 On a server without a browser, put the complete statement in any UTF-8 Markdown
 file. Paragraphs, quotes, mathematical backslashes, and line breaks can be
@@ -36,10 +104,11 @@ python3 web_ui.py statement.md
 This sends the entire file directly to the proof author, exactly like enabling
 **Skip statement review** in Statement mode. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
-web UI: 4 critic rounds, a 168-hour total workflow limit, Sol and Ultra for all proof
-roles, the built-in role prompts, and Fast generation speed.
+web UI: 100 critic rounds, a 168-hour total workflow limit, Sol with Ultra
+reasoning for all roles, the built-in role prompts, and Fast generation. The
+activity log requests concise public reasoning summaries by default.
 
-#### Optional settings
+### Optional settings
 
 Put overrides after the file or folder. The requested single-dash spelling,
 double-dash camelCase spelling, and conventional double-dash kebab-case spelling
@@ -52,16 +121,17 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-criticRounds N` | `4` | Critic rounds per author proof; `1` to `100`. |
+| `-criticRounds N` | `100` | Critic rounds per author proof; `1` to `100`. |
 | `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. It interrupts an active author, but not an active critic or the final LaTeX editor. |
-| `-authorModel MODEL` | `gpt-5.6-sol` | Author model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
-| `-criticModel MODEL` | `gpt-5.6-sol` | Critic model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
-| `-writerModel MODEL` | `gpt-5.6-sol` | LaTeX writer model: `gpt-5.6-sol`, `gpt-5.6-terra`, or `gpt-5.6-luna`. |
+| `-authorModel MODEL` | `gpt-5.6-sol` | Author model: `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
+| `-criticModel MODEL` | `gpt-5.6-sol` | Critic model: the same four choices. |
+| `-writerModel MODEL` | `gpt-5.6-sol` | LaTeX writer model: the same four choices. |
 | `-reasoningEffort LEVEL` | `ultra` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. |
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
 | `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
-| `-speedMode MODE` | `fast` | `fast` for 1.5x generation or `standard` for normal speed. Fast uses credits at a higher rate. |
+| `-speedMode MODE` | `fast` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation. DeepSeek calls always use standard service because Fast is provider-specific. |
+| `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. |
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
 | `-finalPromptFile PATH` | built-in prompt | Load a UTF-8 LaTeX prompt. |
@@ -69,7 +139,86 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 Prompt-file paths are resolved from the terminal's current working directory.
 Run `python3 web_ui.py --help` to see every spelling and allowed value.
 
-#### Parallel folder runs
+## How to use checkpoints
+
+TCS Prover writes durable artifacts while a job progresses. When the Web UI is
+started again, it scans `runs/*/transcript.jsonl`, restores the historical job
+cards, and lists every resumable critic checkpoint found in those run folders.
+You do not need to keep the old browser tab open.
+
+The home-page checkpoint buttons have exact stage semantics:
+
+| Checkpoint shown | What is already saved | What continuation runs |
+| --- | --- | --- |
+| **Saved proof candidate** | Checked statement and complete proof | Starts a fresh three-auditor critic review; later audit files are intentionally not reused when this earlier checkpoint is selected. |
+| **Independent audits 1/3** or **2/3** | Candidate plus the displayed completed reports | Restores those reports and runs only the missing auditors. |
+| **Independent audits 3/3** | Candidate plus all three reports | Skips all auditors and starts coordinator adjudication. |
+| **Critic coordinator — failed/interrupted** | Candidate and all three reports | Retries only the coordinator. |
+
+To continue from the Web UI:
+
+1. Stop the old server if it is still running, then run `python3 web_ui.py`.
+2. On the home screen, locate the historical job by its full start/finish time.
+3. Click the continuation button beside the checkpoint you want.
+4. Confirm the action. TCS Prover creates a new job and opens it immediately.
+
+The source run is never overwritten. The new job copies the selected candidate,
+compatible audit checkpoint, role prompts, model choices, reasoning efforts,
+speed, critic-round limit, and workflow time limit. Old saved model routes that
+are no longer selectable are migrated to the official DeepSeek model when the
+job is restored.
+
+Audit reuse requires an exact proof, model, effort, prompt, and schema match;
+an incompatible audit file is ignored while the earlier proof-candidate
+checkpoint remains available. Very old runs that predate `job-settings.json`
+can restore only choices visible in their transcript. A role that never ran has
+no recorded model choice and therefore uses the current default when resumed.
+The continuation confirmation names these unknown legacy roles before a new
+paid request starts.
+
+A checkpoint exists only after a complete artifact has been written. It cannot
+restore the middle of an in-flight model response or its private reasoning. If
+a process stops between two checkpoints, continuation begins from the most
+recent checkpoint listed on the job card.
+
+### Continue a manually stopped job
+
+Jobs stopped with the Web UI's **Stop** button remain visible as **Stopped at
+review**, **solve**, **repair**, **critic**, **final**, or **failure** after the
+server is restarted. On the home page, use the stage-specific continuation
+button:
+
+| Stopped stage | Button | Continuation boundary |
+| --- | --- | --- |
+| Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
+| Proof author, repair, or interrupted failure summary | **Continue proof author** | Starts a new author thread with the exact checked statement and any compatible `author-memory.json`, and re-queues saved live user instructions. It does not treat visible partial text as a complete proof. A stopped repair originating from critic-resume safely re-enters its critic checkpoint instead, preserving the recovery assignment. |
+| Critic | **Continue critic** | Restores the latest compatible proof and paid independent-audit checkpoint, so completed audits are not repeated. |
+| LaTeX editor | **Retry LaTeX editor** | Starts only the final editor from `final-input.json`, using the normal workflow's original statement-plus-latest-solution prompt contract. LaTeX-only jobs reuse `latex-input.md` and their separate polish contract. Older jobs without an exact final input safely fall back to their latest critic checkpoint. |
+
+Every action creates a new run folder and leaves the stopped source run
+unchanged. An interrupted provider request, model context, subagent process, or
+private reasoning cannot be resumed. Review and final requests therefore retry
+from their exact saved public input, while author continuation uses the bounded
+controller-maintained durable memory. Historical runs created before
+`manual-stop.json` are recognized from their existing `Stop requested`
+transcript entry.
+
+### Command-line fallback
+
+If a run contains `SOLUTION.md` or `saved-candidate.md` but no checkpoint button
+is available, open a new critic job explicitly:
+
+```bash
+python3 web_ui.py --resume-critic runs/2026-08-26_16-33-26_example
+```
+
+This loads the saved complete proof, checked statement, audit checkpoint when
+present, and role prompts into a new browser-visible job. A clean critic pass
+continues to the LaTeX editor. A critic rejection returns the exact candidate
+and bug report to the normal proof-author repair loop; the harness workflow is
+not shortened or replaced.
+
+## Parallel folder runs
 
 Passing a folder starts an independent proof for every top-level `.md` file in
 that folder:
@@ -96,7 +245,7 @@ The exit status is `0` when every proof succeeds, `1` for invalid input or any
 failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder jobs and
 their subprocess trees.
 
-#### Read a transcript as a human narrative
+## Read a transcript as a human narrative
 
 `transcript.jsonl` is the complete machine-readable event log and is deliberately
 verbose. The local browser viewer organizes workflow stages, public reasoning
@@ -134,13 +283,28 @@ Choose **Statement** to review or edit a rough problem before approval. Choose
 **Algorithmic** to specify the model of computation, problem description, and
 asymptotic upper- or lower-bound goal; these fields go directly to the proof
 author without a statement-review step.
-**Advanced** controls each node's model, reasoning effort, prompt, workflow time
-limit, and critic-round limit. Its **Statement review only** option runs just the
-reviewer, saves the checked statement and reviewer notes, and finishes without
+**Advanced** controls each node's model, reasoning effort, prompt, public
+activity-log detail, workflow time limit, and critic-round limit. The log can
+show status only or request concise or detailed model-generated summaries; a
+provider may not return a summary for every reasoning step. Private
+chain-of-thought is never displayed or saved. Its **Statement review only**
+option runs just the reviewer, saves the checked statement and reviewer notes,
+and finishes without
 starting the proof author, critic, or LaTeX editor. This option and **Skip
 statement review** are mutually exclusive. Jobs run in parallel. **Show
 details** displays the exact application prompts and returned model text.
 Private records and outputs are stored under `runs/`.
+
+Every job card shows its full local start and finish date and time, including
+seconds. Active jobs show that they have not finished yet, so repeated problem
+titles remain distinguishable.
+
+While a proof author or author repair is running, **Guide the running proof
+author** sends a live instruction into that same author turn. The prefilled
+instruction stops further experiments and code execution and redirects the
+author to symbolic proof work. This does not restart the Goal or replace the
+thread. The control is intentionally unavailable during statement review,
+critic audits, failure summaries, and final LaTeX editing.
 
 ## Workflow
 
@@ -192,6 +356,12 @@ the corresponding field. Restart the local server after editing a catalog.
 The author uses the durable-state, multi-agent prompt adapted from OpenAI's
 [Cycle Double Cover prompt](https://cdn.openai.com/pdf/04d1d1e4-bc75-476a-97cf-49055cd98d31/cdc_prompt.pdf).
 
+All author models run inside the same Codex app-server lifecycle. The controller
+sets the same persistent Goal through `thread/goal/set`, enables the same native
+multi-agent tools, and uses the same continuation, deadline, compaction, and
+memory logic. When DeepSeek V4 Pro is selected, only the model provider changes;
+subagents inherit that author thread's selected provider and base model.
+
 The author keeps the Goal active: a blocked or prematurely ended author turn is
 continued until it returns a solution or reaches the user-set total elapsed-time
 limit. The web limit uses the same clock displayed at the top of the page, so
@@ -221,7 +391,25 @@ survives a fresh check. The critic therefore do the job again and repairs every 
 fresh critic. Unresolved bugs go back to the author. Only a clean pass exits the
 loop. This catches both structural gaps and also fixable bugs.
 
-“Independent” here means fresh contexts and subagents. A human or different-family review remains advisable.
+“Independent” here means fresh contexts. A human or different-family review
+remains advisable. The Python controller launches three explicit auditor model
+requests concurrently, each with the full statement and candidate plus a
+distinct hostile-audit focus. It verifies that all three return before starting
+a separate coordinating critic. The coordinator cannot spawn or wait for
+subagents, eliminating model-managed spawn and payload-delivery failures.
+Structured requests emit a controller heartbeat every 30 seconds. Each
+heartbeat verifies that the local request process is alive and separately
+reports lifecycle events and actual content events; DeepSeek does not expose
+whether a silent server-side request is computing or queued. DeepSeek auditors
+remain at `high` effort and receive one thirty-minute attempt; the coordinator
+also receives one thirty-minute attempt at the selected critic effort. A
+completed independent audit is checkpointed immediately, and a critic resume
+searches sibling jobs for exact-proof matches instead of paying to repeat them,
+even if the original proof job was selected by mistake. Failed model launches
+retain a bounded, credential-redacted provider/CLI diagnostic. A stalled request
+cannot silently trigger another equally expensive retry. Structured role
+prompts include the JSON contract explicitly because V4 Pro supports JSON
+output but does not natively enforce arbitrary JSON Schema.
 
 ### 4. LaTeX editor
 
