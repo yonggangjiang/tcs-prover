@@ -1,6 +1,0 @@
-[
-  {
-    "name": "Isomorphism",
-    "description": "Let A be a graph problem that takes a graph G = (V,E) (possibly with edge weights) as input and produces an output denoted by A(G). An algorithm in the isomorphic-instance preprocessing model has two phases. Preprocessing: The algorithm receives k prior instances G_1,...,G_k, each with n vertices and m edges, together with their answers A(G_1),...,A(G_k). It constructs a data structure D from these graphs and answers. Query: The algorithm receives D and a new instance H with n vertices and m edges. If H is isomorphic to some G_i, the algorithm must output A(H). If H is not isomorphic to any G_i, the algorithm may either output A(H) exactly or correctly report that H is not isomorphic to any prior instance. Two graphs are isomorphic if there exists a bijection between their vertex sets that preserves edges and non-edges (in case the graph has edge weights, the edge weights should also be preserved). The complexity of an algorithm in this model is measured by its preprocessing time and query time as functions of n, m, and k."
-  }
-]

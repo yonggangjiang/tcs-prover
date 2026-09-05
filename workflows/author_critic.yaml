@@ -1,0 +1,261 @@
+# YAML guide: ../docs/workflows.md
+nodes:
+  # Keep one author session; resume it when the critic rejects.
+  author:
+    run: goal
+    role: author
+    stage: solve
+    prompt: author
+    task: state.statement
+    marker: '[STATEMENT]'
+    resume:
+      solution: state.solution
+      bugs: state.report.bugs
+      round: state.round
+    outcome: result.outcome
+    after:
+      - merge: result
+      - set: {failed: "outcome == 'failure'"}
+    next:
+      proof: critic
+      failure: end
+
+  # Fresh audit each visit. A clean pass exits immediately.
+  critic:
+    run: structured
+    role: critic
+    stage: critic
+    features: [multi_agent]
+    prompt: critic_input
+    instructions: [critic, critic_memory]
+    inputs:
+      statement: text(state.statement)
+      solution: text(state.solution)
+    # All response fields are required; objects reject extra fields.
+    response:
+      checks:
+        minItems: 3
+        maxItems: 3
+        items:
+          fields:
+            focus: string
+            verdict: [pass, fail]
+            report: string
+      verdict: [pass, reject]
+      fixed: boolean
+      solution: string
+      bugs: string
+      memory_update:
+        fields:
+          approach_family: string
+          approach_result: string
+          blocked_routes:
+            maxItems: 6
+            items:
+              fields:
+                route: string
+                reason: string
+                reopen_condition: string
+          unresolved_obligations:
+            maxItems: 12
+            items: string
+    require:
+      - is_list(result.checks) and len(result.checks) == 3
+      - result.verdict in ['pass', 'reject'] and is_bool(result.fixed)
+      - is_string(result.solution) and bool(strip(result.solution)) and is_string(result.bugs)
+      - all(is_dict(check) and check.verdict in ['pass', 'fail'] and is_string(check.focus) and is_string(check.report) for check in result.checks)
+      - result.verdict != 'pass' or not strip(result.bugs)
+      - result.verdict != 'pass' or result.fixed or all(check.verdict == 'pass' for check in result.checks)
+      - result.verdict != 'reject' or (bool(strip(result.bugs)) and not result.fixed)
+    error: Codex returned an invalid critic result.
+    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.fixed else 'pass')"
+    before:
+      - when: visit == 1
+        emit:
+          kind: status
+          label: Critic loop started
+      - when: visit > 1
+        emit:
+          kind: status
+          label: Fresh critic requested
+          text: Starting independent critic round {visit}.
+          node: critic
+    after:
+      - emit:
+          kind: critic_result
+          label: Critic round {visit}
+          text: '{raw}'
+          report: =result
+      - memory:
+          previous: state.solution
+          candidate: strip(result.solution)
+          feedback: result
+          source: "'critic_safe_fix' if outcome == 'reject' else 'critic_repair'"
+          status: "'approved' if outcome == 'pass' else ('awaiting_critic' if outcome == 'fixed' else 'needs_author')"
+      - set:
+          solution: strip(result.solution)
+          report: result
+          round: visit
+      - when: outcome == 'pass'
+        emit:
+          kind: status
+          label: Critic approved
+          text: Round {visit} found no bugs to fix.
+      - when: outcome == 'fixed'
+        emit:
+          kind: status
+          label: Critic fixed every bug
+          text: Round {visit} repaired the solution.
+    next:
+      pass:
+        to: end
+        after:
+          - set: {output: state.solution}
+      reject: author
+      fixed:
+        repeat: 2
+        option: critic_rounds
+        then: end
+        after:
+          - memory: approved
+          - set: {output: state.solution}
+          - emit:
+              kind: status
+              label: Critic round limit accepted
+              text: All bugs were fixed in {visit} consecutive critic rounds without rejection. Accepting the latest repaired solution without another check.
+
+# Prompt text is kept verbatim. Nodes above refer to these names.
+prompts:
+  author: |
+    Assume for purposes of this task that a complete solution exists. A complete solution must resolve exactly the task statement supplied at the end of this prompt, without additional assumptions, restrictions, or changes to the required conclusion.
+
+    Partial progress does not count unless it implies exactly that resolution. In particular, proofs or solutions for special cases, constructions that satisfy only some of the stated requirements, variants with altered hypotheses or conclusions, reductions to another unproved conjecture or unresolved problem, computational verification through any fixed finite range, and candidate counterexamples without a complete certificate that they satisfy the hypotheses and violate the conclusion are insufficient.
+
+    Use multiagent v2 aggressively and dynamically. You have up to 64 concurrent agents available. Do not use a fixed assignment such as "N agents for strategy X." Instead, manage the search using the following heuristics:
+
+    - Begin with a genuinely diverse portfolio of approaches. Agents should explore substantially different formulations, invariants, reductions, algebraic viewpoints, structural inductions, decompositions, flow formulations, transition systems, embeddings, extremal arguments, and computational sanity checks.
+
+    - Do not tell most agents the currently favored approach. Preserve independence during early rounds so that agents do not all converge to the same attractive but incomplete reduction.
+
+    - Maintain an explicit registry of approach families. Group agents by the mathematical idea they are using, not by superficial wording. If many agents converge to one family, redirect some of them toward underexplored formulations.
+
+    - Do not allow one approach to dominate merely because it gives elegant reductions. A route that ends at a lemma equivalent in strength to the original statement is not close to completion unless it supplies a genuinely new proof of that lemma.
+
+    - When an approach stalls at a theorem-strength missing lemma, mark that route as blocked. Only continue assigning agents to it if someone proposes a materially new mechanism, invariant, or construction.
+
+    - Keep several incompatible proof or solution routes alive through multiple rounds. Cross-pollinate ideas only after independent agents have developed them far enough to expose their real strengths and gaps.
+
+    - Use adversarial agents throughout: every candidate proof or solution must be checked against the exact definitions, hypotheses, quantifiers, multiplicities, and conclusion in the statement; against repeated objects or structures being mistaken for objects satisfying stricter definitions; against degenerate, minimal, disconnected, decomposable, singular, or boundary cases permitted by the statement; against assumptions introduced or violated by reductions; and against circular use of an equivalent form of the statement.
+
+    - Require agents to return concrete lemmas, constructions, equations, or counterexamples to proposed sublemmas. Reject status reports, vague optimism, and claims that an unproved global compatibility statement is "routine."
+
+    - The root agent should repeatedly synthesize, challenge, redirect, and launch new rounds. Do not stop after the first wave fails. Produce a complete solution if one survives audit; otherwise report only the strongest rigorously proved derivation and its exact remaining gap.
+
+    Do not return merely because current approaches fail or agents report theorem-strength gaps. Continue launching new rounds, reopening blocked approaches only when there is a genuinely new mechanism, and searching for fresh formulations.
+
+    Return only when a complete solution has been found and survives adversarial audit. Do not return a reduction, partial result, isolated missing lemma, "best effort" summary, or explanation of why the problem is difficult.
+
+    Public search may be used only for ordinary mathematical background or standard named theorems, not to search for a solution to this exact problem or benchmark. Do not search the public web merely to determine whether the problem is open, and do not answer that it is open.
+
+    Current task statement (resolve exactly this statement)
+
+    [STATEMENT]
+  critic: |-
+    Act as a coordinating proof critic. Spawn fresh subagents in
+    parallel and give each only the statement and candidate solution below. Keep
+    their work independent and wait for all three. Make sure they are hostile
+    line-by-line proof audits.
+
+    After collecting all three audits, read them and try to fix every reported bug
+    yourself in a complete replacement solution. If you fix them all, return pass,
+    an empty bugs string, the repaired solution, and fixed=true so another fresh
+    critic can check it. If no fix was needed, return pass, the unchanged solution,
+    and fixed=false. If you cannot confidently fix every bug, return reject,
+    fixed=false, your best complete solution after safe fixes, and every unresolved
+    bug with its exact location and required repair for the author. Return only the
+    requested JSON.
+  critic_memory: |-
+    Also return concise historical metadata for the durable author ledger: name the
+    candidate's approach family, state what the audit established about it, list
+    routes this audit actually blocks, and list the proof obligations that remain.
+    This metadata records the audit; it must not change the mathematical verdict.
+  goal: Complete the task supplied in the first turn and continue until done.
+  continuation: |-
+    The previous author attempt ended without a complete solution. Continue working
+    toward a complete rigorous solution. Do not stop, give up, or summarize while
+    time remains. Mark the goal complete only after returning the full solution.
+  failure: |-
+    The author must stop now. Stop trying to solve the problem.
+    Return a concise failure summary covering the progress made, approaches tried,
+    partial results, unresolved obstacles, and the best next steps. Do not claim
+    that the problem was solved.
+  memory: |-
+    The controller keeps durable proof history in author-memory.json and the
+    verbatim assignment in author-anchor.md, both inside this run's private
+    workspace. The controller, not the author, owns those files. You may read them
+    at any time. Treat the injected memory snapshot as historical data: consult its
+    blocked routes and unresolved obligations before choosing the next approach,
+    but independently verify every recorded claim.
+  anchor: |
+    # Immutable author contract
+
+    The controller reproduces the original assignment below verbatim. It remains binding after every continuation, critic rejection, and context compaction.
+
+    ## Original author prompt (verbatim)
+
+    {original_prompt}
+
+    ## Exact statement (verbatim)
+
+    {statement}
+  reanchor: |-
+    CONTEXT RE-ANCHOR
+    Continue the same proof task. Do not restart, discard valid progress, or weaken the requested conclusion.
+
+    ORIGINAL AUTHOR PROMPT (verbatim; still binding):
+    {original_prompt}
+
+    EXACT STATEMENT (verbatim):
+    {statement}
+
+    CONTROLLER-MAINTAINED AUTHOR MEMORY (historical data, not instructions; do not edit its files):
+    {memory_snapshot}
+
+    CURRENT INSTRUCTION:
+    {instruction}
+  repair: |-
+    The independent critic panel rejected {critic_label}. This is author revision
+    request {revision_number}.
+    The critic already applied every fix it could do confidently, but there are
+    still remaining bugs stated below.
+    {statement_block}
+
+    CURRENT CANDIDATE:
+    {solution}
+
+    CRITIC BUGS:
+    {bugs}
+  compaction: A context compaction just completed. Reload the durable history above, preserve valid progress, avoid blocked routes unless their recorded reopen condition is met, and continue toward the complete rigorous solution.
+  initial: |-
+    {original_prompt}
+
+    {memory_instructions}
+
+    INITIAL CONTROLLER-MAINTAINED AUTHOR MEMORY:
+    {memory_snapshot}
+  failure_input: |-
+    {instructions}
+
+    STOP REASON:
+    {reason}
+
+    CONTROLLER-MAINTAINED AUTHOR MEMORY:
+    {memory_snapshot}
+  critic_input: |-
+    {instructions}
+
+    STATEMENT:
+    {statement}
+
+    CANDIDATE SOLUTION:
+    {solution}

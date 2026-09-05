@@ -1,6 +1,0 @@
-[
-  {
-    "name": "APSP",
-    "description": "The input is a simple directed graph G=(V,E) with non-negative integer edge weights w satisfying 0 ≤ w(e) ≤ n^(O(1)). For u,v ∈ V, let D_G(u,v) be the minimum total weight of a directed u-to-v path, with D_G(u,v)=+∞ if no such path exists. The output of the problem is D_G(u,v) for every pair of u,v in V."
-  }
-]

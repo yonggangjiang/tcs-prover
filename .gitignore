@@ -1,22 +1,12 @@
-# Private problem records and model transcripts
-runs/
-.codex-structured-workspace/
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.venv/
-venv/
-build/
-dist/
-*.egg-info/
-
-# Local credentials and editor/OS files
-.env
-.env.*
-!.env.example
-.gh-config/
-.DS_Store
-.idea/
-.vscode/
+*
+**/
+!transcript/
+!transcript/**/*
+!ui/
+!ui/**/*
+!workflows/
+!workflows/**/*
+!.gitignore
+!README.md
+!web_ui.py
+!workflow_runner.py

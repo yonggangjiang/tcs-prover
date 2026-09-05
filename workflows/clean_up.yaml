@@ -1,0 +1,59 @@
+# YAML guide: ../docs/workflows.md
+nodes:
+  latex_editor:
+    run: structured
+    role: writer
+    stage: final
+    prompt:
+      when: "'solution' in state"
+      then: proof_input
+      else: source_input
+    instructions: final
+    inputs:
+      statement: "text(state.statement) if 'solution' in state else ''"
+      solution: "text(state.solution) if 'solution' in state else ''"
+      source: "text(state.source) if 'solution' not in state else ''"
+    response: {latex: string}
+    require:
+      - is_string(result.latex) and bool(strip(result.latex))
+    error: Codex returned an invalid final proof.
+    after:
+      - set: {output: strip(result.latex)}
+      - when: "'solution' in state"
+        set: {solution: state.output}
+      - when: "'solution' not in state"
+        set: {source: state.output}
+      - emit:
+          kind: final_result
+          label: Final LaTeX proof
+          text: '{raw}'
+          output: =state.output
+    next: end
+
+# Prompt text is kept verbatim. Nodes above refer to these names.
+prompts:
+  final: |-
+    Act as the TCS editor and turn the solution below into a latex proof. Preserve its mathematical
+    content while removing repetition and process commentary. Produce a
+    cleaned-up, self-contained, organized, rigorous, readable LaTeX proof
+    with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper in a tree-like structure:
+    (1) Use definitions and terminologys following the convention of previous works, if there are any,
+    (2) For algorithmic tasks, split the proof into algorithm description, correctness proof, and complexity analysis,
+    (3) Each section and subsectionstarts with a clear statement of the theorem or lemma being proved, the proof should also be well-structures and splits into lemmas if necessary.
+    (4) Each new definition and lemma should have a short explanation of motivation and context before introducing it.
+    (5) Expand on any ambiguous or underspecified details in the proof, and provide clear explanations for any non-trivial steps or reasoning.
+    The final output should be a complete LaTeX document that can be compiled without errors.
+    Return only the requested JSON.
+  proof_input: |-
+    {instructions}
+
+    STATEMENT:
+    {statement}
+
+    LATEST SOLUTION:
+    {solution}
+  source_input: |-
+    {instructions}
+
+    THEOREM AND PROOF TO POLISH:
+    {source}
