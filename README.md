@@ -1,17 +1,18 @@
 # TCS Prover
 
-A local web UI that turns a theoretical-computer-science statement into recorded
-research rounds: propose diverse approaches, check them against earlier work,
-register one approach, explore it, and independently review the result. Complete
-candidates receive three independent audits and a coordinating critic before
-LaTeX editing and final verification. Algorithmic tasks can be entered as statements too.
+A local web UI that gives one persistent author LLM a mathematical statement,
+lets it work through diverse approaches while maintaining three readable memory
+files, independently audits its candidate, and produces verified LaTeX.
+Algorithmic tasks can be entered as statements too.
 
 For a concrete explanation without coding knowledge, follow the
-[manual worker guide](docs/manual_workflow.md). It gives the exact prompts, their
-order, the files to maintain, and the decisions to make with a basic LLM and a laptop.
+[manual worker guide](docs/manual_workflow.md). It gives the exact author
+prompt, how to maintain the three files, when to continue the same conversation,
+and when to hand a complete candidate to the unchanged critic.
 
-The Codex CLI is the local model-call runtime. Persistent research state belongs
-to the controller and its permanent archive, rather than one long conversation.
+The Codex CLI provides the local author session and model-call runtime. The
+author keeps the same conversation while it works; files preserve its assignment,
+attempt history, and proved results across interruptions or context compaction.
 Astra with Ultra reasoning and Fast generation are the defaults for every
 role. DeepSeek V4 Pro is an additional
 model option that uses the same harness pipeline through DeepSeek's official
@@ -134,7 +135,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-criticRounds N` | `2` | At N consecutive repaired rounds, save **verification incomplete**; `1` to `100`. Every changed proof needs a fresh audit. A clean unchanged pass accepts; rejection resets the count. |
-| `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. Bounds research, critic, and final model calls. Completed work and the next step are retained when time runs out. |
+| `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
 | `-authorModel MODEL` | `gpt-6-astra` | Author model: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
 | `-criticModel MODEL` | `gpt-6-astra` | Critic model; same choices as the author. |
 | `-writerModel MODEL` | `gpt-6-astra` | LaTeX writer model; same choices as the author. |
@@ -204,34 +205,32 @@ button:
 | Stopped stage | Button | Continuation boundary |
 | --- | --- | --- |
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
-| Proof author, repair, or interrupted failure summary | **Continue proof author** | Restores the exact statement, complete research archive, pending research step, historical notebooks, and saved user instructions. It does not treat visible partial text as a complete proof. A stopped repair originating from critic-resume safely re-enters its critic checkpoint instead. |
+| Proof author, repair, or interrupted failure summary | **Continue proof author** | Restores `INITIAL_PROMPT.md`, `APPROACHES.md`, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads those files before continuing. Visible partial text is not treated as a complete proof. |
 | Critic | **Continue critic** | Restores the latest compatible proof and paid independent-audit checkpoint, so completed audits are not repeated. |
 | LaTeX editor | **Retry LaTeX editor** | Restores `final-input.json` and runs editing, independent content-preservation review, and local compilation when available. LaTeX-only jobs reuse `latex-input.md`. Older jobs without an exact final input safely fall back to their latest critic checkpoint. |
 
 Every action creates a new run folder and leaves the stopped source run
-unchanged. An interrupted provider request, model context, subagent process, or
-private reasoning cannot be resumed. Review and final requests therefore retry
-from their exact saved public input, while research continuation uses the complete
-controller-maintained archive and saved next step. Historical runs created before
+unchanged. An in-flight request or inaccessible private reasoning cannot be
+recovered as a completed answer. Review and final requests retry from their
+exact saved public input. The author resumes its existing conversation when
+available, or reads its three memory files in a fresh conversation. Historical runs created before
 `manual-stop.json` are recognized from their existing `Stop requested`
 transcript entry.
 
 ### Command-line fallback
 
-Resume persistent research from its last completed step with a new time budget:
+Continue a stopped author with its saved notebooks and a new time budget:
 
 ```bash
 python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN
 python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN --thinking-hours 24
 ```
 
-This opens a continued browser-visible job. The source run is unchanged. The
-new run carries the complete SQLite archive and readable notebooks; saved
-settings remain in effect unless explicitly overridden. All continuation
-paths, including critic and final checkpoints, preserve the research history.
-Old `FAILED.md`, `PROVED.md`, `REGISTRY.md`, and legacy memory files are retained
-and imported as historical evidence. Prompt updates do not discard history;
-an archive for a different exact statement is rejected rather than overwritten.
+This opens a continued browser-visible job and leaves the source run unchanged.
+The new run carries the author's three memory files; saved settings remain in
+effect unless explicitly overridden. The full initial assignment is preserved
+rather than reconstructed from a short summary. Critic and finalization
+checkpoints retain their separate review artifacts.
 
 If a run contains `SOLUTION.md` or `saved-candidate.md` but no checkpoint button
 is available, open a new critic job explicitly:
@@ -325,9 +324,8 @@ seconds. Active jobs show that they have not finished yet, so repeated problem
 titles remain distinguishable.
 
 While a proof author or author repair is running, **Guide the running proof
-author** records a live instruction for the next research step. It does not
-discard the active archive or restart the research project. Research rounds
-already use explicit arguments without shell, web, or subagent tools. The
+author** sends a live instruction into the running author session. It does not
+discard the memory files or restart the problem. The
 control is intentionally unavailable during statement review,
 critic audits, failure summaries, and final LaTeX editing.
 
@@ -335,18 +333,15 @@ critic audits, failure summaries, and final LaTeX editing.
 
 ```mermaid
 flowchart TD
-    S["Optional statement review"] --> A["Plan 3–5 directions"]
-    A --> N["Novelty check against permanent history"]
-    N -- "reject" --> A
-    N -- "approve + controller gates" --> E["Register and explore one approach"]
-    E --> R["Review and record every result"]
-    R -- "incomplete or refuted" --> A
-    R -- "complete candidate" --> C["Three auditors + coordinator"]
-    C -- "reject" --> A
+    S["Optional statement review"] --> A["One persistent author LLM"]
+    A <--> M["INITIAL_PROMPT.md · APPROACHES.md · PROVED.md"]
+    A -- "continue another approach" --> A
+    A -- "complete candidate" --> C["Three auditors + coordinator"]
+    C -- "reject: exact bugs" --> A
     C -- "changed proof: fresh audit" --> C
     C -- "unchanged pass" --> L["LaTeX editor"]
     L --> V["Independent content check + compilation"]
-    A -. "time limit or interruption" .-> P["Preserve checkpoint and resume later"]
+    A -. "time limit or interruption" .-> P["Preserve files and continue later"]
     C -. "repair limit" .-> P
 ```
 
@@ -366,58 +361,48 @@ the target impossible. The review step states the intended convention and writes
 it as `(m+n) log² n` instead of letting that mismatch
 derail the proof search.
 
-### 2. Persistent research rounds
+### 2. One persistent author and three memory files
 
-The default author node uses `run: research`. It makes separate structured
-calls for planning, novelty assessment, one registered exploration, and an
-independent result review. The planner supplies three to five proposals. Before
-assignment the controller searches earlier records, asks a fresh assessor to
-compare mechanisms and obstacles, blocks previously assigned identical
-mechanisms, and excludes the two most recently assigned families. A reopening
-requires existing record IDs and concrete new evidence; a changed mechanism is
-still required.
+The default author uses one goal-based LLM session. It receives the statement
+and a complete search strategy, explores ideas, checks its own arguments,
+records its work, and keeps choosing new directions. There are no separate
+planner, novelty assessor, or research-result reviewer calls inside the author.
+The independent critic still checks any completed candidate afterward.
 
-Every exploration returns a full result card, even when it is incomplete.
-The next reviewer records exactly what failed, the evidence, the condition for
-reopening, and any reusable partial result with its assumptions. Missing
-arguments, refuted subclaims, and interrupted requests have different meanings.
-A reviewed full candidate enters the critic; other results inform the next
-portfolio. Research calls have no shell, web, or subagent tools, so recorded
-claims must be supported by explicit arguments rather than invented experiments.
+The author has exactly three memory files in its run folder:
 
-`research.sqlite3` permanently stores complete public prompts, raw responses,
-research cards, candidate text, reviews, decisions, and checkpoints. Events are
-append-only. SQLite transactions commit a result and its next-step checkpoint
-together. Completed responses are cached for recovery. Disk errors stop further
-work; they do not silently discard research. The exact statement identifies the
-archive; changed prompts/settings become new recorded versions.
-
-Readable views live under `research/`:
-
-| Artifact | Contents |
+| File | Contents |
 | --- | --- |
-| `STATEMENT.md` | Exact original task. |
-| `records/eNNNNNN.md` | Complete readable event cards, retained permanently. |
-| `INDEX.md` | Recent navigation and counts; older cards remain available. |
-| `STATE.md` | Current workbench, open issues, recent families, and saved next step; large caches are summarized. |
-| `FAILED.md` | Rejected, failed, and unfinished work, distinguished by status. |
-| `PROVED.md` | Reviewed results and candidate arguments with their review status; not a blanket claim of formal proof. |
+| `INITIAL_PROMPT.md` | The complete original author prompt, including the exact statement and search strategy. The runner creates it once and preserves it unchanged. |
+| `APPROACHES.md` | Every attempted approach, with a stable ID, mechanism, assumptions, detailed work, current status, failed steps, remaining obstacles, and a concrete condition for revisiting it. |
+| `PROVED.md` | Only fully justified positive or negative lemmas, with exact assumptions, complete arguments, and links to their originating approach IDs. |
 
-Only model briefings and navigation indexes are shortened. The full archive is
-never pruned. Models can search the entire relevant history or request a
-record by ID in successive 16,000-character sections. Reopening repairs missing
-Markdown exports from SQLite. Continuation copies the database consistently and
-regenerates readable views without changing the source run.
+The model maintains `APPROACHES.md` and `PROVED.md` itself. Before trying a
+route, it reads the relevant earlier attempts, compares the actual mechanism
+and obstacle, and explains any substantive difference or satisfied reopening
+condition. Merely renaming an old dead end does not count as a new idea.
+Unfinished arguments and suspected counterexamples remain in `APPROACHES.md`;
+only completely proved results belong in `PROVED.md`. A proved obstruction to
+one method is not a refutation of the original statement unless its proof
+actually establishes that conclusion.
 
-The shared workflow deadline bounds research, critic, and final model calls.
-When a time/repair limit or a repeated request failure stops progress, the next
-step remains saved. `--resume-research` starts a continued job with a new budget.
-This is resumable research, not an indefinitely running background service.
+While the process runs, the author continues in the same conversation. On
+context compaction or continuation it rereads the initial assignment and
+memory files. After an interruption it resumes that conversation when available;
+otherwise it starts a fresh conversation and reads the same three files. The
+runner initializes missing notebooks but does not replace existing research
+with generated summaries or an author SQLite database.
 
-The program enforces registration, exact repeats, and recent-family rotation.
-The novelty assessor's comparison of differently worded ideas remains a model
-judgment and can be wrong. These checks reduce repeated dead ends; they do not
-guarantee semantic novelty or a useful discovery on every round.
+This design depends on the author's adherence to the notebook and novelty
+instructions. It makes its history readable and available; it does not
+mechanically prove that two differently worded ideas are different or guarantee
+that every unsuccessful internal thought was written down. Public transcripts,
+critic checkpoints, and final documents remain separate operational artifacts.
+
+The shared deadline still bounds author, critic, and final model calls. A
+stopped author preserves its best recorded work and outstanding tasks rather
+than claiming a solution. `--resume-research` is the continuation entry point
+for the saved author notebook and conversation.
 
 ### 3. Independent critic
 
@@ -431,7 +416,7 @@ The controller compares returned candidate text rather than trusting the
 critic's `fixed` flag. A changed proof requires another fresh three-auditor
 round. Reaching the consecutive repaired-round limit (default 2) saves
 **verification incomplete** instead of accepting an unchecked repair. A
-rejection returns its exact bugs and safely repaired candidate to research.
+rejection returns its exact bugs and safely repaired candidate to the author.
 
 Open obligations have stable IDs. They persist until the critic resolves each
 supplied ID with explicit evidence. Silence about an issue does not clear it,
@@ -457,14 +442,15 @@ LaTeX-only polishing uses the same preservation and final checks.
 ## Project structure
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
-engine and model transport; `persistent_research.py` manages research rounds,
-and `research_journal.py` owns the permanent archive. `web_ui.py` launches the UI or Markdown proof jobs. The
+engine and model transport; `goal_runtime.py` manages the persistent author
+session. The three author notebooks remain plain Markdown files. `web_ui.py` launches the UI or Markdown proof jobs. The
 `workflows/` directory contains exactly two YAML definitions:
 
 ```text
 workflow_runner.py          Graph engine, model transport, and workflow CLI
-persistent_research.py      Registered research rounds and novelty gates
-research_journal.py         Durable SQLite archive and readable notebooks
+goal_runtime.py             One persistent author session and its configured files
+persistent_research.py      Critic/final checkpoint and review-memory adapters
+research_journal.py         Critic/final archive and readable review artifacts
 latex_verification.py       Restricted local document compilation
 web_ui.py                   UI and Markdown-job launcher
 workflows/
@@ -479,7 +465,7 @@ ui/
   cli.py                    UI startup and Markdown file/folder runs
   index.html, app.js, styles.css
 workflows/workflows.md      Workflow authoring guide and full YAML reference
-docs/manual_workflow.md     Exact prompts and step-by-step worker procedure
+docs/manual_workflow.md     Exact author prompts and three-file worker procedure
 docs/render_manual.py       Regenerate/check the manual against current YAML
 tests/                      Offline regression tests
 ```
@@ -493,8 +479,8 @@ repository's `runs/` folder, regardless of the launcher's working directory.
 
 Each YAML file contains `nodes` and `prompts`. Node names are arbitrary; the
 first node is the entry point. `run: structured` makes a model call with a
-response shape, `run: research` operates the durable research cycle, and the
-legacy `run: goal` remains available for custom persistent-thread workflows. The YAML
+response shape, while `run: goal` starts or resumes the persistent author
+conversation and its configured memory files. The YAML
 defines inputs, result checks, state updates, and transitions, including the
 critic's repeat limit.
 

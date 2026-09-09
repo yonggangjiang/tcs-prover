@@ -1021,7 +1021,7 @@ function renderWorkflow() {
   loop.className = "workflow-loop";
   const loopTitle = document.createElement("strong");
   loopTitle.className = "loop-title";
-  loopTitle.textContent = "Research, review, and record";
+  loopTitle.textContent = "Author and critic";
   const loopNodes = document.createElement("ol");
   loopNodes.className = "loop-nodes";
   const candidateRoute = document.createElement("li");
@@ -1033,7 +1033,7 @@ function renderWorkflow() {
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
     "aria-label",
-    "A research pause, time limit, or verification limit preserves a resumable checkpoint",
+    "Author interruptions and verification limits preserve saved work for continuation",
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";

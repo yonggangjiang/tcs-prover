@@ -422,10 +422,10 @@ def main():
         ),
     )
     parser.add_argument(
-        "--resume-research", metavar="RUN",
+        "--resume-research", "--resume-author", dest="resume_research", metavar="RUN",
         help=(
-            "open the web UI at RUN's durable research checkpoint with a new "
-            "time budget; saved settings are kept unless explicitly overridden"
+            "continue RUN's saved author session and notebooks with a new time "
+            "budget; saved settings are kept unless explicitly overridden"
         ),
     )
     parser.add_argument("--no-browser", action="store_true")

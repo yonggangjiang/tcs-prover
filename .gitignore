@@ -10,6 +10,7 @@
 !README.md
 !web_ui.py
 !workflow_runner.py
+!goal_runtime.py
 !research_journal.py
 !persistent_research.py
 !latex_verification.py

@@ -62,6 +62,33 @@ CONTINUATION_HISTORY_FILES = (
 )
 
 
+def author_memory_files():
+    """Read the author notebook names from the built-in YAML goal node."""
+
+    files = runtime.builtin_workflow("author_critic")["nodes"]["author"].get("files")
+    names = tuple(files) if isinstance(files, dict) else (
+        "INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md",
+    )
+    for name in names:
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts or not name:
+            raise ValueError("Author memory files must stay inside the run directory.")
+    return names
+
+
+def goal_thread_from_record(record):
+    """Accept only an explicit root author status, never a subagent thread."""
+
+    identity = record.get("threadId")
+    if (
+        record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
+        and record.get("root") is not False
+        and isinstance(identity, str) and identity.strip() and "\0" not in identity
+    ):
+        return identity.strip()
+    return ""
+
+
 def isolated_process_options():
     """Put each Codex wrapper in a group that can be stopped as one unit."""
 
@@ -187,7 +214,7 @@ def important_record(record):
         and item.get("type") in {"agentMessage", "agent_message"}
     )
 
-# UI labels describe the research loop and independent final verification.
+# UI labels describe the persistent author and independent verification.
 PUBLIC_GRAPH = {
     "settings": {
         "model": DEFAULT_AUTHOR_MODEL,
@@ -224,12 +251,12 @@ PUBLIC_GRAPH = {
         "author": {
             "label": "Proof author", "short_label": "Author", "stage": "solve",
             "stages": ["solve", "repair"],
-            "description": "Records bounded research rounds and checks new approaches against the permanent archive.",
+            "description": "Keeps one LLM session exploring, recording approaches and checked results in three notebooks.",
         },
         "failure_summary": {
-            "label": "Research checkpoint", "short_label": "Checkpoint",
+            "label": "Saved progress", "short_label": "Saved",
             "stage": "failure",
-            "description": "Preserves completed work, evidence, and the next step when research or verification pauses.",
+            "description": "Preserves the author's notebooks and completed verification work when a job stops.",
         },
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
@@ -258,8 +285,8 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "author", "to": "failure_summary",
-            "label": "Save research checkpoint", "when": "research pauses or the time budget expires",
-            "prompt_change": "Preserve completed rounds and the next recorded action for continuation.",
+            "label": "Preserve author work", "when": "the author is interrupted or its time budget expires",
+            "prompt_change": "Keep the three notebooks and saved session for continuation.",
         },
         {
             "from": "critic", "to": "critic",
@@ -393,6 +420,7 @@ def empty_state(trace=None, trace_version=0):
         "modelOfComputation": "",
         "problemDescription": "",
         "goal": "",
+        "goalThreadId": "",
         "latexInput": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
@@ -507,6 +535,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly",
+            "goalThreadId",
         )
         self._save(
             JOB_SETTINGS_FILENAME,
@@ -551,18 +580,25 @@ class App:
 
         # Carry older source copies through a chain of continuations. Only known
         # research records are copied, never arbitrary workspaces or transcripts.
+        author_files = author_memory_files()
+        current_notebooks = all((source / name).is_file() for name in author_files)
         history = source / "continuation-memory"
         if history.is_dir():
             for path in sorted(history.rglob("*")):
                 if path.is_file() and path.name in CONTINUATION_HISTORY_FILES:
+                    if current_notebooks and path.name in author_files:
+                        continue
                     copy_file(path, path.relative_to(source))
 
         source_history = Path("continuation-memory") / source.name
-        for name in CONTINUATION_HISTORY_FILES:
+        for name in dict.fromkeys((*CONTINUATION_HISTORY_FILES, *author_files)):
             path = source / name
             if name != "source.json" and path.is_file():
+                if current_notebooks and name in author_files:
+                    copy_file(path, Path(name))
+                    continue
                 copy_file(path, source_history / name)
-                if name in LEGACY_RESEARCH_FILES:
+                if name in LEGACY_RESEARCH_FILES or name in author_files:
                     copy_file(path, Path(name))
         provenance = {
             "sourceRun": str(source),
@@ -1235,6 +1271,14 @@ class App:
             options.extend([
                 f"--{role}-prompt-file", str(self.run_dir / f"prompts/{role}.txt"),
             ])
+        if self.state.get("goalThreadId"):
+            options.extend(["--set", "goal_thread_id=" + json.dumps(self.state["goalThreadId"])])
+        author_node = runtime.builtin_workflow("author_critic")["nodes"]["author"]
+        prompt_file = author_node.get("prompt_file")
+        if prompt_file and prompt_file in author_memory_files():
+            original_prompt = self.run_dir / prompt_file
+            if original_prompt.is_file():
+                options.extend(["--set", "author_input_file=" + json.dumps(str(original_prompt))])
         return options
 
     def _launch_solver_locked(self, statement):
@@ -1314,6 +1358,13 @@ class App:
             raise ValueError("Enter a problem statement.")
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
+        if continuation_source:
+            saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
+            if saved_prompt.is_file():
+                original_template = read_utf8(saved_prompt, "saved author prompt")
+                if author_prompt is not None and str(author_prompt).strip() != original_template.strip():
+                    raise ValueError("A continued author must keep its original author prompt; start a new job to change it.")
+                author_prompt = original_template
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -1341,6 +1392,8 @@ class App:
                 continuation_source, stopped_stage,
                 allow_external_source=allow_external_source,
             )
+            if continuation_source:
+                options["goalThreadId"] = saved_goal_thread_id(continuation_source)
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
@@ -1633,6 +1686,11 @@ class App:
                 # Untagged errors belong to the most recently active stage.
                 record = self.parse_line(line, self.state["stage"] or "solve")
                 self.add_trace(record)
+                goal_thread = goal_thread_from_record(record)
+                if goal_thread:
+                    with self.lock:
+                        self.state["goalThreadId"] = goal_thread
+                        self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "diagnostic"
                     and record.get("text", "").startswith("error: ")
@@ -2003,6 +2061,23 @@ def saved_author_instructions(run_dir):
     return list(reversed(selected))
 
 
+def saved_goal_thread_id(run_dir):
+    """Recover the author session ID from existing settings or public statuses."""
+
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        settings = {}
+    if isinstance(settings, dict):
+        identity = settings.get("goalThreadId")
+        if isinstance(identity, str) and identity.strip() and "\0" not in identity:
+            return identity.strip()
+    identity = ""
+    for record in _iter_run_records(run_dir):
+        identity = goal_thread_from_record(record) or identity
+    return identity
+
+
 def saved_manual_stop(run_dir, records=None):
     """Return one durable manual-stop marker, including legacy transcripts."""
 
@@ -2321,6 +2396,7 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly",
+                "goalThreadId",
             ):
                 if key in settings:
                     if key in {
@@ -2408,6 +2484,9 @@ def restore_saved_app(app):
     observed_role_settings = set()
     post_review_request = False
     for record in records:
+        goal_thread = goal_thread_from_record(record)
+        if goal_thread:
+            state["goalThreadId"] = goal_thread
         stage = record.get("stage")
         if stage:
             state["stage"] = stage
@@ -2740,19 +2819,19 @@ def saved_research_source(path):
     source = requested if requested.is_dir() else requested.parent
     source = validated_continuation_source(source, source.parent)
     if not (source / RESEARCH_DATABASE_FILENAME).is_file() and not any(
-        (source / name).is_file() for name in LEGACY_RESEARCH_FILES
+        (source / name).is_file() for name in (*LEGACY_RESEARCH_FILES, *author_memory_files())
         if name != "STATEMENT.md"
     ):
-        raise ValueError("This run has no research archive or legacy research memory.")
+        raise ValueError("This run has no saved author notebooks or research history.")
     settings = {}
     settings_path = source / JOB_SETTINGS_FILENAME
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read saved research settings: {exc}") from exc
+            raise ValueError(f"Cannot read saved author settings: {exc}") from exc
         if not isinstance(settings, dict):
-            raise ValueError("Saved research settings must be an object.")
+            raise ValueError("Saved author settings must be an object.")
     for role in ("author", "critic", "writer"):
         if f"{role}Model" in settings:
             settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
@@ -2969,7 +3048,7 @@ class Server(ThreadingHTTPServer):
         return app
 
     def start_saved_research_job(self, source_run, settings=None):
-        """Restart the journal checkpoint with saved settings and a fresh budget."""
+        """Continue saved author work with its original prompt and a fresh budget."""
 
         source = saved_research_source(source_run)
         with self.jobs_lock:
@@ -3059,6 +3138,30 @@ class Server(ThreadingHTTPServer):
             or source_app.has_active_worker()
         ):
             return None
+        stage = state.get("stoppedStage") or state.get("stage")
+        if (
+            source_app.run_dir and stage in {"solve", "repair", "failure"}
+            and not (source_app.run_dir / "final.tex").is_file()
+            and (
+                all((source_app.run_dir / name).is_file() for name in author_memory_files())
+                or state.get("goalThreadId")
+            )
+        ):
+            try:
+                saved_statement(source_app.run_dir)
+            except ValueError:
+                pass
+            else:
+                return {
+                    "action": "author",
+                    "label": "Continue proof author",
+                    "description": (
+                        "Preserves the three author notebooks and resumes the saved "
+                        "LLM session when available. Otherwise the author continues "
+                        "in a new session from those notebooks. The new run renews "
+                        "the saved time budget."
+                    ),
+                }
         if (
             source_app.run_dir
             and (source_app.run_dir / RESEARCH_DATABASE_FILENAME).is_file()
@@ -3089,7 +3192,6 @@ class Server(ThreadingHTTPServer):
                 }
         if not state.get("manuallyStopped"):
             return None
-        stage = state.get("stoppedStage") or state.get("stage")
         if stage == "review" and state.get("reviewStatement", "").strip():
             legacy_input_warning = (
                 " This older run did not separately save its exact review "
@@ -3138,8 +3240,8 @@ class Server(ThreadingHTTPServer):
                     "action": "author",
                     "label": "Continue proof author",
                     "description": (
-                        "Continues bounded research rounds from the exact "
-                        "statement, permanent journal, and saved notebooks. "
+                        "Continues the author from the exact statement and saved "
+                        "notebooks, resuming the saved LLM session when available. "
                         "A new run renews the configured time budget. "
                         "Previously sent live instructions are queued again."
                     ),

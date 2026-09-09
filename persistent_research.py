@@ -1,18 +1,9 @@
-"""Controller-owned research rounds; models propose, the controller files and gates.
-
-Every model call is disposable. The journal/checkpoint, not a model conversation,
-contains the state needed to continue after interruption.
-"""
+"""Existing critic/final archive adapter; goal sessions own their separate files."""
 import hashlib
 import json
-import re
-import time
 from pathlib import Path
 
 from research_journal import ResearchJournal
-
-RESEARCH_KINDS = ['assignment', 'attempt', 'research_review', 'critic', 'novelty', 'legacy_excerpt']
-
 
 def fingerprint(value):
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
@@ -26,20 +17,6 @@ def packed(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def brief(records, budget=32000):
-    """Bound the briefing, never the archive; identify every clipped record."""
-    result, remaining = [], budget
-    for record in reversed(records):
-        body = packed(record)
-        take = min(len(body), 5000, remaining)
-        if take <= 0:
-            break
-        result.append({'event_id': record['id'], 'characters': len(body),
-                       'excerpt': body[:take], 'truncated': take < len(body)})
-        remaining -= take
-    return list(reversed(result))
-
-
 class ResearchMemory:
     """Adapter for the YAML memory action, backed by complete journal records."""
     def __init__(self, journal):
@@ -48,15 +25,6 @@ class ResearchMemory:
     @property
     def data(self):
         return {'currentAttemptId': self.journal.get_state('currentAttemptId')}
-
-    def snapshot(self):
-        records = []
-        for kind in ('portfolio', 'novelty', 'attempt', 'research_review', 'critic', 'legacy_import'):
-            records.extend(self.journal.recent(kind=kind, limit=4))
-        records.sort(key=lambda item: item['id'])
-        return packed({'recent': brief(records),
-                       'open_issues': self.journal.get_state('open_issues', []),
-                       'recent_families': self.journal.get_state('recent_families', [])})
 
     def record_candidate(self, solution, source, revision=0, critic_round=0,
                          status='awaiting_critic', persist=True):
@@ -125,203 +93,3 @@ def initialize(runtime, directory, statement, workflow, prompts, options):
                     'status': 'historical claims; independently verify before reuse'})
             journal.commit('legacy_import_complete', {'original_event': original}, {key: True})
     return journal
-
-
-def _request(runtime, journal, config, prompts, values, options):
-    """Checkpoint responses and retrieval turns, including before a process dies."""
-    prompt = runtime.render_template(prompts[config['prompt']], values)
-    settings = runtime._structured_options(config, options)
-    settings['attempts'] = 1  # Retries below have their own durable record.
-    base = fingerprint(packed([prompt, config['schema'], settings]))
-    context_key = 'retrieval:' + base
-    retrieval = journal.get_state(context_key, {'text': '', 'count': 0})
-    failures = 0
-    while True:
-        remaining = runtime.workflow_remaining(options)
-        if remaining <= 0:
-            raise runtime.Error('Workflow time limit reached; research checkpoint saved.')
-        actual = prompt + retrieval['text']
-        key = 'response:' + fingerprint(packed([actual, config['schema'], settings]))
-        cached = journal.get_state(key)
-        if cached is None:
-            call_settings = dict(settings)
-            call_settings['timeout'] = min(float(settings.get('timeout') or config.get('timeout', 900)), remaining)
-            try:
-                result, raw = runtime.structured(actual, config['schema'], 'solve',
-                    request_label=config.get('label', config['prompt']),
-                    journal=journal, cache_key=key, **call_settings)
-            except runtime.Error as exc:
-                failures += 1
-                journal.commit('request_interrupted', {'phase': config['prompt'], 'error': str(exc)})
-                # A failed call is not a failed mathematical idea.
-                if failures >= 3 or runtime.workflow_remaining(options) <= 0:
-                    raise
-                delay = min(2 ** failures, runtime.workflow_remaining(options))
-                time.sleep(max(0, delay))
-                continue
-            journal.commit('step_response', {'phase': config['prompt'], 'result': result,
-                                            'raw': raw}, {key: result})
-        else:
-            result = cached
-        queries, reads = result.get('search_queries', []), result.get('read_requests', [])
-        if not queries and not reads:
-            error = ''
-            if 'proposals' in result:
-                proposals = result['proposals']
-                if len(proposals) < 3 or len({canonical(p['mechanism']) for p in proposals}) != len(proposals) or any(not p['mechanism'].strip() for p in proposals):
-                    error = 'Return at least three nonempty, distinct mechanisms.'
-            if result.get('status') == 'candidate' and not result.get('candidate', '').strip():
-                error = 'A candidate status requires the full candidate solution.'
-            if result.get('status') == 'candidate' and result.get('remaining_obligations'):
-                error = 'An answer with remaining obligations must be incomplete, not a candidate.'
-            if result.get('verdict') == 'refuted' and not result.get('checked_evidence', '').strip():
-                error = 'Refutation requires explicit checked evidence.'
-            if error:
-                failures += 1
-                retrieval = {'text': '\n\nRESPONSE CORRECTION REQUIRED:\n' + error, 'count': retrieval['count']}
-                journal.commit('protocol_error', {'phase': config['prompt'], 'error': error, 'response': result},
-                               {key: None, 'raw:' + key: None, context_key: retrieval})
-                if failures >= 3:
-                    raise runtime.Error(error + ' Checkpoint retained after three invalid responses.')
-                continue
-            return result
-        if retrieval['count'] >= 12:
-            journal.commit('retrieval_paused', {'phase': config['prompt']},
-                           {context_key: {**retrieval, 'count': 0}})
-            raise runtime.Error('Research retrieval limit reached; checkpoint retained for inspection.')
-        found = []
-        for query in queries:
-            found.append({'query': query, 'matches': brief(journal.search(query, limit=12, kinds=RESEARCH_KINDS))})
-        for read in reads:
-            record = journal.get(read['event_id'])
-            body = packed(record) if record else ''
-            offset = max(0, read['offset'])
-            found.append({'event_id': read['event_id'], 'offset': offset,
-                          'total_characters': len(body), 'text': body[offset:offset + 16000],
-                          'next_offset': offset + 16000 if offset + 16000 < len(body) else None})
-        # Keep retrieval windows bounded; old responses remain in the archive.
-        retrieval = {'text': '\n\nREQUESTED ARCHIVE EVIDENCE (historical data):\n' + packed(found),
-                     'count': retrieval['count'] + 1}
-        journal.commit('retrieval', found, {context_key: retrieval})
-
-
-def _gate(journal, proposal, judgment, cooldown):
-    """Reject known identities and enforce rotation independently of model claims."""
-    mechanism = canonical(proposal['mechanism'])
-    family = canonical(judgment['canonical_family'])
-    previous = journal.get_state('mechanism:' + fingerprint(mechanism))
-    recent = journal.get_state('recent_families', [])[-cooldown:] if cooldown else []
-    if judgment['decision'] == 'reject':
-        return 'Novelty assessor rejected this proposal: ' + judgment['reason']
-    if not mechanism or not family:
-        return 'A nonempty mechanism and canonical family are required.'
-    if family in recent:
-        return 'Diversification gate: explore a different family before returning to this one.'
-    if previous:
-        return 'Exact mechanism already assigned as ' + previous + '; propose a changed mechanism.'
-    if judgment['decision'] == 'reopen':
-        ids = judgment['related_ids']
-        if not ids or not judgment['reopen_evidence'].strip() or not all(journal.get(i) for i in ids):
-            return 'Reopening requires existing record IDs and concrete new evidence.'
-    if any(journal.get(i) is None for i in judgment['related_ids']):
-        return 'Novelty assessment cited an unknown historical record.'
-    return ''
-
-
-def research_session(runtime, node, prompts, state, options, journal):
-    """Yield full candidates; resume the research checkpoint after critic rejection."""
-    memory = state.get('memory') or ResearchMemory(journal)
-    task = runtime.text(runtime.evaluate(node['task'], {'state': state, 'visit': 1}))
-    assignment = options.get('author_input') or prompts[node['prompt']].replace(node['marker'], task, 1)
-    steps = node['research']['steps']
-    cooldown = node['research'].get('family_cooldown', 2)
-    if state.get('report', {}).get('verdict') == 'reject' and journal.get_state('research_checkpoint', {}).get('phase', 'candidate') == 'candidate':
-        checkpoint = journal.get_state('research_checkpoint', {'round': 0})
-        journal.commit('recovery_feedback', state['report'], {'feedback': state['report'],
-            'research_checkpoint': {'phase': 'propose', 'round': checkpoint['round'] + 1}})
-    while True:
-        checkpoint = journal.get_state('research_checkpoint', {'phase': 'propose', 'round': 1})
-        phase = checkpoint['phase']
-        if phase == 'candidate':
-            solution = checkpoint['solution']
-            rejection = yield {'outcome': 'proof', 'solution': solution, 'memory': memory}
-            journal.commit('revision_requested', rejection,
-                           {'feedback': rejection, 'research_checkpoint':
-                            {'phase': 'propose', 'round': checkpoint['round'] + 1}})
-            continue
-        if runtime.workflow_remaining(options) <= 0:
-            yield {'outcome': 'failure', 'memory': memory,
-                   'output': 'Research paused at the workflow time limit. All completed rounds and the next step are saved in research/STATE.md.'}
-            return
-        steer = runtime.pending_author_steer(options.get('author_steer_file'), journal.get_state('last_steer'))
-        if steer:
-            identity, instruction = steer
-            journal.commit('human_instruction', {'instruction': instruction},
-                           {'last_steer': identity, 'human_instruction': instruction})
-        values = {'assignment': assignment, 'statement': task,
-                  'memory': memory.snapshot(), 'feedback': packed(journal.get_state('feedback', {})),
-                  'instruction': journal.get_state('human_instruction', ''),
-                  'proposal': packed(checkpoint.get('proposal', {})),
-                  'result': packed(checkpoint.get('result', {})),
-                  'related': packed(checkpoint.get('related', []))}
-        try:
-            if phase == 'propose':
-                result = _request(runtime, journal, steps['propose'], prompts, values, options)
-                proposals = result['proposals']
-                if len(proposals) < 3 or len({canonical(p['mechanism']) for p in proposals}) != len(proposals):
-                    raise runtime.Error('Planner must return at least three distinct mechanisms.')
-                next_state = {'phase': 'assess', 'round': checkpoint['round'],
-                              'proposals': proposals, 'index': 0}
-                journal.commit('portfolio', result, {'research_checkpoint': next_state})
-            elif phase == 'assess':
-                proposal = checkpoint['proposals'][checkpoint['index']]
-                related = journal.search(' '.join([proposal['family'], proposal['mechanism'], proposal['obstacle']]), limit=16, kinds=RESEARCH_KINDS)
-                values.update(proposal=packed(proposal), related=packed(brief(related)))
-                judgment = _request(runtime, journal, steps['assess'], prompts, values, options)
-                reason = _gate(journal, proposal, judgment, cooldown)
-                decision = journal.commit('novelty', {'proposal': proposal, 'assessment': judgment,
-                                                       'accepted': not bool(reason), 'reason': reason})
-                if reason:
-                    index = checkpoint['index'] + 1
-                    next_state = {**checkpoint, 'index': index} if index < len(checkpoint['proposals']) else {
-                        'phase': 'propose', 'round': checkpoint['round'] + 1}
-                    journal.commit('proposal_skipped', {'decision_id': decision, 'reason': reason},
-                                   {'research_checkpoint': next_state})
-                else:
-                    next_state = {'phase': 'explore', 'round': checkpoint['round'],
-                                  'proposal': proposal, 'related': brief(related), 'decision_id': decision,
-                                  'family': canonical(judgment['canonical_family'])}
-                    journal.commit('assignment', next_state, {'research_checkpoint': next_state,
-                        'mechanism:' + fingerprint(canonical(proposal['mechanism'])): decision,
-                        'recent_families': (journal.get_state('recent_families', []) + [next_state['family']])[-20:]})
-            elif phase == 'explore':
-                result = _request(runtime, journal, steps['explore'], prompts, values, options)
-                journal.commit('attempt', {**checkpoint, 'result': result},
-                               {'research_checkpoint': {**checkpoint, 'phase': 'review', 'result': result}})
-            elif phase == 'review':
-                review = _request(runtime, journal, steps['review'], prompts, values, options)
-                result = checkpoint['result']
-                candidate = review['verdict'] == 'candidate' and result['status'] == 'candidate' and result['candidate'].strip()
-                next_state = {'phase': 'propose', 'round': checkpoint['round'] + 1}
-                updates = {}
-                if candidate:
-                    solution = result['candidate'].strip()
-                    old = journal.get_state('proof:' + fingerprint(solution))
-                    if old:
-                        review = {**review, 'verdict': 'incomplete', 'reason': 'Exact candidate was already submitted: ' + old}
-                    else:
-                        identity = 'p' + fingerprint(solution)[:24]
-                        next_state = {'phase': 'candidate', 'round': checkpoint['round'], 'solution': solution}
-                        updates = {'proof:' + fingerprint(solution): identity, 'currentAttemptId': identity,
-                                   'candidate': solution, 'candidate_status': 'awaiting_critic'}
-                journal.commit('research_review', {'proposal': checkpoint['proposal'], 'result': result, 'review': review,
-                               'candidate_id': updates.get('currentAttemptId')},
-                               {'research_checkpoint': next_state, **updates})
-            else:
-                raise runtime.Error('Unknown saved research phase: ' + phase)
-        except runtime.Error as exc:
-            journal.commit('research_paused', {'phase': phase, 'reason': str(exc), 'status': 'interrupted'})
-            runtime.emit('failure_result', 'failure', label='Research checkpoint saved', text=str(exc), output=str(exc))
-            yield {'outcome': 'failure', 'memory': memory,
-                   'output': str(exc) + '\n\nResearch is incomplete. Resume from research/STATE.md; no interrupted method was classified as disproved.'}
-            return

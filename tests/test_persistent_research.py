@@ -10,13 +10,11 @@ import unittest
 from unittest.mock import patch
 
 import workflow_runner as runtime
-from persistent_research import ResearchMemory, _gate, canonical, fingerprint, research_session
+from persistent_research import ResearchMemory
+from goal_runtime import _seed_files
 from research_journal import ResearchJournal
 
 ROOT = Path(runtime.__file__).parent
-EMPTY_READS = {'search_queries': [], 'read_requests': []}
-PROPOSALS = [{'family': f'family {i}', 'mechanism': f'mechanism {i}', 'assumptions': 'Exact statement',
-              'obstacle': 'Unproved construction', 'decisive_test': 'Build and check', 'novelty': 'Different construction'} for i in range(3)]
 PROOF = 'Every allowed case follows by the explicit argument supplied here.'
 LATEX = r'\documentclass{article}\begin{document}An explicit argument.\end{document}'
 
@@ -47,18 +45,7 @@ class PipelineTests(unittest.TestCase):
     def model(self, prompt, schema, stage, **settings):
         self.calls.append(settings.get('request_label', stage))
         label = settings.get('request_label', '')
-        if label == 'Plan diverse research directions':
-            value = {'proposals': copy.deepcopy(PROPOSALS), **EMPTY_READS}
-        elif label == 'Check novelty against past work':
-            value = {'decision': 'proceed', 'canonical_family': 'family 0', 'related_ids': [],
-                     'reason': 'A distinct construction.', 'reopen_evidence': '', **EMPTY_READS}
-        elif label == 'Explore one registered approach':
-            value = {'status': 'candidate', 'work': PROOF, 'evidence': 'Explicit derivation.',
-                     'candidate': PROOF, 'remaining_obligations': [], 'next_test': '', **EMPTY_READS}
-        elif label == 'Review and record research result':
-            value = {'verdict': 'candidate', 'reason': 'No gap found.', 'checked_evidence': PROOF,
-                     'failure_scope': '', 'reopen_condition': '', 'reusable_results': PROOF, **EMPTY_READS}
-        elif label.startswith('Independent critic audit'):
+        if label.startswith('Independent critic audit'):
             value = {'focus': 'The supplied focus', 'verdict': 'pass', 'report': 'Checked all steps.'}
         elif label == 'Critic coordinator adjudication':
             value = review_report()
@@ -73,8 +60,18 @@ class PipelineTests(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
+        self.goal_calls = []
+        def goal(runtime, prompt, **kwargs):
+            self.goal_calls.append(prompt)
+            _seed_files(runtime, kwargs['directory'], kwargs['files'], kwargs['prompt_file'])
+            if len(self.goal_calls) == 1:
+                self.assertFalse((kwargs['directory'] / 'research.sqlite3').exists())
+            yield {'outcome': 'proof', 'solution': PROOF}
+        patcher = patch('goal_runtime.goal_session', side_effect=goal)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_complete_pipeline_archives_research_and_checks_final_document(self):
+    def test_single_goal_feeds_unchanged_critic_and_final_document(self):
         with workspace() as directory, patch.object(runtime, 'structured', side_effect=self.model), patch('latex_verification.verify_latex', return_value={'status': 'pass', 'diagnostic': 'Compiled', 'engine': 'mock'}):
             state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'], {'statement': 'Exact test task'})
             self.assertFalse(state['failed'])
@@ -83,7 +80,9 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((directory/'formatted-candidate.tex').is_file())
             with ResearchJournal(directory, 'Exact test task') as journal:
                 kinds = {e['kind'] for e in journal.events()}
-                self.assertTrue({'portfolio','novelty','assignment','attempt','research_review','critic','latex_compilation'} <= kinds)
+                self.assertTrue({'critic','latex_compilation'} <= kinds)
+                self.assertFalse({'portfolio','novelty','assignment','attempt','research_review'} & kinds)
+                self.assertEqual(len(self.goal_calls), 1)
                 self.assertEqual(journal.get_state('candidate_status'), 'approved')
                 self.assertEqual(journal.get_state('workflow_checkpoint')['node'], 'end')
 
@@ -100,8 +99,8 @@ class PipelineTests(unittest.TestCase):
             with ResearchJournal(directory,'Exact task') as journal:
                 requests=list(journal.events('model_request'))
                 replies=list(journal.events('model_response'))
-                self.assertEqual(len(requests),10)
-                self.assertEqual(len(replies),10)
+                self.assertEqual(len(requests),6)
+                self.assertEqual(len(replies),6)
                 self.assertEqual({event['id'] for event in requests},
                                  {event['payload']['request_id'] for event in replies})
                 self.assertTrue(all(event['payload']['prompt'] and event['payload']['schema'] for event in requests))
@@ -121,6 +120,31 @@ class PipelineTests(unittest.TestCase):
             with ResearchJournal(directory,'Task') as journal:
                 self.assertEqual(journal.get_state('candidate_status'),'awaiting_critic')
                 self.assertEqual(journal.get_state('candidate'), PROOF+' repaired')
+
+    def test_new_author_candidate_gets_its_own_critic_record(self):
+        revised = PROOF + ' with the objection resolved.'
+        feedback = []
+        rounds = []
+        def author(runtime, prompt, **kwargs):
+            _seed_files(runtime, kwargs['directory'], kwargs['files'], kwargs['prompt_file'])
+            feedback.append((yield {'outcome': 'proof', 'solution': PROOF}))
+            yield {'outcome': 'proof', 'solution': revised}
+        def model(prompt, schema, stage, **settings):
+            if settings.get('request_label') == 'Critic coordinator adjudication':
+                rounds.append(prompt)
+                report = review_report(verdict='reject') if len(rounds) == 1 else review_report(revised)
+                return report, json.dumps(report)
+            return self.model(prompt, schema, stage, **settings)
+        with workspace() as directory, patch('goal_runtime.goal_session', side_effect=author) as session, patch.object(runtime, 'structured', side_effect=model):
+            result = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'], {'statement': 'Task'})
+            self.assertEqual(session.call_count, 1)
+            self.assertEqual(feedback[0]['bugs'], 'A gap remains.')
+            self.assertEqual(result['output'], revised)
+            with ResearchJournal(directory, 'Task') as journal:
+                reports = list(journal.events('critic'))
+                self.assertEqual(len(reports), 2)
+                self.assertNotEqual(reports[0]['payload']['attempt_id'], reports[1]['payload']['attempt_id'])
+                self.assertEqual(journal.get_state('candidate'), revised)
 
     def test_changed_proof_cannot_hide_behind_fixed_false(self):
         node = runtime.builtin_workflow('author_critic')['nodes']['critic']
@@ -175,29 +199,7 @@ class PipelineTests(unittest.TestCase):
             compiler.assert_not_called()
 
 
-class GateTests(unittest.TestCase):
-    def test_duplicate_mechanism_blocked_despite_novelty_claim(self):
-        with workspace() as directory,ResearchJournal(directory,'Task') as journal:
-            journal.commit('assignment',{}, {'mechanism:'+fingerprint(canonical('Same method')):'e000001'})
-            judgment={'decision':'proceed','canonical_family':'new family','related_ids':[], 'reason':'New!', 'reopen_evidence':''}
-            self.assertIn('already assigned',_gate(journal,{'mechanism':'Same   method'},judgment,2))
-
-    def test_rotation_cannot_be_bypassed_by_new_mechanism_in_same_family(self):
-        with workspace() as directory,ResearchJournal(directory,'Task') as journal:
-            journal.commit('assignment',{}, {'recent_families':['greedy','flow']})
-            judgment={'decision':'proceed','canonical_family':'greedy','related_ids':[], 'reason':'New detail', 'reopen_evidence':''}
-            self.assertIn('Diversification',_gate(journal,{'mechanism':'Different implementation'},judgment,2))
-            judgment['canonical_family']='induction'
-            self.assertEqual(_gate(journal,{'mechanism':'Different implementation'},judgment,2),'')
-
-    def test_reopening_requires_real_record_and_evidence(self):
-        with workspace() as directory,ResearchJournal(directory,'Task') as journal:
-            judgment={'decision':'reopen','canonical_family':'new','related_ids':['e99999'],'reason':'Fixed','reopen_evidence':'New proof'}
-            self.assertIn('existing record',_gate(journal,{'mechanism':'Changed mechanism'},judgment,2))
-
-    def test_mathematical_symbols_not_destroyed_by_duplicate_normalization(self):
-        self.assertNotEqual(canonical('x + y'),canonical('x - y'))
-
+class CriticMemoryTests(unittest.TestCase):
     def test_obligation_resolution_waits_for_unchanged_pass(self):
         with workspace() as directory,ResearchJournal(directory,'Task') as journal:
             memory=ResearchMemory(journal)

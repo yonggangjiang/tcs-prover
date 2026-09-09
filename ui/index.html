@@ -215,7 +215,7 @@
                   Default 2 consecutive repaired rounds. Only a clean PASS of
                   the exact reviewed proof proceeds. At the limit, save the
                   proof as verification incomplete for later continuation.
-                  Rejection returns to research and resets the count.
+                  Rejection returns to the author and resets the count.
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
@@ -223,10 +223,10 @@
                 <input id="thinkingHours" type="number" min="0.01" max="168"
                   step="0.25" value="168" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
-                  Default 168 hours for the whole workflow. Each request is
-                  bounded by the time remaining when it starts. Changes to the
-                  budget apply at the next request. Resume a saved research
-                  checkpoint to start a new run with a renewed budget.
+                  Default 168 hours for the whole workflow. The author keeps
+                  one LLM session while working. After an interruption, continue
+                  from its saved session and three notebooks. A continued run
+                  starts with a renewed time budget.
                 </p>
               </div>
             </details>

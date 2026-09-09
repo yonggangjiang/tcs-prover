@@ -42,10 +42,7 @@ MAX_CRITIC_ROUNDS = 100
 MAX_AUTHOR_HOURS = 168
 DEFAULT_AUTHOR_HOURS = MAX_AUTHOR_HOURS
 STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
-_GOAL_LIFECYCLE = (
-    "goal", "initial", "memory", "anchor", "reanchor", "continuation",
-    "compaction", "repair", "failure", "failure_input",
-)
+_GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 
 
@@ -1090,25 +1087,6 @@ AUTHOR_ANCHOR_FILENAME = "author-anchor.md"
 AUTHOR_MEMORY_FILENAME = "author-memory.json"
 
 
-AUTHOR_MEMORY_SCHEMA_VERSION = 1
-
-
-AUTHOR_MEMORY_MAX_BYTES = 64 * 1024
-
-
-AUTHOR_MEMORY_PROMPT_MAX_BYTES = 24 * 1024
-
-
-AUTHOR_MEMORY_LIMITS = {
-    "attempts": 24,
-    "approaches": 24,
-    "blockedRoutes": 24,
-    "criticFeedback": 24,
-    "unresolvedObligations": 16,
-    "candidateFingerprints": 128,
-}
-
-
 def _sha256(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
@@ -1133,19 +1111,6 @@ def _clipped(value, limit=1600):
         return value
     suffix = f" ... [truncated; sha256={_sha256(value)[:16]}]"
     return value[:max(0, limit - len(suffix))].rstrip() + suffix
-
-
-def _clipped_utf8(value, limit=384):
-    """Clip model-visible history to an exact UTF-8 byte budget."""
-
-    value = str(value or "").strip()
-    encoded = value.encode("utf-8")
-    if len(encoded) <= limit:
-        return value
-    suffix = f" ... [truncated; sha256={_sha256(value)[:16]}]"
-    remaining = max(0, limit - len(suffix.encode("utf-8")))
-    prefix = encoded[:remaining].decode("utf-8", errors="ignore").rstrip()
-    return prefix + suffix
 
 
 def _private_atomic_write(path, content):
@@ -1176,1157 +1141,6 @@ def _private_atomic_write(path, content):
                 temporary.unlink()
             except OSError:
                 pass
-
-
-def author_anchor(original_prompt, statement, prompts=None):
-    """Return the immutable run-local author contract."""
-
-    original_prompt = str(original_prompt)
-    statement = str(statement)
-    text(original_prompt)
-    text(statement)
-    prompts = builtin_workflow("author_critic")["prompts"] if prompts is None else prompts
-    return prompts["anchor"].format(
-        original_prompt=original_prompt, statement=statement,
-    )
-
-
-def reanchored_author_input(
-    original_prompt, statement, memory_snapshot, instruction, prompts=None,
-):
-    """Build a self-contained author continuation without starting a new thread."""
-
-    original_prompt = str(original_prompt)
-    statement = str(statement)
-    text(original_prompt)
-    text(statement)
-    prompts = builtin_workflow("author_critic")["prompts"] if prompts is None else prompts
-    return prompts["reanchor"].format(
-        original_prompt=original_prompt, statement=statement,
-        memory_snapshot=str(memory_snapshot), instruction=str(instruction).strip(),
-    )
-
-
-class AuthorMemory:
-    """Bounded, deterministic author history stored inside one private run."""
-
-    def __init__(self, directory, original_prompt, statement, prompts=None):
-        self.prompts = prompts
-        self.directory = Path(directory).resolve()
-        self.anchor_path = self.directory / AUTHOR_ANCHOR_FILENAME
-        self.memory_path = self.directory / AUTHOR_MEMORY_FILENAME
-        self.original_prompt = str(original_prompt)
-        self.statement = str(statement)
-        text(self.original_prompt)
-        text(self.statement)
-        self.data = self._new_data()
-        self._load_existing()
-        self.save()
-
-    def _new_data(self):
-        return {
-            "schemaVersion": AUTHOR_MEMORY_SCHEMA_VERSION,
-            "problem": {
-                "statementSha256": _sha256(self.statement),
-                "authorPromptSha256": _sha256(self.original_prompt),
-            },
-            "sequence": 0,
-            "currentAttemptId": None,
-            "attempts": [],
-            "approaches": [],
-            "blockedRoutes": [],
-            "criticFeedback": [],
-            "unresolvedObligations": [],
-            "candidateFingerprints": [],
-            "rollup": {
-                "attemptsDropped": 0,
-                "approachesDropped": 0,
-                "blockedRoutesDropped": 0,
-                "criticFeedbackDropped": 0,
-                "unresolvedObligationsDropped": 0,
-                "candidateFingerprintsDropped": 0,
-                "archiveDigest": _sha256(""),
-            },
-        }
-
-    def _load_existing(self):
-        """Load only controller-created memory for this exact assignment."""
-
-        if not self.memory_path.exists():
-            return
-        try:
-            serialized = self.memory_path.read_text(encoding="utf-8")
-            if len(serialized.encode("utf-8")) > AUTHOR_MEMORY_MAX_BYTES:
-                raise ValueError("file exceeds the author-memory size limit")
-            candidate = json.loads(serialized)
-            problem = candidate.get("problem") if isinstance(candidate, dict) else None
-            list_keys = tuple(AUTHOR_MEMORY_LIMITS)
-            compatible = (
-                isinstance(candidate, dict)
-                and candidate.get("schemaVersion") == AUTHOR_MEMORY_SCHEMA_VERSION
-                and isinstance(problem, dict)
-                and problem.get("statementSha256") == _sha256(self.statement)
-                and problem.get("authorPromptSha256") == _sha256(self.original_prompt)
-                and isinstance(candidate.get("sequence"), int)
-                and candidate["sequence"] >= 0
-                and (
-                    candidate.get("currentAttemptId") is None
-                    or isinstance(candidate.get("currentAttemptId"), str)
-                )
-                and all(
-                    isinstance(candidate.get(key), list)
-                    and all(isinstance(item, dict) for item in candidate[key])
-                    for key in list_keys
-                )
-                and isinstance(candidate.get("rollup"), dict)
-                and all(
-                    isinstance(candidate["rollup"].get(key), int)
-                    for key in self.data["rollup"]
-                    if key.endswith("Dropped")
-                )
-                and isinstance(
-                    candidate["rollup"].get("archiveDigest"), str
-                )
-                and len(candidate["rollup"]["archiveDigest"]) == 64
-                and all(
-                    isinstance(item.get("id"), str)
-                    for item in candidate["attempts"]
-                )
-                and all(
-                    isinstance(item.get("normalizedSha256"), str)
-                    and isinstance(item.get("firstAttemptId"), str)
-                    and isinstance(item.get("lastAttemptId"), str)
-                    and isinstance(item.get("occurrences"), int)
-                    for item in candidate["candidateFingerprints"]
-                )
-                and all(
-                    isinstance(item.get("fingerprint"), str)
-                    and isinstance(item.get("occurrences"), int)
-                    for item in candidate["blockedRoutes"]
-                )
-                and all(
-                    isinstance(item.get("fingerprint"), str)
-                    for item in candidate["unresolvedObligations"]
-                )
-            )
-            if not compatible:
-                raise ValueError("incompatible schema or assignment hashes")
-            defaults = self.data["rollup"]
-            candidate["rollup"] = {
-                key: candidate["rollup"].get(key, value)
-                for key, value in defaults.items()
-            }
-            self.data = candidate
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-            emit(
-                "diagnostic", "solve",
-                text=f"Ignored unusable durable author memory: {exc}",
-            )
-
-    def _attempt(self, attempt_id=None):
-        attempt_id = attempt_id or self.data.get("currentAttemptId")
-        return next(
-            (
-                item for item in self.data["attempts"]
-                if item.get("id") == attempt_id
-            ),
-            None,
-        )
-
-    def _fold_dropped(self, key, item):
-        rollup_key = f"{key}Dropped"
-        if rollup_key in self.data["rollup"]:
-            self.data["rollup"][rollup_key] += 1
-        previous = self.data["rollup"]["archiveDigest"]
-        encoded = json.dumps(item, sort_keys=True, ensure_ascii=False)
-        self.data["rollup"]["archiveDigest"] = _sha256(previous + encoded)
-
-    def _bound(self):
-        for key, limit in AUTHOR_MEMORY_LIMITS.items():
-            values = self.data[key]
-            while len(values) > limit:
-                self._fold_dropped(key, values.pop(0))
-
-        # Individual text is clipped before insertion. This final hard bound
-        # drops whole historical records rather than ever writing partial JSON.
-        eviction_order = (
-            "approaches", "blockedRoutes", "criticFeedback", "attempts",
-            "candidateFingerprints",
-        )
-        while len(self.serialized().encode("utf-8")) > AUTHOR_MEMORY_MAX_BYTES:
-            dropped = False
-            for key in eviction_order:
-                values = self.data[key]
-                if not values:
-                    continue
-                if key == "attempts" and len(values) == 1:
-                    continue
-                self._fold_dropped(key, values.pop(0))
-                dropped = True
-                break
-            if not dropped:
-                break
-        size = len(self.serialized().encode("utf-8"))
-        if size > AUTHOR_MEMORY_MAX_BYTES:
-            raise ValueError(
-                f"author memory is {size} bytes; limit is "
-                f"{AUTHOR_MEMORY_MAX_BYTES} bytes"
-            )
-
-    def serialized(self):
-        return json.dumps(
-            self.data, ensure_ascii=False, indent=2, sort_keys=True,
-        ) + "\n"
-
-    def save(self):
-        """Persist canonical files, but never fail the proof over diagnostics."""
-
-        try:
-            self._bound()
-            _private_atomic_write(
-                self.anchor_path,
-                author_anchor(self.original_prompt, self.statement, self.prompts),
-            )
-            _private_atomic_write(self.memory_path, self.serialized())
-            return True
-        except (OSError, UnicodeError, TypeError, ValueError) as exc:
-            emit(
-                "diagnostic", "solve",
-                text=f"Could not persist durable author memory: {exc}",
-            )
-            return False
-
-    def record_candidate(
-        self, solution, source, revision=0, critic_round=0,
-        status="awaiting_critic", persist=True,
-    ):
-        solution = text(solution)
-        exact = _sha256(solution)
-        normalized = _sha256(normalized_candidate(solution))
-        seen = next(
-            (
-                item for item in self.data["candidateFingerprints"]
-                if item["normalizedSha256"] == normalized
-            ),
-            None,
-        )
-        self.data["sequence"] += 1
-        attempt_id = f"a{self.data['sequence']:06d}"
-        duplicate_of = seen["firstAttemptId"] if seen else None
-        if seen:
-            seen["lastAttemptId"] = attempt_id
-            seen["occurrences"] += 1
-        else:
-            self.data["candidateFingerprints"].append({
-                "normalizedSha256": normalized,
-                "firstAttemptId": attempt_id,
-                "lastAttemptId": attempt_id,
-                "occurrences": 1,
-            })
-        previous = self._attempt()
-        if previous and previous.get("status") not in {"approved", "rejected"}:
-            previous["status"] = "superseded"
-        self.data["attempts"].append({
-            "id": attempt_id,
-            "source": _clipped(source, 160),
-            "revision": int(revision),
-            "criticRound": int(critic_round),
-            "status": _clipped(status, 80),
-            "candidate": {
-                "sha256": exact,
-                "normalizedSha256": normalized,
-                "characters": len(solution),
-            },
-            "duplicateOf": duplicate_of,
-            "approachFamily": "",
-            "approachResult": "",
-        })
-        self.data["currentAttemptId"] = attempt_id
-        if persist:
-            self.save()
-        return attempt_id
-
-    def preserve_latest_candidate(
-        self, solution, source, status, revision=0, critic_round=0,
-    ):
-        """Persist final author output without duplicating the current body."""
-
-        solution = text(solution)
-        normalized = _sha256(normalized_candidate(solution))
-        current = self._attempt()
-        candidate = current.get("candidate", {}) if current else {}
-        if candidate.get("normalizedSha256") == normalized:
-            current["status"] = _clipped(status, 80)
-            self.save()
-            return current["id"]
-        return self.record_candidate(
-            solution, source, revision=revision, critic_round=critic_round,
-            status=status,
-        )
-
-    @staticmethod
-    def _memory_update(report):
-        value = report.get("memory_update")
-        if not isinstance(value, dict):
-            return {
-                "approach_family": "", "approach_result": "",
-                "blocked_routes": [], "unresolved_obligations": [],
-            }
-        blocked = value.get("blocked_routes")
-        obligations = value.get("unresolved_obligations")
-        return {
-            "approach_family": _clipped(value.get("approach_family"), 400),
-            "approach_result": _clipped(value.get("approach_result"), 1200),
-            "blocked_routes": blocked if isinstance(blocked, list) else [],
-            "unresolved_obligations": (
-                obligations if isinstance(obligations, list) else []
-            ),
-        }
-
-    def record_critic_report(
-        self, report, critic_round, attempt_id=None, result_attempt_id=None,
-    ):
-        attempt = self._attempt(attempt_id)
-        if attempt is None:
-            return
-        result_attempt = (
-            self._attempt(result_attempt_id) if result_attempt_id else attempt
-        ) or attempt
-        update = self._memory_update(report)
-        attempt["approachFamily"] = update["approach_family"]
-        attempt["approachResult"] = update["approach_result"]
-        if update["approach_family"] or update["approach_result"]:
-            self.data["approaches"].append({
-                "attemptId": attempt["id"],
-                "family": update["approach_family"],
-                "result": update["approach_result"],
-                "verdict": str(report.get("verdict") or ""),
-                "resultAttemptId": result_attempt["id"],
-            })
-
-        for blocked in update["blocked_routes"][:6]:
-            if not isinstance(blocked, dict):
-                continue
-            route = _clipped(blocked.get("route"), 500)
-            reason = _clipped(blocked.get("reason"), 1200)
-            reopen = _clipped(blocked.get("reopen_condition"), 800)
-            if not route and not reason:
-                continue
-            fingerprint = _sha256(route.lower() + "\n" + reason.lower())
-            existing = next((
-                item for item in self.data["blockedRoutes"]
-                if item["fingerprint"] == fingerprint
-            ), None)
-            if existing:
-                existing["occurrences"] += 1
-                existing["lastAttemptId"] = attempt["id"]
-                continue
-            self.data["blockedRoutes"].append({
-                "fingerprint": fingerprint,
-                "route": route,
-                "reason": reason,
-                "reopenCondition": reopen,
-                "firstAttemptId": attempt["id"],
-                "lastAttemptId": attempt["id"],
-                "occurrences": 1,
-            })
-
-        bugs = str(report.get("bugs") or "").strip()
-        if bugs:
-            self.data["criticFeedback"].append({
-                "attemptId": result_attempt["id"],
-                "auditedAttemptId": attempt["id"],
-                "resultAttemptId": result_attempt["id"],
-                "criticRound": int(critic_round),
-                "bugs": _clipped(bugs, 4000),
-                "fullTextSha256": _sha256(bugs),
-            })
-
-        verdict = report.get("verdict")
-        fixed = bool(report.get("fixed"))
-        if verdict == "pass" and not fixed:
-            attempt["status"] = "approved"
-            self.data["unresolvedObligations"] = []
-        else:
-            attempt["status"] = "critic_fixed" if fixed else "rejected"
-            obligations = [
-                _clipped(item, 700)
-                for item in update["unresolved_obligations"][:12]
-                if str(item or "").strip()
-            ]
-            if verdict == "reject" and not obligations and bugs:
-                obligations = [_clipped(bugs, 700)]
-            # The critic is required to report every bug still present in its
-            # result candidate, so its latest list supersedes older live bugs.
-            self.data["unresolvedObligations"] = []
-            state = "awaiting_verification" if fixed else "needs_author"
-            for obligation in obligations:
-                fingerprint = _sha256(obligation.lower())
-                existing = next((
-                    item for item in self.data["unresolvedObligations"]
-                    if item["fingerprint"] == fingerprint
-                ), None)
-                if existing:
-                    existing["state"] = state
-                    existing["lastAttemptId"] = attempt["id"]
-                else:
-                    self.data["unresolvedObligations"].append({
-                        "fingerprint": fingerprint,
-                        "text": obligation,
-                        "state": state,
-                        "auditedAttemptId": attempt["id"],
-                        "firstAttemptId": result_attempt["id"],
-                        "lastAttemptId": result_attempt["id"],
-                    })
-        self.save()
-
-    def mark_current(self, status):
-        attempt = self._attempt()
-        if attempt:
-            attempt["status"] = _clipped(status, 80)
-        if status == "approved":
-            self.data["unresolvedObligations"] = []
-        elif status == "awaiting_critic":
-            for item in self.data["unresolvedObligations"]:
-                item["state"] = "awaiting_verification"
-        self.save()
-
-    def snapshot(self):
-        """Render a concise model-visible view, independently capped at 24 KiB."""
-
-        view = {
-            "currentAttemptId": self.data["currentAttemptId"],
-            "recentAttempts": self.data["attempts"][-10:],
-            "approaches": self.data["approaches"][-12:],
-            "blockedRoutes": self.data["blockedRoutes"][-12:],
-            "unresolvedObligations": [
-                {
-                    "fingerprint": _clipped_utf8(
-                        item.get("fingerprint"), 80,
-                    ),
-                    "text": _clipped_utf8(item.get("text"), 384),
-                    "state": _clipped_utf8(item.get("state"), 48),
-                    "firstAttemptId": _clipped_utf8(
-                        item.get("firstAttemptId"), 80,
-                    ),
-                    "lastAttemptId": _clipped_utf8(
-                        item.get("lastAttemptId"), 80,
-                    ),
-                }
-                for item in self.data["unresolvedObligations"]
-            ],
-            "recentCriticFeedback": self.data["criticFeedback"][-8:],
-            "repeatedCandidates": [
-                item for item in self.data["candidateFingerprints"]
-                if item["occurrences"] > 1
-            ][-16:],
-            "rollup": self.data["rollup"],
-        }
-        eviction_order = (
-            "approaches", "blockedRoutes", "recentCriticFeedback",
-            "recentAttempts", "repeatedCandidates",
-        )
-        while True:
-            rendered = json.dumps(
-                view, ensure_ascii=False, indent=2, sort_keys=True,
-            )
-            if len(rendered.encode("utf-8")) <= AUTHOR_MEMORY_PROMPT_MAX_BYTES:
-                return rendered
-            for key in eviction_order:
-                if view[key]:
-                    view[key].pop(0)
-                    break
-            else:
-                return rendered
-
-
-AUTHOR_LIMIT_POLL_SECONDS = 0.25
-
-
-INTERRUPT_GRACE_SECONDS = 30
-
-
-SUMMARY_GRACE_SECONDS = 300
-
-
-def repair_prompt(
-    statement, solution, bugs, revision_number, critic_round=None,
-    include_statement=True, prompts=None,
-):
-    """Give unresolved critic bugs back to the original author thread."""
-
-    critic_label = (
-        f"critic round {critic_round}" if critic_round is not None
-        else "the current candidate"
-    )
-    statement_block = (
-        f"\n\nSTATEMENT:\n{text(statement)}" if include_statement else ""
-    )
-    prompts = builtin_workflow("author_critic")["prompts"] if prompts is None else prompts
-    return prompts["repair"].format(
-        critic_label=critic_label, revision_number=revision_number,
-        statement_block=statement_block, solution=text(solution), bugs=text(bugs),
-    ).strip()
-
-
-def author_session(
-    prompt, statement, thinking_hours=DEFAULT_AUTHOR_HOURS,
-    author_model=AUTHOR_MODEL, effort=EFFORT, author_effort=None,
-    speed=DEFAULT_SPEED, author_limit_file=None, elapsed_seconds=0,
-    prompts=None, stages=None, node_name="author", memory_directory=None,
-    summary=DEFAULT_REASONING_SUMMARY, author_steer_file=None,
-):
-    """Keep one author thread alive, yielding candidates and accepting rejections.
-
-    The YAML runner owns transitions. Closing the generator stops the deadline
-    watcher and app-server, including when an audit fails or the graph ends.
-    """
-
-    stages = stages or _GOAL_STAGES
-    initial_stage, resume_stage, failure_stage = (stages[key] for key in ("initial", "resume", "failure"))
-    prompts = builtin_workflow("author_critic")["prompts"] if prompts is None else prompts
-    thinking_hours = controlled_author_hours(
-        author_limit_file, author_hours(thinking_hours)
-    )
-    author_model = chosen_model(author_model)
-    author_effort = effective_effort(author_model, author_effort or effort)
-    speed = effective_speed(author_model, speed)
-    author_summary = reasoning_summary(author_model, summary)
-    require_model_credentials(author_model)
-    elapsed_seconds = prior_elapsed_seconds(elapsed_seconds)
-    original_prompt = str(prompt)
-    statement = str(statement)
-    text(original_prompt)
-    text(statement)
-    memory = AuthorMemory(memory_directory or Path.cwd(), original_prompt, statement, prompts=prompts)
-    emit(
-        "status", initial_stage, label="Durable author memory ready",
-        text=(
-            f"{AUTHOR_ANCHOR_FILENAME} and {AUTHOR_MEMORY_FILENAME} are stored "
-            "inside this private run workspace."
-        ),
-    )
-    initial_author_input = prompts["initial"].format(
-        original_prompt=original_prompt, memory_instructions=prompts["memory"],
-        memory_snapshot=memory.snapshot(),
-    )
-    emit(
-        "request", initial_stage, label="Exact solve input", text=initial_author_input,
-        model=author_model, modelProvider=model_provider(author_model), reasoningEffort=author_effort, reasoningSummary=author_summary,
-        serviceTier=speed,
-    )
-    emit(
-        "request", initial_stage, label="Goal continuation instruction", text=prompts["goal"],
-        model=author_model, modelProvider=model_provider(author_model), reasoningEffort=author_effort, reasoningSummary=author_summary,
-        serviceTier=speed,
-    )
-    command = [
-        codex(), "app-server", "--enable", "goals", "--enable", "multi_agent",
-        *provider_arguments(author_model),
-        *speed_arguments(speed, author_model), *context_cache_arguments(),
-    ]
-    process = subprocess.Popen(
-        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-        errors="replace", bufsize=1, env=environment(author_model),
-    )
-
-    # Keep the latest complete answer from the original author thread.
-    answers, stage = [], initial_stage
-    thread, stop_timer = None, None
-    author_active = threading.Event()
-    current_turn = {"id": None}
-    compaction_steers, seen_compactions = {}, set()
-    last_author_cache_usage = {}
-
-    # Every app-server response and notification passes through one filter.
-    def record(message):
-        nonlocal last_author_cache_usage
-        response_id = message.get("id")
-        if response_id in compaction_steers and "method" not in message:
-            context = compaction_steers.pop(response_id)
-            if "error" in message:
-                emit(
-                    "diagnostic", stage,
-                    text=(
-                        "Author context re-anchor raced with turn completion; "
-                        f"the next author input will re-anchor again. {message['error']}"
-                    ),
-                    compactionId=context,
-                )
-        message = public_event(message)
-        if message is None:
-            return
-        params = message.get("params", {})
-        event_thread = params.get("threadId")
-        root = thread is None or event_thread in {None, thread}
-        emit(
-            "codex_event", stage, event=message, root=root,
-        )
-        item = params.get("item") or {}
-        if root and message.get("method") == "thread/tokenUsage/updated":
-            usage = params.get("tokenUsage") or {}
-            last = usage.get("last") if isinstance(usage, dict) else None
-            if isinstance(last, dict):
-                last_author_cache_usage = dict(last)
-        if (
-            root and message.get("method") == "item/completed"
-            and item.get("type") in {"agentMessage", "agent_message"}
-            and item.get("text")
-        ):
-            answers.append(item["text"])
-        if (
-            root and author_active.is_set() and stage in {initial_stage, resume_stage}
-            and message.get("method") == "item/completed"
-            and item.get("type") == "contextCompaction"
-        ):
-            turn_id = params.get("turnId")
-            compaction_id = item.get("id") or f"{turn_id}:contextCompaction"
-            compaction_key = (turn_id, compaction_id)
-            if turn_id and compaction_key not in seen_compactions:
-                seen_compactions.add(compaction_key)
-                memory.save()
-                anchored = reanchored_author_input(
-                    original_prompt, statement, memory.snapshot(),
-                    prompts["compaction"],
-                    prompts=prompts,
-                )
-                emit(
-                    "request", stage,
-                    label="Author context re-anchor after compaction",
-                    text=anchored, model=author_model, modelProvider=model_provider(author_model),
-                    reasoningEffort=author_effort, serviceTier=speed,
-                    reasoningSummary=author_summary, node=node_name,
-                    compactionId=compaction_id,
-                )
-                try:
-                    request_id = rpc.request("turn/steer", {
-                        "threadId": thread,
-                        "expectedTurnId": turn_id,
-                        "input": [{"type": "text", "text": anchored}],
-                    })
-                    compaction_steers[request_id] = compaction_id
-                except (Error, OSError) as exc:
-                    emit(
-                        "diagnostic", stage,
-                        text=f"Could not re-anchor after compaction: {exc}",
-                        compactionId=compaction_id,
-                    )
-
-    rpc = RPC(process, record)
-    try:
-        rpc.call("initialize", {
-            "clientInfo": {
-                "name": "tcs_prover", "title": "TCS Prover", "version": "1"
-            }
-        })
-        rpc.send({"method": "initialized", "params": {}})
-        started = rpc.call("thread/start", {
-            "model": author_model, "modelProvider": model_provider(author_model),
-            # The web app starts this process inside its private problem folder.
-            "cwd": str(memory.directory), "ephemeral": False,
-            "sandbox": "workspace-write", "approvalPolicy": "never",
-            "config": {
-                "model_reasoning_effort": author_effort,
-                "model_reasoning_summary": author_summary,
-                **({"service_tier": "fast"} if speed == "fast" else {}),
-                "features": {"fast_mode": speed == "fast"},
-            },
-        })
-        thread = started["thread"]["id"]
-
-        # Paused avoids an empty automatic turn before the real prompt starts.
-        goal = {"threadId": thread, "objective": prompts["goal"]}
-        rpc.call("thread/goal/set", {**goal, "status": "paused"})
-        author_active.set()
-        started_turn = rpc.call("turn/start", {
-            "threadId": thread,
-            "input": [{"type": "text", "text": initial_author_input}],
-            "summary": author_summary,
-        })
-        rpc.call("thread/goal/set", {**goal, "status": "active"})
-        current_turn["id"] = (started_turn.get("turn") or {}).get("id")
-        timed_out, stop_timer = threading.Event(), threading.Event()
-        deadline_lock = threading.Lock()
-        # The web UI passes the runtime already shown by its elapsed clock, so
-        # review and approval time count toward the same total. Direct/headless
-        # callers leave this at zero and start counting here.
-        deadline_started = time.monotonic() - elapsed_seconds
-        deadline_state = {
-            "hours": thinking_hours,
-            "at": deadline_started + thinking_hours * 3600,
-        }
-
-        def refresh_deadline():
-            """Apply the latest total workflow limit from the web control file."""
-
-            hours = controlled_author_hours(
-                author_limit_file, deadline_state["hours"]
-            )
-            if hours != deadline_state["hours"]:
-                deadline_state["hours"] = hours
-                deadline_state["at"] = deadline_started + hours * 3600
-
-        def deadline_expired():
-            """Refresh the live limit and report whether total time is spent."""
-
-            with deadline_lock:
-                refresh_deadline()
-                expired = time.monotonic() >= deadline_state["at"]
-                if expired:
-                    timed_out.set()
-                return expired
-
-        # At the deadline, interrupt an author but allow a critic to finish.
-        def enforce_deadline():
-            # Short waits let a live limit change take effect promptly. They also
-            # avoid one Windows wait whose timeout stops counting during sleep.
-            while True:
-                with deadline_lock:
-                    refresh_deadline()
-                    remaining = deadline_state["at"] - time.monotonic()
-                    if remaining <= 0:
-                        timed_out.set()
-                        if author_active.is_set():
-                            try:
-                                rpc.request("thread/goal/set", {
-                                    **goal, "status": "paused",
-                                })
-                            except (Error, OSError):
-                                pass
-                            turn_id = current_turn["id"]
-                            if turn_id:
-                                try:
-                                    rpc.request("turn/interrupt", {
-                                        "threadId": thread, "turnId": turn_id,
-                                    })
-                                except (Error, OSError):
-                                    pass
-                        break
-                if stop_timer.wait(min(AUTHOR_LIMIT_POLL_SECONDS, remaining)):
-                    return
-            # A critic is allowed to run past the deadline. Only a stuck author
-            # interruption may force-stop the persistent app server.
-            if (
-                author_active.is_set()
-                and not stop_timer.wait(INTERRUPT_GRACE_SECONDS)
-                and process.poll() is None
-            ):
-                process.terminate()
-
-        timer = threading.Thread(target=enforce_deadline, daemon=True)
-        timer.start()
-
-        def relay_author_steers():
-            """Forward live UI instructions into the active author turn."""
-
-            delivered_id = None
-            while not stop_timer.wait(AUTHOR_STEER_POLL_SECONDS):
-                command = pending_author_steer(
-                    author_steer_file, delivered_id
-                )
-                turn_id = current_turn["id"]
-                if not command or not author_active.is_set() or not turn_id:
-                    continue
-                command_id, instruction = command
-                try:
-                    request_id = rpc.request("turn/steer", {
-                        "threadId": thread,
-                        "expectedTurnId": turn_id,
-                        "input": [{"type": "text", "text": instruction}],
-                    })
-                    delivered_id = command_id
-                    emit(
-                        "request", stage, label="Live author instruction sent",
-                        text=instruction, model=author_model,
-                        modelProvider=model_provider(author_model),
-                        reasoningEffort=author_effort,
-                        reasoningSummary=author_summary,
-                        serviceTier=speed, node=node_name,
-                        steerId=command_id, requestId=request_id,
-                    )
-                except (Error, OSError) as exc:
-                    emit(
-                        "diagnostic", stage,
-                        text=f"Could not steer the active author: {exc}",
-                        node=node_name, steerId=command_id,
-                    )
-
-        threading.Thread(target=relay_author_steers, daemon=True).start()
-        emit(
-            "status", initial_stage, label="Goal started",
-            text=(
-                f"Thread {thread}; total workflow limit {thinking_hours:g} "
-                f"hours; {elapsed_seconds:g} seconds already elapsed."
-            ),
-            threadId=thread,
-        )
-
-        # Resume any terminal author attempt that ended without a solution.
-        status, running, last_author_output = None, True, ""
-        while True:
-            try:
-                message = rpc.read()
-            except Error:
-                if timed_out.is_set():
-                    break
-                raise
-            params = message.get("params", {})
-            if params.get("threadId") not in {None, thread}:
-                continue
-            method = message.get("method")
-            if method == "turn/started":
-                running = True
-                turn_id = (params.get("turn") or {}).get("id")
-                current_turn["id"] = turn_id
-                # Stop an automatic turn that raced with the deadline pause.
-                if timed_out.is_set() and turn_id:
-                    rpc.request("turn/interrupt", {
-                        "threadId": thread, "turnId": turn_id,
-                    })
-            elif method == "turn/completed":
-                turn_status = (params.get("turn") or {}).get("status")
-                running = False
-                current_turn["id"] = None
-                if last_author_cache_usage:
-                    emit_cache_usage(
-                        stage, last_author_cache_usage,
-                        label="Author cache usage",
-                    )
-                    last_author_cache_usage = {}
-                if turn_status in {"failed", "interrupted"} and not timed_out.is_set():
-                    status = "turnFailed"
-            elif method == "thread/goal/updated":
-                value = params.get("goal", {})
-                if value.get("threadId") == thread and value.get("status") in {
-                    "complete", "blocked", "usageLimited", "budgetLimited"
-                }:
-                    status = value["status"]
-
-            if timed_out.is_set() and not running:
-                break
-            if status == "complete" and not running and answers:
-                break
-            if (
-                status == "blocked"
-                or (status == "complete" and not answers)
-            ) and not running:
-                with deadline_lock:
-                    refresh_deadline()
-                    if time.monotonic() >= deadline_state["at"]:
-                        timed_out.set()
-                        break
-                if answers:
-                    last_author_output = answers[-1]
-                    memory.record_candidate(
-                        last_author_output, "author_partial",
-                        status="incomplete",
-                    )
-                    answers.clear()
-                memory.save()
-                continuation = reanchored_author_input(
-                    original_prompt, statement, memory.snapshot(),
-                    prompts["continuation"],
-                    prompts=prompts,
-                )
-                emit(
-                    "request", initial_stage, label="Author continuation",
-                    text=continuation, model=author_model, modelProvider=model_provider(author_model),
-                    reasoningEffort=author_effort,
-                    serviceTier=speed,
-                    reasoningSummary=author_summary,
-                )
-                # Explicit turns start while Goal mode is paused.
-                rpc.call("thread/goal/set", {**goal, "status": "paused"})
-                if timed_out.is_set():
-                    break
-                resumed = rpc.call("turn/start", {
-                    "threadId": thread,
-                    "input": [{"type": "text", "text": continuation}],
-                    "summary": author_summary,
-                })
-                current_turn["id"] = (resumed.get("turn") or {}).get("id")
-                # The deadline and activation serialize through this lock.
-                with deadline_lock:
-                    if timed_out.is_set():
-                        if current_turn["id"]:
-                            rpc.request("turn/interrupt", {
-                                "threadId": thread,
-                                "turnId": current_turn["id"],
-                            })
-                    else:
-                        rpc.request("thread/goal/set", {
-                            **goal, "status": "active",
-                        })
-                status, running = None, True
-            elif status in {
-                "turnFailed", "usageLimited", "budgetLimited"
-            } and not running:
-                break
-
-        # Close the polling race where an author answer arrives just after the
-        # deadline but before the timer thread observes it.
-        deadline_expired()
-        author_active.clear()
-        current_turn["id"] = None
-
-        def summarize_failure(reason, previous=""):
-            """Ask the persistent author thread to preserve unfinished work."""
-
-            nonlocal stage, last_author_cache_usage
-            stop_timer.set()
-            author_active.clear()
-            current_turn["id"] = None
-            try:
-                rpc.call("thread/goal/set", {**goal, "status": "paused"})
-            except (Error, OSError):
-                pass
-            previous = previous or (
-                answers[-1] if answers else last_author_output
-            )
-            stage, answers[:] = failure_stage, []
-            memory.save()
-            summary_prompt = prompts["failure_input"].format(
-                instructions=prompts["failure"], reason=reason,
-                memory_snapshot=memory.snapshot(),
-            )
-            emit(
-                "request", failure_stage, label="Failure summary request",
-                text=summary_prompt, model=author_model, modelProvider=model_provider(author_model),
-                reasoningEffort=author_effort,
-                serviceTier=speed,
-                reasoningSummary=author_summary,
-            )
-            summary_stop = threading.Event()
-            summary_expired = threading.Event()
-            try:
-                summary_turn = rpc.call("turn/start", {
-                    "threadId": thread,
-                    "input": [{"type": "text", "text": summary_prompt}],
-                    "summary": author_summary,
-                })
-                summary_id = (summary_turn.get("turn") or {}).get("id")
-
-                # Even the final summary has a small, fixed grace period.
-                def limit_summary():
-                    if summary_stop.wait(SUMMARY_GRACE_SECONDS):
-                        return
-                    summary_expired.set()
-                    try:
-                        if summary_id:
-                            rpc.request("turn/interrupt", {
-                                "threadId": thread, "turnId": summary_id,
-                            })
-                    except (Error, OSError):
-                        pass
-                    # A frozen server must not defeat the bounded summary.
-                    if not summary_stop.wait(5) and process.poll() is None:
-                        process.terminate()
-
-                threading.Thread(target=limit_summary, daemon=True).start()
-                while True:
-                    message = rpc.read()
-                    params = message.get("params", {})
-                    if params.get("threadId") not in {None, thread}:
-                        continue
-                    turn = params.get("turn") or {}
-                    if (
-                        message.get("method") == "turn/completed"
-                        and (not summary_id or turn.get("id") == summary_id)
-                    ):
-                        if last_author_cache_usage:
-                            emit_cache_usage(
-                                failure_stage, last_author_cache_usage,
-                                label="Failure-summary cache usage",
-                            )
-                            last_author_cache_usage = {}
-                        break
-                    if summary_expired.is_set():
-                        break
-            except (Error, OSError, StopIteration):
-                pass
-            finally:
-                summary_stop.set()
-            summary = answers[-1] if answers else (
-                f"{reason}\n\nLatest author output:\n{previous[:4000]}"
-                if previous else f"{reason}\n\nNo complete solution was produced."
-            )
-            emit(
-                "failure_result", failure_stage, label="Workflow failure summary",
-                text=summary, output=summary,
-            )
-            return summary
-
-        if timed_out.is_set() or status in {
-            "turnFailed", "usageLimited", "budgetLimited"
-        }:
-            with deadline_lock:
-                final_author_hours = deadline_state["hours"]
-            reason = (
-                f"The {final_author_hours:g}-hour total workflow limit was reached "
-                "while the proof author was running."
-                if timed_out.is_set()
-                else f"The author stopped because its state became {status}."
-            )
-            latest = answers[-1] if answers else last_author_output
-            if latest:
-                memory.preserve_latest_candidate(
-                    latest,
-                    "author_timeout" if timed_out.is_set() else "author_failure",
-                    "timed_out" if timed_out.is_set() else "failed",
-                )
-            summary = summarize_failure(reason, previous=latest)
-            yield {"outcome": "failure", "output": summary}
-            return
-
-        emit(
-            "status", initial_stage, label="Goal complete",
-            text=f"Thread {thread}", threadId=thread,
-        )
-
-        solution = answers[-1]
-        memory.record_candidate(
-            solution, "initial_author", status="awaiting_critic",
-        )
-        revision_number = 0
-        while True:
-            rejection = yield {"outcome": "proof", "solution": solution, "memory": memory}
-            # Audit safe fixes are the starting point for author repair.
-            solution = rejection["solution"]
-            round_number = rejection["round"]
-            # Only unresolved bugs return to the persistent author thread.
-            if deadline_expired():
-                with deadline_lock:
-                    final_author_hours = deadline_state["hours"]
-                summary = summarize_failure(
-                    f"The {final_author_hours:g}-hour total workflow limit "
-                    "was reached while the critic was running. The rejected "
-                    "candidate cannot be returned to the proof author.",
-                    previous=solution,
-                )
-                yield {"outcome": "failure", "output": summary}
-                return
-            revision_number += 1
-            repair = repair_prompt(
-                statement, solution, rejection["bugs"], revision_number,
-                critic_round=round_number, include_statement=False,
-                prompts=prompts,
-            )
-            memory.save()
-            instruction = reanchored_author_input(
-                original_prompt, statement, memory.snapshot(), repair,
-                prompts=prompts,
-            )
-            stage, answers[:] = resume_stage, []
-            emit(
-                "request", resume_stage,
-                label=f"Proof author revision {revision_number}",
-                text=instruction, model=author_model, modelProvider=model_provider(author_model),
-                reasoningEffort=author_effort,
-                serviceTier=speed,
-                reasoningSummary=author_summary,
-                node=node_name, round=0,
-            )
-            author_active.set()
-            revision_turn = rpc.call("turn/start", {
-                "threadId": thread,
-                "input": [{"type": "text", "text": instruction}],
-                "summary": author_summary,
-            })
-            current_turn["id"] = (
-                revision_turn.get("turn") or {}
-            ).get("id")
-            revision_id = current_turn["id"]
-            if deadline_expired() and current_turn["id"]:
-                rpc.request("turn/interrupt", {
-                    "threadId": thread, "turnId": current_turn["id"],
-                })
-            turn_status = None
-            while True:
-                try:
-                    message = rpc.read()
-                except Error:
-                    if timed_out.is_set():
-                        break
-                    raise
-                params = message.get("params", {})
-                if params.get("threadId") not in {None, thread}:
-                    continue
-                if (
-                    message.get("method") == "turn/completed"
-                    and (params.get("turn") or {}).get("id") == revision_id
-                ):
-                    turn_status = (params.get("turn") or {}).get("status")
-                    current_turn["id"] = None
-                    if last_author_cache_usage:
-                        emit_cache_usage(
-                            resume_stage, last_author_cache_usage,
-                            label="Author revision cache usage",
-                        )
-                        last_author_cache_usage = {}
-                    if turn_status != "completed" and not timed_out.is_set():
-                        raise Error(
-                            f"Proof author revision {turn_status}; thread {thread}."
-                        )
-                    break
-            author_active.clear()
-            current_turn["id"] = None
-            if deadline_expired():
-                latest_revision = answers[-1] if answers else ""
-                if latest_revision:
-                    memory.preserve_latest_candidate(
-                        latest_revision, "author_revision_timeout",
-                        "timed_out", revision=revision_number,
-                    )
-                with deadline_lock:
-                    final_author_hours = deadline_state["hours"]
-                summary = summarize_failure(
-                    f"The {final_author_hours:g}-hour total workflow limit "
-                    "was reached while the proof author was revising a "
-                    "critic-rejected candidate.",
-                    previous=latest_revision or solution,
-                )
-                yield {"outcome": "failure", "output": summary}
-                return
-            if not answers:
-                raise Error("The proof author returned no replacement solution.")
-            solution = answers[-1]
-            memory.record_candidate(
-                solution, "author_revision", revision=revision_number,
-                status="awaiting_critic",
-            )
-            memory.mark_current("awaiting_critic")
-            emit(
-                "author_result", resume_stage,
-                label=f"Revised solution {revision_number}", text=solution,
-                node=node_name, round=0,
-            )
-    except KeyboardInterrupt:
-        confirmed = []
-        if thread:
-            # Wait briefly for persistence; forced cleanup still has a deadline.
-            def pause():
-                try:
-                    rpc.call("thread/goal/set", {
-                        "threadId": thread, "objective": prompts["goal"], "status": "paused"
-                    })
-                    confirmed.append(True)
-                except (Error, OSError, json.JSONDecodeError):
-                    pass
-
-            worker = threading.Thread(target=pause, daemon=True)
-            worker.start()
-            worker.join(timeout=2)
-            emit(
-                "status", initial_stage,
-                label="Goal paused" if confirmed else "Pause not confirmed",
-                text=f"Thread {thread}",
-            )
-        raise
-    finally:
-        if stop_timer:
-            stop_timer.set()
-        rpc.close()
 
 
 def _strip(value):
@@ -2728,10 +1542,6 @@ def _expand_node(node):
     if node["run"] == "goal":
         node.setdefault("lifecycle", list(_GOAL_LIFECYCLE))
         node.setdefault("stages", dict(_GOAL_STAGES))
-    if node["run"] == "research":
-        for config in node.get("research", {}).get("steps", {}).values():
-            config.setdefault("run", "structured")
-            _expand_node(config)
 
     if "parallel" in node:
         parallel = node["parallel"]
@@ -2760,14 +1570,11 @@ def load_workflow(path):
         isinstance(name, str) and name and name != "end" for name in nodes
     ):
         raise ValueError("A workflow needs named nodes; 'end' is reserved.")
-    if sum(isinstance(node, dict) and node.get("run") == "research" for node in nodes.values()) > 1:
-        raise ValueError("Use one research session per workflow and a separate run directory for each statement.")
     targets = set(nodes) | {"end"}
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery"},
-        "research": {"task", "marker", "resume", "research"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "files", "prompt_file"},
     }
     for name, node in nodes.items():
         if not isinstance(node, dict) or not {"run", "prompt", "next"} <= node.keys():
@@ -2814,40 +1621,22 @@ def load_workflow(path):
             for expression in node.get("require", []):
                 check_expression(expression)
             bindings = node.get("inputs", {})
-        elif kind == "research":
-            for required in ("task", "marker", "resume", "research"):
-                if required not in node:
-                    raise ValueError(f"Research node {name} needs {required}.")
-            check_expression(node["task"])
-            if not isinstance(node["marker"], str) or not node["marker"]:
-                raise ValueError("Research marker must be nonempty.")
-            research = node["research"]
-            if not isinstance(research, dict) or set(research) - {"steps", "family_cooldown"}:
-                raise ValueError("Research configuration allows steps and family_cooldown.")
-            if type(research.get("family_cooldown", 2)) is not int or research.get("family_cooldown", 2) < 1:
-                raise ValueError("Research family_cooldown must be a positive integer.")
-            steps = research.get("steps", {})
-            if not isinstance(steps, dict) or set(steps) != {"propose", "assess", "explore", "review"}:
-                raise ValueError("Research needs propose, assess, explore, and review steps.")
-            for config in steps.values():
-                if set(config) - {"run", "prompt", "schema", "role", "model", "effort", "attempts", "provider_options", "timeout", "label"}:
-                    raise ValueError("Unsupported research step fields.")
-                if config.get("prompt") not in prompts or not isinstance(config.get("schema"), dict):
-                    raise ValueError("Research steps need a named prompt and response schema.")
-                validator_for(config["schema"]).check_schema(config["schema"])
-                if type(config.get("timeout", 900)) not in {int, float} or not 0 < config.get("timeout", 900) <= 3600:
-                    raise ValueError("Research request timeout must be in (0, 3600] seconds.")
-                _check_request_options(config)
-            bindings = node["resume"]
-            if not isinstance(bindings, dict) or not {"solution", "bugs", "round"} <= bindings.keys():
-                raise ValueError("Research resume needs solution, bugs and round.")
         else:
-            for required in ("task", "marker", "lifecycle", "resume"):
+            for required in ("task", "marker", "lifecycle", "resume", "files", "prompt_file"):
                 if required not in node:
                     raise ValueError(f"Goal node {name} needs {required}.")
             check_expression(node["task"])
             if not isinstance(node["marker"], str) or not node["marker"]:
                 raise ValueError(f"Goal node {name} needs a nonempty marker.")
+            files = node["files"]
+            if not isinstance(files, dict) or not files or not all(
+                isinstance(path, str) and path and Path(path).name == path
+                and path not in {".", ".."} and isinstance(content, str)
+                for path, content in files.items()
+            ):
+                raise ValueError(f"Goal node {name} files must map plain filenames to initial text.")
+            if not isinstance(node["prompt_file"], str) or node["prompt_file"] not in files:
+                raise ValueError(f"Goal node {name} prompt_file must name one of its files.")
             lifecycle = node["lifecycle"]
             if isinstance(lifecycle, list) and all(isinstance(key, str) for key in lifecycle):
                 lifecycle = {key: key for key in lifecycle}
@@ -2907,8 +1696,7 @@ def __getattr__(name):
     # The generic execution path never needs to open either bundled YAML file.
     prompt_names = {
         "AUTHOR_PROMPT": "author", "CRITIC_MEMORY_PROMPT": "critic_memory",
-        "CONTINUE_PROMPT": "continuation", "FAILURE_SUMMARY_PROMPT": "failure",
-        "AUTHOR_MEMORY_INSTRUCTIONS": "memory", "GOAL": "goal",
+        "CONTINUE_PROMPT": "continuation", "GOAL": "goal",
     }
     if name in prompt_names or name in {"AUTHOR_PROMPTS", "AUTHOR_WORKFLOW", "CRITIC_PROMPT", "CRITIC_SCHEMA", "DEFAULT_CRITIC_ROUNDS"}:
         workflow = builtin_workflow("author_critic")
@@ -2963,38 +1751,19 @@ def prepare(workflow, options):
             references = [reference["then"], reference["else"]] if isinstance(reference, dict) else [reference]
             for reference in references:
                 _template_parts(prompts[reference], set(node.get("inputs", {})) | {"instructions"})
-        elif node["run"] == "research":
-            if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
-                raise ValueError("Research assignment needs exactly one statement marker.")
-            for config in node["research"]["steps"].values():
-                require_model_credentials(_settings(config, options)["model"])
-                _template_parts(prompts[config["prompt"]], {"assignment", "statement", "memory", "feedback", "instruction", "proposal", "result", "related"})
         else:
-            if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
+            if options.get("author_input") is None and options.get("author_input_file") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
                 raise ValueError(f"Goal prompt must contain exactly one {node['marker']}.")
+            fields = {"original_prompt", "directory", "prompt_file", "solution", "bugs", "round", "revision_number", "instruction"}
             if "recovery" in node:
-                _template_parts(prompts[node["recovery"]["prompt"]], {"original_prompt", "statement", "repair"})
+                _template_parts(prompts[node["recovery"]["prompt"]], fields)
             lifecycle = node["lifecycle"]
             if isinstance(lifecycle, list):
                 lifecycle = {key: key for key in lifecycle}
-            fields = {
-                "anchor": {"original_prompt", "statement"},
-                "reanchor": {"original_prompt", "statement", "memory_snapshot", "instruction"},
-                "repair": {"critic_label", "revision_number", "statement_block", "solution", "bugs"},
-                "initial": {"original_prompt", "memory_instructions", "memory_snapshot"},
-                "failure_input": {"instructions", "reason", "memory_snapshot"},
-            }
-            for key, names in fields.items():
-                _template_parts(prompts[lifecycle[key]], names)
-        for branch in node["next"].values():
-            if isinstance(branch, dict) and "repeat" in branch:
-                limit = options.get(branch.get("option"), branch["repeat"])
-                if type(limit) is not int or limit < 1:
-                    raise ValueError("Repeat limits must be positive integers.")
-    if options.get("critic_rounds") is not None:
-        critic_limit(options["critic_rounds"])
-    author_hours(options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
-    prior_elapsed_seconds(options.get("elapsed_seconds", 0))
+            for reference in lifecycle.values():
+                _template_parts(prompts[reference], fields)
+            for content in node["files"].values():
+                _template_parts(content, {"original_prompt", "statement"})
     return prompts
 
 
@@ -3221,26 +1990,32 @@ def _complete_node(node, state, result, raw, visit, revision):
     return context
 
 
+def _workflow_memory(workflow, state, options, prompts):
+    """Open the existing structured-stage audit archive, separately from goal files."""
+    from persistent_research import initialize, ResearchMemory
+    task = state.get("statement") or state.get("source")
+    journal = initialize(sys.modules[__name__], Path.cwd(), text(task), workflow, prompts, options)
+    state["memory"] = ResearchMemory(journal)
+    options["_journal"] = journal
+    return journal
+
+
 def _execute(workflow, state, options, prompts):
     nodes = workflow["nodes"]
     current, visits, revision = options.get("start_node", next(iter(nodes))), 0, 0
     if current not in nodes:
         raise ValueError(f"Unknown workflow entry node: {current!r}.")
-    started_at = time.monotonic()
     sessions, revisions = {}, {}
     options.setdefault("_workflow_started", time.monotonic())
-    research_nodes = [node for node in nodes.values() if node["run"] == "research"]
+    goal_nodes = [node for node in nodes.values() if node["run"] == "goal"]
     journal = getattr(state.get("memory"), "journal", None)
     final_graph = any("verify_latex" in action for node in nodes.values() for branch in node["next"].values()
                       if isinstance(branch, dict) for action in branch.get("after", []))
-    if (research_nodes or final_graph) and journal is None:
-        from persistent_research import initialize, ResearchMemory
-        task = evaluate(research_nodes[0]["task"], {"state": state, "visit": 1}) if research_nodes else state.get("statement") or state.get("source")
-        journal = initialize(sys.modules[__name__], Path.cwd(), text(task), workflow, prompts, options)
-        state["memory"] = ResearchMemory(journal)
+    if journal is None and (final_graph or (Path.cwd() / "research.sqlite3").exists()):
+        journal = _workflow_memory(workflow, state, options, prompts)
     if journal is not None:
         saved = journal.get_state("workflow_checkpoint")
-        review_target = research_nodes[0]["next"].get("proof") if research_nodes else None
+        review_target = goal_nodes[0]["next"].get("proof") if goal_nodes else None
         if isinstance(review_target, dict):
             review_target = review_target.get("to")
         if saved and not options.get("start_node") and saved.get("node") in nodes:
@@ -3264,6 +2039,11 @@ def _execute(workflow, state, options, prompts):
     try:
         while current != "end":
             node = nodes[current]
+            if node["run"] == "structured" and any("memory" in action for action in node.get("after", [])):
+                if journal is None:
+                    journal = _workflow_memory(workflow, state, options, prompts)
+                if "solution" in state and normalized_candidate(state["solution"]) != normalized_candidate(journal.get_state("candidate", "")):
+                    state["memory"].record_candidate(state["solution"], "review_input")
             if journal is not None:
                 state["open_issues"] = journal.get_state("open_issues", [])
             if workflow_remaining(options) <= 0:
@@ -3278,41 +2058,37 @@ def _execute(workflow, state, options, prompts):
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
             if node["run"] == "structured":
                 result, raw = _model_call(node, prompts, state, options, visits)
-            elif node["run"] == "research":
-                from persistent_research import research_session
-                if current not in sessions:
-                    sessions[current] = research_session(sys.modules[__name__], node, prompts, state, options, journal)
-                    result = next(sessions[current])
-                else:
-                    context = {"state": state, "visit": visits}
-                    result = sessions[current].send({key: evaluate(expression, context) for key, expression in node["resume"].items()})
-                raw = ""
             else:
                 context = {"state": state, "visit": visits}
                 revision = revisions.get(current, 0)
                 if current not in sessions:
                     task = text(evaluate(node["task"], context))
                     prompt = options.get("author_input")
+                    if prompt is None and options.get("author_input_file"):
+                        prompt = Path(options["author_input_file"]).read_bytes().decode("utf-8")
                     if prompt is None:
                         prompt = prompts[node["prompt"]].replace(node["marker"], task, 1)
                     lifecycle = node["lifecycle"]
                     if isinstance(lifecycle, list):
                         lifecycle = {key: key for key in lifecycle}
                     session_prompts = {key: prompts[ref] for key, ref in lifecycle.items()}
+                    directory = (Path.cwd() / "goal-memory" / _sha256(current)[:16]) if multiple_goals else Path.cwd()
                     recovery = node.get("recovery")
+                    instruction = ""
                     if recovery and evaluate(recovery["when"], context):
                         feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
-                        repair = repair_prompt(task, feedback["solution"], feedback["bugs"], 1, critic_round=feedback["round"], include_statement=False, prompts=session_prompts)
-                        prompt = render_template(prompts[recovery["prompt"]], {"original_prompt": prompt, "statement": task, "repair": repair})
-                    settings = _settings(node, options)
-                    session = author_session(
-                        prompt, task, thinking_hours=options.get("thinking_hours", DEFAULT_AUTHOR_HOURS),
-                        author_model=settings["model"], effort=settings["effort"], speed=settings["speed"],
-                        author_limit_file=options.get("author_limit_file"), elapsed_seconds=options.get("elapsed_seconds", 0) + (time.monotonic() - started_at if options.get("start_node") else 0),
-                        prompts=session_prompts,
-                        stages=node.get("stages"), node_name=current,
-                        summary=settings["summary"], author_steer_file=options.get("author_steer_file"),
-                        memory_directory=(Path.cwd() / "goal-memory" / _sha256(current)[:16]) if multiple_goals else None,
+                        instruction = render_template(prompts[recovery["prompt"]], {
+                            "original_prompt": prompt, "directory": str(directory), "prompt_file": node["prompt_file"],
+                            "instruction": "", "revision_number": 1, **feedback,
+                        })
+                    from goal_runtime import goal_session
+                    session = goal_session(
+                        sys.modules[__name__], prompt, prompts=session_prompts,
+                        files={name: render_template(content, {"original_prompt": prompt, "statement": task})
+                               for name, content in node["files"].items()},
+                        prompt_file=node["prompt_file"], directory=directory,
+                        settings=_settings(node, options), options=options,
+                        stages=node.get("stages"), node_name=current, initial_instruction=instruction,
                     )
                     sessions[current] = session
                     result = next(session)
@@ -3374,13 +2150,8 @@ def execute_workflows(paths, state, options=None):
         resume_index = 0
         if prepared and not state.get("memory"):
             first, first_prompts, first_options = prepared[0]
-            has_research = any(node["run"] == "research" for node in first["nodes"].values())
-            if has_research:
-                from persistent_research import initialize, ResearchMemory
-                node = next(node for node in first["nodes"].values() if node["run"] == "research")
-                task = text(evaluate(node["task"], {"state": state, "visit": 1}))
-                journal = initialize(sys.modules[__name__], Path.cwd(), task, first, first_prompts, first_options)
-                state["memory"] = ResearchMemory(journal)
+            if (Path.cwd() / "research.sqlite3").exists():
+                journal = _workflow_memory(first, state, first_options, first_prompts)
                 saved = journal.get_state("workflow_checkpoint")
                 if saved and not options.get("start_node"):
                     for index, (definition, _, _) in enumerate(prepared):

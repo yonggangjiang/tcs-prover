@@ -2,8 +2,8 @@
 
 `workflow_runner.py` executes a YAML graph. The YAML owns prompts, response
 shapes, result checks, state updates, and routing. The runner supplies model
-calls, durable research rounds, and legacy persistent goal sessions. Node names
-carry no special meaning; the `run` operation selects the controller behavior.
+calls and persistent author sessions. Node names carry no special meaning;
+the `run` operation selects the controller behavior.
 
 The bundled `workflows/` directory contains only `author_critic.yaml` and
 `clean_up.yaml`. Keep your own definitions elsewhere, for example
@@ -116,25 +116,35 @@ current node. Other outcomes keep their own routes even at the limit. There is
 no implicit overall graph-iteration limit.
 
 The built-in critic uses this same mechanism. A clean pass exits immediately,
-rejection returns to research and resets the critic's count, and the default
+rejection returns to the author and resets the critic's count, and the default
 second repaired round saves verification incomplete rather than accepting an
 unchecked repair.
 
 ## Reading the bundled workflows
 
-For an operator explanation with the exact prompts and no coding prerequisites,
-read the [manual worker guide](../docs/manual_workflow.md). That guide is
-regenerated from these YAML files using `docs/render_manual.py`.
+For an author-only operator explanation with the exact prompts and no coding
+prerequisites, read the [manual worker guide](../docs/manual_workflow.md). That
+guide is regenerated from the author YAML using `docs/render_manual.py`.
 
-In [`author_critic.yaml`](author_critic.yaml), `author` uses `run: research`.
-Its `task` reads `state.statement`, and the assignment prompt contains the
-`[STATEMENT]` marker. The `research.steps` mapping configures four structured
-roles: propose, assess, explore, and review. Python records and routes each
-round, checks novelty and recent-family rotation before assignment, and retains
-every full result in the permanent journal. A reviewed complete candidate
-yields `outcome: proof`; an interrupted/budget-limited cycle yields
-`outcome: failure` with its saved checkpoint. The node merges this result and
-sets `state.failed` so an incomplete search does not start cleanup.
+In [`author_critic.yaml`](author_critic.yaml), `author` uses `run: goal`.
+Its `task` reads `state.statement`, and the full author prompt contains the
+`[STATEMENT]` marker. One author session explores, checks, records, and revises
+its ideas. Its only persistent author memory is `INITIAL_PROMPT.md`,
+`APPROACHES.md`, and `PROVED.md`. The model writes the latter two; the runner
+initializes absent files and preserves the complete original prompt unchanged.
+There is no separate planner/assessor/result-reviewer sequence inside this node.
+
+The author searches its own detailed attempt history before choosing a route,
+records mechanisms, obstacles, failed steps and reopening conditions, and keeps
+only rigorously proved positive or negative lemmas in `PROVED.md`. These are
+prompt-directed responsibilities of the author, not a controller-enforced
+semantic novelty test. The same session resumes after ordinary continuation,
+compaction, or critic feedback. When that session is unavailable, a fresh one
+reads the three files before continuing the same task.
+
+A full candidate yields `outcome: proof`; unsuccessful termination yields
+`outcome: failure`. The YAML merges the result and sets `state.failed` to
+prevent an incomplete search from starting finalization.
 
 The critic saves `saved-candidate.md`, runs three fresh independent audits in
 parallel, and checkpoints completed reports in `critic-audits.json`. The
@@ -145,7 +155,7 @@ The YAML memory action records the review before replacing `state.solution`,
 so reviewed and repaired versions stay linked.
 
 A clean unchanged pass ends the proof stage. Rejection returns its latest
-candidate and exact feedback to research. A changed proof gets a fresh
+candidate and exact feedback to the same author. A changed proof gets a fresh
 three-auditor round; the default `repeat: 2` limit produces **verification
 incomplete**, preserves the latest candidate, and sets `state.failed`. It
 never approves the last repair merely because the review budget was exhausted.
@@ -164,18 +174,15 @@ feedback.
 
 | Bundled prompt name | Purpose |
 | --- | --- |
-| `author` | Exact research assignment containing `[STATEMENT]`. |
-| `research_propose` | Produce three to five different mechanisms. |
-| `research_assess` | Independently compare a proposal against assigned attempts and failures. |
-| `research_explore` | Work on one registered proposal and return a complete result card. |
-| `research_review` | Review that result, record narrow failure scope, reusable results, and reopening conditions. |
-| `critic`, `critic_memory` | Coordinate audits/repairs and maintain historical obligations with evidence. |
+| `author` | Full initial statement and search/memory strategy. |
+| Goal lifecycle prompts | Continue, reread after compaction, resume after interruption, or repair after critic feedback. |
+| `critic`, `critic_memory` | Coordinate audits/repairs and preserve historical obligations with evidence. |
 | `critic_input`, `critic_audit` | Assemble the actual coordinator and auditor inputs. |
 | `final`, `proof_input`, `source_input` | Edit an accepted proof or existing theorem/proof source. |
 | `verify_final`, `verification_input` | Independently check preservation of the final argument. |
 
-The retained ten goal-lifecycle prompts and `recovery` support legacy custom
-`goal` nodes. They do not drive the default research operation.
+The author prompt and lifecycle/file bindings are part of the YAML. Changing
+the prompt does not require adding a new planner or a database service.
 
 ## Root entries and shared node entries
 
@@ -193,7 +200,7 @@ Every node requires `run`, `prompt`, and `next`. Unknown node fields are rejecte
 
 | Shared entry | Meaning and default |
 | --- | --- |
-| `run` | Required operation: `structured`, `research`, or legacy `goal`. |
+| `run` | Required operation: `structured` or `goal`. |
 | `prompt` | Required name in `prompts`. Structured nodes also support the conditional form below. |
 | `next` | Required transition string or outcome mapping; see [transitions](#transitions). |
 | `role` | Optional model-setting namespace, such as `editor`, `author`, or `critic`. It does not choose an operation. |
@@ -337,161 +344,114 @@ searches sibling runs for matching assignments unless the marker is present.
 For custom workflows, change the declared identity when changing instructions
 or other assumptions that make existing results obsolete.
 
-## Research nodes
+## Goal nodes
 
-`run: research` is the default persistent search operation. It uses fresh,
-tool-free structured requests and a controller-owned SQLite journal, rather
-than relying on an unbounded model conversation. The required node fields are:
+`run: goal` keeps one author session per node across visits. The first visit
+starts the goal; later visits resume that same session with feedback from
+shared state. The default author uses this operation with exactly three
+Markdown memory files. It does not run separate planning, novelty-assessment,
+or research-review model calls and does not maintain an author SQLite journal.
 
-| Entry | Meaning |
+| Entry | Meaning and default |
 | --- | --- |
-| `task` | Expression selecting the exact nonempty statement; normally `state.statement`. |
-| `marker` | Literal occurring once in the main assignment prompt, normally `[STATEMENT]`. |
-| `resume` | Expression mapping containing `solution`, `bugs`, and `round` for critic feedback. |
-| `research.family_cooldown` | Positive number of most recently assigned canonical families excluded from the next assignment; default 2. |
-| `research.steps` | Exactly four named steps: `propose`, `assess`, `explore`, and `review`. |
+| `task` | Required expression selecting nonempty task text from `state` and `visit`. |
+| `marker` | Required literal appearing exactly once in the main prompt; replaced with the exact task. |
+| `prompt_file` | Required filename present in `files`, containing the full permanent initial prompt. The default is explicitly `INITIAL_PROMPT.md`. |
+| `files` | Required nonempty mapping of plain filenames to initial-content templates. Paths and directory traversal are not allowed. Templates receive `original_prompt` and `statement`; existing files are preserved. |
+| `lifecycle` | Bindings for exactly `goal`, `continuation`, `compaction`, `repair`, and `resume`. Omission uses the same-named prompts; a list of all five names or a mapping to other named prompts is supported. |
+| `resume` | Required expression mapping containing `solution`, `bugs`, and `round`, used to return critic feedback to the same session. |
+| `stages` | Optional mapping with exactly `initial`, `resume`, and `failure`. Defaults to `{initial: solve, resume: repair, failure: failure}`. |
+| `recovery` | Optional `{when, prompt}` for first activation entered with saved critic feedback. The named prompt is rendered with the recovery values. |
 
-Each step has a named `prompt`, a `response` shorthand or `schema`, and optional
-`role`, `model`, `effort`, `timeout`, `label`, `attempts`, and `provider_options`.
-`timeout` must be positive and at most 3600 seconds (default 900); the actual
-request is additionally bounded by the shared workflow time remaining. The
-bundled propose/assess/review steps allow 600 seconds each and exploration
-allows 900. The controller owns a bounded retry loop and records request errors;
-step transport calls themselves use one attempt. `features`, per-step graph
-transitions, and arbitrary tool calls are not supported research-step fields.
+The bundled author declares its memory files directly:
 
-The controller supplies these template inputs automatically:
+```yaml
+run: goal
+prompt: author
+task: state.statement
+marker: '[STATEMENT]'
+prompt_file: INITIAL_PROMPT.md
+files:
+  INITIAL_PROMPT.md: '{original_prompt}'
+  APPROACHES.md: |
+    # Attempted approaches
 
-| Placeholder | Value |
+    No approaches attempted yet.
+  PROVED.md: |
+    # Proved lemmas
+
+    No lemmas established yet.
+lifecycle: [goal, continuation, compaction, repair, resume]
+resume:
+  solution: state.solution
+  bugs: state.report.bugs
+  round: state.round
+```
+
+This is an excerpt from a node; add the normal `next`/outcome/actions and
+referenced prompts to form a complete graph. `original_prompt` is the entire
+main prompt after statement-marker substitution. The runner saves that content
+unchanged in the permanent instruction file. The author itself updates
+`APPROACHES.md` and `PROVED.md` using file tools.
+
+The initial author prompt specifies the recording procedure: give each attempt
+a stable approach ID, save it before investigating, retain its detailed work,
+mark it OPEN or CLOSED, and explain the exact obstacle and reopening condition.
+Only fully justified lemmas with complete proofs belong in `PROVED.md`, linked
+to their associated approach IDs. Negative lemmas may prove an obstruction or
+counterexample to a specific claim; a missing argument is not such a proof.
+Invalidated lemmas lose their proved status, with their error and correction
+preserved in the associated approach and dependent results rechecked.
+
+Before a new attempt, the author searches both notebooks for related mechanisms
+and obstacles. Avoiding cosmetic repeats and choosing substantially different
+directions are explicit prompt responsibilities. The controller does not
+pretend to decide mathematical equivalence mechanically. There is no fixed
+family cooldown or separate novelty gate.
+
+The five lifecycle prompts have these uses:
+
+| Lifecycle key | When used |
 | --- | --- |
-| `assignment` | Main author prompt with the exact statement substituted. |
-| `statement` | Exact statement alone. |
-| `memory` | Recent-record briefing, open issues, and recent assigned families. |
-| `feedback` | Latest critic feedback as JSON. |
-| `instruction` | Latest recorded human instruction. |
-| `proposal` | Current registered/assessed proposal as JSON. |
-| `result` | Current exploration result as JSON. |
-| `related` | Retrieved related historical records, carrying IDs and truncation markers. |
+| `goal` | Objective installed for the existing persistent author task. |
+| `continuation` | Continue the same session after an unfinished author turn while time remains. |
+| `compaction` | Reread the permanent assignment and both notebooks after context compaction. |
+| `repair` | Return the latest candidate and exact critic bugs to the same author. |
+| `resume` | Resume preserved files in the current run folder, reusing the prior conversation when available. |
 
-The step response contracts must supply the fields the controller uses:
+Lifecycle/recovery templates may reference `original_prompt`, `directory`,
+`prompt_file`, `solution`, `bugs`, `round`, `revision_number`, and `instruction`.
+The bundled `resume` uses `directory`; `repair` uses `round`, `solution`, and
+`bugs`. Initial file templates use only `original_prompt` and `statement`.
+There is no extra model call to summarize the files at a stopping boundary.
 
-| Step | Required substantive fields |
-| --- | --- |
-| `propose` | `proposals`: three to five objects with `family`, `mechanism`, `assumptions`, `obstacle`, `decisive_test`, `novelty`. Proposals may be empty only while requesting evidence. |
-| `assess` | `decision` (`proceed`, `reopen`, `reject`), `canonical_family`, `related_ids`, `reason`, `reopen_evidence`. |
-| `explore` | `status` (`candidate`, `incomplete`, `refuted`), full `work`, `evidence`, full `candidate` or empty text, `remaining_obligations`, `next_test`. |
-| `review` | `verdict` (`candidate`, `incomplete`, `refuted`), `reason`, `checked_evidence`, `failure_scope`, `reopen_condition`, `reusable_results`. |
+An author candidate yields `outcome: proof` and the complete `solution`.
+Unsuccessful termination yields `outcome: failure` and a diagnostic in
+`output`. Use `outcome: result.outcome` and `after: [{merge: result}]` to expose
+this result to the graph, then set `state.failed` when failure should stop the
+chain. The built-in author demonstrates these actions.
 
-Every step also includes `search_queries` (up to four strings) and
-`read_requests` (up to four objects with `event_id` and integer `offset`). A
-nonempty retrieval request postpones the substantive decision. The controller
-searches the full relevant archive or returns a 16,000-character section of
-the requested full JSON event. Returned sections include their total length
-and next offset. The same role is called again with the evidence appended.
-After 12 retrieval exchanges the step pauses with a resumable checkpoint.
-This prevents accidental infinite lookup loops without erasing earlier results.
+`thinking_hours`, `elapsed_seconds`, and `author_limit_file` control the shared
+workflow deadline, which also bounds structured critic and final requests.
+`author_steer_file` supplies live human instructions to the author session.
+With multiple goal nodes, each node's configured files live in its own directory
+under `goal-memory/`; the default one-author graph keeps its three files in the
+run folder.
 
-The durable cycle is:
-
-1. Record a diverse portfolio; its suggestions are not assignments yet.
-2. Retrieve related assigned attempts/results and ask the independent assessor.
-3. Block a rejected proposal, a previously assigned identical normalized
-   mechanism, either recent family, or an invalid reopening/reference. A
-   reopening must cite existing record IDs and concrete new evidence.
-4. Atomically record the accepted assignment and next exploration step.
-5. Record the complete exploration result, then independently review it.
-6. Return to planning unless both researcher and reviewer support a full,
-   previously unsubmitted candidate; candidates proceed to the outer critic.
-
-Identical-mechanism comparison ignores text case and whitespace. Recognizing
-semantically equivalent ideas with different wording remains the assessor's
-fallible task. Family names come from the assessor and must reuse historical
-names for equivalent families. Rotation is a concrete scheduling constraint,
-not a guarantee that every accepted proposal is mathematically novel.
-
-`research_journal.py` stores permanent events, checkpoint values, and search
-indexes in `research.sqlite3`. A SQLite transaction adds each event and its
-next checkpoint together. No full record is pruned. Model prompts, raw replies,
-validated responses, portfolios, assignments, attempts, reviews, candidates,
-and transitions are all recorded. Completed responses can be reused after a
-restart. The archive is keyed by the exact statement; prompt/configuration
-changes produce version records rather than clearing memory.
-
-`research/records/` contains complete readable cards. `INDEX.md`, `STATE.md`,
-`FAILED.md`, `PROVED.md`, and `STATEMENT.md` provide navigation and the current
-workbench. Only briefings, index navigation, and displayed cache bodies are
-shortened. Explicit event-ID reads recover complete text. Storage errors stop
-progress; interrupted Markdown exports can be rebuilt from the canonical DB.
-Every continuation path copies the complete archive using SQLite backup and
-preserves legacy notebooks for import, leaving the source run unchanged.
-
-For browser-visible continuation with a new time budget:
+Continuation preserves the same conversation when the recorded thread is
+available. If it cannot be resumed, a fresh thread reads the same three files.
+The source run remains unchanged when the UI creates a continued run. Private
+internal reasoning and a half-returned model response are not recovered as a
+completed result.
 
 ```bash
 python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN
 ```
 
-Custom nodes must use one research project per run directory and preserve its
-exact statement. See the bundled author node for a complete validated response
-contract; the [operator manual](../docs/manual_workflow.md) renders its actual
-prompts and required response fields in execution order.
-
-## Goal nodes
-
-This legacy operation remains supported for custom workflows. It uses the
-bounded `author-memory.json` ledger and session lifecycle described below; it
-does not provide the default research registration and novelty gates.
-
-`goal` keeps one session per node across visits. Its first visit starts a task;
-later visits resume the same session using feedback from shared state. Closing
-the graph closes all its sessions. The transport retains the existing durable
-proof-search protocol: a completed candidate yields `outcome: proof`,
-`solution`, and a live `memory` object; an unsuccessful or timed-out search
-yields `outcome: failure` and `output` containing its summary.
-
-| Entry | Meaning and default |
-| --- | --- |
-| `task` | Required expression selecting nonempty task text from `state` and `visit`. |
-| `marker` | Required nonempty literal appearing exactly once in the goal's main `prompt`; the runner replaces it with the task. |
-| `lifecycle` | Optional bindings for the ten lifecycle prompts below. Omission binds each key to the same-named prompt. A list of all ten names is equivalent; a mapping allows different prompt names. |
-| `resume` | Required expression mapping containing `solution`, `bugs`, and `round`, used when re-entering the node. Bind the latest candidate, unresolved feedback, and reviewer round. |
-| `stages` | Optional mapping with exactly `initial`, `resume`, and `failure`. Defaults to `{initial: solve, resume: repair, failure: failure}`. |
-| `recovery` | Optional `{when, prompt}` for a first activation entered with saved feedback. If `when` is true, the named template receives `original_prompt`, `statement`, and formatted `repair` from the lifecycle prompts and `resume` bindings. Later visits resume the existing session normally. |
-
-The lifecycle protocol still needs all ten prompt entries even when `lifecycle`
-is omitted. These are the available placeholders; plain-text entries are not
-formatted themselves:
-
-| Lifecycle key | Purpose | Available placeholders |
-| --- | --- | --- |
-| `goal` | Objective supplied to the persistent goal controller. | None; plain text. |
-| `initial` | First model input. | `original_prompt`, `memory_instructions`, `memory_snapshot` |
-| `memory` | Instructions describing the controller's durable history. | None; inserted into `initial` as `memory_instructions`. |
-| `anchor` | Immutable assignment file. | `original_prompt`, `statement` |
-| `reanchor` | Wrapper reinjected on continuation, compaction, or revision. | `original_prompt`, `statement`, `memory_snapshot`, `instruction` |
-| `continuation` | Instruction when an attempt ends without a complete candidate. | None; inserted into `reanchor` as `instruction`. |
-| `compaction` | Instruction after root-session context compaction. | None; inserted into `reanchor` as `instruction`. |
-| `repair` | Feedback to the existing session after a rejection. | `critic_label`, `revision_number`, `statement_block`, `solution`, `bugs` |
-| `failure` | Instructions for preserving unfinished work. | None; inserted into `failure_input` as `instructions`. |
-| `failure_input` | Final summary request after a stop condition. | `instructions`, `reason`, `memory_snapshot` |
-
-`original_prompt` is the main prompt after marker substitution; `statement` is
-the task text. `memory_snapshot` is the bounded ledger snapshot. `critic_label`
-names the feedback round, `revision_number` starts at 1, and `statement_block`
-is empty on ordinary session resumption because the reanchor already includes
-the task. The formatted `repair` becomes `reanchor`'s `instruction`.
-
-Use `outcome: result.outcome` and `after: [{merge: result}]` to expose the
-session's result to the graph, then explicitly set `state.failed` when failure
-should stop a chain. The default research author uses the same outer result
-shape, but its internal operation differs from this legacy session protocol.
-
-The goal time limit is controlled by options, not extra YAML node fields:
-`thinking_hours`, `elapsed_seconds`, and `author_limit_file`. The
-`author_steer_file` option supplies the UI's live instruction queue to an active
-session. The shared workflow deadline also bounds structured critic and final
-requests. An expired legacy goal produces a failure summary rather than a proof. With multiple goal nodes in one
-graph, each session has its own ledger directory under `goal-memory/`.
+The name of this continuation command is retained for compatibility; it now
+continues the goal-based author and its three notebooks. The old `run: research`
+operation, four research-step contracts, and ten-prompt author-ledger lifecycle
+are no longer supported.
 
 ## State actions
 
@@ -533,9 +493,10 @@ clearly. The engine updates `state.outcome` after node `after` actions, so use
 ### Durable memory action
 
 `memory` does nothing if `state.memory` is absent or `None`. Otherwise it expects
-a memory adapter: `ResearchMemory` backed by the permanent archive for research
-results, or legacy `AuthorMemory` for goal results. It is not a general
-dictionary store.
+the review-memory adapter (`ResearchMemory`) backed by the critic/final archive.
+It is not a general dictionary store and does not maintain the author's three
+notebooks. The default author writes its files directly; this action is used
+by the critic to link reviewed and repaired candidate versions.
 
 `memory: approved` sets the current candidate's status to that literal string.
 The mapping form requires all five expression fields:
@@ -552,9 +513,9 @@ A changed candidate is recorded and linked to the reviewed attempt. The review
 is recorded even when the candidate is unchanged. Historical `memory_update`
 uses `approach_family`, `approach_result`, `blocked_routes` (entries with `route`,
 `reason`, `reopen_condition`), and `unresolved_obligations`. Missing historical
-metadata is tolerated for legacy callers. Research critics also supply
+metadata is tolerated for compatible callers. The critic also supplies
 `resolved_obligations`, each with an existing issue `id` and concrete `evidence`;
-omitted obligations remain open. The research-aware critic gate rejects a pass
+omitted obligations remain open. The critic gate rejects a pass
 with unresolved obligations before graph routing. Status/history actions
 themselves do not choose graph routes;
 the YAML's `next` does that.
@@ -649,10 +610,10 @@ transport and YAML actions. The UI's built-in graphs preserve their existing
 | `--state-file` | Load initial state from a JSON object instead of reading standard input. It does not add the stdin aliases. |
 | `--start-node` | Start the first workflow at the named node; later workflows start at their first node. |
 | `--critic-rounds` | Consecutive repaired-round limit, from 1 to 100; default 2. Reaching it saves verification incomplete. |
-| `--thinking-hours` | Shared elapsed-workflow limit covering research, critic, and final requests: greater than 0 and at most 168 hours, default 168. |
+| `--thinking-hours` | Shared elapsed-workflow limit covering author, critic, and final requests: greater than 0 and at most 168 hours, default 168. |
 | `--elapsed-seconds` | Nonnegative elapsed time to count before starting the workflow, default 0. |
 | `--author-limit-file` | Live JSON control file containing `{"hours": ...}` for the shared workflow time limit. |
-| `--author-steer-file` | Live instruction queue recorded at research-step boundaries or delivered to a legacy goal session. |
+| `--author-steer-file` | Live instruction queue delivered to the persistent author session. |
 | `--author-prompt-file`, `--critic-prompt-file`, `--final-prompt-file` | Replace the corresponding named prompt with UTF-8 file contents. |
 | `--set NAME=VALUE` | Set any named option; repeat as needed. JSON values are decoded, and other values remain strings. Applied after ordinary flags. |
 
@@ -684,9 +645,12 @@ event. Options are shared across a chain and do not become expression-context
 variables.
 
 For compatibility, the `author_input` option can provide an already-expanded
-assignment for research or legacy goal nodes. It bypasses the main prompt's marker substitution
+initial assignment for goal nodes. It bypasses the main prompt's marker substitution
 and marker-count check; lifecycle templates still apply. Ordinary custom
 workflows should use the YAML `prompt`, `task`, and `marker` entries.
+For UI continuation, `author_input_file` reads the existing initial-prompt file
+verbatim, preserving its original whitespace and line endings. `goal_thread_id`
+selects the saved conversation to resume. Neither option creates a memory file.
 
 ## Check a workflow offline
 
@@ -723,7 +687,7 @@ with patch.object(runner, "structured", side_effect=[
 
 Mocking `structured` skips the transport and its schema validation;
 the YAML's `require` checks and graph actions still run. For a goal graph,
-mock `author_session` with a generator yielding the documented goal result and
+mock `goal_runtime.goal_session` with a generator yielding the documented goal result and
 accepting `resume` dictionaries. The repository's regression suite uses these
 boundaries to verify workflows without paid model calls:
 
