@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import workflow_runner as runtime
+from research_journal import DATABASE_FILENAME as RESEARCH_DATABASE_FILENAME, copy_research_archive
 from .review import REVIEW_PROMPT
 
 
@@ -50,6 +51,15 @@ MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
+LEGACY_RESEARCH_FILES = (
+    "STATEMENT.md", "REGISTRY.md", "FAILED.md", "PROVED.md", "LESSONS.md",
+    runtime.AUTHOR_MEMORY_FILENAME,
+)
+CONTINUATION_HISTORY_FILES = (
+    *LEGACY_RESEARCH_FILES, runtime.AUTHOR_ANCHOR_FILENAME,
+    runtime.SAVED_CANDIDATE_FILENAME, "SOLUTION.md", "FAILURE.md",
+    "source.json",
+)
 
 
 def isolated_process_options():
@@ -177,7 +187,7 @@ def important_record(record):
         and item.get("type") in {"agentMessage", "agent_message"}
     )
 
-# UI-only labels mirror the four runtime stages and the statement review.
+# UI labels describe the research loop and independent final verification.
 PUBLIC_GRAPH = {
     "settings": {
         "model": DEFAULT_AUTHOR_MODEL,
@@ -214,21 +224,25 @@ PUBLIC_GRAPH = {
         "author": {
             "label": "Proof author", "short_label": "Author", "stage": "solve",
             "stages": ["solve", "repair"],
-            "description": "Writes the proof and revises it after critic rejection.",
+            "description": "Records bounded research rounds and checks new approaches against the permanent archive.",
         },
         "failure_summary": {
-            "label": "Failure summary", "short_label": "Summary",
+            "label": "Research checkpoint", "short_label": "Checkpoint",
             "stage": "failure",
-            "description": "Preserves progress when total time expires at an author step.",
+            "description": "Preserves completed work, evidence, and the next step when research or verification pauses.",
         },
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
             "stage": "critic",
-            "description": "Audits and repairs proofs until a clean pass or the non-rejecting round limit.",
+            "description": "Audits exact proof versions; a repair limit pauses with verification incomplete.",
         },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
-            "description": "Polishes the accepted proof after a clean pass or the critic round limit.",
+            "description": "Formats the exact proof that received a clean, unchanged critic pass.",
+        },
+        "final_verifier": {
+            "label": "Final verifier", "short_label": "Verify", "stage": "final",
+            "description": "Independently checks that formatting preserves the complete argument, then checks local compilation when available.",
         },
     },
     "edges": [
@@ -244,8 +258,8 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "author", "to": "failure_summary",
-            "label": "Summarize failure", "when": "total time expires at the author",
-            "prompt_change": "Stop solving and summarize progress and obstacles.",
+            "label": "Save research checkpoint", "when": "research pauses or the time budget expires",
+            "prompt_change": "Preserve completed rounds and the next recorded action for continuation.",
         },
         {
             "from": "critic", "to": "critic",
@@ -259,8 +273,23 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "critic", "to": "latex_editor",
-            "label": "Final edit", "when": "critic gives a clean pass or reaches the non-rejecting round limit",
-            "prompt_change": "Send the latest complete solution to the LaTeX editor.",
+            "label": "Format reviewed proof", "when": "critic passes the exact unchanged proof with no open obligations",
+            "prompt_change": "Send the independently reviewed solution to the LaTeX editor.",
+        },
+        {
+            "from": "critic", "to": "failure_summary",
+            "label": "Save verification checkpoint", "when": "the repair limit or remaining time budget is reached",
+            "prompt_change": "Preserve the candidate and completed audits without approving an unchecked repair.",
+        },
+        {
+            "from": "latex_editor", "to": "final_verifier",
+            "label": "Verify final document", "when": "the formatted document is complete",
+            "prompt_change": "Compare the formatted document with the exact reviewed source and check every substantive change.",
+        },
+        {
+            "from": "final_verifier", "to": "failure_summary",
+            "label": "Save formatting checkpoint", "when": "content verification or compilation fails",
+            "prompt_change": "Preserve the reviewed source, formatted document, and feedback for an editor retry.",
         },
     ],
 }
@@ -284,8 +313,12 @@ LATEX_GRAPH = {
             **PUBLIC_GRAPH["nodes"]["latex_editor"],
             "description": "Polishes the supplied theorem and proof into clean LaTeX.",
         },
+        "final_verifier": PUBLIC_GRAPH["nodes"]["final_verifier"],
     },
-    "edges": [],
+    "edges": [
+        edge for edge in PUBLIC_GRAPH["edges"]
+        if edge["from"] == "latex_editor" and edge["to"] == "final_verifier"
+    ],
 }
 
 REVIEW_ONLY_GRAPH = {
@@ -298,6 +331,20 @@ REVIEW_ONLY_GRAPH = {
     },
     "edges": [],
 }
+
+
+def event_node(record, current=""):
+    """Keep explicit node context across node-less events in a shared stage."""
+
+    if record.get("node"):
+        return record["node"]
+    stage = record.get("stage")
+    nodes = PUBLIC_GRAPH["nodes"]
+    active = nodes.get(current, {})
+    if stage in active.get("stages", [active.get("stage")]):
+        return current
+    return next((name for name, node in nodes.items()
+                 if stage in node.get("stages", [node["stage"]])), current)
 
 
 def direct_run_directory(path, runs):
@@ -470,41 +517,69 @@ class App:
         )
 
     def _prepare_continuation(
-        self, source_run="", stopped_stage="", copy_author_memory=False,
+        self, source_run="", stopped_stage="", allow_external_source=False,
     ):
-        """Record immutable provenance and restore compatible author memory."""
+        """Restore the durable archive before any resumed stage can launch.
+
+        Legacy notebooks are kept verbatim for ingestion, together with readable
+        source copies. No prompt-fingerprint or size filter discards old lessons.
+        A failed copy aborts launch instead of starting without research history.
+        """
 
         if not source_run:
             return
-        source = validated_continuation_source(source_run, self.runs)
+        requested_source = Path(source_run).expanduser().absolute()
+        source = validated_continuation_source(
+            requested_source,
+            requested_source.parent if allow_external_source else self.runs,
+        )
+        if source == self.run_dir.resolve():
+            raise ValueError("A continuation must use a new run directory.")
         copied = []
-        if copy_author_memory:
-            memory_path = source / runtime.AUTHOR_MEMORY_FILENAME
-            try:
-                memory_ready = (
-                    memory_path.is_file()
-                    and memory_path.stat().st_size
-                    <= runtime.AUTHOR_MEMORY_MAX_BYTES
-                )
-            except OSError:
-                memory_ready = False
-            if memory_ready:
-                try:
-                    self._save(
-                        runtime.AUTHOR_MEMORY_FILENAME,
-                        memory_path.read_text(encoding="utf-8"),
-                    )
-                    copied.append(runtime.AUTHOR_MEMORY_FILENAME)
-                except (OSError, UnicodeError):
-                    # The new author can still restart from the exact statement.
-                    pass
+        try:
+            if copy_research_archive(source, self.run_dir):
+                copied.append("research.sqlite3")
+        except Exception as exc:
+            raise ValueError(f"Cannot restore the research archive: {exc}") from exc
+
+        def copy_file(path, relative):
+            destination = self.run_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copyfile(path, destination)
+            destination.chmod(0o600)
+            copied.append(str(relative))
+
+        # Carry older source copies through a chain of continuations. Only known
+        # research records are copied, never arbitrary workspaces or transcripts.
+        history = source / "continuation-memory"
+        if history.is_dir():
+            for path in sorted(history.rglob("*")):
+                if path.is_file() and path.name in CONTINUATION_HISTORY_FILES:
+                    copy_file(path, path.relative_to(source))
+
+        source_history = Path("continuation-memory") / source.name
+        for name in CONTINUATION_HISTORY_FILES:
+            path = source / name
+            if name != "source.json" and path.is_file():
+                copy_file(path, source_history / name)
+                if name in LEGACY_RESEARCH_FILES:
+                    copy_file(path, Path(name))
+        provenance = {
+            "sourceRun": str(source),
+            "sourceTranscript": str(source / "transcript.jsonl"),
+            "stoppedStage": str(stopped_stage),
+            "continuedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save(
+            source_history / "source.json",
+            json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+        )
         self._save(
             CONTINUATION_SOURCE_FILENAME,
             json.dumps({
-                "sourceRun": str(source),
-                "stoppedStage": str(stopped_stage),
+                **provenance,
                 "copiedArtifacts": copied,
-                "continuedAt": datetime.now(timezone.utc).isoformat(),
             }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
 
@@ -1183,8 +1258,10 @@ class App:
     def _final_options(self):
         return [
             "--writer-model", self.state["writerModel"],
+            "--critic-model", self.state["criticModel"],
             "--reasoning-effort", self.state["reasoningEffort"],
             "--writer-effort", self.state["writerEffort"],
+            "--critic-effort", self.state["criticEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
             "--speed", self.state["speedMode"],
             "--final-prompt-file", str(self.run_dir / "prompts/final.txt"),
@@ -1228,6 +1305,7 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
+        allow_external_source=False,
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -1260,7 +1338,8 @@ class App:
             if not self.fixed_trace:
                 self.pinned = []
             self._prepare_continuation(
-                continuation_source, stopped_stage, copy_author_memory=True,
+                continuation_source, stopped_stage,
+                allow_external_source=allow_external_source,
             )
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
@@ -1355,6 +1434,7 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="final",
+        critic_model=DEFAULT_CRITIC_MODEL, critic_effort=None,
     ):
         """Retry normal finalization with its exact statement/proof contract."""
 
@@ -1365,6 +1445,8 @@ class App:
             raise ValueError("Saved final input cannot contain NUL characters.")
         options = self._workflow_options(
             writer_model=writer_model,
+            critic_model=critic_model,
+            critic_effort=critic_effort,
             reasoning_effort=reasoning_effort,
             writer_effort=writer_effort,
             final_prompt=final_prompt,
@@ -1461,6 +1543,9 @@ class App:
             self._new_run(statement, f"critic-resume-{source_label}")
             if not self.fixed_trace:
                 self.pinned = []
+            self._prepare_continuation(
+                source_run, "critic", allow_external_source=True,
+            )
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
@@ -1555,14 +1640,14 @@ class App:
                     problem = record["text"][7:]
                 record_stage, record_node = record.get("stage"), record.get("node")
                 stages = {
-                    stage: name
+                    stage
                     for name, item in PUBLIC_GRAPH["nodes"].items()
                     for stage in item.get("stages", [item["stage"]])
                 }
                 if record_stage in stages:
                     with self.lock:
                         self.state["stage"] = record_stage
-                        self.state["activeNode"] = record_node or stages[record_stage]
+                        self.state["activeNode"] = event_node(record, self.state["activeNode"])
                 if isinstance(record.get("round"), int):
                     with self.lock:
                         self.state["round"] = record["round"]
@@ -1616,7 +1701,10 @@ class App:
                 if record.get("kind") == "failure_result":
                     failed = True
                     with self.lock:
-                        self.state["output"] = record.get("output", "")
+                        self.state["output"] = (
+                            record.get("output") or record.get("summary")
+                            or record.get("text", "")
+                        )
                         final = True
                         self._save("failure-summary.md", self.state["output"])
                         if self.state.get("manuallyStopped"):
@@ -1683,7 +1771,7 @@ class App:
                 # killed the child before it closed stdout cleanly.
                 self._clear_manual_stop()
                 self.state["error"] = (
-                    "Proof incomplete. The author produced a failure summary."
+                    "Workflow incomplete. See the saved checkpoint and failure report."
                     if failed else ""
                 )
             elif stopped and code:
@@ -1849,26 +1937,35 @@ def _artifact_time(path):
 def _run_records(run_dir):
     """Read valid records from one private append-only run transcript."""
 
+    return list(_iter_run_records(run_dir))
+
+
+def _iter_run_records(run_dir):
+    """Stream public records so recovery need not retain a large transcript."""
+
     path = Path(run_dir) / "transcript.jsonl"
-    records = []
     try:
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     value = json.loads(line)
                     if isinstance(value, dict):
-                        records.append(value)
+                        yield value
                 except json.JSONDecodeError:
                     continue
     except OSError:
         pass
-    return records
 
 
 def saved_author_instructions(run_dir):
     """Return bounded, deduplicated user steering from a stopped author run."""
 
-    records = _run_records(run_dir)
+    labels = {
+        "Live instruction queued", "Live author instruction sent",
+        "Restored live instructions queued",
+    }
+    records = [record for record in _iter_run_records(run_dir)
+               if record.get("label") in labels]
     restored_ids = {
         str(record.get("steerId") or "").strip()
         for record in records
@@ -1876,10 +1973,6 @@ def saved_author_instructions(run_dir):
         and str(record.get("steerId") or "").strip()
     }
     instructions, seen = [], set()
-    labels = {
-        "Live instruction queued", "Live author instruction sent",
-        "Restored live instructions queued",
-    }
     for record in records:
         if record.get("label") not in labels:
             continue
@@ -2318,11 +2411,7 @@ def restore_saved_app(app):
         stage = record.get("stage")
         if stage:
             state["stage"] = stage
-            state["activeNode"] = {
-                "review": "statement_reviewer", "solve": "author",
-                "repair": "author", "critic": "critic", "final": "latex_editor",
-                "failure": "failure_summary",
-            }.get(stage, state["activeNode"])
+            state["activeNode"] = event_node(record, state["activeNode"])
         if isinstance(record.get("round"), int):
             state["round"] = record["round"]
         if record.get("kind") == "request":
@@ -2330,7 +2419,9 @@ def restore_saved_app(app):
             label = str(record.get("label", ""))
             role = {
                 "review": "review", "solve": "author", "repair": "author",
-                "critic": "critic", "final": "writer",
+                "critic": "critic", "final": (
+                    "critic" if state["activeNode"] == "final_verifier" else "writer"
+                ),
             }.get(stage)
             if (
                 role and isinstance(model, str) and model
@@ -2642,6 +2733,38 @@ def saved_critic_source(path):
     }
 
 
+def saved_research_source(path):
+    """Read checkpoint launch settings without opening a historical transcript."""
+
+    requested = Path(path).expanduser().absolute()
+    source = requested if requested.is_dir() else requested.parent
+    source = validated_continuation_source(source, source.parent)
+    if not (source / RESEARCH_DATABASE_FILENAME).is_file() and not any(
+        (source / name).is_file() for name in LEGACY_RESEARCH_FILES
+        if name != "STATEMENT.md"
+    ):
+        raise ValueError("This run has no research archive or legacy research memory.")
+    settings = {}
+    settings_path = source / JOB_SETTINGS_FILENAME
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read saved research settings: {exc}") from exc
+        if not isinstance(settings, dict):
+            raise ValueError("Saved research settings must be an object.")
+    for role in ("author", "critic", "writer"):
+        if f"{role}Model" in settings:
+            settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
+    for role in ("author", "critic", "final"):
+        path = source / "prompts" / f"{role}.txt"
+        settings[f"{role}Prompt"] = (
+            read_utf8(path, f"saved {role} prompt") if path.exists()
+            else DEFAULT_PROMPTS[role]
+        )
+    return {"run_dir": source, "statement": saved_statement(source), "settings": settings}
+
+
 class Server(ThreadingHTTPServer):
     """Keep independent jobs alive while browser tabs come and go."""
 
@@ -2845,6 +2968,44 @@ class Server(ThreadingHTTPServer):
         self.app = app
         return app
 
+    def start_saved_research_job(self, source_run, settings=None):
+        """Restart the journal checkpoint with saved settings and a fresh budget."""
+
+        source = saved_research_source(source_run)
+        with self.jobs_lock:
+            for previous in self.jobs.values():
+                if previous.run_dir and previous.run_dir.resolve() == source["run_dir"]:
+                    if previous.has_active_worker() or previous.state["phase"] in {
+                        "reviewing", "running", "stopping",
+                    }:
+                        raise ValueError("Stop the source job before resuming its research.")
+        options = {**source["settings"], **(settings or {})}
+        app = App(runs=self.runs)
+        app.start_direct_statement(
+            source["statement"],
+            critic_rounds=options.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            thinking_hours=options.get("thinkingHours", DEFAULT_THINKING_HOURS),
+            author_model=options.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            critic_model=options.get("criticModel", DEFAULT_CRITIC_MODEL),
+            writer_model=options.get("writerModel", DEFAULT_WRITER_MODEL),
+            reasoning_effort=options.get("reasoningEffort", DEFAULT_REASONING_EFFORT),
+            author_effort=options.get("authorEffort"),
+            critic_effort=options.get("criticEffort"),
+            writer_effort=options.get("writerEffort"),
+            author_prompt=options.get("authorPrompt"),
+            critic_prompt=options.get("criticPrompt"),
+            final_prompt=options.get("finalPrompt"),
+            speed_mode=options.get("speedMode", DEFAULT_SPEED),
+            reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
+            continuation_source=source["run_dir"], stopped_stage="research",
+            allow_external_source=True,
+        )
+        self._queue_saved_author_instructions(source["run_dir"], app)
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
     def resume_critic_job(self, run_id, include_audit_checkpoint=True):
         """Resume an idle job from its saved proof using its role settings."""
 
@@ -2890,14 +3051,43 @@ class Server(ThreadingHTTPServer):
 
     @staticmethod
     def _stopped_continuation_plan(source_app, state=None):
-        """Describe the safest available boundary for one manual stop."""
+        """Describe a durable restart for manual stops, exhaustion, or errors."""
 
         state = source_app.snapshot() if state is None else state
         if (
-            not state.get("manuallyStopped")
-            or state.get("phase") in {"reviewing", "running", "stopping"}
+            state.get("phase") in {"reviewing", "running", "stopping"}
             or source_app.has_active_worker()
         ):
+            return None
+        if (
+            source_app.run_dir
+            and (source_app.run_dir / RESEARCH_DATABASE_FILENAME).is_file()
+            and not (source_app.run_dir / "final.tex").is_file()
+        ):
+            if state.get("problemMode") == "latex" and (source_app.run_dir / "latex-input.md").is_file():
+                return {
+                    "action": "final",
+                    "label": "Resume formatting checkpoint",
+                    "description": (
+                        "Restores the saved LaTeX input and research journal, "
+                        "including unfinished formatting verification."
+                    ),
+                }
+            try:
+                saved_statement(source_app.run_dir)
+            except ValueError:
+                pass
+            else:
+                return {
+                    "action": "research",
+                    "label": "Resume research checkpoint",
+                    "description": (
+                        "Restores the permanent research journal and resumes its "
+                        "next recorded step, including unfinished verification. "
+                        "The new run renews the saved time budget."
+                    ),
+                }
+        if not state.get("manuallyStopped"):
             return None
         stage = state.get("stoppedStage") or state.get("stage")
         if stage == "review" and state.get("reviewStatement", "").strip():
@@ -2948,8 +3138,9 @@ class Server(ThreadingHTTPServer):
                     "action": "author",
                     "label": "Continue proof author",
                     "description": (
-                        "Starts a new author thread from the exact checked "
-                        "statement and compatible durable author memory. "
+                        "Continues bounded research rounds from the exact "
+                        "statement, permanent journal, and saved notebooks. "
+                        "A new run renews the configured time budget. "
                         "Previously sent live instructions are queued again."
                     ),
                 }
@@ -2958,8 +3149,8 @@ class Server(ThreadingHTTPServer):
                 "action": "critic",
                 "label": "Continue critic",
                 "description": (
-                    "Continues from the latest compatible saved proof and "
-                    "independent-audit checkpoint."
+                    "Restores the research archive, saved proof, and compatible "
+                    "independent audits in a new run with a renewed time budget."
                 ),
             }
         if stage == "final":
@@ -2973,7 +3164,7 @@ class Server(ThreadingHTTPServer):
                     "label": "Retry LaTeX editor",
                     "description": (
                         "Starts only a new LaTeX-editor request from the exact "
-                        "saved final input."
+                        "saved final input and preserves the research archive."
                     ),
                 }
             if state.get("checkpoints"):
@@ -2991,7 +3182,8 @@ class Server(ThreadingHTTPServer):
     def _queue_saved_author_instructions(source_app, target_app):
         """Replay prior user steering into a newly created author process."""
 
-        instructions = saved_author_instructions(source_app.run_dir)
+        source_directory = source_app.run_dir if isinstance(source_app, App) else source_app
+        instructions = saved_author_instructions(source_directory)
         if not instructions:
             return
         combined = (
@@ -3009,7 +3201,7 @@ class Server(ThreadingHTTPServer):
         })
 
     def continue_stopped_job(self, run_id):
-        """Continue one manually stopped stage in a new immutable-source job."""
+        """Continue a saved checkpoint in a new job with an immutable source."""
 
         # Match delete_job's jobs -> app lock order. Keeping both locks through
         # registration also prevents the immutable source from being moved or
@@ -3027,7 +3219,7 @@ class Server(ThreadingHTTPServer):
         plan = self._stopped_continuation_plan(source_app, source_state)
         if plan is None:
             raise ValueError(
-                "This job has no safe manually stopped stage to continue."
+                "This job has no safe stopped stage or research checkpoint to continue."
             )
         if plan["action"] == "critic":
             continued = self.resume_critic_job(
@@ -3043,7 +3235,7 @@ class Server(ThreadingHTTPServer):
             "speed_mode": source_state["speedMode"],
             "reasoning_summary": source_state["reasoningSummary"],
             "continuation_source": source_run,
-            "stopped_stage": source_state["stoppedStage"],
+            "stopped_stage": source_state.get("stoppedStage") or source_state.get("stage", ""),
         }
         if plan["action"] == "review":
             app.start_review(
@@ -3067,7 +3259,7 @@ class Server(ThreadingHTTPServer):
                 review_only=source_state["statementReviewOnly"],
                 **common,
             )
-        elif plan["action"] == "author":
+        elif plan["action"] in {"author", "research"}:
             author_options = {
                 "critic_rounds": source_state["criticRounds"],
                 "thinking_hours": source_state["thinkingHours"],
@@ -3113,6 +3305,8 @@ class Server(ThreadingHTTPServer):
                     statement=final_input["statement"],
                     solution=final_input["solution"],
                     writer_model=source_state["writerModel"],
+                    critic_model=source_state["criticModel"],
+                    critic_effort=source_state["criticEffort"],
                     reasoning_effort=source_state["reasoningEffort"],
                     writer_effort=source_state["writerEffort"],
                     final_prompt=source_state["finalPrompt"],

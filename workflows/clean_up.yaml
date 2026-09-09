@@ -1,4 +1,4 @@
-# YAML guide: ../docs/workflows.md
+# YAML guide: workflows.md
 nodes:
   latex_editor:
     run: structured
@@ -13,51 +13,140 @@ nodes:
       statement: "text(state.statement) if 'solution' in state else ''"
       solution: "text(state.solution) if 'solution' in state else ''"
       source: "text(state.source) if 'solution' not in state else ''"
+      feedback: "json({'review': get(state, 'formatting_verification', {}), 'compilation': get(state, 'compilation', {})})"
     response: {latex: string}
     require:
       - is_string(result.latex) and bool(strip(result.latex))
-    error: Codex returned an invalid final proof.
+    error: The editor returned an empty or invalid LaTeX document.
     before:
+      - set:
+          accepted_solution: "text(state.solution) if 'solution' in state else text(state.source)"
+          failed: 'False'
       - when: "'solution' in state"
         write:
           path: final-input.json
-          text: "json({'schemaVersion': 1, 'statement': text(state.statement), 'solution': text(state.solution)}) + '\\n'"
+          text: "json({'schemaVersion': 1, 'statement': text(state.statement), 'solution': text(state.accepted_solution)}) + '\\n'"
     after:
       - set: {output: strip(result.latex)}
-      - when: "'solution' in state"
-        set: {solution: state.output}
-      - when: "'solution' not in state"
-        set: {source: state.output}
+      - write:
+          path: formatted-candidate.tex
+          text: state.output
+    next: final_verifier
+  final_verifier:
+    run: structured
+    role: critic
+    stage: final
+    prompt: verification_input
+    instructions: verify_final
+    inputs:
+      statement: "text(state.statement) if 'statement' in state else ''"
+      original: state.accepted_solution
+      formatted: state.output
+    response:
+      verdict: [pass, reject]
+      bugs: string
+    require:
+      - "result.verdict in ['pass', 'reject'] and is_string(result.bugs)"
+      - "(result.verdict == 'pass' and not strip(result.bugs)) or (result.verdict == 'reject' and bool(strip(result.bugs)))"
+    error: The final verifier returned an inconsistent review.
+    outcome: result.verdict
+    after:
+      - set: {formatting_verification: result}
       - emit:
-          kind: final_result
-          label: Final LaTeX proof
+          kind: final_verification
+          label: Independent check of the formatted document
+          report: =result
           text: '{raw}'
-          output: =state.output
-    next: end
-# Model instructions and lifecycle prompts referenced by the nodes above.
+    next:
+      reject:
+        to: end
+        after:
+          - set:
+              failed: 'True'
+              output: "'Final formatting verification failed. The reviewed source is preserved in final-input.json when available; the formatted document is saved in formatted-candidate.tex. Unresolved issues: ' + result.bugs"
+          - emit:
+              kind: failure_result
+              label: Final document needs repair
+              text: =state.output
+              summary: =state.output
+      pass:
+        to: end
+        after:
+          - verify_latex: state.output
+          - when: state.failed
+            set:
+              output: "'Final LaTeX compilation failed. The document remains saved in formatted-candidate.tex. ' + state.compilation.diagnostic"
+          - when: state.failed
+            emit:
+              kind: failure_result
+              label: Final document failed compilation
+              text: =state.output
+              summary: =state.output
+          - when: "not state.failed and 'solution' in state"
+            set: {solution: state.output}
+          - when: "not state.failed and 'solution' not in state"
+            set: {source: state.output}
+          - when: not state.failed
+            emit:
+              kind: final_result
+              label: Verified final LaTeX document
+              text: =state.output
+              output: =state.output
+
 prompts:
   final: |-
-    Act as the TCS editor and turn the solution below into a latex TCS paper. Preserve its mathematical
-    content while removing repetition and process commentary. Produce a
-    cleaned-up, self-contained, organized, rigorous, readable LaTeX TCS paper
-    with clearly stated theorems and logically ordered sections that is considered as a well-written TCS paper in a tree-like structure:
-    (1) Use definitions and terminologys following the convention of previous works, if there are any,
-    (2) For algorithmic tasks, split the proof into algorithm description, correctness proof, and complexity analysis,
-    (3) Each section and subsectionstarts with a clear statement of the theorem or lemma being proved, the proof should also be well-structures and splits into lemmas if necessary.
-    (4) Each new definition and lemma should have a short explanation of motivation and context before introducing it.
-    (5) Expand on any ambiguous or underspecified details in the proof, and provide clear explanations for any non-trivial steps or reasoning.
-    The final output should be a complete LaTeX document that can be compiled without errors.
-    Return only the requested JSON.
+    Turn the supplied solution into a clear, self-contained LaTeX document.
+    Preserve the exact mathematical claim, assumptions, definitions, and proof.
+    Organize the argument into motivated definitions, stated lemmas, and proofs.
+    For an algorithm, separate its description, correctness, and resource costs.
+    Remove repetition and research-process commentary. Explain existing steps
+    clearly, but do not invent missing arguments, add assumptions, or strengthen
+    a claim. If a step is unsupported, preserve and explicitly mark that gap.
+    Use ordinary LaTeX packages and include the complete document, from
+    \documentclass through \end{document}. Do not use external files, commands,
+    shell execution, network access, or embedded executable code.
+    Return only the requested JSON with the complete document in latex.
   proof_input: |-
     {instructions}
 
     STATEMENT:
     {statement}
 
-    LATEST SOLUTION:
+    REVIEWED SOLUTION:
     {solution}
+
+    PREVIOUS FORMATTING FEEDBACK (fix these issues if present):
+    {feedback}
   source_input: |-
     {instructions}
 
-    THEOREM AND PROOF TO POLISH:
+    ORIGINAL THEOREM AND PROOF TO POLISH:
     {source}
+
+    PREVIOUS FORMATTING FEEDBACK (fix these issues if present):
+    {feedback}
+  verify_final: |-
+    Independently compare the original solution with the formatted document.
+    Check every claim, assumption, definition, quantifier, algorithm, and proof
+    step. In particular, check explanations the editor expanded: they must be
+    justified and must not conceal a gap or change the task. Check that no
+    necessary argument was omitted and no unsupported claim was added.
+    If a separate statement is provided, check that the final document resolves
+    exactly that statement. Otherwise use the claim in the original source.
+    Do not rewrite or repair either document. Return verdict=pass and an empty
+    bugs string only if the formatted document preserves a complete, valid
+    argument. Otherwise return verdict=reject and list every issue with its
+    location and the repair needed. You are checking mathematical content;
+    a separate local compiler will check LaTeX compilation when available.
+    Return only the requested JSON.
+  verification_input: |-
+    {instructions}
+
+    STATEMENT (if separately supplied):
+    {statement}
+
+    ORIGINAL SOLUTION:
+    {original}
+
+    FORMATTED LATEX TO CHECK:
+    {formatted}

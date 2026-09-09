@@ -17,7 +17,7 @@ from .server import (
     DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, EFFORTS, HOST,
     MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
-    saved_critic_source,
+    saved_critic_source, saved_research_source,
 )
 
 ACTIVE_PHASES = {"reviewing", "running", "stopping"}
@@ -220,6 +220,35 @@ def direct_cli_options(
     }
 
 
+def research_resume_cli_settings(args, argv):
+    """Override saved research settings only for options explicitly supplied."""
+
+    supplied = {argument.split("=", 1)[0] for argument in argv if argument.startswith("-")}
+    fields = {
+        "criticRounds": ("critic_rounds", "critic-rounds"),
+        "thinkingHours": ("thinking_hours", "thinking-hours"),
+        "reasoningEffort": ("reasoning_effort", "reasoning-effort"),
+        "speedMode": ("speed_mode", "speed-mode"),
+        "reasoningSummary": ("reasoning_summary", "reasoning-summary"),
+    }
+    for role in ("author", "critic", "writer"):
+        fields[f"{role}Model"] = (f"{role}_model", f"{role}-model")
+        fields[f"{role}Effort"] = (f"{role}_effort", f"{role}-effort")
+    options = {
+        key: getattr(args, attribute)
+        for key, (attribute, kebab) in fields.items()
+        if supplied.intersection({f"-{key}", f"--{key}", f"--{kebab}"})
+    }
+    if "reasoningEffort" in options:
+        for role in ("author", "critic", "writer"):
+            options.setdefault(f"{role}Effort", options["reasoningEffort"])
+    for role in ("author", "critic", "final"):
+        path = getattr(args, f"{role}_prompt_file")
+        if path:
+            options[f"{role}Prompt"] = read_utf8(path, f"{role} prompt")
+    return options
+
+
 def _stop_headless_apps(apps):
     """Stop several independent jobs concurrently after Ctrl-C or launch failure."""
 
@@ -392,6 +421,13 @@ def main():
             f"RUN/{runtime.SAVED_CANDIDATE_FILENAME}"
         ),
     )
+    parser.add_argument(
+        "--resume-research", metavar="RUN",
+        help=(
+            "open the web UI at RUN's durable research checkpoint with a new "
+            "time budget; saved settings are kept unless explicitly overridden"
+        ),
+    )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
         "--verbose-events", action="store_true",
@@ -402,7 +438,9 @@ def main():
         dest="critic_rounds", type=int, default=DEFAULT_CRITIC_ROUNDS,
         metavar="N",
         help=(
-            f"accept after N non-rejecting critic rounds (default: {DEFAULT_CRITIC_ROUNDS})"
+            "pause with verification incomplete after N consecutive repaired "
+            f"critic rounds (default: {DEFAULT_CRITIC_ROUNDS}); only a clean "
+            "pass accepts the exact reviewed proof"
         ),
     )
     parser.add_argument(
@@ -457,13 +495,16 @@ def main():
         )
     args = parser.parse_args()
     resume_source = None
-    if args.resume_critic:
-        if args.input_path:
-            parser.error("Do not combine input_path with --resume-critic.")
+    if sum(bool(value) for value in (args.input_path, args.resume_critic, args.resume_research)) > 1:
+        parser.error("Choose only one of input_path, --resume-critic, or --resume-research.")
+    if args.resume_critic or args.resume_research:
         try:
-            resume_source = saved_critic_source(args.resume_critic)
+            resume_source = (
+                saved_research_source(args.resume_research) if args.resume_research
+                else saved_critic_source(args.resume_critic)
+            )
         except (OSError, TypeError, ValueError) as exc:
-            print(f"Cannot resume saved critic: {exc}", file=sys.stderr)
+            print(f"Cannot resume saved job: {exc}", file=sys.stderr)
             return 1
     if args.input_path:
         runtime.configure_standard_streams()
@@ -528,12 +569,18 @@ def main():
                 resume_settings["finalPrompt"] = read_utf8(
                     args.final_prompt_file, "final prompt"
                 )
-            resume_app = server.start_saved_critic_job(
-                resume_source["run_dir"], resume_settings
-            )
+            if args.resume_research:
+                resume_app = server.start_saved_research_job(
+                    resume_source["run_dir"],
+                    research_resume_cli_settings(args, sys.argv[1:]),
+                )
+            else:
+                resume_app = server.start_saved_critic_job(
+                    resume_source["run_dir"], resume_settings,
+                )
         except (OSError, TypeError, ValueError) as exc:
             server.server_close()
-            print(f"Cannot resume saved critic: {exc}", file=sys.stderr)
+            print(f"Cannot resume saved job: {exc}", file=sys.stderr)
             return 1
     # A URL fragment stays in the browser; JavaScript sends it as a secret header.
     job_query = (

@@ -1,7 +1,8 @@
-# YAML guide: ../docs/workflows.md
+# Workflow guide: workflows.md
+# Research steps and response contracts below are enforced by the controller.
 nodes:
   author:
-    run: goal
+    run: research
     role: author
     stage: solve
     prompt: author
@@ -11,13 +12,114 @@ nodes:
       solution: state.solution
       bugs: state.report.bugs
       round: state.round
-    recovery:
-      when: "'report' in state and state.report.verdict == 'reject'"
-      prompt: recovery
+    research:
+      family_cooldown: 2
+      steps:
+        propose:
+          prompt: research_propose
+          role: author
+          timeout: 600
+          label: Plan diverse research directions
+          response:
+            proposals:
+              maxItems: 5
+              items:
+                fields:
+                  family: string
+                  mechanism: string
+                  assumptions: string
+                  obstacle: string
+                  decisive_test: string
+                  novelty: string
+            search_queries:
+              maxItems: 4
+              items: string
+            read_requests:
+              maxItems: 4
+              items:
+                fields:
+                  event_id: string
+                  offset: integer
+        assess:
+          prompt: research_assess
+          role: critic
+          timeout: 600
+          label: Check novelty against past work
+          response:
+            decision:
+            - proceed
+            - reopen
+            - reject
+            canonical_family: string
+            related_ids:
+              maxItems: 12
+              items: string
+            reason: string
+            reopen_evidence: string
+            search_queries:
+              maxItems: 4
+              items: string
+            read_requests:
+              maxItems: 4
+              items:
+                fields:
+                  event_id: string
+                  offset: integer
+        explore:
+          prompt: research_explore
+          role: author
+          timeout: 900
+          label: Explore one registered approach
+          response:
+            status:
+            - candidate
+            - incomplete
+            - refuted
+            work: string
+            evidence: string
+            candidate: string
+            remaining_obligations:
+              maxItems: 20
+              items: string
+            next_test: string
+            search_queries:
+              maxItems: 4
+              items: string
+            read_requests:
+              maxItems: 4
+              items:
+                fields:
+                  event_id: string
+                  offset: integer
+        review:
+          prompt: research_review
+          role: critic
+          timeout: 600
+          label: Review and record research result
+          response:
+            verdict:
+            - candidate
+            - incomplete
+            - refuted
+            reason: string
+            checked_evidence: string
+            failure_scope: string
+            reopen_condition: string
+            reusable_results: string
+            search_queries:
+              maxItems: 4
+              items: string
+            read_requests:
+              maxItems: 4
+              items:
+                fields:
+                  event_id: string
+                  offset: integer
     outcome: result.outcome
     after:
-      - {merge: result}
-      - set: {failed: "outcome == 'failure'"}
+    - merge: result
+    - set:
+        failed: outcome == 'failure'
     next:
       proof: critic
       failure: end
@@ -26,11 +128,14 @@ nodes:
     role: critic
     stage: critic
     prompt: critic_input
-    instructions: [critic, critic_memory]
+    instructions:
+    - critic
+    - critic_memory
     inputs:
       statement: text(state.statement)
       solution: text(state.solution)
       audits: json(parallel)
+      obligations: json(get(state, 'open_issues', []))
     response:
       checks:
         minItems: 3
@@ -38,9 +143,13 @@ nodes:
         items:
           fields:
             focus: string
-            verdict: [pass, fail]
+            verdict:
+            - pass
+            - fail
             report: string
-      verdict: [pass, reject]
+      verdict:
+      - pass
+      - reject
       fixed: boolean
       solution: string
       bugs: string
@@ -58,21 +167,31 @@ nodes:
           unresolved_obligations:
             maxItems: 12
             items: string
+      resolved_obligations:
+        items:
+          fields:
+            id: string
+            evidence: string
     parallel:
       items:
-        - Definitions, quantifiers, game semantics, and line-by-line correctness of every construction and invariant.
-        - Communication protocol implementability and complete accounting of bits, rounds, synchronization, adaptivity, and hidden disclosures.
-        - 'Hostile counterexample search: boundary cases, ownership mistakes, sampling/deletion claims, circular lemmas, and theorem-strength
-          gaps.'
+      - Definitions, quantifiers, game semantics, and line-by-line correctness of every construction and invariant.
+      - Implementability and complete accounting of resources, dependencies, operations, and any communication or
+        algorithmic costs required by this exact statement.
+      - 'Hostile counterexample search: boundary cases, ownership mistakes, sampling/deletion claims, circular lemmas,
+        and theorem-strength gaps.'
       prompt: critic_audit
-      instructions: [critic, critic_memory]
+      instructions:
+      - critic
+      - critic_memory
       inputs:
         statement: text(state.statement)
         solution: text(state.solution)
         focus: item
       response:
         focus: string
-        verdict: [pass, fail]
+        verdict:
+        - pass
+        - fail
         report: string
       output: checks
       item_field: focus
@@ -96,108 +215,87 @@ nodes:
     request_label: Critic coordinator adjudication
     activity_label: Critic coordinator
     require:
-      - is_list(result.checks) and len(result.checks) == 3
-      - "result.verdict in ['pass', 'reject'] and is_bool(result.fixed)"
-      - is_string(result.solution) and bool(strip(result.solution)) and is_string(result.bugs)
-      - "all(is_dict(check) and check.verdict in ['pass', 'fail'] and is_string(check.focus) and is_string(check.report) for check in result.checks)"
-      - "result.verdict != 'pass' or not strip(result.bugs)"
-      - "result.verdict != 'pass' or result.fixed or all(check.verdict == 'pass' for check in result.checks)"
-      - "result.verdict != 'reject' or (bool(strip(result.bugs)) and not result.fixed)"
+    - is_list(result.checks) and len(result.checks) == 3
+    - result.verdict in ['pass', 'reject'] and is_bool(result.fixed)
+    - is_string(result.solution) and bool(strip(result.solution)) and is_string(result.bugs)
+    - all(is_dict(check) and check.verdict in ['pass', 'fail'] and is_string(check.focus) and is_string(check.report)
+      for check in result.checks)
+    - result.verdict != 'pass' or not strip(result.bugs)
+    - result.verdict != 'pass' or result.fixed or all(check.verdict == 'pass' for check in result.checks)
+    - result.verdict != 'reject' or (bool(strip(result.bugs)) and not result.fixed)
     error: Codex returned an invalid critic result.
-    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.fixed else 'pass')"
+    outcome: '''reject'' if result.verdict == ''reject'' else (''fixed'' if result.fixed else ''pass'')'
     before:
-      - when: visit == 1
-        emit:
-          kind: status
-          label: Critic loop started
-      - when: visit > 1
-        emit:
-          kind: status
-          label: Fresh critic requested
-          text: Starting independent critic round {visit}.
-          node: critic
-      - write:
-          path: saved-candidate.md
-          text: "text(state.solution) + '\\n'"
+    - when: visit == 1
+      emit:
+        kind: status
+        label: Critic loop started
+    - when: visit > 1
+      emit:
+        kind: status
+        label: Fresh critic requested
+        text: Starting independent critic round {visit}.
+        node: critic
+    - write:
+        path: saved-candidate.md
+        text: text(state.solution) + '\n'
     after:
-      - emit:
-          kind: critic_result
-          label: Critic round {visit}
-          text: '{raw}'
-          report: =result
-      - memory:
-          previous: state.solution
-          candidate: strip(result.solution)
-          feedback: result
-          source: "'critic_safe_fix' if outcome == 'reject' else 'critic_repair'"
-          status: "'approved' if outcome == 'pass' else ('awaiting_critic' if outcome == 'fixed' else 'needs_author')"
-      - set:
-          solution: strip(result.solution)
-          report: result
-          round: visit
-      - when: "outcome == 'pass'"
-        emit:
-          kind: status
-          label: Critic approved
-          text: Round {visit} found no bugs to fix.
-      - when: "outcome == 'fixed'"
-        emit:
-          kind: status
-          label: Critic fixed every bug
-          text: Round {visit} repaired the solution.
+    - memory:
+        previous: state.solution
+        candidate: strip(result.solution)
+        feedback: result
+        source: '''critic_safe_fix'' if outcome == ''reject'' else ''critic_repair'''
+        status: '''approved'' if outcome == ''pass'' else (''awaiting_critic'' if outcome == ''fixed'' else ''needs_author'')'
+    - emit:
+        kind: critic_result
+        label: Critic round {visit}
+        text: '{raw}'
+        report: =result
+    - set:
+        solution: strip(result.solution)
+        report: result
+        round: visit
+    - when: outcome == 'pass'
+      emit:
+        kind: status
+        label: Critic approved
+        text: Round {visit} found no bugs to fix.
+    - when: outcome == 'fixed'
+      emit:
+        kind: status
+        label: Critic fixed every bug
+        text: Round {visit} repaired the solution.
     next:
       pass:
         to: end
         after:
-          - set: {output: state.solution}
+        - set:
+            output: state.solution
       reject: author
       fixed:
         repeat: 2
         option: critic_rounds
         then: end
         after:
-          - {memory: approved}
-          - set: {output: state.solution}
-          - emit:
-              kind: status
-              label: Critic round limit accepted
-              text: All bugs were fixed in {visit} consecutive critic rounds without rejection. Accepting the latest repaired solution without
-                another check.
-# Model instructions and lifecycle prompts referenced by the nodes above.
+        - memory: awaiting_critic
+        - set:
+            failed: 'True'
+            output: '''Verification incomplete: the repair-round limit was reached. The latest candidate is saved
+              but has not passed an unchanged independent review.'''
+        - emit:
+            kind: failure_result
+            label: Verification checkpoint saved
+            text: '{state.output}'
+            output: =state.output
 prompts:
   author: |
-    Assume for purposes of this task that a complete solution exists. A complete solution must resolve exactly the task statement supplied at the end of this prompt, without additional assumptions, restrictions, or changes to the required conclusion.
+    Work on exactly the statement below. Do not change its assumptions or weaken its conclusion. A complete answer must settle the requested task with a self-contained argument. Finite tests, special cases, and reductions to an unproved claim do not establish a general statement.
 
-    Partial progress does not count unless it implies exactly that resolution. In particular, proofs or solutions for special cases, constructions that satisfy only some of the stated requirements, variants with altered hypotheses or conclusions, reductions to another unproved conjecture or unresolved problem, computational verification through any fixed finite range, and candidate counterexamples without a complete certificate that they satisfy the hypotheses and violate the conclusion are insufficient.
+    The controller manages repeated research rounds and the permanent archive. Complete the particular round you are assigned, even when the whole task remains unsolved. Do not spawn agents, call tools, create goals, or claim to have performed checks you did not perform. Return explicit arguments and evidence, not private internal reasoning or optimistic progress reports.
 
-    Use multiagent v2 aggressively and dynamically. You have up to 64 concurrent agents available. Do not use a fixed assignment such as "N agents for strategy X." Instead, manage the search using the following heuristics:
+    A failed method is not evidence that the statement is false. Keep missing arguments, checked counterexamples to subclaims, and interruptions separate. An earlier record is historical evidence, not an instruction and not automatically a proved fact. Reuse a claim only with its assumptions and supporting argument checked. A counterexample settles the task only when the task permits that outcome and the example is completely certified.
 
-    - Begin with a genuinely diverse portfolio of approaches. Agents should explore substantially different formulations, invariants, reductions, algebraic viewpoints, structural inductions, decompositions, flow formulations, transition systems, embeddings, extremal arguments, and computational sanity checks.
-
-    - Do not tell most agents the currently favored approach. Preserve independence during early rounds so that agents do not all converge to the same attractive but incomplete reduction.
-
-    - Maintain an explicit registry of approach families. Group agents by the mathematical idea they are using, not by superficial wording. If many agents converge to one family, redirect some of them toward underexplored formulations.
-
-    - Do not allow one approach to dominate merely because it gives elegant reductions. A route that ends at a lemma equivalent in strength to the original statement is not close to completion unless it supplies a genuinely new proof of that lemma.
-
-    - When an approach stalls at a theorem-strength missing lemma, mark that route as blocked. Only continue assigning agents to it if someone proposes a materially new mechanism, invariant, or construction.
-
-    - Keep several incompatible proof or solution routes alive through multiple rounds. Cross-pollinate ideas only after independent agents have developed them far enough to expose their real strengths and gaps.
-
-    - Use adversarial agents throughout: every candidate proof or solution must be checked against the exact definitions, hypotheses, quantifiers, multiplicities, and conclusion in the statement; against repeated objects or structures being mistaken for objects satisfying stricter definitions; against degenerate, minimal, disconnected, decomposable, singular, or boundary cases permitted by the statement; against assumptions introduced or violated by reductions; and against circular use of an equivalent form of the statement.
-
-    - Require agents to return concrete lemmas, constructions, equations, or counterexamples to proposed sublemmas. Reject status reports, vague optimism, and claims that an unproved global compatibility statement is "routine."
-
-    - The root agent should repeatedly synthesize, challenge, redirect, and launch new rounds. Do not stop after the first wave fails. Produce a complete solution if one survives audit; otherwise report only the strongest rigorously proved derivation and its exact remaining gap.
-
-    Do not return merely because current approaches fail or agents report theorem-strength gaps. Continue launching new rounds, reopening blocked approaches only when there is a genuinely new mechanism, and searching for fresh formulations.
-
-    Return only when a complete solution has been found and survives adversarial audit. Do not return a reduction, partial result, isolated missing lemma, "best effort" summary, or explanation of why the problem is difficult.
-
-    Public search may be used only for ordinary mathematical background or standard named theorems, not to search for a solution to this exact problem or benchmark. Do not search the public web merely to determine whether the problem is open, and do not answer that it is open.
-
-    Current task statement (resolve exactly this statement)
-
+    STATEMENT:
     [STATEMENT]
   critic: |-
     Act as a coordinating proof critic. The controller will run three fresh,
@@ -212,11 +310,11 @@ prompts:
     fixed=false, your best complete solution after safe fixes, and every unresolved
     bug with its exact location and required repair for the author. Return only the
     requested JSON.
-  critic_memory: |-
-    Also return concise historical metadata for the durable author ledger: name the
-    candidate's approach family, state what the audit established about it, list
-    routes this audit actually blocks, and list the proof obligations that remain.
-    This metadata records the audit; it must not change the mathematical verdict.
+  critic_memory: 'Return historical metadata for the permanent archive: the candidate''s approach family, what the
+    audit established, routes actually blocked with evidence and reopening conditions, and every unresolved proof
+    obligation. Do not classify an incomplete method as disproved. Return resolved_obligations only for supplied
+    existing issue IDs, with concrete evidence explaining why each was resolved or no longer applies to this candidate.
+    Omitted issues remain open. Historical metadata must not alter the mathematical verdict.'
   goal: Complete the task supplied in the first turn and continue until done.
   continuation: |-
     The previous author attempt ended without a complete solution. Continue working
@@ -273,8 +371,8 @@ prompts:
 
     CRITIC BUGS:
     {bugs}
-  compaction: A context compaction just completed. Reload the durable history above, preserve valid progress, avoid blocked routes unless their
-    recorded reopen condition is met, and continue toward the complete rigorous solution.
+  compaction: A context compaction just completed. Reload the durable history above, preserve valid progress, avoid
+    blocked routes unless their recorded reopen condition is met, and continue toward the complete rigorous solution.
   initial: |-
     {original_prompt}
 
@@ -290,14 +388,15 @@ prompts:
 
     CONTROLLER-MAINTAINED AUTHOR MEMORY:
     {memory_snapshot}
-  critic_input: |-
+  critic_input: |
     CONTROLLER ORCHESTRATION OVERRIDE
     The controller has already completed exactly three fresh independent audits.
     Do not spawn, message, or wait for subagents. Read all three reports below,
     adjudicate them, and follow the remaining critic instructions. Your checks
     array must contain exactly these three audits in the same order. Try to repair
-    every valid bug yourself; every changed proof will receive another completely
-    fresh controller-run three-auditor round.
+    every valid bug yourself; every changed proof requires another completely
+    fresh controller-run three-auditor round before acceptance. A budget limit saves
+    verification incomplete; it never approves an unchecked repair.
 
     CRITIC INSTRUCTIONS:
     {instructions}
@@ -310,6 +409,9 @@ prompts:
 
     CANDIDATE SOLUTION:
     {solution}
+
+    EXISTING OPEN OBLIGATIONS (resolve each by ID with evidence, or retain it):
+    {obligations}
   critic_audit: |-
     You are one of three independent hostile proof auditors. The controller already
     created the three auditors in parallel. Do not spawn agents, wait for agents,
@@ -338,3 +440,83 @@ prompts:
 
     RECOVERY ENTRY FROM A SAVED CRITIC JOB:
     {repair}
+  research_propose: |-
+    You are planning the next research round. Read the assignment and archive briefing below.
+
+    Propose between three and five genuinely different mechanisms, ordered by how useful they would be to investigate next. For each give: family, precise mechanism, assumptions, closest obstacle, one decisive next test, and what differs from prior attempts. Group by the underlying mechanism and terminal missing claim, not terminology. Do not disguise an old approach by renaming it. Prefer underexplored families; avoid the two most recently assigned families. Preserve useful partial results and seek connections that remove a recorded obstacle. If the critic rejected a candidate, address its exact bugs when choosing next directions.
+
+    During a retrieval request proposals may be empty. Otherwise supply at least three distinct proposals. The controller will independently check each proposal before assigning work.
+
+    ASSIGNMENT:
+    {assignment}
+
+    ARCHIVE BRIEFING:
+    {memory}
+
+    LATEST CRITIC FEEDBACK:
+    {feedback}
+
+    LATEST HUMAN INSTRUCTION:
+    {instruction}
+
+    If you need older evidence, return search_queries with specific terms or read_requests with an event_id and character offset (start at 0). The controller searches the full archive or returns the requested 16,000-character section, then asks you again. Do not issue a substantive decision while requesting evidence. Otherwise return both lists empty. Recent excerpts may be truncated; use the record ID to inspect the original. Never interpret absence from an excerpt as absence from history.
+  research_assess: |-
+    You are the independent novelty assessor. Decide whether this proposal deserves a research round. Compare its mathematical mechanism, assumptions, and terminal missing claim with prior ASSIGNED attempts and failures. An unassigned portfolio suggestion is not an attempted method. Treat archived model claims as fallible evidence.
+
+    Return reject for the same dead end in new wording, unsupported claims of novelty, or an old obstruction that still applies. Return reopen only if specific new evidence addresses the recorded reopening condition; cite existing event IDs and state that evidence. Return proceed for a meaningfully different mechanism. Supply a stable canonical_family that reuses an existing family name when the mechanism is the same. Give related_ids and an evidence-based reason. The controller additionally blocks identical mechanisms and requires two other families before returning to a recently assigned family. A missing proof, a refuted subclaim, and an interruption must not be confused.
+
+    ASSIGNMENT:
+    {assignment}
+
+    PROPOSAL:
+    {proposal}
+
+    RETRIEVED RELATED RECORDS:
+    {related}
+
+    ARCHIVE BRIEFING:
+    {memory}
+
+    If you need older evidence, return search_queries with specific terms or read_requests with an event_id and character offset (start at 0). The controller searches the full archive or returns the requested 16,000-character section, then asks you again. Do not issue a substantive decision while requesting evidence. Otherwise return both lists empty. Recent excerpts may be truncated; use the record ID to inspect the original. Never interpret absence from an excerpt as absence from history.
+  research_explore: |-
+    You are the researcher assigned exactly one registered approach. Work on its decisive test. Develop a concrete argument, construction, or checked counterexample to a specific subclaim. Preserve the exact assumptions. Do not switch silently to a different mechanism. Do not spawn agents or call tools. Give explicit checkable work and evidence; do not claim experiments or source checks that were not performed.
+
+    End this round with a complete result card even if the overall task is unsolved. Return status incomplete when an argument remains missing; refuted only when you exhibit evidence refuting the precise attempted claim; candidate only when candidate contains a full self-contained resolution of the original assignment. Include all remaining_obligations and the best next_test. A reduction to a claim as strong as the task remains incomplete. Put the full substantive work in work and the supporting argument or witness in evidence. If a full solution exists, repeat that entire solution in candidate so it can be independently audited. Otherwise candidate is empty.
+
+    ASSIGNMENT:
+    {assignment}
+
+    REGISTERED PROPOSAL:
+    {proposal}
+
+    RELEVANT PRIOR RECORDS:
+    {related}
+
+    ARCHIVE BRIEFING:
+    {memory}
+
+    LATEST CRITIC FEEDBACK:
+    {feedback}
+
+    LATEST HUMAN INSTRUCTION:
+    {instruction}
+
+    If you need older evidence, return search_queries with specific terms or read_requests with an event_id and character offset (start at 0). The controller searches the full archive or returns the requested 16,000-character section, then asks you again. Do not issue a substantive decision while requesting evidence. Otherwise return both lists empty. Recent excerpts may be truncated; use the record ID to inspect the original. Never interpret absence from an excerpt as absence from history.
+  research_review: |-
+    You are a fresh hostile reviewer of one research result. Check the stated assumptions, each claimed inference, and the proposed evidence. Look for a small counterexample, circular reasoning, or a missing argument. Do not repair or rewrite the result.
+
+    Return candidate only if the submitted full candidate appears to settle the original statement without gaps; it will still receive three independent audits. Return refuted only when checked_evidence actually refutes the precise attempted claim. Otherwise return incomplete and identify the exact gap. State failure_scope narrowly: failure of one method does not rule out every related method or the target statement. Give a concrete reopen_condition and record reusable_results with their assumptions and verification limits. Never promote an unsupported claim simply because it was written in an earlier notebook.
+
+    ASSIGNMENT:
+    {assignment}
+
+    REGISTERED PROPOSAL:
+    {proposal}
+
+    RESULT TO CHECK:
+    {result}
+
+    RELEVANT PRIOR RECORDS:
+    {related}
+
+    If you need older evidence, return search_queries with specific terms or read_requests with an event_id and character offset (start at 0). The controller searches the full archive or returns the requested 16,000-character section, then asks you again. Do not issue a substantive decision while requesting evidence. Otherwise return both lists empty. Recent excerpts may be truncated; use the record ID to inspect the original. Never interpret absence from an excerpt as absence from history.

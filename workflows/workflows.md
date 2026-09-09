@@ -2,8 +2,8 @@
 
 `workflow_runner.py` executes a YAML graph. The YAML owns prompts, response
 shapes, result checks, state updates, and routing. The runner supplies model
-calls and persistent goal sessions. Node names carry no special meaning, so a
-custom graph needs no Python handler.
+calls, durable research rounds, and legacy persistent goal sessions. Node names
+carry no special meaning; the `run` operation selects the controller behavior.
 
 The bundled `workflows/` directory contains only `author_critic.yaml` and
 `clean_up.yaml`. Keep your own definitions elsewhere, for example
@@ -116,61 +116,66 @@ current node. Other outcomes keep their own routes even at the limit. There is
 no implicit overall graph-iteration limit.
 
 The built-in critic uses this same mechanism. A clean pass exits immediately,
-rejection returns to the author and resets the critic's count, and the default
-second repaired round accepts the latest candidate without another audit.
+rejection returns to research and resets the critic's count, and the default
+second repaired round saves verification incomplete rather than accepting an
+unchecked repair.
 
 ## Reading the bundled workflows
 
-In [`author_critic.yaml`](../workflows/author_critic.yaml), `author` uses `goal`.
-Its `task` reads `state.statement`, and `marker` inserts it into the author
-prompt. `outcome: result.outcome` selects `proof` or `failure`. The `merge`
-action preserves the returned solution, memory, or summary; the next action
-sets `failed` from that outcome. A proof goes to `critic`; failure ends the graph
-and prevents the chained cleanup from starting. On rejection, `resume` supplies
-the latest solution, `report.bugs`, and `round` to the existing author session.
+For an operator explanation with the exact prompts and no coding prerequisites,
+read the [manual worker guide](../docs/manual_workflow.md). That guide is
+regenerated from these YAML files using `docs/render_manual.py`.
 
-The critic first saves `saved-candidate.md`, then its `parallel` block runs
-three independent audits and checkpoints completed reports in `critic-audits.json`.
-The coordinator consumes those actual reports. Its `response` describes exactly three checks, the verdict, repair
-flag, complete solution, unresolved bugs, and historical metadata. Its
-`require` expressions check the three reports and enforce consistent verdicts:
-a clean pass has no failed checks or remaining bugs; a repaired pass has no
-remaining bugs; rejection has unresolved bugs and does not claim a completed
-repair. `outcome` classifies the response as `pass`, `fixed`, or `reject`.
+In [`author_critic.yaml`](author_critic.yaml), `author` uses `run: research`.
+Its `task` reads `state.statement`, and the assignment prompt contains the
+`[STATEMENT]` marker. The `research.steps` mapping configures four structured
+roles: propose, assess, explore, and review. Python records and routes each
+round, checks novelty and recent-family rotation before assignment, and retains
+every full result in the permanent journal. A reviewed complete candidate
+yields `outcome: proof`; an interrupted/budget-limited cycle yields
+`outcome: failure` with its saved checkpoint. The node merges this result and
+sets `state.failed` so an incomplete search does not start cleanup.
 
-The critic emits the response, records its memory update **before** replacing
-`state.solution` so the reviewed and repaired candidates stay linked, then
-stores the latest solution, full `report`, and `round`. `pass` copies the solution
-to `output` and ends. `reject` returns to the author. `fixed` repeats the critic
-until `repeat: 2` or the `critic_rounds` override is reached; the terminal
-branch marks the candidate approved, sets `output`, and emits the round-limit
-acceptance event. The node's `before` actions distinguish the first audit from
-subsequent independent rounds.
+The critic saves `saved-candidate.md`, runs three fresh independent audits in
+parallel, and checkpoints completed reports in `critic-audits.json`. The
+coordinator consumes the actual reports. Before routing, the runner restores
+those original reports in `checks`, compares candidate text to determine
+whether it changed, and rejects passes that leave known obligations unresolved.
+The YAML memory action records the review before replacing `state.solution`,
+so reviewed and repaired versions stay linked.
 
-In [`clean_up.yaml`](../workflows/clean_up.yaml), `latex_editor` chooses
-`proof_input` when `state.solution` exists and `source_input` otherwise. The
-former receives statement and solution separately and saves `final-input.json`
-for exact recovery; the latter receives a combined theorem/proof source. Its response requests `latex`, and `require`
-checks that it is a nonempty string. The actions set `output`, replace the
-corresponding `solution` or `source` for subsequent graphs, and emit
-`final_result` with the raw response and final document. `next: end` finishes
-its single node.
+A clean unchanged pass ends the proof stage. Rejection returns its latest
+candidate and exact feedback to research. A changed proof gets a fresh
+three-auditor round; the default `repeat: 2` limit produces **verification
+incomplete**, preserves the latest candidate, and sets `state.failed`. It
+never approves the last repair merely because the review budget was exhausted.
+
+In [`clean_up.yaml`](clean_up.yaml), `latex_editor` saves the original input in
+`state.accepted_solution` and, for proof jobs, `final-input.json`. It writes
+`formatted-candidate.tex` and proceeds to `final_verifier`. This independent
+structured call checks the original against the formatted content, including
+expanded explanations. A rejection preserves the document and emits failure;
+a pass runs the `verify_latex` action. Compilation failure also remains
+incomplete. An unavailable compiler is reported explicitly while leaving the
+content-reviewed document available. Only successful content verification and
+a non-failing compilation status permit `final_result`. Resumed finalization
+retries the editor with the original source and saved verification/compiler
+feedback.
 
 | Bundled prompt name | Purpose |
 | --- | --- |
-| `author` | Full proof-search assignment containing the `[STATEMENT]` marker. |
-| `critic` | Independent proof audit, repair, and verdict instructions. |
-| `critic_memory` | Additional instructions for returning historical metadata to the durable ledger. |
-| `critic_input` | Coordinator template joining the completed audits, critic instructions, statement, and current candidate. |
-| `critic_audit` | Independent auditor instructions with its assigned focus. |
-| `recovery` | Initial author prompt when a saved candidate is rejected before an author session exists. |
-| `final` | Instructions for the LaTeX editor. |
-| `proof_input` | Cleanup template with separate statement and accepted solution fields. |
-| `source_input` | Cleanup template with a combined theorem/proof source field. |
+| `author` | Exact research assignment containing `[STATEMENT]`. |
+| `research_propose` | Produce three to five different mechanisms. |
+| `research_assess` | Independently compare a proposal against assigned attempts and failures. |
+| `research_explore` | Work on one registered proposal and return a complete result card. |
+| `research_review` | Review that result, record narrow failure scope, reusable results, and reopening conditions. |
+| `critic`, `critic_memory` | Coordinate audits/repairs and maintain historical obligations with evidence. |
+| `critic_input`, `critic_audit` | Assemble the actual coordinator and auditor inputs. |
+| `final`, `proof_input`, `source_input` | Edit an accepted proof or existing theorem/proof source. |
+| `verify_final`, `verification_input` | Independently check preservation of the final argument. |
 
-The ten remaining author prompts implement the session lifecycle; their uses
-and placeholders are listed under [goal nodes](#goal-nodes). They are bound by
-default when `lifecycle` is omitted.
+The retained ten goal-lifecycle prompts and `recovery` support legacy custom
+`goal` nodes. They do not drive the default research operation.
 
 ## Root entries and shared node entries
 
@@ -188,7 +193,7 @@ Every node requires `run`, `prompt`, and `next`. Unknown node fields are rejecte
 
 | Shared entry | Meaning and default |
 | --- | --- |
-| `run` | Required operation: `structured` or `goal`. |
+| `run` | Required operation: `structured`, `research`, or legacy `goal`. |
 | `prompt` | Required name in `prompts`. Structured nodes also support the conditional form below. |
 | `next` | Required transition string or outcome mapping; see [transitions](#transitions). |
 | `role` | Optional model-setting namespace, such as `editor`, `author`, or `critic`. It does not choose an operation. |
@@ -332,7 +337,110 @@ searches sibling runs for matching assignments unless the marker is present.
 For custom workflows, change the declared identity when changing instructions
 or other assumptions that make existing results obsolete.
 
+## Research nodes
+
+`run: research` is the default persistent search operation. It uses fresh,
+tool-free structured requests and a controller-owned SQLite journal, rather
+than relying on an unbounded model conversation. The required node fields are:
+
+| Entry | Meaning |
+| --- | --- |
+| `task` | Expression selecting the exact nonempty statement; normally `state.statement`. |
+| `marker` | Literal occurring once in the main assignment prompt, normally `[STATEMENT]`. |
+| `resume` | Expression mapping containing `solution`, `bugs`, and `round` for critic feedback. |
+| `research.family_cooldown` | Positive number of most recently assigned canonical families excluded from the next assignment; default 2. |
+| `research.steps` | Exactly four named steps: `propose`, `assess`, `explore`, and `review`. |
+
+Each step has a named `prompt`, a `response` shorthand or `schema`, and optional
+`role`, `model`, `effort`, `timeout`, `label`, `attempts`, and `provider_options`.
+`timeout` must be positive and at most 3600 seconds (default 900); the actual
+request is additionally bounded by the shared workflow time remaining. The
+bundled propose/assess/review steps allow 600 seconds each and exploration
+allows 900. The controller owns a bounded retry loop and records request errors;
+step transport calls themselves use one attempt. `features`, per-step graph
+transitions, and arbitrary tool calls are not supported research-step fields.
+
+The controller supplies these template inputs automatically:
+
+| Placeholder | Value |
+| --- | --- |
+| `assignment` | Main author prompt with the exact statement substituted. |
+| `statement` | Exact statement alone. |
+| `memory` | Recent-record briefing, open issues, and recent assigned families. |
+| `feedback` | Latest critic feedback as JSON. |
+| `instruction` | Latest recorded human instruction. |
+| `proposal` | Current registered/assessed proposal as JSON. |
+| `result` | Current exploration result as JSON. |
+| `related` | Retrieved related historical records, carrying IDs and truncation markers. |
+
+The step response contracts must supply the fields the controller uses:
+
+| Step | Required substantive fields |
+| --- | --- |
+| `propose` | `proposals`: three to five objects with `family`, `mechanism`, `assumptions`, `obstacle`, `decisive_test`, `novelty`. Proposals may be empty only while requesting evidence. |
+| `assess` | `decision` (`proceed`, `reopen`, `reject`), `canonical_family`, `related_ids`, `reason`, `reopen_evidence`. |
+| `explore` | `status` (`candidate`, `incomplete`, `refuted`), full `work`, `evidence`, full `candidate` or empty text, `remaining_obligations`, `next_test`. |
+| `review` | `verdict` (`candidate`, `incomplete`, `refuted`), `reason`, `checked_evidence`, `failure_scope`, `reopen_condition`, `reusable_results`. |
+
+Every step also includes `search_queries` (up to four strings) and
+`read_requests` (up to four objects with `event_id` and integer `offset`). A
+nonempty retrieval request postpones the substantive decision. The controller
+searches the full relevant archive or returns a 16,000-character section of
+the requested full JSON event. Returned sections include their total length
+and next offset. The same role is called again with the evidence appended.
+After 12 retrieval exchanges the step pauses with a resumable checkpoint.
+This prevents accidental infinite lookup loops without erasing earlier results.
+
+The durable cycle is:
+
+1. Record a diverse portfolio; its suggestions are not assignments yet.
+2. Retrieve related assigned attempts/results and ask the independent assessor.
+3. Block a rejected proposal, a previously assigned identical normalized
+   mechanism, either recent family, or an invalid reopening/reference. A
+   reopening must cite existing record IDs and concrete new evidence.
+4. Atomically record the accepted assignment and next exploration step.
+5. Record the complete exploration result, then independently review it.
+6. Return to planning unless both researcher and reviewer support a full,
+   previously unsubmitted candidate; candidates proceed to the outer critic.
+
+Identical-mechanism comparison ignores text case and whitespace. Recognizing
+semantically equivalent ideas with different wording remains the assessor's
+fallible task. Family names come from the assessor and must reuse historical
+names for equivalent families. Rotation is a concrete scheduling constraint,
+not a guarantee that every accepted proposal is mathematically novel.
+
+`research_journal.py` stores permanent events, checkpoint values, and search
+indexes in `research.sqlite3`. A SQLite transaction adds each event and its
+next checkpoint together. No full record is pruned. Model prompts, raw replies,
+validated responses, portfolios, assignments, attempts, reviews, candidates,
+and transitions are all recorded. Completed responses can be reused after a
+restart. The archive is keyed by the exact statement; prompt/configuration
+changes produce version records rather than clearing memory.
+
+`research/records/` contains complete readable cards. `INDEX.md`, `STATE.md`,
+`FAILED.md`, `PROVED.md`, and `STATEMENT.md` provide navigation and the current
+workbench. Only briefings, index navigation, and displayed cache bodies are
+shortened. Explicit event-ID reads recover complete text. Storage errors stop
+progress; interrupted Markdown exports can be rebuilt from the canonical DB.
+Every continuation path copies the complete archive using SQLite backup and
+preserves legacy notebooks for import, leaving the source run unchanged.
+
+For browser-visible continuation with a new time budget:
+
+```bash
+python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN
+```
+
+Custom nodes must use one research project per run directory and preserve its
+exact statement. See the bundled author node for a complete validated response
+contract; the [operator manual](../docs/manual_workflow.md) renders its actual
+prompts and required response fields in execution order.
+
 ## Goal nodes
+
+This legacy operation remains supported for custom workflows. It uses the
+bounded `author-memory.json` ledger and session lifecycle described below; it
+does not provide the default research registration and novelty gates.
 
 `goal` keeps one session per node across visits. Its first visit starts a task;
 later visits resume the same session using feedback from shared state. Closing
@@ -375,15 +483,14 @@ the task. The formatted `repair` becomes `reanchor`'s `instruction`.
 
 Use `outcome: result.outcome` and `after: [{merge: result}]` to expose the
 session's result to the graph, then explicitly set `state.failed` when failure
-should stop a chain. The built-in author shows the complete contract in
-[`author_critic.yaml`](../workflows/author_critic.yaml).
+should stop a chain. The default research author uses the same outer result
+shape, but its internal operation differs from this legacy session protocol.
 
 The goal time limit is controlled by options, not extra YAML node fields:
 `thinking_hours`, `elapsed_seconds`, and `author_limit_file`. The
 `author_steer_file` option supplies the UI's live instruction queue to an active
-session. The time limit interrupts an active goal search; an ongoing structured
-call can finish, and a goal resumed
-after its deadline produces a failure summary. With multiple goal nodes in one
+session. The shared workflow deadline also bounds structured critic and final
+requests. An expired legacy goal produces a failure summary rather than a proof. With multiple goal nodes in one
 graph, each session has its own ledger directory under `goal-memory/`.
 
 ## State actions
@@ -401,6 +508,7 @@ The repeat branch's terminal actions additionally see `limit`.
 | `emit` | Event mapping requiring `kind`; may include `stage` and arbitrary event fields. String values are templates unless they begin with `=`, which evaluates the remaining expression and preserves its type. Non-string values pass through unchanged. |
 | `memory` | Update the current durable candidate ledger, as described below. |
 | `write` | `{path, text}` writes an expression result atomically to a literal path, relative to the working directory unless absolute. The expression must produce text; the file is replaced with private permissions where supported. |
+| `verify_latex` | Evaluate LaTeX text and run a bounded local compilation check. Saves `final-validation/main.tex` and `compile.log`, sets `state.compilation` to status/diagnostic/engine, and marks `state.failed` on compilation failure. Missing `pdflatex` reports `unavailable` explicitly without claiming compilation passed. |
 
 Use separate actions when an assignment must see an earlier assignment:
 
@@ -418,15 +526,16 @@ after:
 All values under `set`, `inputs`, and `resume` are **expression strings**.
 For example, use `failed: 'True'` for a boolean and `status: "'accepted'"` for a
 literal string. A mapping can contain several operations; their execution order
-is `memory`, `merge`, `set`, `write`, then `emit`. Separate actions usually read more
+is `memory`, `merge`, `set`, `write`, `verify_latex`, then `emit`. Separate actions usually read more
 clearly. The engine updates `state.outcome` after node `after` actions, so use
 `outcome` directly inside those actions to refer to the current result.
 
 ### Durable memory action
 
 `memory` does nothing if `state.memory` is absent or `None`. Otherwise it expects
-the runner's live `AuthorMemory` object, normally supplied by a goal result.
-It is not a general dictionary store.
+a memory adapter: `ResearchMemory` backed by the permanent archive for research
+results, or legacy `AuthorMemory` for goal results. It is not a general
+dictionary store.
 
 `memory: approved` sets the current candidate's status to that literal string.
 The mapping form requires all five expression fields:
@@ -443,7 +552,11 @@ A changed candidate is recorded and linked to the reviewed attempt. The review
 is recorded even when the candidate is unchanged. Historical `memory_update`
 uses `approach_family`, `approach_result`, `blocked_routes` (entries with `route`,
 `reason`, `reopen_condition`), and `unresolved_obligations`. Missing historical
-metadata is tolerated. Status and history updates do not choose graph routes;
+metadata is tolerated for legacy callers. Research critics also supply
+`resolved_obligations`, each with an existing issue `id` and concrete `evidence`;
+omitted obligations remain open. The research-aware critic gate rejects a pass
+with unresolved obligations before graph routing. Status/history actions
+themselves do not choose graph routes;
 the YAML's `next` does that.
 
 ## Transitions
@@ -535,11 +648,11 @@ transport and YAML actions. The UI's built-in graphs preserve their existing
 | `--reasoning-summary` | Public activity summaries: `none`, `concise` (default), or `detailed`. |
 | `--state-file` | Load initial state from a JSON object instead of reading standard input. It does not add the stdin aliases. |
 | `--start-node` | Start the first workflow at the named node; later workflows start at their first node. |
-| `--critic-rounds` | Built-in critic limit, from 1 to 100; the YAML default is 2. |
-| `--thinking-hours` | Goal search's elapsed-workflow limit: greater than 0 and at most 168 hours, default 168. |
-| `--elapsed-seconds` | Nonnegative elapsed time to count before starting a goal session, default 0. |
-| `--author-limit-file` | Live JSON control file containing `{"hours": ...}` for goal time limits. |
-| `--author-steer-file` | Live instruction-queue file consumed by the persistent goal session. |
+| `--critic-rounds` | Consecutive repaired-round limit, from 1 to 100; default 2. Reaching it saves verification incomplete. |
+| `--thinking-hours` | Shared elapsed-workflow limit covering research, critic, and final requests: greater than 0 and at most 168 hours, default 168. |
+| `--elapsed-seconds` | Nonnegative elapsed time to count before starting the workflow, default 0. |
+| `--author-limit-file` | Live JSON control file containing `{"hours": ...}` for the shared workflow time limit. |
+| `--author-steer-file` | Live instruction queue recorded at research-step boundaries or delivered to a legacy goal session. |
 | `--author-prompt-file`, `--critic-prompt-file`, `--final-prompt-file` | Replace the corresponding named prompt with UTF-8 file contents. |
 | `--set NAME=VALUE` | Set any named option; repeat as needed. JSON values are decoded, and other values remain strings. Applied after ordinary flags. |
 
@@ -571,7 +684,7 @@ event. Options are shared across a chain and do not become expression-context
 variables.
 
 For compatibility, the `author_input` option can provide an already-expanded
-first input for goal nodes. It bypasses the main prompt's marker substitution
+assignment for research or legacy goal nodes. It bypasses the main prompt's marker substitution
 and marker-count check; lifecycle templates still apply. Ordinary custom
 workflows should use the YAML `prompt`, `task`, and `marker` entries.
 

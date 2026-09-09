@@ -11,6 +11,7 @@ import os
 import operator
 import re
 import shutil
+import sqlite3
 import string
 import subprocess
 import sys
@@ -905,7 +906,7 @@ def structured(
     prompt, schema_value, stage, model=MODEL, effort=EFFORT,
     speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
     timeout=None, attempts=STRUCTURED_MAX_ATTEMPTS,
-    request_label=None, activity_label=None, features=(),
+    request_label=None, activity_label=None, features=(), journal=None, cache_key=None,
 ):
     """Run one read-only structured Codex call and relay its visible events."""
 
@@ -923,12 +924,23 @@ def structured(
         raise Error("Structured attempts must be a positive integer.") from exc
     if attempts < 1:
         raise Error("Structured attempts must be a positive integer.")
+    if journal is not None and cache_key:
+        saved_raw = journal.get_state("raw:" + cache_key)
+        if saved_raw is not None:
+            try:
+                return validate_json_schema(decoded_json_object(saved_raw), schema_value), saved_raw
+            except Error:
+                pass
     raw, attempt_effort = "", effort
     for attempt in range(attempts):
         attempt_prompt = (
             prompt if attempt == 0
             else structured_retry_prompt(prompt, raw, schema_value)
         )
+        request_id = journal.commit("model_request", {
+            "stage": stage, "prompt": attempt_prompt, "schema": schema_value,
+            "model": model, "effort": attempt_effort, "attempt": attempt + 1,
+        }) if journal is not None else None
         emit(
             "request", stage,
             label=(
@@ -946,7 +958,12 @@ def structured(
                 speed, summary, timeout=timeout,
                 activity_label=activity_label or request_label, features=features,
             )
+            if journal is not None:
+                journal.commit("model_response", {"request_id": request_id, "raw": raw},
+                               {"raw:" + cache_key: raw} if cache_key else None)
         except StructuredAttemptTimeout as exc:
+            if journal is not None:
+                journal.commit("model_error", {"request_id": request_id, "error": str(exc)})
             emit(
                 "diagnostic", stage,
                 text=f"Structured output attempt {attempt + 1} timed out: {exc}",
@@ -2562,7 +2579,7 @@ def _check_actions(actions):
     if not isinstance(actions, list):
         raise ValueError("Node actions must be a list.")
     for action in actions:
-        if not isinstance(action, dict) or set(action) - {"when", "set", "merge", "emit", "memory", "write"}:
+        if not isinstance(action, dict) or set(action) - {"when", "set", "merge", "emit", "memory", "write", "verify_latex"}:
             raise ValueError("Unknown workflow action.")
         if not (set(action) - {"when"}):
             raise ValueError("A guarded action needs an operation.")
@@ -2570,6 +2587,8 @@ def _check_actions(actions):
             check_expression(action["when"])
         if "merge" in action:
             check_expression(action["merge"])
+        if "verify_latex" in action:
+            check_expression(action["verify_latex"])
         if "set" in action:
             if not isinstance(action["set"], dict) or not all(isinstance(key, str) for key in action["set"]):
                 raise ValueError("State assignments must be a named mapping.")
@@ -2709,6 +2728,10 @@ def _expand_node(node):
     if node["run"] == "goal":
         node.setdefault("lifecycle", list(_GOAL_LIFECYCLE))
         node.setdefault("stages", dict(_GOAL_STAGES))
+    if node["run"] == "research":
+        for config in node.get("research", {}).get("steps", {}).values():
+            config.setdefault("run", "structured")
+            _expand_node(config)
 
     if "parallel" in node:
         parallel = node["parallel"]
@@ -2737,11 +2760,14 @@ def load_workflow(path):
         isinstance(name, str) and name and name != "end" for name in nodes
     ):
         raise ValueError("A workflow needs named nodes; 'end' is reserved.")
+    if sum(isinstance(node, dict) and node.get("run") == "research" for node in nodes.values()) > 1:
+        raise ValueError("Use one research session per workflow and a separate run directory for each statement.")
     targets = set(nodes) | {"end"}
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label"},
         "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery"},
+        "research": {"task", "marker", "resume", "research"},
     }
     for name, node in nodes.items():
         if not isinstance(node, dict) or not {"run", "prompt", "next"} <= node.keys():
@@ -2788,6 +2814,33 @@ def load_workflow(path):
             for expression in node.get("require", []):
                 check_expression(expression)
             bindings = node.get("inputs", {})
+        elif kind == "research":
+            for required in ("task", "marker", "resume", "research"):
+                if required not in node:
+                    raise ValueError(f"Research node {name} needs {required}.")
+            check_expression(node["task"])
+            if not isinstance(node["marker"], str) or not node["marker"]:
+                raise ValueError("Research marker must be nonempty.")
+            research = node["research"]
+            if not isinstance(research, dict) or set(research) - {"steps", "family_cooldown"}:
+                raise ValueError("Research configuration allows steps and family_cooldown.")
+            if type(research.get("family_cooldown", 2)) is not int or research.get("family_cooldown", 2) < 1:
+                raise ValueError("Research family_cooldown must be a positive integer.")
+            steps = research.get("steps", {})
+            if not isinstance(steps, dict) or set(steps) != {"propose", "assess", "explore", "review"}:
+                raise ValueError("Research needs propose, assess, explore, and review steps.")
+            for config in steps.values():
+                if set(config) - {"run", "prompt", "schema", "role", "model", "effort", "attempts", "provider_options", "timeout", "label"}:
+                    raise ValueError("Unsupported research step fields.")
+                if config.get("prompt") not in prompts or not isinstance(config.get("schema"), dict):
+                    raise ValueError("Research steps need a named prompt and response schema.")
+                validator_for(config["schema"]).check_schema(config["schema"])
+                if type(config.get("timeout", 900)) not in {int, float} or not 0 < config.get("timeout", 900) <= 3600:
+                    raise ValueError("Research request timeout must be in (0, 3600] seconds.")
+                _check_request_options(config)
+            bindings = node["resume"]
+            if not isinstance(bindings, dict) or not {"solution", "bugs", "round"} <= bindings.keys():
+                raise ValueError("Research resume needs solution, bugs and round.")
         else:
             for required in ("task", "marker", "lifecycle", "resume"):
                 if required not in node:
@@ -2910,6 +2963,12 @@ def prepare(workflow, options):
             references = [reference["then"], reference["else"]] if isinstance(reference, dict) else [reference]
             for reference in references:
                 _template_parts(prompts[reference], set(node.get("inputs", {})) | {"instructions"})
+        elif node["run"] == "research":
+            if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
+                raise ValueError("Research assignment needs exactly one statement marker.")
+            for config in node["research"]["steps"].values():
+                require_model_credentials(_settings(config, options)["model"])
+                _template_parts(prompts[config["prompt"]], {"assignment", "statement", "memory", "feedback", "instruction", "proposal", "result", "related"})
         else:
             if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
                 raise ValueError(f"Goal prompt must contain exactly one {node['marker']}.")
@@ -2971,6 +3030,23 @@ def _structured_options(node, options):
     return settings
 
 
+def workflow_remaining(options):
+    """One elapsed-time budget across research, audits, and final editing."""
+    started = options.setdefault("_workflow_started", time.monotonic())
+    hours = controlled_author_hours(options.get("author_limit_file"),
+                                   options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
+    return max(0.0, hours * 3600 - options.get("elapsed_seconds", 0)
+               - (time.monotonic() - started))
+
+
+def _bounded_request_settings(settings, options):
+    remaining = workflow_remaining(options)
+    if remaining <= 0:
+        raise Error("Workflow time limit reached; saved work remains resumable.")
+    return {**settings, "timeout": min(settings.get("timeout") or 900, remaining),
+            "attempts": 1, "journal": options.get("_journal")}
+
+
 def _parallel_requests(config, prompts, state, options, visit):
     """Run independent structured requests, restoring exact-input checkpoints."""
     settings = _structured_options(config, options)
@@ -2987,7 +3063,7 @@ def _parallel_requests(config, prompts, state, options, visit):
     emit("status", stage, label="Three independent audits started" if len(reports) == 3 else "Independent requests started", text=f"The controller restored {restored} completed audits and is launching {len(reports) - restored} explicit parallel model requests.", node=stage, auditCount=len(reports), restoredAuditCount=restored, launchedAuditCount=len(reports)-restored, reasoningEffort=effort, timeoutSeconds=settings.get("timeout"))
     def run_one(index, item):
         prompt = _request_prompt(config, prompts, {**context, "item": item})
-        report, _ = structured(prompt, config["schema"], stage, features=config.get("features", []), request_label=f"Independent critic audit {index + 1}", activity_label=f"Independent audit {index + 1}", **settings)
+        report, _ = structured(prompt, config["schema"], stage, features=config.get("features", []), request_label=f"Independent critic audit {index + 1}", activity_label=f"Independent audit {index + 1}", **_bounded_request_settings(settings, options))
         report = dict(report)
         if config.get("item_field"):
             report[config["item_field"]] = item
@@ -3038,16 +3114,41 @@ def _model_call(node, prompts, state, options, visit):
     prompt = _request_prompt(node, prompts, context)
     settings = _structured_options(node, options)
     settings.update({key: node[key] for key in ("request_label", "activity_label") if key in node})
-    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), **settings)
+    cache_key = "structured:" + _sha256(json.dumps([prompt, node["schema"], settings], sort_keys=True))
+    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), cache_key=cache_key, **_bounded_request_settings(settings, options))
+    def invalid_result(message):
+        journal = options.get("_journal")
+        if journal is not None:
+            journal.commit("protocol_error", {"stage": node.get("stage"), "error": message, "raw": raw},
+                           {"raw:" + cache_key: None})
+        raise Error(message)
     if parallel and parallel.get("output"):
-        try:
-            for condition in node.get("require", []):
-                if not evaluate(condition, {**context, "result": report, "raw": raw}):
-                    raise ValueError(f"Unmet response requirement: {condition}")
-        except ValueError as exc:
-            raise Error(node.get("error", str(exc))) from exc
         report[parallel["output"]] = context["parallel"]
         validate_json_schema(report, node["schema"])
+    # A reviewer cannot bypass verification by claiming an edited proof is unchanged.
+    if "fixed" in report and "solution" in report and "solution" in state:
+        report["fixed"] = (report.get("verdict") != "reject" and
+            normalized_candidate(report["solution"]) != normalized_candidate(state["solution"]))
+        memory = state.get("memory")
+        journal = getattr(memory, "journal", None)
+        if journal is not None:
+            issues = journal.get_state("open_issues", [])
+            resolutions = report.get("resolved_obligations", [])
+            known = {item["id"] for item in issues}
+            if any(item["id"] not in known or not item["evidence"].strip() for item in resolutions):
+                invalid_result("Critic must resolve existing issue IDs with explicit evidence.")
+            remaining = [item for item in issues if item["id"] not in {r["id"] for r in resolutions}]
+            if report["verdict"] == "pass" and remaining:
+                report["verdict"], report["fixed"] = "reject", False
+                report["bugs"] = "Previously recorded obligations remain unresolved:\n" + "\n".join(
+                    item["id"] + ": " + item["description"] for item in remaining)
+        new_issues = report.get("memory_update", {}).get("unresolved_obligations", [])
+        if report["verdict"] == "pass" and any(str(item).strip() for item in new_issues):
+            report["verdict"], report["fixed"] = "reject", False
+            report["bugs"] = "The reviewer reported unresolved obligations:\n" + "\n".join(new_issues)
+    for condition in node.get("require", []):
+        if not evaluate(condition, {**context, "result": report, "raw": raw}):
+            invalid_result(node.get("error", "Invalid model response: " + condition))
     return report, raw
 
 
@@ -3085,6 +3186,17 @@ def _apply_actions(actions, context, stage, revision):
             state.update({key: evaluate(expression, context) for key, expression in action["set"].items()})
         if "write" in action:
             _private_atomic_write(Path.cwd() / action["write"]["path"], evaluate(action["write"]["text"], context))
+        if "verify_latex" in action:
+            from latex_verification import verify_latex
+            verification = verify_latex(evaluate(action["verify_latex"], context), Path.cwd())
+            state["compilation"] = verification
+            journal = getattr(state.get("memory"), "journal", None)
+            if journal is not None:
+                journal.commit("latex_compilation", verification)
+            if verification["status"] == "fail":
+                state["failed"] = True
+            elif verification["status"] == "unavailable":
+                emit("diagnostic", stage, text=verification["diagnostic"])
         if "emit" in action:
             fields = {}
             for key, value in action["emit"].items():
@@ -3116,14 +3228,65 @@ def _execute(workflow, state, options, prompts):
         raise ValueError(f"Unknown workflow entry node: {current!r}.")
     started_at = time.monotonic()
     sessions, revisions = {}, {}
+    options.setdefault("_workflow_started", time.monotonic())
+    research_nodes = [node for node in nodes.values() if node["run"] == "research"]
+    journal = getattr(state.get("memory"), "journal", None)
+    final_graph = any("verify_latex" in action for node in nodes.values() for branch in node["next"].values()
+                      if isinstance(branch, dict) for action in branch.get("after", []))
+    if (research_nodes or final_graph) and journal is None:
+        from persistent_research import initialize, ResearchMemory
+        task = evaluate(research_nodes[0]["task"], {"state": state, "visit": 1}) if research_nodes else state.get("statement") or state.get("source")
+        journal = initialize(sys.modules[__name__], Path.cwd(), text(task), workflow, prompts, options)
+        state["memory"] = ResearchMemory(journal)
+    if journal is not None:
+        saved = journal.get_state("workflow_checkpoint")
+        review_target = research_nodes[0]["next"].get("proof") if research_nodes else None
+        if isinstance(review_target, dict):
+            review_target = review_target.get("to")
+        if saved and not options.get("start_node") and saved.get("node") in nodes:
+            state.update(saved["state"])
+            current, visits = saved["node"], saved.get("visits", 0)
+            state["failed"] = False
+        elif saved and not options.get("start_node") and saved.get("node") == "end" and journal.get_state("candidate_status") == "awaiting_critic" and review_target in nodes:
+            current, visits = review_target, 0
+            state["solution"] = journal.get_state("candidate")
+            state["failed"] = False
+        if "solution" in state and normalized_candidate(state["solution"]) != normalized_candidate(journal.get_state("candidate", "")):
+            state["memory"].record_candidate(state["solution"], "recovered_candidate")
+    if journal is not None:
+        options["_journal"] = journal
+        definition = {"workflow": workflow, "prompts": prompts}
+        version = _sha256(json.dumps(definition, sort_keys=True))
+        key = "graph_version:" + _sha256(json.dumps(list(nodes)))
+        if journal.get_state(key) != version:
+            journal.commit("graph_version", definition, {key: version})
     multiple_goals = sum(node["run"] == "goal" for node in nodes.values()) > 1
     try:
         while current != "end":
             node = nodes[current]
+            if journal is not None:
+                state["open_issues"] = journal.get_state("open_issues", [])
+            if workflow_remaining(options) <= 0:
+                raise Error("Workflow time limit reached; checkpoint saved for continuation.")
+            if journal is not None:
+                journal.commit("workflow_checkpoint", {"node": current}, {"workflow_checkpoint": {
+                    "node": current, "visits": visits,
+                    "state": {k: v for k, v in state.items() if k != "memory"}}})
             visits += 1
+            emit("status", node.get("stage", current), label=f"Workflow step: {current}",
+                 node=current, visit=visits)
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
             if node["run"] == "structured":
                 result, raw = _model_call(node, prompts, state, options, visits)
+            elif node["run"] == "research":
+                from persistent_research import research_session
+                if current not in sessions:
+                    sessions[current] = research_session(sys.modules[__name__], node, prompts, state, options, journal)
+                    result = next(sessions[current])
+                else:
+                    context = {"state": state, "visit": visits}
+                    result = sessions[current].send({key: evaluate(expression, context) for key, expression in node["resume"].items()})
+                raw = ""
             else:
                 context = {"state": state, "visit": visits}
                 revision = revisions.get(current, 0)
@@ -3174,6 +3337,11 @@ def _execute(workflow, state, options, prompts):
             if target != current:
                 visits = 0
             current = target
+            if journal is not None:
+                resume_node = next(iter(nodes)) if final_graph and state.get("failed") else current
+                journal.commit("workflow_transition", {"to": current, "outcome": context["outcome"]},
+                    {"workflow_checkpoint": {"node": resume_node, "visits": visits,
+                      "state": {k: v for k, v in state.items() if k != "memory"}}})
         return state
     finally:
         for session in sessions.values():
@@ -3191,7 +3359,8 @@ def execute(path, state=None, *, options=None):
 def execute_workflows(paths, state, options=None):
     """Validate once, then feed state through the graphs until one reports failure."""
 
-    options = {} if options is None else options
+    options = {} if options is None else dict(options)
+    options.setdefault("_workflow_started", time.monotonic())
     prepared = []
     for index, path in enumerate(paths):
         workflow = load_workflow(path)
@@ -3201,11 +3370,32 @@ def execute_workflows(paths, state, options=None):
         elif "start_node" in local_options and local_options["start_node"] not in workflow["nodes"]:
             raise ValueError(f"Unknown workflow entry node: {local_options['start_node']!r}.")
         prepared.append((workflow, prepare(workflow, local_options), local_options))
-    for workflow, prompts, local_options in prepared:
-        _execute(workflow, state, local_options, prompts)
-        if state.get("failed"):
-            break
-    return state
+    try:
+        resume_index = 0
+        if prepared and not state.get("memory"):
+            first, first_prompts, first_options = prepared[0]
+            has_research = any(node["run"] == "research" for node in first["nodes"].values())
+            if has_research:
+                from persistent_research import initialize, ResearchMemory
+                node = next(node for node in first["nodes"].values() if node["run"] == "research")
+                task = text(evaluate(node["task"], {"state": state, "visit": 1}))
+                journal = initialize(sys.modules[__name__], Path.cwd(), task, first, first_prompts, first_options)
+                state["memory"] = ResearchMemory(journal)
+                saved = journal.get_state("workflow_checkpoint")
+                if saved and not options.get("start_node"):
+                    for index, (definition, _, _) in enumerate(prepared):
+                        if saved.get("node") in definition["nodes"]:
+                            resume_index = index
+                            break
+        for workflow, prompts, local_options in prepared[resume_index:]:
+            _execute(workflow, state, local_options, prompts)
+            if state.get("failed"):
+                break
+        return state
+    finally:
+        journal = getattr(state.get("memory"), "journal", None)
+        if journal is not None:
+            journal.close()
 
 
 def _builtin_node(workflow_name, node_name, state, options, visit=1, prompts=None):
@@ -3231,14 +3421,20 @@ def criticize(statement, solution, round_number, model=CRITIC_MODEL, effort=EFFO
 def finalize(statement, solution, model=WRITER_MODEL, effort=EFFORT, instructions=None, speed=DEFAULT_SPEED, prompts=None, summary=DEFAULT_REASONING_SUMMARY):
     state = {"statement": statement, "solution": solution}
     options = {"model": model, "effort": effort, "speed": speed, "summary": summary, "prompts": {"final": instructions} if instructions is not None else {}}
-    _builtin_node("clean_up", "latex_editor", state, options, prompts=prompts)
+    options["prompts"] = {**(prompts or {}), **options["prompts"]}
+    execute_workflows([WORKFLOWS / "clean_up.yaml"], state, options)
+    if state.get("failed"):
+        raise Error(state["output"])
     return state["output"]
 
 
 def polish(source, model=WRITER_MODEL, effort=EFFORT, instructions=None, speed=DEFAULT_SPEED, prompts=None, summary=DEFAULT_REASONING_SUMMARY):
     state = {"source": source}
     options = {"model": model, "effort": effort, "speed": speed, "summary": summary, "prompts": {"final": instructions} if instructions is not None else {}}
-    _builtin_node("clean_up", "latex_editor", state, options, prompts=prompts)
+    options["prompts"] = {**(prompts or {}), **options["prompts"]}
+    execute_workflows([WORKFLOWS / "clean_up.yaml"], state, options)
+    if state.get("failed"):
+        raise Error(state["output"])
     return state["output"]
 
 
@@ -3255,113 +3451,21 @@ def audit_candidate(
 ):
     """Enter the normal proof loop at a fresh critic with a saved proof."""
 
-    audit_started = time.monotonic()
+    options = dict(start_node="critic", critic_rounds=critic_rounds,
+        thinking_hours=thinking_hours, author_model=author_model, critic_model=critic_model,
+        writer_model=writer_model, effort=effort, author_effort=author_effort,
+        critic_effort=critic_effort, writer_effort=writer_effort, speed=speed,
+        author_limit_file=author_limit_file, summary=summary,
+        author_steer_file=author_steer_file,
+        prompts={key: value for key, value in {"author": author_prompt,
+            "critic": critic_prompt, "final": final_prompt}.items() if value is not None})
     if critic_rounds is None:
-        critic_rounds = builtin_workflow("author_critic")["nodes"]["critic"]["next"]["fixed"]["repeat"]
-    critic_rounds = critic_limit(critic_rounds)
-    thinking_hours = controlled_author_hours(
-        author_limit_file, author_hours(thinking_hours)
-    )
-    author_model = chosen_model(author_model)
-    critic_model = chosen_model(critic_model)
-    writer_model = chosen_model(writer_model)
-    author_effort = effective_effort(author_model, author_effort or effort)
-    critic_effort = effective_effort(critic_model, critic_effort or effort)
-    writer_effort = effective_effort(writer_model, writer_effort or effort)
-    speed = chosen_speed(speed)
-    summary = chosen_reasoning_summary(summary)
-    for selected_model in {author_model, critic_model, writer_model}:
-        require_model_credentials(selected_model)
-    statement, solution = text(statement), text(solution)
-    emit(
-        "status", "critic", label="Saved candidate audit started",
-        text=(
-            "The initial proof author is loaded from the source job. A fresh "
-            "critic is auditing the complete saved candidate; an author repair "
-            "runs only if the critic rejects it."
-        ),
-    )
-    for round_number in range(1, critic_rounds + 1):
-        report = criticize(
-            statement, solution, round_number,
-            model=critic_model, effort=critic_effort,
-            instructions=critic_prompt, speed=speed, summary=summary,
-        )
-        solution = report["solution"].strip()
-        if report["verdict"] == "pass" and not report["fixed"]:
-            emit(
-                "status", "critic", label="Saved candidate approved",
-                text=f"Round {round_number} found no bugs to fix.",
-            )
-            return finalize(
-                statement, solution, model=writer_model,
-                effort=writer_effort, instructions=final_prompt,
-                speed=speed, summary=summary,
-            )
-        if report["verdict"] == "pass":
-            emit(
-                "status", "critic", label="Critic repaired saved candidate",
-                text=(
-                    f"Round {round_number} repaired the proof; a fresh critic "
-                    "will recheck it."
-                    if round_number < critic_rounds else
-                    f"Round {round_number} repaired the proof."
-                ),
-            )
-            continue
-        emit(
-            "partial_result", "critic", label="Rejected saved candidate",
-            text=solution, output=solution,
-        )
-        emit(
-            "status", "repair", label="Returning saved proof to author",
-            text=(
-                "The entry critic rejected the saved candidate. A proof author "
-                "will repair that exact candidate before the normal critic loop "
-                "continues."
-            ),
-            node="author",
-        )
-        base = make_prompt(statement, author_prompt) if author_prompt else make_prompt(statement)
-        repair = repair_prompt(
-            statement, solution, report["bugs"], 1,
-            critic_round=round_number, include_statement=False,
-        )
-        resumed_prompt = (
-            f"{base}\n\nRECOVERY ENTRY FROM A SAVED CRITIC JOB:\n{repair}"
-        )
-        return run_goal(
-            resumed_prompt, statement,
-            critic_rounds=critic_rounds,
-            thinking_hours=thinking_hours,
-            author_model=author_model,
-            critic_model=critic_model,
-            writer_model=writer_model,
-            effort=effort,
-            author_effort=author_effort,
-            critic_effort=critic_effort,
-            writer_effort=writer_effort,
-            critic_prompt=critic_prompt,
-            final_prompt=final_prompt,
-            speed=speed,
-            author_limit_file=author_limit_file,
-            elapsed_seconds=time.monotonic() - audit_started,
-            summary=summary,
-            author_steer_file=author_steer_file,
-        )
-    emit(
-        "status", "critic", label="Critic round limit accepted",
-        text=(
-            f"All bugs were fixed in {critic_rounds} consecutive critic rounds "
-            "without rejection. Accepting the latest repaired solution "
-            "without another check."
-        ),
-    )
-    return finalize(
-        statement, solution, model=writer_model,
-        effort=writer_effort, instructions=final_prompt,
-        speed=speed, summary=summary,
-    )
+        options.pop("critic_rounds")
+    state = execute_workflows([WORKFLOWS / "author_critic.yaml", WORKFLOWS / "clean_up.yaml"],
+                              {"statement": text(statement), "solution": text(solution)}, options)
+    if state.get("failed"):
+        raise Error(state["output"])
+    return state["output"]
 
 
 
@@ -3438,7 +3542,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\nStopped workflow.", file=sys.stderr)
         return 130
-    except (Error, ValueError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (Error, ValueError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

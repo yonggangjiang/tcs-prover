@@ -365,6 +365,18 @@ button { min-height: 42px; }
   margin-left: 12px;
 }
 
+.final-check-arrow {
+  grid-column: 3;
+  grid-row: 4;
+  margin-left: 22px;
+}
+
+.final-check {
+  grid-column: 3;
+  grid-row: 5;
+  margin-left: 12px;
+}
+
 .post-loop::before {
   position: absolute;
   z-index: 1;

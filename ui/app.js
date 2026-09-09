@@ -223,7 +223,7 @@ async function continueStopped(job, title) {
   const settingsWarning = job.settingsWarning
     ? `\n\nLegacy settings warning: ${job.settingsWarning}` : "";
   const question = `${job.continueStoppedLabel || "Continue stopped job"} for “${title}”?\n\n`
-    + `${detail}${settingsWarning}\n\nA new job will be created. The stopped source job will not be changed, `
+    + `${detail}${settingsWarning}\n\nA new job will be created. The source job will not be changed, `
     + "and an interrupted model response or private reasoning cannot be resumed.";
   if (!confirm(question)) return;
   try {
@@ -638,8 +638,8 @@ function describe(entry) {
       key: `critic:${entry.round || entry.time}`, type: "agent",
       label: `${entry.label || "Critic result"} · ${report.verdict || "returned"}`,
       text: report.fixed
-        ? "The critic repaired every reported issue. Recheck below the round limit; "
-          + "at the limit, proceed to LaTeX editing."
+        ? "The critic changed the proof. The new version needs another audit; "
+          + "at the repair limit, save verification incomplete."
         : (report.bugs || "No repair was needed."),
       time: entry.time, checks: report.checks || [], replace: true, pinned: true,
     };
@@ -943,7 +943,7 @@ function ingest(entries, reset = false) {
 // Render the critic/repair cycle as a real loop, not five linear steps.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
-  const latexOnly = state.problemMode === "latex";
+  const latexOnly = ["latex", "final-resume"].includes(state.problemMode);
   const criticResume = state.problemMode === "critic-resume";
   const startsAtAuthor = state.problemMode === "algorithmic"
     || state.skipStatementReview;
@@ -992,7 +992,7 @@ function renderWorkflow() {
     if (name === "failure_summary") {
       const condition = document.createElement("span");
       condition.className = "failure-condition";
-      condition.textContent = "At total time limit";
+      condition.textContent = "At a pause or verification limit";
       copy.append(condition);
     }
     row.append(dot, copy);
@@ -1004,7 +1004,10 @@ function renderWorkflow() {
   }
   if (latexOnly) {
     const editor = makeNode("latex_editor", "1");
-    ui.workflowNodes.replaceChildren(editor);
+    const verifyArrow = document.createElement("li");
+    verifyArrow.className = "flow-arrow";
+    verifyArrow.textContent = "Verify formatting ↓";
+    ui.workflowNodes.replaceChildren(editor, verifyArrow, makeNode("final_verifier", "2"));
     return;
   }
   const arrow = (text, pass = false) => {
@@ -1018,7 +1021,7 @@ function renderWorkflow() {
   loop.className = "workflow-loop";
   const loopTitle = document.createElement("strong");
   loopTitle.className = "loop-title";
-  loopTitle.textContent = "Repeat until accepted";
+  loopTitle.textContent = "Research, review, and record";
   const loopNodes = document.createElement("ol");
   loopNodes.className = "loop-nodes";
   const candidateRoute = document.createElement("li");
@@ -1030,7 +1033,7 @@ function renderWorkflow() {
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
     "aria-label",
-    "At the total time limit, an active author stops; an active critic finishes, but rejection returns a failure summary",
+    "A research pause, time limit, or verification limit preserves a resumable checkpoint",
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";
@@ -1043,7 +1046,7 @@ function renderWorkflow() {
   rejectRoute.append(rejectLabel);
   const selfRoute = document.createElement("li");
   selfRoute.className = "loop-self";
-  selfRoute.textContent = "↻ Critic fixes → recheck below limit";
+  selfRoute.textContent = "↻ Changed proof → fresh audit";
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
   const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
@@ -1057,11 +1060,15 @@ function renderWorkflow() {
   // Failure branches left; accepted proofs run directly from critic to editor.
   const branch = document.createElement("li");
   branch.className = "workflow-branch";
-  const passRoute = arrow("PASS or all fixes at limit", true);
+  const passRoute = arrow("Clean, unchanged PASS", true);
   passRoute.classList.add("critic-pass");
   const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");
-  branch.append(failureNode, failureRoute, loop, passRoute, editor);
+  const verificationRoute = arrow("Verify formatting");
+  verificationRoute.classList.add("final-check-arrow");
+  const verifier = makeNode("final_verifier", startsAtAuthor ? "4" : "5");
+  verifier.classList.add("final-check");
+  branch.append(failureNode, failureRoute, loop, passRoute, editor, verificationRoute, verifier);
 
   if (startsAtAuthor) {
     ui.workflowNodes.replaceChildren(branch);

@@ -208,14 +208,14 @@
                 </p>
               </div>
               <div id="criticRoundSetting" class="round-setting">
-                <label for="criticRounds">Critic round limit</label>
+                <label for="criticRounds">Consecutive repair limit</label>
                 <input id="criticRounds" type="number" min="1" max="100"
                   step="1" value="2" aria-describedby="roundHelp">
                 <p id="roundHelp" class="help">
-                  Default 2 consecutive rounds without rejection. A clean PASS
-                  proceeds immediately. At the limit, a proof with all reported
-                  bugs fixed proceeds without another check. Rejection sends
-                  the proof back to the author and resets the count.
+                  Default 2 consecutive repaired rounds. Only a clean PASS of
+                  the exact reviewed proof proceeds. At the limit, save the
+                  proof as verification incomplete for later continuation.
+                  Rejection returns to research and resets the count.
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
@@ -223,9 +223,10 @@
                 <input id="thinkingHours" type="number" min="0.01" max="168"
                   step="0.25" value="168" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
-                  Default 168 hours. This uses the elapsed clock at the top. At
-                  the limit an active author stops; an active critic finishes,
-                  but a rejection cannot start another author revision.
+                  Default 168 hours for the whole workflow. Each request is
+                  bounded by the time remaining when it starts. Changes to the
+                  budget apply at the next request. Resume a saved research
+                  checkpoint to start a new run with a renewed budget.
                 </p>
               </div>
             </details>
