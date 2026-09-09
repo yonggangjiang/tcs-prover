@@ -1,8 +1,9 @@
 # TCS Prover
 
-A local web UI that gives one persistent author LLM a mathematical statement,
-lets it work through diverse approaches while maintaining three readable memory
-files, independently audits its candidate, and produces verified LaTeX.
+A local web UI that gives a persistent root author LLM a mathematical statement,
+lets it explore diverse approaches with independent subagents while maintaining
+three readable memory files, checks its candidate through a critic loop, and
+produces verified LaTeX.
 Algorithmic tasks can be entered as statements too.
 
 The complete author instructions live directly in
@@ -362,11 +363,12 @@ derail the proof search.
 
 ### 2. One persistent author and three memory files
 
-The default author uses one goal-based LLM session. It receives the statement
-and a complete search strategy, explores ideas, checks its own arguments,
-records its work, and keeps choosing new directions. There are no separate
-planner, novelty assessor, or research-result reviewer calls inside the author.
-The independent critic still checks any completed candidate afterward.
+The default author has one persistent root goal and enables `multi_agent`.
+Its prompt calls for aggressive exploration by independent subagents assigned
+different approaches. They are instructed to work without communicating with
+one another and report to the root author, which checks and records their work.
+It keeps choosing new directions under the same initial assignment. The
+separate critic checks any completed candidate afterward.
 
 The author has exactly three memory files in its run folder:
 

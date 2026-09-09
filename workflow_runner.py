@@ -1064,7 +1064,7 @@ class RPC:
         stop_process(self.process)
 
 
-def goal_session(runtime, prompt, *, prompts, settings, options,
+def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  node_name="author", stages=None, initial_instruction=""):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
@@ -1100,11 +1100,26 @@ def goal_session(runtime, prompt, *, prompts, settings, options,
     failure = None
     last_usage = {}
 
+    def is_root(message):
+        params = message.get("params") or {}
+        owners = [params.get("threadId")]
+        for key in ("goal", "turn", "item"):
+            value = params.get(key)
+            if isinstance(value, dict):
+                owners.append(value.get("threadId"))
+        if isinstance(params.get("thread"), dict):
+            owners.append(params["thread"].get("id"))
+        owners = [owner for owner in owners if owner is not None]
+        scoped = message.get("method") in {
+            "turn/started", "turn/completed", "item/completed",
+            "thread/goal/updated", "thread/tokenUsage/updated",
+        }
+        return (bool(owners) or not scoped) and all(owner == thread for owner in owners)
+
     def record(message):
         event = runtime.public_event(message)
         if event is not None:
-            emit("codex_event", event=event,
-                 root=event.get("params", {}).get("threadId") in {None, thread})
+            emit("codex_event", event=event, root=is_root(event))
 
     def steer(instruction, identity, compaction=False):
         request = rpc.request("turn/steer", {
@@ -1163,9 +1178,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options,
         if runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         process = subprocess.Popen([
-            runtime.codex(), "app-server", "--enable", "goals", "--disable", "multi_agent",
+            runtime.codex(), "app-server", "--enable", "goals",
+            *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
             *runtime.context_cache_arguments(),
+            *[argument for feature in features for argument in ("--enable", feature)],
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=runtime.environment(model))
@@ -1178,7 +1195,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options,
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
-                "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast"}},
+                "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
+                             **{feature: True for feature in features}}},
         }
         if hasattr(runtime, "model_provider"):
             thread_options["modelProvider"] = runtime.model_provider(model)
@@ -1211,7 +1229,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options,
                 raise runtime.Error("Workflow time limit reached.")
             message = rpc.read()
             params = message.get("params", {})
-            if params.get("threadId") not in {None, thread}:
+            if not is_root(message):
                 continue
             request = message.get("id")
             if request in pending_steers and "method" not in message:
@@ -1792,7 +1810,7 @@ def load_workflow(path):
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features"},
     }
     for name, node in nodes.items():
         if not isinstance(node, dict) or not {"run", "prompt", "next"} <= node.keys():
@@ -1845,6 +1863,10 @@ def load_workflow(path):
                 check_expression(expression)
             bindings = node.get("inputs", {})
         else:
+            if not isinstance(node.get("features", []), list) or not all(
+                isinstance(feature, str) and feature for feature in node.get("features", [])
+            ):
+                raise ValueError(f"Goal node {name} features must be a list of nonempty strings.")
             for required in ("task", "marker", "lifecycle", "resume"):
                 if required not in node:
                     raise ValueError(f"Goal node {name} needs {required}.")
@@ -2227,6 +2249,7 @@ def _execute(workflow, state, options, prompts):
                     session = goal_session(
                         sys.modules[__name__], prompt, prompts=session_prompts,
                         settings=_settings(node, options), options=options,
+                        features=node.get("features", []),
                         stages=node.get("stages"), node_name=current, initial_instruction=instruction,
                     )
                     sessions[current] = session

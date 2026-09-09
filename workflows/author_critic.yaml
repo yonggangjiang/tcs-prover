@@ -1,31 +1,23 @@
-# Workflow guide: workflows.md
-# One persistent author session; all research-file operations are directed by the author prompt.
+# One persistent author session; the LLM maintains its research files.
 nodes:
   author:
     run: goal
     role: author
     stage: solve
     prompt: author
+    features: [multi_agent]
     task: state.statement
     marker: '[STATEMENT]'
-    lifecycle: [goal, continuation, compaction, repair, resume]
-    stages: {initial: solve, resume: repair, failure: failure}
-    resume:
-      solution: state.solution
-      bugs: state.report.bugs
-      round: state.round
-    recovery:
-      when: "'report' in state and state.report.verdict == 'reject'"
-      prompt: repair
+    resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
+    recovery: {when: "'report' in state and state.report.verdict == 'reject'", prompt: repair}
     outcome: result.outcome
     after:
     - merge: result
     - set:
         solution: "result.output if outcome == 'done' else get(state, 'solution', '')"
         failed: outcome == 'failure'
-    next:
-      done: critic
-      failure: end
+    next: {done: critic, failure: end}
+
   critic:
     run: structured
     role: critic
@@ -166,7 +158,7 @@ nodes:
             output: =state.output
 prompts:
   author: |-
-    Resolve the exact statement below with a complete, rigorous argument. Preserve its assumptions and requested conclusion. Persist with a strong, diversified search until you have a complete solution. Work alone in this LLM session; do not spawn other agents or delegate the task. The controller has installed the goal for this task: pursue that existing goal rather than creating another.
+    Resolve the exact statement below with a complete, rigorous argument. Preserve its assumptions and requested conclusion. Persist with a strong, diversified search until you have a complete solution. Aggressively use subagents to explore substantially different ideas and diversified routes independently, without mutual communication; have them report their results to you. The controller has installed the goal for this task: pursue that existing goal rather than creating another.
 
     Before any mathematical work, use your file tools to inspect the current working directory. If INITIAL_PROMPT.md is absent, create it with this entire initial author prompt verbatim, including the exact statement and every instruction. If APPROACHES.md is absent, create it with the heading "# Attempted approaches". If PROVED.md is absent, create it with the heading "# Proved lemmas". Preserve every existing file and its contents. You, the author LLM, perform all creation, reading, searching, and updating of these files; do not assume the controller has created them for you.
 

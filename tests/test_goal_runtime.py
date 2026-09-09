@@ -160,6 +160,43 @@ class GoalTests(unittest.TestCase):
         self.assertTrue(runtime.stopped)
         self.assertEqual(runtime.rpc.calls[-1][1]["status"], "active")
 
+    def test_features_enable_multi_agent_and_other_flags_on_start_and_resume(self):
+        for options in ({}, {"goal_thread_id": "thread-1"}):
+            with self.subTest(options=options):
+                runtime, session = self.session(features=["multi_agent", "example_feature"], options=options)
+                self.assertEqual(next(session)["outcome"], "done")
+                command = self.spawn.call_args.args[0]
+                self.assertIn(("--enable", "multi_agent"), list(zip(command, command[1:])))
+                self.assertIn(("--enable", "example_feature"), list(zip(command, command[1:])))
+                self.assertNotIn(("--disable", "multi_agent"), list(zip(command, command[1:])))
+                config = next(p["config"] for m, p in runtime.rpc.calls if m in {"thread/start", "thread/resume"})
+                self.assertTrue(config["features"]["multi_agent"])
+                self.assertTrue(config["features"]["example_feature"])
+                self.assertEqual(sum(m in {"thread/start", "thread/resume"} for m, _ in runtime.rpc.calls), 1)
+                session.close()
+
+    def test_goal_yaml_accepts_features_and_passes_them_to_session(self):
+        definition = {"prompts": {**PROMPTS, "assignment": "Do [TASK]."}, "nodes": {
+            "worker": {"run": "goal", "prompt": "assignment", "task": "state.input", "marker": "[TASK]",
+                       "features": ["multi_agent"], "resume": {}, "outcome": "result.outcome",
+                       "after": [{"merge": "result"}], "next": {"done": "end", "failure": "end"}}
+        }}
+        path = self.directory / "custom.yaml"
+        path.write_text(module.yaml.safe_dump(definition))
+        workflow = module.load_workflow(path)
+        with patch.object(module, "goal_session", return_value=iter([{"outcome": "done", "output": "Complete"}])) as session:
+            with patch.object(module, "emit"):
+                # The interpreter closes persistent generators at graph exit.
+                session.return_value = (item for item in [{"outcome": "done", "output": "Complete"}])
+                result = module._execute(workflow, {"input": "the task"}, {}, workflow["prompts"])
+        self.assertEqual(result["output"], "Complete")
+        self.assertEqual(session.call_args.kwargs["features"], ["multi_agent"])
+        for invalid in ("multi_agent", [False], [""]):
+            definition["nodes"]["worker"]["features"] = invalid
+            path.write_text(module.yaml.safe_dump(definition))
+            with self.assertRaisesRegex(ValueError, "features must"):
+                module.load_workflow(path)
+
     def test_explicit_resume_preserves_arbitrary_existing_files_without_reading_them(self):
         contents = {"arbitrary.bin": b"\xff\x00\xfe\r\n", "other.txt": b"Old unrelated assignment\r\n\n"}
         for name, data in contents.items():
@@ -185,6 +222,43 @@ class GoalTests(unittest.TestCase):
                     event("turn/started", turn={"id": "automatic-2"}), *success("Actual proof")]]
         _, session = self.session(scripts)
         self.assertEqual(next(session)["output"], "Actual proof")
+
+    def test_subagent_goal_notifications_cannot_finish_or_fail_the_root(self):
+        child_events = [
+            {"method": "thread/goal/updated", "params": {"goal": {"threadId": "child", "status": "complete"}}},
+            event("thread/goal/updated", goal={"threadId": "child", "status": "complete"}),
+            {"method": "thread/goal/updated", "params": {"goal": {"threadId": "child", "status": "usageLimited"}}},
+        ]
+        scripts = [[answer("Root partial progress"), completed(), *child_events,
+                    event("turn/started", turn={"id": "root-next"}), *success("Root completed result")]]
+        runtime, session = self.session(scripts, features=["multi_agent"])
+        self.assertEqual(next(session)["output"], "Root completed result")
+        logged = [e for e in runtime.events if e.get("event") in child_events]
+        self.assertEqual(len(logged), 3)
+        self.assertTrue(all(e["root"] is False for e in logged))
+
+    def test_subagent_answers_and_compactions_are_excluded_from_root_state(self):
+        child_events = [
+            event("item/completed", threadId="child", item={"type": "agentMessage", "phase": "final_answer", "text": "Child result"}),
+            {"method": "item/completed", "params": {"item": {"threadId": "child", "type": "agentMessage", "text": "Nested child result"}}},
+            event("item/completed", item={"threadId": "child", "type": "agentMessage", "text": "Conflicting-owner child result"}),
+            event("item/completed", threadId="child", turnId="child-turn", item={"type": "contextCompaction", "id": "child-compact"}),
+            {"method": "turn/completed", "params": {"turn": {"threadId": "child", "id": "child-turn", "status": "failed"}}},
+        ]
+        runtime, session = self.session([[*child_events, goal("complete"), completed()], success("Root answer")], features=["multi_agent"])
+        self.assertEqual(next(session)["output"], "Root answer")
+        self.assertEqual(runtime.rpc.turns, 2)
+        self.assertFalse(any(m == "turn/steer" for m, _ in runtime.rpc.calls))
+        self.assertTrue(all(e["root"] is False for e in runtime.events if e.get("event") in child_events))
+
+    def test_goal_completion_requires_explicit_root_identity(self):
+        unknown = {"method": "thread/goal/updated", "params": {"goal": {"status": "complete"}}}
+        root = {"method": "thread/goal/updated", "params": {"goal": {"threadId": "thread-1", "status": "complete"}}}
+        scripts = [[answer("Root unfinished"), completed(), unknown,
+                    event("turn/started", turn={"id": "root-next"}), answer("Root final"), completed(), root]]
+        runtime, session = self.session(scripts, features=["multi_agent"])
+        self.assertEqual(next(session)["output"], "Root final")
+        self.assertTrue(any(e.get("event") == root and e["root"] for e in runtime.events))
 
     def test_commentary_is_not_a_solution_and_blocked_goal_continues(self):
         scripts = [[answer("Working", "commentary"), goal("complete"), completed()],
