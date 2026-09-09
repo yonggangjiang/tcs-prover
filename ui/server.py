@@ -245,11 +245,7 @@ PUBLIC_GRAPH = {
         },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
-            "description": "Formats the passing proof when no edits were needed or the critic round limit was reached.",
-        },
-        "final_verifier": {
-            "label": "Final verifier", "short_label": "Verify", "stage": "final",
-            "description": "Independently checks that formatting preserves the complete argument, then checks local compilation when available.",
+            "description": "Polishes the passing proof into LaTeX in one editor call, then returns it.",
         },
     },
     "edges": [
@@ -288,16 +284,6 @@ PUBLIC_GRAPH = {
             "label": "Save verification checkpoint", "when": "the critic is interrupted or the time budget is reached",
             "prompt_change": "Keep the latest saved proof for continuation at the critic.",
         },
-        {
-            "from": "latex_editor", "to": "final_verifier",
-            "label": "Verify final document", "when": "the formatted document is complete",
-            "prompt_change": "Compare the formatted document with the exact reviewed source and check every substantive change.",
-        },
-        {
-            "from": "final_verifier", "to": "failure_summary",
-            "label": "Save formatting checkpoint", "when": "content verification or compilation fails",
-            "prompt_change": "Preserve the reviewed source, formatted document, and feedback for an editor retry.",
-        },
     ],
 }
 
@@ -318,14 +304,10 @@ LATEX_GRAPH = {
     "nodes": {
         "latex_editor": {
             **PUBLIC_GRAPH["nodes"]["latex_editor"],
-            "description": "Polishes the supplied theorem and proof into clean LaTeX.",
+            "description": "Polishes the supplied writing into LaTeX in one editor call, then returns it.",
         },
-        "final_verifier": PUBLIC_GRAPH["nodes"]["final_verifier"],
     },
-    "edges": [
-        edge for edge in PUBLIC_GRAPH["edges"]
-        if edge["from"] == "latex_editor" and edge["to"] == "final_verifier"
-    ],
+    "edges": [],
 }
 
 REVIEW_ONLY_GRAPH = {

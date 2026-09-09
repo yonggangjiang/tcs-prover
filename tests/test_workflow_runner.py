@@ -41,8 +41,6 @@ class PipelineTests(unittest.TestCase):
             value = review_report()
         elif 'latex' in schema['properties']:
             value = {'latex': LATEX}
-        elif 'verdict' in schema['properties']:
-            value = {'verdict': 'pass', 'bugs': ''}
         else:
             raise AssertionError(stage)
         runtime.validate_json_schema(value, schema)
@@ -60,13 +58,14 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_unchanged_first_critic_pass_goes_directly_to_final_document(self):
-        with workspace() as directory, patch.object(runtime, 'structured', side_effect=self.model), patch.object(runtime, '_run_command', return_value={'status': 'pass', 'diagnostic': 'Compiled', 'engine': 'mock'}):
+        with workspace() as directory, patch.object(runtime, 'structured', side_effect=self.model), patch.object(runtime, '_run_command') as command:
             state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'], {'statement': 'Exact test task'})
             self.assertFalse(state['failed'])
             self.assertEqual(state['output'], LATEX)
             self.assertEqual(self.calls.count('critic'), 1)
-            self.assertEqual(len(self.calls), 3)
-            self.assertTrue((directory/'formatted-candidate.tex').is_file())
+            self.assertEqual(self.calls, ['critic', 'final'])
+            command.assert_not_called()
+            self.assertFalse((directory/'formatted-candidate.tex').exists())
             self.assertEqual(len(self.goal_calls), 1)
             self.assertFalse((directory/'research.sqlite3').exists())
 
@@ -154,16 +153,23 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(settings['attempts'],1)
         self.assertLessEqual(settings['timeout'],1)
 
-    def test_formatter_rejection_prevents_success_and_compilation(self):
-        def model(prompt,schema,stage,**settings):
-            value={'latex':LATEX} if 'latex' in schema['properties'] else {'verdict':'reject','bugs':'Dropped a necessary assumption.'}
-            return value,json.dumps(value)
-        with workspace(),patch.object(runtime,'structured',side_effect=model),patch.object(runtime, '_run_command') as compiler:
-            state=runtime.execute_workflows([ROOT/'workflows/clean_up.yaml'], {'statement':'Task','solution':PROOF})
-            self.assertTrue(state['failed'])
-            self.assertIn('Dropped a necessary assumption',state['output'])
-            self.assertEqual(state['solution'],PROOF)
-            compiler.assert_not_called()
+    def test_cleanup_is_one_editor_call_for_proof_or_standalone_tex(self):
+        for initial in ({'statement': 'Task', 'solution': PROOF}, {'source': LATEX}):
+            source = initial.get('solution', initial.get('source'))
+            def model(prompt, schema, stage, **settings):
+                self.assertEqual(stage, 'final')
+                self.assertEqual(prompt, runtime.FINAL_PROMPT + '\n\nSOLUTION:\n' + source)
+                self.assertEqual(settings['features'], [])
+                return {'latex': LATEX}, json.dumps({'latex': LATEX})
+            with self.subTest(initial=initial), workspace() as directory, patch.object(runtime, 'structured', side_effect=model) as editor, patch.object(runtime, '_run_command') as command, patch.object(runtime, 'emit') as emit:
+                state = runtime.execute_workflows([ROOT/'workflows/clean_up.yaml'], dict(initial))
+                self.assertEqual(editor.call_count, 1)
+                self.assertEqual(state['output'], LATEX)
+                self.assertEqual(list(directory.iterdir()), [])
+                command.assert_not_called()
+                completion = [call for call in emit.call_args_list if call.args[0] == 'final_result']
+                self.assertEqual(len(completion), 1)
+                self.assertEqual(completion[0].kwargs['output'], LATEX)
 
 
 if __name__=='__main__':

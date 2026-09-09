@@ -479,7 +479,7 @@ const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow inserts the statement and adds proof-history instructions.",
   critic: "Each critic call receives the statement and latest proof, then follows these instructions to use fresh independent subagents.",
-  final: "The full request also includes the statement and proof to polish.",
+  final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
 function syncPrompts(source = state) {
@@ -991,7 +991,7 @@ function renderWorkflow() {
     if (name === "failure_summary") {
       const condition = document.createElement("span");
       condition.className = "failure-condition";
-      condition.textContent = "At a pause or verification limit";
+      condition.textContent = "At an interruption or time limit";
       copy.append(condition);
     }
     row.append(dot, copy);
@@ -1002,11 +1002,7 @@ function renderWorkflow() {
     return;
   }
   if (latexOnly) {
-    const editor = makeNode("latex_editor", "1");
-    const verifyArrow = document.createElement("li");
-    verifyArrow.className = "flow-arrow";
-    verifyArrow.textContent = "Verify formatting ↓";
-    ui.workflowNodes.replaceChildren(editor, verifyArrow, makeNode("final_verifier", "2"));
+    ui.workflowNodes.replaceChildren(makeNode("latex_editor", "1"));
     return;
   }
   const arrow = (text, pass = false) => {
@@ -1032,7 +1028,7 @@ function renderWorkflow() {
   failureRoute.className = "failure-route";
   failureRoute.setAttribute(
     "aria-label",
-    "Author interruptions and verification limits preserve saved work for continuation",
+    "Author and critic interruptions preserve saved work for continuation",
   );
   const rejectRoute = document.createElement("li");
   rejectRoute.className = "loop-back";
@@ -1063,11 +1059,7 @@ function renderWorkflow() {
   passRoute.classList.add("critic-pass");
   const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");
-  const verificationRoute = arrow("Verify formatting");
-  verificationRoute.classList.add("final-check-arrow");
-  const verifier = makeNode("final_verifier", startsAtAuthor ? "4" : "5");
-  verifier.classList.add("final-check");
-  branch.append(failureNode, failureRoute, loop, passRoute, editor, verificationRoute, verifier);
+  branch.append(failureNode, failureRoute, loop, passRoute, editor);
 
   if (startsAtAuthor) {
     ui.workflowNodes.replaceChildren(branch);

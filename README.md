@@ -3,7 +3,7 @@
 A local web UI that gives a persistent root author LLM a mathematical statement,
 lets it explore diverse approaches with independent subagents while maintaining
 three readable memory files, checks its candidate through a critic loop, and
-produces verified LaTeX.
+produces a complete LaTeX document.
 Algorithmic tasks can be entered as statements too.
 
 The complete author instructions live directly in
@@ -200,7 +200,7 @@ button:
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
 | Proof author, repair, or interrupted failure summary | **Continue proof author** | Restores `INITIAL_PROMPT.md`, `APPROACHES.md`, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads those files before continuing. Visible partial text is not treated as a complete proof. |
 | Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The critic requests new independent bug-finding reports. |
-| LaTeX editor | **Retry LaTeX editor** | Restores `final-input.json` and runs editing, independent content-preservation review, and local compilation when available. LaTeX-only jobs reuse `latex-input.md`. Older jobs without an exact final input safely fall back to their latest critic checkpoint. |
+| LaTeX editor | **Retry LaTeX editor** | Retries the single editor call with the saved accepted solution or standalone LaTeX source. Older jobs without an exact final input fall back to their latest critic checkpoint. |
 
 Every action creates a new run folder and leaves the stopped source run
 unchanged. An in-flight request or inaccessible private reasoning cannot be
@@ -303,7 +303,7 @@ memory.
 Choose **Statement** to review or edit a rough problem before approval. Include
 the computational model, problem description, and asymptotic goal in the
 statement for algorithmic tasks. Choose **LaTeX polish** to edit an existing
-theorem and proof using the editor, independent final verifier, and compilation check.
+theorem and proof with a single editor call.
 **Advanced** controls each node's model, reasoning effort, prompt, public activity-log
 detail, workflow time limit, and critic-round limit. The log can show status
 only or request concise or detailed model-generated summaries. Its **Statement review only** option runs just the
@@ -335,7 +335,7 @@ flowchart TD
     C -- "reject: exact bugs and reset rounds" --> A
     C -- "edited pass below maximum" --> C
     C -- "unchanged pass or edited pass at maximum" --> L["LaTeX editor"]
-    L --> V["Independent content check + compilation"]
+    L --> O["Final LaTeX output"]
     A -. "time limit or interruption" .-> P["Preserve files and continue later"]
 ```
 
@@ -421,20 +421,13 @@ LaTeX formatting. The setting is a maximum for consecutive edited passes, not
 a requirement to obtain a fixed number of passes. Model review is not formal
 proof verification.
 
-### 4. LaTeX editing and final verification
+### 4. LaTeX editing
 
-The editor preserves the exact accepted input, produces `formatted-candidate.tex`,
-and sends it to a separate content verifier. That verifier compares the
-original argument and final document, including any expanded explanation. It
-does not repair the document. Rejection preserves both versions and the reasons;
-resumed finalization retries the editor with the original input and saved feedback.
-
-After a content pass, local `pdflatex` compilation runs when installed, with
-shell execution disabled, restricted file access, and a 30-second timeout.
-`final-validation/` retains the exact source, compiler log, and any resulting
-PDF. Compilation failure remains incomplete. If the compiler is unavailable,
-the LaTeX document can still be delivered with that limitation stated explicitly.
-LaTeX-only polishing uses the same preservation and final checks.
+The editor makes one LLM call with the editing prompt and accepted solution,
+or the supplied `.tex` contents in standalone mode. It returns a JSON object
+whose `latex` field contains the complete document, which becomes the final
+output. Compilability is a prompt requirement; the workflow does not run a
+compiler or an additional final verifier.
 
 ## Project structure
 

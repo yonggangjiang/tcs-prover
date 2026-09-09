@@ -112,16 +112,18 @@ class OperationalContinuationTests(unittest.TestCase):
         launched.assert_called_once()
 
 
-    def test_final_resume_preserves_saved_verifier_model_settings(self):
+    def test_final_resume_preserves_editor_model_settings_and_single_stage(self):
         app = server.App(runs=self.runs)
         with mock.patch.object(app, "_launch_saved_final_locked", return_value=(object(), object())):
             app.start_final_resume(
                 self.statement, "Reviewed proof.", continuation_source=self.source,
-                critic_model="gpt-5.6-sol", critic_effort="high",
+                writer_model="gpt-5.6-sol", writer_effort="high",
             )
         options = app._final_options()
-        self.assertEqual(options[options.index("--critic-model") + 1], "gpt-5.6-sol")
-        self.assertEqual(options[options.index("--critic-effort") + 1], "high")
+        self.assertEqual(options[options.index("--writer-model") + 1], "gpt-5.6-sol")
+        self.assertEqual(options[options.index("--writer-effort") + 1], "high")
+        self.assertEqual(set(app.state["workflow"]["nodes"]), {"latex_editor"})
+        self.assertEqual(app.state["workflow"]["edges"], [])
 
 
     def test_critic_accepts_explicit_external_run_directory(self):
@@ -250,21 +252,24 @@ class OperationalContinuationTests(unittest.TestCase):
         self.assertIn("Workflow incomplete", app.state["error"])
 
 
-    def test_final_verifier_context_survives_node_less_requests(self):
+    def test_single_editor_result_completes_without_another_stage(self):
         app = server.App(runs=self.runs)
         app._new_run(self.statement)
         process, token = mock.Mock(), object()
         records = [
-            {"kind": "status", "stage": "final", "node": "final_verifier"},
-            {"kind": "request", "stage": "final", "text": "Check the formatted proof"},
-            {"kind": "failure_result", "stage": "final", "summary": "A missing argument"},
+            {"kind": "status", "stage": "final", "node": "latex_editor"},
+            {"kind": "request", "stage": "final", "text": "Polish the supplied writing"},
+            {"kind": "final_result", "stage": "final", "output": "Full LaTeX output."},
         ]
         process.stdout = iter(json.dumps(record) + "\n" for record in records)
-        process.wait.return_value = 1
+        process.wait.return_value = 0
         app.process, app.active_token = process, token
         app.state.update(phase="running", stage="final", activeNode="latex_editor")
         app._read_output(process, token)
-        self.assertEqual(app.state["activeNode"], "final_verifier")
+        self.assertEqual(app.state["activeNode"], "latex_editor")
+        self.assertEqual(app.state["phase"], "done")
+        self.assertEqual(app.state["error"], "")
+        self.assertEqual((app.run_dir / "final.tex").read_text(), "Full LaTeX output.")
         self.assertEqual(server.event_node({"stage": "final"}), "latex_editor")
 
 
