@@ -221,7 +221,7 @@ def direct_cli_options(
 
 
 def research_resume_cli_settings(args, argv):
-    """Override saved research settings only for options explicitly supplied."""
+    """Override saved author settings only for options explicitly supplied."""
 
     supplied = {argument.split("=", 1)[0] for argument in argv if argument.startswith("-")}
     fields = {
@@ -422,9 +422,9 @@ def main():
         ),
     )
     parser.add_argument(
-        "--resume-research", "--resume-author", dest="resume_research", metavar="RUN",
+        "--resume-author", "--resume-research", dest="resume_research", metavar="RUN",
         help=(
-            "continue RUN's saved author session and notebooks with a new time "
+            "continue RUN's saved author session in its original workspace with a new time "
             "budget; saved settings are kept unless explicitly overridden"
         ),
     )
@@ -496,7 +496,7 @@ def main():
     args = parser.parse_args()
     resume_source = None
     if sum(bool(value) for value in (args.input_path, args.resume_critic, args.resume_research)) > 1:
-        parser.error("Choose only one of input_path, --resume-critic, or --resume-research.")
+        parser.error("Choose only one of input_path, --resume-critic, or --resume-author.")
     if args.resume_critic or args.resume_research:
         try:
             resume_source = (

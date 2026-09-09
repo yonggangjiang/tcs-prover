@@ -17,7 +17,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import workflow_runner as runtime
-from research_journal import DATABASE_FILENAME as RESEARCH_DATABASE_FILENAME, copy_research_archive
 from .review import REVIEW_PROMPT
 
 
@@ -51,31 +50,6 @@ MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
-LEGACY_RESEARCH_FILES = (
-    "STATEMENT.md", "REGISTRY.md", "FAILED.md", "PROVED.md", "LESSONS.md",
-    runtime.AUTHOR_MEMORY_FILENAME,
-)
-CONTINUATION_HISTORY_FILES = (
-    *LEGACY_RESEARCH_FILES, runtime.AUTHOR_ANCHOR_FILENAME,
-    runtime.SAVED_CANDIDATE_FILENAME, "SOLUTION.md", "FAILURE.md",
-    "source.json",
-)
-
-
-def author_memory_files():
-    """Read the author notebook names from the built-in YAML goal node."""
-
-    files = runtime.builtin_workflow("author_critic")["nodes"]["author"].get("files")
-    names = tuple(files) if isinstance(files, dict) else (
-        "INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md",
-    )
-    for name in names:
-        path = Path(name)
-        if path.is_absolute() or ".." in path.parts or not name:
-            raise ValueError("Author memory files must stay inside the run directory.")
-    return names
-
-
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
 
@@ -251,12 +225,12 @@ PUBLIC_GRAPH = {
         "author": {
             "label": "Proof author", "short_label": "Author", "stage": "solve",
             "stages": ["solve", "repair"],
-            "description": "Keeps one LLM session exploring, recording approaches and checked results in three notebooks.",
+            "description": "The LLM explores in one session and maintains its notebooks following the YAML prompts.",
         },
         "failure_summary": {
             "label": "Saved progress", "short_label": "Saved",
             "stage": "failure",
-            "description": "Preserves the author's notebooks and completed verification work when a job stops.",
+            "description": "The author's workspace and completed verification work remain available when a job stops.",
         },
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
@@ -286,7 +260,7 @@ PUBLIC_GRAPH = {
         {
             "from": "author", "to": "failure_summary",
             "label": "Preserve author work", "when": "the author is interrupted or its time budget expires",
-            "prompt_change": "Keep the three notebooks and saved session for continuation.",
+            "prompt_change": "Resume the same author workspace and saved session.",
         },
         {
             "from": "critic", "to": "critic",
@@ -394,13 +368,6 @@ def validated_continuation_source(path, runs):
     candidate = Path(path)
     if not direct_run_directory(candidate, runs):
         raise ValueError("The stopped source job is outside the runs directory.")
-    try:
-        if any(item.is_symlink() for item in candidate.rglob("*")):
-            raise ValueError(
-                "The stopped source job contains a symbolic-link artifact."
-            )
-    except OSError as exc:
-        raise ValueError("The stopped source job cannot be inspected safely.") from exc
     return candidate.resolve()
 
 
@@ -421,6 +388,8 @@ def empty_state(trace=None, trace_version=0):
         "problemDescription": "",
         "goal": "",
         "goalThreadId": "",
+        "goalWorkspace": "",
+        "goalResume": False,
         "latexInput": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
@@ -535,7 +504,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly",
-            "goalThreadId",
+            "goalThreadId", "goalWorkspace", "goalResume",
         )
         self._save(
             JOB_SETTINGS_FILENAME,
@@ -548,12 +517,7 @@ class App:
     def _prepare_continuation(
         self, source_run="", stopped_stage="", allow_external_source=False,
     ):
-        """Restore the durable archive before any resumed stage can launch.
-
-        Legacy notebooks are kept verbatim for ingestion, together with readable
-        source copies. No prompt-fingerprint or size filter discards old lessons.
-        A failed copy aborts launch instead of starting without research history.
-        """
+        """Record a continuation source without inspecting LLM-managed files."""
 
         if not source_run:
             return
@@ -564,58 +528,13 @@ class App:
         )
         if source == self.run_dir.resolve():
             raise ValueError("A continuation must use a new run directory.")
-        copied = []
-        try:
-            if copy_research_archive(source, self.run_dir):
-                copied.append("research.sqlite3")
-        except Exception as exc:
-            raise ValueError(f"Cannot restore the research archive: {exc}") from exc
-
-        def copy_file(path, relative):
-            destination = self.run_dir / relative
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            shutil.copyfile(path, destination)
-            destination.chmod(0o600)
-            copied.append(str(relative))
-
-        # Carry older source copies through a chain of continuations. Only known
-        # research records are copied, never arbitrary workspaces or transcripts.
-        author_files = author_memory_files()
-        current_notebooks = all((source / name).is_file() for name in author_files)
-        history = source / "continuation-memory"
-        if history.is_dir():
-            for path in sorted(history.rglob("*")):
-                if path.is_file() and path.name in CONTINUATION_HISTORY_FILES:
-                    if current_notebooks and path.name in author_files:
-                        continue
-                    copy_file(path, path.relative_to(source))
-
-        source_history = Path("continuation-memory") / source.name
-        for name in dict.fromkeys((*CONTINUATION_HISTORY_FILES, *author_files)):
-            path = source / name
-            if name != "source.json" and path.is_file():
-                if current_notebooks and name in author_files:
-                    copy_file(path, Path(name))
-                    continue
-                copy_file(path, source_history / name)
-                if name in LEGACY_RESEARCH_FILES or name in author_files:
-                    copy_file(path, Path(name))
-        provenance = {
-            "sourceRun": str(source),
-            "sourceTranscript": str(source / "transcript.jsonl"),
-            "stoppedStage": str(stopped_stage),
-            "continuedAt": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save(
-            source_history / "source.json",
-            json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True)
-            + "\n",
-        )
         self._save(
             CONTINUATION_SOURCE_FILENAME,
             json.dumps({
-                **provenance,
-                "copiedArtifacts": copied,
+                "sourceRun": str(source),
+                "sourceTranscript": str(source / "transcript.jsonl"),
+                "stoppedStage": str(stopped_stage),
+                "continuedAt": datetime.now(timezone.utc).isoformat(),
             }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
 
@@ -1273,12 +1192,10 @@ class App:
             ])
         if self.state.get("goalThreadId"):
             options.extend(["--set", "goal_thread_id=" + json.dumps(self.state["goalThreadId"])])
-        author_node = runtime.builtin_workflow("author_critic")["nodes"]["author"]
-        prompt_file = author_node.get("prompt_file")
-        if prompt_file and prompt_file in author_memory_files():
-            original_prompt = self.run_dir / prompt_file
-            if original_prompt.is_file():
-                options.extend(["--set", "author_input_file=" + json.dumps(str(original_prompt))])
+        if self.state.get("goalWorkspace"):
+            options.extend(["--set", "goal_cwd=" + json.dumps(self.state["goalWorkspace"])])
+        if self.state.get("goalResume"):
+            options.extend(["--set", "goal_resume=true"])
         return options
 
     def _launch_solver_locked(self, statement):
@@ -1393,7 +1310,7 @@ class App:
                 allow_external_source=allow_external_source,
             )
             if continuation_source:
-                options["goalThreadId"] = saved_goal_thread_id(continuation_source)
+                options.update(saved_goal_options(continuation_source))
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
@@ -1599,6 +1516,8 @@ class App:
             self._prepare_continuation(
                 source_run, "critic", allow_external_source=True,
             )
+            if source_run:
+                options.update(saved_goal_options(source_run))
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
@@ -1690,6 +1609,8 @@ class App:
                 if goal_thread:
                     with self.lock:
                         self.state["goalThreadId"] = goal_thread
+                        if not self.state.get("goalWorkspace"):
+                            self.state["goalWorkspace"] = str(self.run_dir.resolve())
                         self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "diagnostic"
@@ -2078,6 +1999,22 @@ def saved_goal_thread_id(run_dir):
     return identity
 
 
+def saved_goal_options(run_dir):
+    """Recover generic session/workspace settings without reading author files."""
+
+    run_dir = Path(run_dir).resolve()
+    try:
+        settings = json.loads((run_dir / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        settings = {}
+    workspace = settings.get("goalWorkspace") if isinstance(settings, dict) else None
+    workspace = Path(workspace).expanduser().resolve() if isinstance(workspace, str) and workspace else run_dir
+    if not workspace.is_dir():
+        raise ValueError(f"The saved author workspace no longer exists: {workspace}")
+    return {"goalWorkspace": str(workspace), "goalResume": True,
+            "goalThreadId": saved_goal_thread_id(run_dir)}
+
+
 def saved_manual_stop(run_dir, records=None):
     """Return one durable manual-stop marker, including legacy transcripts."""
 
@@ -2156,7 +2093,7 @@ def checkpoint_artifact_signature(run_dir, include_transcript=True):
     run_dir = Path(run_dir)
     signature = []
     names = [
-        "checked-statement.md", runtime.AUTHOR_ANCHOR_FILENAME,
+        "checked-statement.md",
         "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME,
         runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
     ]
@@ -2244,7 +2181,6 @@ def saved_run_checkpoints(run_dir):
     run_dir = Path(run_dir)
     statement_ready = bool(
         (run_dir / "checked-statement.md").is_file()
-        or (run_dir / runtime.AUTHOR_ANCHOR_FILENAME).is_file()
     )
     candidate_path = next(
         (
@@ -2396,7 +2332,7 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly",
-                "goalThreadId",
+                "goalThreadId", "goalWorkspace", "goalResume",
             ):
                 if key in settings:
                     if key in {
@@ -2687,15 +2623,6 @@ def saved_statement(path):
     if not run_dir.is_dir():
         raise ValueError(f"The saved run does not exist: {run_dir}")
     statement = ""
-    anchor_path = run_dir / runtime.AUTHOR_ANCHOR_FILENAME
-    if anchor_path.exists():
-        try:
-            anchor = read_utf8(anchor_path, "saved author anchor")
-            marker = "## Exact statement (verbatim)"
-            if marker in anchor:
-                statement = anchor.split(marker, 1)[1].strip()
-        except ValueError:
-            pass
     checked_path = run_dir / "checked-statement.md"
     if not statement and checked_path.exists():
         checked = read_utf8(checked_path, "saved checked statement")
@@ -2715,13 +2642,7 @@ def saved_statement(path):
                 f"Cannot locate the checked statement in {checked_path}."
             )
     elif not statement:
-        anchor = read_utf8(anchor_path, "saved author anchor")
-        marker = "## Exact statement (verbatim)"
-        if marker not in anchor:
-            raise ValueError(
-                f"Cannot locate the exact statement in {anchor_path}."
-            )
-        statement = anchor.split(marker, 1)[1].strip()
+        raise ValueError(f"No saved checked statement exists in {run_dir}.")
     if not statement:
         raise ValueError("The saved checked statement is empty.")
     return statement
@@ -2818,11 +2739,6 @@ def saved_research_source(path):
     requested = Path(path).expanduser().absolute()
     source = requested if requested.is_dir() else requested.parent
     source = validated_continuation_source(source, source.parent)
-    if not (source / RESEARCH_DATABASE_FILENAME).is_file() and not any(
-        (source / name).is_file() for name in (*LEGACY_RESEARCH_FILES, *author_memory_files())
-        if name != "STATEMENT.md"
-    ):
-        raise ValueError("This run has no saved author notebooks or research history.")
     settings = {}
     settings_path = source / JOB_SETTINGS_FILENAME
     if settings_path.exists():
@@ -3006,6 +2922,8 @@ class Server(ThreadingHTTPServer):
 
         settings = dict(settings or {})
         source = saved_critic_source(source_run)
+        with self.jobs_lock:
+            self._check_author_workspace_idle(source["run_dir"])
         app = App(runs=self.runs)
         app.start_critic_resume(
             statement=source["statement"],
@@ -3052,12 +2970,7 @@ class Server(ThreadingHTTPServer):
 
         source = saved_research_source(source_run)
         with self.jobs_lock:
-            for previous in self.jobs.values():
-                if previous.run_dir and previous.run_dir.resolve() == source["run_dir"]:
-                    if previous.has_active_worker() or previous.state["phase"] in {
-                        "reviewing", "running", "stopping",
-                    }:
-                        raise ValueError("Stop the source job before resuming its research.")
+            self._check_author_workspace_idle(source["run_dir"])
         options = {**source["settings"], **(settings or {})}
         app = App(runs=self.runs)
         app.start_direct_statement(
@@ -3076,7 +2989,7 @@ class Server(ThreadingHTTPServer):
             final_prompt=options.get("finalPrompt"),
             speed_mode=options.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
-            continuation_source=source["run_dir"], stopped_stage="research",
+            continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
@@ -3084,6 +2997,20 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         self.app = app
         return app
+
+    def _check_author_workspace_idle(self, source_run):
+        """Keep two author processes from updating one shared workspace."""
+
+        workspace = saved_goal_options(source_run)["goalWorkspace"]
+        for previous in self.jobs.values():
+            if not previous.run_dir or not (
+                previous.has_active_worker()
+                or previous.state["phase"] in {"reviewing", "running", "stopping"}
+            ):
+                continue
+            previous_workspace = previous.state.get("goalWorkspace") or str(previous.run_dir.resolve())
+            if str(Path(previous_workspace).resolve()) == workspace:
+                raise ValueError("Stop the source workspace's active job before continuing its author.")
 
     def resume_critic_job(self, run_id, include_audit_checkpoint=True):
         """Resume an idle job from its saved proof using its role settings."""
@@ -3142,10 +3069,7 @@ class Server(ThreadingHTTPServer):
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
             and not (source_app.run_dir / "final.tex").is_file()
-            and (
-                all((source_app.run_dir / name).is_file() for name in author_memory_files())
-                or state.get("goalThreadId")
-            )
+            and state.get("problemMode") != "critic-resume"
         ):
             try:
                 saved_statement(source_app.run_dir)
@@ -3156,40 +3080,26 @@ class Server(ThreadingHTTPServer):
                     "action": "author",
                     "label": "Continue proof author",
                     "description": (
-                        "Preserves the three author notebooks and resumes the saved "
+                        "Reopens the same author workspace and resumes the saved "
                         "LLM session when available. Otherwise the author continues "
-                        "in a new session from those notebooks. The new run renews "
+                        "in a new session using the YAML recovery prompt. The new run renews "
                         "the saved time budget."
                     ),
                 }
         if (
-            source_app.run_dir
-            and (source_app.run_dir / RESEARCH_DATABASE_FILENAME).is_file()
-            and not (source_app.run_dir / "final.tex").is_file()
+            stage in {"solve", "repair", "failure"}
+            and state.get("problemMode") == "critic-resume"
         ):
-            if state.get("problemMode") == "latex" and (source_app.run_dir / "latex-input.md").is_file():
-                return {
-                    "action": "final",
-                    "label": "Resume formatting checkpoint",
-                    "description": (
-                        "Restores the saved LaTeX input and research journal, "
-                        "including unfinished formatting verification."
-                    ),
-                }
-            try:
-                saved_statement(source_app.run_dir)
-            except ValueError:
-                pass
-            else:
-                return {
-                    "action": "research",
-                    "label": "Resume research checkpoint",
-                    "description": (
-                        "Restores the permanent research journal and resumes its "
-                        "next recorded step, including unfinished verification. "
-                        "The new run renews the saved time budget."
-                    ),
-                }
+            if not state.get("checkpoints"):
+                return None
+            return {
+                "action": "critic",
+                "label": "Continue from critic",
+                "description": (
+                    "Restores the saved critic checkpoint so any required "
+                    "author repair receives its exact recovery assignment."
+                ),
+            }
         if not state.get("manuallyStopped"):
             return None
         if stage == "review" and state.get("reviewStatement", "").strip():
@@ -3204,20 +3114,6 @@ class Server(ThreadingHTTPServer):
                 "description": (
                     "Starts a new statement-review request with the saved draft, "
                     "role settings, and prompt." + legacy_input_warning
-                ),
-            }
-        if (
-            stage in {"solve", "repair", "failure"}
-            and state.get("problemMode") == "critic-resume"
-        ):
-            if not state.get("checkpoints"):
-                return None
-            return {
-                "action": "critic",
-                "label": "Continue from critic",
-                "description": (
-                    "Restores the saved critic checkpoint so any required "
-                    "author repair receives its exact recovery assignment."
                 ),
             }
         if stage in {"solve", "repair", "failure"}:
@@ -3240,8 +3136,8 @@ class Server(ThreadingHTTPServer):
                     "action": "author",
                     "label": "Continue proof author",
                     "description": (
-                        "Continues the author from the exact statement and saved "
-                        "notebooks, resuming the saved LLM session when available. "
+                        "Continues the author in the same workspace, resuming the "
+                        "saved LLM session when available. "
                         "A new run renews the configured time budget. "
                         "Previously sent live instructions are queued again."
                     ),
@@ -3251,7 +3147,7 @@ class Server(ThreadingHTTPServer):
                 "action": "critic",
                 "label": "Continue critic",
                 "description": (
-                    "Restores the research archive, saved proof, and compatible "
+                    "Restores the saved proof and compatible "
                     "independent audits in a new run with a renewed time budget."
                 ),
             }
@@ -3266,7 +3162,7 @@ class Server(ThreadingHTTPServer):
                     "label": "Retry LaTeX editor",
                     "description": (
                         "Starts only a new LaTeX-editor request from the exact "
-                        "saved final input and preserves the research archive."
+                        "saved final input."
                     ),
                 }
             if state.get("checkpoints"):
@@ -3303,25 +3199,23 @@ class Server(ThreadingHTTPServer):
         })
 
     def continue_stopped_job(self, run_id):
-        """Continue a saved checkpoint in a new job with an immutable source."""
+        """Continue a saved stage with new logs and the existing author workspace."""
 
-        # Match delete_job's jobs -> app lock order. Keeping both locks through
-        # registration also prevents the immutable source from being moved or
-        # repurposed while its artifacts are copied.
+        # Match delete_job's jobs -> app lock order while registering the new job.
         with self.jobs_lock:
             source_app = self.get_job(run_id)
             with source_app.lock:
                 return self._continue_stopped_job_locked(source_app)
 
     def _continue_stopped_job_locked(self, source_app):
-        """Create a continuation while holding the immutable source lock."""
+        """Create a continuation while holding the source job lock."""
 
         validated_continuation_source(source_app.run_dir, self.runs)
         source_state = source_app.snapshot()
         plan = self._stopped_continuation_plan(source_app, source_state)
         if plan is None:
             raise ValueError(
-                "This job has no safe stopped stage or research checkpoint to continue."
+                "This job has no saved stage available to continue."
             )
         if plan["action"] == "critic":
             continued = self.resume_critic_job(
@@ -3361,7 +3255,8 @@ class Server(ThreadingHTTPServer):
                 review_only=source_state["statementReviewOnly"],
                 **common,
             )
-        elif plan["action"] in {"author", "research"}:
+        elif plan["action"] == "author":
+            self._check_author_workspace_idle(source_run)
             author_options = {
                 "critic_rounds": source_state["criticRounds"],
                 "thinking_hours": source_state["thinkingHours"],
@@ -3450,10 +3345,7 @@ class Server(ThreadingHTTPServer):
                     (run_dir / "SOLUTION.md").is_file()
                     or (run_dir / runtime.SAVED_CANDIDATE_FILENAME).is_file()
                 )
-                and (
-                    (run_dir / "checked-statement.md").is_file()
-                    or (run_dir / runtime.AUTHOR_ANCHOR_FILENAME).is_file()
-                )
+                and (run_dir / "checked-statement.md").is_file()
             )
             continuation = self._stopped_continuation_plan(app, state)
             job["canContinueStopped"] = continuation is not None
@@ -3482,6 +3374,14 @@ class Server(ThreadingHTTPServer):
                 folder = app.run_dir
                 if not folder or folder.resolve().parent != self.runs.resolve():
                     raise ValueError("The job folder is outside the runs directory.")
+                for other in self.jobs.values():
+                    if other is app or not (other.has_active_worker() or other.state["phase"] in {
+                        "reviewing", "running", "stopping",
+                    }):
+                        continue
+                    workspace = other.state.get("goalWorkspace")
+                    if workspace and Path(workspace).resolve() == folder.resolve():
+                        raise ValueError("Stop the continuation using this author workspace before deleting it.")
                 trash = self.runs / ".trash"
                 trash.mkdir(parents=True, exist_ok=True, mode=0o700)
                 trash.chmod(0o700)

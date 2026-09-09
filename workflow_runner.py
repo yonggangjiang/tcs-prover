@@ -11,7 +11,6 @@ import os
 import operator
 import re
 import shutil
-import sqlite3
 import string
 import subprocess
 import sys
@@ -903,7 +902,7 @@ def structured(
     prompt, schema_value, stage, model=MODEL, effort=EFFORT,
     speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
     timeout=None, attempts=STRUCTURED_MAX_ATTEMPTS,
-    request_label=None, activity_label=None, features=(), journal=None, cache_key=None,
+    request_label=None, activity_label=None, features=(),
 ):
     """Run one read-only structured Codex call and relay its visible events."""
 
@@ -921,23 +920,12 @@ def structured(
         raise Error("Structured attempts must be a positive integer.") from exc
     if attempts < 1:
         raise Error("Structured attempts must be a positive integer.")
-    if journal is not None and cache_key:
-        saved_raw = journal.get_state("raw:" + cache_key)
-        if saved_raw is not None:
-            try:
-                return validate_json_schema(decoded_json_object(saved_raw), schema_value), saved_raw
-            except Error:
-                pass
     raw, attempt_effort = "", effort
     for attempt in range(attempts):
         attempt_prompt = (
             prompt if attempt == 0
             else structured_retry_prompt(prompt, raw, schema_value)
         )
-        request_id = journal.commit("model_request", {
-            "stage": stage, "prompt": attempt_prompt, "schema": schema_value,
-            "model": model, "effort": attempt_effort, "attempt": attempt + 1,
-        }) if journal is not None else None
         emit(
             "request", stage,
             label=(
@@ -955,12 +943,7 @@ def structured(
                 speed, summary, timeout=timeout,
                 activity_label=activity_label or request_label, features=features,
             )
-            if journal is not None:
-                journal.commit("model_response", {"request_id": request_id, "raw": raw},
-                               {"raw:" + cache_key: raw} if cache_key else None)
         except StructuredAttemptTimeout as exc:
-            if journal is not None:
-                journal.commit("model_error", {"request_id": request_id, "error": str(exc)})
             emit(
                 "diagnostic", stage,
                 text=f"Structured output attempt {attempt + 1} timed out: {exc}",
@@ -1081,18 +1064,245 @@ class RPC:
         stop_process(self.process)
 
 
-AUTHOR_ANCHOR_FILENAME = "author-anchor.md"
+def goal_session(runtime, prompt, *, prompts, settings, options,
+                 node_name="author", stages=None, initial_instruction=""):
+    """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
+    Yield its final answer only after goal completion; accept follow-up feedback
+    through ``send``. The model manages its own work in the supplied workspace.
+    """
+    directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
+    stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
+    stage = stages["initial"]
+    values = dict(original_prompt=prompt, directory=directory,
+                  solution="", bugs="", round=0, revision_number=0, instruction=initial_instruction)
 
-AUTHOR_MEMORY_FILENAME = "author-memory.json"
+    def render(name):
+        return runtime.render_template(prompts[name], values)
+
+    def emit(kind, **fields):
+        runtime.emit(kind, stage, node=node_name, **fields)
+
+    settings = dict(settings)
+    model = settings["model"]
+    settings["effort"] = runtime.effective_effort(model, settings["effort"])
+    settings["speed"] = runtime.effective_speed(model, settings["speed"])
+    summary = settings["summary"] = runtime.reasoning_summary(model, settings["summary"])
+    thread = None
+    rpc = process = None
+    stop = threading.Event()
+    expired = threading.Event()
+    state = {"turn": None, "active": True, "steer": None}
+    pending_steers = {}
+    pending_compaction = None
+    seen_compactions = set()
+    goal = {}
+    failure = None
+    last_usage = {}
+
+    def record(message):
+        event = runtime.public_event(message)
+        if event is not None:
+            emit("codex_event", event=event,
+                 root=event.get("params", {}).get("threadId") in {None, thread})
+
+    def steer(instruction, identity, compaction=False):
+        request = rpc.request("turn/steer", {
+            "threadId": thread, "expectedTurnId": state["turn"],
+            "input": [{"type": "text", "text": instruction}],
+        })
+        pending_steers[request] = (identity, instruction, compaction)
+        emit("request", label="Author context re-anchor after compaction" if compaction
+             else "Live author instruction sent", text=instruction, threadId=thread)
+
+    def watch():
+        while not stop.wait(0.1):
+            if runtime.workflow_remaining(options) <= 0:
+                expired.set()
+                if not state["active"]:
+                    return
+                try:
+                    if thread:
+                        rpc.request("thread/goal/set", {**goal, "status": "paused"})
+                        if state["turn"]:
+                            rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
+                except (runtime.Error, OSError):
+                    pass
+                if not stop.wait(getattr(runtime, "INTERRUPT_GRACE_SECONDS", 5)):
+                    runtime.stop_process(process)
+                return
+            if state["active"] and state["turn"]:
+                command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
+                if command and not any(item[0] == command[0] for item in list(pending_steers.values())):
+                    try:
+                        steer(command[1], command[0])
+                    except (runtime.Error, OSError) as exc:
+                        emit("diagnostic", text=f"Could not send live instruction: {exc}")
+
+    def start_turn(instruction):
+        if expired.is_set() or runtime.workflow_remaining(options) <= 0:
+            raise runtime.Error("Workflow time limit reached.")
+        rpc.call("thread/goal/set", {**goal, "status": "paused"})
+        emit("request", label="Exact solve input", text=instruction, threadId=thread,
+             model=model, reasoningEffort=settings["effort"], reasoningSummary=summary)
+        state["active"] = True
+        result = rpc.call("turn/start", {"threadId": thread, "cwd": str(directory),
+            "input": [{"type": "text", "text": instruction}], "summary": summary})
+        state["turn"] = (result.get("turn") or {}).get("id")
+        if expired.is_set() or runtime.workflow_remaining(options) <= 0:
+            raise runtime.Error("Workflow time limit reached.")
+        rpc.call("thread/goal/set", {**goal, "status": "active"})
+
+    def collect(item, answers):
+        if (item.get("type") in {"agentMessage", "agent_message"}
+                and item.get("phase") in {None, "final_answer"}
+                and isinstance(item.get("text"), str) and item["text"].strip()):
+            answers.append(item["text"])
+
+    try:
+        if runtime.workflow_remaining(options) <= 0:
+            raise runtime.Error("Workflow time limit reached.")
+        process = subprocess.Popen([
+            runtime.codex(), "app-server", "--enable", "goals", "--disable", "multi_agent",
+            *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
+            *runtime.context_cache_arguments(),
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
+            env=runtime.environment(model))
+        rpc = runtime.RPC(process, record)
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        rpc.call("initialize", {"clientInfo": {"name": "tcs_prover", "title": "TCS Prover", "version": "1"}})
+        rpc.send({"method": "initialized", "params": {}})
+        thread_options = {
+            "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
+            "sandbox": "workspace-write", "approvalPolicy": "never",
+            "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
+                "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast"}},
+        }
+        if hasattr(runtime, "model_provider"):
+            thread_options["modelProvider"] = runtime.model_provider(model)
+        resumed = False
+        if options.get("goal_thread_id"):
+            try:
+                result = rpc.call("thread/resume", {**thread_options, "threadId": options["goal_thread_id"],
+                                                    "excludeTurns": True})
+                resumed = True
+            except runtime.Error as exc:
+                missing = ("not found", "not_found", "notfound", "unknown thread", "does not exist",
+                           "no rollout", "failed to load thread", "failed to load rollout",
+                           "could not find thread", "thread unavailable", "thread is unavailable")
+                if not any(word in str(exc).lower() for word in missing):
+                    raise
+                emit("diagnostic", text=f"Saved thread unavailable; starting a new session with the supplied resume instructions: {exc}")
+        if not resumed:
+            result = rpc.call("thread/start", {**thread_options, "ephemeral": False})
+        thread = result["thread"]["id"]
+        goal = {"threadId": thread, "objective": render("goal")}
+        emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
+             text=f"Thread {thread}")
+        instruction = render("resume") if options.get("goal_resume") or options.get("goal_thread_id") else prompt
+        if initial_instruction:
+            instruction += "\n\n" + initial_instruction
+        start_turn(instruction)
+        status, running, answers = None, True, []
+        while True:
+            if expired.is_set() or runtime.workflow_remaining(options) <= 0:
+                raise runtime.Error("Workflow time limit reached.")
+            message = rpc.read()
+            params = message.get("params", {})
+            if params.get("threadId") not in {None, thread}:
+                continue
+            request = message.get("id")
+            if request in pending_steers and "method" not in message:
+                identity, instruction, compaction = pending_steers.pop(request)
+                if "error" in message:
+                    if compaction:
+                        pending_compaction = instruction
+                    emit("diagnostic", text=f"Instruction raced with turn completion: {message['error']}")
+                elif not compaction:
+                    state["steer"] = identity
+            method, turn = message.get("method"), params.get("turn") or {}
+            if method == "turn/started":
+                running, answers = True, []
+                state["turn"] = turn.get("id")
+                if pending_compaction and state["turn"]:
+                    steer(pending_compaction, "retry", True)
+                    pending_compaction = None
+            elif method == "item/completed":
+                item = params.get("item") or {}
+                collect(item, answers)
+                if item.get("type") == "contextCompaction":
+                    key = (params.get("turnId"), item.get("id"))
+                    if key not in seen_compactions:
+                        seen_compactions.add(key)
+                        state["turn"] = params.get("turnId") or state["turn"]
+                        pending_compaction = render("compaction")
+                        if state["turn"]:
+                            steer(pending_compaction, key, True)
+                            pending_compaction = None
+            elif method == "thread/goal/updated":
+                status = (params.get("goal") or {}).get("status")
+            elif method == "thread/tokenUsage/updated":
+                last_usage = (params.get("tokenUsage") or {}).get("last") or {}
+            elif method == "turn/completed":
+                running, state["turn"] = False, None
+                if last_usage and hasattr(runtime, "emit_cache_usage"):
+                    runtime.emit_cache_usage(stage, last_usage, label="Author cache usage")
+                    last_usage = {}
+                for item in turn.get("items", []):
+                    collect(item, answers)
+                if turn.get("status") in {"failed", "interrupted"}:
+                    raise runtime.Error(f"Author turn {turn['status']}: {turn.get('error') or 'no complete result'}")
+            elif method == "error" and not params.get("willRetry", False):
+                raise runtime.Error(str(params.get("error") or params))
+            if status in {"usageLimited", "budgetLimited"}:
+                raise runtime.Error(f"Author stopped: {status}.")
+            if not running and status == "complete" and answers:
+                state["active"] = False
+                solution = answers[-1]
+                emit("status", label="Goal complete", threadId=thread, text=f"Thread {thread}")
+                emit("author_result", label="Author solution", text=solution, threadId=thread)
+                rejection = yield {"outcome": "done", "output": solution}
+                if rejection is None:
+                    return
+                values.update(rejection)
+                values["revision_number"] += 1
+                stage = stages["resume"]
+                start_turn(render("repair"))
+                status, running, answers = None, True, []
+            elif not running and status in {"blocked", "complete"}:
+                start_turn(render("continuation"))
+                status, running, answers = None, True, []
+    except (runtime.Error, OSError, ValueError) as exc:
+        stage = stages["failure"]
+        diagnostic = "Workflow time limit reached." if expired.is_set() else str(exc)
+        emit("diagnostic", text=diagnostic, threadId=thread)
+        emit("failure_result", label="Author stopped", text=diagnostic, output=diagnostic, threadId=thread)
+        failure = {"outcome": "failure", "output": diagnostic}
+    finally:
+        stop.set()
+        if rpc and thread and state["active"]:
+            def pause():
+                try:
+                    rpc.call("thread/goal/set", {**goal, "status": "paused"})
+                except (runtime.Error, OSError, ValueError):
+                    pass
+            cleanup = threading.Thread(target=pause, daemon=True)
+            cleanup.start()
+            cleanup.join(timeout=1)
+        if process:
+            runtime.stop_process(process)
+    if failure:
+        yield failure
 
 
 def _sha256(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
-def normalized_candidate(value):
-    """Normalize only presentation-level whitespace for duplicate fingerprints."""
+def normalized_text(value):
+    """Normalize line endings and trailing/outer blank space for text comparison."""
 
     lines = str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines = [line.rstrip() for line in lines]
@@ -1104,7 +1314,7 @@ def normalized_candidate(value):
 
 
 def _clipped(value, limit=1600):
-    """Keep ledger text bounded while retaining a fingerprint of omitted text."""
+    """Shorten diagnostic text while retaining a fingerprint of omitted text."""
 
     value = str(value or "").strip()
     if len(value) <= limit:
@@ -1162,7 +1372,7 @@ _EXPRESSION_FUNCTIONS = {
     "is_bool": lambda value: isinstance(value, bool),
     "is_list": lambda value: isinstance(value, list),
     "is_dict": lambda value: isinstance(value, dict),
-    "get": _get, "json": lambda value: json.dumps(value, ensure_ascii=False, indent=2),
+    "get": _get, "normalized_text": normalized_text, "json": lambda value: json.dumps(value, ensure_ascii=False, indent=2),
 }
 _EXPRESSION_BINARY = {
     ast.Add: operator.add, ast.Sub: operator.sub,
@@ -1393,7 +1603,7 @@ def _check_actions(actions):
     if not isinstance(actions, list):
         raise ValueError("Node actions must be a list.")
     for action in actions:
-        if not isinstance(action, dict) or set(action) - {"when", "set", "merge", "emit", "memory", "write", "verify_latex"}:
+        if not isinstance(action, dict) or set(action) - {"when", "set", "merge", "emit", "write", "command"}:
             raise ValueError("Unknown workflow action.")
         if not (set(action) - {"when"}):
             raise ValueError("A guarded action needs an operation.")
@@ -1401,8 +1611,23 @@ def _check_actions(actions):
             check_expression(action["when"])
         if "merge" in action:
             check_expression(action["merge"])
-        if "verify_latex" in action:
-            check_expression(action["verify_latex"])
+        if "command" in action:
+            config = action["command"]
+            if not isinstance(config, dict) or not {"argv", "timeout", "result"} <= config.keys() or set(config) - {"argv", "cwd", "env", "timeout", "produces", "log", "result"}:
+                raise ValueError("A command needs argv, timeout, and a result state key.")
+            if not isinstance(config["argv"], list) or not config["argv"] or not all(isinstance(arg, str) and arg for arg in config["argv"]):
+                raise ValueError("Command argv must be a nonempty list of strings.")
+            if type(config["timeout"]) not in {int, float} or not math.isfinite(config["timeout"]) or config["timeout"] <= 0:
+                raise ValueError("Command timeout must be positive and finite.")
+            if not all(isinstance(config.get(key, "."), str) and config.get(key, ".") for key in ("cwd", "log", "result")):
+                raise ValueError("Command paths and result must be nonempty strings.")
+            if not isinstance(config.get("env", {}), dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in config.get("env", {}).items()):
+                raise ValueError("Command env must map strings to strings.")
+            outputs = config.get("produces", [])
+            if not isinstance(outputs, list) or not all(isinstance(path, str) and path and not Path(path).is_absolute() and ".." not in Path(path).parts for path in outputs):
+                raise ValueError("Command produces must name relative output files.")
+            for value in [*config["argv"], config.get("cwd", "."), *config.get("env", {}).values()]:
+                _template_parts(value, {"state", "result", "raw", "visit", "outcome", "limit"})
         if "set" in action:
             if not isinstance(action["set"], dict) or not all(isinstance(key, str) for key in action["set"]):
                 raise ValueError("State assignments must be a named mapping.")
@@ -1416,13 +1641,6 @@ def _check_actions(actions):
                     check_expression(value[1:])
                 elif isinstance(value, str):
                     _template_parts(value, {"state", "result", "raw", "visit", "outcome", "limit"})
-        if "memory" in action and not isinstance(action["memory"], str):
-            entry = action["memory"]
-            if not isinstance(entry, dict) or set(entry) != {"previous", "candidate", "feedback", "source", "status"}:
-                raise ValueError("A ledger entry needs previous, candidate, feedback, source, and status.")
-            for expression in entry.values():
-                check_expression(expression)
-
         if "write" in action:
             entry = action["write"]
             if not isinstance(entry, dict) or set(entry) != {"path", "text"} or not isinstance(entry["path"], str):
@@ -1573,8 +1791,8 @@ def load_workflow(path):
     targets = set(nodes) | {"end"}
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
     specific = {
-        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "files", "prompt_file"},
+        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery"},
     }
     for name, node in nodes.items():
         if not isinstance(node, dict) or not {"run", "prompt", "next"} <= node.keys():
@@ -1606,6 +1824,11 @@ def load_workflow(path):
         _check_actions(node.get("after", []))
         if kind == "structured":
             _check_request_options(node)
+            normalized = node.get("normalize", {})
+            if not isinstance(normalized, dict) or not all(isinstance(key, str) for key in normalized):
+                raise ValueError("Result normalization must map field names to expressions.")
+            for expression in normalized.values():
+                check_expression(expression)
             if "parallel" in node:
                 _check_parallel(node["parallel"], prompts)
             if not isinstance(node.get("schema"), dict):
@@ -1622,21 +1845,12 @@ def load_workflow(path):
                 check_expression(expression)
             bindings = node.get("inputs", {})
         else:
-            for required in ("task", "marker", "lifecycle", "resume", "files", "prompt_file"):
+            for required in ("task", "marker", "lifecycle", "resume"):
                 if required not in node:
                     raise ValueError(f"Goal node {name} needs {required}.")
             check_expression(node["task"])
             if not isinstance(node["marker"], str) or not node["marker"]:
                 raise ValueError(f"Goal node {name} needs a nonempty marker.")
-            files = node["files"]
-            if not isinstance(files, dict) or not files or not all(
-                isinstance(path, str) and path and Path(path).name == path
-                and path not in {".", ".."} and isinstance(content, str)
-                for path, content in files.items()
-            ):
-                raise ValueError(f"Goal node {name} files must map plain filenames to initial text.")
-            if not isinstance(node["prompt_file"], str) or node["prompt_file"] not in files:
-                raise ValueError(f"Goal node {name} prompt_file must name one of its files.")
             lifecycle = node["lifecycle"]
             if isinstance(lifecycle, list) and all(isinstance(key, str) for key in lifecycle):
                 lifecycle = {key: key for key in lifecycle}
@@ -1654,8 +1868,8 @@ def load_workflow(path):
                     raise ValueError("Goal recovery needs when and a named prompt.")
                 check_expression(recovery["when"])
             bindings = node["resume"]
-            if not isinstance(bindings, dict) or not {"solution", "bugs", "round"} <= bindings.keys():
-                raise ValueError(f"Goal node {name} must bind the candidate, feedback, and round for resumption.")
+            if not isinstance(bindings, dict):
+                raise ValueError(f"Goal node {name} resume must be a mapping of input names to expressions.")
         if not isinstance(bindings, dict) or not all(isinstance(key, str) for key in bindings):
             raise ValueError(f"Invalid input bindings in node {name}.")
         for expression in bindings.values():
@@ -1695,7 +1909,7 @@ def __getattr__(name):
     # These public defaults are used by the UI and existing Python callers.
     # The generic execution path never needs to open either bundled YAML file.
     prompt_names = {
-        "AUTHOR_PROMPT": "author", "CRITIC_MEMORY_PROMPT": "critic_memory",
+        "AUTHOR_PROMPT": "author",
         "CONTINUE_PROMPT": "continuation", "GOAL": "goal",
     }
     if name in prompt_names or name in {"AUTHOR_PROMPTS", "AUTHOR_WORKFLOW", "CRITIC_PROMPT", "CRITIC_SCHEMA", "DEFAULT_CRITIC_ROUNDS"}:
@@ -1705,7 +1919,7 @@ def __getattr__(name):
             return prompts[prompt_names[name]]
         return {
             "AUTHOR_PROMPTS": prompts, "AUTHOR_WORKFLOW": workflow,
-            "CRITIC_PROMPT": prompts["critic"] + "\n\n" + prompts["critic_memory"],
+            "CRITIC_PROMPT": prompts["critic"],
             "CRITIC_SCHEMA": workflow["nodes"]["critic"]["schema"],
             "DEFAULT_CRITIC_ROUNDS": workflow["nodes"]["critic"]["next"]["fixed"]["repeat"],
         }[name]
@@ -1752,9 +1966,9 @@ def prepare(workflow, options):
             for reference in references:
                 _template_parts(prompts[reference], set(node.get("inputs", {})) | {"instructions"})
         else:
-            if options.get("author_input") is None and options.get("author_input_file") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
+            if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
                 raise ValueError(f"Goal prompt must contain exactly one {node['marker']}.")
-            fields = {"original_prompt", "directory", "prompt_file", "solution", "bugs", "round", "revision_number", "instruction"}
+            fields = {"original_prompt", "directory", "solution", "bugs", "round", "revision_number", "instruction"} | set(node["resume"])
             if "recovery" in node:
                 _template_parts(prompts[node["recovery"]["prompt"]], fields)
             lifecycle = node["lifecycle"]
@@ -1762,8 +1976,6 @@ def prepare(workflow, options):
                 lifecycle = {key: key for key in lifecycle}
             for reference in lifecycle.values():
                 _template_parts(prompts[reference], fields)
-            for content in node["files"].values():
-                _template_parts(content, {"original_prompt", "statement"})
     return prompts
 
 
@@ -1813,7 +2025,7 @@ def _bounded_request_settings(settings, options):
     if remaining <= 0:
         raise Error("Workflow time limit reached; saved work remains resumable.")
     return {**settings, "timeout": min(settings.get("timeout") or 900, remaining),
-            "attempts": 1, "journal": options.get("_journal")}
+            "attempts": 1}
 
 
 def _parallel_requests(config, prompts, state, options, visit):
@@ -1883,42 +2095,53 @@ def _model_call(node, prompts, state, options, visit):
     prompt = _request_prompt(node, prompts, context)
     settings = _structured_options(node, options)
     settings.update({key: node[key] for key in ("request_label", "activity_label") if key in node})
-    cache_key = "structured:" + _sha256(json.dumps([prompt, node["schema"], settings], sort_keys=True))
-    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), cache_key=cache_key, **_bounded_request_settings(settings, options))
-    def invalid_result(message):
-        journal = options.get("_journal")
-        if journal is not None:
-            journal.commit("protocol_error", {"stage": node.get("stage"), "error": message, "raw": raw},
-                           {"raw:" + cache_key: None})
-        raise Error(message)
+    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), **_bounded_request_settings(settings, options))
     if parallel and parallel.get("output"):
         report[parallel["output"]] = context["parallel"]
-        validate_json_schema(report, node["schema"])
-    # A reviewer cannot bypass verification by claiming an edited proof is unchanged.
-    if "fixed" in report and "solution" in report and "solution" in state:
-        report["fixed"] = (report.get("verdict") != "reject" and
-            normalized_candidate(report["solution"]) != normalized_candidate(state["solution"]))
-        memory = state.get("memory")
-        journal = getattr(memory, "journal", None)
-        if journal is not None:
-            issues = journal.get_state("open_issues", [])
-            resolutions = report.get("resolved_obligations", [])
-            known = {item["id"] for item in issues}
-            if any(item["id"] not in known or not item["evidence"].strip() for item in resolutions):
-                invalid_result("Critic must resolve existing issue IDs with explicit evidence.")
-            remaining = [item for item in issues if item["id"] not in {r["id"] for r in resolutions}]
-            if report["verdict"] == "pass" and remaining:
-                report["verdict"], report["fixed"] = "reject", False
-                report["bugs"] = "Previously recorded obligations remain unresolved:\n" + "\n".join(
-                    item["id"] + ": " + item["description"] for item in remaining)
-        new_issues = report.get("memory_update", {}).get("unresolved_obligations", [])
-        if report["verdict"] == "pass" and any(str(item).strip() for item in new_issues):
-            report["verdict"], report["fixed"] = "reject", False
-            report["bugs"] = "The reviewer reported unresolved obligations:\n" + "\n".join(new_issues)
+    for key, expression in node.get("normalize", {}).items():
+        report[key] = evaluate(expression, {**context, "result": report, "raw": raw})
+    validate_json_schema(report, node["schema"])
     for condition in node.get("require", []):
         if not evaluate(condition, {**context, "result": report, "raw": raw}):
-            invalid_result(node.get("error", "Invalid model response: " + condition))
+            raise Error(node.get("error", "Invalid model response: " + condition))
     return report, raw
+
+
+def _run_command(config, context):
+    """Run a bounded argv command and check only its declared output files."""
+    argv = [render_template(value, context) for value in config["argv"]]
+    directory = (Path.cwd() / render_template(config.get("cwd", "."), context)).resolve()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    outputs = [directory / name for name in config.get("produces", [])]
+    for path in outputs:
+        path.unlink(missing_ok=True)
+    engine = shutil.which(argv[0])
+    code, output = None, ""
+    if engine is None:
+        status, diagnostic = "unavailable", f"Command unavailable: {argv[0]}."
+    else:
+        environment = {**os.environ, **{key: render_template(value, context) for key, value in config.get("env", {}).items()}}
+        try:
+            result = subprocess.run([engine, *argv[1:]], cwd=directory, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace", timeout=config["timeout"], check=False,
+                **({"umask": 0o077} if os.name != "nt" else {}))
+            code, output = result.returncode, result.stdout or ""
+            produced = all(path.is_file() and path.stat().st_size > 0 for path in outputs)
+            status = "pass" if code == 0 and produced else "fail"
+            diagnostic = f"Command exited with code {code}."
+            if code == 0 and not produced:
+                diagnostic += " A declared output file is missing or empty."
+        except subprocess.TimeoutExpired as exc:
+            status, diagnostic = "fail", f"Command exceeded {config['timeout']:g} seconds."
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+        except OSError as exc:
+            status, diagnostic = "fail", f"Command could not run: {exc}"
+    if config.get("log"):
+        _private_atomic_write(directory / config["log"], diagnostic + "\n\n" + output)
+    return {"status": status, "diagnostic": diagnostic, "returncode": code}
 
 
 def _apply_actions(actions, context, stage, revision):
@@ -1926,26 +2149,6 @@ def _apply_actions(actions, context, stage, revision):
     for action in actions:
         if "when" in action and not evaluate(action["when"], context):
             continue
-        if "memory" in action and state.get("memory") is not None:
-            memory, entry = state["memory"], action["memory"]
-            if isinstance(entry, str):
-                memory.mark_current(entry)
-            else:
-                values = {key: evaluate(expression, context) for key, expression in entry.items()}
-                audited_attempt = memory.data.get("currentAttemptId")
-                changed = normalized_candidate(values["candidate"]) != normalized_candidate(values["previous"])
-                result_attempt = audited_attempt
-                if changed:
-                    result_attempt = memory.record_candidate(
-                        values["candidate"], values["source"], revision=revision,
-                        critic_round=context["visit"], status=values["status"], persist=False,
-                    )
-                memory.record_critic_report(
-                    values["feedback"], context["visit"], attempt_id=audited_attempt,
-                    result_attempt_id=result_attempt,
-                )
-                if not changed:
-                    memory.mark_current(values["status"])
         if "merge" in action:
             values = evaluate(action["merge"], context)
             if not isinstance(values, dict):
@@ -1955,17 +2158,9 @@ def _apply_actions(actions, context, stage, revision):
             state.update({key: evaluate(expression, context) for key, expression in action["set"].items()})
         if "write" in action:
             _private_atomic_write(Path.cwd() / action["write"]["path"], evaluate(action["write"]["text"], context))
-        if "verify_latex" in action:
-            from latex_verification import verify_latex
-            verification = verify_latex(evaluate(action["verify_latex"], context), Path.cwd())
-            state["compilation"] = verification
-            journal = getattr(state.get("memory"), "journal", None)
-            if journal is not None:
-                journal.commit("latex_compilation", verification)
-            if verification["status"] == "fail":
-                state["failed"] = True
-            elif verification["status"] == "unavailable":
-                emit("diagnostic", stage, text=verification["diagnostic"])
+        if "command" in action:
+            config = action["command"]
+            state[config["result"]] = _run_command(config, context)
         if "emit" in action:
             fields = {}
             for key, value in action["emit"].items():
@@ -1990,16 +2185,6 @@ def _complete_node(node, state, result, raw, visit, revision):
     return context
 
 
-def _workflow_memory(workflow, state, options, prompts):
-    """Open the existing structured-stage audit archive, separately from goal files."""
-    from persistent_research import initialize, ResearchMemory
-    task = state.get("statement") or state.get("source")
-    journal = initialize(sys.modules[__name__], Path.cwd(), text(task), workflow, prompts, options)
-    state["memory"] = ResearchMemory(journal)
-    options["_journal"] = journal
-    return journal
-
-
 def _execute(workflow, state, options, prompts):
     nodes = workflow["nodes"]
     current, visits, revision = options.get("start_node", next(iter(nodes))), 0, 0
@@ -2007,51 +2192,11 @@ def _execute(workflow, state, options, prompts):
         raise ValueError(f"Unknown workflow entry node: {current!r}.")
     sessions, revisions = {}, {}
     options.setdefault("_workflow_started", time.monotonic())
-    goal_nodes = [node for node in nodes.values() if node["run"] == "goal"]
-    journal = getattr(state.get("memory"), "journal", None)
-    final_graph = any("verify_latex" in action for node in nodes.values() for branch in node["next"].values()
-                      if isinstance(branch, dict) for action in branch.get("after", []))
-    if journal is None and (final_graph or (Path.cwd() / "research.sqlite3").exists()):
-        journal = _workflow_memory(workflow, state, options, prompts)
-    if journal is not None:
-        saved = journal.get_state("workflow_checkpoint")
-        review_target = goal_nodes[0]["next"].get("proof") if goal_nodes else None
-        if isinstance(review_target, dict):
-            review_target = review_target.get("to")
-        if saved and not options.get("start_node") and saved.get("node") in nodes:
-            state.update(saved["state"])
-            current, visits = saved["node"], saved.get("visits", 0)
-            state["failed"] = False
-        elif saved and not options.get("start_node") and saved.get("node") == "end" and journal.get_state("candidate_status") == "awaiting_critic" and review_target in nodes:
-            current, visits = review_target, 0
-            state["solution"] = journal.get_state("candidate")
-            state["failed"] = False
-        if "solution" in state and normalized_candidate(state["solution"]) != normalized_candidate(journal.get_state("candidate", "")):
-            state["memory"].record_candidate(state["solution"], "recovered_candidate")
-    if journal is not None:
-        options["_journal"] = journal
-        definition = {"workflow": workflow, "prompts": prompts}
-        version = _sha256(json.dumps(definition, sort_keys=True))
-        key = "graph_version:" + _sha256(json.dumps(list(nodes)))
-        if journal.get_state(key) != version:
-            journal.commit("graph_version", definition, {key: version})
-    multiple_goals = sum(node["run"] == "goal" for node in nodes.values()) > 1
     try:
         while current != "end":
             node = nodes[current]
-            if node["run"] == "structured" and any("memory" in action for action in node.get("after", [])):
-                if journal is None:
-                    journal = _workflow_memory(workflow, state, options, prompts)
-                if "solution" in state and normalized_candidate(state["solution"]) != normalized_candidate(journal.get_state("candidate", "")):
-                    state["memory"].record_candidate(state["solution"], "review_input")
-            if journal is not None:
-                state["open_issues"] = journal.get_state("open_issues", [])
             if workflow_remaining(options) <= 0:
-                raise Error("Workflow time limit reached; checkpoint saved for continuation.")
-            if journal is not None:
-                journal.commit("workflow_checkpoint", {"node": current}, {"workflow_checkpoint": {
-                    "node": current, "visits": visits,
-                    "state": {k: v for k, v in state.items() if k != "memory"}}})
+                raise Error("Workflow time limit reached.")
             visits += 1
             emit("status", node.get("stage", current), label=f"Workflow step: {current}",
                  node=current, visit=visits)
@@ -2064,29 +2209,23 @@ def _execute(workflow, state, options, prompts):
                 if current not in sessions:
                     task = text(evaluate(node["task"], context))
                     prompt = options.get("author_input")
-                    if prompt is None and options.get("author_input_file"):
-                        prompt = Path(options["author_input_file"]).read_bytes().decode("utf-8")
                     if prompt is None:
                         prompt = prompts[node["prompt"]].replace(node["marker"], task, 1)
                     lifecycle = node["lifecycle"]
                     if isinstance(lifecycle, list):
                         lifecycle = {key: key for key in lifecycle}
                     session_prompts = {key: prompts[ref] for key, ref in lifecycle.items()}
-                    directory = (Path.cwd() / "goal-memory" / _sha256(current)[:16]) if multiple_goals else Path.cwd()
+                    directory = options.get("goal_cwd") or str(Path.cwd())
                     recovery = node.get("recovery")
                     instruction = ""
                     if recovery and evaluate(recovery["when"], context):
                         feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
                         instruction = render_template(prompts[recovery["prompt"]], {
-                            "original_prompt": prompt, "directory": str(directory), "prompt_file": node["prompt_file"],
+                            "original_prompt": prompt, "directory": str(directory),
                             "instruction": "", "revision_number": 1, **feedback,
                         })
-                    from goal_runtime import goal_session
                     session = goal_session(
                         sys.modules[__name__], prompt, prompts=session_prompts,
-                        files={name: render_template(content, {"original_prompt": prompt, "statement": task})
-                               for name, content in node["files"].items()},
-                        prompt_file=node["prompt_file"], directory=directory,
                         settings=_settings(node, options), options=options,
                         stages=node.get("stages"), node_name=current, initial_instruction=instruction,
                     )
@@ -2113,11 +2252,6 @@ def _execute(workflow, state, options, prompts):
             if target != current:
                 visits = 0
             current = target
-            if journal is not None:
-                resume_node = next(iter(nodes)) if final_graph and state.get("failed") else current
-                journal.commit("workflow_transition", {"to": current, "outcome": context["outcome"]},
-                    {"workflow_checkpoint": {"node": resume_node, "visits": visits,
-                      "state": {k: v for k, v in state.items() if k != "memory"}}})
         return state
     finally:
         for session in sessions.values():
@@ -2146,27 +2280,11 @@ def execute_workflows(paths, state, options=None):
         elif "start_node" in local_options and local_options["start_node"] not in workflow["nodes"]:
             raise ValueError(f"Unknown workflow entry node: {local_options['start_node']!r}.")
         prepared.append((workflow, prepare(workflow, local_options), local_options))
-    try:
-        resume_index = 0
-        if prepared and not state.get("memory"):
-            first, first_prompts, first_options = prepared[0]
-            if (Path.cwd() / "research.sqlite3").exists():
-                journal = _workflow_memory(first, state, first_options, first_prompts)
-                saved = journal.get_state("workflow_checkpoint")
-                if saved and not options.get("start_node"):
-                    for index, (definition, _, _) in enumerate(prepared):
-                        if saved.get("node") in definition["nodes"]:
-                            resume_index = index
-                            break
-        for workflow, prompts, local_options in prepared[resume_index:]:
-            _execute(workflow, state, local_options, prompts)
-            if state.get("failed"):
-                break
-        return state
-    finally:
-        journal = getattr(state.get("memory"), "journal", None)
-        if journal is not None:
-            journal.close()
+    for workflow, prompts, local_options in prepared:
+        _execute(workflow, state, local_options, prompts)
+        if state.get("failed"):
+            break
+    return state
 
 
 def _builtin_node(workflow_name, node_name, state, options, visit=1, prompts=None):
@@ -2313,7 +2431,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\nStopped workflow.", file=sys.stderr)
         return 130
-    except (Error, ValueError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError, sqlite3.Error) as exc:
+    except (Error, ValueError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

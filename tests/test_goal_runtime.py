@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from goal_runtime import goal_session
+import workflow_runner as module
 
 
 def event(method, **params):
@@ -118,12 +118,12 @@ class Runtime:
 
 PROMPTS = {
     "goal": "Complete this exact assignment.",
-    "continuation": "Continue the same goal and read {prompt_file}.",
-    "compaction": "Reload the notebooks in {directory}, keeping {prompt_file} fixed.",
+    "continuation": "Continue the same goal using the earlier instructions.",
+    "compaction": "Reload your own work in {directory} and continue.",
     "repair": "Revision {revision_number}; critic round {round}: {bugs}\nCandidate: {solution}",
-    "resume": "Resume in {directory}; read {prompt_file} and both research notebooks.",
+    "resume": "Resume in {directory}; follow your earlier records.\nOriginal assignment:\n{original_prompt}",
 }
-FILES = {"assignment.txt": "Exact assignment", "attempts.md": "# Attempts\n", "failed.md": "# Failures\n"}
+PROMPT = "Exact assignment"
 SETTINGS = {"model": "test-model", "effort": "high", "speed": "standard", "summary": "concise"}
 
 
@@ -132,22 +132,22 @@ class GoalTests(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.directory = Path(self.folder.name).resolve()
-        self.popen = patch("goal_runtime.subprocess.Popen", return_value=SimpleNamespace())
+        self.popen = patch.object(module.subprocess, "Popen", return_value=SimpleNamespace())
         self.spawn = self.popen.start()
         self.addCleanup(self.popen.stop)
 
     def session(self, scripts=None, **kwargs):
         runtime = Runtime(scripts if scripts is not None else [success()])
-        session = goal_session(runtime, FILES["assignment.txt"], prompts=PROMPTS, files=FILES,
-                               prompt_file="assignment.txt", directory=self.directory,
-                               settings=SETTINGS, options=kwargs.pop("options", {}), **kwargs)
+        options = {"goal_cwd": str(self.directory), **kwargs.pop("options", {})}
+        session = module.goal_session(runtime, PROMPT, prompts=PROMPTS,
+                                      settings=SETTINGS, options=options, **kwargs)
         self.addCleanup(session.close)
         return runtime, session
 
-    def test_initial_files_single_goal_and_cleanup(self):
+    def test_single_goal_and_cleanup_create_no_workspace_files(self):
         runtime, session = self.session()
-        self.assertEqual(next(session), {"outcome": "proof", "solution": "Full proof"})
-        self.assertEqual({p.name: p.read_text() for p in self.directory.iterdir()}, FILES)
+        self.assertEqual(next(session), {"outcome": "done", "output": "Full proof"})
+        self.assertEqual(list(self.directory.iterdir()), [])
         command = self.spawn.call_args.args[0]
         self.assertIn("goals", command)
         self.assertEqual(command[command.index("--disable") + 1], "multi_agent")
@@ -160,45 +160,47 @@ class GoalTests(unittest.TestCase):
         self.assertTrue(runtime.stopped)
         self.assertEqual(runtime.rpc.calls[-1][1]["status"], "active")
 
-    def test_existing_notebooks_preserved_and_resume_instructions_used(self):
-        for name, value in FILES.items():
-            (self.directory / name).write_text(value)
-        (self.directory / "failed.md").write_bytes(b"Complete old failures\r\n\n")
+    def test_explicit_resume_preserves_arbitrary_existing_files_without_reading_them(self):
+        contents = {"arbitrary.bin": b"\xff\x00\xfe\r\n", "other.txt": b"Old unrelated assignment\r\n\n"}
+        for name, data in contents.items():
+            (self.directory / name).write_bytes(data)
+        runtime, session = self.session(options={"goal_resume": True})
+        with patch("builtins.open", side_effect=AssertionError("No file access")):
+            with patch.object(Path, "open", side_effect=AssertionError("No file access")):
+                next(session)
+        self.assertEqual({p.name: p.read_bytes() for p in self.directory.iterdir()}, contents)
+        prompt = next(p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start")
+        self.assertEqual(prompt, PROMPTS["resume"].format(directory=self.directory, original_prompt=PROMPT))
+
+    def test_existing_files_do_not_implicitly_select_resume_or_change_prompt(self):
+        (self.directory / "existing.txt").write_bytes(b"Different contents\r\n")
         runtime, session = self.session()
         next(session)
-        self.assertEqual((self.directory / "failed.md").read_bytes(), b"Complete old failures\r\n\n")
         prompt = next(p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start")
-        self.assertIn("Resume in", prompt)
-
-    def test_changed_assignment_rejected_before_any_call_or_notebook_write(self):
-        (self.directory / "assignment.txt").write_text("Another assignment")
-        _, session = self.session()
-        with self.assertRaisesRegex(TransportError, "saved initial prompt differs"):
-            next(session)
-        self.spawn.assert_not_called()
-        self.assertEqual(len(list(self.directory.iterdir())), 1)
+        self.assertEqual(prompt, PROMPT)
+        self.assertEqual((self.directory / "existing.txt").read_bytes(), b"Different contents\r\n")
 
     def test_ordinary_turn_return_is_not_a_completed_goal(self):
         scripts = [[answer("Partial work"), completed(),
                     event("turn/started", turn={"id": "automatic-2"}), *success("Actual proof")]]
         _, session = self.session(scripts)
-        self.assertEqual(next(session)["solution"], "Actual proof")
+        self.assertEqual(next(session)["output"], "Actual proof")
 
     def test_commentary_is_not_a_solution_and_blocked_goal_continues(self):
         scripts = [[answer("Working", "commentary"), goal("complete"), completed()],
                    [answer("This route failed"), goal("blocked"), completed()], success()]
         runtime, session = self.session(scripts)
-        self.assertEqual(next(session)["solution"], "Full proof")
+        self.assertEqual(next(session)["output"], "Full proof")
         self.assertEqual(runtime.rpc.turns, 3)
         self.assertEqual(sum(m == "thread/start" for m, _ in runtime.rpc.calls), 1)
         inputs = [p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start"]
-        self.assertEqual(inputs[1:], ["Continue the same goal and read assignment.txt."] * 2)
+        self.assertEqual(inputs[1:], [PROMPTS["continuation"]] * 2)
 
     def test_rejected_proof_restarts_goal_on_same_thread_and_waits_for_completion(self):
         runtime, session = self.session([success(), [answer("Still repairing"), goal("blocked"), completed()], success("Repaired proof")])
         next(session)
         result = session.send({"solution": "Safe fixes", "bugs": "Gap in step 2", "round": 3})
-        self.assertEqual(result["solution"], "Repaired proof")
+        self.assertEqual(result["output"], "Repaired proof")
         turns = [p for m, p in runtime.rpc.calls if m == "turn/start"]
         self.assertEqual({p["threadId"] for p in turns}, {"thread-1"})
         self.assertEqual(turns[1]["input"][0]["text"], "Revision 1; critic round 3: Gap in step 2\nCandidate: Safe fixes")
@@ -210,7 +212,7 @@ class GoalTests(unittest.TestCase):
         next(session)
         steers = [p for m, p in runtime.rpc.calls if m == "turn/steer"]
         self.assertEqual(len(steers), 1)
-        self.assertEqual(steers[0]["input"][0]["text"], PROMPTS["compaction"].format(directory=self.directory, prompt_file="assignment.txt"))
+        self.assertEqual(steers[0]["input"][0]["text"], PROMPTS["compaction"].format(directory=self.directory))
 
     def test_cross_process_resume_overrides_workspace(self):
         runtime, session = self.session(options={"goal_thread_id": "thread-1"})
@@ -224,7 +226,7 @@ class GoalTests(unittest.TestCase):
     def test_missing_saved_thread_falls_back_but_quota_error_does_not(self):
         runtime, session = self.session(options={"goal_thread_id": "missing"})
         runtime.resume_error = "thread/resume failed: thread not found"
-        self.assertEqual(next(session)["outcome"], "proof")
+        self.assertEqual(next(session)["outcome"], "done")
         self.assertEqual(sum(m == "thread/start" for m, _ in runtime.rpc.calls), 1)
         runtime2, session2 = self.session(options={"goal_thread_id": "missing"})
         runtime2.resume_error = "Quota exceeded"
@@ -238,7 +240,7 @@ class GoalTests(unittest.TestCase):
                 self.assertEqual(next(session)["outcome"], "failure")
                 self.assertEqual(runtime.rpc.turns, 1)
                 session.close()
-                self.assertEqual({p.name for p in self.directory.iterdir()}, set(FILES))
+                self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_elapsed_limit_starts_no_model(self):
         runtime, session = self.session()
@@ -253,22 +255,22 @@ class GoalTests(unittest.TestCase):
             self.assertTrue(runtime.steered.wait(2))
             rpc.messages.extend(success())
         runtime.on_empty = wait_for_steer
-        self.assertEqual(next(session)["outcome"], "proof")
+        self.assertEqual(next(session)["outcome"], "done")
         steers = [p for m, p in runtime.rpc.calls if m == "turn/steer"]
         self.assertEqual(steers[0]["expectedTurnId"], "turn-1")
         self.assertEqual(steers[0]["input"][0]["text"], runtime.command[1])
 
-    def test_saved_critic_feedback_does_not_change_original_prompt_file(self):
+    def test_saved_critic_feedback_is_submitted_without_writing_it(self):
         runtime, session = self.session(initial_instruction="Previously rejected: repair step 2.")
         next(session)
-        self.assertEqual((self.directory / "assignment.txt").read_text(), "Exact assignment")
+        self.assertEqual(list(self.directory.iterdir()), [])
         prompt = next(p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start")
         self.assertIn("Previously rejected: repair step 2.", prompt)
 
     def test_turn_payload_final_answer_and_late_goal_completion(self):
         final = {"type": "agentMessage", "phase": "final_answer", "text": "Proof from final turn"}
         _, session = self.session([[completed(items=[final]), goal("complete")]])
-        self.assertEqual(next(session)["solution"], final["text"])
+        self.assertEqual(next(session)["output"], final["text"])
 
     def test_deadline_interrupts_hung_transport_without_summary_turn(self):
         runtime, session = self.session([[]])
@@ -295,15 +297,6 @@ class GoalTests(unittest.TestCase):
         self.assertEqual(next(session)["outcome"], "failure")
         self.assertFalse(any(m in {"thread/start", "turn/start"} for m, _ in runtime.rpc.calls))
 
-    def test_workspace_escape_rejected(self):
-        runtime = Runtime([success()])
-        session = goal_session(runtime, "Exact assignment", prompts=PROMPTS,
-            files={**FILES, "../outside.txt": "bad"}, prompt_file="assignment.txt",
-            directory=self.directory, settings=SETTINGS, options={})
-        with self.assertRaisesRegex(TransportError, "relative paths"):
-            next(session)
-        self.spawn.assert_not_called()
-
     def test_completed_author_cleanup_does_not_emit_events_over_later_critic_stage(self):
         runtime, session = self.session()
         next(session)
@@ -313,17 +306,33 @@ class GoalTests(unittest.TestCase):
         self.assertEqual(runtime.events, previous_events)
         self.assertTrue(runtime.stopped)
 
-    def test_initial_prompt_crlf_and_whitespace_survive_resumption_exactly(self):
+    def test_deadline_while_yielded_to_critic_does_not_pause_or_stop_completed_author(self):
+        runtime, session = self.session()
+        next(session)
+        previous_calls, previous_events = list(runtime.rpc.calls), list(runtime.events)
+        observed = threading.Event()
+        def remaining(options):
+            observed.set()
+            return 0
+        runtime.workflow_remaining = remaining
+        self.assertTrue(observed.wait(1))
+        threading.Event().wait(0.05)
+        self.assertEqual(runtime.rpc.calls, previous_calls)
+        self.assertEqual(runtime.events, previous_events)
+        self.assertEqual(runtime.stopped, [])
+        session.close()
+        self.assertTrue(runtime.stopped)
+
+    def test_original_prompt_crlf_and_whitespace_are_submitted_verbatim_on_resume(self):
         original = "\r\n Original π statement\r\n  Keep these spaces. \r\n\r\n"
-        files = {**FILES, "assignment.txt": original}
-        for name, text in files.items():
-            (self.directory / name).write_bytes(text.encode("utf-8"))
         runtime = Runtime([success()])
-        session = goal_session(runtime, original, prompts=PROMPTS, files=files,
-            prompt_file="assignment.txt", directory=self.directory, settings=SETTINGS, options={})
+        session = module.goal_session(runtime, original, prompts=PROMPTS, settings=SETTINGS,
+            options={"goal_cwd": str(self.directory), "goal_resume": True})
         self.addCleanup(session.close)
-        self.assertEqual(next(session)["outcome"], "proof")
-        self.assertEqual((self.directory / "assignment.txt").read_bytes(), original.encode("utf-8"))
+        self.assertEqual(next(session)["outcome"], "done")
+        prompt = next(p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start")
+        self.assertEqual(prompt, PROMPTS["resume"].format(directory=self.directory, original_prompt=original))
+        self.assertEqual(list(self.directory.iterdir()), [])
 
 
 if __name__ == "__main__":

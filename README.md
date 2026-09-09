@@ -5,10 +5,9 @@ lets it work through diverse approaches while maintaining three readable memory
 files, independently audits its candidate, and produces verified LaTeX.
 Algorithmic tasks can be entered as statements too.
 
-For a concrete explanation without coding knowledge, follow the
-[manual worker guide](docs/manual_workflow.md). It gives the exact author
-prompt, how to maintain the three files, when to continue the same conversation,
-and when to hand a complete candidate to the unchanged critic.
+The complete author instructions live directly in
+[`workflows/author_critic.yaml`](workflows/author_critic.yaml). The LLM creates,
+reads, searches, and updates its own three files under that prompt.
 
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
@@ -373,11 +372,12 @@ The author has exactly three memory files in its run folder:
 
 | File | Contents |
 | --- | --- |
-| `INITIAL_PROMPT.md` | The complete original author prompt, including the exact statement and search strategy. The runner creates it once and preserves it unchanged. |
+| `INITIAL_PROMPT.md` | The complete original author prompt, including the exact statement and search strategy. The author creates it if absent and is instructed to preserve it unchanged. |
 | `APPROACHES.md` | Every attempted approach, with a stable ID, mechanism, assumptions, detailed work, current status, failed steps, remaining obstacles, and a concrete condition for revisiting it. |
 | `PROVED.md` | Only fully justified positive or negative lemmas, with exact assumptions, complete arguments, and links to their originating approach IDs. |
 
-The model maintains `APPROACHES.md` and `PROVED.md` itself. Before trying a
+The model creates all three files when absent and maintains `APPROACHES.md`
+and `PROVED.md` itself. Before trying a
 route, it reads the relevant earlier attempts, compares the actual mechanism
 and obstacle, and explains any substantive difference or satisfied reopening
 condition. Merely renaming an old dead end does not count as a new idea.
@@ -390,8 +390,9 @@ While the process runs, the author continues in the same conversation. On
 context compaction or continuation it rereads the initial assignment and
 memory files. After an interruption it resumes that conversation when available;
 otherwise it starts a fresh conversation and reads the same three files. The
-runner initializes missing notebooks but does not replace existing research
-with generated summaries or an author SQLite database.
+resume prompt includes the original full assignment as a fallback when the
+initial prompt file is absent. File creation, reading, and updating belong to
+the LLM; the runner does not parse, summarize, or maintain a research database.
 
 This design depends on the author's adherence to the notebook and novelty
 instructions. It makes its history readable and available; it does not
@@ -412,17 +413,16 @@ and hostile counterexamples. The coordinator receives their actual reports
 and tries to repair valid bugs. Every completed auditor report is checkpointed
 immediately; compatible continuation reuses completed reports.
 
-The controller compares returned candidate text rather than trusting the
-critic's `fixed` flag. A changed proof requires another fresh three-auditor
+The YAML compares returned candidate text through a generic `normalize`
+expression rather than trusting the critic's `fixed` flag. A changed proof requires another fresh three-auditor
 round. Reaching the consecutive repaired-round limit (default 2) saves
 **verification incomplete** instead of accepting an unchecked repair. A
 rejection returns its exact bugs and safely repaired candidate to the author.
 
-Open obligations have stable IDs. They persist until the critic resolves each
-supplied ID with explicit evidence. Silence about an issue does not clear it,
-and a pass with outstanding obligations becomes a rejection. Acceptance
-requires an unchanged pass with the three actual audits passing and no
-remaining bugs or obligations. Model review is not formal proof verification.
+Acceptance requires an unchanged pass with the three actual audits passing
+and no reported bugs. On rejection, the author records the critic's objections
+in its approach history and rechecks affected proved lemmas. Model review is
+not formal proof verification.
 
 ### 4. LaTeX editing and final verification
 
@@ -442,16 +442,12 @@ LaTeX-only polishing uses the same preservation and final checks.
 ## Project structure
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
-engine and model transport; `goal_runtime.py` manages the persistent author
-session. The three author notebooks remain plain Markdown files. `web_ui.py` launches the UI or Markdown proof jobs. The
+engine and model/goal transport. The three author notebooks remain plain
+Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches the UI or Markdown proof jobs. The
 `workflows/` directory contains exactly two YAML definitions:
 
 ```text
 workflow_runner.py          Graph engine, model transport, and workflow CLI
-goal_runtime.py             One persistent author session and its configured files
-persistent_research.py      Critic/final checkpoint and review-memory adapters
-research_journal.py         Critic/final archive and readable review artifacts
-latex_verification.py       Restricted local document compilation
 web_ui.py                   UI and Markdown-job launcher
 workflows/
   author_critic.yaml         Author/critic prompts, response schema, and logic
@@ -465,8 +461,6 @@ ui/
   cli.py                    UI startup and Markdown file/folder runs
   index.html, app.js, styles.css
 workflows/workflows.md      Workflow authoring guide and full YAML reference
-docs/manual_workflow.md     Exact author prompts and three-file worker procedure
-docs/render_manual.py       Regenerate/check the manual against current YAML
 tests/                      Offline regression tests
 ```
 
@@ -480,8 +474,7 @@ repository's `runs/` folder, regardless of the launcher's working directory.
 Each YAML file contains `nodes` and `prompts`. Node names are arbitrary; the
 first node is the entry point. `run: structured` makes a model call with a
 response shape, while `run: goal` starts or resumes the persistent author
-conversation and its configured memory files. The YAML
-defines inputs, result checks, state updates, and transitions, including the
+conversation. Memory-file instructions are plain prompt text. The YAML defines inputs, result checks, state updates, and transitions, including the
 critic's repeat limit.
 
 A complete custom workflow can be as small as this `summarize.yaml`:

@@ -1,4 +1,4 @@
-"""Author recovery needs its three notebooks and root session, not SQLite."""
+"""Author recovery reuses a workspace; only the LLM manages its notebooks."""
 
 import io
 import json
@@ -50,7 +50,7 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
         workers.start()
         self.addCleanup(workers.stop)
 
-    def test_three_notebooks_and_original_prompt_restore_before_author_launch(self):
+    def test_workspace_and_original_prompt_restore_without_notebook_access(self):
         source_before = {str(path.relative_to(self.source)): path.read_bytes()
                          for path in self.source.rglob("*") if path.is_file()}
         app = server.App(runs=self.runs)
@@ -58,23 +58,29 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
         def launch(statement):
             self.assertEqual(statement, self.statement)
             self.assertEqual(app.state["authorPrompt"], self.prompt)
-            for name, content in self.contents.items():
-                self.assertEqual((app.run_dir / name).read_text(encoding="utf-8"), content)
-                self.assertFalse(any((app.run_dir / "continuation-memory").rglob(name)))
-            self.assertFalse((app.run_dir / server.RESEARCH_DATABASE_FILENAME).exists())
+            for name in self.contents:
+                self.assertFalse((app.run_dir / name).exists())
+            self.assertFalse((app.run_dir / "continuation-memory").exists())
             options = app._proof_options_locked()
             setting = options[options.index("--set") + 1]
             self.assertEqual(setting.split("=", 1)[0], "goal_thread_id")
             self.assertEqual(json.loads(setting.split("=", 1)[1]), "root-two")
             settings = dict(options[index + 1].split("=", 1)
                             for index, argument in enumerate(options) if argument == "--set")
-            prompt_file = Path(json.loads(settings["author_input_file"]))
-            self.assertEqual(prompt_file, app.run_dir / "INITIAL_PROMPT.md")
-            self.assertEqual(prompt_file.read_bytes(), self.contents["INITIAL_PROMPT.md"].encode())
+            self.assertEqual(json.loads(settings["goal_cwd"]), str(self.source.resolve()))
+            self.assertTrue(json.loads(settings["goal_resume"]))
             return object(), object()
 
+        original_read, original_write = Path.read_text, Path.write_text
+        def guarded_read(path, *args, **kwargs):
+            self.assertNotIn(path.name, self.contents, "UI must not read LLM memory")
+            return original_read(path, *args, **kwargs)
+        def guarded_write(path, *args, **kwargs):
+            self.assertNotIn(path.name, self.contents, "UI must not write LLM memory")
+            return original_write(path, *args, **kwargs)
         with mock.patch.object(app, "_launch_solver_locked", side_effect=launch):
-            app.start_direct_statement(self.statement, continuation_source=self.source, stopped_stage="solve")
+            with mock.patch.object(Path, "read_text", guarded_read), mock.patch.object(Path, "write_text", guarded_write):
+                app.start_direct_statement(self.statement, continuation_source=self.source, stopped_stage="solve")
         self.assertEqual(
             {str(path.relative_to(self.source)): path.read_bytes()
              for path in self.source.rglob("*") if path.is_file()}, source_before,
@@ -89,6 +95,21 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
                 plan = server.Server._stopped_continuation_plan(app)
                 self.assertEqual(plan["action"], "author")
                 self.assertEqual(plan["label"], "Continue proof author")
+
+    def test_quota_failure_during_critic_resume_repair_keeps_critic_recovery(self):
+        for name in self.contents:
+            (self.source / name).unlink()
+        (self.source / server.runtime.SAVED_CANDIDATE_FILENAME).write_text(
+            "The complete proof sent to the critic.", encoding="utf-8",
+        )
+        app = server.App(runs=self.runs)
+        app.state.update(phase="error", stage="repair", problemMode="critic-resume",
+                         error="Quota exhausted", manuallyStopped=False)
+        plan = server.Server._stopped_continuation_plan(app)
+        self.assertEqual(plan["action"], "critic")
+        self.assertEqual(plan["label"], "Continue from critic")
+        (self.source / server.runtime.SAVED_CANDIDATE_FILENAME).unlink()
+        self.assertIsNone(server.Server._stopped_continuation_plan(app))
 
     def test_new_root_session_is_saved_in_existing_job_settings(self):
         app = server.App(runs=self.runs)
@@ -109,14 +130,14 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
         self.assertEqual(server.saved_goal_thread_id(app.run_dir), "resumed-root")
         self.assertFalse((app.run_dir / "author-session.json").exists())
 
-    def test_saved_author_source_loads_without_a_database(self):
+    def test_saved_author_source_loads_from_ui_settings(self):
         source = server.saved_research_source(self.source)
         self.assertEqual(source["statement"], self.statement)
         self.assertEqual(source["settings"]["authorPrompt"], self.prompt + "\n")
         self.assertEqual(source["settings"]["thinkingHours"], 2.75)
         self.assertEqual(server.saved_goal_thread_id(self.source), "root-two")
 
-    def test_missing_thread_id_still_allows_file_based_continuation(self):
+    def test_missing_thread_id_still_reopens_workspace(self):
         (self.source / "transcript.jsonl").write_text("", encoding="utf-8")
         app = server.App(runs=self.runs)
         with mock.patch.object(app, "_launch_solver_locked", return_value=(object(), object())):
@@ -126,9 +147,29 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
         settings = dict(options[index + 1].split("=", 1)
                         for index, argument in enumerate(options) if argument == "--set")
         self.assertNotIn("goal_thread_id", settings)
-        self.assertIn("author_input_file", settings)
+        self.assertEqual(json.loads(settings["goal_cwd"]), str(self.source.resolve()))
+        self.assertTrue(json.loads(settings["goal_resume"]))
         for name in self.contents:
-            self.assertEqual((app.run_dir / name).read_bytes(), (self.source / name).read_bytes())
+            self.assertFalse((app.run_dir / name).exists())
+
+    def test_continuation_chain_keeps_original_workspace(self):
+        first = server.App(runs=self.runs)
+        with mock.patch.object(first, "_launch_solver_locked", return_value=(object(), object())):
+            first.start_direct_statement(self.statement, continuation_source=self.source)
+        second = server.App(runs=self.runs)
+        with mock.patch.object(second, "_launch_solver_locked", return_value=(object(), object())):
+            second.start_direct_statement(self.statement, continuation_source=first.run_dir)
+        self.assertEqual(second.state["goalWorkspace"], str(self.source.resolve()))
+        settings = json.loads((second.run_dir / server.JOB_SETTINGS_FILENAME).read_text())
+        self.assertEqual(settings["goalWorkspace"], str(self.source.resolve()))
+
+    def test_interruption_before_memory_files_exist_can_continue(self):
+        for name in self.contents:
+            (self.source / name).unlink()
+        (self.source / "transcript.jsonl").write_text("", encoding="utf-8")
+        app = server.App(runs=self.runs)
+        app.state.update(phase="error", stage="solve", error="Network unavailable")
+        self.assertEqual(server.Server._stopped_continuation_plan(app)["action"], "author")
 
     def test_continuation_rejects_changed_author_template(self):
         app = server.App(runs=self.runs)

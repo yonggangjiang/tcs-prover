@@ -72,7 +72,23 @@ nodes:
       pass:
         to: end
         after:
-          - verify_latex: state.output
+          - write:
+              path: final-validation/main.tex
+              text: state.output
+          - command:
+              argv: [pdflatex, -no-shell-escape, -interaction=nonstopmode, -halt-on-error, -file-line-error, main.tex]
+              cwd: final-validation
+              env: {openout_any: p, openin_any: p, shell_escape: f, TEXMFOUTPUT: ''}
+              timeout: 30
+              produces: [main.pdf]
+              log: compile.log
+              result: compilation
+          - set:
+              failed: state.compilation.status == 'fail'
+          - when: state.compilation.status == 'unavailable'
+            emit:
+              kind: diagnostic
+              text: 'LaTeX compilation unavailable: pdflatex is not installed. The document is saved but has not been compiled.'
           - when: state.failed
             set:
               output: "'Final LaTeX compilation failed. The document remains saved in formatted-candidate.tex. ' + state.compilation.diagnostic"

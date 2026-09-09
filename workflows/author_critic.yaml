@@ -1,5 +1,5 @@
 # Workflow guide: workflows.md
-# The author is one persistent goal session; its instructions and files are defined here.
+# One persistent author session; all research-file operations are directed by the author prompt.
 nodes:
   author:
     run: goal
@@ -8,17 +8,6 @@ nodes:
     prompt: author
     task: state.statement
     marker: '[STATEMENT]'
-    prompt_file: INITIAL_PROMPT.md
-    files:
-      INITIAL_PROMPT.md: '{original_prompt}'
-      APPROACHES.md: |
-        # Attempted approaches
-
-        No approaches attempted yet.
-      PROVED.md: |
-        # Proved lemmas
-
-        No lemmas established yet.
     lifecycle: [goal, continuation, compaction, repair, resume]
     stages: {initial: solve, resume: repair, failure: failure}
     resume:
@@ -32,23 +21,21 @@ nodes:
     after:
     - merge: result
     - set:
+        solution: "result.output if outcome == 'done' else get(state, 'solution', '')"
         failed: outcome == 'failure'
     next:
-      proof: critic
+      done: critic
       failure: end
   critic:
     run: structured
     role: critic
     stage: critic
     prompt: critic_input
-    instructions:
-    - critic
-    - critic_memory
+    instructions: critic
     inputs:
       statement: text(state.statement)
       solution: text(state.solution)
       audits: json(parallel)
-      obligations: json(get(state, 'open_issues', []))
     response:
       checks:
         minItems: 3
@@ -66,25 +53,6 @@ nodes:
       fixed: boolean
       solution: string
       bugs: string
-      memory_update:
-        fields:
-          approach_family: string
-          approach_result: string
-          blocked_routes:
-            maxItems: 6
-            items:
-              fields:
-                route: string
-                reason: string
-                reopen_condition: string
-          unresolved_obligations:
-            maxItems: 12
-            items: string
-      resolved_obligations:
-        items:
-          fields:
-            id: string
-            evidence: string
     parallel:
       items:
       - Definitions, quantifiers, game semantics, and line-by-line correctness of every construction and invariant.
@@ -93,9 +61,7 @@ nodes:
       - 'Hostile counterexample search: boundary cases, ownership mistakes, sampling/deletion claims, circular lemmas,
         and theorem-strength gaps.'
       prompt: critic_audit
-      instructions:
-      - critic
-      - critic_memory
+      instructions: critic
       inputs:
         statement: text(state.statement)
         solution: text(state.solution)
@@ -127,6 +93,8 @@ nodes:
         timeout: 1800
     request_label: Critic coordinator adjudication
     activity_label: Critic coordinator
+    normalize:
+      fixed: "result.verdict == 'pass' and normalized_text(result.solution) != normalized_text(state.solution)"
     require:
     - is_list(result.checks) and len(result.checks) == 3
     - result.verdict in ['pass', 'reject'] and is_bool(result.fixed)
@@ -137,7 +105,7 @@ nodes:
     - result.verdict != 'pass' or result.fixed or all(check.verdict == 'pass' for check in result.checks)
     - result.verdict != 'reject' or (bool(strip(result.bugs)) and not result.fixed)
     error: Codex returned an invalid critic result.
-    outcome: '''reject'' if result.verdict == ''reject'' else (''fixed'' if result.fixed else ''pass'')'
+    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.fixed else 'pass')"
     before:
     - when: visit == 1
       emit:
@@ -153,12 +121,6 @@ nodes:
         path: saved-candidate.md
         text: text(state.solution) + '\n'
     after:
-    - memory:
-        previous: state.solution
-        candidate: strip(result.solution)
-        feedback: result
-        source: '''critic_safe_fix'' if outcome == ''reject'' else ''critic_repair'''
-        status: '''approved'' if outcome == ''pass'' else (''awaiting_critic'' if outcome == ''fixed'' else ''needs_author'')'
     - emit:
         kind: critic_result
         label: Critic round {visit}
@@ -168,6 +130,9 @@ nodes:
         solution: strip(result.solution)
         report: result
         round: visit
+    - write:
+        path: saved-candidate.md
+        text: text(state.solution) + '\n'
     - when: outcome == 'pass'
       emit:
         kind: status
@@ -190,7 +155,6 @@ nodes:
         option: critic_rounds
         then: end
         after:
-        - memory: awaiting_critic
         - set:
             failed: 'True'
             output: '''Verification incomplete: the repair-round limit was reached. The latest candidate is saved
@@ -203,6 +167,8 @@ nodes:
 prompts:
   author: |-
     Resolve the exact statement below with a complete, rigorous argument. Preserve its assumptions and requested conclusion. Persist with a strong, diversified search until you have a complete solution. Work alone in this LLM session; do not spawn other agents or delegate the task. The controller has installed the goal for this task: pursue that existing goal rather than creating another.
+
+    Before any mathematical work, use your file tools to inspect the current working directory. If INITIAL_PROMPT.md is absent, create it with this entire initial author prompt verbatim, including the exact statement and every instruction. If APPROACHES.md is absent, create it with the heading "# Attempted approaches". If PROVED.md is absent, create it with the heading "# Proved lemmas". Preserve every existing file and its contents. You, the author LLM, perform all creation, reading, searching, and updating of these files; do not assume the controller has created them for you.
 
     Maintain exactly these three research files in the current working directory:
 
@@ -237,11 +203,6 @@ prompts:
     fixed=false, your best complete solution after safe fixes, and every unresolved
     bug with its exact location and required repair for the author. Return only the
     requested JSON.
-  critic_memory: 'Return historical metadata for the permanent archive: the candidate''s approach family, what the
-    audit established, routes actually blocked with evidence and reopening conditions, and every unresolved proof
-    obligation. Do not classify an incomplete method as disproved. Return resolved_obligations only for supplied
-    existing issue IDs, with concrete evidence explaining why each was resolved or no longer applies to this candidate.
-    Omitted issues remain open. Historical metadata must not alter the mathematical verdict.'
   goal: >-
     Resolve the statement in INITIAL_PROMPT.md. Always follow that file, keep
     APPROACHES.md and PROVED.md current, avoid recorded closed approaches unless
@@ -260,11 +221,20 @@ prompts:
     recorded closed approaches.
   resume: |-
     Resume the existing task in this working directory: {directory}
-    The three research files have been preserved here. Read INITIAL_PROMPT.md
-    first and follow it. Then read APPROACHES.md and PROVED.md and continue the
-    recorded work. Use these current copies for all file updates. Do not start
-    from an empty history or repeat closed approaches. A previous interruption
-    or usage limit was not a mathematical failure.
+    Use your file tools to read INITIAL_PROMPT.md first and follow it. Then read
+    APPROACHES.md and PROVED.md and continue the recorded work. Preserve existing
+    files and use these current copies for all updates. Do not start from an
+    empty history or repeat closed approaches. A previous interruption or usage
+    limit was not a mathematical failure.
+
+    If INITIAL_PROMPT.md is missing, create it from the complete original initial
+    author prompt below, without this continuation wrapper. Initialize either
+    other notebook only if it is absent, following the original instructions.
+    All file operations are your responsibility; the controller does not read,
+    create, summarize, or update your research memory for you.
+
+    ORIGINAL INITIAL AUTHOR PROMPT:
+    {original_prompt}
   repair: |-
     Continue the same task under INITIAL_PROMPT.md. Read APPROACHES.md and
     PROVED.md. The critic rejected round {round}; record these objections in the
@@ -298,9 +268,6 @@ prompts:
 
     CANDIDATE SOLUTION:
     {solution}
-
-    EXISTING OPEN OBLIGATIONS (resolve each by ID with evidence, or retain it):
-    {obligations}
   critic_audit: |-
     You are one of three independent hostile proof auditors. The controller already
     created the three auditors in parallel. Do not spawn agents, wait for agents,
