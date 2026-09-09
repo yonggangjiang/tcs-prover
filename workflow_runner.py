@@ -2091,19 +2091,6 @@ def _parallel_requests(config, prompts, state, options, visit):
     return reports
 
 
-def critic_audit_prompt(statement, solution, focus, instructions):
-    workflow = builtin_workflow("author_critic")
-    return render_template(workflow["prompts"]["critic_audit"], {"statement": statement, "solution": solution, "focus": focus, "instructions": instructions})
-
-
-def independent_critic_audits(statement, solution, model, effort, instructions, speed, summary):
-    workflow = builtin_workflow("author_critic")
-    config = {**workflow["nodes"]["critic"]["parallel"], "stage": "critic"}
-    save_critic_candidate(solution)
-    prompts = {**workflow["prompts"], "critic": instructions}
-    return _parallel_requests(config, prompts, {"statement": statement, "solution": solution}, {"model": model, "effort": effort, "speed": speed, "summary": summary}, 1)
-
-
 def _model_call(node, prompts, state, options, visit):
     """Run a configured request, optionally collecting independent inputs first."""
     context = {"state": state, "visit": visit}
@@ -2324,9 +2311,6 @@ def _builtin_node(workflow_name, node_name, state, options, visit=1, prompts=Non
 
 def criticize(statement, solution, round_number, model=CRITIC_MODEL, effort=EFFORT, instructions=None, speed=DEFAULT_SPEED, prompts=None, summary=DEFAULT_REASONING_SUMMARY):
     options = {"model": model, "effort": effort, "speed": speed, "summary": summary, "prompts": {"critic": instructions} if instructions is not None else {}}
-    resolved = {**builtin_workflow("author_critic")["prompts"], **(prompts or {}), **options["prompts"]}
-    instructions = _instructions(builtin_workflow("author_critic")["nodes"]["critic"], resolved)
-    options["parallel_results"] = independent_critic_audits(text(statement), text(solution), chosen_model(model), effective_effort(model, effort), instructions, chosen_speed(speed), chosen_reasoning_summary(summary))
     return _builtin_node("author_critic", "critic", {"statement": statement, "solution": solution}, options, round_number, prompts)
 
 

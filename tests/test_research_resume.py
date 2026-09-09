@@ -43,14 +43,58 @@ class OperationalContinuationTests(unittest.TestCase):
             self.assertEqual((statement, solution), (self.statement, "The proposed proof."))
             self.assert_no_memory_copy(app.run_dir)
             self.assertEqual((app.run_dir / server.runtime.SAVED_CANDIDATE_FILENAME).read_text(), solution + "\n")
-            self.assertEqual((app.run_dir / server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME).read_text(), '{"saved": "audit"}')
+            self.assertFalse((app.run_dir / server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME).exists())
             self.assertEqual(app.state["goalWorkspace"], str(self.source.resolve()))
             return object(), object()
 
-        with mock.patch.object(app, "_launch_critic_resume_locked", side_effect=launch) as launched:
-            app.start_critic_resume(self.statement, "The proposed proof.", source_run=self.source,
-                                    audit_checkpoint='{"saved": "audit"}')
+        with mock.patch.object(server, "critic_uses_parallel_audits", return_value=False):
+            with mock.patch.object(app, "_launch_critic_resume_locked", side_effect=launch) as launched:
+                app.start_critic_resume(self.statement, "The proposed proof.", source_run=self.source,
+                                        audit_checkpoint='{"saved": "audit"}')
         launched.assert_called_once()
+
+    def test_single_call_critic_ignores_legacy_audit_checkpoints(self):
+        (self.source / server.runtime.SAVED_CANDIDATE_FILENAME).write_text("Complete proof.")
+        (self.source / server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text("obsolete data")
+        original_read = server.read_utf8
+        def read(path, purpose):
+            self.assertNotEqual(Path(path).name, server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME)
+            return original_read(path, purpose)
+        with mock.patch.object(server, "critic_uses_parallel_audits", return_value=False):
+            with mock.patch.object(server, "read_utf8", side_effect=read):
+                with mock.patch.object(server, "valid_saved_audit_reports") as audits:
+                    checkpoints = server.saved_run_checkpoints(self.source)
+            self.assertEqual([item["id"] for item in checkpoints], ["candidate"])
+            audits.assert_not_called()
+
+    def test_final_input_requires_approval_for_unchanged_and_edited_passes(self):
+        for fixed, approved in ((None, False), (None, True), (False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(fixed=fixed, approved=approved):
+                app = server.App(runs=self.runs)
+                app._new_run(self.statement)
+                (app.run_dir / "checked-statement.md").write_text("# Checked statement\n\n" + self.statement)
+                records = [{"kind": "critic_result", "stage": "critic", "report": {
+                    "verdict": "pass", "solution": "Latest proof.", "bugs": "",
+                }}]
+                if fixed is not None:
+                    records[0]["report"]["fixed"] = fixed
+                if approved:
+                    records.append({"kind": "status", "stage": "critic", "node": "critic", "label": "Critic approved"})
+                process, token = mock.Mock(), object()
+                process.stdout = iter(json.dumps(record) + "\n" for record in records)
+                process.wait.return_value = 1
+                app.process, app.active_token = process, token
+                app.state.update(phase="running", stage="critic")
+                app._read_output(process, token)
+                self.assertEqual(app.state["finalInputReady"], approved)
+                final_input = app.run_dir / server.runtime.FINAL_INPUT_FILENAME
+                self.assertEqual(final_input.exists(), approved)
+                final_input.unlink(missing_ok=True)
+                if approved:
+                    self.assertEqual(server.saved_final_input(app.run_dir)["solution"], "Latest proof.")
+                else:
+                    with self.assertRaises(ValueError):
+                        server.saved_final_input(app.run_dir)
 
 
     def test_final_preserves_operational_input_before_launch(self):

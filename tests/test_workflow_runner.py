@@ -1,6 +1,5 @@
 """Offline behavioral tests. No paid model calls are made."""
 import contextlib
-import copy
 import io
 import json
 import os
@@ -16,10 +15,8 @@ PROOF = 'Every allowed case follows by the explicit argument supplied here.'
 LATEX = r'\documentclass{article}\begin{document}An explicit argument.\end{document}'
 
 
-def review_report(solution=PROOF, verdict='pass', fixed=False):
-    return {'checks': [{'focus': focus, 'verdict': 'pass', 'report': 'Checked.'}
-                       for focus in runtime.builtin_workflow('author_critic')['nodes']['critic']['parallel']['items']],
-            'verdict': verdict, 'fixed': fixed, 'solution': solution,
+def review_report(solution=PROOF, verdict='pass'):
+    return {'verdict': verdict, 'solution': solution,
             'bugs': 'A gap remains.' if verdict == 'reject' else ''}
 
 
@@ -39,17 +36,15 @@ def workspace():
 class PipelineTests(unittest.TestCase):
     def model(self, prompt, schema, stage, **settings):
         self.calls.append(settings.get('request_label', stage))
-        label = settings.get('request_label', '')
-        if label.startswith('Independent critic audit'):
-            value = {'focus': 'The supplied focus', 'verdict': 'pass', 'report': 'Checked all steps.'}
-        elif label == 'Critic coordinator adjudication':
+        if stage == 'critic':
+            self.assertEqual(settings['features'], ['multi_agent'])
             value = review_report()
         elif 'latex' in schema['properties']:
             value = {'latex': LATEX}
         elif 'verdict' in schema['properties']:
             value = {'verdict': 'pass', 'bugs': ''}
         else:
-            raise AssertionError(label)
+            raise AssertionError(stage)
         runtime.validate_json_schema(value, schema)
         return value, json.dumps(value)
 
@@ -64,69 +59,87 @@ class PipelineTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_single_goal_feeds_unchanged_critic_and_final_document(self):
+    def test_unchanged_first_critic_pass_goes_directly_to_final_document(self):
         with workspace() as directory, patch.object(runtime, 'structured', side_effect=self.model), patch.object(runtime, '_run_command', return_value={'status': 'pass', 'diagnostic': 'Compiled', 'engine': 'mock'}):
             state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'], {'statement': 'Exact test task'})
             self.assertFalse(state['failed'])
             self.assertEqual(state['output'], LATEX)
-            self.assertEqual(len([x for x in self.calls if x.startswith('Independent critic audit')]), 3)
+            self.assertEqual(self.calls.count('critic'), 1)
+            self.assertEqual(len(self.calls), 3)
             self.assertTrue((directory/'formatted-candidate.tex').is_file())
             self.assertEqual(len(self.goal_calls), 1)
             self.assertFalse((directory/'research.sqlite3').exists())
 
-    def test_repair_limit_preserves_candidate_without_approval_or_cleanup(self):
+    def test_edited_pass_repeats_to_max_then_outputs_latest_proof(self):
+        reports, events = [], []
         def model(prompt, schema, stage, **settings):
-            if settings.get('request_label') == 'Critic coordinator adjudication':
-                report = review_report(PROOF + ' repaired', fixed=True)
-                return report, json.dumps(report)
-            return self.model(prompt, schema, stage, **settings)
-        with workspace() as directory, patch.object(runtime, 'structured', side_effect=model):
-            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'],
-                {'statement': 'Task', 'solution': PROOF}, {'start_node':'critic','critic_rounds':1})
-            self.assertTrue(state['failed'])
-            self.assertIn('Verification incomplete', state['output'])
-            self.assertFalse((directory/'formatted-candidate.tex').exists())
-            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), PROOF+' repaired')
+            self.assertEqual(stage, 'critic')
+            self.assertEqual(settings['features'], ['multi_agent'])
+            self.assertIn(reports[-1]['solution'] if reports else PROOF, prompt)
+            report = review_report(PROOF + ' repaired' * (len(reports) + 1))
+            reports.append(report)
+            return report, json.dumps(report)
+        with workspace() as directory, patch.object(runtime, 'structured', side_effect=model), patch.object(runtime, 'emit', side_effect=lambda *args, **kwargs: events.append((args, kwargs))):
+            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],
+                {'statement': 'Task', 'solution': PROOF}, {'start_node': 'critic', 'critic_rounds': 3})
+            self.assertFalse(state.get('failed'))
+            self.assertEqual(len(reports), 3)
+            self.assertEqual(state['output'], PROOF + ' repaired' * 3)
+            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), state['output'])
+            approvals = [i for i, (_, fields) in enumerate(events) if fields.get('label') == 'Critic approved']
+            critic_results = [i for i, (args, _) in enumerate(events) if args[0] == 'critic_result']
+            self.assertEqual(len(approvals), 1)
+            self.assertGreater(approvals[0], critic_results[-1])
 
-    def test_critic_rejection_returns_to_the_same_author_session(self):
+    def test_unchanged_pass_after_repair_finishes_before_max(self):
+        repaired = PROOF + ' repaired'
+        report = review_report(repaired)
+        with workspace(), patch.object(runtime, 'structured', return_value=(report, json.dumps(report))) as model:
+            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],
+                {'statement': 'Task', 'solution': PROOF}, {'start_node': 'critic', 'critic_rounds': 5})
+            self.assertEqual(model.call_count, 2)
+            self.assertEqual(state['output'], repaired)
+
+    def test_rejection_at_max_returns_to_same_author_and_resets_rounds(self):
         revised = PROOF + ' with the objection resolved.'
-        feedback = []
-        rounds = []
+        feedback, rounds = [], []
         def author(runtime, prompt, **kwargs):
             feedback.append((yield {'outcome': 'done', 'output': PROOF}))
             yield {'outcome': 'done', 'output': revised}
         def model(prompt, schema, stage, **settings):
-            if settings.get('request_label') == 'Critic coordinator adjudication':
-                rounds.append(prompt)
-                report = review_report(verdict='reject') if len(rounds) == 1 else review_report(revised)
-                return report, json.dumps(report)
-            return self.model(prompt, schema, stage, **settings)
+            self.assertEqual(stage, 'critic')
+            rounds.append(prompt)
+            if len(rounds) == 2:
+                report = review_report(PROOF + ' safe repair', verdict='reject')
+            else:
+                report = review_report((PROOF if len(rounds) == 1 else revised) + ' repaired' * len(rounds))
+            return report, json.dumps(report)
         with workspace() as directory, patch.object(runtime, 'goal_session', side_effect=author) as session, patch.object(runtime, 'structured', side_effect=model):
             result = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'], {'statement': 'Task'})
             self.assertEqual(session.call_count, 1)
             self.assertEqual(feedback[0]['bugs'], 'A gap remains.')
-            self.assertEqual(result['output'], revised)
-            self.assertEqual(len(rounds), 2)
-            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), revised)
+            self.assertEqual(feedback[0]['solution'], PROOF + ' safe repair')
+            self.assertEqual(feedback[0]['round'], 2)
+            self.assertEqual(result['output'], revised + ' repaired' * 4)
+            self.assertEqual(len(rounds), 4)
+            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), result['output'])
 
-    def test_changed_proof_cannot_hide_behind_fixed_false(self):
-        node = runtime.builtin_workflow('author_critic')['nodes']['critic']
-        report = review_report(PROOF+' changed',fixed=False)
-        with workspace(), patch.object(runtime,'structured',return_value=(report,json.dumps(report))):
-            actual,_=runtime._model_call(node,runtime.builtin_workflow('author_critic')['prompts'],
-                {'statement':'Task','solution':PROOF}, {'parallel_results':report['checks']},1)
-            self.assertTrue(actual['fixed'])
+    def test_convenience_critic_makes_one_llm_call_with_subagents_enabled(self):
+        report = review_report()
+        with workspace(), patch.object(runtime, 'structured', return_value=(report, json.dumps(report))) as model:
+            self.assertEqual(runtime.criticize('Task', PROOF, 1), report)
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(model.call_args.kwargs['features'], ['multi_agent'])
 
-    def test_fresh_auditor_fail_cannot_be_replaced_by_coordinator_pass(self):
-        workflow=runtime.builtin_workflow('author_critic')
-        node=workflow['nodes']['critic']
-        report=review_report()
-        audits=copy.deepcopy(report['checks'])
-        audits[0]['verdict']='fail'
-        with workspace(),patch.object(runtime,'structured',return_value=(report,json.dumps(report))):
-            state={'statement':'Task','solution':PROOF}
-            with self.assertRaises(runtime.Error):
-                runtime._model_call(node,workflow['prompts'],state,{'parallel_results':audits},1)
+    def test_invalid_critic_result_cannot_approve_or_erase_saved_candidate(self):
+        invalid = [review_report(''), {**review_report(), 'bugs': 'An unresolved gap.'},
+                   {**review_report(verdict='reject'), 'bugs': ''}]
+        for report in invalid:
+            with self.subTest(report=report), workspace() as directory, patch.object(runtime, 'structured', return_value=(report, json.dumps(report))):
+                with self.assertRaises(runtime.Error):
+                    runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],
+                        {'statement': 'Task', 'solution': PROOF}, {'start_node': 'critic'})
+                self.assertEqual((directory/'saved-candidate.md').read_text().strip(), PROOF)
 
     def test_no_call_starts_after_shared_deadline(self):
         with workspace(),patch.object(runtime,'structured') as model:

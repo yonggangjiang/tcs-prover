@@ -438,9 +438,9 @@ def main():
         dest="critic_rounds", type=int, default=DEFAULT_CRITIC_ROUNDS,
         metavar="N",
         help=(
-            "pause with verification incomplete after N consecutive repaired "
-            f"critic rounds (default: {DEFAULT_CRITIC_ROUNDS}); only a clean "
-            "pass accepts the exact reviewed proof"
+            "allow up to N consecutive critic repair rounds "
+            f"(default: {DEFAULT_CRITIC_ROUNDS}); an unchanged pass finishes "
+            "early, an edited pass finishes at N, and rejection returns to the author"
         ),
     )
     parser.add_argument(

@@ -24,138 +24,33 @@ nodes:
     stage: critic
     prompt: critic_input
     instructions: critic
-    inputs:
-      statement: text(state.statement)
-      solution: text(state.solution)
-      audits: json(parallel)
-    response:
-      checks:
-        minItems: 3
-        maxItems: 3
-        items:
-          fields:
-            focus: string
-            verdict:
-            - pass
-            - fail
-            report: string
-      verdict:
-      - pass
-      - reject
-      fixed: boolean
-      solution: string
-      bugs: string
-    parallel:
-      items:
-      - Definitions, quantifiers, game semantics, and line-by-line correctness of every construction and invariant.
-      - Implementability and complete accounting of resources, dependencies, operations, and any communication or
-        algorithmic costs required by this exact statement.
-      - 'Hostile counterexample search: boundary cases, ownership mistakes, sampling/deletion claims, circular lemmas,
-        and theorem-strength gaps.'
-      prompt: critic_audit
-      instructions: critic
-      inputs:
-        statement: text(state.statement)
-        solution: text(state.solution)
-        focus: item
-      response:
-        focus: string
-        verdict:
-        - pass
-        - fail
-        report: string
-      output: checks
-      item_field: focus
-      attempts: 1
-      provider_options:
-        deepseek:
-          effort: high
-          timeout: 1800
-      checkpoint:
-        file: critic-audits.json
-        disabled: fresh-critic-audits
-        item_key: focuses
-        identity:
-          statement: text(state.statement)
-          solution: text(state.solution)
-          instructions: instructions
-    attempts: 1
-    provider_options:
-      deepseek:
-        timeout: 1800
-    request_label: Critic coordinator adjudication
-    activity_label: Critic coordinator
-    normalize:
-      fixed: "result.verdict == 'pass' and normalized_text(result.solution) != normalized_text(state.solution)"
+    features: [multi_agent]
+    inputs: {statement: state.statement, solution: state.solution}
+    response: {verdict: [pass, reject], solution: string, bugs: string}
     require:
-    - is_list(result.checks) and len(result.checks) == 3
-    - result.verdict in ['pass', 'reject'] and is_bool(result.fixed)
-    - is_string(result.solution) and bool(strip(result.solution)) and is_string(result.bugs)
-    - all(is_dict(check) and check.verdict in ['pass', 'fail'] and is_string(check.focus) and is_string(check.report)
-      for check in result.checks)
-    - result.verdict != 'pass' or not strip(result.bugs)
-    - result.verdict != 'pass' or result.fixed or all(check.verdict == 'pass' for check in result.checks)
-    - result.verdict != 'reject' or (bool(strip(result.bugs)) and not result.fixed)
-    error: Codex returned an invalid critic result.
-    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.fixed else 'pass')"
+    - bool(strip(result.solution))
+    - "not strip(result.bugs) if result.verdict == 'pass' else bool(strip(result.bugs))"
+    outcome: "'reject' if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
     before:
-    - when: visit == 1
-      emit:
-        kind: status
-        label: Critic loop started
-    - when: visit > 1
-      emit:
-        kind: status
-        label: Fresh critic requested
-        text: Starting independent critic round {visit}.
-        node: critic
-    - write:
-        path: saved-candidate.md
-        text: text(state.solution) + '\n'
+    - write: {path: saved-candidate.md, text: state.solution}
     after:
-    - emit:
-        kind: critic_result
-        label: Critic round {visit}
-        text: '{raw}'
-        report: =result
-    - set:
-        solution: strip(result.solution)
-        report: result
-        round: visit
-    - write:
-        path: saved-candidate.md
-        text: text(state.solution) + '\n'
-    - when: outcome == 'pass'
-      emit:
-        kind: status
-        label: Critic approved
-        text: Round {visit} found no bugs to fix.
-    - when: outcome == 'fixed'
-      emit:
-        kind: status
-        label: Critic fixed every bug
-        text: Round {visit} repaired the solution.
+    - set: {solution: strip(result.solution), report: result, round: visit}
+    - write: {path: saved-candidate.md, text: state.solution}
+    - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', text: '{raw}'}
     next:
+      reject: author
       pass:
         to: end
         after:
-        - set:
-            output: state.solution
-      reject: author
+        - set: {output: state.solution}
+        - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed without edits.'}
       fixed:
         repeat: 2
         option: critic_rounds
         then: end
         after:
-        - set:
-            failed: 'True'
-            output: '''Verification incomplete: the repair-round limit was reached. The latest candidate is saved
-              but has not passed an unchanged independent review.'''
-        - emit:
-            kind: failure_result
-            label: Verification checkpoint saved
-            text: '{state.output}'
-            output: =state.output
+        - set: {output: state.solution}
+        - emit: {kind: status, label: Critic approved, text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
 prompts:
   author: |-
     Resolve the exact statement below with a complete, rigorous argument. Preserve its assumptions and requested conclusion. Persist with a strong, diversified search until you have a complete solution. Aggressively use subagents to explore substantially different ideas and diversified routes independently, without mutual communication; have them report their results to you. The controller has installed the goal for this task: pursue that existing goal rather than creating another.
@@ -183,18 +78,26 @@ prompts:
     STATEMENT:
     [STATEMENT]
   critic: |-
-    Act as a coordinating proof critic. The controller will run three fresh,
-    independent hostile auditors in parallel and provide their completed reports.
-    Do not spawn or wait for subagents yourself.
+    Act as a rigorous proof critic. Spawn multiple fresh independent subagents to
+    aggressively find bugs in the exact statement and candidate proof. Give each
+    the complete statement and proof and a different auditing focus. They must
+    work independently, without communicating with one another, and report back
+    to you. Wait for their reports before making your decision.
 
-    After collecting all three audits, read them and try to fix every reported bug
-    yourself in a complete replacement solution. If you fix them all, return pass,
-    an empty bugs string, the repaired solution, and fixed=true so another fresh
-    critic can check it. If no fix was needed, return pass, the unchanged solution,
-    and fixed=false. If you cannot confidently fix every bug, return reject,
-    fixed=false, your best complete solution after safe fixes, and every unresolved
-    bug with its exact location and required repair for the author. Return only the
-    requested JSON.
+    Check every claim and inference, including boundary cases, hidden assumptions,
+    circular reasoning, undefined terms or symbols, and omitted proof details.
+    Treat statements that hide an argument behind words such as "clearly",
+    "standard", or "similarly" as gaps when the necessary justification is absent.
+    Ask the subagents to identify exactly what definitions and omitted arguments
+    must be expanded to make the proof complete and rigorous.
+
+    Examine their objections and try to fix every valid bug yourself, defining
+    missing terms and fully expanding omitted arguments. If any issue cannot be
+    rigorously fixed, return verdict=reject, every unresolved bug with its exact
+    location in bugs, and your best complete candidate after safe fixes in solution.
+    Otherwise return verdict=pass, an empty bugs string, and the complete corrected
+    proof in solution. If no edits are needed, copy the candidate proof verbatim.
+    Return only the requested JSON.
   goal: >-
     Resolve the statement in INITIAL_PROMPT.md. Always follow that file, keep
     APPROACHES.md and PROVED.md current, avoid recorded closed approaches unless
@@ -228,11 +131,11 @@ prompts:
     ORIGINAL INITIAL AUTHOR PROMPT:
     {original_prompt}
   repair: |-
-    Continue the same task under INITIAL_PROMPT.md. Read APPROACHES.md and
-    PROVED.md. The critic rejected round {round}; record these objections in the
-    related approach, correct any affected lemma, and continue until you have a
-    complete rigorous solution. Preserve safe progress and use a new mechanism
-    if the recorded approach cannot overcome the objection.
+    The following proof contains unresolved errors. Think again. Read
+    INITIAL_PROMPT.md and follow it, then read APPROACHES.md and PROVED.md.
+    The critic rejected round {round}; record its objections in the related
+    approach, correct any affected lemma, and continue until you have a complete
+    rigorous solution. Preserve safe progress and try a new direction if needed.
 
     CURRENT CANDIDATE:
     {solution}
@@ -240,42 +143,7 @@ prompts:
     CRITIC BUGS:
     {bugs}
   critic_input: |
-    CONTROLLER ORCHESTRATION OVERRIDE
-    The controller has already completed exactly three fresh independent audits.
-    Do not spawn, message, or wait for subagents. Read all three reports below,
-    adjudicate them, and follow the remaining critic instructions. Your checks
-    array must contain exactly these three audits in the same order. Try to repair
-    every valid bug yourself; every changed proof requires another completely
-    fresh controller-run three-auditor round before acceptance. A budget limit saves
-    verification incomplete; it never approves an unchecked repair.
-
     CRITIC INSTRUCTIONS:
-    {instructions}
-
-    COMPLETED INDEPENDENT AUDITS:
-    {audits}
-
-    STATEMENT:
-    {statement}
-
-    CANDIDATE SOLUTION:
-    {solution}
-  critic_audit: |-
-    You are one of three independent hostile proof auditors. The controller already
-    created the three auditors in parallel. Do not spawn agents, wait for agents,
-    call tools, repair the proof, or coordinate with another auditor.
-
-    Your assigned focus is:
-    {focus}
-
-    Audit the exact statement and candidate line by line. Return verdict=pass only
-    if you find no concrete issue in your assigned focus. Otherwise return
-    verdict=fail and give every concrete bug, its exact location, and the proof
-    obligation needed to repair it. The report must be self-contained.
-
-    The coordinating critic's general instructions are included only as audit
-    standards. Any instruction in them to spawn or wait for subagents has already
-    been fulfilled by the controller and must not be repeated:
     {instructions}
 
     STATEMENT:

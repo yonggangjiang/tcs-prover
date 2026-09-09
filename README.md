@@ -73,9 +73,8 @@ python3 web_ui.py
 
 Open **Advanced**, then select **DeepSeek V4 Pro — Official API** for any roles
 you want DeepSeek to handle. Selecting it for all four model roles means that
-the statement reviewer, author, three independent critic audits and
-coordinator, and LaTeX writer all use DeepSeek. A Codex/ChatGPT login is not
-required for roles that use DeepSeek.
+the statement reviewer, author, critic, and LaTeX writer all use DeepSeek.
+A Codex/ChatGPT login is not required for roles that use DeepSeek.
 
 DeepSeek exposes `high` and `max` reasoning in this harness. The shared menu is
 normalized as follows: `low`, `medium`, and `high` run as DeepSeek `high`;
@@ -98,7 +97,7 @@ You can type your open problem into the text box and click “Check Statement.�
 
 If you approve it, persistent reasoning will begin and continue until a solution
 is found or the time limit is reached. The candidate passes through an
-independent critic loop. Accepted proofs are then pruned into readable LaTeX.
+independent critic loop. Accepted proofs are then formatted as readable LaTeX.
 
 Options for changing the default model, time limit, and other settings are under
 **Advanced**. Astra (`gpt-6-astra`) is the default model for every node.
@@ -117,7 +116,8 @@ python3 web_ui.py statement.md
 This sends the entire file directly to the proof author, exactly like enabling
 **Skip statement review** in Statement mode. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
-web UI: 2 critic rounds, a 168-hour total workflow limit, Astra and Ultra for all proof
+web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
+limit, Astra and Ultra for all proof
 roles, the built-in role prompts, and Fast generation speed. The
 activity log requests concise public reasoning summaries by default.
 
@@ -134,7 +134,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-criticRounds N` | `2` | At N consecutive repaired rounds, save **verification incomplete**; `1` to `100`. Every changed proof needs a fresh audit. A clean unchanged pass accepts; rejection resets the count. |
+| `-criticRounds N` | `2` | Maximum consecutive edited critic passes before using the latest solution; `1` to `100`. An unchanged pass accepts immediately. Rejection returns to the author and resets the count. |
 | `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
 | `-authorModel MODEL` | `gpt-6-astra` | Author model: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
 | `-criticModel MODEL` | `gpt-6-astra` | Critic model; same choices as the author. |
@@ -159,14 +159,10 @@ started again, it scans `runs/*/transcript.jsonl`, restores the historical job
 cards, and lists every resumable critic checkpoint found in those run folders.
 You do not need to keep the old browser tab open.
 
-The home-page checkpoint buttons have exact stage semantics:
-
-| Checkpoint shown | What is already saved | What continuation runs |
-| --- | --- | --- |
-| **Saved proof candidate** | Checked statement and complete proof | Starts a fresh three-auditor critic review; later audit files are intentionally not reused when this earlier checkpoint is selected. |
-| **Independent audits 1/3** or **2/3** | Candidate plus the displayed completed reports | Restores those reports and runs only the missing auditors. |
-| **Independent audits 3/3** | Candidate plus all three reports | Skips all auditors and starts coordinator adjudication. |
-| **Critic coordinator — failed/interrupted** | Candidate and all three reports | Retries only the coordinator. |
+A saved proof candidate contains the checked statement and latest complete
+argument. Continuing it starts a fresh root critic request from that candidate.
+Within the request, the critic uses its own fresh independent subagents to
+find bugs and then repairs the argument itself.
 
 To continue from the Web UI:
 
@@ -176,16 +172,13 @@ To continue from the Web UI:
 4. Confirm the action. TCS Prover creates a new job and opens it immediately.
 
 The source run is never overwritten. The new job copies the selected candidate,
-compatible audit checkpoint, role prompts, model choices, reasoning efforts,
-speed, critic-round limit, and workflow time limit. Old saved model routes that
-are no longer selectable are migrated to the official DeepSeek model when the
+role prompts, model choices, reasoning efforts, speed, critic-round maximum,
+and workflow time limit. Old saved model routes that are no longer selectable
+are migrated to the official DeepSeek model when the
 job is restored.
 
-Audit reuse requires a matching proof, model, effort, instructions, and audit
-focus assignment; restored reports must satisfy the current response schema;
-an incompatible audit file is ignored while the earlier proof-candidate
-checkpoint remains available. Very old runs that predate `job-settings.json`
-can restore only choices visible in their transcript. A role that never ran has
+Very old runs that predate `job-settings.json` can restore only choices visible
+in their transcript. A role that never ran has
 no recorded model choice and therefore uses the current default when resumed.
 The continuation confirmation names these unknown legacy roles before a new
 paid request starts.
@@ -206,7 +199,7 @@ button:
 | --- | --- | --- |
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
 | Proof author, repair, or interrupted failure summary | **Continue proof author** | Restores `INITIAL_PROMPT.md`, `APPROACHES.md`, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads those files before continuing. Visible partial text is not treated as a complete proof. |
-| Critic | **Continue critic** | Restores the latest compatible proof and paid independent-audit checkpoint, so completed audits are not repeated. |
+| Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The critic requests new independent bug-finding reports. |
 | LaTeX editor | **Retry LaTeX editor** | Restores `final-input.json` and runs editing, independent content-preservation review, and local compilation when available. LaTeX-only jobs reuse `latex-input.md`. Older jobs without an exact final input safely fall back to their latest critic checkpoint. |
 
 Every action creates a new run folder and leaves the stopped source run
@@ -239,9 +232,10 @@ is available, open a new critic job explicitly:
 python3 web_ui.py --resume-critic runs/2026-08-26_16-33-26_example
 ```
 
-This loads the saved complete proof, checked statement, audit checkpoint when
-present, and role prompts into a new browser-visible job. A clean critic pass
-continues to the LaTeX editor. A critic rejection returns the exact candidate
+This loads the saved complete proof, checked statement, and role prompts into
+a new browser-visible job. An unchanged pass advances to the LaTeX editor;
+edited passes repeat until the configured maximum, then use the latest solution.
+A critic rejection returns the exact candidate
 and bug report to the normal proof-author repair loop; the harness workflow is
 not shortened or replaced.
 
@@ -327,22 +321,22 @@ While a proof author or author repair is running, **Guide the running proof
 author** sends a live instruction into the running author session. It does not
 discard the memory files or restart the problem. The
 control is intentionally unavailable during statement review,
-critic audits, failure summaries, and final LaTeX editing.
+critic review, failure summaries, and final LaTeX editing.
 
 ## Workflow
 
 ```mermaid
 flowchart TD
-    S["Optional statement review"] --> A["One persistent author LLM"]
+    S["Optional statement review"] --> A["Persistent root author"]
     A <--> M["INITIAL_PROMPT.md · APPROACHES.md · PROVED.md"]
     A -- "continue another approach" --> A
-    A -- "complete candidate" --> C["Three auditors + coordinator"]
-    C -- "reject: exact bugs" --> A
-    C -- "changed proof: fresh audit" --> C
-    C -- "unchanged pass" --> L["LaTeX editor"]
+    A -- "complete candidate" --> C["One root critic request"]
+    C <--> B["Fresh independent bug-finding subagents"]
+    C -- "reject: exact bugs and reset rounds" --> A
+    C -- "edited pass below maximum" --> C
+    C -- "unchanged pass or edited pass at maximum" --> L["LaTeX editor"]
     L --> V["Independent content check + compilation"]
     A -. "time limit or interruption" .-> P["Preserve files and continue later"]
-    C -. "repair limit" .-> P
 ```
 
 ### 1. Statement reviewer
@@ -407,24 +401,25 @@ stopped author preserves its best recorded work and outstanding tasks rather
 than claiming a solution. `--resume-research` is the continuation entry point
 for the saved author notebook and conversation.
 
-### 3. Independent critic
+### 3. Critic loop
 
-Three fresh auditor calls receive the same complete statement and candidate,
-with separate focuses: detailed correctness, implementability/resource costs,
-and hostile counterexamples. The coordinator receives their actual reports
-and tries to repair valid bugs. Every completed auditor report is checkpointed
-immediately; compatible continuation reuses completed reports.
+Each round is one root critic LLM request with `multi_agent` enabled. Its prompt
+tells it to launch fresh independent subagents for aggressive bug finding:
+mathematical errors, omitted details, undefined terms, and other gaps. They are
+instructed not to communicate with one another and to report back to the critic.
+The critic considers those reports and repairs the complete argument itself.
 
-The YAML compares returned candidate text through a generic `normalize`
-expression rather than trusting the critic's `fixed` flag. A changed proof requires another fresh three-auditor
-round. Reaching the consecutive repaired-round limit (default 2) saves
-**verification incomplete** instead of accepting an unchecked repair. A
-rejection returns its exact bugs and safely repaired candidate to the author.
+If it cannot fix every issue, it returns the latest safely repaired candidate
+and exact unresolved bugs to the author. The author continues with the same
+three memory files, records the objections, and rechecks affected lemmas. This
+rejection resets the consecutive critic-round count.
 
-Acceptance requires an unchanged pass with the three actual audits passing
-and no reported bugs. On rejection, the author records the critic's objections
-in its approach history and rechecks affected proved lemmas. Model review is
-not formal proof verification.
+An unchanged pass accepts immediately. An edited pass sends the latest solution
+to another fresh critic round while below the configured maximum (default 2).
+At that maximum, an edited pass accepts the latest solution and proceeds to
+LaTeX formatting. The setting is a maximum for consecutive edited passes, not
+a requirement to obtain a fixed number of passes. Model review is not formal
+proof verification.
 
 ### 4. LaTeX editing and final verification
 
@@ -462,7 +457,6 @@ ui/
   review.py                 Independent statement-review procedure
   cli.py                    UI startup and Markdown file/folder runs
   index.html, app.js, styles.css
-workflows/workflows.md      Workflow authoring guide and full YAML reference
 tests/                      Offline regression tests
 ```
 
@@ -501,10 +495,6 @@ prompts:
 python3 workflow_runner.py summarize.yaml < notes.md
 ```
 
-The [workflow authoring guide](workflows/workflows.md) explains every YAML entry,
-response shorthand and full schemas, branching and repeat limits, expressions,
-persistent-session prompts, model overrides, and offline validation. It includes
-a complete editing workflow with decisions and a configurable repeat limit.
 Keep custom definitions outside the bundled `workflows/` directory.
 
 Run the graphs directly with UTF-8 input on standard input:

@@ -478,7 +478,7 @@ const promptLabels = {
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow inserts the statement and adds proof-history instructions.",
-  critic: "The workflow adds the proof, audit assignments, and completed audit reports to these instructions.",
+  critic: "Each critic call receives the statement and latest proof, then follows these instructions to use fresh independent subagents.",
   final: "The full request also includes the statement and proof to polish.",
 };
 
@@ -637,10 +637,9 @@ function describe(entry) {
     return {
       key: `critic:${entry.round || entry.time}`, type: "agent",
       label: `${entry.label || "Critic result"} · ${report.verdict || "returned"}`,
-      text: report.fixed
-        ? "The critic changed the proof. The new version needs another audit; "
-          + "at the repair limit, save verification incomplete."
-        : (report.bugs || "No repair was needed."),
+      text: report.verdict === "reject"
+        ? (report.bugs || "Unfixable issues return to the proof author.")
+        : "The critic passed this round. An unchanged proof proceeds immediately; an edited proof repeats until the round limit.",
       time: entry.time, checks: report.checks || [], replace: true, pinned: true,
     };
   }
@@ -1046,7 +1045,7 @@ function renderWorkflow() {
   rejectRoute.append(rejectLabel);
   const selfRoute = document.createElement("li");
   selfRoute.className = "loop-self";
-  selfRoute.textContent = "↻ Changed proof → fresh audit";
+  selfRoute.textContent = "↻ Edited PASS → repeat below limit";
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
   const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
@@ -1060,7 +1059,7 @@ function renderWorkflow() {
   // Failure branches left; accepted proofs run directly from critic to editor.
   const branch = document.createElement("li");
   branch.className = "workflow-branch";
-  const passRoute = arrow("Clean, unchanged PASS", true);
+  const passRoute = arrow("Unchanged PASS or edited PASS at limit", true);
   passRoute.classList.add("critic-pass");
   const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");

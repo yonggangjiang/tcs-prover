@@ -208,14 +208,14 @@
                 </p>
               </div>
               <div id="criticRoundSetting" class="round-setting">
-                <label for="criticRounds">Consecutive repair limit</label>
+                <label for="criticRounds">Maximum consecutive critic rounds</label>
                 <input id="criticRounds" type="number" min="1" max="100"
                   step="1" value="2" aria-describedby="roundHelp">
                 <p id="roundHelp" class="help">
-                  Default 2 consecutive repaired rounds. Only a clean PASS of
-                  the exact reviewed proof proceeds. At the limit, save the
-                  proof as verification incomplete for later continuation.
-                  Rejection returns to the author and resets the count.
+                  Default 2 rounds. Each critic call uses fresh independent
+                  subagents and fixes issues. An unchanged PASS proceeds immediately;
+                  an edited PASS repeats until the limit, then proceeds.
+                  Unfixable issues return to the author and reset the count.
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">

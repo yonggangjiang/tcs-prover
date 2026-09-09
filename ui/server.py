@@ -63,6 +63,12 @@ def goal_thread_from_record(record):
     return ""
 
 
+def critic_uses_parallel_audits():
+    """Whether the built-in critic supports legacy controller audit checkpoints."""
+
+    return bool(runtime.builtin_workflow("author_critic")["nodes"]["critic"].get("parallel"))
+
+
 def isolated_process_options():
     """Put each Codex wrapper in a group that can be stopped as one unit."""
 
@@ -235,11 +241,11 @@ PUBLIC_GRAPH = {
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
             "stage": "critic",
-            "description": "Audits exact proof versions; a repair limit pauses with verification incomplete.",
+            "description": "One critic call uses fresh independent subagents, checks the proof, and fixes issues. Unfixable issues return to the author.",
         },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
-            "description": "Formats the exact proof that received a clean, unchanged critic pass.",
+            "description": "Formats the passing proof when no edits were needed or the critic round limit was reached.",
         },
         "final_verifier": {
             "label": "Final verifier", "short_label": "Verify", "stage": "final",
@@ -265,7 +271,7 @@ PUBLIC_GRAPH = {
         {
             "from": "critic", "to": "critic",
             "label": "Recheck repair", "when": "critic fixes all bugs and the round limit is not reached",
-            "prompt_change": "Send the repaired solution to a fresh critic.",
+            "prompt_change": "Send the repaired solution to a fresh critic call with new independent subagents.",
         },
         {
             "from": "critic", "to": "author",
@@ -274,13 +280,13 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "critic", "to": "latex_editor",
-            "label": "Format reviewed proof", "when": "critic passes the exact unchanged proof with no open obligations",
+            "label": "Format reviewed proof", "when": "critic passes without edits or passes with edits at the round limit",
             "prompt_change": "Send the independently reviewed solution to the LaTeX editor.",
         },
         {
             "from": "critic", "to": "failure_summary",
-            "label": "Save verification checkpoint", "when": "the repair limit or remaining time budget is reached",
-            "prompt_change": "Preserve the candidate and completed audits without approving an unchecked repair.",
+            "label": "Save verification checkpoint", "when": "the critic is interrupted or the time budget is reached",
+            "prompt_change": "Keep the latest saved proof for continuation at the critic.",
         },
         {
             "from": "latex_editor", "to": "final_verifier",
@@ -1528,12 +1534,12 @@ class App:
             })
             self._save("checked-statement.md", f"# Checked statement\n\n{statement}\n")
             self._save(runtime.SAVED_CANDIDATE_FILENAME, solution + "\n")
-            if audit_checkpoint:
+            if audit_checkpoint and critic_uses_parallel_audits():
                 self._save(
                     runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
                     str(audit_checkpoint),
                 )
-            if not recover_audit_checkpoint:
+            if not recover_audit_checkpoint and critic_uses_parallel_audits():
                 self._save(
                     runtime.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME,
                     (
@@ -1593,6 +1599,7 @@ class App:
         """Store tagged solver events and build the visible final answer."""
 
         problem, answers, order, final, failed = "", {}, [], False, False
+        latest_critic_solution = ""
         try:
             for line in process.stdout:
                 if self.output_stream is not None:
@@ -1645,25 +1652,28 @@ class App:
                     order.clear()
                     with self.lock:
                         self.state["output"] = ""
-                report = record.get("report")
+                if record.get("kind") == "critic_result":
+                    report = record.get("report")
+                    latest_critic_solution = (
+                        report["solution"] if isinstance(report, dict)
+                        and report.get("verdict") == "pass"
+                        and isinstance(report.get("solution"), str)
+                        else ""
+                    )
                 if (
-                    record.get("kind") == "critic_result"
-                    and isinstance(report, dict)
-                    and report.get("verdict") == "pass"
-                    and report.get("fixed") is False
-                    and isinstance(report.get("solution"), str)
-                    and report["solution"].strip()
+                    record.get("kind") == "status"
+                    and record.get("label") == "Critic approved"
+                    and latest_critic_solution.strip()
                 ):
                     try:
                         runtime.save_final_input(
-                            saved_statement(self.run_dir),
-                            report["solution"],
+                            saved_statement(self.run_dir), latest_critic_solution,
                             directory=self.run_dir,
                         )
                         with self.lock:
                             self.state["finalInputReady"] = True
                     except (OSError, UnicodeError, TypeError, ValueError):
-                        # The clean critic record remains a legacy recovery path.
+                        # The explicit approval in the transcript remains recoverable.
                         pass
                 if record.get("kind") == "final_result":
                     with self.lock:
@@ -2095,8 +2105,9 @@ def checkpoint_artifact_signature(run_dir, include_transcript=True):
     names = [
         "checked-statement.md",
         "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME,
-        runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
     ]
+    if critic_uses_parallel_audits():
+        names.append(runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME)
     # The live transcript changes on every heartbeat. Candidate and audit files
     # cover checkpoints that can appear while a job is active; scan the full
     # transcript once the job becomes idle to discover coordinator failures.
@@ -2114,6 +2125,8 @@ def checkpoint_artifact_signature(run_dir, include_transcript=True):
 def valid_saved_audit_reports(run_dir, source):
     """Return only audit reports the runner can actually restore."""
 
+    if not critic_uses_parallel_audits():
+        return []
     run_dir = Path(run_dir)
     path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
     try:
@@ -2214,6 +2227,8 @@ def saved_run_checkpoints(run_dir):
             "resumeLabel": "Continue at critic",
         })
 
+    if not critic_uses_parallel_audits():
+        return checkpoints
     audit_path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
     reports = valid_saved_audit_reports(run_dir, source) if source else []
     completed_audits = sum(report is not None for report in reports)
@@ -2671,23 +2686,22 @@ def saved_final_input(path, records=None):
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
 
-    # Backward compatibility for runs created before final-input.json. Only a
-    # clean, unchanged critic pass identifies the exact historical final input.
+    # The workflow approves either an unchanged pass or an edited pass at its limit.
     records = _run_records(run_dir) if records is None else records
-    for record in reversed(records):
-        report = record.get("report")
-        if (
-            record.get("kind") == "critic_result"
-            and isinstance(report, dict)
-            and report.get("verdict") == "pass"
-            and report.get("fixed") is False
-            and isinstance(report.get("solution"), str)
-            and report["solution"].strip()
-        ):
-            return {
-                "statement": saved_statement(run_dir),
-                "solution": report["solution"].strip(),
-            }
+    latest_solution, approved_solution = "", ""
+    for record in records:
+        if record.get("kind") == "critic_result":
+            report = record.get("report")
+            latest_solution = (
+                report["solution"] if isinstance(report, dict)
+                and report.get("verdict") == "pass"
+                and isinstance(report.get("solution"), str)
+                else ""
+            )
+        elif record.get("kind") == "status" and record.get("label") == "Critic approved":
+            approved_solution = latest_solution
+    if approved_solution.strip():
+        return {"statement": saved_statement(run_dir), "solution": approved_solution.strip()}
     raise ValueError(
         "This stopped final-editor job has no exact saved final input. "
         "Continue it from its latest critic checkpoint instead."
@@ -2717,7 +2731,7 @@ def saved_critic_source(path):
     try:
         audit_checkpoint = (
             read_utf8(checkpoint_path, "saved critic audit checkpoint")
-            if checkpoint_path.exists() else ""
+            if critic_uses_parallel_audits() and checkpoint_path.exists() else ""
         )
     except ValueError:
         # A corrupt optional audit must not hide the earlier valid candidate.
@@ -3147,8 +3161,8 @@ class Server(ThreadingHTTPServer):
                 "action": "critic",
                 "label": "Continue critic",
                 "description": (
-                    "Restores the saved proof and compatible "
-                    "independent audits in a new run with a renewed time budget."
+                    "Restores the saved proof for a fresh critic call and "
+                    "independent subagents in a new run with a renewed time budget."
                 ),
             }
         if stage == "final":
