@@ -49,6 +49,7 @@ JOB_SETTINGS_FILENAME = "job-settings.json"
 MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
+RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md"}
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
@@ -702,6 +703,36 @@ class App:
                 if isinstance(failure, dict) else failure
             )
         return value.strip() if isinstance(value, str) else ""
+
+    def memory_file(self, name, version=""):
+        """Display one author-owned file on demand, without modifying it."""
+
+        if name not in RESEARCH_MEMORY_FILES:
+            raise ValueError("Unknown research memory file.")
+        with self.lock:
+            directory = self.state.get("goalWorkspace") or self.run_dir
+        result = {"name": name, "status": "missing"}
+        if not directory:
+            return result
+        directory = Path(directory).expanduser().resolve()
+        path = directory / name
+        result["workspace"] = directory.name
+        try:
+            if path.is_symlink():
+                return {**result, "status": "unavailable"}
+            if not path.is_file():
+                return result
+            info = path.stat()
+            current_version = f"{directory}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
+            result.update(status="ready", version=current_version,
+                          modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
+            if current_version == version:
+                return {**result, "unchanged": True}
+            return {**result, "content": path.read_text(encoding="utf-8")}
+        except FileNotFoundError:
+            return {**result, "status": "missing"}
+        except (OSError, UnicodeError):
+            return {**result, "status": "unavailable"}
 
     def snapshot(self, after=None):
         """Copy state, optionally returning only newly appended records."""
@@ -3445,6 +3476,15 @@ class Handler(BaseHTTPRequestHandler):
         run_id = (query.get("job") or [""])[0]
         if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
             return self.send({"error": "Untrusted local host."}, status=403)
+        if request.path == "/memory":
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                name = (query.get("file") or [""])[0]
+                version = (query.get("version") or [""])[0]
+                return self.send(self.server.get_job(run_id).memory_file(name, version))
+            except ValueError as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/state":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)

@@ -291,6 +291,32 @@
             <span id="roundBadge" class="round-badge" hidden></span>
           </div>
 
+          <details id="memoryPanel" class="memory-panel" hidden>
+            <summary>
+              <span class="memory-mark" aria-hidden="true">≡</span>
+              <span><strong>Research memory</strong><small>Prompt, attempted approaches, and proved lemmas</small></span>
+              <span class="memory-chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="memory-tabs" role="tablist" aria-label="Research memory files">
+              <button id="memoryPromptTab" type="button" role="tab" aria-selected="true"
+                aria-controls="memoryDocument" data-memory="INITIAL_PROMPT.md">Initial prompt</button>
+              <button id="memoryApproachesTab" type="button" role="tab" aria-selected="false"
+                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES.md">Attempted approaches</button>
+              <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
+                aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
+            </div>
+            <div class="memory-meta">
+              <code id="memoryFilename">INITIAL_PROMPT.md</code>
+              <span id="memoryUpdated" role="status"></span>
+            </div>
+            <div id="memoryDocument" class="memory-document" role="tabpanel"
+              aria-labelledby="memoryPromptTab" tabindex="0">
+              <p id="memoryMessage" class="memory-message">Open a file to read the author’s saved work.</p>
+              <div id="memoryContent" class="memory-content"></div>
+            </div>
+            <p class="memory-footer">Read-only · Refreshes automatically while open</p>
+          </details>
+
           <section class="timeline-surface" aria-labelledby="activityHeading">
             <div class="timeline-head">
               <div>

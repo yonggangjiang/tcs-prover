@@ -62,6 +62,9 @@ const ui = {
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
   modelSummary: $("modelSummary"),
   lastActivity: $("lastActivity"), timeline: $("timelineList"),
+  memoryPanel: $("memoryPanel"), memoryFilename: $("memoryFilename"),
+  memoryUpdated: $("memoryUpdated"), memoryDocument: $("memoryDocument"),
+  memoryMessage: $("memoryMessage"), memoryContent: $("memoryContent"),
   jump: $("jumpLatest"), filters: $("filters"),
   workflowRail: $("workflowRail"), workflowNodes: $("workflowNodes"),
   activityToggle: $("activityToggle"), activityPanel: $("activityPanel"),
@@ -93,6 +96,12 @@ let promptStorageFallback = null;
 const promptStorageKey = "tcs-prover-role-prompts";
 const timelineRows = new Map();
 const detailRows = new Map();
+const memoryTabs = [...document.querySelectorAll("[data-memory]")];
+let memoryJob = null;
+let memoryFile = "INITIAL_PROMPT.md";
+let memoryVersion = "";
+let memoryTimer;
+let memoryRequest = 0;
 const pinnedKinds = new Set([
   "request", "review_result", "critic_result", "author_result",
   "final_result", "failure_result", "partial_result", "diagnostic", "error",
@@ -785,6 +794,146 @@ function appendFormattedText(element, value) {
   }
 }
 
+// Readable Markdown sections, built with text nodes so file content cannot run HTML.
+function renderMemoryContent(value) {
+  const scrollTop = ui.memoryDocument.scrollTop;
+  const expanded = new Map([...ui.memoryContent.querySelectorAll("details")]
+    .map((section) => [section.dataset.heading, section.open]));
+  const fragment = document.createDocumentFragment();
+  let target = fragment;
+  let paragraph = [];
+  let code = null;
+  let fence = "";
+  let sections = 0;
+  const flush = () => {
+    if (!paragraph.length) return;
+    const copy = document.createElement("p");
+    appendFormattedText(copy, paragraph.join("\n"));
+    target.append(copy);
+    paragraph = [];
+  };
+  for (const line of value.split(/\r?\n/)) {
+    const marker = line.match(/^\s*(`{3,}|~{3,})/);
+    if (code !== null) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
+        const pre = document.createElement("pre");
+        pre.textContent = code.join("\n");
+        target.append(pre);
+        code = null;
+      } else code.push(line);
+      continue;
+    }
+    if (marker) { flush(); code = []; fence = marker[1]; continue; }
+    const heading = line.match(/^(#{1,6})\s+(.+)/);
+    if (heading) {
+      flush();
+      if (heading[1].length === 2) {
+        const section = document.createElement("details");
+        section.className = "memory-section";
+        section.dataset.heading = heading[2];
+        section.open = expanded.get(heading[2]) ?? (sections === 0);
+        const summary = document.createElement("summary");
+        appendFormattedText(summary, heading[2]);
+        target = document.createElement("div");
+        target.className = "memory-section-body";
+        section.append(summary, target);
+        fragment.append(section);
+        sections += 1;
+      } else {
+        const title = document.createElement(heading[1].length === 1 ? "h3" : "h4");
+        appendFormattedText(title, heading[2]);
+        if (heading[1].length === 1) target = fragment;
+        target.append(title);
+      }
+    } else if (!line.trim()) flush();
+    else paragraph.push(line);
+  }
+  flush();
+  if (code !== null) {
+    const pre = document.createElement("pre");
+    pre.textContent = code.join("\n");
+    target.append(pre);
+  }
+  ui.memoryContent.replaceChildren(fragment);
+  ui.memoryDocument.scrollTop = scrollTop;
+}
+
+async function loadMemory() {
+  clearTimeout(memoryTimer);
+  if (!ui.memoryPanel.open || ui.memoryPanel.hidden || document.hidden) return;
+  const job = currentJob;
+  const requestId = ++memoryRequest;
+  try {
+    const file = await request(jobPath("/memory", { file: memoryFile, version: memoryVersion }));
+    if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+    if (file.status === "ready") {
+      if (!file.unchanged) {
+        memoryVersion = file.version;
+        renderMemoryContent(file.content);
+        ui.memoryMessage.textContent = "This file is still empty.";
+        show(ui.memoryMessage, !file.content.trim());
+      }
+      ui.memoryUpdated.textContent = `Updated ${new Date(file.modifiedAt).toLocaleString()}`;
+    } else {
+      memoryVersion = "";
+      ui.memoryContent.replaceChildren();
+      ui.memoryMessage.textContent = file.status === "missing"
+        ? "The author has not created this file yet. It will appear here when saved."
+        : "This file is unavailable right now. Trying again shortly…";
+      show(ui.memoryMessage, true);
+      ui.memoryUpdated.textContent = file.status === "missing" ? "Not created yet" : "Temporarily unavailable";
+    }
+  } catch (error) {
+    if (job !== currentJob || requestId !== memoryRequest) return;
+    ui.memoryUpdated.textContent = "Could not refresh. Retrying…";
+    if (!memoryVersion) {
+      ui.memoryMessage.textContent = error.message;
+      show(ui.memoryMessage, true);
+    }
+  } finally {
+    if (job === currentJob && requestId === memoryRequest && ui.memoryPanel.open && !ui.memoryPanel.hidden) {
+      memoryTimer = setTimeout(loadMemory, 5000);
+    }
+  }
+}
+
+function selectMemoryFile(tab) {
+  ++memoryRequest;
+  memoryFile = tab.dataset.memory;
+  memoryVersion = "";
+  for (const item of memoryTabs) {
+    item.setAttribute("aria-selected", String(item === tab));
+    item.tabIndex = item === tab ? 0 : -1;
+  }
+  ui.memoryFilename.textContent = memoryFile;
+  ui.memoryDocument.setAttribute("aria-labelledby", tab.id);
+  ui.memoryDocument.scrollTop = 0;
+  ui.memoryContent.replaceChildren();
+  ui.memoryMessage.textContent = "Loading saved work…";
+  show(ui.memoryMessage, true);
+  ui.memoryUpdated.textContent = "";
+  loadMemory();
+}
+
+function syncMemoryPanel() {
+  const identity = currentJob || state.runId || "";
+  if (memoryJob !== identity) {
+    memoryJob = identity;
+    ++memoryRequest;
+    clearTimeout(memoryTimer);
+    ui.memoryPanel.open = false;
+    selectMemoryFile(memoryTabs[0]);
+  }
+  const visible = Boolean(identity) && !ui.run.hidden
+    && state.problemMode !== "latex" && !state.statementReviewOnly;
+  show(ui.memoryPanel, visible);
+  if (!visible) {
+    ui.memoryPanel.open = false;
+    clearTimeout(memoryTimer);
+    ++memoryRequest;
+  }
+}
+
 // Update only the affected timeline row; never rebuild the full transcript.
 function upsertTimeline(card) {
   if (!card || (!card.text && !card.checks?.length)) return;
@@ -1113,6 +1262,7 @@ function render(next) {
   );
   show(ui.workflowRail, phase !== "input");
   show(ui.activityToggle, Boolean(currentJob));
+  syncMemoryPanel();
   ui.notice.textContent = state.error || "";
   show(ui.notice, Boolean(state.error));
 
@@ -1446,6 +1596,27 @@ ui.sendAuthorSteer.onclick = () => {
   }
   act("/steer-author", { instruction });
 };
+ui.memoryPanel.addEventListener("toggle", () => {
+  ++memoryRequest;
+  clearTimeout(memoryTimer);
+  if (ui.memoryPanel.open) loadMemory();
+});
+for (const tab of memoryTabs) {
+  tab.onclick = () => selectMemoryFile(tab);
+  tab.onkeydown = (event) => {
+    const index = memoryTabs.indexOf(tab);
+    const next = { ArrowRight: (index + 1) % 3, ArrowLeft: (index + 2) % 3,
+      Home: 0, End: 2 }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    memoryTabs[next].focus();
+    selectMemoryFile(memoryTabs[next]);
+  };
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) loadMemory();
+  else clearTimeout(memoryTimer);
+});
 ui.stop.onclick = () => act("/stop");
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
