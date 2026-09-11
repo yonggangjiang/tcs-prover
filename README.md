@@ -336,16 +336,24 @@ discard the memory files or restart the problem. The
 control is intentionally unavailable during statement review,
 critic review, failure summaries, and final LaTeX editing.
 
-**Pause**, beside **Stop**, asks the active author to save its notebook updates
-and close its subagents. It allows up to 60 seconds for saving, then closes the
-session; if the model cannot respond, only previously saved work is recoverable.
-Wait for **Paused**, change your Codex CLI login if needed, then click **Resume**
-on the inference page or job card. Resume launches a fresh CLI process in the
-same run folder, appends to its transcript, and resumes the saved thread when
-available. The research records and any critic rejection remain available.
+**Pause**, beside **Stop**, interrupts the active Codex turn and pauses its goal,
+preserving the native conversation and existing research files. It does not ask
+the model to produce a final answer or spend another turn writing a summary.
+Wait for **Paused** before closing the UI or changing your Codex CLI login. Then
+click **Resume** on the inference page or job card: a fresh CLI process reopens
+the same saved thread in the same run folder and appends to its transcript.
+If that saved thread cannot be reopened, the job remains paused with an error
+and can be retried; it does not silently replace the conversation. A pause before
+Codex created any thread starts that initial thread on Resume.
 Paused jobs also remain resumable after restarting the UI. Paused time does not
-consume the remaining workflow time budget. **Stop** keeps its existing immediate
-termination behavior.
+consume the remaining workflow time budget. Already saved conversation and file
+content are retained; an interrupted response or file write may be incomplete.
+Usage limits, network failures, and unexpected author interruptions also pause
+the job automatically, displaying the reason and keeping Resume available in
+the same folder. Resolve the interruption, then click Resume when ready.
+For a reached workflow time limit, increase the existing total time limit control
+while paused before clicking Resume.
+**Stop** keeps its existing immediate termination behavior.
 
 When LaTeX editing finishes, **Download .tex** downloads that job's saved
 `final.tex`. There is no PDF generation or PDF download.
@@ -556,8 +564,8 @@ Node `role` settings can use options such as `editor_model` and `editor_effort`.
 The CLI initializes `state.input`, `state.statement`, and `state.source` with the
 same input after trimming surrounding whitespace. Chained graphs share state,
 and `state.failed` stops the chain. An optional `goal_pause_file` control path
-also pauses execution when the file exists. Goal nodes can bind a `pause`
-lifecycle prompt in YAML to request a save before stopping. Pausing emits
+also pauses execution when the file exists. Goal sessions pause their native
+goal and interrupt the active turn without an additional model prompt. Pausing emits
 `workflow_paused` with the current node and workflow state, sets `state.paused`,
 and stops the chain without returning a completed proof. The UI persists this
 controller checkpoint separately from the LLM-managed research notebooks.

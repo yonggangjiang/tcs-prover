@@ -142,9 +142,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_no_call_starts_after_shared_deadline(self):
         with workspace(),patch.object(runtime,'structured') as model:
-            with self.assertRaises(runtime.Error):
-                runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],{'statement':'Task'},
-                    {'thinking_hours':0.001,'elapsed_seconds':10})
+            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],{'statement':'Task'},
+                {'thinking_hours':0.001,'elapsed_seconds':10})
+            self.assertTrue(state['paused'])
             model.assert_not_called()
 
     def test_bounded_calls_have_no_stale_internal_retry_budget(self):
@@ -183,6 +183,30 @@ class PipelineTests(unittest.TestCase):
         checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
         self.assertEqual(checkpoint['node'], 'author')
         self.assertEqual(checkpoint['state'], state)
+
+    def test_author_errors_checkpoint_reason_and_never_enter_critic_or_cleanup(self):
+        interruptions = [runtime.WorkflowPaused('Connection lost', reason='Connection lost', thread_id='saved-root'),
+                         RuntimeError('Unexpected author error')]
+        for interruption in interruptions:
+            with self.subTest(interruption=interruption), workspace(), patch.object(runtime, 'goal_session', side_effect=interruption), patch.object(runtime, 'structured') as model, patch.object(runtime, 'emit') as emit:
+                state = runtime.execute_workflows(
+                    [ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'],
+                    {'statement': 'Task', 'solution': PROOF}, options={'goal_thread_id': 'saved-root'})
+            self.assertTrue(state['paused'])
+            self.assertFalse(state.get('failed'))
+            self.assertEqual(state['solution'], PROOF)
+            model.assert_not_called()
+            checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
+            self.assertEqual(checkpoint['reason'], str(interruption))
+            self.assertEqual(checkpoint['threadId'], 'saved-root')
+
+    def test_elapsed_author_limit_pauses_before_starting_a_model(self):
+        with workspace(), patch.object(runtime, 'workflow_remaining', return_value=0), patch.object(runtime, 'goal_session') as author, patch.object(runtime, 'emit') as emit:
+            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'], {'statement': 'Task'})
+        self.assertTrue(state['paused'])
+        author.assert_not_called()
+        checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
+        self.assertIn('time limit', checkpoint['reason'])
 
     def test_live_web_search_is_enabled_for_all_structured_stages_and_retries(self):
         for stage in ('review', 'critic', 'final'):

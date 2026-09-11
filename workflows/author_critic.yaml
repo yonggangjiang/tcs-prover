@@ -5,7 +5,7 @@ nodes:
     role: author
     stage: solve
     prompt: author
-    lifecycle: [goal, continuation, compaction, repair, resume, pause]
+    lifecycle: [goal, continuation, compaction, repair, resume]
     features: [multi_agent]
     task: state.statement
     marker: '[STATEMENT]'
@@ -151,16 +151,6 @@ prompts:
 
     ORIGINAL INITIAL AUTHOR PROMPT:
     {original_prompt}
-  pause: >-
-    The user requested a pause. Stop exploring new directions. Ask your active
-    subagents to stop and report their current findings. Save the current work,
-    unfinished arguments, and exact next steps in the active approach files and
-    update their index; use the legacy notebook instead if INITIAL_PROMPT.md
-    still specifies it. Save only fully proved lemmas in PROVED.md.
-    Preserve INITIAL_PROMPT.md unchanged. Close your
-    subagents and return a brief checkpoint summary. This is an interruption,
-    not a mathematical failure or a completed solution. Do not reactivate or
-    complete the goal; wait for the user to resume.
   repair: |-
     The following proof contains unresolved errors. Think again. Read
     INITIAL_PROMPT.md and follow it, then read the index, relevant approach files,

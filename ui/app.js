@@ -280,7 +280,7 @@ function renderJobs(jobs) {
     status.className = `job-status ${job.phase}`;
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
-      running: "Running", stopping: "Stopping", pausing: "Saving before pause", paused: "Paused", done: "Finished",
+      running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: "Finished",
     };
     status.textContent = job.manuallyStopped
       ? `Stopped at ${job.stoppedStage || "saved stage"}`
@@ -1407,19 +1407,19 @@ function render(next) {
   const done = phase === "done";
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
-    : phase === "paused" ? "Paused" : phase === "pausing" ? "Saving before pause"
+    : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? "Finished" : (node.label || "Codex is working");
   ui.runLabel.textContent = phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
-    : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Saving the current work…"
+    : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing Codex…"
     : phase === "stopping" ? "Stopping safely…"
       : (state.error || (done ? (node.label || "Final result")
         : (node.label || "Codex is working")));
   ui.runDescription.textContent = state.error
-    || (phase === "paused" ? "Resume continues in this same run folder. You can change your Codex CLI login before resuming."
-      : phase === "pausing" ? "The author has up to 60 seconds to save its work. If it cannot respond, the last saved work remains available."
+    || (phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
+      : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : done ? "The output and transcript remain preserved for this job."
         : (node.description || ""));
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
@@ -1428,10 +1428,12 @@ function render(next) {
   const maximumAuthorLimit = Number(
     state.workflow?.settings?.thinking_hours?.maximum || 168
   );
-  const canSetAuthorLimit = phase === "running"
+  const authorRunning = phase === "running"
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author";
-  show(ui.authorSteerControl, canSetAuthorLimit);
-  ui.sendAuthorSteer.disabled = !canSetAuthorLimit;
+  const canSetAuthorLimit = authorRunning || (phase === "paused"
+    && ["solve", "repair"].includes(state.stage) && state.activeNode === "author");
+  show(ui.authorSteerControl, authorRunning);
+  ui.sendAuthorSteer.disabled = !authorRunning;
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
   const authorLimitText = authorLimit.toLocaleString(undefined, {
     maximumFractionDigits: 2,
@@ -1442,7 +1444,7 @@ function render(next) {
     ui.authorLimitHours.value = String(authorLimit);
   }
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
-  show(ui.pause, canSetAuthorLimit);
+  show(ui.pause, authorRunning);
   show(ui.resume, phase === "paused");
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.stop, working);

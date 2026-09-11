@@ -50,6 +50,8 @@ class RPC:
         if method == "turn/steer":
             self.runtime.steered.set()
             self.messages.append({"id": self.number, "result": {}})
+        if method == "turn/interrupt":
+            self.runtime.interrupted.set()
         return self.number
 
     def call(self, method, params):
@@ -64,6 +66,8 @@ class RPC:
             raise TransportError(self.runtime.resume_error)
         if method in {"thread/start", "thread/resume"}:
             return {"thread": {"id": "thread-1"}}
+        if method == "thread/goal/get":
+            return {"goal": self.runtime.saved_goal}
         if method == "turn/start":
             self.turns += 1
             self.messages.append(event("turn/started", turn={"id": f"turn-{self.turns}"}))
@@ -92,6 +96,8 @@ class Runtime:
         self.events, self.stopped = [], []
         self.remaining, self.resume_error, self.on_empty = 100, None, None
         self.steered = threading.Event()
+        self.interrupted = threading.Event()
+        self.saved_goal = None
         self.command = None
 
     def RPC(self, process, record):
@@ -326,22 +332,57 @@ class GoalTests(unittest.TestCase):
         self.assertEqual(sum(m == "thread/start" for m, _ in runtime.rpc.calls), 1)
         runtime2, session2 = self.session(options={"goal_thread_id": "missing"})
         runtime2.resume_error = "Quota exceeded"
-        self.assertEqual(next(session2)["outcome"], "failure")
+        with self.assertRaisesRegex(module.WorkflowPaused, "Quota exceeded"):
+            next(session2)
         self.assertFalse(any(m == "thread/start" for m, _ in runtime2.rpc.calls))
 
-    def test_usage_or_network_failure_never_requests_model_summary(self):
-        for messages in ([goal("usageLimited")], [TransportError("Network unavailable")], [completed("failed")]):
+    def test_paused_run_requires_its_original_thread_even_if_unavailable(self):
+        for error in ("thread not found", "Quota exceeded", "Network unavailable"):
+            with self.subTest(error=error):
+                runtime, session = self.session(options={"goal_thread_id": "thread-1", "goal_require_resume": True})
+                runtime.resume_error = error
+                with self.assertRaisesRegex(module.WorkflowPaused, "no replacement was started"):
+                    next(session)
+                self.assertFalse(any(m in {"thread/start", "turn/start"} for m, _ in runtime.rpc.calls))
+
+    def test_strict_resume_without_thread_id_starts_no_process(self):
+        _, session = self.session(options={"goal_require_resume": True})
+        with self.assertRaisesRegex(module.WorkflowPaused, "thread ID is missing"):
+            next(session)
+        self.spawn.assert_not_called()
+
+    def test_resume_preserves_saved_goal_objective_and_budget(self):
+        runtime, session = self.session(options={"goal_thread_id": "thread-1", "goal_require_resume": True})
+        runtime.saved_goal = {"objective": "The original research goal before YAML changed.",
+                              "status": "paused", "tokenBudget": 90000, "tokensUsed": 12345}
+        self.assertEqual(next(session)["outcome"], "done")
+        updates = [p for m, p in runtime.rpc.calls if m == "thread/goal/set"]
+        self.assertEqual(updates[0]["objective"], runtime.saved_goal["objective"])
+        self.assertTrue(all("objective" not in p for p in updates[1:]))
+        self.assertTrue(all("tokenBudget" not in p for p in updates))
+        self.assertFalse(any(m in {"thread/start", "thread/fork", "thread/goal/clear"} for m, _ in runtime.rpc.calls))
+
+    def test_usage_network_and_unexpected_errors_pause_without_model_summary(self):
+        for messages in ([goal("usageLimited")], [goal("budgetLimited")],
+                         [TransportError("Network unavailable")], [completed("failed")],
+                         [RuntimeError("Unexpected transport error")]):
             with self.subTest(messages=messages):
                 runtime, session = self.session([messages])
-                self.assertEqual(next(session)["outcome"], "failure")
+                with self.assertRaises(module.WorkflowPaused) as raised:
+                    next(session)
+                self.assertTrue(raised.exception.reason)
+                self.assertEqual(raised.exception.thread_id, "thread-1")
                 self.assertEqual(runtime.rpc.turns, 1)
                 session.close()
                 self.assertEqual(list(self.directory.iterdir()), [])
+                self.assertFalse(any(e["kind"] == "failure_result" for e in runtime.events))
+                self.assertEqual(runtime.rpc.calls[-1], ("thread/goal/set", {"threadId": "thread-1", "status": "paused"}))
 
     def test_elapsed_limit_starts_no_model(self):
         runtime, session = self.session()
         runtime.remaining = 0
-        self.assertEqual(next(session)["outcome"], "failure")
+        with self.assertRaisesRegex(module.WorkflowPaused, "time limit"):
+            next(session)
         self.spawn.assert_not_called()
 
     def test_live_steering_goes_to_current_turn(self):
@@ -355,24 +396,34 @@ class GoalTests(unittest.TestCase):
         steers = [p for m, p in runtime.rpc.calls if m == "turn/steer"]
         self.assertEqual(steers[0]["expectedTurnId"], "turn-1")
         self.assertEqual(steers[0]["input"][0]["text"], runtime.command[1])
+        self.assertTrue(any(e.get("authorSteerDelivered") == "steer-1" for e in runtime.events))
 
-    def test_pause_steers_current_turn_and_never_returns_checkpoint_as_proof(self):
+    def test_resume_does_not_replay_an_accepted_live_instruction(self):
+        runtime, session = self.session([[]], options={"goal_thread_id": "thread-1", "author_steer_delivered": "steer-1"})
+        runtime.command = ("steer-1", "Already accepted before the pause")
+        def continue_after_watch(rpc):
+            self.assertFalse(runtime.steered.wait(0.25))
+            rpc.messages.extend(success())
+        runtime.on_empty = continue_after_watch
+        self.assertEqual(next(session)["outcome"], "done")
+        self.assertFalse(any(m == "turn/steer" for m, _ in runtime.rpc.calls))
+
+    def test_pause_interrupts_current_turn_without_asking_model_to_save(self):
         path = self.directory / "pause-request.json"
         runtime, session = self.session([[]], options={"goal_pause_file": str(path)})
-        instruction = "Save your own work, then return a checkpoint summary."
         def pause_after_start(rpc):
             path.write_text("{}")
-            self.assertTrue(runtime.steered.wait(2))
-            rpc.messages.extend(success("Checkpoint summary, not a proof"))
+            self.assertTrue(runtime.interrupted.wait(2))
+            rpc.messages.extend([answer("Unfinished argument"), goal("paused"), completed("interrupted")])
         runtime.on_empty = pause_after_start
-        with patch.dict(PROMPTS, pause=instruction), self.assertRaises(module.WorkflowPaused):
+        with patch.dict(PROMPTS, pause="Legacy save prompt"), self.assertRaises(module.WorkflowPaused):
             next(session)
         self.assertEqual(runtime.rpc.turns, 1)
         self.assertTrue(runtime.stopped)
         self.assertFalse(any(e["kind"] in {"author_result", "failure_result"} for e in runtime.events))
-        sent = next(p for m, p in runtime.rpc.calls if m == "turn/steer")
-        self.assertEqual(sent["input"][0]["text"], instruction)
-        self.assertEqual(sent["expectedTurnId"], "turn-1")
+        sent = next(p for m, p in runtime.rpc.calls if m == "turn/interrupt")
+        self.assertEqual(sent, {"threadId": "thread-1", "turnId": "turn-1"})
+        self.assertFalse(any(m == "turn/steer" for m, _ in runtime.rpc.calls))
         self.assertEqual(runtime.rpc.calls[-1][1]["status"], "paused")
 
     def test_pause_without_a_responsive_model_retains_last_saved_work(self):
@@ -380,7 +431,6 @@ class GoalTests(unittest.TestCase):
         notebook = self.directory / "APPROACHES.md"
         notebook.write_text("Saved route and exact obstacle")
         runtime, session = self.session([[]], options={"goal_pause_file": str(path)})
-        runtime.PAUSE_GRACE_SECONDS = 0.01
         stopped = threading.Event()
         runtime.stop_process = lambda process: stopped.set()
         def hang(rpc):
@@ -437,17 +487,17 @@ class GoalTests(unittest.TestCase):
             self.assertTrue(runtime.stopped)
             raise TransportError("Process stopped")
         runtime.on_empty = deadline
-        result = next(session)
-        self.assertEqual(result["outcome"], "failure")
-        self.assertIn("time limit", result["output"])
+        with self.assertRaisesRegex(module.WorkflowPaused, "time limit"):
+            next(session)
         self.assertEqual(runtime.rpc.turns, 1)
         self.assertTrue(any(m == "turn/interrupt" for m, _ in runtime.rpc.calls))
-        self.assertTrue(any(e["kind"] == "failure_result" for e in runtime.events))
+        self.assertFalse(any(e["kind"] == "failure_result" for e in runtime.events))
 
     def test_resume_network_error_never_starts_a_replacement_model(self):
         runtime, session = self.session(options={"goal_thread_id": "saved"})
         runtime.resume_error = "thread/resume failed: network unavailable"
-        self.assertEqual(next(session)["outcome"], "failure")
+        with self.assertRaisesRegex(module.WorkflowPaused, "network unavailable"):
+            next(session)
         self.assertFalse(any(m in {"thread/start", "turn/start"} for m, _ in runtime.rpc.calls))
 
     def test_completed_author_cleanup_does_not_emit_events_over_later_critic_stage(self):

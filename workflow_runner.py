@@ -108,6 +108,11 @@ class Error(RuntimeError):
 class WorkflowPaused(Error):
     """Suspend execution without completing a node or entering its successor."""
 
+    def __init__(self, message="Workflow paused.", *, reason="", thread_id=None):
+        super().__init__(message)
+        self.reason = reason
+        self.thread_id = thread_id
+
 
 def text(value):
     """Require nonempty text."""
@@ -1098,12 +1103,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     expired = threading.Event()
     pausing = threading.Event()
     pause_file = options.get("goal_pause_file")
-    state = {"turn": None, "active": True, "steer": None}
+    state = {"turn": None, "active": True, "steer": options.get("author_steer_delivered")}
     pending_steers = {}
     pending_compaction = None
     seen_compactions = set()
     goal = {}
-    failure = None
+    pause_reason = ""
     last_usage = {}
 
     def is_root(message):
@@ -1138,32 +1143,31 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     def watch():
         pause_started = None
+        interrupted_turn = None
         while not stop.wait(0.1):
             if pause_file and Path(pause_file).is_file() and state["active"]:
-                if pause_started is None and state["turn"]:
+                if pause_started is None:
                     pause_started = time.monotonic()
                     pausing.set()
+                if thread and state["turn"] and state["turn"] != interrupted_turn:
+                    interrupted_turn = state["turn"]
                     try:
-                        rpc.request("thread/goal/set", {**goal, "status": "paused"})
-                        if "pause" in prompts:
-                            steer(render("pause"), "pause")
-                        else:
-                            rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
+                        rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
+                        rpc.request("turn/interrupt", {"threadId": thread, "turnId": interrupted_turn})
                     except (runtime.Error, OSError) as exc:
-                        emit("diagnostic", text=f"Could not deliver pause instruction: {exc}")
-                if pause_started is not None:
-                    if time.monotonic() - pause_started >= getattr(runtime, "PAUSE_GRACE_SECONDS", 60):
-                        emit("diagnostic", text="Pause save window expired; resumption will use the last saved work.")
-                        runtime.stop_process(process)
-                        return
-                    continue
+                        emit("diagnostic", text=f"Could not interrupt the author: {exc}")
+                if time.monotonic() - pause_started >= getattr(runtime, "INTERRUPT_GRACE_SECONDS", 5):
+                    emit("diagnostic", text="Codex did not acknowledge the pause; keeping its saved session and the last saved work.")
+                    runtime.stop_process(process)
+                    return
+                continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
                 if not state["active"]:
                     return
                 try:
                     if thread:
-                        rpc.request("thread/goal/set", {**goal, "status": "paused"})
+                        rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         if state["turn"]:
                             rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
                 except (runtime.Error, OSError):
@@ -1195,7 +1199,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         if not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
-            rpc.call("thread/goal/set", {**goal, "status": "active"})
+            rpc.call("thread/goal/set", {"threadId": thread, "status": "active"})
 
     def collect(item, answers):
         if (item.get("type") in {"agentMessage", "agent_message"}
@@ -1209,6 +1213,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Pause requested before starting the model.")
         if runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
+        if options.get("goal_require_resume") and not options.get("goal_thread_id"):
+            raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation.")
         process = subprocess.Popen([
             runtime.codex(), "app-server", "--enable", "goals",
             "-c", 'web_search="live"', "-c", "tools.web_search=true",
@@ -1244,6 +1250,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                                     "excludeTurns": True})
                 resumed = True
             except runtime.Error as exc:
+                if options.get("goal_require_resume"):
+                    raise runtime.Error(f"Could not resume the saved Codex conversation; no replacement was started. {exc}") from exc
                 missing = ("not found", "not_found", "notfound", "unknown thread", "does not exist",
                            "no rollout", "failed to load thread", "failed to load rollout",
                            "could not find thread", "thread unavailable", "thread is unavailable")
@@ -1253,7 +1261,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if not resumed:
             result = rpc.call("thread/start", {**thread_options, "ephemeral": False})
         thread = result["thread"]["id"]
-        goal = {"threadId": thread, "objective": render("goal")}
+        if resumed and thread != options["goal_thread_id"]:
+            raise runtime.Error("Codex returned a different thread ID; refusing to continue a replacement conversation.")
+        saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed else {}
+        goal = {"threadId": thread, "objective": saved_goal.get("objective") or render("goal")}
         emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
              text=f"Thread {thread}")
         instruction = render("resume") if options.get("goal_resume") or options.get("goal_thread_id") else prompt
@@ -1277,6 +1288,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     emit("diagnostic", text=f"Instruction raced with turn completion: {message['error']}")
                 elif not compaction:
                     state["steer"] = identity
+                    emit("status", label="Author instruction accepted", authorSteerDelivered=identity,
+                         text="The current conversation has received the live instruction.", threadId=thread)
             method, turn = message.get("method"), params.get("turn") or {}
             if method == "turn/started":
                 running, answers = True, []
@@ -1335,22 +1348,21 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             elif not running and status in {"blocked", "complete"}:
                 start_turn(render("continuation"))
                 status, running, answers = None, True, []
-    except (runtime.Error, OSError, ValueError) as exc:
+    except Exception as exc:
         if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
             pausing.set()
             emit("status", label="Author paused", text=str(exc), threadId=thread)
         else:
-            stage = stages["failure"]
-            diagnostic = "Workflow time limit reached." if expired.is_set() else str(exc)
-            emit("diagnostic", text=diagnostic, threadId=thread)
-            emit("failure_result", label="Author stopped", text=diagnostic, output=diagnostic, threadId=thread)
-            failure = {"outcome": "failure", "output": diagnostic}
+            pausing.set()
+            pause_reason = "Workflow time limit reached." if expired.is_set() else (str(exc) or type(exc).__name__)
+            emit("diagnostic", text=pause_reason, threadId=thread)
+            emit("status", label="Author paused", text=pause_reason, threadId=thread)
     finally:
         stop.set()
         if rpc and thread and state["active"]:
             def pause():
                 try:
-                    rpc.call("thread/goal/set", {**goal, "status": "paused"})
+                    rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
                 except (runtime.Error, OSError, ValueError):
                     pass
             cleanup = threading.Thread(target=pause, daemon=True)
@@ -1359,9 +1371,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if process:
             runtime.stop_process(process)
     if pausing.is_set():
-        raise WorkflowPaused("Workflow paused.")
-    if failure:
-        yield failure
+        raise WorkflowPaused(pause_reason or "Workflow paused.", reason=pause_reason, thread_id=thread)
 
 
 def _sha256(value):
@@ -2313,9 +2323,15 @@ def _execute(workflow, state, options, prompts):
                 visits = 0
             current = target
         return state
-    except WorkflowPaused:
+    except Exception as exc:
+        if not isinstance(exc, WorkflowPaused) and node["run"] != "goal":
+            raise
         state["paused"] = True
-        emit("workflow_paused", node.get("stage", current), node=current, state=state)
+        state.pop("failed", None)
+        reason = exc.reason if isinstance(exc, WorkflowPaused) else (str(exc) or type(exc).__name__)
+        thread_id = getattr(exc, "thread_id", None) or options.get("goal_thread_id")
+        emit("workflow_paused", node.get("stage", current), node=current, state=state,
+             reason=reason, threadId=thread_id)
         return state
     finally:
         for session in sessions.values():
@@ -2413,6 +2429,8 @@ def audit_candidate(
         options.pop("critic_rounds")
     state = execute_workflows([WORKFLOWS / "author_critic.yaml", WORKFLOWS / "clean_up.yaml"],
                               {"statement": text(statement), "solution": text(solution)}, options)
+    if state.get("paused"):
+        raise WorkflowPaused()
     if state.get("failed"):
         raise Error(state["output"])
     return state["output"]
@@ -2434,6 +2452,8 @@ def run_goal(prompt, statement, critic_rounds=None, thinking_hours=DEFAULT_AUTHO
     if critic_rounds is not None:
         options["critic_rounds"] = critic_limit(critic_rounds)
     state = execute_workflows([WORKFLOWS / "author_critic.yaml", WORKFLOWS / "clean_up.yaml"], {"statement": statement}, options)
+    if state.get("paused"):
+        raise WorkflowPaused()
     return state["output"]
 
 

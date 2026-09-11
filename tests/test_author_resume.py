@@ -114,6 +114,7 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
     def test_new_root_session_is_saved_in_existing_job_settings(self):
         app = server.App(runs=self.runs)
         app._new_run(self.statement)
+        app._save("checked-statement.md", "# Checked statement\n\n" + self.statement + "\n")
         process, token = mock.Mock(), object()
         records = [
             {"kind": "status", "stage": "solve", "label": "Goal resumed", "threadId": "resumed-root"},
@@ -128,6 +129,10 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
         settings = json.loads((app.run_dir / server.JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(settings["goalThreadId"], "resumed-root")
         self.assertEqual(server.saved_goal_thread_id(app.run_dir), "resumed-root")
+        self.assertEqual(app.state["phase"], "paused")
+        checkpoint = json.loads((app.run_dir / server.PAUSE_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["state"]["statement"], self.statement)
+        self.assertEqual(checkpoint["goalThreadId"], "resumed-root")
         self.assertFalse((app.run_dir / "author-session.json").exists())
 
     def test_saved_author_source_loads_from_ui_settings(self):

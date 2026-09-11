@@ -61,7 +61,7 @@ def goal_thread_from_record(record):
 
     identity = record.get("threadId")
     if (
-        record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
+        record.get("kind") in {"status", "workflow_paused"} and record.get("stage") in {"solve", "repair"}
         and record.get("root") is not False
         and isinstance(identity, str) and identity.strip() and "\0" not in identity
     ):
@@ -405,6 +405,7 @@ def empty_state(trace=None, trace_version=0):
         "goalThreadId": "",
         "goalWorkspace": "",
         "goalResume": False,
+        "authorSteerDelivered": "",
         "latexInput": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
@@ -519,7 +520,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly",
-            "goalThreadId", "goalWorkspace", "goalResume", "elapsedSeconds", "resumedAt",
+            "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         self._save(
             JOB_SETTINGS_FILENAME,
@@ -1312,7 +1313,8 @@ class App:
 
         author_limit_file = self._write_author_limit(self.state["thinkingHours"])
         author_steer_file = self.run_dir / AUTHOR_STEER_FILENAME
-        author_steer_file.unlink(missing_ok=True)
+        if not self.state.get("goalResume"):
+            author_steer_file.unlink(missing_ok=True)
         options = [
             "--critic-rounds", str(self.state["criticRounds"]),
             "--thinking-hours", str(self.state["thinkingHours"]),
@@ -1337,6 +1339,8 @@ class App:
             options.extend(["--set", "goal_cwd=" + json.dumps(self.state["goalWorkspace"])])
         if self.state.get("goalResume"):
             options.extend(["--set", "goal_resume=true"])
+            if self.state.get("authorSteerDelivered"):
+                options.extend(["--set", "author_steer_delivered=" + json.dumps(self.state["authorSteerDelivered"])])
         options.extend(["--set", "goal_pause_file=" + json.dumps(str(self.run_dir / PAUSE_REQUEST_FILENAME))])
         return options
 
@@ -1369,8 +1373,20 @@ class App:
         self._save(".pause.tmp", json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
         (self.run_dir / ".pause.tmp").replace(self.run_dir / PAUSE_FILENAME)
 
+    def _author_checkpoint_state(self):
+        """Recover controller input if the author exits before emitting its state."""
+
+        checkpoint_state = {"statement": saved_statement(self.run_dir)}
+        report_record = next((record for record in reversed(self.retained_trace())
+                              if record.get("kind") == "critic_result"), None)
+        if report_record and report_record.get("report", {}).get("verdict") == "reject":
+            checkpoint_state.update(report=report_record["report"],
+                                    solution=report_record["report"]["solution"],
+                                    round=report_record.get("round", self.state["round"]))
+        return checkpoint_state
+
     def pause(self):
-        """Request a notebook save before closing the author session."""
+        """Interrupt the author while retaining its native session for resume."""
 
         with self.lock:
             if self.state["phase"] == "pausing":
@@ -1378,20 +1394,14 @@ class App:
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
                 raise ValueError("Pause is available while the proof author is working.")
-            checkpoint_state = {"statement": saved_statement(self.run_dir)}
-            if self.state["stage"] == "repair":
-                report_record = next((record for record in reversed(self.retained_trace())
-                                      if record.get("kind") == "critic_result"), None)
-                if report_record and report_record.get("report", {}).get("verdict") == "reject":
-                    checkpoint_state.update(report=report_record["report"],
-                                            solution=report_record["report"]["solution"],
-                                            round=report_record.get("round", self.state["round"]))
+            checkpoint_state = self._author_checkpoint_state()
             self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
-                              "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"]})
+                              "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
+                              "goalThreadId": self.state.get("goalThreadId", "")})
             self._save(PAUSE_REQUEST_FILENAME, "{}\n")
             self.state.update(phase="pausing", error="")
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
-                            "label": "Pause requested", "text": "The author has up to 60 seconds to save its work before its process closes."})
+                            "label": "Pause requested", "text": "Interrupting Codex and preserving its saved conversation for Resume."})
             process, token = self.process, self.active_token
 
         def finish_if_unresponsive():
@@ -1399,7 +1409,7 @@ class App:
             if process is None:
                 return
             try:
-                process.wait(timeout=70)
+                process.wait(timeout=10)
                 return
             except subprocess.TimeoutExpired:
                 pass
@@ -1407,7 +1417,7 @@ class App:
                 if self.active_token is not token or self.state["phase"] != "pausing":
                     return
                 self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": "Pause could not finish saving; resume will use the last saved work."})
+                                "text": "Codex did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
             stop_process_tree(process)
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
@@ -1423,16 +1433,21 @@ class App:
             workflow_state.pop("paused", None)
             workflow_state.pop("failed", None)
             previous = dict(self.state)
+            if checkpoint.get("goalThreadId"):
+                self.state["goalThreadId"] = checkpoint["goalThreadId"]
             self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
                               resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="")
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
             process = None
             try:
-                self._save_pause({**checkpoint, "status": "running"})
+                self._save_pause({**checkpoint, "status": "running", "error": ""})
                 self._save_job_settings(self.state)
+                resume_options = (["--set", "goal_require_resume=true"]
+                                  if self.state.get("goalThreadId") else [])
                 process, token = self._launch_workflow_locked(
                     ["author_critic.yaml", "clean_up.yaml"], "",
-                    [*self._proof_options_locked(), "--elapsed-seconds", str(checkpoint["elapsedSeconds"]),
+                    [*self._proof_options_locked(), *resume_options,
+                     "--elapsed-seconds", str(checkpoint["elapsedSeconds"]),
                      "--start-node", checkpoint["node"]],
                     checkpoint["stage"], checkpoint["node"], state=workflow_state,
                 )
@@ -1446,7 +1461,7 @@ class App:
                 self._save_job_settings(self.state)
                 raise
             self.add_trace({"kind": "status", "stage": checkpoint["stage"], "node": checkpoint["node"],
-                            "label": "Resume requested", "text": "Continuing in this run folder with a fresh Codex CLI process."})
+                            "label": "Resume requested", "text": "Reopening the saved Codex conversation in this same run folder."})
 
     def final_tex(self):
         """Read the finished LaTeX artifact for an authenticated download."""
@@ -1834,6 +1849,7 @@ class App:
 
         problem, answers, order, final, failed = "", {}, [], False, False
         latest_critic_solution = ""
+        last_work_node = self.state["activeNode"]
         try:
             for line in process.stdout:
                 if self.output_stream is not None:
@@ -1853,12 +1869,22 @@ class App:
                         if not self.state.get("goalWorkspace"):
                             self.state["goalWorkspace"] = str(self.run_dir.resolve())
                         self._save_job_settings(self.state)
+                delivered = record.get("authorSteerDelivered")
+                if (record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
+                        and record.get("root") is not False and isinstance(delivered, str) and delivered):
+                    with self.lock:
+                        self.state["authorSteerDelivered"] = delivered
+                        self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "diagnostic"
                     and record.get("text", "").startswith("error: ")
                 ):
                     problem = record["text"][7:]
                 record_stage, record_node = record.get("stage"), record.get("node")
+                if record_node and record_node != "failure_summary":
+                    last_work_node = record_node
+                elif record_stage in {"solve", "repair", "critic", "final"}:
+                    last_work_node = event_node(record, last_work_node)
                 stages = {
                     stage
                     for name, item in PUBLIC_GRAPH["nodes"].items()
@@ -1896,10 +1922,22 @@ class App:
                     )
                 if record.get("kind") == "workflow_paused":
                     with self.lock:
-                        if self.state["phase"] == "pausing":
-                            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-                            self._save_pause({**checkpoint, "state": record["state"], "node": record["node"],
-                                              "stage": checkpoint["stage"] if record["node"] == "author" else record["stage"]})
+                        if self.state["phase"] != "stopping" and not self.state.get("manuallyStopped"):
+                            try:
+                                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+                            except (OSError, ValueError):
+                                checkpoint = {}
+                            reason = record.get("reason", "")
+                            paused_stage = record["stage"]
+                            if (record["node"] == "author"
+                                    and record["state"].get("report", {}).get("verdict") == "reject"):
+                                paused_stage = "repair"
+                            self._save_pause({**checkpoint, "status": "pausing", "state": record["state"],
+                                              "node": record["node"], "error": reason,
+                                              "elapsedSeconds": self._elapsed_seconds(),
+                                              "goalThreadId": self.state.get("goalThreadId", ""),
+                                              "stage": paused_stage})
+                            self.state.update(phase="pausing", error=reason)
                 if (
                     record.get("kind") == "status"
                     and record.get("label") == "Critic approved"
@@ -1996,10 +2034,22 @@ class App:
                 self.worker_token = None
             self.state["phase"] = "done"
             self.state["finishedAt"] = datetime.now(timezone.utc).isoformat()
-            if paused and (not final or failed):
+            try:
                 checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-                self._save_pause({**checkpoint, "status": "paused", "elapsedSeconds": self._elapsed_seconds()})
-                self.state.update(phase="paused", error="")
+            except (OSError, ValueError):
+                checkpoint = {}
+            author_interrupted = (not stopped and last_work_node == "author" and (not final or failed))
+            if (paused or author_interrupted) and (not final or failed):
+                error = checkpoint.get("error", "") if paused else (
+                    problem or (self.state["output"] if failed else "")
+                    or f"The author exited before completing the task (code {code}).")
+                if not paused:
+                    workflow_state = {**checkpoint.get("state", {}), **self._author_checkpoint_state()}
+                    checkpoint.update(state=workflow_state, node="author",
+                                      stage="repair" if workflow_state.get("report") else "solve")
+                self._save_pause({**checkpoint, "status": "paused", "elapsedSeconds": self._elapsed_seconds(),
+                                  "goalThreadId": self.state.get("goalThreadId", ""), "error": error})
+                self.state.update(phase="paused", error=error, activeNode=checkpoint["node"], stage=checkpoint["stage"])
             elif final:
                 # A complete terminal record is durable and wins even when Stop
                 # killed the child before it closed stdout cleanly.
@@ -2080,7 +2130,7 @@ class App:
                 )
 
     def set_author_time_limit(self, hours):
-        """Replace the live total-workflow deadline with a chosen total."""
+        """Replace a running or paused author's total-workflow deadline."""
 
         try:
             hours = float(hours)
@@ -2093,15 +2143,15 @@ class App:
             )
         with self.lock:
             if not (
-                self.state["phase"] == "running"
+                self.state["phase"] in {"running", "paused"}
                 and self.state["activeNode"] == "author"
                 and self.state["stage"] in {"solve", "repair"}
             ):
                 raise ValueError(
                     "The total time limit can only be changed while the proof "
-                    "author is running."
+                    "author is running or paused."
                 )
-            if self.process is None or self.process.poll() is not None:
+            if self.state["phase"] == "running" and (self.process is None or self.process.poll() is not None):
                 raise ValueError("The proof author is no longer running.")
             hours = round(hours, 10)
             self._write_author_limit(hours)
@@ -2594,7 +2644,7 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly",
-                "goalThreadId", "goalWorkspace", "goalResume", "elapsedSeconds", "resumedAt",
+                "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
                     if key in {
@@ -2685,6 +2735,10 @@ def restore_saved_app(app):
         goal_thread = goal_thread_from_record(record)
         if goal_thread:
             state["goalThreadId"] = goal_thread
+        delivered = record.get("authorSteerDelivered")
+        if (record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
+                and record.get("root") is not False and isinstance(delivered, str) and delivered):
+            state["authorSteerDelivered"] = delivered
         stage = record.get("stage")
         if stage:
             state["stage"] = stage
@@ -2843,7 +2897,10 @@ def restore_saved_app(app):
     try:
         checkpoint = json.loads((run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
         if checkpoint["status"] in {"paused", "pausing"} and not (run_dir / "final.tex").is_file() and manual_stop is None:
-            state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"], error="")
+            state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
+                         error=checkpoint.get("error", ""))
+            if checkpoint.get("goalThreadId"):
+                state["goalThreadId"] = checkpoint["goalThreadId"]
     except (OSError, ValueError, KeyError, TypeError):
         pass
     state["checkpoints"] = saved_run_checkpoints(run_dir)
