@@ -164,12 +164,33 @@ def prepare_runs_directory(path):
     grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
 
 
-DEFAULT_PROMPTS = {
-    "review": REVIEW_PROMPT,
-    "author": runtime.AUTHOR_PROMPT,
-    "critic": runtime.CRITIC_PROMPT,
-    "final": runtime.FINAL_PROMPT,
-}
+def default_prompts():
+    """Read workflow prompts at use time, including edits made while serving."""
+
+    author_critic = runtime.builtin_workflow("author_critic")["prompts"]
+    return {
+        "review": REVIEW_PROMPT,
+        "author": author_critic["author"],
+        "critic": author_critic["critic"],
+        "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
+    }
+
+
+def web_prompt_options(body, roles, source=None):
+    """Accept only deliberate per-job edits; old browser defaults are ignored."""
+
+    overrides = body.get("promptOverrides", {})
+    if not isinstance(overrides, dict) or any(
+        name not in {"review", "author", "critic", "final"}
+        or not isinstance(value, str) for name, value in overrides.items()
+    ):
+        raise ValueError("Prompt overrides must map role names to prompt text.")
+    return {
+        f"{name}_prompt": overrides.get(name, (source or {}).get(f"{name}Prompt"))
+        for name in roles
+    }
+
+
 REVIEW_MODELS = MODELS
 TRACE_LIMIT = 1500
 PINNED_KINDS = {
@@ -210,7 +231,6 @@ PUBLIC_GRAPH = {
         "models": list(MODELS),
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
-        "prompts": DEFAULT_PROMPTS,
         "model_summary": "Astra/Ultra review · Astra/Ultra author, critic, writer",
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
@@ -363,6 +383,7 @@ def validated_continuation_source(path, runs):
 def empty_state(trace=None, trace_version=0):
     """Return the complete, intentionally small UI state."""
 
+    prompts = default_prompts()
     return {
         "phase": "input",
         "problemMode": "statement",
@@ -393,10 +414,10 @@ def empty_state(trace=None, trace_version=0):
         "reasoningEffort": DEFAULT_REASONING_EFFORT,
         "reasoningSummary": DEFAULT_REASONING_SUMMARY,
         "speedMode": DEFAULT_SPEED,
-        "reviewPrompt": DEFAULT_PROMPTS["review"],
-        "authorPrompt": DEFAULT_PROMPTS["author"],
-        "criticPrompt": DEFAULT_PROMPTS["critic"],
-        "finalPrompt": DEFAULT_PROMPTS["final"],
+        "reviewPrompt": prompts["review"],
+        "authorPrompt": prompts["author"],
+        "criticPrompt": prompts["critic"],
+        "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
         "thinkingHours": DEFAULT_THINKING_HOURS,
         "stage": "",
@@ -412,7 +433,7 @@ def empty_state(trace=None, trace_version=0):
         "settingsWarning": "",
         "runId": "",
         "checkpoints": [],
-        "workflow": PUBLIC_GRAPH,
+        "workflow": {**PUBLIC_GRAPH, "settings": {**PUBLIC_GRAPH["settings"], "prompts": prompts}},
         "trace": trace if trace is not None else [],
         "traceVersion": trace_version,
     }
@@ -739,6 +760,10 @@ class App:
 
         with self.lock:
             state = dict(self.state)
+            graph = state["workflow"]
+            state["workflow"] = {
+                **graph, "settings": {**graph["settings"], "prompts": default_prompts()},
+            }
             include_transcript = state["phase"] not in {
                 "reviewing", "running", "stopping",
             }
@@ -791,9 +816,10 @@ class App:
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "final": final_prompt,
         }
+        defaults = default_prompts()
         prompts = {
             name: str(
-                DEFAULT_PROMPTS[name] if value is None else value
+                defaults[name] if value is None else value
             ).strip()
             for name, value in supplied_prompts.items()
         }
@@ -867,7 +893,7 @@ class App:
             "criticEffort": critic_effort,
             "writerEffort": writer_effort,
             "reviewPrompt": (
-                prompts["review"] if include_review else DEFAULT_PROMPTS["review"]
+                prompts["review"] if include_review else defaults["review"]
             ),
             "authorPrompt": prompts["author"],
             "criticPrompt": prompts["critic"],
@@ -2733,12 +2759,13 @@ def saved_critic_source(path):
         solution_path = run_dir / "SOLUTION.md"
     solution = read_utf8(solution_path, "saved complete proof")
     statement = saved_statement(run_dir)
+    defaults = default_prompts()
     prompts = {}
     for name in ("author", "critic", "final"):
         prompt_path = run_dir / "prompts" / f"{name}.txt"
         prompts[name] = (
             read_utf8(prompt_path, f"saved {name} prompt")
-            if prompt_path.exists() else DEFAULT_PROMPTS[name]
+            if prompt_path.exists() else defaults[name]
         )
     checkpoint_path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
     try:
@@ -2778,11 +2805,12 @@ def saved_research_source(path):
     for role in ("author", "critic", "writer"):
         if f"{role}Model" in settings:
             settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
+    defaults = default_prompts()
     for role in ("author", "critic", "final"):
         path = source / "prompts" / f"{role}.txt"
         settings[f"{role}Prompt"] = (
             read_utf8(path, f"saved {role} prompt") if path.exists()
-            else DEFAULT_PROMPTS[role]
+            else defaults[role]
         )
     return {"run_dir": source, "statement": saved_statement(source), "settings": settings}
 
@@ -2829,31 +2857,6 @@ class Server(ThreadingHTTPServer):
             {"review_only": body.get("statementReviewOnly")}
             if "statementReviewOnly" in body else {}
         )
-        new_settings = any(key in body for key in (
-            "reviewEffort", "authorEffort", "criticEffort", "writerEffort",
-            "reviewPrompt", "authorPrompt", "criticPrompt", "finalPrompt",
-            "speedMode", "reasoningSummary",
-        ))
-        if not new_settings:
-            app.start_review(
-                body.get("statement", ""), body.get("feedback", ""),
-                body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
-                body.get("reviewModel", DEFAULT_REVIEW_MODEL),
-                body.get("thinkingHours", DEFAULT_THINKING_HOURS),
-                body.get("authorModel", DEFAULT_AUTHOR_MODEL),
-                body.get("criticModel", DEFAULT_CRITIC_MODEL),
-                body.get("writerModel", DEFAULT_WRITER_MODEL),
-                legacy_effort,
-                speed_mode=body.get("speedMode", DEFAULT_SPEED),
-                reasoning_summary=body.get(
-                    "reasoningSummary", DEFAULT_REASONING_SUMMARY
-                ),
-                **review_only_option,
-            )
-            with self.jobs_lock:
-                self.jobs[app.state["runId"]] = app
-            self.app = app
-            return app
         app.start_review(
             statement=body.get("statement", ""),
             feedback=body.get("feedback", ""),
@@ -2868,10 +2871,8 @@ class Server(ThreadingHTTPServer):
             author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
-            review_prompt=body.get("reviewPrompt"),
-            author_prompt=body.get("authorPrompt"),
-            critic_prompt=body.get("criticPrompt"),
-            final_prompt=body.get("finalPrompt"),
+            **web_prompt_options(body, ("review", "author", "critic", "final"),
+                                 app.state if run_id else None),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -2904,9 +2905,7 @@ class Server(ThreadingHTTPServer):
             author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
-            author_prompt=body.get("authorPrompt"),
-            critic_prompt=body.get("criticPrompt"),
-            final_prompt=body.get("finalPrompt"),
+            **web_prompt_options(body, ("author", "critic", "final")),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -2931,7 +2930,7 @@ class Server(ThreadingHTTPServer):
             writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
             reasoning_effort=legacy_effort,
             writer_effort=body.get("writerEffort", legacy_effort),
-            final_prompt=body.get("finalPrompt"),
+            **web_prompt_options(body, ("final",)),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY

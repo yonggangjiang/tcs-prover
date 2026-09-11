@@ -313,6 +313,14 @@ statement review** are mutually exclusive. Jobs run in parallel. **Show
 details** displays the exact application prompts and returned model text.
 Private records and outputs are stored under `runs/`.
 
+New jobs read the author and critic prompts from `workflows/author_critic.yaml`
+and the final editor prompt from `workflows/clean_up.yaml` at launch. YAML edits
+take effect without restarting the server, even if the browser page was already
+open. The prompt editor refreshes these defaults when opened. **Apply to this
+job** changes only that job; prompts are never remembered in browser storage or
+carried into the next new job. Continuing an existing job preserves its saved
+prompt and research workspace; start a new job to use a changed author policy.
+
 Every job card shows its full local start and finish date and time, including
 seconds. Active jobs show that they have not finished yet, so repeated problem
 titles remain distinguishable.

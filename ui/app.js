@@ -92,8 +92,10 @@ let activeFilter = "all";
 let activePrompt = "review";
 let promptValues = {};
 let promptDrafts = {};
-let promptStorageFallback = null;
-const promptStorageKey = "tcs-prover-role-prompts";
+let promptOriginals = {};
+let promptOverrides = {};
+// Retire browser-persisted prompts: every new job starts from the workflow files.
+try { localStorage.removeItem("tcs-prover-role-prompts"); } catch (_) {}
 const timelineRows = new Map();
 const detailRows = new Map();
 const memoryTabs = [...document.querySelectorAll("[data-memory]")];
@@ -486,40 +488,28 @@ const promptLabels = {
 
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
-  author: "Keep exactly one [STATEMENT]. The workflow inserts the statement and adds proof-history instructions.",
+  author: "Keep exactly one [STATEMENT]. The workflow replaces it with your statement.",
   critic: "Each critic call receives the statement and latest proof, then follows these instructions to use fresh independent subagents.",
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
 function syncPrompts(source = state) {
   const defaults = source.workflow?.settings?.prompts || {};
-  let saved = {};
-  if (source.phase === "input") {
-    try {
-      saved = promptStorageFallback
-        || JSON.parse(localStorage.getItem(promptStorageKey) || "{}");
-    } catch (_) {
-      saved = {};
-    }
-  }
-  const savedText = (name) => typeof saved?.[name] === "string"
-    ? saved[name] : "";
-  promptValues = {
-    review: savedText("review") || source.reviewPrompt || defaults.review || "",
-    author: savedText("author") || source.authorPrompt || defaults.author || "",
-    critic: savedText("critic") || source.criticPrompt || defaults.critic || "",
-    final: savedText("final") || source.finalPrompt || defaults.final || "",
-  };
+  promptOverrides = {};
+  promptValues = Object.fromEntries(Object.keys(promptLabels).map((name) => [
+    name, (source.runId ? source[`${name}Prompt`] : defaults[name]) || defaults[name] || "",
+  ]));
 }
 
 function updatePromptHelp() {
   const defaults = state.workflow?.settings?.prompts || {};
   const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
   ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
-    + (isDefault ? "current default" : "saved or edited prompt");
+    + (isDefault ? "current default" : "this job's prompt");
   ui.promptEditorHelp.textContent = (isDefault ? "" :
-    "This overrides the current default. Reset restores the default; Save applies it. ")
-    + promptHelp[activePrompt];
+    "This overrides the default for this job only. ")
+    + promptHelp[activePrompt]
+    + " New jobs load defaults from the workflow files; browser edits are not remembered.";
 }
 
 function selectPrompt(name) {
@@ -536,13 +526,30 @@ function selectPrompt(name) {
   }
 }
 
-function openPromptEditor() {
-  if (!promptValues.review) syncPrompts();
-  promptDrafts = { ...promptValues };
-  activePrompt = selectedProblemMode() === "latex" ? "final"
-    : ui.skipStatementReview.checked ? "author" : "review";
-  selectPrompt(activePrompt);
-  ui.promptDialog.showModal();
+async function currentPromptDefaults() {
+  const job = currentJob;
+  const next = await request(jobPath("/state"));
+  if (job !== currentJob) return null;
+  state.workflow = next.workflow;
+  return state.workflow.settings.prompts;
+}
+
+async function openPromptEditor() {
+  try {
+    const defaults = await currentPromptDefaults();
+    if (!defaults) return;
+    if (!currentJob) promptValues = { ...defaults, ...promptOverrides };
+    else if (!promptValues.review) syncPrompts();
+    promptDrafts = { ...promptValues };
+    promptOriginals = { ...promptValues };
+    activePrompt = selectedProblemMode() === "latex" ? "final"
+      : ui.skipStatementReview.checked ? "author" : "review";
+    selectPrompt(activePrompt);
+    ui.promptDialog.showModal();
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
 }
 
 function savePrompts() {
@@ -562,17 +569,14 @@ function savePrompts() {
     Object.entries(promptDrafts).map(([name, prompt]) => [name, prompt.trim()])
   );
   const defaults = state.workflow?.settings?.prompts || {};
-  // Persist only custom text so saving one role does not freeze every default.
-  // Legacy saved prompts remain available until the user explicitly resets them.
-  const overrides = Object.fromEntries(Object.entries(promptValues).filter(
-    ([name, prompt]) => prompt !== (defaults[name] || "").trim()
-  ));
-  try {
-    localStorage.setItem(promptStorageKey, JSON.stringify(overrides));
-    promptStorageFallback = null;
-  } catch (_) {
-    // Keep saved customizations across jobs in this tab when storage is blocked.
-    promptStorageFallback = overrides;
+  // Send only deliberate edits. Unedited roles are resolved on the server at launch.
+  for (const [name, prompt] of Object.entries(promptValues)) {
+    if (prompt === (promptOriginals[name] || "").trim()) continue;
+    const baseline = (
+      (state.runId ? state[`${name}Prompt`] : defaults[name]) || defaults[name] || ""
+    ).trim();
+    if (prompt === baseline) delete promptOverrides[name];
+    else promptOverrides[name] = prompt;
   }
   ui.notice.textContent = "";
   show(ui.notice, false);
@@ -1432,10 +1436,7 @@ async function startReview(statement, feedback = "") {
       authorEffort: ui.authorEffort.value,
       criticEffort: ui.criticEffort.value,
       writerEffort: ui.writerEffort.value,
-      reviewPrompt: promptValues.review,
-      authorPrompt: promptValues.author,
-      criticPrompt: promptValues.critic,
-      finalPrompt: promptValues.final,
+      promptOverrides,
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
       speedMode: ui.speedMode.value,
@@ -1468,7 +1469,8 @@ async function startLatexOnly() {
       content: ui.latexInput.value,
       writerModel: ui.writerModel.value,
       writerEffort: ui.writerEffort.value,
-      finalPrompt: promptValues.final,
+      promptOverrides: Object.hasOwn(promptOverrides, "final")
+        ? { final: promptOverrides.final } : {},
       speedMode: ui.speedMode.value,
       reasoningSummary: ui.reasoningSummary.value,
     });
@@ -1566,11 +1568,17 @@ ui.promptTabs.onclick = (event) => {
   const tab = event.target.closest("[data-prompt]");
   if (tab) selectPrompt(tab.dataset.prompt);
 };
-ui.resetPrompt.onclick = () => {
-  const defaults = state.workflow?.settings?.prompts || {};
-  promptDrafts[activePrompt] = defaults[activePrompt] || "";
-  ui.promptEditor.value = promptDrafts[activePrompt];
-  updatePromptHelp();
+ui.resetPrompt.onclick = async () => {
+  try {
+    const defaults = await currentPromptDefaults();
+    if (!defaults) return;
+    promptDrafts[activePrompt] = defaults[activePrompt] || "";
+    ui.promptEditor.value = promptDrafts[activePrompt];
+    updatePromptHelp();
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
 };
 ui.promptEditor.oninput = updatePromptHelp;
 ui.savePrompts.onclick = savePrompts;

@@ -1923,9 +1923,8 @@ def load_workflow(path):
     return workflow
 
 
-@functools.lru_cache(maxsize=2)
 def builtin_workflow(name):
-    """Load UI/convenience defaults lazily, without coupling custom graphs to them."""
+    """Read current UI/convenience defaults without caching editable YAML."""
 
     return load_workflow(WORKFLOWS / f"{name}.yaml")
 
