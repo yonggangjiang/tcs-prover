@@ -22,7 +22,7 @@ REVIEW_PROMPT = (
     'Do a initial scanning on corner cases, edge cases, counter examples to see if the statement is trivial or false. \n'
     'If you found the statement is trivial or false, first try to clear typos, fix any ambiguities, or add missing context or conventional assumptions to make the statement non-trivial. If you can fix it, explain the fix in the note, and return the final problem statement. Remember to check the problem statement again until it passed your audit. If you cannot fix it, explain why in the notes and return the version you think is the best possible statement.\n'
     'If the statement remains non-trivial and open after your scanning, then return a complete, rigorous, self-contained problem statement.\n'
-    'The returned problem statement should just be a complete, rigorous, self-contained problem statement without any commentary or notes. The notes field should contain your reasoning, explanation of any fixes, and any remaining concerns about the statement.\n'
+    'The returned problem statement should use conventional notations and terminologies in TCS, especially asymptotic bounds notations, to avoid overly complex expressions and guarantee conciseness, while maintaining the rigour of the original statement. \n'
     'Return only the requested JSON.'
 )
 

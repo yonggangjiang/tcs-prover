@@ -39,6 +39,7 @@ class RPC:
         self.runtime, self.record = runtime, record
         self.messages, self.calls = deque(), []
         self.number, self.turns = 0, 0
+        self.capabilities = {}
 
     def send(self, message):
         self.calls.append((message["method"], message.get("params")))
@@ -53,6 +54,12 @@ class RPC:
 
     def call(self, method, params):
         self.calls.append((method, params))
+        if method == "initialize":
+            self.capabilities = params.get("capabilities", {})
+        if (method in {"thread/start", "thread/resume"}
+                and "runtimeWorkspaceRoots" in params
+                and not self.capabilities.get("experimentalApi")):
+            raise TransportError(f"{method}.runtimeWorkspaceRoots requires experimentalApi capability")
         if method == "thread/resume" and self.runtime.resume_error:
             raise TransportError(self.runtime.resume_error)
         if method in {"thread/start", "thread/resume"}:
@@ -173,6 +180,19 @@ class GoalTests(unittest.TestCase):
                 self.assertTrue(config["features"]["multi_agent"])
                 self.assertTrue(config["features"]["example_feature"])
                 self.assertEqual(sum(m in {"thread/start", "thread/resume"} for m, _ in runtime.rpc.calls), 1)
+                session.close()
+
+    def test_experimental_workspace_api_is_negotiated_for_start_and_resume(self):
+        for options in ({}, {"goal_thread_id": "thread-1"}):
+            with self.subTest(options=options):
+                runtime, session = self.session(options=options)
+                self.assertEqual(next(session)["outcome"], "done")
+                initialization = runtime.rpc.calls[0]
+                self.assertEqual(initialization[0], "initialize")
+                self.assertTrue(initialization[1]["capabilities"]["experimentalApi"])
+                thread = next(params for method, params in runtime.rpc.calls
+                              if method in {"thread/start", "thread/resume"})
+                self.assertEqual(thread["runtimeWorkspaceRoots"], [str(self.directory)])
                 session.close()
 
     def test_goal_yaml_accepts_features_and_passes_them_to_session(self):

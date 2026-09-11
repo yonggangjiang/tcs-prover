@@ -1189,7 +1189,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         rpc = runtime.RPC(process, record)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
-        rpc.call("initialize", {"clientInfo": {"name": "tcs_prover", "title": "TCS Prover", "version": "1"}})
+        rpc.call("initialize", {
+            "clientInfo": {"name": "tcs_prover", "title": "TCS Prover", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        })
         rpc.send({"method": "initialized", "params": {}})
         thread_options = {
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
