@@ -105,6 +105,10 @@ class Error(RuntimeError):
     """Show a short, understandable failure."""
 
 
+class WorkflowPaused(Error):
+    """Suspend execution without completing a node or entering its successor."""
+
+
 def text(value):
     """Require nonempty text."""
 
@@ -545,10 +549,10 @@ def output_schema_arguments(model, schema_path):
     return ["--output-schema", str(schema_path)]
 
 def structured_tool_arguments(stage, features=()):
-    """Keep structured calls tool-free unless the YAML explicitly enables a feature."""
+    """Enable live search; keep other optional tools controlled by YAML."""
     return [
-        "-c", 'web_search="disabled"',
-        "-c", "tools.web_search=false",
+        "-c", 'web_search="live"',
+        "-c", "tools.web_search=true",
         "-c", "tools.view_image=false",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
     ]
@@ -571,8 +575,8 @@ def structured_retry_prompt(prompt, raw, schema_value):
     return (
         f"{prompt}\n\nSTRUCTURED OUTPUT RECOVERY RETRY\n"
         "The previous attempt did not produce one valid final JSON object. "
-        "Do not call tools, search the web, discuss the formatting failure, or "
-        "return a placeholder. Re-evaluate the task as needed and return the "
+        "Do not discuss the formatting failure or return a placeholder. "
+        "Re-evaluate the task, using web search if needed, and return the "
         "complete substantive answer as exactly one JSON object matching this "
         f"schema:\n{schema}\n\nPREVIOUS INVALID OUTPUT:\n{previous}"
     )
@@ -991,7 +995,7 @@ def structured(
                 raise Error(f"{exc}{suffix}") from exc
             emit(
                 "status", stage, label="Retrying structured output",
-                text="Retrying once without search or local tools.",
+                text="Retrying once for valid structured output; web search remains available.",
             )
     raise Error(f"Codex {stage} did not return structured output.")
 
@@ -1092,6 +1096,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     rpc = process = None
     stop = threading.Event()
     expired = threading.Event()
+    pausing = threading.Event()
+    pause_file = options.get("goal_pause_file")
     state = {"turn": None, "active": True, "steer": None}
     pending_steers = {}
     pending_compaction = None
@@ -1131,7 +1137,26 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
              else "Live author instruction sent", text=instruction, threadId=thread)
 
     def watch():
+        pause_started = None
         while not stop.wait(0.1):
+            if pause_file and Path(pause_file).is_file() and state["active"]:
+                if pause_started is None and state["turn"]:
+                    pause_started = time.monotonic()
+                    pausing.set()
+                    try:
+                        rpc.request("thread/goal/set", {**goal, "status": "paused"})
+                        if "pause" in prompts:
+                            steer(render("pause"), "pause")
+                        else:
+                            rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
+                    except (runtime.Error, OSError) as exc:
+                        emit("diagnostic", text=f"Could not deliver pause instruction: {exc}")
+                if pause_started is not None:
+                    if time.monotonic() - pause_started >= getattr(runtime, "PAUSE_GRACE_SECONDS", 60):
+                        emit("diagnostic", text="Pause save window expired; resumption will use the last saved work.")
+                        runtime.stop_process(process)
+                        return
+                    continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
                 if not state["active"]:
@@ -1155,6 +1180,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         emit("diagnostic", text=f"Could not send live instruction: {exc}")
 
     def start_turn(instruction):
+        if pause_file and Path(pause_file).is_file():
+            pausing.set()
+            raise runtime.Error("Pause requested.")
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         rpc.call("thread/goal/set", {**goal, "status": "paused"})
@@ -1166,7 +1194,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         state["turn"] = (result.get("turn") or {}).get("id")
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
-        rpc.call("thread/goal/set", {**goal, "status": "active"})
+        if not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
+            rpc.call("thread/goal/set", {**goal, "status": "active"})
 
     def collect(item, answers):
         if (item.get("type") in {"agentMessage", "agent_message"}
@@ -1175,10 +1204,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             answers.append(item["text"])
 
     try:
+        if pause_file and Path(pause_file).is_file():
+            pausing.set()
+            raise runtime.Error("Pause requested before starting the model.")
         if runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         process = subprocess.Popen([
             runtime.codex(), "app-server", "--enable", "goals",
+            "-c", 'web_search="live"', "-c", "tools.web_search=true",
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
             *runtime.context_cache_arguments(),
@@ -1198,6 +1231,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
+                "web_search": "live", "tools": {"web_search": True},
                 "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
                              **{feature: True for feature in features}}},
         }
@@ -1247,13 +1281,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if method == "turn/started":
                 running, answers = True, []
                 state["turn"] = turn.get("id")
-                if pending_compaction and state["turn"]:
+                if pending_compaction and state["turn"] and not pausing.is_set():
                     steer(pending_compaction, "retry", True)
                     pending_compaction = None
             elif method == "item/completed":
                 item = params.get("item") or {}
                 collect(item, answers)
-                if item.get("type") == "contextCompaction":
+                if item.get("type") == "contextCompaction" and not pausing.is_set():
                     key = (params.get("turnId"), item.get("id"))
                     if key not in seen_compactions:
                         seen_compactions.add(key)
@@ -1273,10 +1307,16 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     last_usage = {}
                 for item in turn.get("items", []):
                     collect(item, answers)
+                if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
+                    pausing.set()
+                    raise runtime.Error("Author paused at the current turn boundary.")
                 if turn.get("status") in {"failed", "interrupted"}:
                     raise runtime.Error(f"Author turn {turn['status']}: {turn.get('error') or 'no complete result'}")
             elif method == "error" and not params.get("willRetry", False):
                 raise runtime.Error(str(params.get("error") or params))
+            if not running and pause_file and Path(pause_file).is_file():
+                pausing.set()
+                raise runtime.Error("Author paused at the current turn boundary.")
             if status in {"usageLimited", "budgetLimited"}:
                 raise runtime.Error(f"Author stopped: {status}.")
             if not running and status == "complete" and answers:
@@ -1296,11 +1336,15 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 start_turn(render("continuation"))
                 status, running, answers = None, True, []
     except (runtime.Error, OSError, ValueError) as exc:
-        stage = stages["failure"]
-        diagnostic = "Workflow time limit reached." if expired.is_set() else str(exc)
-        emit("diagnostic", text=diagnostic, threadId=thread)
-        emit("failure_result", label="Author stopped", text=diagnostic, output=diagnostic, threadId=thread)
-        failure = {"outcome": "failure", "output": diagnostic}
+        if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
+            pausing.set()
+            emit("status", label="Author paused", text=str(exc), threadId=thread)
+        else:
+            stage = stages["failure"]
+            diagnostic = "Workflow time limit reached." if expired.is_set() else str(exc)
+            emit("diagnostic", text=diagnostic, threadId=thread)
+            emit("failure_result", label="Author stopped", text=diagnostic, output=diagnostic, threadId=thread)
+            failure = {"outcome": "failure", "output": diagnostic}
     finally:
         stop.set()
         if rpc and thread and state["active"]:
@@ -1314,6 +1358,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             cleanup.join(timeout=1)
         if process:
             runtime.stop_process(process)
+    if pausing.is_set():
+        raise WorkflowPaused("Workflow paused.")
     if failure:
         yield failure
 
@@ -1880,7 +1926,7 @@ def load_workflow(path):
             if isinstance(lifecycle, list) and all(isinstance(key, str) for key in lifecycle):
                 lifecycle = {key: key for key in lifecycle}
             required = set(_GOAL_LIFECYCLE)
-            if not isinstance(lifecycle, dict) or set(lifecycle) != required or not all(
+            if not isinstance(lifecycle, dict) or not required <= set(lifecycle) or set(lifecycle) - required - {"pause"} or not all(
                 isinstance(ref, str) and ref in prompts for ref in lifecycle.values()
             ):
                 raise ValueError(f"Goal node {name} must bind its lifecycle prompts.")
@@ -2206,6 +2252,8 @@ def _execute(workflow, state, options, prompts):
     try:
         while current != "end":
             node = nodes[current]
+            if options.get("goal_pause_file") and Path(options["goal_pause_file"]).is_file():
+                raise WorkflowPaused("Paused before the next workflow step.")
             if workflow_remaining(options) <= 0:
                 raise Error("Workflow time limit reached.")
             visits += 1
@@ -2265,6 +2313,10 @@ def _execute(workflow, state, options, prompts):
                 visits = 0
             current = target
         return state
+    except WorkflowPaused:
+        state["paused"] = True
+        emit("workflow_paused", node.get("stage", current), node=current, state=state)
+        return state
     finally:
         for session in sessions.values():
             session.close()
@@ -2294,7 +2346,7 @@ def execute_workflows(paths, state, options=None):
         prepared.append((workflow, prepare(workflow, local_options), local_options))
     for workflow, prompts, local_options in prepared:
         _execute(workflow, state, local_options, prompts)
-        if state.get("failed"):
+        if state.get("failed") or state.get("paused"):
             break
     return state
 
@@ -2433,6 +2485,8 @@ def main(argv=None):
                 raise Error("Workflow input cannot contain NUL characters.")
             state = {"input": source, "statement": source, "source": source}
         state = execute_workflows(args.workflows, state, options)
+        if state.get("paused"):
+            return 0
         if state.get("failed"):
             return 1
         emit("workflow_result", "workflow", output=state.get("output", ""))

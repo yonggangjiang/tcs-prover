@@ -50,6 +50,7 @@ const ui = {
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   stop: $("stopButton"),
+  pause: $("pauseButton"), resume: $("resumeButton"), downloadTex: $("downloadTexButton"),
   authorTimeLimitControl: $("authorTimeLimitControl"),
   authorLimitSummary: $("authorLimitSummary"),
   authorLimitHours: $("authorLimitHours"),
@@ -65,6 +66,7 @@ const ui = {
   memoryPanel: $("memoryPanel"), memoryFilename: $("memoryFilename"),
   memoryUpdated: $("memoryUpdated"), memoryDocument: $("memoryDocument"),
   memoryMessage: $("memoryMessage"), memoryContent: $("memoryContent"),
+  memoryApproachPicker: $("memoryApproachPicker"), memoryApproach: $("memoryApproach"),
   jump: $("jumpLatest"), filters: $("filters"),
   workflowRail: $("workflowRail"), workflowNodes: $("workflowNodes"),
   activityToggle: $("activityToggle"), activityPanel: $("activityPanel"),
@@ -101,6 +103,7 @@ const detailRows = new Map();
 const memoryTabs = [...document.querySelectorAll("[data-memory]")];
 let memoryJob = null;
 let memoryFile = "INITIAL_PROMPT.md";
+let memoryAnchor = "";
 let memoryVersion = "";
 let memoryTimer;
 let memoryRequest = 0;
@@ -236,7 +239,7 @@ async function continueStopped(job, title) {
   const question = `${job.continueStoppedLabel || "Continue stopped job"} for “${title}”?\n\n`
     + `${detail}${settingsWarning}\n\nA new job will be created. The source job will not be changed, `
     + "and an interrupted model response or private reasoning cannot be resumed.";
-  if (!confirm(question)) return;
+  if (job.phase !== "paused" && !confirm(question)) return;
   try {
     const next = await request(
       `/continue-stopped?job=${encodeURIComponent(job.runId)}`, {}
@@ -277,7 +280,7 @@ function renderJobs(jobs) {
     status.className = `job-status ${job.phase}`;
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
-      running: "Running", stopping: "Stopping", done: "Finished",
+      running: "Running", stopping: "Stopping", pausing: "Saving before pause", paused: "Paused", done: "Finished",
     };
     status.textContent = job.manuallyStopped
       ? `Stopped at ${job.stoppedStage || "saved stage"}`
@@ -323,7 +326,7 @@ function renderJobs(jobs) {
           const continueButton = document.createElement("button");
           continueButton.className = "secondary compact checkpoint-resume";
           continueButton.textContent = checkpoint.resumeLabel || "Continue";
-          continueButton.disabled = ["reviewing", "running", "stopping"]
+          continueButton.disabled = ["reviewing", "running", "stopping", "pausing", "paused"]
             .includes(job.phase);
           continueButton.onclick = () => resumeCheckpoint(
             job, checkpoint, title.textContent,
@@ -359,7 +362,7 @@ function renderJobs(jobs) {
     const remove = document.createElement("button");
     remove.className = "ghost compact job-delete";
     remove.textContent = "Delete";
-    remove.disabled = ["reviewing", "running", "stopping"].includes(job.phase);
+    remove.disabled = ["reviewing", "running", "stopping", "pausing"].includes(job.phase);
     remove.title = remove.disabled ? "Stop this job before deleting it." : "";
     remove.onclick = () => deleteJob(job, title.textContent);
     actions.append(open, separate, continueButton, resume, remove);
@@ -591,9 +594,9 @@ function clockText(date) {
     : "";
 }
 
-function elapsedText(start) {
+function elapsedText(start, end = Date.now(), previousSeconds = 0) {
   if (!start) return "";
-  const seconds = Math.max(0, Math.floor((Date.now() - new Date(start)) / 1000));
+  const seconds = Math.max(0, Math.floor(previousSeconds + (new Date(end) - new Date(start)) / 1000));
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   const rest = seconds % 60;
@@ -799,6 +802,29 @@ function appendFormattedText(element, value) {
 }
 
 // Readable Markdown sections, built with text nodes so file content cannot run HTML.
+function appendMemoryText(element, value) {
+  const files = ui.memoryApproachPicker.hidden ? [] : [...ui.memoryApproach.options].map((option) => option.value);
+  for (const part of String(value).split(/(\[[^\]\n]+\]\([^()\s]+\))/g)) {
+    const link = part.match(/^\[([^\]\n]+)\]\(([^()\s]+)\)$/);
+    const [path, anchor = ""] = link ? link[2].split("#", 2) : [];
+    const notebook = path?.replace(/^\.\.\//, "");
+    const target = link && (
+      ["INITIAL_PROMPT.md", "PROVED.md"].includes(notebook) ? notebook
+        : /^APPROACHES\/(?:INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md$/.test(path) ? path
+          : path === "" ? memoryFile
+            : [path, `APPROACHES/${path}`, path === "../APPROACHES.md" ? "APPROACHES.md" : ""]
+              .find((name) => files.includes(name))
+    );
+    if (!target) { appendFormattedText(element, part); continue; }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "memory-link";
+    appendFormattedText(button, link[1]);
+    button.onclick = () => selectMemoryDocument(target === "APPROACHES/INDEX.md" ? "APPROACHES" : target, anchor);
+    element.append(button);
+  }
+}
+
 function renderMemoryContent(value) {
   const scrollTop = ui.memoryDocument.scrollTop;
   const expanded = new Map([...ui.memoryContent.querySelectorAll("details")]
@@ -812,7 +838,7 @@ function renderMemoryContent(value) {
   const flush = () => {
     if (!paragraph.length) return;
     const copy = document.createElement("p");
-    appendFormattedText(copy, paragraph.join("\n"));
+    appendMemoryText(copy, paragraph.join("\n"));
     target.append(copy);
     paragraph = [];
   };
@@ -837,7 +863,7 @@ function renderMemoryContent(value) {
         section.dataset.heading = heading[2];
         section.open = expanded.get(heading[2]) ?? (sections === 0);
         const summary = document.createElement("summary");
-        appendFormattedText(summary, heading[2]);
+        appendMemoryText(summary, heading[2]);
         target = document.createElement("div");
         target.className = "memory-section-body";
         section.append(summary, target);
@@ -845,7 +871,7 @@ function renderMemoryContent(value) {
         sections += 1;
       } else {
         const title = document.createElement(heading[1].length === 1 ? "h3" : "h4");
-        appendFormattedText(title, heading[2]);
+        appendMemoryText(title, heading[2]);
         if (heading[1].length === 1) target = fragment;
         target.append(title);
       }
@@ -862,6 +888,39 @@ function renderMemoryContent(value) {
   ui.memoryDocument.scrollTop = scrollTop;
 }
 
+function revealMemoryAnchor() {
+  if (!memoryAnchor) return;
+  const anchor = memoryAnchor.toLowerCase();
+  memoryAnchor = "";
+  const section = [...ui.memoryContent.querySelectorAll("details")].find((item) => {
+    const heading = item.dataset.heading.toLowerCase();
+    return heading.match(/^[al]\d+\b/)?.[0] === anchor
+      || heading.replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-") === anchor;
+  });
+  if (section) {
+    section.open = true;
+    section.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function renderMemoryChoices(file) {
+  const files = file.files || [];
+  show(ui.memoryApproachPicker, files.length > 0);
+  if (!files.length) return;
+  const selected = memoryFile === "APPROACHES" ? "APPROACHES/INDEX.md" : memoryFile;
+  const choices = files.includes(selected) ? files : [...files, selected];
+  if (JSON.stringify([...ui.memoryApproach.options].map((option) => option.value)) !== JSON.stringify(choices)) {
+    ui.memoryApproach.replaceChildren(...choices.map((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name === "APPROACHES/INDEX.md" ? "Index"
+        : name === "APPROACHES.md" ? "Historical notebook" : name.slice("APPROACHES/".length, -3);
+      return option;
+    }));
+  }
+  ui.memoryApproach.value = selected;
+}
+
 async function loadMemory() {
   clearTimeout(memoryTimer);
   if (!ui.memoryPanel.open || ui.memoryPanel.hidden || document.hidden) return;
@@ -870,6 +929,8 @@ async function loadMemory() {
   try {
     const file = await request(jobPath("/memory", { file: memoryFile, version: memoryVersion }));
     if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+    renderMemoryChoices(file);
+    ui.memoryFilename.textContent = file.name;
     if (file.status === "ready") {
       if (!file.unchanged) {
         memoryVersion = file.version;
@@ -878,6 +939,7 @@ async function loadMemory() {
         show(ui.memoryMessage, !file.content.trim());
       }
       ui.memoryUpdated.textContent = `Updated ${new Date(file.modifiedAt).toLocaleString()}`;
+      revealMemoryAnchor();
     } else {
       memoryVersion = "";
       ui.memoryContent.replaceChildren();
@@ -902,15 +964,23 @@ async function loadMemory() {
 }
 
 function selectMemoryFile(tab) {
-  ++memoryRequest;
-  memoryFile = tab.dataset.memory;
-  memoryVersion = "";
+  show(ui.memoryApproachPicker, false);
+  selectMemoryDocument(tab.dataset.memory);
+}
+
+function selectMemoryDocument(name, anchor = "") {
+  const category = name.startsWith("APPROACHES") ? "APPROACHES" : name;
+  const tab = memoryTabs.find((item) => item.dataset.memory === category);
   for (const item of memoryTabs) {
     item.setAttribute("aria-selected", String(item === tab));
     item.tabIndex = item === tab ? 0 : -1;
   }
-  ui.memoryFilename.textContent = memoryFile;
-  ui.memoryDocument.setAttribute("aria-labelledby", tab.id);
+  if (tab) ui.memoryDocument.setAttribute("aria-labelledby", tab.id);
+  ++memoryRequest;
+  memoryFile = name;
+  memoryAnchor = anchor;
+  memoryVersion = "";
+  ui.memoryFilename.textContent = name;
   ui.memoryDocument.scrollTop = 0;
   ui.memoryContent.replaceChildren();
   ui.memoryMessage.textContent = "Loading saved work…";
@@ -1227,12 +1297,12 @@ function renderWorkflow() {
 
 function renderClock() {
   ui.elapsed.textContent = state.startedAt && state.phase !== "input"
-    ? elapsedText(state.startedAt) : "";
+    ? elapsedText(state.resumedAt || state.startedAt, state.finishedAt || Date.now(), Number(state.elapsedSeconds || 0)) : "";
   if (state.lastActivityAt) {
     const ago = Math.max(0, Math.floor(
       (Date.now() - new Date(state.lastActivityAt)) / 1000
     ));
-    const working = ["reviewing", "running", "stopping"].includes(state.phase);
+    const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase);
     const activity = working
       ? (ago < 2 ? "Working · public activity now"
         : `Still working · waiting ${ago}s for the next public event`)
@@ -1253,7 +1323,7 @@ function render(next) {
   ingest(newEntries, !incremental);
 
   const phase = state.phase;
-  const working = ["reviewing", "running", "stopping"].includes(phase);
+  const working = ["reviewing", "running", "stopping", "pausing"].includes(phase);
   const reviewOnlyResult = phase === "done"
     && state.statementReviewOnly && Boolean(state.review);
   const reviewReady = phase === "reviewed" || reviewOnlyResult;
@@ -1261,7 +1331,7 @@ function render(next) {
   show(ui.review, reviewReady);
   show(
     ui.run,
-    ["reviewing", "running", "stopping", "done"].includes(phase)
+    ["reviewing", "running", "stopping", "pausing", "paused", "done"].includes(phase)
       && !reviewOnlyResult,
   );
   show(ui.workflowRail, phase !== "input");
@@ -1337,17 +1407,21 @@ function render(next) {
   const done = phase === "done";
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
+    : phase === "paused" ? "Paused" : phase === "pausing" ? "Saving before pause"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? "Finished" : (node.label || "Codex is working");
-  ui.runLabel.textContent = done ? "RUN COMPLETE" : (node.short_label || "CODEX");
+  ui.runLabel.textContent = phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
+    : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Saving the current work…"
     : phase === "stopping" ? "Stopping safely…"
       : (state.error || (done ? (node.label || "Final result")
         : (node.label || "Codex is working")));
   ui.runDescription.textContent = state.error
-    || (done ? "The output and transcript remain preserved for this job."
-      : (node.description || ""));
+    || (phase === "paused" ? "Resume continues in this same run folder. You can change your Codex CLI login before resuming."
+      : phase === "pausing" ? "The author has up to 60 seconds to save its work. If it cannot respond, the last saved work remains available."
+      : done ? "The output and transcript remain preserved for this job."
+        : (node.description || ""));
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
   const authorLimit = Number(state.thinkingHours || 168);
@@ -1368,9 +1442,12 @@ function render(next) {
     ui.authorLimitHours.value = String(authorLimit);
   }
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
-  show(ui.stop, !done);
+  show(ui.pause, canSetAuthorLimit);
+  show(ui.resume, phase === "paused");
+  show(ui.downloadTex, Boolean(state.canDownloadTex));
+  show(ui.stop, working);
   ui.stop.disabled = phase === "stopping";
-  ui.run.setAttribute("aria-busy", String(!done));
+  ui.run.setAttribute("aria-busy", String(working));
 
   renderWorkflow();
   renderClock();
@@ -1609,6 +1686,9 @@ ui.memoryPanel.addEventListener("toggle", () => {
   clearTimeout(memoryTimer);
   if (ui.memoryPanel.open) loadMemory();
 });
+ui.memoryApproach.onchange = () => selectMemoryDocument(
+  ui.memoryApproach.value === "APPROACHES/INDEX.md" ? "APPROACHES" : ui.memoryApproach.value,
+);
 for (const tab of memoryTabs) {
   tab.onclick = () => selectMemoryFile(tab);
   tab.onkeydown = (event) => {
@@ -1626,6 +1706,30 @@ document.addEventListener("visibilitychange", () => {
   else clearTimeout(memoryTimer);
 });
 ui.stop.onclick = () => act("/stop");
+ui.pause.onclick = () => act("/pause");
+ui.resume.onclick = () => act("/resume");
+ui.downloadTex.onclick = async () => {
+  ui.downloadTex.disabled = true;
+  try {
+    const response = await fetch(jobPath("/download-tex"), {
+      headers: { "X-TCS-Prover-Token": sessionToken },
+    });
+    if (!response.ok) throw new Error((await response.json()).error || "Download failed.");
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "final.tex";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  } finally {
+    ui.downloadTex.disabled = false;
+  }
+};
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
 window.onpopstate = () => {

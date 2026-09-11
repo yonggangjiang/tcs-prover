@@ -301,9 +301,13 @@
               <button id="memoryPromptTab" type="button" role="tab" aria-selected="true"
                 aria-controls="memoryDocument" data-memory="INITIAL_PROMPT.md">Initial prompt</button>
               <button id="memoryApproachesTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES.md">Attempted approaches</button>
+                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES">Attempted approaches</button>
               <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
                 aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
+            </div>
+            <div id="memoryApproachPicker" class="memory-approach-picker" hidden>
+              <label for="memoryApproach">Approach</label>
+              <select id="memoryApproach" aria-controls="memoryDocument"></select>
             </div>
             <div class="memory-meta">
               <code id="memoryFilename">INITIAL_PROMPT.md</code>
@@ -359,7 +363,10 @@
                 Set limit
               </button>
             </div>
+            <button id="pauseButton" class="secondary" hidden>Pause</button>
             <button id="stopButton" class="danger">Stop</button>
+            <button id="resumeButton" class="primary" hidden>Resume</button>
+            <button id="downloadTexButton" class="secondary" hidden>Download .tex</button>
             <button id="homeButton" class="secondary">Return home</button>
           </div>
         </section>

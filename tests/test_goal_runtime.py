@@ -179,6 +179,8 @@ class GoalTests(unittest.TestCase):
                 config = next(p["config"] for m, p in runtime.rpc.calls if m in {"thread/start", "thread/resume"})
                 self.assertTrue(config["features"]["multi_agent"])
                 self.assertTrue(config["features"]["example_feature"])
+                self.assertEqual(config["web_search"], "live")
+                self.assertTrue(config["tools"]["web_search"])
                 self.assertEqual(sum(m in {"thread/start", "thread/resume"} for m, _ in runtime.rpc.calls), 1)
                 session.close()
 
@@ -353,6 +355,63 @@ class GoalTests(unittest.TestCase):
         steers = [p for m, p in runtime.rpc.calls if m == "turn/steer"]
         self.assertEqual(steers[0]["expectedTurnId"], "turn-1")
         self.assertEqual(steers[0]["input"][0]["text"], runtime.command[1])
+
+    def test_pause_steers_current_turn_and_never_returns_checkpoint_as_proof(self):
+        path = self.directory / "pause-request.json"
+        runtime, session = self.session([[]], options={"goal_pause_file": str(path)})
+        instruction = "Save your own work, then return a checkpoint summary."
+        def pause_after_start(rpc):
+            path.write_text("{}")
+            self.assertTrue(runtime.steered.wait(2))
+            rpc.messages.extend(success("Checkpoint summary, not a proof"))
+        runtime.on_empty = pause_after_start
+        with patch.dict(PROMPTS, pause=instruction), self.assertRaises(module.WorkflowPaused):
+            next(session)
+        self.assertEqual(runtime.rpc.turns, 1)
+        self.assertTrue(runtime.stopped)
+        self.assertFalse(any(e["kind"] in {"author_result", "failure_result"} for e in runtime.events))
+        sent = next(p for m, p in runtime.rpc.calls if m == "turn/steer")
+        self.assertEqual(sent["input"][0]["text"], instruction)
+        self.assertEqual(sent["expectedTurnId"], "turn-1")
+        self.assertEqual(runtime.rpc.calls[-1][1]["status"], "paused")
+
+    def test_pause_without_a_responsive_model_retains_last_saved_work(self):
+        path = self.directory / "pause-request.json"
+        notebook = self.directory / "APPROACHES.md"
+        notebook.write_text("Saved route and exact obstacle")
+        runtime, session = self.session([[]], options={"goal_pause_file": str(path)})
+        runtime.PAUSE_GRACE_SECONDS = 0.01
+        stopped = threading.Event()
+        runtime.stop_process = lambda process: stopped.set()
+        def hang(rpc):
+            path.write_text("{}")
+            self.assertTrue(stopped.wait(2))
+            raise TransportError("Transport ended")
+        runtime.on_empty = hang
+        with self.assertRaises(module.WorkflowPaused):
+            next(session)
+        self.assertEqual(notebook.read_text(), "Saved route and exact obstacle")
+        self.assertTrue(any("last saved work" in e.get("text", "") for e in runtime.events))
+        self.assertFalse(any(e["kind"] == "failure_result" for e in runtime.events))
+
+    def test_preexisting_pause_request_starts_no_process(self):
+        path = self.directory / "pause-request.json"
+        path.write_text("{}")
+        _, session = self.session(options={"goal_pause_file": str(path)})
+        with self.assertRaises(module.WorkflowPaused):
+            next(session)
+        self.spawn.assert_not_called()
+
+    def test_pause_after_turn_before_late_goal_completion_cannot_yield_proof(self):
+        path = self.directory / "pause-request.json"
+        runtime, session = self.session([[answer("Proof"), completed()]], options={"goal_pause_file": str(path)})
+        def pause_at_boundary(rpc):
+            path.write_text("{}")
+            rpc.messages.append(goal("complete"))
+        runtime.on_empty = pause_at_boundary
+        with self.assertRaises(module.WorkflowPaused):
+            next(session)
+        self.assertFalse(any(e["kind"] == "author_result" for e in runtime.events))
 
     def test_saved_critic_feedback_is_submitted_without_writing_it(self):
         runtime, session = self.session(initial_instruction="Previously rejected: repair step 2.")

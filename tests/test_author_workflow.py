@@ -1,4 +1,4 @@
-"""The author stays a single generic goal node with three YAML-defined files."""
+"""The author stays a single generic goal node with YAML-defined research records."""
 import copy
 import os
 from pathlib import Path

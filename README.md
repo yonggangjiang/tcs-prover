@@ -2,13 +2,14 @@
 
 A local web UI that gives a persistent root author LLM a mathematical statement,
 lets it explore diverse approaches with independent subagents while maintaining
-three readable memory files, checks its candidate through a critic loop, and
+a readable research journal, checks its candidate through a critic loop, and
 produces a complete LaTeX document.
 Algorithmic tasks can be entered as statements too.
 
 The complete author instructions live directly in
 [`workflows/author_critic.yaml`](workflows/author_critic.yaml). The LLM creates,
-reads, searches, and updates its own three files under that prompt.
+reads, searches, and updates its initial instructions, approach files, and proved
+lemmas under that prompt.
 
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
@@ -171,7 +172,7 @@ To continue from the Web UI:
 3. Click the continuation button beside the checkpoint you want.
 4. Confirm the action. TCS Prover creates a new job and opens it immediately.
 
-The source run is never overwritten. The new job copies the selected candidate,
+Saved run inputs and transcripts are preserved. The new job copies the selected candidate,
 role prompts, model choices, reasoning efforts, speed, critic-round maximum,
 and workflow time limit. Old saved model routes that are no longer selectable
 are migrated to the official DeepSeek model when the
@@ -198,15 +199,16 @@ button:
 | Stopped stage | Button | Continuation boundary |
 | --- | --- | --- |
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
-| Proof author, repair, or interrupted failure summary | **Continue proof author** | Restores `INITIAL_PROMPT.md`, `APPROACHES.md`, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads those files before continuing. Visible partial text is not treated as a complete proof. |
+| Proof author, repair, or interrupted failure summary | **Continue proof author** | Uses `INITIAL_PROMPT.md`, the approach index and route files, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads the active work before continuing. Unmigrated older runs retain their `APPROACHES.md` layout. Visible partial text is not treated as a complete proof. |
 | Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The critic requests new independent bug-finding reports. |
 | LaTeX editor | **Retry LaTeX editor** | Retries the single editor call with the saved accepted solution or standalone LaTeX source. Older jobs without an exact final input fall back to their latest critic checkpoint. |
 
-Every action creates a new run folder and leaves the stopped source run
-unchanged. An in-flight request or inaccessible private reasoning cannot be
+These continuation actions create a new run folder while preserving the source
+job's saved inputs and transcripts. Author continuation updates the existing shared
+research records. An in-flight request or inaccessible private reasoning cannot be
 recovered as a completed answer. Review and final requests retry from their
 exact saved public input. The author resumes its existing conversation when
-available, or reads its three memory files in a fresh conversation. Historical runs created before
+available, or reads its research records in a fresh conversation. Historical runs created before
 `manual-stop.json` are recognized from their existing `Stop requested`
 transcript entry.
 
@@ -219,8 +221,9 @@ python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN
 python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN --thinking-hours 24
 ```
 
-This opens a continued browser-visible job and leaves the source run unchanged.
-The new run carries the author's three memory files; saved settings remain in
+This opens a continued browser-visible job while preserving the source job's
+saved inputs and transcripts. The author updates its existing research workspace;
+saved settings remain in
 effect unless explicitly overridden. The full initial assignment is preserved
 rather than reconstructed from a short summary. Critic and finalization
 checkpoints retain their separate review artifacts.
@@ -319,7 +322,9 @@ take effect without restarting the server, even if the browser page was already
 open. The prompt editor refreshes these defaults when opened. **Apply to this
 job** changes only that job; prompts are never remembered in browser storage or
 carried into the next new job. Continuing an existing job preserves its saved
-prompt and research workspace; start a new job to use a changed author policy.
+prompt and research workspace. Use a new job for a changed author policy, or
+explicitly approve a history-preserving migration of the existing instructions
+and research records.
 
 Every job card shows its full local start and finish date and time, including
 seconds. Active jobs show that they have not finished yet, so repeated problem
@@ -331,13 +336,33 @@ discard the memory files or restart the problem. The
 control is intentionally unavailable during statement review,
 critic review, failure summaries, and final LaTeX editing.
 
+**Pause**, beside **Stop**, asks the active author to save its notebook updates
+and close its subagents. It allows up to 60 seconds for saving, then closes the
+session; if the model cannot respond, only previously saved work is recoverable.
+Wait for **Paused**, change your Codex CLI login if needed, then click **Resume**
+on the inference page or job card. Resume launches a fresh CLI process in the
+same run folder, appends to its transcript, and resumes the saved thread when
+available. The research records and any critic rejection remain available.
+Paused jobs also remain resumable after restarting the UI. Paused time does not
+consume the remaining workflow time budget. **Stop** keeps its existing immediate
+termination behavior.
+
+When LaTeX editing finishes, **Download .tex** downloads that job's saved
+`final.tex`. There is no PDF generation or PDF download.
+
+Live web search is enabled for the author, statement reviewer, critic, and
+LaTeX editor, including structured retries and the configuration inherited by
+subagents. The runner explicitly sets Codex's
+[`web_search="live"`](https://learn.chatgpt.com/docs/config-file/config-reference)
+for new and resumed sessions; the models decide when to search.
+
 ## Workflow
 
 ```mermaid
 flowchart TD
     S["Optional statement review"] --> A["Persistent root author"]
-    A <--> M["INITIAL_PROMPT.md · APPROACHES.md · PROVED.md"]
-    A -- "continue another approach" --> A
+    A <--> M["INITIAL_PROMPT.md · APPROACHES/ · PROVED.md"]
+    A -- "continue research" --> A
     A -- "complete candidate" --> C["One root critic request"]
     C <--> B["Fresh independent bug-finding subagents"]
     C -- "reject: exact bugs and reset rounds" --> A
@@ -363,40 +388,56 @@ the target impossible. The review step states the intended convention and writes
 it as `(m+n) log² n` instead of letting that mismatch
 derail the proof search.
 
-### 2. One persistent author and three memory files
+### 2. One persistent author and an indexed research journal
 
 The default author has one persistent root goal and enables `multi_agent`.
-Its prompt calls for aggressive exploration by independent subagents assigned
-different approaches. They are instructed to work without communicating with
-one another and report to the root author, which checks and records their work.
-It keeps choosing new directions under the same initial assignment. The
-separate critic checks any completed candidate afterward.
+Its prompt calls for deep investigation of one principal route, with independent
+subagents applying different methods to its unresolved steps. They work without
+communicating with one another and report to the root author, which also does
+mathematical work and records the results. Difficulty or completion of a helper
+lemma does not automatically trigger another brainstorming round. The separate
+critic checks any completed candidate afterward.
 
-The author has exactly three memory files in its run folder:
+The author maintains three research locations in its run folder:
 
 | File | Contents |
 | --- | --- |
 | `INITIAL_PROMPT.md` | The complete original author prompt, including the exact statement and search strategy. The author creates it if absent and is instructed to preserve it unchanged. |
-| `APPROACHES.md` | Every attempted approach, with a stable ID, mechanism, assumptions, detailed work, current status, failed steps, remaining obstacles, and a concrete condition for revisiting it. |
+| `APPROACHES/` | `INDEX.md` identifies the principal route, links every approach, and records its status and obstacle or result. Each `A001-short-title.md` route file starts with its current position and next action, followed by dated, detailed research entries. |
 | `PROVED.md` | Only fully justified positive or negative lemmas, with exact assumptions, complete arguments, and links to their originating approach IDs. |
 
-The model creates all three files when absent and maintains `APPROACHES.md`
-and `PROVED.md` itself. Before trying a
-route, it reads the relevant earlier attempts, compares the actual mechanism
-and obstacle, and explains any substantive difference or satisfied reopening
-condition. Merely renaming an old dead end does not count as a new idea.
-Unfinished arguments and suspected counterexamples remain in `APPROACHES.md`;
-only completely proved results belong in `PROVED.md`. A proved obstruction to
-one method is not a refutation of the original statement unless its proof
-actually establishes that conclusion.
+The model creates and maintains these records itself. Route statuses are
+**ACTIVE**, **PARKED** (unresolved, with a re-entry action), **CLOSED** (a scoped
+failed claim or construction), and **RESOLVED** (the stated subproblem is solved).
+The index is navigation, not a substitute for reading the active argument and
+its supporting lemmas. The optional **Research memory** browser panel shows the
+index and lets you select a route; legacy notebooks remain readable.
+
+Each route retains constructions, calculations, attempted proofs, examples,
+counterexamples, repairs, and substantive subagent findings with their full
+arguments and explicit gaps, rather than conclusions alone. Corrections are
+appended while the current-position summary stays up to date. Before switching,
+the author records what it tried, why the obstacle remains, how to resume, and
+why the alternative deserves priority. New lemmas must be applied to the current
+candidate, with the remaining task-level obligations made explicit. There are
+no added model roles, routine lemma-audit loops, or token/word quotas.
+
+Unfinished arguments and suspected counterexamples remain in the approach files;
+only completely proved results belong in `PROVED.md`. A failed variant does not
+close an entire research family. Renaming a failed construction is not a new idea.
 
 While the process runs, the author continues in the same conversation. On
-context compaction or continuation it rereads the initial assignment and
-memory files. After an interruption it resumes that conversation when available;
-otherwise it starts a fresh conversation and reads the same three files. The
+context compaction or continuation it reads the initial assignment, index, active
+route's current position and relevant entries, and supporting lemmas. It resumes
+the recorded next action. After an interruption it resumes that conversation
+when available; otherwise it reads the same records in a fresh conversation. The
 resume prompt includes the original full assignment as a fallback when the
 initial prompt file is absent. File creation, reading, and updating belong to
 the LLM; the runner does not parse, summarize, or maintain a research database.
+An older run's saved initial instructions retain its legacy layout unless the
+user explicitly approves a migration. Such a migration preserves its original
+chronological notebook and initial instructions as historical artifacts, and
+identifies the new active layout explicitly in `INITIAL_PROMPT.md`.
 
 This design depends on the author's adherence to the notebook and novelty
 instructions. It makes its history readable and available; it does not
@@ -419,7 +460,7 @@ The critic considers those reports and repairs the complete argument itself.
 
 If it cannot fix every issue, it returns the latest safely repaired candidate
 and exact unresolved bugs to the author. The author continues with the same
-three memory files, records the objections, and rechecks affected lemmas. This
+research records, records the objections, and rechecks affected lemmas. This
 rejection resets the consecutive critic-round count.
 
 An unchanged pass accepts immediately. An edited pass sends the latest solution
@@ -440,7 +481,7 @@ compiler or an additional final verifier.
 ## Project structure
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
-engine and model/goal transport. The three author notebooks remain plain
+engine and model/goal transport. The author research records remain plain
 Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches the UI or Markdown proof jobs. The
 `workflows/` directory contains exactly two YAML definitions:
 
@@ -514,7 +555,13 @@ Node `role` settings can use options such as `editor_model` and `editor_effort`.
 
 The CLI initializes `state.input`, `state.statement`, and `state.source` with the
 same input after trimming surrounding whitespace. Chained graphs share state,
-and `state.failed` stops the chain. Output is JSONL events, ending with
+and `state.failed` stops the chain. An optional `goal_pause_file` control path
+also pauses execution when the file exists. Goal nodes can bind a `pause`
+lifecycle prompt in YAML to request a save before stopping. Pausing emits
+`workflow_paused` with the current node and workflow state, sets `state.paused`,
+and stops the chain without returning a completed proof. The UI persists this
+controller checkpoint separately from the LLM-managed research notebooks.
+Output is JSONL events, ending with
 `workflow_result` on success and its
 `output` field from `state.output`. The Python API is
 `execute(path, state, options=...)` or `execute_workflows(paths, state, options)`.

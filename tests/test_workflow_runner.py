@@ -171,6 +171,28 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(len(completion), 1)
                 self.assertEqual(completion[0].kwargs['output'], LATEX)
 
+    def test_pausing_repair_checkpoints_exact_feedback_and_stops_the_chain(self):
+        report = review_report(verdict='reject')
+        initial = {'statement': 'Task', 'solution': PROOF, 'report': report, 'round': 2}
+        with workspace(), patch.object(runtime, 'goal_session', side_effect=runtime.WorkflowPaused), patch.object(runtime, 'structured') as model, patch.object(runtime, 'emit') as emit:
+            state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml', ROOT/'workflows/clean_up.yaml'], initial)
+        self.assertTrue(state['paused'])
+        self.assertEqual(state['report'], report)
+        self.assertEqual(state['round'], 2)
+        model.assert_not_called()
+        checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
+        self.assertEqual(checkpoint['node'], 'author')
+        self.assertEqual(checkpoint['state'], state)
+
+    def test_live_web_search_is_enabled_for_all_structured_stages_and_retries(self):
+        for stage in ('review', 'critic', 'final'):
+            for features in ([], ['multi_agent']):
+                arguments = runtime.structured_tool_arguments(stage, features)
+                self.assertIn('web_search="live"', arguments)
+                self.assertIn('tools.web_search=true', arguments)
+                self.assertNotIn('tools.web_search=false', arguments)
+        self.assertIn('using web search if needed', runtime.structured_retry_prompt('Task', '', {}))
+
 
 if __name__=='__main__':
     unittest.main()

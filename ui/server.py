@@ -7,10 +7,12 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
 from collections import deque
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,11 +47,14 @@ STOP_TIMEOUT_SECONDS = 2
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
 AUTHOR_STEER_FILENAME = "author-steer.json"
+PAUSE_FILENAME = "pause.json"
+PAUSE_REQUEST_FILENAME = "pause-request.json"
 JOB_SETTINGS_FILENAME = "job-settings.json"
 MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
 RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md"}
+APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
@@ -514,7 +519,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly",
-            "goalThreadId", "goalWorkspace", "goalResume",
+            "goalThreadId", "goalWorkspace", "goalResume", "elapsedSeconds", "resumedAt",
         )
         self._save(
             JOB_SETTINGS_FILENAME,
@@ -728,7 +733,8 @@ class App:
     def memory_file(self, name, version=""):
         """Display one author-owned file on demand, without modifying it."""
 
-        if name not in RESEARCH_MEMORY_FILES:
+        approach = name in {"APPROACHES", "APPROACHES.md"} or bool(APPROACH_MEMORY_FILE.fullmatch(name))
+        if name not in RESEARCH_MEMORY_FILES and not approach:
             raise ValueError("Unknown research memory file.")
         with self.lock:
             directory = self.state.get("goalWorkspace") or self.run_dir
@@ -736,24 +742,109 @@ class App:
         if not directory:
             return result
         directory = Path(directory).expanduser().resolve()
-        path = directory / name
         result["workspace"] = directory.name
         try:
-            if path.is_symlink():
-                return {**result, "status": "unavailable"}
-            if not path.is_file():
-                return result
-            info = path.stat()
-            current_version = f"{directory}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
-            result.update(status="ready", version=current_version,
-                          modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
-            if current_version == version:
-                return {**result, "unchanged": True}
-            return {**result, "content": path.read_text(encoding="utf-8")}
+            if os.name == "nt":
+                return self._memory_file_portable(directory, name, version, result, approach)
+            # Pin directories while reading so a concurrent rename or symlink swap
+            # cannot redirect the viewer outside the selected author's workspace.
+            with ExitStack() as opened:
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                parent = os.open(directory, flags)
+                opened.callback(os.close, parent)
+                filename = name
+                if approach:
+                    result["files"] = []
+                    try:
+                        folder = os.open("APPROACHES", flags, dir_fd=parent)
+                    except FileNotFoundError:
+                        if name not in {"APPROACHES", "APPROACHES.md"}:
+                            return result
+                        filename = "APPROACHES.md"
+                        result["name"] = filename
+                    else:
+                        opened.callback(os.close, folder)
+                        entries = []
+                        for entry in os.listdir(folder):
+                            relative = f"APPROACHES/{entry}"
+                            if not APPROACH_MEMORY_FILE.fullmatch(relative) or entry == "INDEX.md":
+                                continue
+                            try:
+                                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
+                                    entries.append(relative)
+                            except FileNotFoundError:
+                                continue
+                        result["files"] = ["APPROACHES/INDEX.md", *sorted(entries)]
+                        try:
+                            if stat.S_ISREG(os.stat("APPROACHES.md", dir_fd=parent, follow_symlinks=False).st_mode):
+                                result["files"].append("APPROACHES.md")
+                        except FileNotFoundError:
+                            pass
+                        if name == "APPROACHES.md":
+                            filename = name
+                        else:
+                            parent = folder
+                            filename = "INDEX.md" if name == "APPROACHES" else name.split("/")[1]
+                            result["name"] = f"APPROACHES/{filename}"
+                descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                    info = os.fstat(source.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        return {**result, "status": "unavailable"}
+                    current_version = f"{directory}:{result['name']}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
+                    result.update(status="ready", version=current_version,
+                                  modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
+                    if current_version == version:
+                        return {**result, "unchanged": True}
+                    return {**result, "content": source.read()}
         except FileNotFoundError:
             return {**result, "status": "missing"}
         except (OSError, UnicodeError):
             return {**result, "status": "unavailable"}
+
+    @staticmethod
+    def _memory_file_portable(directory, name, version, result, approach):
+        """Keep the read-only viewer available where directory descriptors are unsupported."""
+
+        def linked(path):
+            return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+
+        path = directory / name
+        if approach:
+            folder = directory / "APPROACHES"
+            result["files"] = []
+            if linked(folder):
+                return {**result, "status": "unavailable"}
+            if folder.exists():
+                if not folder.is_dir():
+                    return {**result, "status": "unavailable"}
+                result["files"] = ["APPROACHES/INDEX.md", *sorted(
+                    f"APPROACHES/{entry.name}" for entry in folder.iterdir()
+                    if entry.name != "INDEX.md" and APPROACH_MEMORY_FILE.fullmatch(f"APPROACHES/{entry.name}")
+                    and not linked(entry) and entry.is_file()
+                )]
+                legacy = directory / "APPROACHES.md"
+                if not linked(legacy) and legacy.is_file():
+                    result["files"].append("APPROACHES.md")
+                name = "APPROACHES/INDEX.md" if name == "APPROACHES" else name
+            elif name == "APPROACHES":
+                name = "APPROACHES.md"
+            result["name"] = name
+            path = directory / name
+        if linked(path) or path.resolve() != path:
+            return {**result, "status": "unavailable"}
+        if not path.is_file():
+            return result
+        info = path.stat()
+        current_version = f"{directory}:{name}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
+        result.update(status="ready", version=current_version,
+                      modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
+        if current_version == version:
+            return {**result, "unchanged": True}
+        content = path.read_text(encoding="utf-8")
+        if linked(path) or path.resolve() != path:
+            return {**result, "status": "unavailable"}
+        return {**result, "content": content}
 
     def snapshot(self, after=None):
         """Copy state, optionally returning only newly appended records."""
@@ -765,7 +856,7 @@ class App:
                 **graph, "settings": {**graph["settings"], "prompts": default_prompts()},
             }
             include_transcript = state["phase"] not in {
-                "reviewing", "running", "stopping",
+                "reviewing", "running", "stopping", "pausing",
             }
             signature = checkpoint_artifact_signature(
                 self.run_dir, include_transcript=include_transcript,
@@ -776,6 +867,11 @@ class App:
                 )
                 self._checkpoint_cache_signature = signature
             state["checkpoints"] = list(self._checkpoint_cache)
+            state["canDownloadTex"] = bool(
+                state["phase"] == "done" and not self.has_active_worker()
+                and self.run_dir and (self.run_dir / "final.tex").is_file()
+                and not (self.run_dir / "final.tex").is_symlink()
+            )
             trace, version = self.state["trace"], self.state["traceVersion"]
             first = version - len(trace)
             if isinstance(after, int) and first <= after <= version:
@@ -962,7 +1058,7 @@ class App:
         if not statement:
             raise ValueError("Enter a problem statement.")
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
             # Feedback retries stay in the same problem folder.
             retry = self.state["phase"] == "reviewed" and self.run_dir is not None
@@ -1241,13 +1337,23 @@ class App:
             options.extend(["--set", "goal_cwd=" + json.dumps(self.state["goalWorkspace"])])
         if self.state.get("goalResume"):
             options.extend(["--set", "goal_resume=true"])
+        options.extend(["--set", "goal_pause_file=" + json.dumps(str(self.run_dir / PAUSE_REQUEST_FILENAME))])
         return options
 
     def _launch_solver_locked(self, statement):
         """Start the author/critic graph followed by final cleanup."""
 
+        return self._launch_workflow_locked(
+            ["author_critic.yaml", "clean_up.yaml"], statement,
+            [*self._proof_options_locked(), "--elapsed-seconds", str(self._elapsed_seconds())],
+            "solve", "author",
+        )
+
+    def _elapsed_seconds(self):
+        """Count active time across pauses without charging the paused interval."""
+
         try:
-            started_at = datetime.fromisoformat(self.state["startedAt"])
+            started_at = datetime.fromisoformat(self.state.get("resumedAt") or self.state["startedAt"])
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=timezone.utc)
             elapsed_seconds = max(
@@ -1255,11 +1361,100 @@ class App:
             )
         except (KeyError, TypeError, ValueError):
             elapsed_seconds = 0.0
-        return self._launch_workflow_locked(
-            ["author_critic.yaml", "clean_up.yaml"], statement,
-            [*self._proof_options_locked(), "--elapsed-seconds", str(elapsed_seconds)],
-            "solve", "author",
-        )
+        return float(self.state.get("elapsedSeconds", 0)) + elapsed_seconds
+
+    def _save_pause(self, checkpoint):
+        """Atomically store controller state; research notebooks belong to the LLM."""
+
+        self._save(".pause.tmp", json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
+        (self.run_dir / ".pause.tmp").replace(self.run_dir / PAUSE_FILENAME)
+
+    def pause(self):
+        """Request a notebook save before closing the author session."""
+
+        with self.lock:
+            if self.state["phase"] == "pausing":
+                return
+            if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
+                    or self.state["stage"] not in {"solve", "repair"}):
+                raise ValueError("Pause is available while the proof author is working.")
+            checkpoint_state = {"statement": saved_statement(self.run_dir)}
+            if self.state["stage"] == "repair":
+                report_record = next((record for record in reversed(self.retained_trace())
+                                      if record.get("kind") == "critic_result"), None)
+                if report_record and report_record.get("report", {}).get("verdict") == "reject":
+                    checkpoint_state.update(report=report_record["report"],
+                                            solution=report_record["report"]["solution"],
+                                            round=report_record.get("round", self.state["round"]))
+            self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
+                              "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"]})
+            self._save(PAUSE_REQUEST_FILENAME, "{}\n")
+            self.state.update(phase="pausing", error="")
+            self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
+                            "label": "Pause requested", "text": "The author has up to 60 seconds to save its work before its process closes."})
+            process, token = self.process, self.active_token
+
+        def finish_if_unresponsive():
+            # Also covers workers started before pause support was installed.
+            if process is None:
+                return
+            try:
+                process.wait(timeout=70)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            with self.lock:
+                if self.active_token is not token or self.state["phase"] != "pausing":
+                    return
+                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                "text": "Pause could not finish saving; resume will use the last saved work."})
+            stop_process_tree(process)
+
+        threading.Thread(target=finish_if_unresponsive, daemon=True).start()
+
+    def resume(self):
+        """Reopen this run with a new CLI process and the saved goal/thread."""
+
+        with self.lock:
+            if self.state["phase"] != "paused" or self.has_active_worker():
+                raise ValueError("Wait until the author is paused before resuming.")
+            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+            workflow_state = dict(checkpoint["state"])
+            workflow_state.pop("paused", None)
+            workflow_state.pop("failed", None)
+            previous = dict(self.state)
+            self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
+                              resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="")
+            (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
+            process = None
+            try:
+                self._save_pause({**checkpoint, "status": "running"})
+                self._save_job_settings(self.state)
+                process, token = self._launch_workflow_locked(
+                    ["author_critic.yaml", "clean_up.yaml"], "",
+                    [*self._proof_options_locked(), "--elapsed-seconds", str(checkpoint["elapsedSeconds"]),
+                     "--start-node", checkpoint["node"]],
+                    checkpoint["stage"], checkpoint["node"], state=workflow_state,
+                )
+                self._spawn_worker(self._read_output, (process, token), token)
+            except (OSError, ValueError, RuntimeError):
+                if process is not None:
+                    stop_process_tree(process)
+                self.state = previous
+                self.process = self.active_token = self.worker_token = None
+                self._save_pause(checkpoint)
+                self._save_job_settings(self.state)
+                raise
+            self.add_trace({"kind": "status", "stage": checkpoint["stage"], "node": checkpoint["node"],
+                            "label": "Resume requested", "text": "Continuing in this run folder with a fresh Codex CLI process."})
+
+    def final_tex(self):
+        """Read the finished LaTeX artifact for an authenticated download."""
+
+        with self.lock:
+            if not self.snapshot()["canDownloadTex"]:
+                raise ValueError("A completed final.tex is not available for this job.")
+            return (self.run_dir / "final.tex").read_bytes()
 
     def _final_options(self):
         return [
@@ -1345,7 +1540,7 @@ class App:
             include_review=False,
         )
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
             self._new_run(statement)
             if not self.fixed_trace:
@@ -1410,7 +1605,7 @@ class App:
             include_review=False,
         )
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
             self._new_run(source)
             if not self.fixed_trace:
@@ -1470,7 +1665,7 @@ class App:
             include_review=False,
         )
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
             source_label = (
                 Path(continuation_source).name
@@ -1552,7 +1747,7 @@ class App:
             include_review=False,
         )
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
             source_label = Path(source_run).name if source_run else "saved-proof"
             self._new_run(statement, f"critic-resume-{source_label}")
@@ -1699,6 +1894,12 @@ class App:
                         and isinstance(report.get("solution"), str)
                         else ""
                     )
+                if record.get("kind") == "workflow_paused":
+                    with self.lock:
+                        if self.state["phase"] == "pausing":
+                            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+                            self._save_pause({**checkpoint, "state": record["state"], "node": record["node"],
+                                              "stage": checkpoint["stage"] if record["node"] == "author" else record["stage"]})
                 if (
                     record.get("kind") == "status"
                     and record.get("label") == "Critic approved"
@@ -1786,6 +1987,7 @@ class App:
                     self.worker_token = None
                 return
             stopped = self.state["phase"] == "stopping"
+            paused = self.state["phase"] == "pausing"
             if self.process is process:
                 self.process = None
             if self.active_token is token:
@@ -1794,7 +1996,11 @@ class App:
                 self.worker_token = None
             self.state["phase"] = "done"
             self.state["finishedAt"] = datetime.now(timezone.utc).isoformat()
-            if final:
+            if paused and (not final or failed):
+                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+                self._save_pause({**checkpoint, "status": "paused", "elapsedSeconds": self._elapsed_seconds()})
+                self.state.update(phase="paused", error="")
+            elif final:
                 # A complete terminal record is durable and wins even when Stop
                 # killed the child before it closed stdout cleanly.
                 self._clear_manual_stop()
@@ -1802,7 +2008,7 @@ class App:
                     "Workflow incomplete. See the saved checkpoint and failure report."
                     if failed else ""
                 )
-            elif stopped and code:
+            elif stopped:
                 self.state["error"] = "Stopped."
                 self.state["output"] = self.state["output"] or (
                     "Codex was stopped before it produced an answer."
@@ -1816,7 +2022,7 @@ class App:
         """Clear the saved transcript only when no request is active."""
 
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Wait for the current Codex request to finish.")
             self.state["trace"] = []
             self.state["traceVersion"] = 0
@@ -1833,7 +2039,7 @@ class App:
                 and self.state["error"] == "Stopped."
             ):
                 return
-            if self.state["phase"] not in {"reviewing", "running"}:
+            if self.state["phase"] not in {"reviewing", "running", "pausing"}:
                 raise ValueError("Codex is not working.")
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"],
@@ -1860,6 +2066,8 @@ class App:
                 manuallyStopped=True,
                 stoppedStage=self.state["stage"],
             )
+            (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
+            (self.run_dir / PAUSE_FILENAME).unlink(missing_ok=True)
             process, self.state["phase"] = self.process, "stopping"
         stop_process_tree(process)
         with self.lock:
@@ -1944,7 +2152,7 @@ class App:
         """Return to the first screen when no child is active."""
 
         with self.lock:
-            if self.state["phase"] in {"reviewing", "running", "stopping"}:
+            if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Stop the current work first.")
             trace, version = self.state["trace"], self.state["traceVersion"]
             self.state = empty_state(trace, version)
@@ -2386,7 +2594,7 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly",
-                "goalThreadId", "goalWorkspace", "goalResume",
+                "goalThreadId", "goalWorkspace", "goalResume", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
                     if key in {
@@ -2632,6 +2840,12 @@ def restore_saved_app(app):
             state["output"] = (
                 "This job was manually stopped. Continue it from the home page."
             )
+    try:
+        checkpoint = json.loads((run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+        if checkpoint["status"] in {"paused", "pausing"} and not (run_dir / "final.tex").is_file() and manual_stop is None:
+            state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"], error="")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     state["checkpoints"] = saved_run_checkpoints(run_dir)
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
@@ -3031,19 +3245,28 @@ class Server(ThreadingHTTPServer):
         for previous in self.jobs.values():
             if not previous.run_dir or not (
                 previous.has_active_worker()
-                or previous.state["phase"] in {"reviewing", "running", "stopping"}
+                or previous.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
             ):
                 continue
             previous_workspace = previous.state.get("goalWorkspace") or str(previous.run_dir.resolve())
             if str(Path(previous_workspace).resolve()) == workspace:
                 raise ValueError("Stop the source workspace's active job before continuing its author.")
 
+    def resume_paused_job(self, run_id):
+        """Resume in place, preventing concurrent authors in the same workspace."""
+
+        with self.jobs_lock:
+            app = self.get_job(run_id)
+            self._check_author_workspace_idle(app.run_dir)
+            app.resume()
+        return app
+
     def resume_critic_job(self, run_id, include_audit_checkpoint=True):
         """Resume an idle job from its saved proof using its role settings."""
 
         source_app = self.get_job(run_id)
         source_state = source_app.snapshot()
-        if source_state["phase"] in {"reviewing", "running", "stopping"}:
+        if source_state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
             raise ValueError(
                 "Stop this job before starting another critic from its proof."
             )
@@ -3065,7 +3288,7 @@ class Server(ThreadingHTTPServer):
 
         source_app = self.get_job(run_id)
         source_state = source_app.snapshot()
-        if source_state["phase"] in {"reviewing", "running", "stopping"}:
+        if source_state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
             raise ValueError("Stop this job before continuing a checkpoint.")
         checkpoint = next(
             (
@@ -3087,10 +3310,12 @@ class Server(ThreadingHTTPServer):
 
         state = source_app.snapshot() if state is None else state
         if (
-            state.get("phase") in {"reviewing", "running", "stopping"}
+            state.get("phase") in {"reviewing", "running", "stopping", "pausing"}
             or source_app.has_active_worker()
         ):
             return None
+        if state.get("phase") == "paused":
+            return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
         stage = state.get("stoppedStage") or state.get("stage")
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
@@ -3243,6 +3468,8 @@ class Server(ThreadingHTTPServer):
             raise ValueError(
                 "This job has no saved stage available to continue."
             )
+        if plan["action"] == "resume":
+            return self.resume_paused_job(source_state["runId"])
         if plan["action"] == "critic":
             continued = self.resume_critic_job(
                 source_state["runId"], include_audit_checkpoint=True,
@@ -3365,7 +3592,7 @@ class Server(ThreadingHTTPServer):
             checkpoints = state.get("checkpoints", [])
             job["checkpoints"] = checkpoints
             job["canResumeCritic"] = bool(
-                state["phase"] not in {"reviewing", "running", "stopping"}
+                state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
                 and run_dir
                 and (
                     (run_dir / "SOLUTION.md").is_file()
@@ -3393,7 +3620,7 @@ class Server(ThreadingHTTPServer):
                 raise ValueError("That job is not available in this TCS Prover session.")
             with app.lock:
                 if (
-                    app.state["phase"] in {"reviewing", "running", "stopping"}
+                    app.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
                     or app.worker_token is not None
                 ):
                     raise ValueError("Stop this job before deleting it.")
@@ -3402,7 +3629,7 @@ class Server(ThreadingHTTPServer):
                     raise ValueError("The job folder is outside the runs directory.")
                 for other in self.jobs.values():
                     if other is app or not (other.has_active_worker() or other.state["phase"] in {
-                        "reviewing", "running", "stopping",
+                        "reviewing", "running", "stopping", "pausing",
                     }):
                         continue
                     workspace = other.state.get("goalWorkspace")
@@ -3475,6 +3702,14 @@ class Handler(BaseHTTPRequestHandler):
         run_id = (query.get("job") or [""])[0]
         if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
             return self.send({"error": "Untrusted local host."}, status=403)
+        if request.path == "/download-tex":
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.get_job(run_id).final_tex(), "application/x-tex; charset=utf-8",
+                                 headers={"Content-Disposition": 'attachment; filename="final.tex"'})
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/memory":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -3547,7 +3782,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected a JSON object.")
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
-            if request.path == "/resume-critic":
+            if request.path == "/resume":
+                app = self.server.resume_paused_job(run_id)
+            elif request.path == "/resume-critic":
                 app = self.server.resume_critic_job(run_id)
             elif request.path == "/resume-checkpoint":
                 app = self.server.resume_checkpoint_job(
@@ -3571,13 +3808,15 @@ class Handler(BaseHTTPRequestHandler):
                 app.steer_author(body.get("instruction"))
             elif request.path == "/stop":
                 app.stop()
+            elif request.path == "/pause":
+                app.pause()
             elif request.path == "/reset":
                 app.reset()
             elif request.path == "/clear-trace":
                 app.clear_trace()
             elif request.path not in {
                 "/review", "/direct", "/finalize",
-                "/resume-critic", "/resume-checkpoint", "/continue-stopped",
+                "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
             }:
                 return self.send({"error": "Not found."}, status=404)
             self.send(app.snapshot())
