@@ -455,6 +455,93 @@ button { min-height: 42px; }
 .memory-footer { margin: 0; padding: 10px 20px; border-top: 1px solid #edeee9; color: var(--muted); font-size: 0.7rem; }
 .memory-panel summary:focus-visible, .memory-tabs button:focus-visible, .memory-document:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
 
+.research-audits {
+  margin: 0 0 18px;
+  padding: 15px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.research-audits > summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 0.88rem;
+  font-weight: 650;
+}
+.research-audits > summary span {
+  margin-left: 10px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 400;
+}
+.research-audits-initial { margin: 18px 0 0 20px; background: #fafbf9; }
+.advanced .research-audits > summary { width: auto; }
+.research-audit-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+.research-audit-fields label { margin-bottom: 6px; color: var(--muted); font-size: 0.78rem; }
+.research-audit-fields input, .research-audit-fields select {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #cccdc8;
+  border-radius: 8px;
+  color: var(--ink);
+  background: #fcfcfb;
+}
+.research-audit-actions { display: flex; align-items: center; gap: 16px; margin-top: 12px; }
+.research-audit-actions .help { flex: 1; margin: 0; }
+.research-audits > .help { margin-bottom: 0; }
+.research-audits summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.research-audit-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin: 0 0 10px;
+  padding: 0 2px;
+}
+.research-audit-clock {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.research-audit-clock strong {
+  color: var(--ink);
+  font-size: 0.96rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.research-audit-timer-state { font-size: 0.73rem; }
+.research-audit-activity { display: grid; gap: 8px; margin-bottom: 14px; }
+.research-auditor { padding: 12px 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.research-auditor-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 0.8rem; }
+.research-auditor-badge { color: var(--accent); font-size: 0.72rem; font-weight: 600; }
+.research-auditor p { margin: 7px 0 4px; font-size: 0.78rem; line-height: 1.5; white-space: pre-line; overflow-wrap: anywhere; }
+.research-auditor small { color: var(--muted); font-size: 0.68rem; }
+.research-auditor.unavailable { border-color: #dec9a4; }
+.research-auditor.unavailable .research-auditor-badge { color: #795011; }
+.research-auditor > .memory-link { margin-left: 12px; }
+.research-auditor details { margin-top: 8px; font-size: 0.74rem; }
+.research-auditor summary { cursor: pointer; color: var(--muted); }
+.research-auditor ol { max-height: 220px; overflow: auto; padding-left: 22px; line-height: 1.6; }
+.research-auditor li { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.research-audit-status { margin: -5px 0 18px; white-space: pre-line; }
+.research-audit-status.warning {
+  padding: 10px 14px;
+  border-left: 3px solid #c38a2c;
+  border-radius: 0 8px 8px 0;
+  color: #795011;
+  background: #fff8e9;
+}
+
 label { display: block; margin-bottom: 8px; font-weight: 650; }
 label span { color: var(--muted); font-weight: 450; }
 
@@ -1019,6 +1106,11 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 }
 
 @media (max-width: 620px) {
+  .research-audit-fields { grid-template-columns: 1fr; }
+  .research-audits > summary span { display: block; margin: 5px 0 0; }
+  .research-audits-initial { margin-left: 0; }
+  .memory-tabs { flex-wrap: wrap; }
+  .memory-tabs button { flex-basis: calc(50% - 5px); }
   .topbar { padding: 0 13px; }
   .work-pane { padding: 28px 13px 65px; }
   .workflow-rail { margin: 12px 10px 0; }

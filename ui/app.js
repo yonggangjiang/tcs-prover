@@ -58,6 +58,20 @@ const ui = {
   authorSteerControl: $("authorSteerControl"),
   authorSteerInstruction: $("authorSteerInstruction"),
   sendAuthorSteer: $("sendAuthorSteerButton"),
+  researchAuditsSetting: $("researchAuditsSetting"),
+  researchAuditInterval: $("researchAuditInterval"),
+  researchAuditModels: [$("researchAuditOne"), $("researchAuditTwo"), $("researchAuditThree")],
+  researchAuditsControl: $("researchAuditsControl"),
+  liveResearchAuditInterval: $("liveResearchAuditInterval"),
+  liveResearchAuditModels: [$("liveResearchAuditOne"), $("liveResearchAuditTwo"), $("liveResearchAuditThree")],
+  researchAuditSummary: $("researchAuditSummary"), researchAuditStatus: $("researchAuditStatus"),
+  researchAuditCountdown: $("researchAuditCountdown"),
+  researchAuditToolbar: $("researchAuditToolbar"),
+  researchAuditActivity: $("researchAuditActivity"),
+  researchAuditCountdownLabel: $("researchAuditCountdownLabel"),
+  researchAuditTimerState: $("researchAuditTimerState"),
+  startResearchAudit: $("startResearchAuditButton"),
+  applyResearchAudits: $("applyResearchAuditsButton"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
@@ -107,6 +121,11 @@ let memoryAnchor = "";
 let memoryVersion = "";
 let memoryTimer;
 let memoryRequest = 0;
+let researchAuditJob = null;
+let researchAuditDirty = false;
+let researchAuditSaving = false;
+let researchAuditStarting = false;
+let researchAuditFeedback = "";
 const pinnedKinds = new Set([
   "request", "review_result", "critic_result", "author_result",
   "final_result", "failure_result", "partial_result", "diagnostic", "error",
@@ -411,6 +430,7 @@ function setProblemMode(mode) {
   show(ui.reviewOnlySetting, statement);
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
+  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly);
   ui.problem.required = statement;
   ui.latexInput.required = latexOnly;
   ui.check.textContent = latexOnly ? "Polish LaTeX"
@@ -611,6 +631,7 @@ function nodeFromStage(stage) {
 // Preserve prompts, results, errors, and completed root-model answers.
 function importantEntry(entry) {
   if (pinnedKinds.has(entry.kind)) return true;
+  if (entry.kind === "research_audit") return entry.status !== "working" || Boolean(entry.recovered);
   if (entry.kind !== "codex_event" || entry.root === false) return false;
   const event = entry.event || {};
   const item = event.params?.item || event.item || {};
@@ -672,6 +693,10 @@ function describe(entry) {
         ? entry.output : text,
       time: entry.time, replace: true, pinned: true,
     };
+  }
+  if (entry.kind === "research_audit") {
+    return {key: `audit:${entry.slot}:${entry.time}:${entry.status}`, type: entry.status === "warning" ? "error" : "status",
+      label: entry.label || `Audit ${entry.slot}`, text, time: entry.time, replace: true};
   }
   if (entry.kind === "status") {
     return {
@@ -809,10 +834,11 @@ function appendMemoryText(element, value) {
     const [path, anchor = ""] = link ? link[2].split("#", 2) : [];
     const notebook = path?.replace(/^\.\.\//, "");
     const target = link && (
-      ["INITIAL_PROMPT.md", "PROVED.md"].includes(notebook) ? notebook
-        : /^APPROACHES\/(?:INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md$/.test(path) ? path
+      ["INITIAL_PROMPT.md", "PROVED.md", "audit.md"].includes(notebook) ? notebook
+        : /^APPROACHES\/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md$/.test(notebook) ? notebook
+          : /^AUDITS\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(notebook) ? notebook
           : path === "" ? memoryFile
-            : [path, `APPROACHES/${path}`, path === "../APPROACHES.md" ? "APPROACHES.md" : ""]
+            : [path, `APPROACHES/${path}`, `AUDITS/${path}`, path === "../APPROACHES.md" ? "APPROACHES.md" : ""]
               .find((name) => files.includes(name))
     );
     if (!target) { appendFormattedText(element, part); continue; }
@@ -820,7 +846,9 @@ function appendMemoryText(element, value) {
     button.type = "button";
     button.className = "memory-link";
     appendFormattedText(button, link[1]);
-    button.onclick = () => selectMemoryDocument(target === "APPROACHES/INDEX.md" ? "APPROACHES" : target, anchor);
+    button.onclick = () => selectMemoryDocument(
+      /^APPROACHES\/(?:index|INDEX)\.md$/.test(target) ? "APPROACHES" : target, anchor,
+    );
     element.append(button);
   }
 }
@@ -907,14 +935,15 @@ function renderMemoryChoices(file) {
   const files = file.files || [];
   show(ui.memoryApproachPicker, files.length > 0);
   if (!files.length) return;
-  const selected = memoryFile === "APPROACHES" ? "APPROACHES/INDEX.md" : memoryFile;
+  const selected = ["APPROACHES", "AUDITS"].includes(memoryFile) ? file.name : memoryFile;
   const choices = files.includes(selected) ? files : [...files, selected];
   if (JSON.stringify([...ui.memoryApproach.options].map((option) => option.value)) !== JSON.stringify(choices)) {
     ui.memoryApproach.replaceChildren(...choices.map((name) => {
       const option = document.createElement("option");
       option.value = name;
-      option.textContent = name === "APPROACHES/INDEX.md" ? "Index"
-        : name === "APPROACHES.md" ? "Historical notebook" : name.slice("APPROACHES/".length, -3);
+      option.textContent = /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "Index"
+        : name === "APPROACHES.md" ? "Historical notebook"
+          : name === "audit.md" ? "Historical audit notebook" : name.slice(name.lastIndexOf("/") + 1, -3);
       return option;
     }));
   }
@@ -944,7 +973,9 @@ async function loadMemory() {
       memoryVersion = "";
       ui.memoryContent.replaceChildren();
       ui.memoryMessage.textContent = file.status === "missing"
-        ? "The author has not created this file yet. It will appear here when saved."
+        ? (memoryFile === "AUDITS" || memoryFile.startsWith("AUDITS/") || memoryFile === "audit.md"
+          ? "No audit report has been saved here yet. Reports will appear after an audit completes."
+          : "The author has not created this file yet. It will appear here when saved.")
         : "This file is unavailable right now. Trying again shortly…";
       show(ui.memoryMessage, true);
       ui.memoryUpdated.textContent = file.status === "missing" ? "Not created yet" : "Temporarily unavailable";
@@ -969,7 +1000,8 @@ function selectMemoryFile(tab) {
 }
 
 function selectMemoryDocument(name, anchor = "") {
-  const category = name.startsWith("APPROACHES") ? "APPROACHES" : name;
+  const category = name.startsWith("APPROACHES") ? "APPROACHES"
+    : name === "AUDITS" || name.startsWith("AUDITS/") || name === "audit.md" ? "AUDITS" : name;
   const tab = memoryTabs.find((item) => item.dataset.memory === category);
   for (const item of memoryTabs) {
     item.setAttribute("aria-selected", String(item === tab));
@@ -1091,7 +1123,8 @@ function upsertTimeline(card) {
 function detailCard(entry) {
   if (entry.kind === "request" && entry.text) {
     return {
-      key: `detail-prompt:${entry.time}`, label: "Prompt to model",
+      key: `detail-prompt:${entry.time}`,
+      label: entry.stage === "audit" ? entry.label || "Audit prompt to model" : "Prompt to model",
       text: entry.text,
     };
   }
@@ -1302,13 +1335,221 @@ function renderClock() {
     const ago = Math.max(0, Math.floor(
       (Date.now() - new Date(state.lastActivityAt)) / 1000
     ));
-    const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase);
+    const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase)
+      || Boolean(state.auditHoldingAuthor);
     const activity = working
       ? (ago < 2 ? "Working · public activity now"
         : `Still working · waiting ${ago}s for the next public event`)
       : `Updated ${ago < 2 ? "just now" : `${ago}s ago`}`;
     ui.lastActivity.textContent = `${activity} · `
       + `${state.traceVersion || 0} events recorded`;
+  }
+}
+
+function researchAuditValues(live = false) {
+  return {
+    intervalHours: Number((live ? ui.liveResearchAuditInterval : ui.researchAuditInterval).value),
+    models: (live ? ui.liveResearchAuditModels : ui.researchAuditModels).map((select) => select.value),
+  };
+}
+
+function fillResearchAuditControls(live = false) {
+  const catalog = state.workflow?.settings?.research_audits || {};
+  const config = state.researchAudits || catalog;
+  const choices = catalog.choices || [{ value: "none", label: "None" }];
+  const interval = live ? ui.liveResearchAuditInterval : ui.researchAuditInterval;
+  const models = live ? ui.liveResearchAuditModels : ui.researchAuditModels;
+  const hours = String(config.intervalHours ?? catalog.intervalHours ?? 2);
+  if (interval.value !== hours) interval.value = hours;
+  models.forEach((select, index) => {
+    const signature = JSON.stringify(choices);
+    if (select.dataset.choices !== signature) {
+      select.replaceChildren(...choices.map((choice) => {
+        const option = document.createElement("option");
+        option.value = choice.value;
+        option.textContent = choice.label;
+        return option;
+      }));
+      select.dataset.choices = signature;
+    }
+    const selected = config.models?.[index] || "none";
+    if (select.value !== selected) select.value = selected;
+  });
+}
+
+function renderResearchAudits(canEdit) {
+  const identity = currentJob || state.runId || "";
+  if (researchAuditJob !== identity) {
+    researchAuditJob = identity;
+    researchAuditDirty = false;
+    researchAuditSaving = false;
+    researchAuditStarting = false;
+    researchAuditFeedback = "";
+    ui.researchAuditsControl.open = false;
+  }
+  show(ui.researchAuditsControl, canEdit);
+  if (!researchAuditDirty && !researchAuditSaving) fillResearchAuditControls(true);
+  for (const input of [ui.liveResearchAuditInterval, ...ui.liveResearchAuditModels]) input.disabled = !canEdit;
+  ui.applyResearchAudits.disabled = !canEdit || researchAuditSaving || researchAuditStarting || !researchAuditDirty;
+  ui.applyResearchAudits.textContent = researchAuditSaving ? "Applying…" : "Apply";
+  const config = state.researchAudits || {};
+  const status = state.researchAuditStatus || {};
+  const enabled = (config.models || []).filter((model) => model !== "none").length;
+  const running = Array.isArray(status.runningSlots) ? status.runningSlots.length : Number(status.runningSlots || 0);
+  ui.researchAuditSummary.textContent = enabled
+    ? `${enabled} selected · every ${config.intervalHours ?? 2} active author hours` : "Disabled";
+  const progress = state.researchAuditProgress || {};
+  const remaining = Math.max(0, Math.ceil((config.intervalHours ?? 2) * 3600
+    - Math.max(0, (progress.elapsedSeconds || 0) - (progress.lastStartedSeconds || 0))));
+  const countdown = [Math.floor(remaining / 3600), Math.floor(remaining / 60) % 60, remaining % 60]
+    .map((part) => String(part).padStart(2, "0")).join(":");
+  const auditing = Boolean(state.auditHoldingAuthor || (state.phase === "running" && status.batchActive))
+    || running > 0;
+  const author = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
+  ui.researchAuditCountdownLabel.textContent = auditing ? "Research audits" : "Next audit";
+  ui.researchAuditCountdown.textContent = auditing
+    ? (state.phase === "pausing" ? "Preparing…" : "In progress") : countdown;
+  ui.researchAuditTimerState.textContent = auditing && state.phase !== "running" ? "author paused"
+    : state.phase === "running" ? "author time" : "paused";
+  show(ui.researchAuditToolbar, Boolean((enabled || auditing) && author
+    && ["running", "pausing", "paused"].includes(state.phase)));
+  ui.startResearchAudit.disabled = !author || state.phase !== "running" || !enabled || auditing
+    || researchAuditDirty || researchAuditSaving || researchAuditStarting;
+  ui.startResearchAudit.textContent = researchAuditStarting ? "Starting…" : "Start audit now";
+  ui.startResearchAudit.title = researchAuditDirty ? "Apply your audit settings first."
+    : "Run the selected auditors now and reset the audit interval.";
+  renderResearchAuditActivity();
+  const modelWarnings = Array.isArray(status.warnings) ? status.warnings : [];
+  let batchError = String(status.batchError || status.lastError || "");
+  for (const warning of modelWarnings) batchError = batchError.replace(String(warning.message || ""), "");
+  const warnings = batchError.trim() ? [batchError.trim()] : [];
+  ui.researchAuditStatus.textContent = [
+    ...warnings,
+    researchAuditDirty ? "Changes have not been applied." : "",
+    researchAuditFeedback,
+  ].filter(Boolean).join("\n");
+  ui.researchAuditStatus.className = "help research-audit-status"
+    + (warnings.length || researchAuditFeedback ? " warning" : "");
+  show(ui.researchAuditStatus, Boolean(ui.researchAuditStatus.textContent));
+}
+
+function renderResearchAuditActivity() {
+  const config = state.researchAudits || {};
+  const status = state.researchAuditStatus || {};
+  const choices = state.workflow?.settings?.research_audits?.choices || [];
+  const warnings = Array.isArray(status.warnings) ? status.warnings : [];
+  const running = Array.isArray(status.runningSlots) ? status.runningSlots : [];
+  const live = Boolean(state.auditHoldingAuthor || (state.phase === "running" && status.batchActive));
+  const events = (state.trace || []).filter((entry) => entry.kind === "research_audit");
+  const rows = (config.models || []).flatMap((model, index) => {
+    if (model === "none") return [];
+    const slot = index + 1;
+    const log = events.filter((entry) => entry.slot === slot && entry.model === model).slice(-30);
+    const last = log[log.length - 1];
+    const warning = warnings.find((item) => item.slot === slot && item.model === model);
+    const busy = running.includes(slot) && (live || state.phase === "running");
+    let phase = last?.status || (warning ? "warning" : "idle");
+    if (busy && ["warning", "completed", "cancelled", "idle"].includes(phase)) phase = "starting";
+    if (!busy && ["checking", "waiting", "starting", "running", "working", "retrying"].includes(phase)) {
+      phase = warning ? "warning" : "idle";
+    }
+    const labels = {checking: "Checking", waiting: "Waiting for author", starting: "Connecting",
+      running: "Connecting", working: "Working", retrying: "Retrying", completed: "Completed",
+      cancelled: "Cancelled", warning: "Unavailable", idle: "Waiting"};
+    let text = phase === "warning" ? warning?.message || last?.text : last?.text;
+    if (phase === "idle") text = "Waiting for the next audit.";
+    if (phase === "starting" && last?.status !== "starting") text = "Waiting for a model response.";
+    text = String(text || "Waiting for a model response.")
+      .replace(/^Warning: Audit-\d+ — .*? skipped: /, "").replace(/\. No report saved\.$/, "");
+    return [{slot, model, name: choices.find((item) => item.value === model)?.label || model,
+      phase, label: labels[phase] || phase, text, log, time: last?.time, report: last?.report}];
+  });
+  show(ui.researchAuditActivity, rows.length > 0 && !["input", "reviewed", "reviewing"].includes(state.phase));
+  const signature = JSON.stringify([currentJob, rows]);
+  if (ui.researchAuditActivity.dataset.signature !== signature) {
+    const open = new Set([...ui.researchAuditActivity.querySelectorAll("details[open]")].map((item) => item.dataset.slot));
+    const cards = rows.map((row) => {
+      const card = document.createElement("section");
+      card.className = "research-auditor" + (["warning", "retrying"].includes(row.phase) ? " unavailable" : "");
+      const head = document.createElement("div"); head.className = "research-auditor-head";
+      const name = document.createElement("strong"); name.textContent = `Audit ${row.slot} · ${row.name}`;
+      const badge = document.createElement("span"); badge.className = "research-auditor-badge"; badge.textContent = row.label;
+      head.append(name, badge);
+      const message = document.createElement("p"); message.textContent = row.text;
+      const time = document.createElement("small");
+      if (row.time) time.dataset.auditTime = row.time;
+      card.append(head, message, time);
+      if (row.report && /^AUDITS\/[a-zA-Z0-9_.+-]+\.md$/.test(row.report)) {
+        const link = document.createElement("button"); link.className = "memory-link"; link.textContent = "Read report";
+        link.onclick = () => { ui.memoryPanel.open = true; selectMemoryDocument(row.report); };
+        card.append(link);
+      }
+      if (row.log.length) {
+        const details = document.createElement("details"); details.dataset.slot = String(row.slot);
+        details.open = open.has(String(row.slot));
+        const summary = document.createElement("summary"); summary.textContent = `Activity · ${row.log.length} recent events`;
+        const log = document.createElement("ol");
+        for (const entry of row.log) {
+          const line = document.createElement("li");
+          line.textContent = `${clockText(entry.time)} · ${entry.status}: ${entry.text || ""}`;
+          log.append(line);
+        }
+        details.append(summary, log); card.append(details);
+      }
+      return card;
+    });
+    ui.researchAuditActivity.replaceChildren(...cards);
+    ui.researchAuditActivity.dataset.signature = signature;
+  }
+  for (const time of ui.researchAuditActivity.querySelectorAll("[data-audit-time]")) {
+    time.textContent = `Last activity ${clockText(time.dataset.auditTime)} · ${elapsedText(time.dataset.auditTime)} ago`;
+  }
+}
+
+async function applyResearchAudits() {
+  const config = researchAuditValues(true);
+  if (!(Number.isFinite(config.intervalHours) && config.intervalHours > 0)) {
+    researchAuditFeedback = "Set an interval greater than zero hours.";
+    renderResearchAudits(!ui.researchAuditsControl.hidden);
+    ui.liveResearchAuditInterval.focus();
+    return;
+  }
+  const job = currentJob;
+  researchAuditFeedback = "";
+  researchAuditSaving = true;
+  renderResearchAudits(true);
+  try {
+    const next = await request(jobPath("/set-research-audits"), config);
+    if (job !== currentJob) return;
+    researchAuditDirty = JSON.stringify(researchAuditValues(true)) !== JSON.stringify(config);
+    researchAuditSaving = false;
+    render(next);
+  } catch (error) {
+    if (job !== currentJob) return;
+    researchAuditSaving = false;
+    researchAuditFeedback = error.message;
+    renderResearchAudits(!ui.researchAuditsControl.hidden);
+  }
+}
+
+async function startResearchAudit() {
+  if (ui.startResearchAudit.disabled) return;
+  const job = currentJob;
+  researchAuditStarting = true;
+  researchAuditFeedback = "";
+  renderResearchAudits(true);
+  try {
+    const next = await request(jobPath("/start-research-audit"), {});
+    if (job !== currentJob) return;
+    researchAuditStarting = false;
+    render(next);
+  } catch (error) {
+    if (job !== currentJob) return;
+    researchAuditStarting = false;
+    researchAuditFeedback = error.message === "Not found."
+      ? "Pause the author, restart the web UI, and resume to enable Start audit now."
+      : error.message;
+    renderResearchAudits(!ui.researchAuditsControl.hidden);
   }
 }
 
@@ -1323,7 +1564,8 @@ function render(next) {
   ingest(newEntries, !incremental);
 
   const phase = state.phase;
-  const working = ["reviewing", "running", "stopping", "pausing"].includes(phase);
+  const auditHolding = Boolean(state.auditHoldingAuthor) && ["pausing", "paused"].includes(phase);
+  const working = ["reviewing", "running", "stopping", "pausing"].includes(phase) || auditHolding;
   const reviewOnlyResult = phase === "done"
     && state.statementReviewOnly && Boolean(state.review);
   const reviewReady = phase === "reviewed" || reviewOnlyResult;
@@ -1365,6 +1607,7 @@ function render(next) {
     ui.thinkingHours.value = state.thinkingHours || 168;
     ui.thinkingHours.min = hours.minimum || 0.01;
     ui.thinkingHours.max = hours.maximum || 168;
+    fillResearchAuditControls();
     setProblemMode(state.problemMode || "statement");
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
@@ -1386,6 +1629,7 @@ function render(next) {
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
     ui.thinkingHours.value = state.thinkingHours || 168;
+    fillResearchAuditControls();
     checkEdited();
     reviewPending = false;
   }
@@ -1407,18 +1651,22 @@ function render(next) {
   const done = phase === "done";
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
+    : auditHolding ? "Research audits"
     : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? "Finished" : (node.label || "Codex is working");
-  ui.runLabel.textContent = phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
+  ui.runLabel.textContent = auditHolding ? "RESEARCH AUDITS"
+    : phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
+    : auditHolding ? (phase === "pausing" ? "Pausing author for research audits…" : "Author paused for research audits")
     : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing Codex…"
     : phase === "stopping" ? "Stopping safely…"
       : (state.error || (done ? (node.label || "Final result")
         : (node.label || "Codex is working")));
   ui.runDescription.textContent = state.error
-    || (phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
+    || (auditHolding ? "The author will resume automatically in the same conversation after all audit reports are saved. Click Pause to cancel the audits and keep the author paused."
+      : phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : done ? "The output and transcript remain preserved for this job."
         : (node.description || ""));
@@ -1432,6 +1680,7 @@ function render(next) {
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author";
   const canSetAuthorLimit = authorRunning || (phase === "paused"
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author");
+  renderResearchAudits(canSetAuthorLimit);
   show(ui.authorSteerControl, authorRunning);
   ui.sendAuthorSteer.disabled = !authorRunning;
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
@@ -1444,8 +1693,10 @@ function render(next) {
     ui.authorLimitHours.value = String(authorLimit);
   }
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
-  show(ui.pause, authorRunning);
+  show(ui.pause, authorRunning || auditHolding);
+  ui.pause.title = auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
   show(ui.resume, phase === "paused");
+  ui.resume.disabled = auditHolding;
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.stop, working);
   ui.stop.disabled = phase === "stopping";
@@ -1518,6 +1769,7 @@ async function startReview(statement, feedback = "") {
       promptOverrides,
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
+      researchAudits: researchAuditValues(),
       speedMode: ui.speedMode.value,
       reasoningSummary: ui.reasoningSummary.value,
       statementReviewOnly: reviewOnly,
@@ -1683,20 +1935,31 @@ ui.sendAuthorSteer.onclick = () => {
   }
   act("/steer-author", { instruction });
 };
+ui.applyResearchAudits.onclick = applyResearchAudits;
+ui.startResearchAudit.onclick = startResearchAudit;
+for (const input of [ui.liveResearchAuditInterval, ...ui.liveResearchAuditModels]) {
+  input.addEventListener("input", () => {
+    researchAuditDirty = true;
+    researchAuditFeedback = "";
+    renderResearchAudits(true);
+  });
+}
 ui.memoryPanel.addEventListener("toggle", () => {
   ++memoryRequest;
   clearTimeout(memoryTimer);
   if (ui.memoryPanel.open) loadMemory();
 });
 ui.memoryApproach.onchange = () => selectMemoryDocument(
-  ui.memoryApproach.value === "APPROACHES/INDEX.md" ? "APPROACHES" : ui.memoryApproach.value,
+  /^APPROACHES\/(?:index|INDEX)\.md$/.test(ui.memoryApproach.value)
+    ? "APPROACHES" : ui.memoryApproach.value,
 );
 for (const tab of memoryTabs) {
   tab.onclick = () => selectMemoryFile(tab);
   tab.onkeydown = (event) => {
     const index = memoryTabs.indexOf(tab);
-    const next = { ArrowRight: (index + 1) % 3, ArrowLeft: (index + 2) % 3,
-      Home: 0, End: 2 }[event.key];
+    const count = memoryTabs.length;
+    const next = { ArrowRight: (index + 1) % count, ArrowLeft: (index + count - 1) % count,
+      Home: 0, End: count - 1 }[event.key];
     if (next === undefined) return;
     event.preventDefault();
     memoryTabs[next].focus();

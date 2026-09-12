@@ -350,6 +350,7 @@ const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, refresh = () => {};
+const renderResearchAudits = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 const jobPath = path => path + '?job=same-job', sessionToken = 'secret';
 let clicked = '', requested = '', download = '';

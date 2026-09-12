@@ -11,5 +11,3 @@
 !web_ui.py
 !workflow_runner.py
 !requirements.txt
-!tests/
-!tests/*.py

@@ -1,0 +1,51 @@
+# Optional research audits during an author pause. Edit audit instructions here.
+defaults:
+  intervalHours: 2
+  models: [none, none, none]
+
+# Model IDs and maximum supported reasoning effort belong here, not in Python.
+# Refresh explicit IDs when providers release stronger models.
+models:
+  - {value: none, label: None}
+  - {value: gpt-6-astra, label: GPT Astra (Ultra), provider: codex, model: gpt-6-astra, effort: ultra}
+  - {value: gpt-5.6-sol, label: GPT Sol (Ultra), provider: codex, model: gpt-5.6-sol, effort: ultra}
+  - {value: gpt-5.6-terra, label: GPT Terra (Ultra), provider: codex, model: gpt-5.6-terra, effort: ultra}
+  - {value: gpt-5.6-luna, label: GPT Luna (Max), provider: codex, model: gpt-5.6-luna, effort: max}
+  - {value: claude-fable, label: Claude Fable 5.1 (Max), provider: claude, model: claude-fable-5-1, effort: max}
+  - {value: claude-opus, label: Claude Opus (Max), provider: claude, model: opus, effort: max}
+  - {value: claude-sonnet, label: Claude Sonnet (Max), provider: claude, model: sonnet, effort: max}
+  - {value: claude-haiku, label: Claude Haiku, provider: claude, model: haiku}
+  - {value: kimi-k3, label: Kimi K3 (Max), provider: kimi, model: kimi-code/k3, effort: max}
+  - {value: kimi-code, label: Kimi Code (Max), provider: kimi, model: kimi-code/kimi-for-coding, effort: max}
+
+# A read-only snapshot of the paused author's records; audits never edit them.
+snapshotFiles:
+  - checked-statement.md
+  - INITIAL_PROMPT.md
+  - APPROACHES/**/*.md
+  - APPROACHES.md
+  - PROVED.md
+output: AUDITS
+
+# EDIT AUDIT PROMPT HERE: advice only; the author owns research file management.
+prompt: |-
+  You are an independent research adviser reviewing a saved research trajectory.
+  The original task for the research is in INITIAL_PROMPT.md, and the author has saved their work in APPROACHES.md, APPROACHES/**/*.md that record their approaches, and PROVED.md that records their proven results. Your audit has two goals:
+
+  1. Help the author make progress toward proving the exact mathematical statement
+  more efficiently and with a greater chance of success. Propose new approaches, lemmas, and directions that are likely to advance the research.
+  Identify what matters most in the current trajectory: promising ideas, useful lemmas, decisive gaps, bottlenecks, and work that is unlikely to advance the goal. Propose new ideas when useful, and critically examine the author's approaches and lemmas where
+  their correctness or usefulness affects progress. Explain which directions or
+  questions deserve attention and why. Focus scrutiny where it can change the
+  course of the research; routine re-checking of every lemma is not required.
+
+  2. Audit the organization of the saved research files, their usefulness as
+  persistent memory, and their readability for a human. Examine the approach DAG,
+  index, node files, and lemma records for unclear relationships, missing context,
+  duplication, inconsistent statuses, stale plans, and material that is difficult
+  to find or understand. Suggest concrete improvements to file structure, links,
+  summaries, and explanations that make the work easier to retrieve, understand,
+  and continue without losing substantive mathematical detail. Prefer simple
+  improvements that reduce reading and maintenance effort.
+
+  Once you have completed your review, return a clear Markdown report. 

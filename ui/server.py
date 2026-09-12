@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import workflow_runner as runtime
+from . import audits
 from .review import REVIEW_PROMPT
 
 
@@ -53,8 +54,9 @@ JOB_SETTINGS_FILENAME = "job-settings.json"
 MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
-RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md"}
-APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
+RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md"}
+APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
+AUDIT_MEMORY_FILE = re.compile(r"AUDITS/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
@@ -209,6 +211,8 @@ def important_record(record):
 
     if record.get("kind") in PINNED_KINDS:
         return True
+    if record.get("kind") == "research_audit":
+        return record.get("status") != "working" or bool(record.get("recovered"))
     if record.get("kind") != "codex_event" or record.get("root") is False:
         return False
     event = record.get("event") or {}
@@ -234,6 +238,7 @@ PUBLIC_GRAPH = {
         "review_model": DEFAULT_REVIEW_MODEL,
         "review_models": list(REVIEW_MODELS),
         "models": list(MODELS),
+        "research_audits": {**audits.default_settings(), "choices": audits.model_choices()},
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "model_summary": "Astra/Ultra review · Astra/Ultra author, critic, writer",
@@ -426,6 +431,10 @@ def empty_state(trace=None, trace_version=0):
         "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
         "thinkingHours": DEFAULT_THINKING_HOURS,
+        "researchAudits": audits.default_settings(),
+        "researchAuditProgress": {},
+        "researchAuditStatus": {"runningSlots": [], "lastError": "", "warnings": []},
+        "auditHoldingAuthor": False,
         "stage": "",
         "activeNode": "",
         "round": 0,
@@ -467,6 +476,9 @@ class App:
         self.active_token = None
         self.worker_token = None
         self.lock = threading.RLock()
+        self.research_audits = None
+        self._audit_token = None
+        self._audit_pause_engine = None
         self._checkpoint_cache = []
         self._checkpoint_cache_signature = None
 
@@ -485,6 +497,12 @@ class App:
     def _new_run(self, statement, slug_source=None):
         """Create a private, readable folder name for one problem."""
 
+        if self.research_audits is not None:
+            self.research_audits.close()
+            self.research_audits = None
+            self._audit_token = None
+        self._audit_pause_engine = None
+        self.state["auditHoldingAuthor"] = False
         if self.fixed_trace:
             self.run_dir = self.trace_file.parent
         else:
@@ -519,6 +537,7 @@ class App:
             "reasoningEffort", "reviewEffort", "authorEffort",
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
+            "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
@@ -569,12 +588,210 @@ class App:
         try:
             worker = threading.Thread(target=target, args=args, daemon=True)
             worker.start()
-            return worker
         except Exception:
             with self.lock:
                 if self.worker_token is token:
                     self.worker_token = None
             raise
+        self._start_research_audits(token)
+        return worker
+
+    def _start_research_audits(self, token):
+        """Monitor optional audits separately from the workflow reader."""
+
+        with self.lock:
+            if self.research_audits is not None and self._audit_pause_engine is self.research_audits:
+                # Automatic resume keeps the same audit clock and monitor.
+                self._audit_token = token
+                return
+            if (token is None or self.worker_token is not token or self._audit_token is token
+                    or all(model == "none" for model in self.state["researchAudits"]["models"])):
+                return
+            workspace = self.state.get("goalWorkspace") or self.run_dir
+
+            def record(event):
+                with self.lock:
+                    if self.research_audits is engine:
+                        self.add_trace(event)
+                        self.state["researchAuditProgress"] = engine.checkpoint()
+                        self.state["researchAuditStatus"] = engine.status()
+                        if event.get("status") in {"warning", "completed", "retrying"} or event.get("recovered"):
+                            self._save_job_settings(self.state)
+
+            try:
+                engine = audits.ResearchAudits(workspace, on_event=record,
+                                               progress=self.state["researchAuditProgress"],
+                                               before_batch=self._pause_for_research_audit,
+                                               after_batch=self._resume_after_research_audit)
+            except Exception as exc:
+                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
+                return
+            if self.research_audits is not None:
+                self.research_audits.close()
+            self.research_audits = engine
+            self._audit_token = token
+
+        def monitor():
+            checkpoint_at = 0
+            tick = threading.Event()
+            try:
+                while True:
+                    with self.lock:
+                        if (engine.closed or self.research_audits is not engine
+                                or (self.worker_token is not self._audit_token
+                                    and self._audit_pause_engine is not engine)):
+                            break
+                        self._update_research_audits()
+                        elapsed = self.state["researchAuditProgress"].get("elapsedSeconds", 0)
+                        if elapsed - checkpoint_at >= 60:
+                            self._save_job_settings(self.state)
+                            checkpoint_at = elapsed
+                    tick.wait(1)
+            except (OSError, ValueError) as exc:
+                record({"kind": "research_audit", "stage": "audit", "status": "error", "text": str(exc)})
+            finally:
+                engine.close()
+                with self.lock:
+                    if self.research_audits is engine:
+                        self.state["researchAuditProgress"] = engine.checkpoint()
+                        status = engine.status()
+                        if (self.state["researchAuditStatus"].get("lastError")
+                                and not self.state["researchAuditStatus"].get("warnings")):
+                            status["lastError"] = self.state["researchAuditStatus"]["lastError"]
+                        self.state["researchAuditStatus"] = status
+                        # An audit batch releases its own pause after its cancelled
+                        # workers finish, even when this monitor has failed.
+                        if self._audit_pause_engine is not engine:
+                            self.research_audits = None
+                            self._audit_token = None
+                            self.state["auditHoldingAuthor"] = False
+                        if self.run_dir:
+                            self._save_job_settings(self.state)
+
+        try:
+            threading.Thread(target=monitor, daemon=True).start()
+        except Exception as exc:
+            engine.close()
+            with self.lock:
+                self.research_audits = None
+                self._audit_token = None
+                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
+
+    def _update_research_audits(self):
+        """Tick author time; keep audits alive during their own temporary pause."""
+
+        if self.research_audits is not None:
+            if self.research_audits.closed:
+                return
+            active = (self.state["phase"] == "running" and self.state["activeNode"] == "author"
+                      and self.state["stage"] in {"solve", "repair"})
+            try:
+                self.research_audits.update(
+                    self.state["researchAudits"], active=active,
+                    paused_for_audit=self._audit_pause_engine is self.research_audits,
+                )
+                self.state["researchAuditProgress"] = self.research_audits.checkpoint()
+                self.state["researchAuditStatus"] = self.research_audits.status()
+            except Exception as exc:
+                self.research_audits.close()
+                if self._audit_pause_engine is not self.research_audits:
+                    self.research_audits = None
+                    self._audit_token = None
+                    self.state["auditHoldingAuthor"] = False
+                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
+
+    def _pause_for_research_audit(self, engine):
+        """Wait for the author reader to settle before any audit reads its files."""
+
+        with self.lock:
+            if (self.research_audits is not engine or self.state["phase"] != "running"
+                    or self.state["activeNode"] != "author" or self.state["stage"] not in {"solve", "repair"}):
+                return False
+            self._audit_pause_engine = engine
+            self.state["auditHoldingAuthor"] = True
+            self.pause(_for_audit=True)
+        tick = threading.Event()
+        while True:
+            with self.lock:
+                if self.research_audits is not engine or self._audit_pause_engine is not engine:
+                    return False
+                if self.state["phase"] == "paused" and self.worker_token is None:
+                    if self.state["activeNode"] != "author" or self.state["stage"] not in {"solve", "repair"}:
+                        return False
+                    if not self.state.get("goalThreadId"):
+                        self.state["error"] = "No saved author conversation is available. Resume manually before auditing."
+                    return not bool(self.state["error"])
+                if self.state["phase"] != "pausing":
+                    return False
+            tick.wait(0.1)
+
+    def _resume_after_research_audit(self, engine):
+        """Resume only our own pause, after all audit reports have been published."""
+
+        with self.lock:
+            if self.research_audits is not engine or self._audit_pause_engine is not engine:
+                return
+            self.state["auditHoldingAuthor"] = False
+            if engine.closed:
+                self.state["researchAuditProgress"] = engine.checkpoint()
+                self.research_audits = None
+                self._audit_token = self._audit_pause_engine = None
+            try:
+                if (self.state["phase"] == "paused" and self.worker_token is None
+                        and not self.state["error"] and self.state.get("goalThreadId")):
+                    self.resume()
+            except Exception as exc:
+                self.state["error"] = f"Audits finished, but the author could not resume: {exc}"
+                self.add_trace({"kind": "research_audit", "stage": "audit", "status": "error",
+                                "text": self.state["error"]})
+            finally:
+                self._audit_pause_engine = None
+                self._save_job_settings(self.state)
+
+    def set_research_audits(self, settings):
+        """Apply the three optional auditor choices without restarting research."""
+
+        settings = audits.normalize_settings(settings)
+        with self.lock:
+            if (self.state["phase"] not in {"running", "paused"}
+                    or self.state["activeNode"] != "author"
+                    or self.state["stage"] not in {"solve", "repair"}):
+                raise ValueError("Research audits can be changed while the author is running or paused.")
+            if (self.research_audits is None
+                    and all(model == "none" for model in self.state["researchAudits"]["models"])):
+                self.state["researchAuditProgress"] = {}
+            self.state["researchAudits"] = settings
+            self._update_research_audits()
+            if self.research_audits is None:
+                warnings = audits.selected_warnings(self.state["researchAuditProgress"].get("warnings"), settings)
+                self.state["researchAuditProgress"]["warnings"] = warnings
+                self.state["researchAuditStatus"] = {
+                    "runningSlots": [], "warnings": warnings,
+                    "lastError": "\n".join(item["message"] for item in warnings),
+                }
+            self._save_job_settings(self.state)
+            self._start_research_audits(self.worker_token)
+
+    def start_research_audit_now(self):
+        """Run the saved auditors now and restart their interval clock."""
+
+        with self.lock:
+            if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
+                    or self.state["stage"] not in {"solve", "repair"} or self.worker_token is None
+                    or self.state["manuallyStopped"] or self._audit_pause_engine is not None
+                    or self.state["auditHoldingAuthor"]):
+                raise ValueError("Start an audit while the author is running.")
+            settings = self.state["researchAudits"]
+            if all(model == "none" for model in settings["models"]):
+                raise ValueError("Select and save at least one auditor first.")
+            if self.research_audits is None:
+                self._start_research_audits(self.worker_token)
+            if self.research_audits is None:
+                raise ValueError("The research audit scheduler is unavailable.")
+            self.research_audits.update(settings, active=True, start_now=True)
+            self.state["researchAuditProgress"] = self.research_audits.checkpoint()
+            self.state["researchAuditStatus"] = self.research_audits.status()
+            self._save_job_settings(self.state)
 
     def has_active_worker(self):
         """Return whether a model reader can still mutate this run."""
@@ -735,7 +952,8 @@ class App:
         """Display one author-owned file on demand, without modifying it."""
 
         approach = name in {"APPROACHES", "APPROACHES.md"} or bool(APPROACH_MEMORY_FILE.fullmatch(name))
-        if name not in RESEARCH_MEMORY_FILES and not approach:
+        audit = name in {"AUDITS", "audit.md"} or bool(AUDIT_MEMORY_FILE.fullmatch(name))
+        if name not in RESEARCH_MEMORY_FILES and not approach and not audit:
             raise ValueError("Unknown research memory file.")
         with self.lock:
             directory = self.state.get("goalWorkspace") or self.run_dir
@@ -766,16 +984,18 @@ class App:
                     else:
                         opened.callback(os.close, folder)
                         entries = []
-                        for entry in os.listdir(folder):
+                        names = os.listdir(folder)
+                        index = "index.md" if "index.md" in names else "INDEX.md"
+                        for entry in names:
                             relative = f"APPROACHES/{entry}"
-                            if not APPROACH_MEMORY_FILE.fullmatch(relative) or entry == "INDEX.md":
+                            if not APPROACH_MEMORY_FILE.fullmatch(relative) or entry in {"INDEX.md", "index.md"}:
                                 continue
                             try:
                                 if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
                                     entries.append(relative)
                             except FileNotFoundError:
                                 continue
-                        result["files"] = ["APPROACHES/INDEX.md", *sorted(entries)]
+                        result["files"] = [f"APPROACHES/{index}", *sorted(entries)]
                         try:
                             if stat.S_ISREG(os.stat("APPROACHES.md", dir_fd=parent, follow_symlinks=False).st_mode):
                                 result["files"].append("APPROACHES.md")
@@ -785,8 +1005,41 @@ class App:
                             filename = name
                         else:
                             parent = folder
-                            filename = "INDEX.md" if name == "APPROACHES" else name.split("/")[1]
+                            filename = index if name == "APPROACHES" else name.split("/")[1]
                             result["name"] = f"APPROACHES/{filename}"
+                elif audit:
+                    result["files"] = []
+                    try:
+                        folder = os.open("AUDITS", flags, dir_fd=parent)
+                    except FileNotFoundError:
+                        folder = None
+                    else:
+                        opened.callback(os.close, folder)
+                        entries = []
+                        for entry in os.listdir(folder):
+                            if not AUDIT_MEMORY_FILE.fullmatch(f"AUDITS/{entry}"):
+                                continue
+                            try:
+                                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
+                                    entries.append(f"AUDITS/{entry}")
+                            except FileNotFoundError:
+                                continue
+                        result["files"] = sorted(entries, reverse=True)
+                    try:
+                        if stat.S_ISREG(os.stat("audit.md", dir_fd=parent, follow_symlinks=False).st_mode):
+                            result["files"].append("audit.md")
+                    except FileNotFoundError:
+                        pass
+                    if name == "AUDITS":
+                        if not result["files"]:
+                            return result
+                        name = result["files"][0]
+                    result["name"] = name
+                    filename = name
+                    if name.startswith("AUDITS/"):
+                        if folder is None:
+                            return result
+                        parent, filename = folder, name.split("/")[1]
                 descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
                 with os.fdopen(descriptor, "r", encoding="utf-8") as source:
                     info = os.fstat(source.fileno())
@@ -819,17 +1072,37 @@ class App:
             if folder.exists():
                 if not folder.is_dir():
                     return {**result, "status": "unavailable"}
-                result["files"] = ["APPROACHES/INDEX.md", *sorted(
-                    f"APPROACHES/{entry.name}" for entry in folder.iterdir()
-                    if entry.name != "INDEX.md" and APPROACH_MEMORY_FILE.fullmatch(f"APPROACHES/{entry.name}")
+                entries = list(folder.iterdir())
+                index = "index.md" if any(entry.name == "index.md" for entry in entries) else "INDEX.md"
+                result["files"] = [f"APPROACHES/{index}", *sorted(
+                    f"APPROACHES/{entry.name}" for entry in entries
+                    if entry.name not in {"INDEX.md", "index.md"} and APPROACH_MEMORY_FILE.fullmatch(f"APPROACHES/{entry.name}")
                     and not linked(entry) and entry.is_file()
                 )]
                 legacy = directory / "APPROACHES.md"
                 if not linked(legacy) and legacy.is_file():
                     result["files"].append("APPROACHES.md")
-                name = "APPROACHES/INDEX.md" if name == "APPROACHES" else name
+                name = f"APPROACHES/{index}" if name == "APPROACHES" else name
             elif name == "APPROACHES":
                 name = "APPROACHES.md"
+            result["name"] = name
+            path = directory / name
+        elif name in {"AUDITS", "audit.md"} or AUDIT_MEMORY_FILE.fullmatch(name):
+            folder = directory / "AUDITS"
+            result["files"] = []
+            if linked(folder) or (folder.exists() and not folder.is_dir()):
+                return {**result, "status": "unavailable"}
+            if folder.exists():
+                result["files"] = sorted((f"AUDITS/{entry.name}" for entry in folder.iterdir()
+                                          if AUDIT_MEMORY_FILE.fullmatch(f"AUDITS/{entry.name}")
+                                          and not linked(entry) and entry.is_file()), reverse=True)
+            legacy = directory / "audit.md"
+            if not linked(legacy) and legacy.is_file():
+                result["files"].append("audit.md")
+            if name == "AUDITS":
+                if not result["files"]:
+                    return result
+                name = result["files"][0]
             result["name"] = name
             path = directory / name
         if linked(path) or path.resolve() != path:
@@ -895,6 +1168,7 @@ class App:
         review_prompt=None, include_review=True,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
+        research_audits=None,
     ):
         """Normalize and validate settings shared by both input modes."""
 
@@ -999,6 +1273,7 @@ class App:
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
+            "researchAudits": audits.normalize_settings(research_audits),
         }
 
     def start_review(
@@ -1017,6 +1292,7 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         review_only=False,
         continuation_source="", stopped_stage="",
+        research_audits=None,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -1055,6 +1331,7 @@ class App:
             review_prompt=review_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
+            research_audits=research_audits if not review_only else None,
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -1385,10 +1662,17 @@ class App:
                                     round=report_record.get("round", self.state["round"]))
         return checkpoint_state
 
-    def pause(self):
+    def pause(self, *, _for_audit=False):
         """Interrupt the author while retaining its native session for resume."""
 
         with self.lock:
+            if not _for_audit and self._audit_pause_engine is not None:
+                # A human pause cancels the audits and their automatic resume.
+                self._audit_pause_engine = None
+                self.state["auditHoldingAuthor"] = False
+                self._update_research_audits()
+                if self.state["phase"] in {"pausing", "paused"}:
+                    return
             if self.state["phase"] == "pausing":
                 return
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
@@ -1400,8 +1684,12 @@ class App:
                               "goalThreadId": self.state.get("goalThreadId", "")})
             self._save(PAUSE_REQUEST_FILENAME, "{}\n")
             self.state.update(phase="pausing", error="")
+            self._update_research_audits()
+            self._save_job_settings(self.state)
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
-                            "label": "Pause requested", "text": "Interrupting Codex and preserving its saved conversation for Resume."})
+                            "label": "Paused for research audits" if _for_audit else "Pause requested",
+                            "text": ("Preserving the author conversation; it will resume after the audit reports are saved."
+                                     if _for_audit else "Interrupting Codex and preserving its saved conversation for Resume.")})
             process, token = self.process, self.active_token
 
         def finish_if_unresponsive():
@@ -1426,6 +1714,8 @@ class App:
         """Reopen this run with a new CLI process and the saved goal/thread."""
 
         with self.lock:
+            if self.state.get("auditHoldingAuthor"):
+                raise ValueError("Wait for the audits to finish, or choose Pause to cancel them before resuming.")
             if self.state["phase"] != "paused" or self.has_active_worker():
                 raise ValueError("Wait until the author is paused before resuming.")
             checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
@@ -1522,6 +1812,7 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
         allow_external_source=False,
+        research_audits=None,
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -1553,6 +1844,7 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
+            research_audits=research_audits,
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -1892,8 +2184,11 @@ class App:
                 }
                 if record_stage in stages:
                     with self.lock:
+                        previous_stage = (self.state["stage"], self.state["activeNode"])
                         self.state["stage"] = record_stage
                         self.state["activeNode"] = event_node(record, self.state["activeNode"])
+                        if previous_stage != (self.state["stage"], self.state["activeNode"]):
+                            self._update_research_audits()
                 if isinstance(record.get("round"), int):
                     with self.lock:
                         self.state["round"] = record["round"]
@@ -1938,6 +2233,8 @@ class App:
                                               "goalThreadId": self.state.get("goalThreadId", ""),
                                               "stage": paused_stage})
                             self.state.update(phase="pausing", error=reason)
+                            self._update_research_audits()
+                            self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "status"
                     and record.get("label") == "Critic approved"
@@ -2067,6 +2364,9 @@ class App:
                 self.state["error"] = problem or f"The solver exited with code {code}."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
+            self._update_research_audits()
+            if self.research_audits is not None:
+                self._save_job_settings(self.state)
 
     def clear_trace(self):
         """Clear the saved transcript only when no request is active."""
@@ -2089,8 +2389,10 @@ class App:
                 and self.state["error"] == "Stopped."
             ):
                 return
-            if self.state["phase"] not in {"reviewing", "running", "pausing"}:
+            if self.state["phase"] not in {"reviewing", "running", "pausing"} and not self.state.get("auditHoldingAuthor"):
                 raise ValueError("Codex is not working.")
+            self._audit_pause_engine = None
+            self.state["auditHoldingAuthor"] = False
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"],
                 "node": self.state["activeNode"],
@@ -2119,6 +2421,8 @@ class App:
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
             (self.run_dir / PAUSE_FILENAME).unlink(missing_ok=True)
             process, self.state["phase"] = self.process, "stopping"
+            self._update_research_audits()
+            self._save_job_settings(self.state)
         stop_process_tree(process)
         with self.lock:
             # Real jobs stay non-continuable until their reader has drained all
@@ -2204,6 +2508,11 @@ class App:
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Stop the current work first.")
+            if self.research_audits is not None:
+                self.research_audits.close()
+                self.research_audits = None
+                self._audit_token = None
+            self._audit_pause_engine = None
             trace, version = self.state["trace"], self.state["traceVersion"]
             self.state = empty_state(trace, version)
             self.state["runId"] = self.run_dir.name if self.run_dir else ""
@@ -2643,6 +2952,7 @@ def restore_saved_app(app):
                 "reasoningEffort", "reviewEffort", "authorEffort",
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
+                "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
@@ -2660,12 +2970,22 @@ def restore_saved_app(app):
                     ):
                         continue
                     persisted_settings.add(key)
+                    if key == "researchAudits":
+                        try:
+                            state[key] = audits.normalize_settings(settings[key])
+                        except ValueError:
+                            state["settingsWarning"] = "Saved research audit settings are invalid; audits are disabled."
+                        continue
+                    if key == "researchAuditProgress" and not isinstance(settings[key], dict):
+                        continue
                     state[key] = (
                         restored_model(settings[key])
                         if key.endswith("Model") else settings[key]
                     )
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
+    warnings = audits.selected_warnings(state["researchAuditProgress"].get("warnings"), state["researchAudits"])
+    state["researchAuditStatus"].update(warnings=warnings, lastError="\n".join(item["message"] for item in warnings))
     for name in ("review", "author", "critic", "final"):
         prompt_path = run_dir / "prompts" / f"{name}.txt"
         try:
@@ -3149,6 +3469,7 @@ class Server(ThreadingHTTPServer):
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
             ),
             **review_only_option,
+            research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3177,6 +3498,7 @@ class Server(ThreadingHTTPServer):
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("author", "critic", "final")),
+            research_audits=body.get("researchAudits"),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -3288,6 +3610,7 @@ class Server(ThreadingHTTPServer):
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
+            research_audits=options.get("researchAudits"),
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
@@ -3861,6 +4184,10 @@ class Handler(BaseHTTPRequestHandler):
                 app.approve(body.get("statement"))
             elif request.path == "/set-author-time-limit":
                 app.set_author_time_limit(body.get("hours"))
+            elif request.path == "/set-research-audits":
+                app.set_research_audits(body)
+            elif request.path == "/start-research-audit":
+                app.start_research_audit_now()
             elif request.path == "/steer-author":
                 app.steer_author(body.get("instruction"))
             elif request.path == "/stop":
