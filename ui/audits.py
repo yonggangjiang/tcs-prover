@@ -380,7 +380,7 @@ class ResearchAudits:
     def _event(self, status, slot, model, text, **details):
         self.on_event({"kind": "research_audit", "stage": "audit", "status": status,
                        "slot": slot, "model": model, "text": text,
-                       "label": f"Audit-{slot}: {status}", **details})
+                       "label": f"Audit-{slot}: {status}" if slot else f"Research audits: {status}", **details})
 
     def _activity(self, slot, model, cancelled, status, text):
         with self.lock:
@@ -407,17 +407,37 @@ class ResearchAudits:
                 self.last_error = message
         self._event("warning", slot, model, message)
 
-    def _snapshot(self, directory):
-        """Copy saved files once; all auditors read the same captured view."""
-        root = self.run_dir.resolve()
-        paths = sorted({path for pattern in self.config["snapshotFiles"] for path in root.glob(pattern)})
+    def _rotate_reports(self):
+        """Move previous reports into history without copying or replacing files."""
+        output = self.config["output"]
+        history = self.config.get("history", "audit_history")
+        if (any(not isinstance(name, str) or Path(name).name != name
+                or name in {"", ".", ".."} for name in (output, history))
+                or output == history):
+            raise ValueError("Audit output and history must be distinct workspace folder names.")
+        directory, archive = self.run_dir / output, self.run_dir / history
+        for folder in (directory, archive):
+            if folder.is_symlink():
+                raise RuntimeError("Audit report and history directories cannot be symlinks.")
+            folder.mkdir(mode=0o700, exist_ok=True)
+        paths = sorted(directory.iterdir())
+        if any(path.is_dir() and not path.is_symlink() for path in paths):
+            raise RuntimeError("The audit report directory must contain files, not subdirectories.")
+        archived = {}
         for path in paths:
-            relative = path.relative_to(root)
-            if not path.is_file() or any(part.is_symlink() for part in [path, *path.parents] if part != root):
-                continue
-            destination = directory / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, destination)
+            destination, version = archive / path.name, 1
+            while True:
+                try:
+                    # An exclusive hard link followed by unlink is a move on this
+                    # workspace filesystem; interrupted moves never lose the source.
+                    os.link(path, destination, follow_symlinks=False)
+                    break
+                except FileExistsError:
+                    version += 1
+                    destination = archive / f"{path.stem}-previous-{version}{path.suffix}"
+            path.unlink()
+            archived[f"{output}/{path.name}"] = f"{history}/{destination.name}"
+        return archived
 
     def _batch(self, selected):
         models = {row["value"]: row for row in self.config["models"]}
@@ -451,67 +471,69 @@ class ResearchAudits:
                 if self.closed or all(cancel.is_set() for cancel in self.running.values()):
                     return
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            with tempfile.TemporaryDirectory(prefix="tcs-research-audit-") as folder:
-                workspace = Path(folder)
-                self._snapshot(workspace)
-                with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-                    futures = {}
-                    for slot, value in selected:
-                        cancel = self.running[slot]
-                        if not cancel.is_set():
-                            self._event("starting", slot, value, f"Starting audit of the research snapshot captured at {stamp}.")
-                            model = models[value]
-                            request = {"kind": "request", "stage": "audit", "status": "prompt", "slot": slot,
-                                       "model": model["model"], "provider": model["provider"],
-                                       "reasoningEffort": model.get("effort"), "snapshotAt": stamp}
-                            role = "Agent instructions" if model["provider"] == "kimi" else "Prompt to model"
-                            label = f"Audit-{slot} — {model['label']}"
-                            self.on_event({**request, "label": f"{label} — {role}", "text": prompt})
-                            if model["provider"] == "kimi":
-                                self.on_event({**request, "label": f"{label} — User message", "text": KIMI_START_PROMPT})
-                            options = {}
-                            if self.provider is run_auditor:
-                                options["on_activity"] = lambda status, text, slot=slot, value=value, cancel=cancel: self._activity(slot, value, cancel, status, text)
-                            futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = (slot, value, cancel)
-                    for future in as_completed(futures):
-                        slot, value, cancel = futures[future]
-                        try:
-                            result = future.result()
+            workspace = self.run_dir.resolve()
+            archived = self._rotate_reports()
+            if archived:
+                self._event("archived", 0, "", f"Moved {len(archived)} previous audit files to {self.config.get('history', 'audit_history')}/.",
+                            archivedPaths=archived)
+            with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+                futures = {}
+                for slot, value in selected:
+                    cancel = self.running[slot]
+                    if not cancel.is_set():
+                        self._event("starting", slot, value, f"Starting audit in the paused author workspace at {stamp}.")
+                        model = models[value]
+                        request = {"kind": "request", "stage": "audit", "status": "prompt", "slot": slot,
+                                   "model": model["model"], "provider": model["provider"],
+                                   "reasoningEffort": model.get("effort"), "auditStartedAt": stamp}
+                        role = "Agent instructions" if model["provider"] == "kimi" else "Prompt to model"
+                        label = f"Audit-{slot} — {model['label']}"
+                        self.on_event({**request, "label": f"{label} — {role}", "text": prompt})
+                        if model["provider"] == "kimi":
+                            self.on_event({**request, "label": f"{label} — User message", "text": KIMI_START_PROMPT})
+                        options = {}
+                        if self.provider is run_auditor:
+                            options["on_activity"] = lambda status, text, slot=slot, value=value, cancel=cancel: self._activity(slot, value, cancel, status, text)
+                        futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = (slot, value, cancel)
+                for future in as_completed(futures):
+                    slot, value, cancel = futures[future]
+                    try:
+                        result = future.result()
+                        if cancel.is_set():
+                            self._event("cancelled", slot, value, "Research audit cancelled.")
+                            continue
+                        if (not isinstance(result, dict)
+                                or not isinstance(result.get("text"), str) or not result["text"].strip()
+                                or not isinstance(result.get("model"), str) or not result["model"].strip()):
+                            raise RuntimeError("The auditor returned an empty or malformed report")
+                        completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                        directory = self.run_dir / self.config["output"]
+                        model_name = re.sub(r"[^a-zA-Z0-9_-]", "-", result["model"])[:80]
+                        filename = f"{completed.replace(':', '').replace('+0000', 'Z')}-audit-{slot}-{model_name}-{uuid.uuid4().hex[:8]}.md"
+                        with self.lock:
                             if cancel.is_set():
-                                self._event("cancelled", slot, value, "Research audit cancelled.")
                                 continue
-                            if (not isinstance(result, dict)
-                                    or not isinstance(result.get("text"), str) or not result["text"].strip()
-                                    or not isinstance(result.get("model"), str) or not result["model"].strip()):
-                                raise RuntimeError("The auditor returned an empty or malformed report")
-                            completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                            directory = self.run_dir / self.config["output"]
-                            model_name = re.sub(r"[^a-zA-Z0-9_-]", "-", result["model"])[:80]
-                            filename = f"{completed.replace(':', '').replace('+0000', 'Z')}-audit-{slot}-{model_name}-{uuid.uuid4().hex[:8]}.md"
-                            with self.lock:
-                                if cancel.is_set():
-                                    continue
-                                directory.mkdir(mode=0o700, exist_ok=True)
-                                if directory.is_symlink():
-                                    raise RuntimeError("The audit report directory cannot be a symlink.")
-                                descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".audit-", suffix=".tmp")
-                                try:
-                                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                                        stream.write(f"# Audit-{slot} — {completed} — {result['model']}\n\n"
-                                                     f"Research snapshot: {stamp}\n\n{result['text'].strip()}\n")
-                                    # Publish the complete file without replacing any existing report.
-                                    os.link(temporary, directory / filename)
-                                finally:
-                                    os.unlink(temporary)
-                                if self.settings["models"][slot - 1] == value:
-                                    self.warnings.pop(slot, None)
-                            self._event("completed", slot, value, f"Report saved to {self.config['output']}/{filename}.",
-                                        actualModel=result["model"], report=f"{self.config['output']}/{filename}")
-                        except Exception as exc:
-                            self._warning(slot, value, exc)
-                        finally:
-                            with self.lock:
-                                self.running.pop(slot, None)
+                            directory.mkdir(mode=0o700, exist_ok=True)
+                            if directory.is_symlink():
+                                raise RuntimeError("The audit report directory cannot be a symlink.")
+                            descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".audit-", suffix=".tmp")
+                            try:
+                                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                                    stream.write(f"# Audit-{slot} — {completed} — {result['model']}\n\n"
+                                                 f"Audit started: {stamp}\n\n{result['text'].strip()}\n")
+                                # Publish the complete file without replacing any existing report.
+                                os.link(temporary, directory / filename)
+                            finally:
+                                os.unlink(temporary)
+                            if self.settings["models"][slot - 1] == value:
+                                self.warnings.pop(slot, None)
+                        self._event("completed", slot, value, f"Report saved to {self.config['output']}/{filename}.",
+                                    actualModel=result["model"], report=f"{self.config['output']}/{filename}")
+                    except Exception as exc:
+                        self._warning(slot, value, exc)
+                    finally:
+                        with self.lock:
+                            self.running.pop(slot, None)
         except Exception as exc:
             self._warning(0, "", exc)
         finally:

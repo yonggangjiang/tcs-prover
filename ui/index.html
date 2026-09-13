@@ -39,7 +39,7 @@
             <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
             <h1>What should we solve?</h1>
             <p id="introDescription">Start with a rough TCS problem. The agent will clarify it,
-              ask for approval, solve it, audit it, and produce clean LaTeX.</p>
+              ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
           </div>
           <div class="composer">
             <fieldset class="problem-mode">
@@ -73,6 +73,13 @@
                   placeholder="Paste an AI generated writing…"></textarea>
               </div>
             </div>
+            <label id="fileManagementSetting" class="file-management-setting" for="fileManagement">
+              <span>
+                <strong>Manage research files</strong>
+                <small id="fileManagementHelp">Off · Focus on proving the statement with a simple author prompt.</small>
+              </span>
+              <input id="fileManagement" type="checkbox" role="switch" aria-describedby="fileManagementHelp">
+            </label>
             <details class="advanced">
               <summary>Advanced</summary>
               <div class="model-grid">
@@ -226,11 +233,10 @@
                   Default 168 hours for the whole workflow. The author keeps
                   one LLM session while working. After an interruption, continue
                   in the same workspace and saved session when available.
-                  The LLM manages its notebooks through the YAML prompts.
                   A continued run starts with a renewed time budget.
                 </p>
               </div>
-              <details id="researchAuditsSetting" class="research-audits research-audits-initial">
+              <details id="researchAuditsSetting" class="research-audits research-audits-initial" hidden>
                 <summary>Research audits <span>Optional independent suggestions</span></summary>
                 <div class="research-audit-fields">
                   <div>
@@ -241,7 +247,7 @@
                   <div><label for="researchAuditTwo">Audit two</label><select id="researchAuditTwo"><option value="none">None</option></select></div>
                   <div><label for="researchAuditThree">Audit three</label><select id="researchAuditThree"><option value="none">None</option></select></div>
                 </div>
-                <p class="help">The author pauses while selected models independently review the research, then resumes after their reports are saved in AUDITS/. None disables that audit.</p>
+                <p class="help">The author pauses while selected models independently review the same workspace. Current reports appear in AUDITS/; previous reports move to audit_history/ when the next batch starts. None disables that audit.</p>
               </details>
             </details>
             <div class="composer-actions">
@@ -307,19 +313,33 @@
           <details id="memoryPanel" class="memory-panel" hidden>
             <summary>
               <span class="memory-mark" aria-hidden="true">≡</span>
-              <span><strong>Research memory</strong><small>Prompt, approaches, proved lemmas, and audit suggestions</small></span>
+              <span><strong>Research files</strong><small>Original statement, approach graph, proved lemmas, and independent reports</small></span>
               <span class="memory-chevron" aria-hidden="true">⌄</span>
             </summary>
             <div class="memory-tabs" role="tablist" aria-label="Research memory files">
               <button id="memoryPromptTab" type="button" role="tab" aria-selected="true"
                 aria-controls="memoryDocument" data-memory="INITIAL_PROMPT.md">Initial prompt</button>
               <button id="memoryApproachesTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES">Attempted approaches</button>
+                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES">Approach graph</button>
               <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
                 aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
               <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Audit suggestions</button>
+                aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Current audits</button>
+              <button id="memoryAuditHistoryTab" type="button" role="tab" aria-selected="false"
+                aria-controls="memoryDocument" tabindex="-1" data-memory="audit_history">Audit history</button>
             </div>
+            <section id="approachGraph" class="approach-graph" aria-labelledby="approachGraphHeading" hidden>
+              <div class="approach-graph-heading">
+                <div><h3 id="approachGraphHeading">How the approaches connect</h3>
+                  <p id="approachGraphSummary">Each node opens a saved approach. Arrows point from parent to child.</p></div>
+                <button id="approachIndexButton" type="button" class="ghost compact">Read index</button>
+              </div>
+              <p id="approachGraphWarning" class="help graph-warning" role="status" hidden></p>
+              <div id="approachGraphViewport" class="approach-graph-viewport" tabindex="0" aria-label="Approach diagram. Scroll to explore; tab to focus nodes and Enter to read a file.">
+                <div id="approachGraphCanvas" class="approach-graph-canvas"></div>
+              </div>
+              <div id="approachGraphInspector" class="approach-graph-inspector">Hover or focus a node for its result and dependencies. Select it to read the full record.</div>
+            </section>
             <div id="memoryApproachPicker" class="memory-approach-picker" hidden>
               <label for="memoryApproach">File</label>
               <select id="memoryApproach" aria-controls="memoryDocument"></select>
@@ -357,7 +377,7 @@
               <div><label for="liveResearchAuditThree">Audit three</label><select id="liveResearchAuditThree"><option value="none">None</option></select></div>
             </div>
             <div class="research-audit-actions">
-              <p class="help">Apply changes without restarting the author. Each audit batch pauses the author, saves separate reports in AUDITS/, then resumes the same conversation.</p>
+              <p class="help">Apply changes without restarting the author. Auditors read the author's workspace while it is paused. Each new batch moves previous reports to audit_history/ and saves current reports in AUDITS/.</p>
               <button id="applyResearchAuditsButton" type="button" class="secondary compact" disabled>Apply</button>
             </div>
           </details>

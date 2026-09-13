@@ -34,6 +34,8 @@ const ui = {
   skipStatementReview: $("skipStatementReview"),
   reviewOnlySetting: $("reviewOnlySetting"),
   statementReviewOnly: $("statementReviewOnly"),
+  fileManagement: $("fileManagement"), fileManagementSetting: $("fileManagementSetting"),
+  fileManagementHelp: $("fileManagementHelp"),
   speedModeSetting: $("speedModeSetting"),
   criticRoundSetting: $("criticRoundSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
@@ -81,6 +83,9 @@ const ui = {
   memoryUpdated: $("memoryUpdated"), memoryDocument: $("memoryDocument"),
   memoryMessage: $("memoryMessage"), memoryContent: $("memoryContent"),
   memoryApproachPicker: $("memoryApproachPicker"), memoryApproach: $("memoryApproach"),
+  approachGraph: $("approachGraph"), approachGraphSummary: $("approachGraphSummary"),
+  approachGraphCanvas: $("approachGraphCanvas"), approachGraphInspector: $("approachGraphInspector"),
+  approachGraphWarning: $("approachGraphWarning"), approachIndex: $("approachIndexButton"),
   jump: $("jumpLatest"), filters: $("filters"),
   workflowRail: $("workflowRail"), workflowNodes: $("workflowNodes"),
   activityToggle: $("activityToggle"), activityPanel: $("activityPanel"),
@@ -121,6 +126,8 @@ let memoryAnchor = "";
 let memoryVersion = "";
 let memoryTimer;
 let memoryRequest = 0;
+let approachIndex = { version: "", content: "", files: [] };
+let approachGraphSignature = "";
 let researchAuditJob = null;
 let researchAuditDirty = false;
 let researchAuditSaving = false;
@@ -258,7 +265,7 @@ async function continueStopped(job, title) {
   const question = `${job.continueStoppedLabel || "Continue stopped job"} for “${title}”?\n\n`
     + `${detail}${settingsWarning}\n\nA new job will be created. The source job will not be changed, `
     + "and an interrupted model response or private reasoning cannot be resumed.";
-  if (job.phase !== "paused" && !confirm(question)) return;
+  if (!["paused", "prepared"].includes(job.phase) && !confirm(question)) return;
   try {
     const next = await request(
       `/continue-stopped?job=${encodeURIComponent(job.runId)}`, {}
@@ -300,6 +307,7 @@ function renderJobs(jobs) {
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
       running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: "Finished",
+      prepared: "Ready to start",
     };
     status.textContent = job.manuallyStopped
       ? `Stopped at ${job.stoppedStage || "saved stage"}`
@@ -313,8 +321,8 @@ function renderJobs(jobs) {
       }) : "—";
     const finished = job.finishedAt
       || (job.phase === "done" ? job.lastActivityAt : "");
-    times.textContent = `Started: ${localTime(job.startedAt)} · `
-      + `Finished: ${finished ? localTime(finished) : "Not finished"}`;
+    times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
+      : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
     const checkpoints = job.checkpoints || [];
     if (checkpoints.length) {
@@ -407,6 +415,15 @@ function selectedProblemMode() {
   return [...ui.problemModes].find((input) => input.checked)?.value || "statement";
 }
 
+function managesResearchFiles(source = state) {
+  // Runs saved before this option existed used the managed author by default.
+  return source.runId ? source.fileManagement !== false : ui.fileManagement.checked;
+}
+
+function selectedAuthorPrompt() {
+  return managesResearchFiles() ? "author" : "author_simple";
+}
+
 function setProblemMode(mode) {
   const latexOnly = mode === "latex";
   const statement = !latexOnly;
@@ -430,7 +447,13 @@ function setProblemMode(mode) {
   show(ui.reviewOnlySetting, statement);
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
-  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly);
+  show(ui.fileManagementSetting, !latexOnly && !reviewOnly);
+  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly && ui.fileManagement.checked);
+  ui.fileManagementHelp.textContent = ui.fileManagement.checked
+    ? "On · Organize approach files, proved lemmas, and optional research audits."
+    : "Off · Focus on proving the statement with a simple author prompt.";
+  ui.authorPromptTab.dataset.prompt = selectedAuthorPrompt();
+  ui.authorPromptTab.textContent = ui.fileManagement.checked ? "Author · managed" : "Author · simple";
   ui.problem.required = statement;
   ui.latexInput.required = latexOnly;
   ui.check.textContent = latexOnly ? "Polish LaTeX"
@@ -443,13 +466,13 @@ function setProblemMode(mode) {
         + "stop without starting the proof author."
     : skipReview
       ? "Enter the exact statement to send directly to the proof author, followed "
-        + "by independent audit and LaTeX editing."
+        + "by independent proof verification and LaTeX editing."
       : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
-        + "solve it, audit it, and produce clean LaTeX.";
+        + "solve it, verify the proof, and produce clean LaTeX.";
   if (reviewOnly && activePrompt !== "review" && ui.promptDialog.open) {
     selectPrompt("review");
   } else if (skipReview && activePrompt === "review" && ui.promptDialog.open) {
-    selectPrompt("author");
+    selectPrompt(selectedAuthorPrompt());
   }
   if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
     selectPrompt("final");
@@ -505,13 +528,14 @@ function updateModelSummary() {
 }
 
 const promptLabels = {
-  review: "Reviewer prompt", author: "Author prompt",
+  review: "Reviewer prompt", author: "Managed author prompt", author_simple: "Simple author prompt",
   critic: "Critic prompt", final: "Final writer prompt",
 };
 
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow replaces it with your statement.",
+  author_simple: "Used when research file management is off. Keep exactly one [STATEMENT] for your statement.",
   critic: "Each critic call receives the statement and latest proof, then follows these instructions to use fresh independent subagents.",
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
@@ -520,8 +544,17 @@ function syncPrompts(source = state) {
   const defaults = source.workflow?.settings?.prompts || {};
   promptOverrides = {};
   promptValues = Object.fromEntries(Object.keys(promptLabels).map((name) => [
-    name, (source.runId ? source[`${name}Prompt`] : defaults[name]) || defaults[name] || "",
+    name, savedPrompt(source, name) || defaults[name] || "",
   ]));
+}
+
+function savedPrompt(source, name) {
+  if (!source.runId) return "";
+  if (name === "author" || name === "author_simple") {
+    const selected = source.fileManagement === false ? "author_simple" : "author";
+    return name === selected ? source.authorPrompt : "";
+  }
+  return source[`${name}Prompt`];
 }
 
 function updatePromptHelp() {
@@ -566,7 +599,7 @@ async function openPromptEditor() {
     promptDrafts = { ...promptValues };
     promptOriginals = { ...promptValues };
     activePrompt = selectedProblemMode() === "latex" ? "final"
-      : ui.skipStatementReview.checked ? "author" : "review";
+      : ui.skipStatementReview.checked ? selectedAuthorPrompt() : "review";
     selectPrompt(activePrompt);
     ui.promptDialog.showModal();
   } catch (error) {
@@ -582,9 +615,9 @@ function savePrompts() {
     show(ui.notice, true);
     return;
   }
-  if ((promptDrafts.author.match(/\[STATEMENT\]/g) || []).length !== 1) {
+  if (["author", "author_simple"].some((name) => (promptDrafts[name]?.match(/\[STATEMENT\]/g) || []).length !== 1)) {
     ui.notice.textContent =
-      "The author prompt must contain exactly one [STATEMENT].";
+      "Each author prompt must contain exactly one [STATEMENT].";
     show(ui.notice, true);
     return;
   }
@@ -596,7 +629,7 @@ function savePrompts() {
   for (const [name, prompt] of Object.entries(promptValues)) {
     if (prompt === (promptOriginals[name] || "").trim()) continue;
     const baseline = (
-      (state.runId ? state[`${name}Prompt`] : defaults[name]) || defaults[name] || ""
+      savedPrompt(state, name) || defaults[name] || ""
     ).trim();
     if (prompt === baseline) delete promptOverrides[name];
     else promptOverrides[name] = prompt;
@@ -826,31 +859,64 @@ function appendFormattedText(element, value) {
   }
 }
 
-// Readable Markdown sections, built with text nodes so file content cannot run HTML.
+// Resolve only supported research files; arbitrary URLs and HTML stay plain text.
+function memoryLinkTarget(href, from = memoryFile) {
+  const [raw, anchor = ""] = href.split("#", 2);
+  if (!raw) return { name: from, anchor };
+  if (from === "APPROACHES" || from === "APPROACHES.md") from = "APPROACHES/index.md";
+  if (/^[a-z][a-z\d+.-]*:|^\//i.test(raw)) return null;
+  let path;
+  try { path = decodeURIComponent(raw); } catch (_) { return null; }
+  const parts = from.includes("/") ? from.split("/").slice(0, -1) : [];
+  // Root-relative notebook links are common in saved research records.
+  if (/^(?:APPROACHES|AUDITS|audit_history)\//.test(path)) parts.length = 0;
+  for (const part of path.split("/")) {
+    if (part === "." || !part) continue;
+    if (part === "..") { if (!parts.length) return null; parts.pop(); }
+    else parts.push(part);
+  }
+  const name = parts.join("/");
+  if (!/^(?:INITIAL_PROMPT\.md|PROVED\.md|APPROACHES\.md|audit\.md|APPROACHES\/(?:index|INDEX|A\d{3,}(?:-[A-Za-z0-9_-]+)?)\.md|(?:AUDITS|audit_history)\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md)$/.test(name)) return null;
+  return { name: /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "APPROACHES" : name, anchor };
+}
+
+// Build inline Markdown with DOM nodes, never with HTML from a file.
 function appendMemoryText(element, value) {
-  const files = ui.memoryApproachPicker.hidden ? [] : [...ui.memoryApproach.options].map((option) => option.value);
-  for (const part of String(value).split(/(\[[^\]\n]+\]\([^()\s]+\))/g)) {
+  for (const part of String(value).split(/(\[[^\]\n]+\]\([^()\s]+\)|`[^`\n]+`|\*\*[^*]+\*\*)/g)) {
     const link = part.match(/^\[([^\]\n]+)\]\(([^()\s]+)\)$/);
-    const [path, anchor = ""] = link ? link[2].split("#", 2) : [];
-    const notebook = path?.replace(/^\.\.\//, "");
-    const target = link && (
-      ["INITIAL_PROMPT.md", "PROVED.md", "audit.md"].includes(notebook) ? notebook
-        : /^APPROACHES\/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md$/.test(notebook) ? notebook
-          : /^AUDITS\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(notebook) ? notebook
-          : path === "" ? memoryFile
-            : [path, `APPROACHES/${path}`, `AUDITS/${path}`, path === "../APPROACHES.md" ? "APPROACHES.md" : ""]
-              .find((name) => files.includes(name))
-    );
+    const target = link && memoryLinkTarget(link[2], ui.memoryFilename.textContent || memoryFile);
+    if (part.startsWith("`") && part.endsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = part.slice(1, -1); element.append(code); continue;
+    }
     if (!target) { appendFormattedText(element, part); continue; }
     const button = document.createElement("button");
     button.type = "button";
     button.className = "memory-link";
     appendFormattedText(button, link[1]);
-    button.onclick = () => selectMemoryDocument(
-      /^APPROACHES\/(?:index|INDEX)\.md$/.test(target) ? "APPROACHES" : target, anchor,
-    );
+    button.onclick = () => selectMemoryDocument(target.name, target.anchor);
     element.append(button);
   }
+}
+
+function markdownTableCells(line) {
+  const row = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  // A literal escaped pipe (including mathematical \|) is not a cell boundary.
+  return row.split(/(?<!\\)\|/).map((cell) => cell.trim().replace(/\\\|/g, "|"));
+}
+
+function markdownTableDivider(line) {
+  const cells = markdownTableCells(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function plainMarkdown(value) {
+  return value.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\*\*|`/g, "").replace(/<br\s*\/?>/gi, " · ").trim();
+}
+
+function memoryHeadingId(value) {
+  return plainMarkdown(value).toLowerCase().replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-");
 }
 
 function renderMemoryContent(value) {
@@ -863,6 +929,7 @@ function renderMemoryContent(value) {
   let code = null;
   let fence = "";
   let sections = 0;
+  let list = null;
   const flush = () => {
     if (!paragraph.length) return;
     const copy = document.createElement("p");
@@ -870,7 +937,9 @@ function renderMemoryContent(value) {
     target.append(copy);
     paragraph = [];
   };
-  for (const line of value.split(/\r?\n/)) {
+  const lines = value.split(/\r?\n/);
+  for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
+    const line = lines[lineNumber];
     const marker = line.match(/^\s*(`{3,}|~{3,})/);
     if (code !== null) {
       if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length) {
@@ -881,15 +950,48 @@ function renderMemoryContent(value) {
       } else code.push(line);
       continue;
     }
-    if (marker) { flush(); code = []; fence = marker[1]; continue; }
+    if (marker) { flush(); list = null; code = []; fence = marker[1]; continue; }
+    // Saved lemma markers are navigation hints, never arbitrary executable HTML.
+    if (/^\s*<a\s+id=["'][A-Za-z][A-Za-z0-9_-]*["']\s*>\s*<\/a>\s*$/.test(line)) {
+      flush(); list = null; continue;
+    }
+    if (/^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line)) {
+      flush(); list = null; target.append(document.createElement("hr")); continue;
+    }
+    if (line.includes("|") && lineNumber + 1 < lines.length && markdownTableDivider(lines[lineNumber + 1])) {
+      flush(); list = null;
+      const wrapper = document.createElement("div"); wrapper.className = "memory-table-wrap";
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const header = document.createElement("tr");
+      const headers = markdownTableCells(line);
+      for (const value of headers) {
+        const cell = document.createElement("th"); cell.scope = "col";
+        appendMemoryText(cell, value); header.append(cell);
+      }
+      head.append(header); table.append(head);
+      const body = document.createElement("tbody");
+      lineNumber += 1;
+      while (lineNumber + 1 < lines.length && lines[lineNumber + 1].includes("|") && lines[lineNumber + 1].trim()) {
+        const row = document.createElement("tr");
+        const values = markdownTableCells(lines[++lineNumber]);
+        for (let column = 0; column < headers.length; column += 1) {
+          const cell = document.createElement("td");
+          appendMemoryText(cell, values[column] || ""); row.append(cell);
+        }
+        body.append(row);
+      }
+      table.append(body); wrapper.append(table); target.append(wrapper); continue;
+    }
     const heading = line.match(/^(#{1,6})\s+(.+)/);
     if (heading) {
-      flush();
+      flush(); list = null;
       if (heading[1].length === 2) {
         const section = document.createElement("details");
         section.className = "memory-section";
         section.dataset.heading = heading[2];
-        section.open = expanded.get(heading[2]) ?? (sections === 0);
+        section.id = `memory-${memoryHeadingId(heading[2])}`;
+        section.open = expanded.get(heading[2]) ?? (sections < 2);
         const summary = document.createElement("summary");
         appendMemoryText(summary, heading[2]);
         target = document.createElement("div");
@@ -899,12 +1001,31 @@ function renderMemoryContent(value) {
         sections += 1;
       } else {
         const title = document.createElement(heading[1].length === 1 ? "h3" : "h4");
+        title.id = `memory-${memoryHeadingId(heading[2])}`;
         appendMemoryText(title, heading[2]);
         if (heading[1].length === 1) target = fragment;
         target.append(title);
       }
-    } else if (!line.trim()) flush();
-    else paragraph.push(line);
+    } else if (!line.trim()) { flush(); list = null; }
+    else if (/^\s*(?:[-*+] |\d+[.)] )/.test(line)) {
+      flush();
+      const item = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)/);
+      const tag = /^\d/.test(item[1]) ? "ol" : "ul";
+      if (!list || list.tagName.toLowerCase() !== tag) {
+        list = document.createElement(tag);
+        if (tag === "ol") list.start = parseInt(item[1], 10);
+        target.append(list);
+      }
+      const entry = document.createElement("li"); appendMemoryText(entry, item[2]); list.append(entry);
+    } else if (/^(?:\*\*)?(Parents|Children|Status):(?:\*\*)?\s*/i.test(line)) {
+      flush(); list = null;
+      const metadata = line.match(/^(?:\*\*)?(Parents|Children|Status):(?:\*\*)?\s*(.*)/i);
+      const row = document.createElement("div"); row.className = "memory-record-meta";
+      const label = document.createElement("strong"); label.textContent = metadata[1];
+      const detail = document.createElement("span"); appendMemoryText(detail, metadata[2]);
+      if (metadata[1].toLowerCase() === "status") detail.className = `approach-status ${plainMarkdown(metadata[2]).toLowerCase()}`;
+      row.append(label, detail); target.append(row);
+    } else { list = null; paragraph.push(line); }
   }
   flush();
   if (code !== null) {
@@ -920,22 +1041,191 @@ function revealMemoryAnchor() {
   if (!memoryAnchor) return;
   const anchor = memoryAnchor.toLowerCase();
   memoryAnchor = "";
-  const section = [...ui.memoryContent.querySelectorAll("details")].find((item) => {
-    const heading = item.dataset.heading.toLowerCase();
-    return heading.match(/^[al]\d+\b/)?.[0] === anchor
-      || heading.replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-") === anchor;
+  const section = [...ui.memoryContent.querySelectorAll("details, h3, h4")].find((item) => {
+    const heading = (item.dataset.heading || item.textContent).toLowerCase();
+    return heading.match(/^[al]\d+\b/)?.[0] === anchor || memoryHeadingId(heading) === anchor;
   });
   if (section) {
-    section.open = true;
+    if (section.tagName === "DETAILS") section.open = true;
+    const parent = section.closest("details"); if (parent) parent.open = true;
     section.scrollIntoView({ block: "nearest" });
   }
+}
+
+// The index parent column is authoritative. Only existing node files become buttons.
+function parseApproachGraph(content, files) {
+  const nodes = files.filter((name) => /^APPROACHES\/A\d{3,}(?:-[A-Za-z0-9_-]+)?\.md$/.test(name))
+    .map((name) => {
+      const filename = name.split("/").at(-1);
+      const id = filename.match(/^A\d+/)[0];
+      return { id, file: name, title: filename.replace(/\.md$/, "").replace(/^A\d+-?/, "").replace(/[-_]/g, " ") || id,
+        parents: [], children: [], status: "UNLISTED", result: "This file is not yet listed in the index.", indexed: false };
+    });
+  const byFile = new Map(nodes.map((node) => [node.file, node]));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const warnings = [];
+  if (byId.size !== nodes.length) warnings.push("Some files share an approach ID; use unique stable IDs in the index.");
+  const lines = content.split(/\r?\n/);
+  for (let row = 0; row + 1 < lines.length; row += 1) {
+    if (!lines[row].includes("|") || !markdownTableDivider(lines[row + 1])) continue;
+    const headings = markdownTableCells(lines[row]).map((cell) => plainMarkdown(cell).toLowerCase());
+    const parentColumn = headings.findIndex((value) => /parent/.test(value));
+    if (parentColumn < 0) continue;
+    const statusColumn = headings.findIndex((value) => /status/.test(value));
+    const resultColumn = headings.findIndex((value) => /result|question|summary|outcome|obstacle/.test(value));
+    const titleColumn = headings.findIndex((value) => /title|approach|node/.test(value));
+    row += 1;
+    while (row + 1 < lines.length && lines[row + 1].trim() && lines[row + 1].includes("|")) {
+      const cells = markdownTableCells(lines[++row]);
+      // The node link belongs in its own identity/title cell, never the parent column.
+      const identityCells = [cells[0], titleColumn > 0 ? cells[titleColumn] : ""];
+      let linkedNode = null;
+      let label = "";
+      for (const cell of identityCells) {
+        for (const match of (cell || "").matchAll(/\[([^\]]+)\]\(([^()\s]+)\)/g)) {
+          const target = memoryLinkTarget(match[2], "APPROACHES/index.md");
+          if (target && byFile.has(target.name)) { linkedNode = byFile.get(target.name); label = match[1]; break; }
+        }
+        if (linkedNode) break;
+      }
+      if (!linkedNode) continue;
+      const node = linkedNode;
+      const title = plainMarkdown(titleColumn >= 0 ? cells[titleColumn] || label : label)
+        .replace(new RegExp(`^${node.id}\\b[\\s:—–-]*`), "").trim();
+      node.title = title || node.title;
+      node.parents = [...new Set((cells[parentColumn] || "").match(/\bA\d{3,}\b/g) || [])];
+      const status = plainMarkdown(cells[statusColumn] || "").toUpperCase();
+      node.status = ["ACTIVE", "PARKED", "CLOSED", "RESOLVED"].includes(status) ? status : "UNSPECIFIED";
+      node.result = plainMarkdown(cells[resultColumn] || "") || "No result or remaining question recorded in the index yet.";
+      node.indexed = true;
+    }
+  }
+  const edges = [];
+  const missing = new Set();
+  for (const node of nodes) {
+    for (const parent of node.parents) {
+      if (byId.has(parent)) {
+        edges.push({ from: parent, to: node.id });
+        byId.get(parent).children.push(node.id);
+      } else missing.add(parent);
+    }
+  }
+  if (missing.size) warnings.push(`Parent files missing from the workspace: ${[...missing].join(", ")}.`);
+  const unlisted = nodes.filter((node) => !node.indexed).length;
+  if (unlisted) warnings.push(`${unlisted} ${unlisted === 1 ? "file is" : "files are"} not linked in the parent table; shown without inferred dependencies.`);
+  const indegrees = new Map(nodes.map((node) => [node.id, 0]));
+  for (const edge of edges) indegrees.set(edge.to, indegrees.get(edge.to) + 1);
+  const queue = nodes.filter((node) => indegrees.get(node.id) === 0);
+  for (const node of nodes) node.depth = 0;
+  let visited = 0;
+  for (let index = 0; index < queue.length; index += 1) {
+    const node = queue[index]; visited += 1;
+    for (const childId of node.children) {
+      const child = byId.get(childId);
+      child.depth = Math.max(child.depth, node.depth + 1);
+      indegrees.set(childId, indegrees.get(childId) - 1);
+      if (indegrees.get(childId) === 0) queue.push(child);
+    }
+  }
+  if (visited < nodes.length) {
+    warnings.push("The parent table contains a cycle. Check the dependencies; cyclic nodes are displayed together.");
+    const depth = Math.max(0, ...queue.map((node) => node.depth)) + 1;
+    for (const node of nodes) if (indegrees.get(node.id) > 0) node.depth = depth;
+  }
+  return { nodes, edges, warnings };
+}
+
+function inspectApproachNode(node) {
+  ui.approachGraphInspector.replaceChildren();
+  const heading = document.createElement("strong"); heading.textContent = `${node.id} — ${node.title}`;
+  const result = document.createElement("p"); result.textContent = node.result;
+  const dependencies = document.createElement("small");
+  dependencies.textContent = `${node.status} · Parents: ${node.parents.join(", ") || "none"} · Children: ${node.children.join(", ") || "none"}`;
+  const path = document.createElement("code"); path.textContent = node.file;
+  ui.approachGraphInspector.append(heading, result, dependencies, path);
+}
+
+function renderApproachGraph() {
+  const signature = JSON.stringify([approachIndex.content, approachIndex.files]);
+  if (signature === approachGraphSignature) {
+    for (const button of ui.approachGraphCanvas.querySelectorAll("button")) {
+      button.setAttribute("aria-current", String(button.dataset.file === memoryFile));
+    }
+    return;
+  }
+  approachGraphSignature = signature;
+  const graph = parseApproachGraph(approachIndex.content, approachIndex.files);
+  ui.approachGraphSummary.textContent = graph.nodes.length
+    ? `${graph.nodes.length} approach files · ${graph.edges.length} connections · Parent → child. Select a node to read its file.`
+    : "Saved approach files will appear here. The index parent table defines their connections.";
+  ui.approachGraphWarning.textContent = graph.warnings.join(" ");
+  show(ui.approachGraphWarning, graph.warnings.length > 0);
+  ui.approachGraphCanvas.replaceChildren();
+  ui.approachGraphInspector.textContent = "Hover or focus a node for its result and dependencies. Select it to read the full record.";
+  const columnRows = new Map();
+  const nodeWidth = 210, nodeHeight = 112, columnGap = 60, rowGap = 30, padding = 20;
+  for (const node of graph.nodes) {
+    const row = columnRows.get(node.depth) || 0;
+    columnRows.set(node.depth, row + 1);
+    node.x = padding + node.depth * (nodeWidth + columnGap);
+    node.y = padding + row * (nodeHeight + rowGap);
+  }
+  const width = graph.nodes.length ? Math.max(...graph.nodes.map((node) => node.x)) + nodeWidth + padding : 0;
+  const height = graph.nodes.length ? Math.max(...graph.nodes.map((node) => node.y)) + nodeHeight + padding : 0;
+  ui.approachGraphCanvas.style.width = `${width}px`;
+  ui.approachGraphCanvas.style.height = `${height}px`;
+  const svgElement = (tag, attributes = {}) => {
+    const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+    return element;
+  };
+  const svg = svgElement("svg", { width, height, "aria-hidden": "true", focusable: "false" });
+  const defs = svgElement("defs");
+  const marker = svgElement("marker", { id: "approach-arrow", markerWidth: "8", markerHeight: "8", refX: "7", refY: "4", orient: "auto" });
+  marker.append(svgElement("path", { d: "M 0 0 L 8 4 L 0 8 z", fill: "#77958b" }));
+  defs.append(marker); svg.append(defs);
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  for (const edge of graph.edges) {
+    const source = byId.get(edge.from), target = byId.get(edge.to);
+    const x1 = source.x + nodeWidth, y1 = source.y + nodeHeight / 2;
+    const x2 = target.x - 5, y2 = target.y + nodeHeight / 2;
+    const bend = Math.max(24, (x2 - x1) / 2);
+    const path = svgElement("path", { d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
+      fill: "none", stroke: "#91aaa0", "stroke-width": "1.5", "marker-end": "url(#approach-arrow)" });
+    svg.append(path);
+  }
+  ui.approachGraphCanvas.append(svg);
+  for (const node of graph.nodes) {
+    const button = document.createElement("button"); button.type = "button";
+    button.className = `approach-node ${node.status.toLowerCase()}`;
+    button.dataset.file = node.file;
+    button.style.left = `${node.x}px`; button.style.top = `${node.y}px`;
+    button.setAttribute("aria-current", String(node.file === memoryFile));
+    button.setAttribute("aria-label", `${node.id}: ${node.title}. ${node.status}. Open ${node.file}`);
+    button.setAttribute("aria-describedby", "approachGraphInspector");
+    button.title = `${node.id} — ${node.title}\n${node.status}\n${node.result}\nParents: ${node.parents.join(", ") || "none"}\nChildren: ${node.children.join(", ") || "none"}\n${node.file}`;
+    const id = document.createElement("strong"); id.textContent = node.id;
+    const title = document.createElement("span"); title.className = "approach-node-title"; title.textContent = node.title;
+    const status = document.createElement("small"); status.className = `approach-status ${node.status.toLowerCase()}`; status.textContent = node.status;
+    button.append(id, title, status);
+    button.onmouseenter = () => inspectApproachNode(node);
+    button.onfocus = () => inspectApproachNode(node);
+    button.onclick = () => {
+      inspectApproachNode(node); selectMemoryDocument(node.file);
+      ui.memoryDocument.focus({ preventScroll: true });
+      ui.memoryDocument.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    };
+    ui.approachGraphCanvas.append(button);
+  }
+  const selected = graph.nodes.find((node) => node.file === memoryFile);
+  if (selected) inspectApproachNode(selected);
 }
 
 function renderMemoryChoices(file) {
   const files = file.files || [];
   show(ui.memoryApproachPicker, files.length > 0);
   if (!files.length) return;
-  const selected = ["APPROACHES", "AUDITS"].includes(memoryFile) ? file.name : memoryFile;
+  const selected = ["APPROACHES", "AUDITS", "audit_history"].includes(memoryFile) ? file.name : memoryFile;
   const choices = files.includes(selected) ? files : [...files, selected];
   if (JSON.stringify([...ui.memoryApproach.options].map((option) => option.value)) !== JSON.stringify(choices)) {
     ui.memoryApproach.replaceChildren(...choices.map((name) => {
@@ -958,6 +1248,15 @@ async function loadMemory() {
   try {
     const file = await request(jobPath("/memory", { file: memoryFile, version: memoryVersion }));
     if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+    if (memoryFile.startsWith("APPROACHES")) {
+      const index = memoryFile === "APPROACHES" || /^APPROACHES\/(?:index|INDEX)\.md$/.test(memoryFile)
+        ? file : await request(jobPath("/memory", { file: "APPROACHES", version: approachIndex.version }));
+      if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+      if (index.status === "ready" && /^APPROACHES\/(?:index|INDEX)\.md$/.test(index.name)) {
+        approachIndex = { version: index.version, files: index.files || [], content: index.unchanged ? approachIndex.content : index.content };
+      } else approachIndex = { version: "", content: "", files: index.files || [] };
+      renderApproachGraph();
+    }
     renderMemoryChoices(file);
     ui.memoryFilename.textContent = file.name;
     if (file.status === "ready") {
@@ -973,7 +1272,9 @@ async function loadMemory() {
       memoryVersion = "";
       ui.memoryContent.replaceChildren();
       ui.memoryMessage.textContent = file.status === "missing"
-        ? (memoryFile === "AUDITS" || memoryFile.startsWith("AUDITS/") || memoryFile === "audit.md"
+        ? (memoryFile === "audit_history" || memoryFile.startsWith("audit_history/") || memoryFile === "audit.md"
+          ? "No previous audit reports yet. Current reports move here when the next audit batch starts."
+          : memoryFile === "AUDITS" || memoryFile.startsWith("AUDITS/")
           ? "No audit report has been saved here yet. Reports will appear after an audit completes."
           : "The author has not created this file yet. It will appear here when saved.")
         : "This file is unavailable right now. Trying again shortly…";
@@ -999,15 +1300,29 @@ function selectMemoryFile(tab) {
   selectMemoryDocument(tab.dataset.memory);
 }
 
+function resolveArchivedMemoryFile(name, entries = state.trace || []) {
+  if (!/^AUDITS\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(name)) return name;
+  for (const entry of [...entries].reverse()) {
+    if (entry.kind !== "research_audit" || entry.status !== "archived") continue;
+    const paths = entry.archivedPaths;
+    const archived = paths && Object.hasOwn(paths, name) ? paths[name] : "";
+    if (typeof archived === "string" && /^audit_history\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(archived)) return archived;
+  }
+  return name;
+}
+
 function selectMemoryDocument(name, anchor = "") {
+  name = resolveArchivedMemoryFile(name);
   const category = name.startsWith("APPROACHES") ? "APPROACHES"
-    : name === "AUDITS" || name.startsWith("AUDITS/") || name === "audit.md" ? "AUDITS" : name;
+    : name === "audit_history" || name.startsWith("audit_history/") || name === "audit.md" ? "audit_history"
+    : name === "AUDITS" || name.startsWith("AUDITS/") ? "AUDITS" : name;
   const tab = memoryTabs.find((item) => item.dataset.memory === category);
   for (const item of memoryTabs) {
     item.setAttribute("aria-selected", String(item === tab));
     item.tabIndex = item === tab ? 0 : -1;
   }
   if (tab) ui.memoryDocument.setAttribute("aria-labelledby", tab.id);
+  show(ui.approachGraph, category === "APPROACHES");
   ++memoryRequest;
   memoryFile = name;
   memoryAnchor = anchor;
@@ -1018,7 +1333,15 @@ function selectMemoryDocument(name, anchor = "") {
   ui.memoryMessage.textContent = "Loading saved work…";
   show(ui.memoryMessage, true);
   ui.memoryUpdated.textContent = "";
+  if (category === "APPROACHES") renderApproachGraph();
   loadMemory();
+}
+
+function followArchivedMemoryFile() {
+  if (!ui.memoryPanel.open || ui.memoryPanel.hidden) return;
+  const name = memoryFile === "AUDITS" ? ui.memoryFilename.textContent : memoryFile;
+  const archived = resolveArchivedMemoryFile(name);
+  if (archived !== name) selectMemoryDocument(archived, memoryAnchor);
 }
 
 function syncMemoryPanel() {
@@ -1027,12 +1350,15 @@ function syncMemoryPanel() {
     memoryJob = identity;
     ++memoryRequest;
     clearTimeout(memoryTimer);
+    approachIndex = { version: "", content: "", files: [] };
+    approachGraphSignature = "";
     ui.memoryPanel.open = false;
     selectMemoryFile(memoryTabs[0]);
   }
   const visible = Boolean(identity) && !ui.run.hidden
-    && state.problemMode !== "latex" && !state.statementReviewOnly;
+    && state.problemMode !== "latex" && !state.statementReviewOnly && managesResearchFiles();
   show(ui.memoryPanel, visible);
+  if (visible) followArchivedMemoryFile();
   if (!visible) {
     ui.memoryPanel.open = false;
     clearTimeout(memoryTimer);
@@ -1378,6 +1704,11 @@ function fillResearchAuditControls(live = false) {
 }
 
 function renderResearchAudits(canEdit) {
+  if (!managesResearchFiles()) {
+    for (const element of [ui.researchAuditsControl, ui.researchAuditToolbar,
+      ui.researchAuditActivity, ui.researchAuditStatus]) show(element, false);
+    return;
+  }
   const identity = currentJob || state.runId || "";
   if (researchAuditJob !== identity) {
     researchAuditJob = identity;
@@ -1573,10 +1904,10 @@ function render(next) {
   show(ui.review, reviewReady);
   show(
     ui.run,
-    ["reviewing", "running", "stopping", "pausing", "paused", "done"].includes(phase)
+    ["reviewing", "running", "stopping", "pausing", "paused", "prepared", "done"].includes(phase)
       && !reviewOnlyResult,
   );
-  show(ui.workflowRail, phase !== "input");
+  show(ui.workflowRail, phase !== "input" && managesResearchFiles());
   show(ui.activityToggle, Boolean(currentJob));
   syncMemoryPanel();
   ui.notice.textContent = state.error || "";
@@ -1599,6 +1930,7 @@ function render(next) {
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
+    ui.fileManagement.checked = Boolean(state.fileManagement);
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 2;
@@ -1611,6 +1943,7 @@ function render(next) {
     setProblemMode(state.problemMode || "statement");
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
+    ui.fileManagement.checked = state.fileManagement !== false;
     ui.reviewModel.value = state.reviewModel || "gpt-6-astra";
     ui.authorModel.value = state.authorModel || "gpt-6-astra";
     ui.criticModel.value = state.criticModel || "gpt-6-astra";
@@ -1652,20 +1985,21 @@ function render(next) {
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
     : auditHolding ? "Research audits"
-    : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
+    : phase === "prepared" ? "Ready to start" : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? "Finished" : (node.label || "Codex is working");
   ui.runLabel.textContent = auditHolding ? "RESEARCH AUDITS"
-    : phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
+    : phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
     : auditHolding ? (phase === "pausing" ? "Pausing author for research audits…" : "Author paused for research audits")
-    : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing Codex…"
+    : phase === "prepared" ? "Prepared research workspace" : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing Codex…"
     : phase === "stopping" ? "Stopping safely…"
       : (state.error || (done ? (node.label || "Final result")
         : (node.label || "Codex is working")));
   ui.runDescription.textContent = state.error
     || (auditHolding ? "The author will resume automatically in the same conversation after all audit reports are saved. Click Pause to cancel the audits and keep the author paused."
+      : phase === "prepared" ? "Review the reorganized research files, then start a fresh author session in this workspace."
       : phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : done ? "The output and transcript remain preserved for this job."
@@ -1695,7 +2029,8 @@ function render(next) {
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
   show(ui.pause, authorRunning || auditHolding);
   ui.pause.title = auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
-  show(ui.resume, phase === "paused");
+  show(ui.resume, phase === "paused" || phase === "prepared");
+  ui.resume.textContent = phase === "prepared" ? "Start prepared run" : "Resume";
   ui.resume.disabled = auditHolding;
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.stop, working);
@@ -1753,7 +2088,7 @@ async function startReview(statement, feedback = "") {
   clearTimeout(jobsTimer);
   const reviewOnly = !feedback && ui.statementReviewOnly.checked;
   const skipReview = !reviewOnly && !feedback && ui.skipStatementReview.checked;
-  if (!(skipReview ? promptValues.author : promptValues.review)) syncPrompts();
+  if (!(skipReview ? promptValues[selectedAuthorPrompt()] : promptValues.review)) syncPrompts();
   reviewPending = !skipReview;
   const job = currentJob;
   try {
@@ -1767,9 +2102,11 @@ async function startReview(statement, feedback = "") {
       criticEffort: ui.criticEffort.value,
       writerEffort: ui.writerEffort.value,
       promptOverrides,
+      fileManagement: managesResearchFiles(),
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
-      researchAudits: researchAuditValues(),
+      researchAudits: managesResearchFiles() ? researchAuditValues()
+        : { intervalHours: 0, models: ["none", "none", "none"] },
       speedMode: ui.speedMode.value,
       reasoningSummary: ui.reasoningSummary.value,
       statementReviewOnly: reviewOnly,
@@ -1891,6 +2228,12 @@ ui.statementReviewOnly.onchange = () => {
   if (ui.statementReviewOnly.checked) ui.skipStatementReview.checked = false;
   setProblemMode(selectedProblemMode());
 };
+ui.fileManagement.onchange = () => {
+  setProblemMode(selectedProblemMode());
+  if (ui.promptDialog.open && ["author", "author_simple"].includes(activePrompt)) {
+    selectPrompt(selectedAuthorPrompt());
+  }
+};
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }
@@ -1953,6 +2296,7 @@ ui.memoryApproach.onchange = () => selectMemoryDocument(
   /^APPROACHES\/(?:index|INDEX)\.md$/.test(ui.memoryApproach.value)
     ? "APPROACHES" : ui.memoryApproach.value,
 );
+ui.approachIndex.onclick = () => selectMemoryDocument("APPROACHES");
 for (const tab of memoryTabs) {
   tab.onclick = () => selectMemoryFile(tab);
   tab.onkeydown = (event) => {
@@ -1972,7 +2316,7 @@ document.addEventListener("visibilitychange", () => {
 });
 ui.stop.onclick = () => act("/stop");
 ui.pause.onclick = () => act("/pause");
-ui.resume.onclick = () => act("/resume");
+ui.resume.onclick = () => act(state.phase === "prepared" ? "/continue-stopped" : "/resume");
 ui.downloadTex.onclick = async () => {
   ui.downloadTex.disabled = true;
   try {

@@ -36,13 +36,13 @@ class PromptDefaultsTests(unittest.TestCase):
         self.manager.fixed_app = False
 
     def edit_yaml(self, version):
-        for filename, names in (("author_critic.yaml", ("author", "critic")),
+        for filename, names in (("author_critic.yaml", ("author", "author_simple", "critic")),
                                 ("clean_up.yaml", ("final",))):
             path = self.workflows / filename
             workflow = yaml.safe_load(path.read_text())
             for name in names:
                 workflow["prompts"][name] = f"{version} {name} policy." + (
-                    "\n\n[STATEMENT]" if name == "author" else ""
+                    "\n\n[STATEMENT]" if name in {"author", "author_simple"} else ""
                 )
             path.write_text(yaml.safe_dump(workflow, sort_keys=False))
 
@@ -54,10 +54,10 @@ class PromptDefaultsTests(unittest.TestCase):
         latest = server.empty_state()
         self.assertTrue(original["authorPrompt"].startswith("First"))
         for name in ("author", "critic", "final"):
-            expected = server.default_prompts()[name]
+            expected = server.default_prompts()["author_simple" if name == "author" else name]
             self.assertEqual(latest[f"{name}Prompt"], expected)
-            self.assertEqual(latest["workflow"]["settings"]["prompts"][name], expected)
-            self.assertEqual(app.snapshot()["workflow"]["settings"]["prompts"][name], expected)
+            self.assertEqual(latest["workflow"]["settings"]["prompts"][name], server.default_prompts()[name])
+            self.assertEqual(app.snapshot()["workflow"]["settings"]["prompts"][name], server.default_prompts()[name])
 
     def test_new_web_jobs_ignore_old_page_prompts_and_save_current_yaml(self):
         self.edit_yaml("Old page")
@@ -70,13 +70,13 @@ class PromptDefaultsTests(unittest.TestCase):
             with self.subTest(launch=launch.__name__):
                 app = launch(body)
                 for name in roles:
-                    expected = server.default_prompts()[name]
+                    expected = server.default_prompts()["author_simple" if name == "author" else name]
                     self.assertEqual(app.state[f"{name}Prompt"], expected)
                     self.assertEqual((app.run_dir / "prompts" / f"{name}.txt").read_text(), expected + "\n")
                 if "author" in roles:
                     options = app._proof_options_locked()
                     path = Path(options[options.index("--author-prompt-file") + 1])
-                    self.assertEqual(path.read_text().strip(), server.default_prompts()["author"])
+                    self.assertEqual(path.read_text().strip(), server.default_prompts()["author_simple"])
                 for name in server.RESEARCH_MEMORY_FILES:
                     self.assertFalse((app.run_dir / name).exists(), "Only the LLM creates memory")
 
@@ -84,11 +84,11 @@ class PromptDefaultsTests(unittest.TestCase):
         self.edit_yaml("Current")
         custom = "Deliberate per-job instructions. [STATEMENT]"
         edited = self.manager.start_direct_job({
-            "statement": "First task", "promptOverrides": {"author": custom},
+            "statement": "First task", "promptOverrides": {"author_simple": custom},
         })
         fresh = self.manager.start_direct_job({"statement": "Next task"})
         self.assertEqual(edited.state["authorPrompt"], custom)
-        self.assertEqual(fresh.state["authorPrompt"], server.default_prompts()["author"])
+        self.assertEqual(fresh.state["authorPrompt"], server.default_prompts()["author_simple"])
         self.assertEqual(edited.state["criticPrompt"], fresh.state["criticPrompt"])
 
     def test_review_retry_and_run_history_keep_the_job_prompt(self):
@@ -118,7 +118,7 @@ const functions = app.slice(app.indexOf('const promptLabels ='), app.indexOf('fu
 const setup = `
 let currentJob = '', activePrompt = 'review';
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
-const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', critic: 'Critic', final: 'Final'};
+const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', author_simple: 'Simple [STATEMENT]', critic: 'Critic', final: 'Final'};
 let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};
 const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATEMENT]'}),
                       setItem: () => {throw Error('Prompts must not be persisted');}};
@@ -127,6 +127,7 @@ const ui = {promptEditor: {value: ''}, notice: {}, promptEditorLabel: {}, prompt
   promptDialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}}};
 const show = () => {};
 const selectedProblemMode = () => 'statement';
+const selectedAuthorPrompt = () => 'author_simple';
 const jobPath = path => path;
 let diskPrompts = defaults;
 const request = async () => ({workflow: {settings: {prompts: diskPrompts}}});
@@ -162,6 +163,21 @@ const checks = `
   // Historical jobs still display their actual prompt, rather than rewriting history.
   syncPrompts({...state, runId: 'old-job', authorPrompt: 'Actual saved author [STATEMENT]'});
   assert.equal(promptValues.author, 'Actual saved author [STATEMENT]');
+  syncPrompts({...state, runId: 'simple-job', fileManagement: false, authorPrompt: 'Saved simple [STATEMENT]'});
+  assert.equal(promptValues.author_simple, 'Saved simple [STATEMENT]');
+  assert.equal(promptValues.author, diskPrompts.author);
+
+  // Switching between author editors preserves an independent custom value for each mode.
+  syncPrompts();
+  await openPromptEditor();
+  selectPrompt('author_simple');
+  ui.promptEditor.value = 'Custom simple [STATEMENT]';
+  selectPrompt('author');
+  ui.promptEditor.value = 'Custom managed [STATEMENT]';
+  selectPrompt('author_simple');
+  assert.equal(ui.promptEditor.value, 'Custom simple [STATEMENT]');
+  savePrompts();
+  assert.deepEqual(promptOverrides, {author_simple: 'Custom simple [STATEMENT]', author: 'Custom managed [STATEMENT]'});
 })();
 `;
 Promise.resolve(vm.runInNewContext(setup + functions + checks, {assert}))

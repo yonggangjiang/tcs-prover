@@ -53,40 +53,73 @@ nodes:
         - set: {output: state.solution}
         - emit: {kind: status, label: Critic approved, text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
 prompts:
+  author_simple: |-
+    The following is the statement to prove. Try to prove it with a complete, rigorous argument.
+
+    STATEMENT:
+    [STATEMENT]
+  goal_simple: >-
+    Prove the exact statement given in the initial prompt with a complete, rigorous argument.
+  continuation_simple: >-
+    Continue trying to prove the same statement in this conversation. Return a
+    complete, rigorous solution only when the exact statement is resolved.
+  compaction_simple: >-
+    Continue the same proof task using the conversation summary. Preserve the
+    exact assumptions and requested conclusion.
+  resume_simple: |-
+    Continue trying to prove the statement below, using any previous work in this conversation.
+
+    ORIGINAL AUTHOR PROMPT:
+    {original_prompt}
+  repair_simple: |-
+    Correct the unresolved errors in this candidate and continue proving the exact statement.
+
+    CURRENT CANDIDATE:
+    {solution}
+
+    CRITIC BUGS:
+    {bugs}
+
   # EDIT AUTHOR HERE: research freedom and all author-managed file instructions.
   author: |-
-    Resolve the exact statement below with a complete, rigorous argument. Preserve its assumptions and requested conclusion. Think deeply and consider substantially diversified approaches.
-    
-    You, the author LLM, create, read, search, and update your research records using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout. 
+    Resolve the exact statement below with a complete, rigorous proof. Think deeply and consider substantially diversified approaches.
 
-    Maintain these research records in the current working directory:
+    You, the author LLM, create, read, search, and update your research records using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout.
+
+    Maintain these research records in the current working directory, please strictly follow the file structure and do not create new files or change the file structure:
 
     1. INITIAL_PROMPT.md is the permanent instruction file, containing the complete initial prompt and exact statement. Follow it throughout the task. Do not rewrite, shorten, or replace it without an explicit user instruction. Read it at the start, after context compaction, and whenever resuming work.
 
-    2. APPROACHES/ contains a simple directed acyclic graph (DAG) of attempted approaches. Each node is a Markdown file with a stable ID and descriptive name, for example A001-xxx.md. An edge A -> B means that approach B developed from approach A; it records research history, not a claim that A is correct. An approach may have no parents or several parents, including failed approaches from which it learned. Parents must already exist when a child is created. Reusing an old idea in a new form can create a new child, never an edge back to an earlier node. Keep references to supporting proofs separate from these history edges.
+    2. APPROACHES/ contains a simple directed acyclic graph (DAG) of attempted approaches. Each node is a Markdown file with a stable ID and descriptive name, for example A001-xxx.md. An edge A -> B means that approach B developed from approach A. An approach may have no parents or several parents.
 
-    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, status, and a concise result or remaining question. This parent table defines the DAG; no other graph format is required. Keep untried ideas briefly in the index until investigated. Update the table when a node is added or its position changes, with links to the relevant detailed records. Use the index to locate arguments, not as a replacement for reading them.
+    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG; no other graph format is required. Keep untried ideas briefly in the index until investigated. Update the table when a node is added or its position changes, with links to the relevant detailed records.
 
-    Each node file has this readable structure:
+    Each node file has this markdown structure:
 
     # A001 — Descriptive title
     Parents: linked IDs, or none.
+    Children: linked IDs, or none.
     Status: ACTIVE, PARKED, CLOSED, or RESOLVED.
-    Summary: what this approach attempts.
+
+    ACTIVE means currently being developed; PARKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved.
 
     ## Context and objective
-    Define the local problem, assumptions, notation, and connection to the original statement. Explain the relation to the parents and cite supporting lemmas by ID.
+
+    Define the local problem. Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definition should be self-contained, with every first appearance of a term or symbol clearly defined under the TCS convention, Do not omit sentence  components like subjects, objects, or quantifiers, especially for a term that depends on other terms. Explain how this node's objective relates to the original statement, with the assumptions that the reader might not know the global context like the paranet nodes.
 
     ## Detailed work
-    Append dated mathematical work with descriptive subsections: definitions, constructions or pseudocode, calculations, attempted proofs, examples, failures, repairs, and substantive subagent arguments. Explain nontrivial steps and significant decisions so another reader can understand and continue the work. Distinguish established results, incomplete arguments, and conjectures. Preserve earlier work when correcting it, with explicit links between an error and its correction.
 
-    Continue updating a node while developing the same attempt. Create a child for a distinct attempt or a substantial development that deserves its own file, rather than for every helper lemma or edit. Split large records at meaningful subproblem boundaries, preserving the detailed work and links to its history. Include enough local context to read each node independently, while linking precise supporting sections instead of copying entire ancestor files. Read relevant arguments and their dependencies in full, using targeted sections rather than repeatedly loading the entire archive.
+    Append all mathematical work and thinking process towards the objective described above. Let above, assume the reader only knows the original definitions and statement in INITIAL_PROMPT.md, and make this self-contained.
 
-    ACTIVE means currently being developed; PARKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved. Record the exact evidence and scope of a failure, including what would have to change for a new attempt to address it. An unfinished proof is not a refutation, a failed variant does not close its whole research family, and a resolved subproblem does not resolve the full statement. Search related records before a new attempt to avoid repeating recorded failures in different words; record what is new when revisiting them.
+    This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to previous context.
 
-    3. PROVED.md contains only rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. Positive and negative results are both welcome. Justify every inference and identify earlier lemmas or standard theorems used, including their required hypotheses. Experiments, conjectures, and arguments with gaps belong in the approach files. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them. Routine repeated auditing of existing lemmas is not required.
+    If some part becomes blocked, generate a new child node and state clearly here what is the obstacle and why it is blocked.
 
-    4. AUDITS/ contains independent audit reports, one Markdown file per report. When scheduled audits are enabled, the controller temporarily pauses your research, saves the independent reports here, and resumes your existing goal and conversation after the audit batch finishes. On resumption, read the latest reports before continuing. Consider their suggestions as advisory and decide whether to use them; they do not override the statement or these instructions. Leave the reports intact. Older runs may also have audit.md; preserve it as historical advice. You remain responsible for organizing and updating your own research records.
+    3. PROVED.md contains only important re-usable rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. Positive and negative results are both welcome. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them.
+
+    Apply the same self-contained writing principle as above: every lemma and proof should be readable without assuming the reader knows the global context. The lemmas should not contain everything proved, but only those that are important and re-usable.
+
+    4. AUDITS/ contains only the current batch of independent audit reports, one Markdown file per report. When an audit batch starts, the controller pauses your research and moves all previous reports from AUDITS/ to audit_history/. Auditors read this same working directory directly, without copying the research files, and leave your records unchanged. The controller saves the new reports in AUDITS/ and resumes your existing goal and conversation after the batch finishes. On resumption, read the current reports before continuing. Consider their suggestions as advisory and decide whether to use them; they do not override the statement or these instructions. Leave AUDITS/ and audit_history/ intact; the controller manages them. Older runs may also have audit.md; preserve it as historical advice. You remain responsible for organizing and updating your own research records.
 
     Return a complete, self-contained solution only when it resolves the exact statement and every necessary claim is justified. A special case, reduction to an unproved claim, or progress report is not a complete solution. A counterexample resolves the task only if the statement permits that answer and its validity is fully proved.
 
@@ -130,17 +163,9 @@ prompts:
     Resume the existing task in this working directory: {directory}
     Use your file tools to read INITIAL_PROMPT.md first and follow its current
     instructions and memory layout, including any explicit user-approved migration.
-    Recover the relevant saved context and preserve the research history. If
-    the saved layout uses APPROACHES/INDEX.md or APPROACHES.md, retain that layout;
-    do not silently migrate it. Continue the same goal. A previous interruption
-    or usage limit was not a mathematical failure.
+    Continue the same goal.
     If new reports are present in AUDITS/, read them and consider their advice
-    before continuing; preserve any legacy audit.md as well.
-
-    If INITIAL_PROMPT.md is missing, create it from the complete original initial
-    author prompt below, without this continuation wrapper. Initialize other
-    research records only if absent, following that prompt's instructions.
-    Organize and maintain the research files yourself, following that prompt.
+    before continuing.
 
     ORIGINAL INITIAL AUTHOR PROMPT:
     {original_prompt}

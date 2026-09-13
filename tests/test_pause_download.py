@@ -347,6 +347,7 @@ const document = {activeElement: null, body: {append() {}}, createElement() {
   return {click() {download = this.download;}, remove() {}};
 }};
 const show = (element, visible) => element.hidden = !visible;
+const managesResearchFiles = () => true;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, refresh = () => {};

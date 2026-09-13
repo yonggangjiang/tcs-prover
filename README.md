@@ -1,15 +1,17 @@
 # TCS Prover
 
 A local web UI that gives a persistent root author LLM a mathematical statement,
-lets it explore diverse approaches with independent subagents while maintaining
-a readable research journal, checks its candidate through a critic loop, and
+lets it explore approaches with independent subagents, checks its candidate
+through a critic loop, and
 produces a complete LaTeX document.
 Algorithmic tasks can be entered as statements too.
 
 The complete author instructions live directly in
 [`workflows/author_critic.yaml`](workflows/author_critic.yaml). The LLM creates,
 reads, searches, and updates its initial instructions, approach files, and proved
-lemmas under that prompt.
+lemmas when **Manage research files** is enabled. This switch is off by default
+on the home screen: `author_simple` asks only for a rigorous proof, and the UI
+hides research records and scheduled audits. The critic and LaTeX writer still run.
 
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
@@ -158,6 +160,10 @@ Run `python3 web_ui.py --help` to see every spelling and allowed value.
 TCS Prover writes durable artifacts while a job progresses. When the Web UI is
 started again, it scans `runs/*/transcript.jsonl`, restores the historical job
 cards, and lists every resumable critic checkpoint found in those run folders.
+It also discovers prepared workspaces with `preparedRun: true` in
+`job-settings.json`. **Start prepared run** opens a fresh author session in that
+exact folder, using its saved prompts and research records; no earlier session
+or elapsed budget is inherited.
 You do not need to keep the old browser tab open.
 
 A saved proof candidate contains the checked statement and latest complete
@@ -396,67 +402,54 @@ the target impossible. The review step states the intended convention and writes
 it as `(m+n) log² n` instead of letting that mismatch
 derail the proof search.
 
-### 2. One persistent author and an indexed research journal
+### 2. One persistent author, with optional research files
 
-The default author has one persistent root goal and enables `multi_agent`.
-Its prompt calls for deep investigation of one principal route, with independent
-subagents applying different methods to its unresolved steps. They work without
-communicating with one another and report to the root author, which also does
-mathematical work and records the results. Difficulty or completion of a helper
-lemma does not automatically trigger another brainstorming round. The separate
-critic checks any completed candidate afterward.
+Home-screen jobs default to **Manage research files: Off**. The `author_simple`
+prompt in `workflows/author_critic.yaml` asks the author to prove the supplied
+statement. Its goal, continuation, compaction, resume, and repair prompts also
+avoid requiring a file layout. The mode is saved with the job and retained on
+continuation. Existing runs without the setting retain managed mode. Direct
+CLI jobs retain managed mode for compatibility; the generic runner also accepts
+`--set file_management=false` to use the simple prompt family.
 
-The author maintains three research locations in its run folder:
+Turn **Manage research files** on before starting a job to enable the full
+research workspace and scheduled advisers. The managed author explores diverse
+approaches, using these records:
 
 | File | Contents |
 | --- | --- |
-| `INITIAL_PROMPT.md` | The complete original author prompt, including the exact statement and search strategy. The author creates it if absent and is instructed to preserve it unchanged. |
-| `APPROACHES/` | `INDEX.md` identifies the principal route, links every approach, and records its status and obstacle or result. Each `A001-short-title.md` route file starts with its current position and next action, followed by dated, detailed research entries. |
-| `PROVED.md` | Only fully justified positive or negative lemmas, with exact assumptions, complete arguments, and links to their originating approach IDs. |
+| `INITIAL_PROMPT.md` | The permanent complete initial author prompt and exact statement. |
+| `APPROACHES/index.md` | A short table of linked node IDs and titles, parents, children, status, and result or remaining question. Its parent column defines the DAG. |
+| `APPROACHES/A001-short-title.md` | One approach with linked Parents and Children, Status, **Context and objective**, and organized **Detailed work**. Each argument defines its terms and explains its relation to the task. |
+| `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
+| `AUDITS/` | Independent reports from the current audit batch only. |
+| `audit_history/` | Previous audit reports, moved here by the controller when the next batch starts. |
 
-The model creates and maintains these records itself. Route statuses are
-**ACTIVE**, **PARKED** (unresolved, with a re-entry action), **CLOSED** (a scoped
-failed claim or construction), and **RESOLVED** (the stated subproblem is solved).
-The index is navigation, not a substitute for reading the active argument and
-its supporting lemmas. The optional **Research memory** browser panel shows the
-index and lets you select a route; legacy notebooks remain readable.
+The **Research files** panel presents the approach DAG as clickable nodes. Hover
+or focus a node to see its status, relationships, and result or open question;
+click it to read the corresponding file. The index table, node selector, collapsible
+sections, and Markdown links provide additional navigation. Older `INDEX.md` and
+`APPROACHES.md` layouts remain readable.
 
-Each route retains constructions, calculations, attempted proofs, examples,
-counterexamples, repairs, and substantive subagent findings with their full
-arguments and explicit gaps, rather than conclusions alone. Corrections are
-appended while the current-position summary stays up to date. Before switching,
-the author records what it tried, why the obstacle remains, how to resume, and
-why the alternative deserves priority. New lemmas must be applied to the current
-candidate, with the remaining task-level obligations made explicit. There are
-no added model roles, routine lemma-audit loops, or token/word quotas.
+Statuses have precise scope: **ACTIVE** means under development; **PARKED** means
+unresolved with its obstacle recorded; **CLOSED** means an identified claim or
+construction failed; **RESOLVED** means that node's stated objective was achieved.
+Unfinished work stays in approach files. Only established reusable results belong
+in `PROVED.md`, and a disproved lemma must lose its proved status with its
+correction and affected dependencies recorded.
 
-Unfinished arguments and suspected counterexamples remain in the approach files;
-only completely proved results belong in `PROVED.md`. A failed variant does not
-close an entire research family. Renaming a failed construction is not a new idea.
+Scheduled audits pause the author and read its actual working directory directly.
+They do not copy the workspace or edit the author's research records. Before
+launching the available auditors, the controller moves existing `AUDITS/` files
+to `audit_history/`, preserving colliding filenames with a suffix. New reports
+are saved in `AUDITS/`, then the same author conversation resumes and considers
+their advice. Provider failures leave earlier reports safely in history. Legacy
+`audit.md` remains available under audit history.
 
-While the process runs, the author continues in the same conversation. On
-context compaction or continuation it reads the initial assignment, index, active
-route's current position and relevant entries, and supporting lemmas. It resumes
-the recorded next action. After an interruption it resumes that conversation
-when available; otherwise it reads the same records in a fresh conversation. The
-resume prompt includes the original full assignment as a fallback when the
-initial prompt file is absent. File creation, reading, and updating belong to
-the LLM; the runner does not parse, summarize, or maintain a research database.
-An older run's saved initial instructions retain its legacy layout unless the
-user explicitly approves a migration. Such a migration preserves its original
-chronological notebook and initial instructions as historical artifacts, and
-identifies the new active layout explicitly in `INITIAL_PROMPT.md`.
-
-This design depends on the author's adherence to the notebook and novelty
-instructions. It makes its history readable and available; it does not
-mechanically prove that two differently worded ideas are different or guarantee
-that every unsuccessful internal thought was written down. Public transcripts,
-critic checkpoints, and final documents remain separate operational artifacts.
-
-The shared deadline still bounds author, critic, and final model calls. A
-stopped author preserves its best recorded work and outstanding tasks rather
-than claiming a solution. `--resume-research` is the continuation entry point
-for the saved author notebook and conversation.
+The author creates and maintains its mathematical records. On managed-mode
+compaction or resumption it reads `INITIAL_PROMPT.md` and recovers the relevant
+work from that layout. The runner retains the conversation and operational
+checkpoints. `--resume-research` continues saved author work with a fresh budget.
 
 ### 3. Critic loop
 
@@ -467,8 +460,8 @@ instructed not to communicate with one another and to report back to the critic.
 The critic considers those reports and repairs the complete argument itself.
 
 If it cannot fix every issue, it returns the latest safely repaired candidate
-and exact unresolved bugs to the author. The author continues with the same
-research records, records the objections, and rechecks affected lemmas. This
+and exact unresolved bugs to the author. The author continues the proof task; in managed mode it also records the
+objections and rechecks affected lemmas in its research files. This
 rejection resets the consecutive critic-round count.
 
 An unchanged pass accepts immediately. An edited pass sends the latest solution

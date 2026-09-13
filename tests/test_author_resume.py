@@ -62,11 +62,9 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
                 self.assertFalse((app.run_dir / name).exists())
             self.assertFalse((app.run_dir / "continuation-memory").exists())
             options = app._proof_options_locked()
-            setting = options[options.index("--set") + 1]
-            self.assertEqual(setting.split("=", 1)[0], "goal_thread_id")
-            self.assertEqual(json.loads(setting.split("=", 1)[1]), "root-two")
             settings = dict(options[index + 1].split("=", 1)
                             for index, argument in enumerate(options) if argument == "--set")
+            self.assertEqual(json.loads(settings["goal_thread_id"]), "root-two")
             self.assertEqual(json.loads(settings["goal_cwd"]), str(self.source.resolve()))
             self.assertTrue(json.loads(settings["goal_resume"]))
             return object(), object()

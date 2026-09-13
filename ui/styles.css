@@ -446,6 +446,18 @@ button { min-height: 42px; }
 .memory-content h3 { margin: 0 0 16px; font-size: 1.15rem; letter-spacing: -0.015em; }
 .memory-content h4 { margin: 20px 0 8px; font-size: 0.95rem; }
 .memory-content p { margin: 0 0 14px; white-space: pre-wrap; }
+.memory-content code { padding: 2px 4px; border-radius: 4px; background: var(--soft); font-size: 0.84em; }
+.memory-content ul, .memory-content ol { margin: 0 0 16px; padding-left: 24px; }
+.memory-content li { margin-bottom: 7px; }
+.memory-content hr { height: 0; margin: 22px 0; border: 0; border-top: 1px solid var(--line); }
+.memory-table-wrap { max-width: 100%; margin: 4px 0 20px; overflow-x: auto; }
+.memory-content table { width: 100%; border-collapse: collapse; font-size: 0.8rem; line-height: 1.55; }
+.memory-content th { background: #f4f7f4; color: #40554c; font-size: 0.74rem; }
+.memory-content th, .memory-content td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; min-width: 90px; }
+.memory-content td:first-child { min-width: 190px; }
+.memory-record-meta { display: flex; gap: 12px; align-items: baseline; margin: 0 0 9px; font-size: 0.8rem; }
+.memory-record-meta > strong { flex: 0 0 68px; color: var(--muted); font-weight: 500; }
+.memory-record-meta + .memory-section { margin-top: 20px; }
 .memory-link { min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; cursor: pointer; }
 .memory-content pre { padding: 14px; border-radius: 8px; background: var(--soft); white-space: pre-wrap; font-size: 0.8rem; line-height: 1.6; }
 .memory-section { margin-bottom: 10px; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
@@ -454,6 +466,48 @@ button { min-height: 42px; }
 .memory-section-body { padding: 16px 18px 2px; }
 .memory-footer { margin: 0; padding: 10px 20px; border-top: 1px solid #edeee9; color: var(--muted); font-size: 0.7rem; }
 .memory-panel summary:focus-visible, .memory-tabs button:focus-visible, .memory-document:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+
+.file-management-setting { display: flex; justify-content: space-between; align-items: center; gap: 24px; margin: 20px 0 8px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+.file-management-setting:has(input:checked) { background: #f5fbf8; border-color: #b7d7c8; }
+.file-management-setting strong, .file-management-setting small { display: block; }
+.file-management-setting strong { font-size: 0.87rem; }
+.file-management-setting small { margin-top: 4px; color: var(--muted); font-size: 0.77rem; font-weight: 400; }
+.file-management-setting input { appearance: none; position: relative; flex: 0 0 42px; width: 42px; height: 24px; margin: 0; padding: 0; border: 0; border-radius: 20px; background: #b7bcb8; cursor: pointer; }
+.file-management-setting input::before { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: white; content: ""; transition: transform 0.15s; }
+.file-management-setting input:checked { background: var(--accent); }
+.file-management-setting input:checked::before { transform: translateX(18px); }
+.file-management-setting input:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+
+.approach-graph { border-top: 1px solid var(--line); background: #fafcfb; }
+.approach-graph-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px 12px; }
+.approach-graph-heading h3 { margin: 0 0 4px; font-size: 0.9rem; }
+.approach-graph-heading p { margin: 0; color: var(--muted); font-size: 0.75rem; }
+.approach-graph-heading button { flex-shrink: 0; font-size: 0.75rem; }
+.approach-graph-viewport { max-height: 465px; overflow: auto; background-image: radial-gradient(#cad8d0 0.7px, transparent 0.7px); background-size: 16px 16px; overscroll-behavior: contain; }
+.approach-graph-viewport:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.approach-graph-canvas { position: relative; min-width: 100%; }
+.approach-graph-canvas > svg { position: absolute; inset: 0; pointer-events: none; }
+.approach-node { position: absolute; display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-start; width: 210px; height: 112px; min-height: 0; padding: 11px 13px; border: 1px solid #d0d9d3; border-left-width: 4px; border-radius: 9px; background: white; color: var(--ink); text-align: left; box-shadow: 0 2px 5px #243b2f08; }
+.approach-node:hover, .approach-node:focus-visible { z-index: 1; border-color: var(--accent); background: #f8fcfa; outline: 2px solid #93cbb7; outline-offset: 2px; }
+.approach-node[aria-current="true"] { box-shadow: 0 0 0 2px var(--accent); }
+.approach-node > strong { color: #456252; font-size: 0.72rem; line-height: 1.4; }
+.approach-node-title { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; margin: 3px 0 6px; font-size: 0.8rem; font-weight: 550; line-height: 1.4; }
+.approach-status { width: fit-content; padding: 2px 6px; border-radius: 4px; background: #eff1ef; color: #68766c; font-size: 0.61rem; font-weight: 650; letter-spacing: 0.035em; line-height: 1.5; }
+.approach-node > .approach-status { margin-top: auto; }
+.approach-node.active { border-left-color: #247a66; }
+.approach-status.active { background: #e4f4eb; color: #24634c; }
+.approach-node.parked { border-left-color: #bf9741; }
+.approach-status.parked { background: #faf0d8; color: #886217; }
+.approach-node.closed { border-left-color: #b47876; }
+.approach-status.closed { background: #faeae9; color: #945350; }
+.approach-node.resolved { border-left-color: #5888ac; }
+.approach-status.resolved { background: #e8f1fa; color: #326689; }
+.approach-graph-inspector { min-height: 122px; padding: 15px 20px; border-top: 1px solid #e3ebe5; background: #f2f7f3; color: #495c50; font-size: 0.8rem; }
+.approach-graph-inspector > strong { display: block; font-size: 0.82rem; color: var(--ink); }
+.approach-graph-inspector > p { margin: 6px 0; }
+.approach-graph-inspector > small, .approach-graph-inspector > code { display: block; margin-top: 4px; color: var(--muted); font-size: 0.71rem; overflow-wrap: anywhere; }
+.graph-warning { margin: 0; padding: 0 20px 12px; color: #886217; }
+.job-status.prepared { color: #23664f; background: #e6f3eb; }
 
 .research-audits {
   margin: 0 0 18px;

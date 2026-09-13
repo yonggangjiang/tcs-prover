@@ -2029,7 +2029,13 @@ def _settings(node, options):
 def prepare(workflow, options):
     """Resolve prompt overrides and validate every node before starting any model."""
 
-    prompts = {**workflow["prompts"], **options.get("prompts", {})}
+    prompts = dict(workflow["prompts"])
+    # Built-in author prompts have a simple variant for every lifecycle event.
+    # Other workflows without these variants retain their original behavior.
+    if options.get("file_management") is False:
+        prompts.update({name: prompts[f"{name}_simple"] for name in tuple(prompts)
+                        if f"{name}_simple" in prompts})
+    prompts.update(options.get("prompts", {}))
     if not all(isinstance(value, str) and value.strip() for value in prompts.values()):
         raise ValueError("Prompt overrides must be nonempty strings.")
     for node in workflow["nodes"].values():

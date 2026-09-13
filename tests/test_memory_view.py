@@ -244,11 +244,11 @@ class MemoryViewTests(unittest.TestCase):
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const selected = source.slice(source.indexOf('function revealMemoryAnchor('), source.indexOf('function syncMemoryPanel('));
-const linkFormatter = source.slice(source.indexOf('function appendMemoryText('), source.indexOf('function renderMemoryContent('));
+const linkFormatter = source.slice(source.indexOf('function memoryLinkTarget('), source.indexOf('function renderMemoryContent('));
 const pending = [], rendered = [], timers = [];
 const element = () => ({ textContent: '', hidden: false, scrollTop: 0, replaceChildren() {}, setAttribute() {}, querySelectorAll: () => [] });
 const ui = Object.fromEntries(['memoryPanel', 'memoryApproachPicker', 'memoryApproach', 'memoryDocument',
-  'memoryFilename', 'memoryUpdated', 'memoryContent', 'memoryMessage'].map(name => [name, element()]));
+  'memoryFilename', 'memoryUpdated', 'memoryContent', 'memoryMessage', 'approachGraph'].map(name => [name, element()]));
 ui.memoryPanel.open = true;
 ui.memoryApproach.options = [];
 ui.memoryApproach.replaceChildren = (...options) => { ui.memoryApproach.options = options; };
@@ -256,7 +256,9 @@ const tabs = ['INITIAL_PROMPT.md', 'APPROACHES', 'PROVED.md'].map((file, i) => (
   dataset: { memory: file }, id: `tab${i}`, setAttribute() {},
 }));
 const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: 'resumed', memoryFile: 'INITIAL_PROMPT.md',
+  state: {trace: []},
   memoryVersion: '', memoryRequest: 0, memoryTimer: null, memoryAnchor: '',
+  approachIndex: {version: '', content: '', files: []}, approachGraphSignature: '',
   document: { hidden: false, createElement: () => ({ children: [], append(child) { this.children.push(child); } }) },
   show: (element, visible) => { element.hidden = !visible; },
   clearTimeout() {}, setTimeout: callback => { timers.push(callback); return timers.length; },
@@ -265,10 +267,17 @@ const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: 'resumed', 
   renderMemoryContent: content => rendered.push(content),
   appendFormattedText: (element, text) => element.children.push(text),
 });
-vm.runInContext(linkFormatter + selected, context);
+vm.runInContext(linkFormatter + selected + '\nfunction renderApproachGraph() {}', context);
 const ready = (name, content, files, version = name) => ({ name, content, files, version,
   status: 'ready', modifiedAt: '2026-09-11T00:00:00Z' });
-const settle = async value => { pending.shift().resolve(value); await Promise.resolve(); await Promise.resolve(); };
+const settle = async value => {
+  pending.shift().resolve(value); await new Promise(setImmediate);
+  // A selected node also refreshes the authoritative parent table for the graph.
+  if (pending[0]?.path.file === 'APPROACHES') {
+    pending.shift().resolve(ready('APPROACHES/INDEX.md', 'Index', value.files));
+    await new Promise(setImmediate);
+  }
+};
 (async () => {
   context.selectMemoryFile(tabs[1]);
   assert.equal(pending[0].path.file, 'APPROACHES');
@@ -286,7 +295,7 @@ const settle = async value => { pending.shift().resolve(value); await Promise.re
   context.appendMemoryText(links, '[Route](A001.md) [Index](INDEX.md) [Archive](../APPROACHES.md) '
     + '[External](https://example.com) [Escape](../../secret.md) [Unknown](A999.md)');
   const buttons = links.children.filter(child => child.className === 'memory-link');
-  assert.equal(buttons.length, 3);
+  assert.equal(buttons.length, 4);
   assert.equal(buttons[0].children[0], 'Route');
   assert.equal(buttons[2].children[0], 'Archive');
   assert.ok(links.children.includes('[External](https://example.com)'));
@@ -330,7 +339,7 @@ const settle = async value => { pending.shift().resolve(value); await Promise.re
   context.appendMemoryText(lemmaLink, '[L095](../PROVED.md#l095)');
   lemmaLink.children.find(child => child.className === 'memory-link').onclick();
   assert.equal(pending[0].path.file, 'PROVED.md');
-  const lemma = { dataset: { heading: 'L095 — Exact terminal SCCs' }, open: false,
+  const lemma = { dataset: { heading: 'L095 — Exact terminal SCCs' }, open: false, tagName: 'DETAILS', closest() {return this;},
     scrollIntoView() { this.scrolled = true; } };
   ui.memoryContent.querySelectorAll = () => [lemma];
   await settle(ready('PROVED.md', 'Lemma proof', undefined));

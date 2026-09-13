@@ -56,7 +56,7 @@ CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
 RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md"}
 APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
-AUDIT_MEMORY_FILE = re.compile(r"AUDITS/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
+AUDIT_MEMORY_FILE = re.compile(r"(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
@@ -178,6 +178,7 @@ def default_prompts():
     return {
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
+        "author_simple": author_critic["author_simple"],
         "critic": author_critic["critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
     }
@@ -188,12 +189,17 @@ def web_prompt_options(body, roles, source=None):
 
     overrides = body.get("promptOverrides", {})
     if not isinstance(overrides, dict) or any(
-        name not in {"review", "author", "critic", "final"}
+        name not in {"review", "author", "author_simple", "critic", "final"}
         or not isinstance(value, str) for name, value in overrides.items()
     ):
         raise ValueError("Prompt overrides must map role names to prompt text.")
+    managed = body.get("fileManagement", (source or {}).get("fileManagement", False))
+    if source and managed != source.get("fileManagement", True):
+        raise ValueError("Start a new job to change research file management.")
     return {
-        f"{name}_prompt": overrides.get(name, (source or {}).get(f"{name}Prompt"))
+        f"{name}_prompt": overrides.get(
+            "author_simple" if name == "author" and not managed else name,
+            (source or {}).get(f"{name}Prompt"))
         for name in roles
     }
 
@@ -262,7 +268,7 @@ PUBLIC_GRAPH = {
         "author": {
             "label": "Proof author", "short_label": "Author", "stage": "solve",
             "stages": ["solve", "repair"],
-            "description": "The LLM explores in one session and maintains its notebooks following the YAML prompts.",
+            "description": "The author explores approaches and works toward a complete, rigorous proof.",
         },
         "failure_summary": {
             "label": "Saved progress", "short_label": "Saved",
@@ -399,6 +405,8 @@ def empty_state(trace=None, trace_version=0):
         "problemMode": "statement",
         "skipStatementReview": False,
         "statementReviewOnly": False,
+        "fileManagement": False,
+        "preparedRun": False,
         "draft": "",
         "reviewStatement": "",
         "reviewFeedback": "",
@@ -426,7 +434,7 @@ def empty_state(trace=None, trace_version=0):
         "reasoningSummary": DEFAULT_REASONING_SUMMARY,
         "speedMode": DEFAULT_SPEED,
         "reviewPrompt": prompts["review"],
-        "authorPrompt": prompts["author"],
+        "authorPrompt": prompts["author_simple"],
         "criticPrompt": prompts["critic"],
         "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
@@ -538,7 +546,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
-            "problemMode", "skipStatementReview", "statementReviewOnly",
+            "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         self._save(
@@ -604,7 +612,8 @@ class App:
                 # Automatic resume keeps the same audit clock and monitor.
                 self._audit_token = token
                 return
-            if (token is None or self.worker_token is not token or self._audit_token is token
+            if (not self.state.get("fileManagement", True)
+                    or token is None or self.worker_token is not token or self._audit_token is token
                     or all(model == "none" for model in self.state["researchAudits"]["models"])):
                 return
             workspace = self.state.get("goalWorkspace") or self.run_dir
@@ -753,6 +762,8 @@ class App:
 
         settings = audits.normalize_settings(settings)
         with self.lock:
+            if not self.state.get("fileManagement", True):
+                raise ValueError("Research audits require file management for this run.")
             if (self.state["phase"] not in {"running", "paused"}
                     or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
@@ -776,6 +787,8 @@ class App:
         """Run the saved auditors now and restart their interval clock."""
 
         with self.lock:
+            if not self.state.get("fileManagement", True):
+                raise ValueError("Research audits require file management for this run.")
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"} or self.worker_token is None
                     or self.state["manuallyStopped"] or self._audit_pause_engine is not None
@@ -952,7 +965,8 @@ class App:
         """Display one author-owned file on demand, without modifying it."""
 
         approach = name in {"APPROACHES", "APPROACHES.md"} or bool(APPROACH_MEMORY_FILE.fullmatch(name))
-        audit = name in {"AUDITS", "audit.md"} or bool(AUDIT_MEMORY_FILE.fullmatch(name))
+        audit = name in {"AUDITS", "audit_history", "audit.md"} or bool(AUDIT_MEMORY_FILE.fullmatch(name))
+        audit_folder = "audit_history" if name in {"audit_history", "audit.md"} or name.startswith("audit_history/") else "AUDITS"
         if name not in RESEARCH_MEMORY_FILES and not approach and not audit:
             raise ValueError("Unknown research memory file.")
         with self.lock:
@@ -1010,33 +1024,33 @@ class App:
                 elif audit:
                     result["files"] = []
                     try:
-                        folder = os.open("AUDITS", flags, dir_fd=parent)
+                        folder = os.open(audit_folder, flags, dir_fd=parent)
                     except FileNotFoundError:
                         folder = None
                     else:
                         opened.callback(os.close, folder)
                         entries = []
                         for entry in os.listdir(folder):
-                            if not AUDIT_MEMORY_FILE.fullmatch(f"AUDITS/{entry}"):
+                            if not AUDIT_MEMORY_FILE.fullmatch(f"{audit_folder}/{entry}"):
                                 continue
                             try:
                                 if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
-                                    entries.append(f"AUDITS/{entry}")
+                                    entries.append(f"{audit_folder}/{entry}")
                             except FileNotFoundError:
                                 continue
                         result["files"] = sorted(entries, reverse=True)
                     try:
-                        if stat.S_ISREG(os.stat("audit.md", dir_fd=parent, follow_symlinks=False).st_mode):
+                        if audit_folder == "audit_history" and stat.S_ISREG(os.stat("audit.md", dir_fd=parent, follow_symlinks=False).st_mode):
                             result["files"].append("audit.md")
                     except FileNotFoundError:
                         pass
-                    if name == "AUDITS":
+                    if name in {"AUDITS", "audit_history"}:
                         if not result["files"]:
                             return result
                         name = result["files"][0]
                     result["name"] = name
                     filename = name
-                    if name.startswith("AUDITS/"):
+                    if name.startswith(("AUDITS/", "audit_history/")):
                         if folder is None:
                             return result
                         parent, filename = folder, name.split("/")[1]
@@ -1087,19 +1101,20 @@ class App:
                 name = "APPROACHES.md"
             result["name"] = name
             path = directory / name
-        elif name in {"AUDITS", "audit.md"} or AUDIT_MEMORY_FILE.fullmatch(name):
-            folder = directory / "AUDITS"
+        elif name in {"AUDITS", "audit_history", "audit.md"} or AUDIT_MEMORY_FILE.fullmatch(name):
+            audit_folder = "audit_history" if name in {"audit_history", "audit.md"} or name.startswith("audit_history/") else "AUDITS"
+            folder = directory / audit_folder
             result["files"] = []
             if linked(folder) or (folder.exists() and not folder.is_dir()):
                 return {**result, "status": "unavailable"}
             if folder.exists():
-                result["files"] = sorted((f"AUDITS/{entry.name}" for entry in folder.iterdir()
-                                          if AUDIT_MEMORY_FILE.fullmatch(f"AUDITS/{entry.name}")
+                result["files"] = sorted((f"{audit_folder}/{entry.name}" for entry in folder.iterdir()
+                                          if AUDIT_MEMORY_FILE.fullmatch(f"{audit_folder}/{entry.name}")
                                           and not linked(entry) and entry.is_file()), reverse=True)
             legacy = directory / "audit.md"
-            if not linked(legacy) and legacy.is_file():
+            if audit_folder == "audit_history" and not linked(legacy) and legacy.is_file():
                 result["files"].append("audit.md")
-            if name == "AUDITS":
+            if name in {"AUDITS", "audit_history"}:
                 if not result["files"]:
                     return result
                 name = result["files"][0]
@@ -1169,9 +1184,12 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         research_audits=None,
+        file_management=True,
     ):
         """Normalize and validate settings shared by both input modes."""
 
+        if not isinstance(file_management, bool):
+            raise ValueError("File management must be enabled or disabled.")
         review_model = str(review_model or "")
         author_model = str(author_model or "")
         critic_model = str(critic_model or "")
@@ -1188,6 +1206,8 @@ class App:
             "critic": critic_prompt, "final": final_prompt,
         }
         defaults = default_prompts()
+        if not file_management:
+            defaults["author"] = defaults["author_simple"]
         prompts = {
             name: str(
                 defaults[name] if value is None else value
@@ -1273,7 +1293,9 @@ class App:
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
-            "researchAudits": audits.normalize_settings(research_audits),
+            "fileManagement": file_management,
+            "researchAudits": audits.normalize_settings(research_audits) if file_management else {
+                **audits.default_settings(), "models": ["none", "none", "none"]},
         }
 
     def start_review(
@@ -1293,6 +1315,7 @@ class App:
         review_only=False,
         continuation_source="", stopped_stage="",
         research_audits=None,
+        file_management=True,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -1332,6 +1355,7 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             research_audits=research_audits if not review_only else None,
+            file_management=file_management,
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -1600,6 +1624,7 @@ class App:
             "--speed", self.state["speedMode"],
             "--author-limit-file", str(author_limit_file),
             "--author-steer-file", str(author_steer_file),
+            "--set", "file_management=" + json.dumps(self.state.get("fileManagement", True)),
         ]
         for role in ("author", "critic", "writer"):
             options.extend([
@@ -1710,6 +1735,39 @@ class App:
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
 
+    def start_prepared_run(self):
+        """Start a curated workspace in place, with no inherited author session."""
+
+        with self.lock:
+            if self.state["phase"] != "prepared" or self.has_active_worker():
+                raise ValueError("This workspace is no longer waiting to start.")
+            statement = saved_statement(self.run_dir)
+            for role in ("author", "critic", "writer"):
+                runtime.verify_model_credentials(self.state[f"{role}Model"])
+            for role in ("author", "critic", "final"):
+                self._save(f"prompts/{role}.txt", self.state[f"{role}Prompt"] + "\n")
+            previous = dict(self.state)
+            now = datetime.now(timezone.utc).isoformat()
+            self.state.update(preparedRun=False, goalResume=False, goalThreadId="",
+                              goalWorkspace=str(self.run_dir.resolve()), authorSteerDelivered="",
+                              elapsedSeconds=0, startedAt=now, resumedAt=now, finishedAt="",
+                              researchAuditProgress={}, error="")
+            process = None
+            try:
+                self._save_job_settings(self.state)
+                process, token = self._launch_solver_locked(statement)
+                self._spawn_worker(self._read_output, (process, token), token)
+            except (OSError, ValueError, RuntimeError):
+                if process is not None:
+                    stop_process_tree(process)
+                self.state = previous
+                self.process = self.active_token = self.worker_token = None
+                self._save_job_settings(self.state)
+                raise
+            self.add_trace({"kind": "status", "stage": "solve", "node": "author",
+                            "label": "Prepared research started",
+                            "text": "Started a fresh author session in the prepared workspace."})
+
     def resume(self):
         """Reopen this run with a new CLI process and the saved goal/thread."""
 
@@ -1813,6 +1871,7 @@ class App:
         continuation_source="", stopped_stage="",
         allow_external_source=False,
         research_audits=None,
+        file_management=True,
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -1822,6 +1881,7 @@ class App:
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
         if continuation_source:
+            file_management = saved_file_management(continuation_source)
             saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
             if saved_prompt.is_file():
                 original_template = read_utf8(saved_prompt, "saved author prompt")
@@ -1845,6 +1905,7 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             research_audits=research_audits,
+            file_management=file_management,
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2036,6 +2097,7 @@ class App:
             raise ValueError("A saved statement and complete proof are required.")
         if "\0" in statement or "\0" in solution:
             raise ValueError("Saved critic inputs cannot contain NUL characters.")
+        file_management = saved_file_management(source_run) if source_run else True
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -2052,6 +2114,7 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
+            file_management=file_management,
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2615,6 +2678,15 @@ def saved_goal_thread_id(run_dir):
     return identity
 
 
+def saved_file_management(run_dir):
+    """Old runs are managed; only an explicit saved false selects simple mode."""
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return True
+    return not isinstance(settings, dict) or settings.get("fileManagement") is not False
+
+
 def saved_goal_options(run_dir):
     """Recover generic session/workspace settings without reading author files."""
 
@@ -2628,6 +2700,7 @@ def saved_goal_options(run_dir):
     if not workspace.is_dir():
         raise ValueError(f"The saved author workspace no longer exists: {workspace}")
     return {"goalWorkspace": str(workspace), "goalResume": True,
+            "fileManagement": not isinstance(settings, dict) or settings.get("fileManagement") is not False,
             "goalThreadId": saved_goal_thread_id(run_dir)}
 
 
@@ -2914,6 +2987,8 @@ def restore_saved_app(app):
         return app
     records = _run_records(run_dir)
     state = empty_state(app.state["trace"], app.state["traceVersion"])
+    # Historical jobs predate the opt-in switch and used managed author records.
+    state.update(fileManagement=True, authorPrompt=default_prompts()["author"])
     state["runId"] = run_dir.name
     draft_path = run_dir / "draft.md"
     try:
@@ -2953,12 +3028,12 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
-                "problemMode", "skipStatementReview", "statementReviewOnly",
+                "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
                     if key in {
-                        "skipStatementReview", "statementReviewOnly",
+                        "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
                     } and not isinstance(settings[key], bool):
                         continue
                     if (
@@ -2984,6 +3059,9 @@ def restore_saved_app(app):
                     )
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
+    if not state["fileManagement"]:
+        state["authorPrompt"] = default_prompts()["author_simple"]
+        state["researchAudits"] = {**audits.default_settings(), "models": ["none", "none", "none"]}
     warnings = audits.selected_warnings(state["researchAuditProgress"].get("warnings"), state["researchAudits"])
     state["researchAuditStatus"].update(warnings=warnings, lastError="\n".join(item["message"] for item in warnings))
     for name in ("review", "author", "critic", "final"):
@@ -3223,6 +3301,8 @@ def restore_saved_app(app):
                 state["goalThreadId"] = checkpoint["goalThreadId"]
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    if state["preparedRun"] and not records and not state["output"]:
+        state.update(phase="prepared", stage="solve", activeNode="author", finishedAt="", error="")
     state["checkpoints"] = saved_run_checkpoints(run_dir)
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
@@ -3235,7 +3315,16 @@ def restore_saved_jobs(runs):
     """Load every historical run as an idle job after a Web UI restart."""
 
     jobs = {}
-    for transcript in sorted(Path(runs).glob("*/transcript.jsonl")):
+    candidates = set(Path(runs).glob("*/transcript.jsonl"))
+    for settings_path in Path(runs).glob("*/job-settings.json"):
+        if settings_path.is_symlink():
+            continue
+        try:
+            if json.loads(settings_path.read_text(encoding="utf-8")).get("preparedRun") is True:
+                candidates.add(settings_path.parent / "transcript.jsonl")
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            continue
+    for transcript in sorted(candidates):
         if transcript.is_symlink() or not direct_run_directory(
             transcript.parent, runs
         ):
@@ -3352,6 +3441,8 @@ def saved_critic_source(path):
     statement = saved_statement(run_dir)
     defaults = default_prompts()
     prompts = {}
+    if not saved_file_management(run_dir):
+        defaults["author"] = defaults["author_simple"]
     for name in ("author", "critic", "final"):
         prompt_path = run_dir / "prompts" / f"{name}.txt"
         prompts[name] = (
@@ -3397,6 +3488,8 @@ def saved_research_source(path):
         if f"{role}Model" in settings:
             settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
     defaults = default_prompts()
+    if settings.get("fileManagement") is False:
+        defaults["author"] = defaults["author_simple"]
     for role in ("author", "critic", "final"):
         path = source / "prompts" / f"{role}.txt"
         settings[f"{role}Prompt"] = (
@@ -3470,6 +3563,7 @@ class Server(ThreadingHTTPServer):
             ),
             **review_only_option,
             research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
+            file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3499,6 +3593,7 @@ class Server(ThreadingHTTPServer):
             writer_effort=body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("author", "critic", "final")),
             research_audits=body.get("researchAudits"),
+            file_management=body.get("fileManagement", False),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -3611,6 +3706,7 @@ class Server(ThreadingHTTPServer):
             continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
             research_audits=options.get("researchAudits"),
+            file_management=options.get("fileManagement", True),
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
@@ -3696,6 +3792,9 @@ class Server(ThreadingHTTPServer):
             return None
         if state.get("phase") == "paused":
             return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
+        if state.get("phase") == "prepared":
+            return {"action": "prepared", "label": "Start prepared run",
+                    "description": "Start a fresh author session in this prepared research workspace."}
         stage = state.get("stoppedStage") or state.get("stage")
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
@@ -3850,6 +3949,10 @@ class Server(ThreadingHTTPServer):
             )
         if plan["action"] == "resume":
             return self.resume_paused_job(source_state["runId"])
+        if plan["action"] == "prepared":
+            self._check_author_workspace_idle(source_app.run_dir)
+            source_app.start_prepared_run()
+            return source_app
         if plan["action"] == "critic":
             continued = self.resume_critic_job(
                 source_state["runId"], include_audit_checkpoint=True,
@@ -3886,6 +3989,8 @@ class Server(ThreadingHTTPServer):
                 critic_prompt=source_state["criticPrompt"],
                 final_prompt=source_state["finalPrompt"],
                 review_only=source_state["statementReviewOnly"],
+                file_management=source_state.get("fileManagement", True),
+                research_audits=source_state.get("researchAudits"),
                 **common,
             )
         elif plan["action"] == "author":
@@ -3903,6 +4008,8 @@ class Server(ThreadingHTTPServer):
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
                 "final_prompt": source_state["finalPrompt"],
+                "file_management": source_state.get("fileManagement", True),
+                "research_audits": source_state.get("researchAudits"),
                 **common,
             }
             app.start_direct_statement(
