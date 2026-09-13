@@ -53,6 +53,7 @@ const ui = {
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   stop: $("stopButton"),
   pause: $("pauseButton"), resume: $("resumeButton"), downloadTex: $("downloadTexButton"),
+  downloadPdf: $("downloadPdfButton"),
   authorTimeLimitControl: $("authorTimeLimitControl"),
   authorLimitSummary: $("authorLimitSummary"),
   authorLimitHours: $("authorLimitHours"),
@@ -121,7 +122,7 @@ const timelineRows = new Map();
 const detailRows = new Map();
 const memoryTabs = [...document.querySelectorAll("[data-memory]")];
 let memoryJob = null;
-let memoryFile = "INITIAL_PROMPT.md";
+let memoryFile = "APPROACHES";
 let memoryAnchor = "";
 let memoryVersion = "";
 let memoryTimer;
@@ -876,7 +877,7 @@ function memoryLinkTarget(href, from = memoryFile) {
     else parts.push(part);
   }
   const name = parts.join("/");
-  if (!/^(?:INITIAL_PROMPT\.md|PROVED\.md|APPROACHES\.md|audit\.md|APPROACHES\/(?:index|INDEX|A\d{3,}(?:-[A-Za-z0-9_-]+)?)\.md|(?:AUDITS|audit_history)\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md)$/.test(name)) return null;
+  if (!/^(?:PROVED\.md|APPROACHES\.md|audit\.md|APPROACHES\/(?:index|INDEX|A\d{3,}(?:-[A-Za-z0-9_-]+)?)\.md|(?:AUDITS|audit_history)\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md)$/.test(name)) return null;
   return { name: /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "APPROACHES" : name, anchor };
 }
 
@@ -1095,7 +1096,7 @@ function parseApproachGraph(content, files) {
       node.title = title || node.title;
       node.parents = [...new Set((cells[parentColumn] || "").match(/\bA\d{3,}\b/g) || [])];
       const status = plainMarkdown(cells[statusColumn] || "").toUpperCase();
-      node.status = ["ACTIVE", "PARKED", "CLOSED", "RESOLVED"].includes(status) ? status : "UNSPECIFIED";
+      node.status = ["ACTIVE", "BLOCKED", "CLOSED", "RESOLVED"].includes(status) ? status : "UNSPECIFIED";
       node.result = plainMarkdown(cells[resultColumn] || "") || "No result or remaining question recorded in the index yet.";
       node.indexed = true;
     }
@@ -1532,6 +1533,8 @@ function renderWorkflow() {
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
   const seen = new Set(seenInThisJob);
+  const compiling = ["latex_compile", "latex_repair"].includes(state.activeNode);
+  if (seen.has("latex_repair")) seen.add("latex_compile");
   if (criticResume) {
     seen.add("statement_reviewer");
     seen.add("author");
@@ -1539,8 +1542,9 @@ function renderWorkflow() {
   const makeNode = (name, number) => {
     const item = nodes[name];
     const row = document.createElement("li");
-    const active = state.phase !== "done" && state.activeNode === name;
-    const failed = state.phase === "done" && state.activeNode === name
+    const current = state.activeNode === name || (name === "latex_compile" && compiling);
+    const active = state.phase !== "done" && current;
+    const failed = state.phase === "done" && current
       && (state.error || name === "failure_summary");
     const status = active ? "active" : failed ? "failed"
       : seen.has(name) ? "complete" : "";
@@ -1583,16 +1587,19 @@ function renderWorkflow() {
     ui.workflowNodes.replaceChildren(makeNode("statement_reviewer", "1"));
     return;
   }
-  if (latexOnly) {
-    ui.workflowNodes.replaceChildren(makeNode("latex_editor", "1"));
-    return;
-  }
   const arrow = (text, pass = false) => {
     const row = document.createElement("li");
     row.className = `flow-arrow${pass ? " pass" : ""}`;
     row.textContent = `${text} ↓`;
     return row;
   };
+  if (latexOnly) {
+    ui.workflowNodes.replaceChildren(makeNode("latex_editor", "1"));
+    if (nodes.latex_compile) {
+      ui.workflowNodes.append(arrow("Compile and check"), makeNode("latex_compile", "2"));
+    }
+    return;
+  }
 
   const loop = document.createElement("li");
   loop.className = "workflow-loop";
@@ -1642,6 +1649,13 @@ function renderWorkflow() {
   const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");
   branch.append(failureNode, failureRoute, loop, passRoute, editor);
+  if (nodes.latex_compile) {
+    const compileRoute = arrow("Compile and check");
+    compileRoute.classList.add("compile-route");
+    const compiler = makeNode("latex_compile", startsAtAuthor ? "4" : "5");
+    compiler.classList.add("compile-node");
+    branch.append(compileRoute, compiler);
+  }
 
   if (startsAtAuthor) {
     ui.workflowNodes.replaceChildren(branch);
@@ -2033,6 +2047,7 @@ function render(next) {
   ui.resume.textContent = phase === "prepared" ? "Start prepared run" : "Resume";
   ui.resume.disabled = auditHolding;
   show(ui.downloadTex, Boolean(state.canDownloadTex));
+  show(ui.downloadPdf, Boolean(state.canDownloadPdf));
   show(ui.stop, working);
   ui.stop.disabled = phase === "stopping";
   ui.run.setAttribute("aria-busy", String(working));
@@ -2317,17 +2332,17 @@ document.addEventListener("visibilitychange", () => {
 ui.stop.onclick = () => act("/stop");
 ui.pause.onclick = () => act("/pause");
 ui.resume.onclick = () => act(state.phase === "prepared" ? "/continue-stopped" : "/resume");
-ui.downloadTex.onclick = async () => {
-  ui.downloadTex.disabled = true;
+async function downloadArtifact(button, extension) {
+  button.disabled = true;
   try {
-    const response = await fetch(jobPath("/download-tex"), {
+    const response = await fetch(jobPath(`/download-${extension}`), {
       headers: { "X-TCS-Prover-Token": sessionToken },
     });
     if (!response.ok) throw new Error((await response.json()).error || "Download failed.");
     const url = URL.createObjectURL(await response.blob());
     const link = document.createElement("a");
     link.href = url;
-    link.download = "final.tex";
+    link.download = `final.${extension}`;
     document.body.append(link);
     link.click();
     link.remove();
@@ -2336,9 +2351,11 @@ ui.downloadTex.onclick = async () => {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   } finally {
-    ui.downloadTex.disabled = false;
+    button.disabled = false;
   }
-};
+}
+ui.downloadTex.onclick = () => downloadArtifact(ui.downloadTex, "tex");
+ui.downloadPdf.onclick = () => downloadArtifact(ui.downloadPdf, "pdf");
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
 window.onpopstate = () => {

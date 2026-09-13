@@ -386,6 +386,9 @@ button { min-height: 42px; }
   content: "";
 }
 
+.compile-route { grid-column: 3; grid-row: 4; margin-left: 22px; }
+.compile-node { grid-column: 3; grid-row: 5; margin-left: 12px; }
+
 /* The initial composer is spacious, but contains only the requested basics. */
 .input-view { max-width: 1260px; margin: 4vh auto 0; }
 .intro { max-width: 610px; margin-bottom: 28px; }
@@ -496,8 +499,8 @@ button { min-height: 42px; }
 .approach-node > .approach-status { margin-top: auto; }
 .approach-node.active { border-left-color: #247a66; }
 .approach-status.active { background: #e4f4eb; color: #24634c; }
-.approach-node.parked { border-left-color: #bf9741; }
-.approach-status.parked { background: #faf0d8; color: #886217; }
+.approach-node.blocked { border-left-color: #bf9741; }
+.approach-status.blocked { background: #faf0d8; color: #886217; }
 .approach-node.closed { border-left-color: #b47876; }
 .approach-status.closed { background: #faeae9; color: #945350; }
 .approach-node.resolved { border-left-color: #5888ac; }

@@ -1690,10 +1690,12 @@ def _check_actions(actions):
             check_expression(action["merge"])
         if "command" in action:
             config = action["command"]
-            if not isinstance(config, dict) or not {"argv", "timeout", "result"} <= config.keys() or set(config) - {"argv", "cwd", "env", "timeout", "produces", "log", "result"}:
+            if not isinstance(config, dict) or not {"argv", "timeout", "result"} <= config.keys() or set(config) - {"argv", "cwd", "env", "timeout", "produces", "log", "result", "requires"}:
                 raise ValueError("A command needs argv, timeout, and a result state key.")
             if not isinstance(config["argv"], list) or not config["argv"] or not all(isinstance(arg, str) and arg for arg in config["argv"]):
                 raise ValueError("Command argv must be a nonempty list of strings.")
+            if not isinstance(config.get("requires", []), list) or not all(isinstance(name, str) and name for name in config.get("requires", [])):
+                raise ValueError("Command requires must be a list of executable names.")
             if type(config["timeout"]) not in {int, float} or not math.isfinite(config["timeout"]) or config["timeout"] <= 0:
                 raise ValueError("Command timeout must be positive and finite.")
             if not all(isinstance(config.get(key, "."), str) and config.get(key, ".") for key in ("cwd", "log", "result")):
@@ -1870,16 +1872,17 @@ def load_workflow(path):
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize"},
         "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features"},
+        "command": {"command", "require", "error"},
     }
     for name, node in nodes.items():
-        if not isinstance(node, dict) or not {"run", "prompt", "next"} <= node.keys():
-            raise ValueError(f"Node {name} needs run, prompt, and next.")
+        if not isinstance(node, dict) or not {"run", "next"} <= node.keys():
+            raise ValueError(f"Node {name} needs run and next.")
         _expand_node(node)
         kind = node["run"]
         if not isinstance(kind, str) or kind not in specific or set(node) - (shared | specific[kind]):
             raise ValueError(f"Unsupported operation or fields in node {name}.")
-        reference = node["prompt"]
-        references = [reference]
+        reference = node.get("prompt")
+        references = [] if kind == "command" else [reference]
         if isinstance(reference, dict):
             if set(reference) != {"when", "then", "else"} or kind != "structured":
                 raise ValueError(f"Invalid prompt selection in node {name}.")
@@ -1921,6 +1924,13 @@ def load_workflow(path):
             for expression in node.get("require", []):
                 check_expression(expression)
             bindings = node.get("inputs", {})
+        elif kind == "command":
+            _check_actions([{"command": node.get("command")}])
+            if not isinstance(node.get("require", []), list):
+                raise ValueError(f"Node {name} require must be a list of expressions.")
+            for expression in node.get("require", []):
+                check_expression(expression)
+            bindings = {}
         else:
             if not isinstance(node.get("features", []), list) or not all(
                 isinstance(feature, str) and feature for feature in node.get("features", [])
@@ -2039,6 +2049,8 @@ def prepare(workflow, options):
     if not all(isinstance(value, str) and value.strip() for value in prompts.values()):
         raise ValueError("Prompt overrides must be nonempty strings.")
     for node in workflow["nodes"].values():
+        if node["run"] == "command":
+            continue
         settings = _settings(node, options)
         require_model_credentials(settings["model"])
         if node["run"] == "structured":
@@ -2189,14 +2201,15 @@ def _run_command(config, context):
     for path in outputs:
         path.unlink(missing_ok=True)
     engine = shutil.which(argv[0])
+    missing = [name for name in config.get("requires", []) if shutil.which(name) is None]
     code, output = None, ""
-    if engine is None:
-        status, diagnostic = "unavailable", f"Command unavailable: {argv[0]}."
+    if engine is None or missing:
+        status, diagnostic = "unavailable", f"Command unavailable: {', '.join(([argv[0]] if engine is None else []) + missing)}."
     else:
         environment = {**os.environ, **{key: render_template(value, context) for key, value in config.get("env", {}).items()}}
         try:
             result = subprocess.run([engine, *argv[1:]], cwd=directory, env=environment,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", timeout=config["timeout"], check=False,
                 **({"umask": 0o077} if os.name != "nt" else {}))
             code, output = result.returncode, result.stdout or ""
@@ -2211,10 +2224,14 @@ def _run_command(config, context):
             if isinstance(output, bytes):
                 output = output.decode("utf-8", errors="replace")
         except OSError as exc:
-            status, diagnostic = "fail", f"Command could not run: {exc}"
+            status, diagnostic = "unavailable", f"Command could not run: {exc}"
+    if status != "pass":
+        for path in outputs:
+            path.unlink(missing_ok=True)
     if config.get("log"):
         _private_atomic_write(directory / config["log"], diagnostic + "\n\n" + output)
-    return {"status": status, "diagnostic": diagnostic, "returncode": code}
+    return {"status": status, "diagnostic": diagnostic, "returncode": code,
+            "output": output[-24000:]}
 
 
 def _apply_actions(actions, context, stage, revision):
@@ -2278,6 +2295,12 @@ def _execute(workflow, state, options, prompts):
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
             if node["run"] == "structured":
                 result, raw = _model_call(node, prompts, state, options, visits)
+            elif node["run"] == "command":
+                config = dict(node["command"])
+                config["timeout"] = min(config["timeout"], workflow_remaining(options))
+                result = _run_command(config, {"state": state, "visit": visits})
+                state[config["result"]] = result
+                raw = result["output"]
             else:
                 context = {"state": state, "visit": visits}
                 revision = revisions.get(current, 0)

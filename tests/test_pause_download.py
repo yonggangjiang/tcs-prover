@@ -304,10 +304,12 @@ class PauseDownloadTests(unittest.TestCase):
         self.assertEqual(self.app.final_tex(), tex)
         self.assertFalse(any(p.suffix == ".pdf" for p in self.run.iterdir()))
 
-    def test_download_endpoint_requires_auth_and_serves_exact_tex_only(self):
+    def test_download_endpoints_require_auth_and_serve_exact_artifacts(self):
         self.app.state["phase"] = "done"
         self.app.worker_token = None
         self.app._save("final.tex", "\\documentclass{article}\n% Unicode π\n")
+        pdf = b"%PDF-1.4\n\x00\xff compiled document\n%%EOF\n"
+        (self.run / "final.pdf").write_bytes(pdf)
         http = server.Server((server.HOST, 0), runs=self.runs)
         http.jobs[self.run.name] = self.app
         thread = threading.Thread(target=http.serve_forever, daemon=True)
@@ -315,24 +317,89 @@ class PauseDownloadTests(unittest.TestCase):
         self.addCleanup(http.server_close)
         self.addCleanup(thread.join)
         self.addCleanup(http.shutdown)
-        url = http.origin + "/download-tex?job=" + self.run.name
-        with self.assertRaises(HTTPError) as error:
-            urlopen(url)
-        self.assertEqual(error.exception.code, 403)
         headers = {"X-TCS-Prover-Token": http.token}
-        with urlopen(Request(url, headers=headers)) as response:
-            self.assertEqual(response.read(), (self.run / "final.tex").read_bytes())
-            self.assertEqual(response.headers["Content-Disposition"], 'attachment; filename="final.tex"')
-        for path in ("/download-tex?job=missing", "/download-pdf?job=" + self.run.name):
+        for extension, mime in (("tex", "application/x-tex"), ("pdf", "application/pdf")):
+            url = http.origin + f"/download-{extension}?job=" + self.run.name
+            with self.assertRaises(HTTPError) as error:
+                urlopen(url)
+            self.assertEqual(error.exception.code, 403)
+            with urlopen(Request(url, headers=headers)) as response:
+                self.assertEqual(response.read(), (self.run / f"final.{extension}").read_bytes())
+                self.assertEqual(response.headers.get_content_type(), mime)
+                self.assertEqual(response.headers["Content-Disposition"], f'attachment; filename="final.{extension}"')
+        for path in ("/download-tex?job=missing", "/download-pdf?job=missing"):
             with self.assertRaises(HTTPError):
                 urlopen(Request(http.origin + path, headers=headers))
+        (self.run / "final.pdf").unlink()
+        with self.assertRaises(HTTPError):
+            urlopen(Request(url, headers=headers))
+        (self.run / "final.pdf").symlink_to(self.run / "PROVED.md")
+        with self.assertRaises(HTTPError):
+            urlopen(Request(url, headers=headers))
         (self.run / "final.tex").unlink()
         (self.run / "final.tex").symlink_to(self.run / "PROVED.md")
         with self.assertRaises(HTTPError):
-            urlopen(Request(url, headers=headers))
+            urlopen(Request(http.origin + "/download-tex?job=" + self.run.name, headers=headers))
+
+    def test_pdf_requires_completed_source_and_survives_server_restart(self):
+        (self.run / "final.pdf").write_bytes(b"%PDF-1.4\nSaved PDF\n%%EOF")
+        self.assertFalse(self.app.snapshot()["canDownloadPdf"])
+        self.app._save("final.tex", "Saved source")
+        self.assertFalse(self.app.snapshot()["canDownloadPdf"])
+        self.app.state["phase"] = "done"
+        self.assertFalse(self.app.snapshot()["canDownloadPdf"])
+        self.app.worker_token = self.app.active_token = None
+        self.assertTrue(self.app.snapshot()["canDownloadPdf"])
+        self.app.add_trace({"kind": "final_result", "stage": "final", "node": "latex_compile", "output": "Saved source"})
+        restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
+        self.assertTrue(restored.snapshot()["canDownloadPdf"])
+        self.assertEqual(restored.final_pdf(), (self.run / "final.pdf").read_bytes())
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
-    def test_browser_pause_resume_controls_and_tex_download(self):
+    def test_browser_shows_compilation_and_repair_in_both_workflows(self):
+        script = r"""
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+class Element {
+  constructor() {
+    this.children = []; this.dataset = {}; this.className = '';
+    this.classList = {add: name => this.className += ' ' + name};
+  }
+  append(...items) {this.children.push(...items);}
+  replaceChildren(...items) {this.children = items;}
+  setAttribute() {}
+}
+const ui = {workflowNodes: new Element()};
+const state = {phase: 'running', problemMode: 'latex', activeNode: 'latex_repair',
+  workflow: JSON.parse(process.argv[2]), trace: [{node: 'latex_editor'}, {node: 'latex_compile'}, {node: 'latex_repair'}]};
+const context = {ui, state, document: {createElement: () => new Element()}, nodeFromStage: () => 'latex_editor'};
+vm.createContext(context);
+vm.runInContext(source.slice(source.indexOf('function renderWorkflow()'), source.indexOf('function renderClock()')), context);
+const flattened = node => [node, ...node.children.flatMap(flattened)];
+for (const problemMode of ['latex', 'statement']) {
+  state.problemMode = problemMode;
+  state.phase = 'running'; state.error = '';
+  context.renderWorkflow();
+  let rows = flattened(ui.workflowNodes).filter(row => row.dataset.node);
+  let compiler = rows.find(row => row.dataset.node === 'latex_compile');
+  assert(compiler.className.includes('active'));
+  assert(rows.indexOf(compiler) > rows.findIndex(row => row.dataset.node === 'latex_editor'));
+  state.phase = 'done';
+  context.renderWorkflow();
+  compiler = flattened(ui.workflowNodes).find(row => row.dataset.node === 'latex_compile');
+  assert(compiler.className.includes('complete'));
+  state.error = 'Compilation failed';
+  context.renderWorkflow();
+  compiler = flattened(ui.workflowNodes).find(row => row.dataset.node === 'latex_compile');
+  assert(compiler.className.includes('failed'));
+}
+"""
+        result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js"), json.dumps(server.PUBLIC_GRAPH)],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
+    def test_browser_pause_resume_controls_and_source_pdf_downloads(self):
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
@@ -367,6 +434,8 @@ const checks = `
 (async () => {
   const running = {phase: 'running', stage: 'solve', activeNode: 'author'};
   render(running);
+  assert.equal(ui.downloadTex.hidden, true);
+  assert.equal(ui.downloadPdf.hidden, true);
   assert.equal(ui.pause.hidden, false);
   assert.equal(ui.stop.hidden, false);
   assert.equal(ui.resume.hidden, true);
@@ -386,12 +455,17 @@ const checks = `
   ui.resume.onclick(); assert.equal(clicked, '/resume');
   render({...running, stage: 'critic', activeNode: 'critic'});
   assert.equal(ui.pause.hidden, true);
-  render({...running, phase: 'done', stage: 'final', activeNode: 'latex_editor', canDownloadTex: true});
+  render({...running, phase: 'done', stage: 'final', activeNode: 'latex_compile', canDownloadTex: true, canDownloadPdf: true});
   assert.equal(ui.downloadTex.hidden, false);
   await ui.downloadTex.onclick();
   assert.equal(requested, '/download-tex?job=same-job');
   assert.equal(download, 'final.tex');
   assert.equal(ui.downloadTex.disabled, false);
+  assert.equal(ui.downloadPdf.hidden, false);
+  await ui.downloadPdf.onclick();
+  assert.equal(requested, '/download-pdf?job=same-job');
+  assert.equal(download, 'final.pdf');
+  assert.equal(ui.downloadPdf.disabled, false);
 })();
 `;
 Promise.resolve(vm.runInNewContext(setup + renderer + handlers + checks, {assert}))

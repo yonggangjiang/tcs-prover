@@ -2,7 +2,9 @@
 
 import json
 import os
+from html.parser import HTMLParser
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +15,20 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from ui import server
+
+
+class PageElements(HTMLParser):
+    """Use the shipped markup for browser fixtures, including missing elements."""
+
+    def __init__(self):
+        super().__init__()
+        self.elements = {}
+        self.feed((server.UI / "index.html").read_text())
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if "id" in attrs:
+            self.elements[attrs["id"]] = attrs
 
 
 class MemoryViewTests(unittest.TestCase):
@@ -243,24 +259,31 @@ class MemoryViewTests(unittest.TestCase):
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const selected = source.slice(source.indexOf('function revealMemoryAnchor('), source.indexOf('function syncMemoryPanel('));
+const selected = source.slice(source.indexOf('function revealMemoryAnchor('), source.indexOf('function upsertTimeline('));
 const linkFormatter = source.slice(source.indexOf('function memoryLinkTarget('), source.indexOf('function renderMemoryContent('));
 const pending = [], rendered = [], timers = [];
-const element = () => ({ textContent: '', hidden: false, scrollTop: 0, replaceChildren() {}, setAttribute() {}, querySelectorAll: () => [] });
+const markup = JSON.parse(process.argv[2]);
+const element = () => ({ textContent: '', hidden: false, scrollTop: 0, attrs: {}, replaceChildren() {},
+  setAttribute(key, value) {this.attrs[key] = value;}, querySelectorAll: () => [] });
 const ui = Object.fromEntries(['memoryPanel', 'memoryApproachPicker', 'memoryApproach', 'memoryDocument',
-  'memoryFilename', 'memoryUpdated', 'memoryContent', 'memoryMessage', 'approachGraph'].map(name => [name, element()]));
+  'memoryFilename', 'memoryUpdated', 'memoryContent', 'memoryMessage', 'approachGraph'].map(name => [name, markup[name] ? element() : null]));
+ui.run = element();
 ui.memoryPanel.open = true;
 ui.memoryApproach.options = [];
 ui.memoryApproach.replaceChildren = (...options) => { ui.memoryApproach.options = options; };
-const tabs = ['INITIAL_PROMPT.md', 'APPROACHES', 'PROVED.md'].map((file, i) => ({
-  dataset: { memory: file }, id: `tab${i}`, setAttribute() {},
+const tabs = Object.values(markup).filter(attrs => attrs['data-memory']).map(attrs => ({
+  ...element(), dataset: {memory: attrs['data-memory']}, id: attrs.id,
 }));
-const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: 'resumed', memoryFile: 'INITIAL_PROMPT.md',
+const approachTab = tabs.find(tab => tab.dataset.memory === 'APPROACHES');
+const lemmaTab = tabs.find(tab => tab.dataset.memory === 'PROVED.md');
+const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', memoryJob: null,
+  memoryFile: source.match(/let memoryFile = "([^"]+)"/)[1],
   state: {trace: []},
   memoryVersion: '', memoryRequest: 0, memoryTimer: null, memoryAnchor: '',
   approachIndex: {version: '', content: '', files: []}, approachGraphSignature: '',
   document: { hidden: false, createElement: () => ({ children: [], append(child) { this.children.push(child); } }) },
   show: (element, visible) => { element.hidden = !visible; },
+  managesResearchFiles: () => true,
   clearTimeout() {}, setTimeout: callback => { timers.push(callback); return timers.length; },
   jobPath: (path, values) => ({ path, ...values }),
   request: path => new Promise(resolve => pending.push({ path, resolve })),
@@ -279,7 +302,19 @@ const settle = async value => {
   }
 };
 (async () => {
-  context.selectMemoryFile(tabs[1]);
+  assert.equal(context.memoryFile, 'APPROACHES');
+  context.syncMemoryPanel();
+  assert.equal(ui.memoryPanel.hidden, true);
+  assert.equal(pending.length, 0);
+  context.currentJob = 'resumed';
+  context.syncMemoryPanel();
+  assert.equal(ui.memoryPanel.hidden, false);
+  assert.equal(ui.memoryPanel.open, false);
+  assert.equal(approachTab.attrs['aria-selected'], 'true');
+  assert.equal(approachTab.tabIndex, 0);
+  assert.equal(ui.memoryDocument.attrs['aria-labelledby'], approachTab.id);
+  ui.memoryPanel.open = true;
+  context.loadMemory();
   assert.equal(pending[0].path.file, 'APPROACHES');
   const files = ['APPROACHES/INDEX.md', 'APPROACHES/A001.md', 'APPROACHES/A002.md'];
   await settle(ready('APPROACHES/INDEX.md', 'Index', files));
@@ -293,13 +328,14 @@ const settle = async value => {
   assert.equal(ui.memoryApproach.options.at(-1).textContent, 'Historical notebook');
   const links = { children: [], append(child) { this.children.push(child); } };
   context.appendMemoryText(links, '[Route](A001.md) [Index](INDEX.md) [Archive](../APPROACHES.md) '
-    + '[External](https://example.com) [Escape](../../secret.md) [Unknown](A999.md)');
+    + '[External](https://example.com) [Escape](../../secret.md) [Unknown](A999.md) [Initial prompt](../INITIAL_PROMPT.md)');
   const buttons = links.children.filter(child => child.className === 'memory-link');
   assert.equal(buttons.length, 4);
   assert.equal(buttons[0].children[0], 'Route');
   assert.equal(buttons[2].children[0], 'Archive');
   assert.ok(links.children.includes('[External](https://example.com)'));
   assert.ok(links.children.includes('[Escape](../../secret.md)'));
+  assert.ok(links.children.includes('[Initial prompt](../INITIAL_PROMPT.md)'));
   buttons[0].onclick();
   assert.equal(pending[0].path.file, files[1]);
   await settle(ready(files[1], 'Linked route', [...files, 'APPROACHES.md']));
@@ -321,7 +357,7 @@ const settle = async value => {
   assert.equal(ui.memoryApproach.options.length, 4);
   context.loadMemory();
   const oldRoute = pending.shift();
-  context.selectMemoryFile(tabs[2]);
+  context.selectMemoryFile(lemmaTab);
   await settle(ready('PROVED.md', 'Lemma', undefined));
   oldRoute.resolve(ready(files[2], 'Old route', files));
   await Promise.resolve(); await Promise.resolve();
@@ -345,9 +381,9 @@ const settle = async value => {
   await settle(ready('PROVED.md', 'Lemma proof', undefined));
   assert.equal(lemma.open, true);
   assert.equal(lemma.scrolled, true);
-  assert.equal(tabs[2].tabIndex, 0);
-  assert.equal(tabs[1].tabIndex, -1);
-  context.selectMemoryFile(tabs[1]);
+  assert.equal(lemmaTab.tabIndex, 0);
+  assert.equal(approachTab.tabIndex, -1);
+  context.selectMemoryFile(approachTab);
   await settle(ready('APPROACHES.md', 'Legacy notebook', []));
   assert.equal(ui.memoryApproachPicker.hidden, true);
   assert.equal(ui.memoryFilename.textContent, 'APPROACHES.md');
@@ -360,9 +396,21 @@ const settle = async value => {
   assert.equal(pending.length, count);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
-        result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js")],
+        result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js"), json.dumps(PageElements().elements)],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ui_bindings_and_memory_labels_match_remaining_html(self):
+        elements = PageElements().elements
+        source = (server.UI / "app.js").read_text()
+        bindings = set(re.findall(r'\$\("([^"]+)"\)', source))
+        self.assertEqual(bindings - elements.keys(), set())
+        tabs = [attrs for attrs in elements.values() if "data-memory" in attrs]
+        selected = [tab for tab in tabs if tab.get("aria-selected") == "true"]
+        self.assertEqual([tab["data-memory"] for tab in selected], ["APPROACHES"])
+        self.assertNotEqual(selected[0].get("tabindex"), "-1")
+        self.assertEqual(elements["memoryDocument"]["aria-labelledby"], selected[0]["id"])
+        self.assertNotIn("INITIAL_PROMPT.md", [tab["data-memory"] for tab in tabs])
 
 
 if __name__ == "__main__":

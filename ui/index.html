@@ -313,14 +313,12 @@
           <details id="memoryPanel" class="memory-panel" hidden>
             <summary>
               <span class="memory-mark" aria-hidden="true">≡</span>
-              <span><strong>Research files</strong><small>Original statement, approach graph, proved lemmas, and independent reports</small></span>
+              <span><strong>Research files</strong><small>Approach graph, proved lemmas, and independent reports</small></span>
               <span class="memory-chevron" aria-hidden="true">⌄</span>
             </summary>
             <div class="memory-tabs" role="tablist" aria-label="Research memory files">
-              <button id="memoryPromptTab" type="button" role="tab" aria-selected="true"
-                aria-controls="memoryDocument" data-memory="INITIAL_PROMPT.md">Initial prompt</button>
-              <button id="memoryApproachesTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="APPROACHES">Approach graph</button>
+              <button id="memoryApproachesTab" type="button" role="tab" aria-selected="true"
+                aria-controls="memoryDocument" data-memory="APPROACHES">Approach graph</button>
               <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
                 aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
               <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
@@ -345,11 +343,11 @@
               <select id="memoryApproach" aria-controls="memoryDocument"></select>
             </div>
             <div class="memory-meta">
-              <code id="memoryFilename">INITIAL_PROMPT.md</code>
+              <code id="memoryFilename">APPROACHES</code>
               <span id="memoryUpdated" role="status"></span>
             </div>
             <div id="memoryDocument" class="memory-document" role="tabpanel"
-              aria-labelledby="memoryPromptTab" tabindex="0">
+              aria-labelledby="memoryApproachesTab" tabindex="0">
               <p id="memoryMessage" class="memory-message">Open a file to read the author’s saved work.</p>
               <div id="memoryContent" class="memory-content"></div>
             </div>
@@ -406,7 +404,7 @@
 
           <div id="authorSteerControl" class="author-steer-control" hidden>
             <label for="authorSteerInstruction">Guide the running proof author</label>
-            <textarea id="authorSteerInstruction" rows="3" maxlength="12000">Stop all computational experiments and code execution now. Do not write or run additional scripts. Continue this same task using symbolic mathematical reasoning, explicit lemmas, and proof construction only. Treat existing experimental output only as a source of conjectures, never as proof.</textarea>
+            <textarea id="authorSteerInstruction" rows="3" maxlength="12000"></textarea>
             <button id="sendAuthorSteerButton" class="secondary compact">
               Send instruction now
             </button>
@@ -428,7 +426,8 @@
             <button id="pauseButton" class="secondary" hidden>Pause</button>
             <button id="stopButton" class="danger">Stop</button>
             <button id="resumeButton" class="primary" hidden>Resume</button>
-            <button id="downloadTexButton" class="secondary" hidden>Download .tex</button>
+            <button id="downloadTexButton" class="secondary" hidden>Download source (.tex)</button>
+            <button id="downloadPdfButton" class="secondary" hidden>Download PDF</button>
             <button id="homeButton" class="secondary">Return home</button>
           </div>
         </section>

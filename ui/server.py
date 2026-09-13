@@ -282,7 +282,15 @@ PUBLIC_GRAPH = {
         },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
-            "description": "Polishes the passing proof into LaTeX in one editor call, then returns it.",
+            "description": "Polishes the passing proof into a complete LaTeX document.",
+        },
+        "latex_compile": {
+            "label": "Compile PDF", "short_label": "Compile", "stage": "final",
+            "description": "Compiles LaTeX, fixes compilation errors, and repeats until the source and PDF are ready.",
+        },
+        "latex_repair": {
+            "label": "Fix LaTeX errors", "short_label": "Fix LaTeX", "stage": "final",
+            "description": "Makes minor source changes using the compiler errors, then recompiles.",
         },
     },
     "edges": [
@@ -321,6 +329,9 @@ PUBLIC_GRAPH = {
             "label": "Save verification checkpoint", "when": "the critic is interrupted or the time budget is reached",
             "prompt_change": "Keep the latest saved proof for continuation at the critic.",
         },
+        {"from": "latex_editor", "to": "latex_compile", "label": "Compile LaTeX"},
+        {"from": "latex_compile", "to": "latex_repair", "label": "Compilation failed"},
+        {"from": "latex_repair", "to": "latex_compile", "label": "Retry compilation"},
     ],
 }
 
@@ -341,10 +352,12 @@ LATEX_GRAPH = {
     "nodes": {
         "latex_editor": {
             **PUBLIC_GRAPH["nodes"]["latex_editor"],
-            "description": "Polishes the supplied writing into LaTeX in one editor call, then returns it.",
+            "description": "Polishes the supplied writing into a complete LaTeX document.",
         },
+        "latex_compile": PUBLIC_GRAPH["nodes"]["latex_compile"],
+        "latex_repair": PUBLIC_GRAPH["nodes"]["latex_repair"],
     },
-    "edges": [],
+    "edges": [edge for edge in PUBLIC_GRAPH["edges"] if edge["from"].startswith("latex_")],
 }
 
 REVIEW_ONLY_GRAPH = {
@@ -1161,6 +1174,11 @@ class App:
                 and self.run_dir and (self.run_dir / "final.tex").is_file()
                 and not (self.run_dir / "final.tex").is_symlink()
             )
+            state["canDownloadPdf"] = bool(
+                state["canDownloadTex"] and (self.run_dir / "final.pdf").is_file()
+                and not (self.run_dir / "final.pdf").is_symlink()
+                and (self.run_dir / "final.pdf").stat().st_size > 0
+            )
             trace, version = self.state["trace"], self.state["traceVersion"]
             first = version - len(trace)
             if isinstance(after, int) and first <= after <= version:
@@ -1818,6 +1836,14 @@ class App:
             if not self.snapshot()["canDownloadTex"]:
                 raise ValueError("A completed final.tex is not available for this job.")
             return (self.run_dir / "final.tex").read_bytes()
+
+    def final_pdf(self):
+        """Read the compiled PDF for an authenticated download."""
+
+        with self.lock:
+            if not self.snapshot()["canDownloadPdf"]:
+                raise ValueError("A completed final.pdf is not available for this job.")
+            return (self.run_dir / "final.pdf").read_bytes()
 
     def _final_options(self):
         return [
@@ -4189,12 +4215,15 @@ class Handler(BaseHTTPRequestHandler):
         run_id = (query.get("job") or [""])[0]
         if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
             return self.send({"error": "Untrusted local host."}, status=403)
-        if request.path == "/download-tex":
+        if request.path in {"/download-tex", "/download-pdf"}:
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             try:
-                return self.send(self.server.get_job(run_id).final_tex(), "application/x-tex; charset=utf-8",
-                                 headers={"Content-Disposition": 'attachment; filename="final.tex"'})
+                app = self.server.get_job(run_id)
+                pdf = request.path == "/download-pdf"
+                return self.send(app.final_pdf() if pdf else app.final_tex(),
+                                 "application/pdf" if pdf else "application/x-tex; charset=utf-8",
+                                 headers={"Content-Disposition": f'attachment; filename="final.{"pdf" if pdf else "tex"}"'})
             except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
         if request.path == "/memory":

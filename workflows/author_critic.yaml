@@ -84,7 +84,7 @@ prompts:
   author: |-
     Resolve the exact statement below with a complete, rigorous proof. Think deeply and consider substantially diversified approaches.
 
-    You, the author LLM, create, read, search, and update your research records using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout.
+    You, the author LLM, create, read, search, and update your research records and thinking process using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout.
 
     Maintain these research records in the current working directory, please strictly follow the file structure and do not create new files or change the file structure:
 
@@ -99,13 +99,14 @@ prompts:
     # A001 — Descriptive title
     Parents: linked IDs, or none.
     Children: linked IDs, or none.
-    Status: ACTIVE, PARKED, CLOSED, or RESOLVED.
+    Status: ACTIVE, BLOCKED, CLOSED, or RESOLVED.
 
-    ACTIVE means currently being developed; PARKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved.
+    ACTIVE means currently being developed; BLOCKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved.
 
     ## Context and objective
 
-    Define the local problem. Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definition should be self-contained, with every first appearance of a term or symbol clearly defined under the TCS convention, Do not omit sentence  components like subjects, objects, or quantifiers, especially for a term that depends on other terms. Explain how this node's objective relates to the original statement, with the assumptions that the reader might not know the global context like the paranet nodes.
+    Define the local problem. Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definitions should be self-contained, with every first appearance of a term or symbol clearly defined under the convention of the field where the original statement is from. Before finishing a node update, read its opening using only the original problem statement and the text preceding each sentence. For every imported procedure or result that can not be understood within just the context of the original statement, clearly define and explain it. A name, lemma ID, or parent link should be provided for each related explaination. After the local problem being defined, explain clearly how this node's objective relates to the original statement and the overall research goal. 
+
 
     ## Detailed work
 
@@ -114,6 +115,14 @@ prompts:
     This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to previous context.
 
     If some part becomes blocked, generate a new child node and state clearly here what is the obstacle and why it is blocked.
+
+    ## Obstacles
+
+    This section is only required if the node is BLOCKED. State clearly what is the obstacle and why it is blocked. Record whether this approach is still pursued. If yes, refer to the child node that is being developed to overcome the obstacle. If no, explain why this approach is abandoned, what other approaches are being pursued, and when is this approach likely to be revisited. 
+
+    ## Conclusions
+
+    This section is only required if the node is RESOLVED or CLOSED. If the node is RESOLVED, state clearly what is proved; If the proof is recorded in PROVED.md, give the lemma ID and a brief description. If the node is CLOSED, state clearly what is disproved or what is the obstacle that cannot be overcome; Again, if the proof is recorded in PROVED.md, give the lemma ID and a brief description.
 
     3. PROVED.md contains only important re-usable rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. Positive and negative results are both welcome. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them.
 

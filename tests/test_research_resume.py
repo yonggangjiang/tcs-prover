@@ -112,7 +112,7 @@ class OperationalContinuationTests(unittest.TestCase):
         launched.assert_called_once()
 
 
-    def test_final_resume_preserves_editor_model_settings_and_single_stage(self):
+    def test_final_resume_preserves_editor_model_settings_and_compile_loop(self):
         app = server.App(runs=self.runs)
         with mock.patch.object(app, "_launch_saved_final_locked", return_value=(object(), object())):
             app.start_final_resume(
@@ -122,8 +122,8 @@ class OperationalContinuationTests(unittest.TestCase):
         options = app._final_options()
         self.assertEqual(options[options.index("--writer-model") + 1], "gpt-5.6-sol")
         self.assertEqual(options[options.index("--writer-effort") + 1], "high")
-        self.assertEqual(set(app.state["workflow"]["nodes"]), {"latex_editor"})
-        self.assertEqual(app.state["workflow"]["edges"], [])
+        self.assertEqual(set(app.state["workflow"]["nodes"]), {"latex_editor", "latex_compile", "latex_repair"})
+        self.assertIn({"from": "latex_repair", "to": "latex_compile", "label": "Retry compilation"}, app.state["workflow"]["edges"])
 
 
     def test_critic_accepts_explicit_external_run_directory(self):

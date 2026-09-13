@@ -3,7 +3,7 @@
 A local web UI that gives a persistent root author LLM a mathematical statement,
 lets it explore approaches with independent subagents, checks its candidate
 through a critic loop, and
-produces a complete LaTeX document.
+produces a complete LaTeX document and compiled PDF.
 Algorithmic tasks can be entered as statements too.
 
 The complete author instructions live directly in
@@ -24,7 +24,9 @@ API.
 
 ## Install and run
 
-Requires Python 3.9+ and the Codex CLI. Install Codex CLI through this
+Requires Python 3.9+, the Codex CLI, and a TeX distribution with `latexmk`
+and `pdflatex` available on `PATH` (for example, TeX Live, MacTeX, or MiKTeX).
+Install Codex CLI through this
 [official website](https://learn.chatgpt.com/docs/codex/cli).
 
 ```bash
@@ -361,8 +363,9 @@ For a reached workflow time limit, increase the existing total time limit contro
 while paused before clicking Resume.
 **Stop** keeps its existing immediate termination behavior.
 
-When LaTeX editing finishes, **Download .tex** downloads that job's saved
-`final.tex`. There is no PDF generation or PDF download.
+When compilation succeeds, **Download source (.tex)** and **Download PDF**
+download that job's saved `final.tex` and `final.pdf`. Older jobs that only
+contain a source file still offer the source download.
 
 Live web search is enabled for the author, statement reviewer, critic, and
 LaTeX editor, including structured retries and the configuration inherited by
@@ -431,7 +434,7 @@ click it to read the corresponding file. The index table, node selector, collaps
 sections, and Markdown links provide additional navigation. Older `INDEX.md` and
 `APPROACHES.md` layouts remain readable.
 
-Statuses have precise scope: **ACTIVE** means under development; **PARKED** means
+Statuses have precise scope: **ACTIVE** means under development; **BLOCKED** means
 unresolved with its obstacle recorded; **CLOSED** means an identified claim or
 construction failed; **RESOLVED** means that node's stated objective was achieved.
 Unfinished work stays in approach files. Only established reusable results belong
@@ -475,9 +478,18 @@ proof verification.
 
 The editor makes one LLM call with the editing prompt and accepted solution,
 or the supplied `.tex` contents in standalone mode. It returns a JSON object
-whose `latex` field contains the complete document, which becomes the final
-output. Compilability is a prompt requirement; the workflow does not run a
-compiler or an additional final verifier.
+whose `latex` field contains the complete document. A final compilation node
+runs `latexmk` with `pdflatex`, repeating TeX passes as needed to stabilize
+references. Compiler errors go back to the writer for minor compilation fixes,
+then the document is compiled again until it succeeds, the job is stopped,
+or the existing workflow time limit is reached. Repairs preserve the mathematics
+and paper structure. Shell escape and automatic latexmk configuration loading
+are disabled.
+
+Only successful compilation publishes `final.tex` and `final.pdf`. The working
+source is retained as `latex-source.tex`, and compiler output is saved in
+`latex-compile.log`. Missing compiler tools produce a setup error without
+repeated model repair calls.
 
 ## Project structure
 
@@ -513,7 +525,12 @@ repository's `runs/` folder, regardless of the launcher's working directory.
 Each YAML file contains `nodes` and `prompts`. Node names are arbitrary; the
 first node is the entry point. `run: structured` makes a model call with a
 response shape, while `run: goal` starts or resumes the persistent author
-conversation. Memory-file instructions are plain prompt text. The YAML defines inputs, result checks, state updates, and transitions, including the
+conversation. `run: command` executes a bounded command without a model call;
+its `command` mapping specifies `argv`, `timeout`, and a `result` state key,
+with optional `cwd`, `env`, `requires` executables, `produces` files, and `log`.
+Transitions can inspect `result.status` (`pass`, `fail`, or `unavailable`) and
+repairs can use `result.output` (the last 24,000 characters of command output).
+Memory-file instructions are plain prompt text. The YAML defines inputs, result checks, state updates, and transitions, including the
 critic's repeat limit.
 
 A complete custom workflow can be as small as this `summarize.yaml`:
