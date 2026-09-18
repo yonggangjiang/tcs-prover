@@ -21,10 +21,135 @@ import workflow_runner as runtime
 
 CONFIG_PATH = runtime.WORKFLOWS / "research_audit.yaml"
 KIMI_START_PROMPT = "Run the research audit."
+DIGEST_FILENAME = "audit-digest.md"
+DEFAULT_TIMEOUT_MINUTES = 25
+SOLVER_BRIEF_LIMIT = 40000
+SOLVER_LEMMA_LIMIT = 1500
+VERDICT_LINE = re.compile(r"^\s*VERDICT\s+(A\d{3})\s*:\s*(CONTINUE|STOP|REDIRECT)\b\s*(.*)$", re.IGNORECASE)
+DIRECTION_LINE = re.compile(r"^\s*DIRECTION\s*\d*\s*:\s*(.+)$", re.IGNORECASE)
+PREMISE_LINE = re.compile(r"^\s*PREMISE\s*:\s*(.+)$", re.IGNORECASE)
+LEMMA_HEADING = re.compile(r"^## (L\d{3}\b.*)$")
+PROOF_START = re.compile(r"^(\*\*Proof|Proof\.|### )")
 
 
 def load_config():
     return yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def timeout_seconds(config):
+    """Per-auditor time box; zero disables it."""
+    try:
+        minutes = float(config.get("timeoutMinutes", DEFAULT_TIMEOUT_MINUTES))
+    except (TypeError, ValueError):
+        minutes = DEFAULT_TIMEOUT_MINUTES
+    return minutes * 60 if math.isfinite(minutes) and minutes > 0 else 0
+
+
+def solver_settings(config):
+    """The fresh-eyes solver: enabled flag, model reference, and its prompt."""
+    solver = config.get("solver") if isinstance(config.get("solver"), dict) else {}
+    prompt = config.get("solver_prompt")
+    enabled = bool(solver.get("enabled")) and isinstance(prompt, str) and bool(prompt.strip())
+    return {"enabled": enabled, "model": solver.get("model") or "slot-1", "prompt": prompt if enabled else ""}
+
+
+def statement_text(run_dir):
+    """The exact task, without the author's file instructions."""
+    path = Path(run_dir) / "INITIAL_PROMPT.md"
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    marker = re.search(r"^STATEMENT:\s*$", text, re.MULTILINE)
+    return (text[marker.end():] if marker else text).strip()
+
+
+def solver_brief(run_dir, limit=SOLVER_BRIEF_LIMIT):
+    """The author's PLAN plus lemma statements without proofs or node bodies."""
+    run_dir = Path(run_dir)
+    parts = []
+    index = run_dir / "APPROACHES" / "index.md"
+    if index.is_file():
+        plan, inside = [], False
+        for line in index.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("## "):
+                if inside:
+                    break
+                inside = line.strip().lower().startswith("## plan")
+            if inside:
+                plan.append(line)
+        parts.append("\n".join(plan) if plan else "## PLAN\n(the author has not written a PLAN section yet)")
+    proved = run_dir / "PROVED.md"
+    if proved.is_file():
+        parts.append("\n## Lemma statements (proofs omitted)")
+        current, block = None, []
+
+        def flush():
+            if current is not None:
+                body = "\n".join(block).strip()
+                parts.append(f"\n### {current}\n{body[:SOLVER_LEMMA_LIMIT]}")
+
+        for line in proved.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = LEMMA_HEADING.match(line)
+            if match:
+                flush()
+                current, block = match.group(1).strip(), []
+                continue
+            if current is None:
+                continue
+            if PROOF_START.match(line.strip()):
+                flush()
+                current, block = None, []
+                continue
+            block.append(line)
+        flush()
+    text = "\n".join(parts)
+    data = text.encode("utf-8")
+    if len(data) > limit:
+        text = data[:limit].decode("utf-8", errors="ignore") + "\n[brief cut at the size limit]"
+    return text
+
+
+def write_digest(run_dir, config, reports, stamp):
+    """One page the author reads first: verdict tallies, directions, premise gaps, summaries."""
+    tallies, directions, premises, summaries = {}, [], [], []
+    for label, text in reports:
+        for line in text.splitlines():
+            match = VERDICT_LINE.match(line)
+            if match:
+                tallies.setdefault(match.group(1).upper(), []).append(
+                    (match.group(2).upper(), label, match.group(3).strip(" —–-:")[:160]))
+                continue
+            match = DIRECTION_LINE.match(line)
+            if match:
+                directions.append((label, match.group(1).strip()[:240]))
+                continue
+            match = PREMISE_LINE.match(line)
+            if match:
+                premises.append((label, match.group(1).strip()[:240]))
+        body = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
+        summaries.append((label, " ".join(body[:10])[:900]))
+    output = config.get("output", "AUDITS")
+    lines = [f"# Audit digest — {stamp}", "",
+             f"{len(reports)} report(s) in {output}/. Answer every verdict and direction in the PLAN's "
+             "AUDIT RESPONSES; a STOP from two or more auditors sets the node BLOCKED unless you rebut it.",
+             "", "## Verdicts by node"]
+    for node in sorted(tallies):
+        counts = {}
+        for verdict, _, _ in tallies[node]:
+            counts[verdict] = counts.get(verdict, 0) + 1
+        summary = ", ".join(f"{verdict} x{count}" for verdict, count in sorted(counts.items()))
+        flag = "  <- STOP by 2+ auditors" if counts.get("STOP", 0) >= 2 else ""
+        lines.append(f"- {node}: {summary}{flag}")
+        for verdict, label, reason in tallies[node]:
+            lines.append(f"  - {verdict} ({label}): {reason}")
+    if not tallies:
+        lines.append("(no VERDICT lines found)")
+    lines += ["", "## Directions"] + ([f"- ({label}) {text}" for label, text in directions] or ["(none)"])
+    lines += ["", "## Premise gaps"] + ([f"- ({label}) {text}" for label, text in premises] or ["(none)"])
+    lines += ["", "## Executive summaries"] + [f"- {label}: {text}" for label, text in summaries]
+    text = "\n".join(lines) + "\n"
+    runtime._private_atomic_write(Path(run_dir) / DIGEST_FILENAME, text)
+    return text
 
 
 def default_settings():
@@ -474,7 +599,16 @@ class ResearchAudits:
             if archived:
                 self._event("archived", 0, "", f"Moved {len(archived)} previous audit files to {self.config.get('history', 'audit_history')}/.",
                             archivedPaths=archived)
-            with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+            solver = solver_settings(self.config)
+            solver_model = None
+            if solver["enabled"] and (self.run_dir / "INITIAL_PROMPT.md").is_file():
+                reference = solver["model"]
+                if reference == "slot-1":
+                    reference = selected[0][1]
+                solver_model = models.get(reference)
+            saved_reports = []
+            solver_workspace = tempfile.TemporaryDirectory(prefix="tcs-fresh-eyes-") if solver_model else None
+            with ThreadPoolExecutor(max_workers=len(selected) + (1 if solver_model else 0)) as pool:
                 futures = {}
                 for slot, value in selected:
                     cancel = self.running[slot]
@@ -493,45 +627,97 @@ class ResearchAudits:
                         if self.provider is run_auditor:
                             options["on_activity"] = lambda status, text, slot=slot, value=value, cancel=cancel: self._activity(slot, value, cancel, status, text)
                         futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = (slot, value, cancel)
-                for future in as_completed(futures):
-                    slot, value, cancel = futures[future]
-                    try:
-                        result = future.result()
-                        if cancel.is_set():
-                            self._event("cancelled", slot, value, "Research audit cancelled.")
-                            continue
-                        if (not isinstance(result, dict)
-                                or not isinstance(result.get("text"), str) or not result["text"].strip()
-                                or not isinstance(result.get("model"), str) or not result["model"].strip()):
-                            raise RuntimeError("The auditor returned an empty or malformed report")
-                        completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                        directory = self.run_dir / self.config["output"]
-                        model_name = re.sub(r"[^a-zA-Z0-9_-]", "-", result["model"])[:80]
-                        filename = f"{completed.replace(':', '').replace('+0000', 'Z')}-audit-{slot}-{model_name}-{uuid.uuid4().hex[:8]}.md"
-                        with self.lock:
+                solver_cancel = threading.Event()
+                if solver_model:
+                    # The solver never sees the records: only the statement and a one-page brief.
+                    solver_dir = Path(solver_workspace.name)
+                    (solver_dir / "STATEMENT.md").write_text(statement_text(self.run_dir) + "\n", encoding="utf-8")
+                    (solver_dir / "BRIEF.md").write_text(solver_brief(self.run_dir) + "\n", encoding="utf-8")
+                    value = solver_model["value"]
+                    self._event("starting", 0, value, f"Starting the fresh-eyes solver with the statement and brief at {stamp}.")
+                    self.on_event({"kind": "request", "stage": "audit", "status": "prompt", "slot": 0,
+                                   "model": solver_model["model"], "provider": solver_model["provider"],
+                                   "reasoningEffort": solver_model.get("effort"), "auditStartedAt": stamp,
+                                   "label": f"Fresh-eyes solver — {solver_model['label']} — Prompt to model",
+                                   "text": solver["prompt"]})
+                    options = {}
+                    if self.provider is run_auditor:
+                        options["on_activity"] = lambda status, text, value=value: self._event(status, 0, value, text)
+                    futures[pool.submit(self.provider, solver_model, solver["prompt"], solver_dir, solver_cancel, **options)] = (0, value, solver_cancel)
+                timeout = timeout_seconds(self.config)
+                expired = threading.Event()
+                cancels = [cancel for _, _, cancel in futures.values()]
+
+                def expire():
+                    expired.set()
+                    for cancel in cancels:
+                        cancel.set()
+
+                timer = threading.Timer(timeout, expire) if timeout else None
+                if timer:
+                    timer.daemon = True
+                    timer.start()
+                try:
+                    for future in as_completed(futures):
+                        slot, value, cancel = futures[future]
+                        try:
+                            result = future.result()
                             if cancel.is_set():
+                                self._event("cancelled", slot, value,
+                                            f"Time box of {timeout / 60:g} minutes reached; no report saved."
+                                            if expired.is_set() else "Research audit cancelled.")
                                 continue
-                            directory.mkdir(mode=0o700, exist_ok=True)
-                            if directory.is_symlink():
-                                raise RuntimeError("The audit report directory cannot be a symlink.")
-                            descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".audit-", suffix=".tmp")
-                            try:
-                                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                                    stream.write(f"# Audit-{slot} — {completed} — {result['model']}\n\n"
-                                                 f"Audit started: {stamp}\n\n{result['text'].strip()}\n")
-                                # Publish the complete file without replacing any existing report.
-                                os.link(temporary, directory / filename)
-                            finally:
-                                os.unlink(temporary)
-                            if self.settings["models"][slot - 1] == value:
-                                self.warnings.pop(slot, None)
-                        self._event("completed", slot, value, f"Report saved to {self.config['output']}/{filename}.",
-                                    actualModel=result["model"], report=f"{self.config['output']}/{filename}")
-                    except Exception as exc:
-                        self._warning(slot, value, exc)
-                    finally:
-                        with self.lock:
-                            self.running.pop(slot, None)
+                            if (not isinstance(result, dict)
+                                    or not isinstance(result.get("text"), str) or not result["text"].strip()
+                                    or not isinstance(result.get("model"), str) or not result["model"].strip()):
+                                raise RuntimeError("The auditor returned an empty or malformed report")
+                            completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                            directory = self.run_dir / self.config["output"]
+                            model_name = re.sub(r"[^a-zA-Z0-9_-]", "-", result["model"])[:80]
+                            kind = "fresh-eyes" if slot == 0 else f"audit-{slot}"
+                            filename = f"{completed.replace(':', '').replace('+0000', 'Z')}-{kind}-{model_name}-{uuid.uuid4().hex[:8]}.md"
+                            title = "Fresh-eyes solver" if slot == 0 else f"Audit-{slot}"
+                            with self.lock:
+                                if cancel.is_set():
+                                    continue
+                                directory.mkdir(mode=0o700, exist_ok=True)
+                                if directory.is_symlink():
+                                    raise RuntimeError("The audit report directory cannot be a symlink.")
+                                descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".audit-", suffix=".tmp")
+                                try:
+                                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                                        stream.write(f"# {title} — {completed} — {result['model']}\n\n"
+                                                     f"Audit started: {stamp}\n\n{result['text'].strip()}\n")
+                                    # Publish the complete file without replacing any existing report.
+                                    os.link(temporary, directory / filename)
+                                finally:
+                                    os.unlink(temporary)
+                                if slot and self.settings["models"][slot - 1] == value:
+                                    self.warnings.pop(slot, None)
+                            saved_reports.append((f"{kind} {result['model']}", result["text"]))
+                            self._event("completed", slot, value, f"{title} report saved to {self.config['output']}/{filename}.",
+                                        actualModel=result["model"], report=f"{self.config['output']}/{filename}")
+                        except Exception as exc:
+                            if slot:
+                                self._warning(slot, value, exc)
+                            else:
+                                self._event("warning", 0, value, f"Fresh-eyes solver skipped: {str(exc) or type(exc).__name__}.")
+                        finally:
+                            with self.lock:
+                                self.running.pop(slot, None)
+                                if all(cancel.is_set() for cancel in self.running.values()) and self.running:
+                                    solver_cancel.set()
+                finally:
+                    if timer:
+                        timer.cancel()
+            if saved_reports:
+                try:
+                    write_digest(self.run_dir, self.config, saved_reports, stamp)
+                    self._event("digest", 0, "", f"Wrote {DIGEST_FILENAME} from {len(saved_reports)} report(s).")
+                except Exception as exc:
+                    self._event("warning", 0, "", f"Could not write {DIGEST_FILENAME}: {exc}")
+            if solver_workspace:
+                solver_workspace.cleanup()
         except Exception as exc:
             self._warning(0, "", exc)
         finally:

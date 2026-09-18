@@ -13,5 +13,10 @@
 !requirements.txt
 !tests/
 !tests/*.py
+!tools/
+!tools/**/*
+!postmortem/
+!postmortem/**/
+!postmortem/**/*.md
 **/__pycache__/
 *.pyc

@@ -1,0 +1,56 @@
+## Window 20:13–21:16 UTC (narrative.txt lines 6854–8409)
+
+Caveats (verified): filechanges.txt has no entries after 19:48:53, so writes were reconstructed from root `python3 - <<'PY'` heredocs in commands.txt; root→subagent task text is absent from transcript.jsonl (subAgentActivity items carry only agentPath), so subagent intent is quoted from each subagent's first MESSAGE; root reasoning survives only as one-line THINK summaries.
+
+### 1. Narrative
+- 20:13:28–20:14:58 resume: root reads INITIAL_PROMPT, three audit reports (cmds 20:13:34–20:13:52), spawns batch_supersets (20:14:29), audit_cleanup (20:14:34), approximation_proofs (20:14:38). ROOT MESSAGE 20:14:58 (N:6892): "Its strongest proposal is a way to compute an entire chain of minimum-superset cuts with one minimum-cost flow. I'm checking that reduction … also correcting A045's stale index status." Cause: audit-1 lines 25–27 and audit-3 line 112.
+- 20:14–20:20: audit_cleanup audits A045/L055, edits A044 (20:16:58). approximation_proofs reads Quanrud proofs: "Neither inspected approximation proof constructs an efficiently represented fractional arborescence packing" (20:18:36). batch_supersets writes A046 (RESOLVED 20:20:25, "350 graphs and 1,750 prefixes"); root promotes L057 (20:22:19).
+- 20:20–20:37: capped batches A047/L058; root THINKs "capped source flow and matroid union" (20:20:06), "polymatroid guarantees" (20:20:41). ROOT MESSAGE 20:29:28 (N:7256): "sparse two-hub family where uniform random ordering still costs quadratic expected work." audit_cleanup 20:32:12 rigorous counterexample; 20:36:38 A047 §11 (Ω(N²)) and §12. Root creates A048 (20:37:37).
+- 20:41:38 COMPACTION #1; 8 re-reads in 14 s; L059 promoted 20:42:48, L060 20:44:44. ROOT MESSAGE 20:43:21: "checking whether vertex imbalance offers a better source-selection rule, while another agent examines the recent packing algorithm's proof." Root greps records for 'imbalance|Eulerian' (20:43:54) before pursuing.
+- 20:41–20:55 SXZ proof mining by audit_cleanup; result 20:46:14 (N:7647): "A complete forest-intersection certificate does not itself provide directed arborescences for sampling."
+- 20:44–20:56: A049/L061 (imbalance ⇒ undirected min-cut) and A050/L062 (incoming-excess Ω(N^{3/2})). ROOT MESSAGE 20:50:34: "the general running-time gap remains."
+- 20:54–21:04 pivot to undirected trees: THINKs 20:55:04 "fractional matroid intersection | tree outdegree constraints", 20:55:19 "random arborescence sampling", 20:58:06 "polymatroid intersections and arborescence polytopes"; WEBSEARCH 20:58:13 "maximum entropy spanning tree distribution prescribed marginals". audit_cleanup retasked 20:55:40 (MST queries enforcing outdegree constraints). ROOT MESSAGE 20:58:22 (N:7912): "undirected tree samples can suffice if their average outgoing degrees meet exact constraints. That could avoid maintaining directed trees." A051 created 20:59:48, L063 promoted 21:04:16. Inferred trigger: the 20:46:14 obstacle.
+- 21:00–21:06 CLNPS analysis by batch_supersets (21:01:04): "Replacing the small-side packing requires a near-linear construction of sufficiently accurate tree packing without paying Θ(k) fresh arborescence optimizations."
+- 21:01–21:16 entropy/Laplacian machinery: WEBSEARCHes 21:01:20–30 (radial isotropic, Barthe, 2504.05687); A052 created 21:08:16; ROOT MESSAGE 21:09:25 "A proposed Gaussian estimator fails even on a cycle"; A053 created 21:10:55; approximation_proofs 21:15:04 refutes polylog range claim. 21:16:41 COMPACTION #2.
+
+### 2. Time budget (63 min; root tokensUsed 6,786,459→8,626,089)
+Counts: ROOT THINK 195, ROOT commands 59 (19 record-writing heredocs, 1 DAG validator, 1 numeric check, 12 post-compaction re-reads, ~26 reads of own nodes), ROOT WEBSEARCH 6, ROOT MESSAGE 9, 72 subagent interactions; subagent THINK 470, commands 150, WEBSEARCH 27, results 20; compactions 2 root + 3 subagent.
+Estimate: (a) exploration ≈50% root; (b) self-verification ≈5% root, delegated (≈10 of 20 subagent results are sibling audits ≈40% subagent effort); (c) records ≈30%: 8 nodes = 2,814 lines and L056–L063 = 2,161 PROVED lines in 63 min, proofs duplicated node/lemma (A047 §11 vs L059) despite audit-3 line 114; (d) literature ≈10% root, ≈25% of two subagents (SXZ ×5, CLNPS ×6, 2504.05687 ×6, vdBrand ×3, Karger, 2401.05627); (e) compaction recovery ≈5%.
+
+### 3. Near-misses
+- I3/I6: A051 §2 (lines 101–133) proves "convex hull of labelled undirected spanning-tree incidence vectors ∩ {d_v=1} = convex hull of rooted in-arborescence incidence vectors" via L019 — used only to avoid directed trees ("The conversion through L019 is only an existence proof"), never to average a tree with a fractional point. Root THINKs 21:11:47, 21:13:38, 21:13:52 on polytopes/convex mixtures (summaries only).
+- I2: L063 = E κ_T(S) = x(δ⁺(S)) + Σ(1−d_v); follow-up was "which distribution has these marginals" (max-entropy), never "move ONE tree's marginals toward q".
+- I5: min-cost circulation used throughout (L057/L058) for supersets/supply, not exchange; "exchange" appears only in audit_cleanup THINK 20:53:30 (SXZ's exchange graph) and A051's parent link to A028, unused in body.
+- I8: treated as obstacle (20:46:14) and routed around (A051 §5: "No color is required to be a directed arborescence"); no "Edmonds/branching" in A046–A053 or L056–L063.
+- I7: "rounding" only as CLNPS capacity rounding and THINK 20:59:02.
+- I4: closest is the barrier sentence at 21:01:04 §5; audit-3 line 31 "or replace it by a packing-free exact search" was read as the split recursion.
+
+### 4. Framing
+Start: ordering/progress for the split recursion (20:14:58, 20:43:21, 20:50:34). Pivot 20:58:22: construct an undirected-tree distribution fast. 21:04:19: implicit Newton. 21:09:25: fast Hessian products. End (A052 §6): precision, implicit Hessian, tail maxima, parameter ranges, sampleable weights. Drift to machinery verified; no trace of "sample one tree without building the packing"; A052 §11 cites Schild's sampler as the final step.
+
+### 5. Harness events
+Audit resumption: acted on audit-1 batching, audit-3 status fix, audit-3 §4.2 proof mining, audit-2 R5 CLNPS; ignored audit-2 R7 (progress report) and R6/audit-3 §3 (deprioritize entropy) — re-entered entropy at 20:57. Compaction #1: 8 re-reads, back to writing in 70 s, idea checked against records by grep. Subagent compactions: no restarts. Compaction #2: 5 re-reads, then A054 in the same entropy sub-branch. No turn ends/steers in window.
+
+### 6. Lessons
+1. Five of eight lemmas (L059, L060, L062, L065, L066) are obstructions against the author's own heuristics; the loop "propose rule → Ω(·) family → promote → next rule" never asked for the cheapest positive mechanism. A rule "after two obstruction lemmas on a branch, name and test the simplest positive mechanism" would have forced the one-tree step.
+2. Existence theorems (L019, A051 §2) were used only as existence and followed by attempts to construct the whole distribution; the PDF uses existence as a feasibility certificate for one bounded circulation. All ingredients (L006, L007, L019, L063, circulation primitive, A028 compression) were present and never composed.
+3. Audit guidance amplified drift (batching interface; abstract "packing-free"; entropy deprioritization renamed rather than obeyed). Audits should name a concrete mechanism for the crux, and record-writing (~5,000 lines/63 min with duplication) should be capped.
+
+---
+
+## Key findings
+
+- [verified] In the window the author spent ~45 min (20:14–20:56) on an audit-suggested min-cost-circulation split recursion (A046–A050, L057–L062) and produced three lower-bound lemmas (L059, L060, L062) against its own ordering rules before abandoning the route.
+  - evidence: narrative.txt N:6892 (20:14:58 'strongest proposal is a way to compute an entire chain of minimum-superset cuts with one minimum-cost flow'), N:7256 (20:29:28 two-hub quadratic), 20:50:34 'general running-time gap remains'; AUDITS audit-1 lines 25–27; commands.txt python heredocs 20:17:08, 20:29:41, 20:37:37, 20:42:48, 20:44:44, 20:51:39, 20:56:37.
+- [verified] At 20:59–21:04 the author proved L063 and, inside A051 §2, the polytope identity that undirected spanning-tree hull ∩ {d_v=1} equals the arborescence polytope, but used it only to justify undirected samples and then pivoted to max-entropy/Laplacian-Hessian machinery instead of a single-tree averaging step.
+  - evidence: APPROACHES/A051 lines 101–133 ('The conversion through L019 is only an existence proof'); ROOT MESSAGE 20:58:22 (N:7912) and 21:04:19 (N:8177 'constructing such a distribution fast enough … implicit Newton method'); WEBSEARCH 20:58:13 'maximum entropy spanning tree distribution prescribed marginals'; A052 §6 lines 237–243.
+- [verified] Ingredient I8 (Edmonds decomposition into arborescences) was encountered as an obstacle and routed around rather than used; I4/I5/I7 never appear in the window.
+  - evidence: audit_cleanup 20:46:14 (N:7647) 'A complete forest-intersection certificate does not itself provide directed arborescences for sampling'; A051 §5 'No color is required to be a directed arborescence'; grep of A046–A053 and PROVED lines 4292–6452 finds no 'Edmonds', 'branching', 'fundamental path', or flow 'rounding'.
+- [verified] The author's framing drifted toward heavier machinery over the window: ordering rules → MST Lagrangian → entropy dual with Laplacian Hessians → Gaussian spectral sketches → parameter-range lower bounds; no formulation asked to sample one tree without constructing the whole distribution.
+  - evidence: ROOT MESSAGEs at 20:43:21, 20:50:34, 20:58:22, 21:04:19, 21:09:25; ROOT WEBSEARCHes 21:01:20–21:01:30 (radial isotropic, Barthe, arXiv 2504.05687); A052 §11 cites Schild's sampler as the final step; approximation_proofs 21:15:04 range refutation.
+- [verified] Roughly 30% of root effort went to record writing: 8 nodes (2,814 lines) and 8 lemmas (2,161 PROVED lines) in 63 minutes, with node/lemma proof duplication that audit-3 had already flagged.
+  - evidence: wc -l of A046–A053; PROVED.md L056 at 4292 to L064 at 6453; A047 §11 'This section retains the construction and proof in its local context' while L059 is canonical; audit-3 line 114 'Near-verbatim duplication'; 19 of 59 root commands are record-writing heredocs.
+- [likely] The pivot from the split recursion back to tree distributions (20:54–20:58) was triggered by the SXZ proof-mining obstacle about forest certificates not yielding directed arborescences.
+  - evidence: Temporal adjacency: audit_cleanup result 20:46:14, root THINKs 20:54:46–20:58:06 on matroid intersection / tree outdegree constraints, audit_cleanup retasked 20:55:40 on MST queries enforcing outdegree constraints; root→subagent task text is not recorded in the transcript.
+- [verified] Compactions cost little wall time (about 1.5 min each, 8 and 5 re-read commands) and the author re-anchored correctly; subagent compactions caused no task loss. Audit guidance itself contributed to the drift (batching interface accepted; entropy deprioritization re-entered under a new name).
+  - evidence: commands.txt 20:41:43–20:41:57 and 21:16:47–21:16:57; control_events.txt 20:41:38, 21:16:41; audit-2 R6/R7 and audit-3 §3 not followed; ROOT MESSAGE 20:58:22 re-entering the tree-distribution route.
