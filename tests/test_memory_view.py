@@ -144,6 +144,134 @@ class MemoryViewTests(unittest.TestCase):
         (folder / "A001.md").unlink()
         self.assertEqual(self.app.memory_file("APPROACHES", first["version"])["files"], ["APPROACHES/INDEX.md"])
 
+    def test_graph_uses_node_files_in_resumed_workspace_without_an_index(self):
+        folder = self.original / "APPROACHES"
+        folder.mkdir()
+        first = "# A001 — First route\n\nParents: none\nChildren: A099\nStatus: ACTIVE.\n\n## Context and objective\nStart here.\n\nMore detail."
+        second = "# A002 — Follow-up\n\n**Parents:** [A001](A001-first.md), A001\n**Status:** RESOLVED\n\n## Context and objective\nTry it.\n\n## Conclusions\nIt works."
+        (folder / "A001-first.md").write_text(first)
+        (folder / "A002.md").write_text(second)
+        wrong = self.resumed / "APPROACHES"
+        wrong.mkdir()
+        (wrong / "A999.md").write_text("Wrong workspace")
+        result = self.app.approach_graph()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["indexFile"], "")
+        self.assertEqual(result["files"], ["APPROACHES/A001-first.md", "APPROACHES/A002.md"])
+        self.assertEqual(result["nodes"], [
+            {"id": "A001", "file": "APPROACHES/A001-first.md", "title": "First route", "parents": [],
+             "status": "ACTIVE", "result": "Start here.", "hasParents": True, "readStatus": "ready"},
+            {"id": "A002", "file": "APPROACHES/A002.md", "title": "Follow-up", "parents": ["A001"],
+             "status": "RESOLVED", "result": "It works.", "hasParents": True, "readStatus": "ready"},
+        ])
+        self.assertFalse((folder / "index.md").exists())
+        # Even an unreadable index cannot affect the graph.
+        (folder / "index.md").write_bytes(b"\xff")
+        with patch.object(server, "approach_metadata", side_effect=AssertionError("Unchanged node parsed")):
+            unchanged = self.app.approach_graph()
+        self.assertEqual(unchanged["nodes"], result["nodes"])
+        self.assertEqual(unchanged["indexFile"], "APPROACHES/index.md")
+        self.assertEqual((folder / "A001-first.md").read_text(), first)
+
+    def test_graph_refreshes_changed_added_and_removed_nodes_without_index_edits(self):
+        folder = self.original / "APPROACHES"
+        folder.mkdir()
+        index = folder / "index.md"
+        index.write_text("Stale index: A002 has no parents and is ACTIVE.")
+        (folder / "A001.md").write_text("# Root\nParents: none\nStatus: ACTIVE")
+        route = folder / "A002.md"
+        route.write_text("# Route\nParents: none\nStatus: ACTIVE")
+        self.app.approach_graph()
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+        route.write_text("# Revised route\nParents: A001\nStatus: BLOCKED\n\n## Obstacles\nMissing bound.")
+        with patch.object(server, "approach_metadata", wraps=server.approach_metadata) as parse:
+            refreshed = self.app.approach_graph()
+        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(refreshed["nodes"][1]["parents"], ["A001"])
+        self.assertEqual(refreshed["nodes"][1]["status"], "BLOCKED")
+        self.assertEqual(refreshed["nodes"][1]["result"], "Missing bound.")
+        route.unlink()
+        (folder / "A003.md").write_text("# Next route\nParents: A001\nStatus: ACTIVE")
+        refreshed = self.app.approach_graph()
+        self.assertEqual([node["id"] for node in refreshed["nodes"]], ["A001", "A003"])
+        self.assertNotIn("APPROACHES/A002.md", self.app._approach_cache)
+        self.assertEqual((index.read_bytes(), index.stat().st_mtime_ns), before)
+
+    def test_graph_reports_and_retries_unreadable_nodes_without_hiding_others(self):
+        folder = self.original / "APPROACHES"
+        folder.mkdir()
+        broken = folder / "A001-unfinished-route.md"
+        broken.write_bytes(b"\xff")
+        (folder / "A002.md").write_text("# Readable\nParents: A001\nStatus: ACTIVE")
+        for _ in range(2):
+            result = self.app.approach_graph()
+            self.assertEqual([node["readStatus"] for node in result["nodes"]], ["unavailable", "ready"])
+            self.assertEqual(result["nodes"][0]["title"], "unfinished route")
+            self.assertEqual(self.app._approach_cache["APPROACHES/A001-unfinished-route.md"]["version"], "")
+        broken.write_text("# Recovered\nParents: none\nStatus: RESOLVED")
+        result = self.app.approach_graph()
+        self.assertEqual(result["nodes"][0]["readStatus"], "ready")
+        self.assertEqual(result["nodes"][0]["title"], "Recovered")
+
+    def test_graph_ignores_symlinks_and_does_not_invent_missing_index_files(self):
+        self.assertEqual(self.app.approach_graph()["files"], [])
+        (self.original / "APPROACHES.md").write_text("Historical notebook")
+        self.assertEqual(self.app.approach_graph()["files"], ["APPROACHES.md"])
+        folder = self.original / "APPROACHES"
+        folder.mkdir()
+        (folder / "A001.md").write_text("# Root\nParents: none\nStatus: ACTIVE")
+        (folder / "A002.md").symlink_to(self.original / "APPROACHES.md")
+        (folder / "index.md").symlink_to(self.original / "APPROACHES.md")
+        result = self.app.approach_graph()
+        self.assertEqual(result["files"], ["APPROACHES/A001.md", "APPROACHES.md"])
+        self.assertEqual(result["indexFile"], "")
+        folder.rename(self.original / "previous")
+        folder.symlink_to(self.original / "previous")
+        result = self.app.approach_graph()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["nodes"], [])
+
+    def test_portable_graph_listing_works_without_index_and_node_reads_skip_listing(self):
+        folder = self.original / "APPROACHES"
+        folder.mkdir()
+        (folder / "A001.md").write_text("# Root\nParents: none\nStatus: ACTIVE")
+        result = self.app._memory_file_portable(
+            self.original.resolve(), "APPROACHES", "", {"status": "missing"}, True, listing_only=True,
+        )
+        self.assertEqual(result["files"], ["APPROACHES/A001.md"])
+        self.assertEqual(result["status"], "ready")
+        self.assertNotIn("content", result)
+        with patch.object(Path, "iterdir", side_effect=AssertionError("Node read rescanned directory")):
+            node = self.app._memory_file_portable(
+                self.original.resolve(), "APPROACHES/A001.md", "", {"status": "missing"}, True, include_files=False,
+            )
+        self.assertIn("# Root", node["content"])
+
+    def test_node_metadata_uses_header_fields_and_preserves_missing_metadata(self):
+        result = server.approach_metadata("APPROACHES/A010-slug-title.md", """# A010 — Title
+Parent: A002, [A003](A003-other.md)
+Status: PARKED.
+
+## Context and objective
+Explain the task.
+
+## Detailed work
+Status: RESOLVED
+Parents: A999
+
+## Obstacles
+The key bound is missing.
+
+More technical detail.
+""")
+        self.assertEqual(result["parents"], ["A002", "A003"])
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["result"], "The key bound is missing.")
+        missing = server.approach_metadata("APPROACHES/A011-new-idea.md", "Work in progress")
+        self.assertEqual(missing["title"], "new idea")
+        self.assertEqual(missing["status"], "UNSPECIFIED")
+        self.assertFalse(missing["hasParents"])
+
     def test_approach_traversal_and_symlinked_folder_are_rejected(self):
         for name in ("APPROACHES/../PROVED.md", "APPROACHES/sub/A001.md", "APPROACHES/secret.md",
                      "APPROACHES/A001.md/extra", "APPROACHES//A001.md", "APPROACHES/A001.md\n"):
@@ -254,6 +382,17 @@ class MemoryViewTests(unittest.TestCase):
             with urlopen(Request(url, headers={"X-TCS-Prover-Token": http.token})) as response:
                 self.assertEqual(json.load(response)["content"], content)
 
+        graph_url = http.origin + "/approach-graph?job=resumed"
+        with self.assertRaises(HTTPError) as error:
+            urlopen(graph_url)
+        self.assertEqual(error.exception.code, 403)
+        with urlopen(Request(graph_url, headers={"X-TCS-Prover-Token": http.token})) as response:
+            graph = json.load(response)
+            self.assertEqual([node["id"] for node in graph["nodes"]], ["A001"])
+        with self.assertRaises(HTTPError) as error:
+            urlopen(Request(http.origin + "/approach-graph?job=missing", headers={"X-TCS-Prover-Token": http.token}))
+        self.assertEqual(error.exception.code, 400)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
     def test_browser_folder_selection_refresh_and_stale_responses(self):
         script = r"""
@@ -280,7 +419,7 @@ const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', memoryJ
   memoryFile: source.match(/let memoryFile = "([^"]+)"/)[1],
   state: {trace: []},
   memoryVersion: '', memoryRequest: 0, memoryTimer: null, memoryAnchor: '',
-  approachIndex: {version: '', content: '', files: []}, approachGraphSignature: '',
+  approachGraphData: {nodes: [], files: [], indexFile: ''}, approachGraphSignature: '',
   document: { hidden: false, createElement: () => ({ children: [], append(child) { this.children.push(child); } }) },
   show: (element, visible) => { element.hidden = !visible; },
   managesResearchFiles: () => true,
@@ -293,13 +432,18 @@ const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', memoryJ
 vm.runInContext(linkFormatter + selected + '\nfunction renderApproachGraph() {}', context);
 const ready = (name, content, files, version = name) => ({ name, content, files, version,
   status: 'ready', modifiedAt: '2026-09-11T00:00:00Z' });
+let graphFiles = ['APPROACHES/INDEX.md', 'APPROACHES/A001.md', 'APPROACHES/A002.md'];
+const settleGraph = async (files = graphFiles) => {
+  if (pending[0]?.path.path !== '/approach-graph') return;
+  graphFiles = files;
+  pending.shift().resolve({files, nodes: files.filter(name => /\/A\d/.test(name)).map(file => ({file})),
+    indexFile: files.find(name => /\/(index|INDEX)\.md$/.test(name)) || ''});
+  await new Promise(setImmediate);
+};
 const settle = async value => {
+  await settleGraph(value.files || graphFiles);
+  if (!pending.length) return;
   pending.shift().resolve(value); await new Promise(setImmediate);
-  // A selected node also refreshes the authoritative parent table for the graph.
-  if (pending[0]?.path.file === 'APPROACHES') {
-    pending.shift().resolve(ready('APPROACHES/INDEX.md', 'Index', value.files));
-    await new Promise(setImmediate);
-  }
 };
 (async () => {
   assert.equal(context.memoryFile, 'APPROACHES');
@@ -315,11 +459,15 @@ const settle = async value => {
   assert.equal(ui.memoryDocument.attrs['aria-labelledby'], approachTab.id);
   ui.memoryPanel.open = true;
   context.loadMemory();
-  assert.equal(pending[0].path.file, 'APPROACHES');
+  assert.equal(pending[0].path.path, '/approach-graph');
   const files = ['APPROACHES/INDEX.md', 'APPROACHES/A001.md', 'APPROACHES/A002.md'];
-  await settle(ready('APPROACHES/INDEX.md', 'Index', files));
+  await settleGraph(files);
   assert.equal(ui.memoryApproachPicker.hidden, false);
-  assert.equal(ui.memoryApproach.value, files[0]);
+  assert.equal(ui.memoryApproach.value, 'APPROACHES');
+  assert.equal(rendered.length, 0);
+  assert.match(ui.memoryMessage.textContent, /Select an approach/);
+  context.selectMemoryDocument(files[0]);
+  await settle(ready(files[0], 'Index', files));
   assert.equal(rendered.at(-1), 'Index');
   context.selectMemoryDocument('APPROACHES.md');
   await settle(ready('APPROACHES.md', 'Historical work', [...files, 'APPROACHES.md']));
@@ -337,12 +485,15 @@ const settle = async value => {
   assert.ok(links.children.includes('[Escape](../../secret.md)'));
   assert.ok(links.children.includes('[Initial prompt](../INITIAL_PROMPT.md)'));
   buttons[0].onclick();
+  await settleGraph();
   assert.equal(pending[0].path.file, files[1]);
   await settle(ready(files[1], 'Linked route', [...files, 'APPROACHES.md']));
   buttons[1].onclick();
-  assert.equal(pending[0].path.file, 'APPROACHES');
+  await settleGraph();
+  assert.equal(pending[0].path.file, files[0]);
   await settle(ready(files[0], 'Linked index', [...files, 'APPROACHES.md']));
   context.selectMemoryDocument(files[1]);
+  await settleGraph();
   assert.equal(pending[0].path.version, '');
   const slow = pending.shift();
   context.selectMemoryDocument(files[2]);
@@ -354,8 +505,9 @@ const settle = async value => {
   context.loadMemory();
   await settle({ ...ready(files[2], undefined, [...files, 'APPROACHES/A003.md']), unchanged: true });
   assert.equal(rendered.at(-1), 'Route two');
-  assert.equal(ui.memoryApproach.options.length, 4);
+  assert.equal(ui.memoryApproach.options.length, 5);
   context.loadMemory();
+  await settleGraph();
   const oldRoute = pending.shift();
   context.selectMemoryFile(lemmaTab);
   await settle(ready('PROVED.md', 'Lemma', undefined));
@@ -369,6 +521,7 @@ const settle = async value => {
   const linked = { children: [], append(child) { this.children.push(child); } };
   context.appendMemoryText(linked, '[Route](APPROACHES/A001.md)');
   linked.children.find(child => child.className === 'memory-link').onclick();
+  await settleGraph();
   assert.equal(pending[0].path.file, files[1]);
   await settle(ready(files[1], 'Route one', files));
   const lemmaLink = { children: [], append(child) { this.children.push(child); } };
@@ -383,17 +536,50 @@ const settle = async value => {
   assert.equal(lemma.scrolled, true);
   assert.equal(lemmaTab.tabIndex, 0);
   assert.equal(approachTab.tabIndex, -1);
-  context.selectMemoryFile(approachTab);
+  context.selectMemoryDocument('APPROACHES.md');
   await settle(ready('APPROACHES.md', 'Legacy notebook', []));
   assert.equal(ui.memoryApproachPicker.hidden, true);
   assert.equal(ui.memoryFilename.textContent, 'APPROACHES.md');
   context.loadMemory();
+  await settleGraph();
   ui.memoryPanel.open = false;
   await settle(ready(files[0], 'Hidden response', files));
   assert.equal(rendered.at(-1), 'Legacy notebook');
   const count = pending.length;
   context.loadMemory();
   assert.equal(pending.length, count);
+
+  ui.memoryPanel.open = true;
+  context.selectMemoryDocument('APPROACHES');
+  const oldGraph = pending.shift();
+  context.selectMemoryDocument(files[1]);
+  await settle(ready(files[1], 'Latest route', files.slice(1)));
+  const latestGraph = context.approachGraphData;
+  oldGraph.resolve({files: [], nodes: [], indexFile: ''});
+  await new Promise(setImmediate);
+  assert.equal(context.approachGraphData, latestGraph);
+  assert.equal(rendered.at(-1), 'Latest route');
+  assert.equal(pending.length, 0);
+
+  context.loadMemory();
+  const previousJobGraph = pending.shift();
+  context.currentJob = 'another-job';
+  context.syncMemoryPanel();
+  ui.memoryPanel.open = true;
+  context.loadMemory();
+  await settleGraph(['APPROACHES/A010.md']);
+  const anotherJobGraph = context.approachGraphData;
+  previousJobGraph.resolve({files, nodes: [{file: files[1]}], indexFile: files[0]});
+  await new Promise(setImmediate);
+  assert.equal(context.approachGraphData, anotherJobGraph);
+  assert.equal(ui.memoryApproach.options.length, 2);
+  assert.equal(pending.length, 0);
+
+  context.loadMemory();
+  ui.memoryPanel.open = false;
+  await settleGraph(files);
+  assert.equal(context.approachGraphData, anotherJobGraph);
+  assert.equal(pending.length, 0);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
         result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js"), json.dumps(PageElements().elements)],

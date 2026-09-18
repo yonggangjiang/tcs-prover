@@ -92,7 +92,7 @@ prompts:
 
     2. APPROACHES/ contains a simple directed acyclic graph (DAG) of attempted approaches. Each node is a Markdown file with a stable ID and descriptive name, for example A001-xxx.md. An edge A -> B means that approach B developed from approach A. An approach may have no parents or several parents.
 
-    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG; no other graph format is required. Keep untried ideas briefly in the index until investigated. Update the table when a node is added or its position changes, with links to the relevant detailed records.
+    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG. Update the table whenever a node is added or its position changes, with links to the relevant detailed records.
 
     Each node file has this markdown structure:
 
@@ -103,18 +103,17 @@ prompts:
 
     ACTIVE means currently being developed; BLOCKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved.
 
+    For the following sections, the writing should follow strictly the following rules: Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definitions should be self-contained, with every first appearance of a term or symbol clearly defined under the convention of the field where the original statement is from. Before finishing a node update, read its opening using only the original problem statement and the text preceding each sentence. For every imported procedure, term or sentence that can not be understood within just the context of the original statement, clearly define and explain it. A name, lemma ID, or parent link should be provided for each related explaination. 
+
     ## Context and objective
 
-    Define the local problem. Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definitions should be self-contained, with every first appearance of a term or symbol clearly defined under the convention of the field where the original statement is from. Before finishing a node update, read its opening using only the original problem statement and the text preceding each sentence. For every imported procedure or result that can not be understood within just the context of the original statement, clearly define and explain it. A name, lemma ID, or parent link should be provided for each related explaination. After the local problem being defined, explain clearly how this node's objective relates to the original statement and the overall research goal. 
-
+    Define the local problem. Split this part into three parts. 1. Backgrounds: Given all the definitions and context that the author should know before reading the objective, they can be definitions or procedures, prelims from other parts of this project. 2. Objective: a clearly defined objective that the reader is able to understand with only the backgrounds and general TCS knowledge under the field of the orginal statement. 3. Connection to the overall research goal: explain how this node's objective relates to the original statement and the overall research goal.
 
     ## Detailed work
 
-    Append all mathematical work and thinking process towards the objective described above. Let above, assume the reader only knows the original definitions and statement in INITIAL_PROMPT.md, and make this self-contained.
+    Append all mathematical work and thinking process towards the objective described above. Let above.
 
-    This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to previous context.
-
-    If some part becomes blocked, generate a new child node and state clearly here what is the obstacle and why it is blocked.
+    This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma, and how it relates to the overall objective. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to the general context.
 
     ## Obstacles
 

@@ -80,6 +80,18 @@ render({...author, phase: 'running', auditHoldingAuthor: false});
 assert.equal(ui.pause.hidden, false);
 assert.equal(ui.resume.hidden, true);
 assert.equal(polls, 3);
+render({...author, phase: 'paused'});
+assert.match(ui.runDescription.textContent, /resume automatically in the same conversation/);
+assert.equal(ui.resume.disabled, true);
+assert.equal(polls, 4);
+render({...author, phase: 'paused', auditHoldingAuthor: false,
+  researchAuditStatus: {batchActive: true}});
+assert.equal(ui.resume.disabled, true);
+assert.equal(polls, 5); // Keep polling through the batch's final cleanup.
+render({...author, phase: 'paused', auditHoldingAuthor: false,
+  researchAuditStatus: {batchActive: false}});
+assert.equal(ui.resume.disabled, false);
+assert.equal(polls, 5);
 `;
 vm.runInNewContext(setup + renderer + handlers + checks, {assert});
 """
@@ -473,7 +485,7 @@ const checks = `
   await starting;
   assert.equal(ui.startResearchAudit.disabled, false);
   assert.equal(ui.researchAuditStatus.textContent,
-    'Pause the author, restart the web UI, and resume to enable Start audit now.');
+    'Pause the author and restart the web UI to enable Start audit now.');
   starting = startResearchAudit();
   request = pending.shift();
   request.resolve(ready);
@@ -481,7 +493,7 @@ const checks = `
   assert.equal(ui.researchAuditStatus.textContent, '');
 
   for (const blocked of [
-    {phase: 'paused'}, {phase: 'pausing'}, {phase: 'done'}, {activeNode: 'critic'},
+    {phase: 'pausing'}, {phase: 'done'}, {activeNode: 'critic'}, {manuallyStopped: true},
     {auditHoldingAuthor: true}, {researchAuditStatus: {runningSlots: [1]}},
     {researchAuditStatus: {runningSlots: [], batchActive: true}},
     {researchAudits: {intervalHours: 2, models: ['none', 'none', 'none']}},
@@ -495,10 +507,23 @@ const checks = `
   assertCountdown('In progress', 'Research audits', 'author time');
   render({...ready, phase: 'paused', auditHoldingAuthor: false,
     researchAuditStatus: {runningSlots: [], batchActive: true}});
-  assertCountdown('01:55:00', 'Next audit', 'paused');
+  assertCountdown('In progress', 'Research audits', 'author paused');
   assert.equal(ui.researchAuditToolbar.hidden, false);
   assert.equal(ui.startResearchAudit.disabled, true);
+  const paused = {...ready, phase: 'paused'};
+  render(paused);
+  assert.equal(ui.startResearchAudit.disabled, false);
+  assert.match(ui.startResearchAudit.title, /resume the author automatically/);
+  starting = startResearchAudit();
+  request = pending.shift();
+  assert.equal(request.path, '/start-research-audit?job=second');
+  request.resolve({...paused, auditHoldingAuthor: true,
+    researchAuditStatus: {runningSlots: [1], batchActive: true}});
+  await starting;
+  assert.equal(ui.startResearchAudit.disabled, true);
+  assertCountdown('In progress', 'Research audits', 'author paused');
   render(ready);
+  assert.equal(ui.startResearchAudit.disabled, false);
   researchAuditDirty = true;
   renderResearchAudits(true);
   assert.equal(ui.startResearchAudit.disabled, true);

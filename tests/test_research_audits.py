@@ -193,7 +193,7 @@ class AuditSchedulingTests(unittest.TestCase):
         self.launch(scheduler, settings("claude-opus", "gpt-6-astra", "kimi-code"))
         self.finish(scheduler)
         before.assert_not_called()
-        after.assert_not_called()
+        after.assert_called_once_with(scheduler)
         self.assertEqual(self.calls, [])
         self.assertEqual(self.reports(), [])
         self.assertEqual([event["status"] for event in self.events], ["checking", "warning"] * 3)
@@ -266,7 +266,7 @@ class AuditSchedulingTests(unittest.TestCase):
             self.launch(scheduler)
             self.finish(scheduler)
             before.assert_not_called()
-            after.assert_not_called()
+            after.assert_called_once_with(scheduler)
             self.assertEqual(self.calls, [])
             self.assertIn("nonempty prompt", scheduler.status()["batchError"])
             self.assertTrue(scheduler.active)
@@ -305,7 +305,7 @@ class AuditSchedulingTests(unittest.TestCase):
         self.assertEqual(scheduler.settings, options)
         self.assertEqual(scheduler.status()["warnings"], previous_warning)
         before.assert_not_called()
-        after.assert_not_called()
+        self.assertEqual(after.call_count, 2)
 
     def test_warning_clears_only_for_successful_model_while_other_failure_persists(self):
         failed = {"gpt-6-astra", "claude-opus"}

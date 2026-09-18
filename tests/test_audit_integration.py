@@ -212,7 +212,7 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertFalse(self.app.state["auditHoldingAuthor"])
         engine.before_batch.assert_not_called()  # Preflight has not completed yet.
 
-    def test_manual_start_rejects_none_and_non_running_author_states(self):
+    def test_manual_start_rejects_none_invalid_states_and_unsettled_pauses(self):
         self.app.worker_token = object()
         self.app.state.update(phase="running")
         with patch.object(self.app, "_start_research_audits") as start_monitor:
@@ -235,6 +235,194 @@ class AuditIntegrationTests(unittest.TestCase):
             self.app.start_research_audit_now()
         self.assertIsNone(self.app.research_audits.thread)
         self.assertEqual(self.app.research_audits.checkpoint()["lastStartedSeconds"], 100)
+
+    def launch_paused_audit(self, *, preflight=lambda model: True, provider=None, fail_start=False):
+        """Exercise real scheduler threads with local fake auditors."""
+        constructor, start = audits.ResearchAudits, threading.Thread.start
+        engines, threads = [], []
+        self.audit_clock = 0
+
+        def create(workspace, **kwargs):
+            engine = constructor(workspace, **kwargs, clock=lambda: self.audit_clock,
+                                 preflight=preflight, provider=provider or (
+                                     lambda model, prompt, cwd, cancel: {"text": "Saved advice", "model": model["model"]}))
+            engines.append(engine)
+            return engine
+
+        def start_thread(thread):
+            if fail_start and thread._target.__name__ == "_batch":
+                raise RuntimeError("Audit worker could not start")
+            threads.append(thread)
+            return start(thread)
+
+        def cleanup():
+            for engine in engines:
+                engine.close()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.addCleanup(cleanup)
+        with patch.object(audits, "ResearchAudits", side_effect=create), \
+                patch.object(threading.Thread, "start", start_thread):
+            self.app.start_research_audit_now()
+        return engines[-1]
+
+    def test_restored_paused_author_audits_then_resumes_same_thread_and_checkpoint(self):
+        self.app.state.update(researchAudits=self.options, goalThreadId="saved-author",
+                              researchAuditProgress={"elapsedSeconds": 300, "lastStartedSeconds": 100})
+        self.app._save_pause({"status": "paused", "node": "author", "stage": "solve", "error": "Old connection error",
+                              "goalThreadId": "saved-author", "elapsedSeconds": 1234,
+                              "state": {"statement": "Exact task"}})
+        self.app._save_job_settings(self.app.state)
+        self.app = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
+        checkpoint = json.loads((self.app.run_dir / server.PAUSE_FILENAME).read_text())
+        self.assertEqual(self.app.state["phase"], "paused")
+        self.assertIsNone(self.app.worker_token)
+        self.assertIsNone(self.app.research_audits)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def launch(command, **kwargs):
+            # No author process may start until every selected report is saved.
+            self.assertEqual(len(list((self.app.run_dir / "AUDITS").glob("*.md"))), 2)
+            settings = dict(command[i + 1].split("=", 1) for i, value in enumerate(command) if value == "--set")
+            self.assertEqual(json.loads(settings["goal_thread_id"]), "saved-author")
+            self.assertTrue(json.loads(settings["goal_require_resume"]))
+            self.assertEqual(kwargs["cwd"], self.app.run_dir)
+            return Mock(stdin=io.StringIO())
+
+        def spawn(target, args, token):
+            self.app.worker_token = token
+            self.app._start_research_audits(token)
+
+        with patch.object(self.app, "pause", side_effect=AssertionError("Already paused")), \
+                patch.object(self.app, "resume", wraps=self.app.resume) as resume, \
+                patch.object(server.subprocess, "Popen", side_effect=launch) as popen, \
+                patch.object(self.app, "_spawn_worker", side_effect=spawn):
+            engine = self.launch_paused_audit(preflight=lambda model: release.wait(3))
+            self.assertTrue(self.app.state["auditHoldingAuthor"])
+            self.assertEqual(self.app.state["error"], "")
+            popen.assert_not_called()
+            with self.assertRaises(ValueError):
+                self.app.resume()
+            resume.reset_mock()
+            with self.assertRaises(ValueError):
+                self.app.start_research_audit_now()
+            self.audit_clock = 100000
+            self.app._update_research_audits()
+            self.assertEqual(engine.checkpoint()["elapsedSeconds"], 300)
+            self.assertEqual(engine.checkpoint()["lastStartedSeconds"], 300)
+            self.assertEqual(engine.status()["runningSlots"], [1, 3])
+            release.set()
+            engine.thread.join(timeout=3)
+            self.assertFalse(engine.thread.is_alive())
+            resume.assert_called_once()
+            popen.assert_called_once()
+        self.assertEqual(self.app.state["phase"], "running")
+        self.assertEqual(self.app.state["goalThreadId"], "saved-author")
+        self.assertEqual(self.app.state["elapsedSeconds"], 1234)
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+        self.assertIsNone(self.app._audit_pause_engine)
+        resumed = json.loads((self.app.run_dir / server.PAUSE_FILENAME).read_text())
+        self.assertEqual(resumed["status"], "running")
+        for key in ("goalThreadId", "state", "elapsedSeconds", "node", "stage"):
+            self.assertEqual(resumed[key], checkpoint[key])
+        self.assertEqual(len(list((self.app.run_dir / "AUDITS").glob("*.md"))), 2)
+        self.assertIs(self.app.research_audits, engine)
+        self.assertIs(self.app._audit_token, self.app.worker_token)
+        self.app._update_research_audits()
+        self.assertEqual(engine.checkpoint()["elapsedSeconds"], 300)
+        self.assertFalse(self.app.state["researchAuditStatus"]["batchActive"])
+
+    def test_paused_audit_preflight_failure_still_requests_author_continuation(self):
+        self.app.state.update(researchAudits=self.options, error="Author usage limit", goalThreadId="")
+        provider = Mock()
+        with patch.object(self.app, "resume") as resume:
+            engine = self.launch_paused_audit(preflight=lambda model: False, provider=provider)
+            engine.thread.join(timeout=3)
+            self.assertFalse(engine.thread.is_alive())
+            resume.assert_called_once()
+        provider.assert_not_called()
+        self.assertEqual(self.app.state["phase"], "paused")
+        self.assertEqual(self.app.state["error"], "")
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+        self.assertIsNone(self.app._audit_pause_engine)
+        self.assertEqual(len(engine.status()["warnings"]), 2)
+        self.assertFalse((self.app.run_dir / "AUDITS").exists())
+
+    def test_paused_audit_launch_failure_releases_workspace(self):
+        self.app.state.update(researchAudits=self.options, error="Previous author error")
+        with self.assertRaisesRegex(ValueError, "Audit worker could not start"):
+            self.launch_paused_audit(fail_start=True)
+        self.assertEqual(self.app.state["phase"], "paused")
+        self.assertEqual(self.app.state["error"], "Previous author error")
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+        self.assertIsNone(self.app._audit_pause_engine)
+        self.assertFalse(self.app.research_audits.status()["batchActive"])
+
+    def test_paused_audit_reports_failed_resume_without_replacing_the_thread(self):
+        self.app.state.update(researchAudits=self.options, goalThreadId="saved-author")
+        with patch.object(self.app, "resume", side_effect=ValueError("Saved thread unavailable")) as resume:
+            engine = self.launch_paused_audit()
+            engine.thread.join(timeout=3)
+            self.assertFalse(engine.thread.is_alive())
+            resume.assert_called_once()
+        self.assertEqual(self.app.state["phase"], "paused")
+        self.assertEqual(self.app.state["goalThreadId"], "saved-author")
+        self.assertIn("Saved thread unavailable", self.app.state["error"])
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+
+    def test_cancelling_paused_audit_stops_auditors_without_resuming_author(self):
+        self.app.state["researchAudits"] = self.options
+        working, cancelled = threading.Event(), threading.Event()
+
+        def provider(model, prompt, cwd, cancel):
+            working.set()
+            if cancel.wait(3):
+                cancelled.set()
+            return {"text": "Cancelled advice", "model": model["model"]}
+
+        with patch.object(self.app, "resume") as resume:
+            engine = self.launch_paused_audit(provider=provider)
+            self.assertTrue(working.wait(3))
+            self.app.pause()
+            engine.thread.join(timeout=3)
+            self.assertFalse(engine.thread.is_alive())
+            resume.assert_not_called()
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+        self.assertEqual(self.app.state["phase"], "paused")
+        self.assertEqual(list((self.app.run_dir / "AUDITS").glob("*.md")), [])
+
+    def test_server_shutdown_cancels_audits_without_resuming_author(self):
+        engine = self.pause_for_audit()
+        manager = Mock(jobs={"selected": self.app}, jobs_lock=threading.RLock())
+        with patch.object(self.app, "resume") as resume:
+            server.Server.stop_all(manager)
+            self.app._resume_after_research_audit(engine)
+        engine.close.assert_called_once()
+        resume.assert_not_called()
+        self.assertFalse(self.app.state["auditHoldingAuthor"])
+        self.assertIsNone(self.app._audit_pause_engine)
+
+    def test_paused_audit_and_resume_respect_other_jobs_using_the_workspace(self):
+        self.app._save_job_settings(self.app.state)
+        manager = server.Server((server.HOST, 0), runs=self.runs)
+        self.addCleanup(manager.server_close)
+        manager.jobs[self.app.state["runId"]] = self.app
+        other = server.App(runs=self.runs)
+        other._new_run("Continuation")
+        other.state.update(phase="running", goalWorkspace=str(self.app.run_dir))
+        manager.jobs[other.run_dir.name] = other
+        with patch.object(self.app, "start_research_audit_now") as start:
+            with self.assertRaisesRegex(ValueError, "active job"):
+                manager.start_research_audit_job(self.app.state["runId"])
+        start.assert_not_called()
+        other.state.update(phase="paused", auditHoldingAuthor=True)
+        with patch.object(self.app, "resume") as resume:
+            with self.assertRaisesRegex(ValueError, "active job"):
+                manager.resume_paused_job(self.app.state["runId"])
+        resume.assert_not_called()
 
     def test_model_warnings_restore_while_paused_and_follow_live_slot_selection(self):
         warnings = [{"slot": slot, "model": model, "message": f"Warning: Audit-{slot} — {model} is unavailable"}
@@ -286,7 +474,7 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertFalse(engine.thread.is_alive())
         self.app._update_research_audits()
         before.assert_not_called()
-        after.assert_not_called()
+        after.assert_called_once_with(engine)
         provider.assert_not_called()
         self.assertIs(self.app.worker_token, token)
         self.assertIs(self.app.active_token, token)

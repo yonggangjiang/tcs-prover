@@ -334,8 +334,8 @@ class ResearchAudits:
             enabled = any(model != "none" for model in settings["models"])
             busy = self.thread is not None and self.thread.is_alive()
             if start_now:
-                if self.closed or not active:
-                    raise ValueError("Start an audit while the author is running.")
+                if self.closed or not (active or paused_for_audit):
+                    raise ValueError("Start an audit while the author is running or paused for auditing.")
                 if not enabled:
                     raise ValueError("Select and save at least one auditor first.")
                 if busy:
@@ -351,8 +351,8 @@ class ResearchAudits:
             for slot, cancel in self.running.items():
                 if (not active and not paused_for_audit) or settings["models"][slot - 1] == "none":
                     cancel.set()
-            if (active and enabled and not busy
-                    and (start_now or self.elapsed - self.last_started >= settings["intervalHours"] * 3600)):
+            if (enabled and not busy and ((start_now and (active or paused_for_audit))
+                    or (active and self.elapsed - self.last_started >= settings["intervalHours"] * 3600))):
                 previous_start, previous_thread = self.last_started, self.thread
                 self.last_started = self.elapsed
                 self.last_error = ""
@@ -441,7 +441,6 @@ class ResearchAudits:
 
     def _batch(self, selected):
         models = {row["value"]: row for row in self.config["models"]}
-        pause_requested = False
         try:
             # Freeze one current prompt for the batch, including all parallel auditors.
             prompt = (load_config() if self.reload_prompt else self.config).get("prompt")
@@ -464,7 +463,6 @@ class ResearchAudits:
                 selected = [(slot, value) for slot, value in eligible if not self.running[slot].is_set()]
                 if self.closed or not selected:
                     return
-            pause_requested = True
             if not self.before_batch(self):
                 return
             with self.lock:
@@ -540,8 +538,8 @@ class ResearchAudits:
             with self.lock:
                 self.running.clear()
             try:
-                if pause_requested:
-                    self.after_batch(self)
+                # Release a manually paused workspace even when preflight fails.
+                self.after_batch(self)
             except Exception as exc:
                 with self.lock:
                     self.last_error = str(exc)

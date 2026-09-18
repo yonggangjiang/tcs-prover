@@ -363,6 +363,14 @@ For a reached workflow time limit, increase the existing total time limit contro
 while paused before clicking Resume.
 **Stop** keeps its existing immediate termination behavior.
 
+**Start audit now** is available while the author is running or paused, once at
+least one auditor is selected and its settings applied. An audit started from a
+paused job audits the saved workspace first, then resumes the author automatically
+in the same conversation. Click **Pause** during the audit to cancel it and keep
+the author paused.
+Audit time does not advance the author clock, and another audit cannot start
+until the current batch finishes.
+
 When compilation succeeds, **Download source (.tex)** and **Download PDF**
 download that job's saved `final.tex` and `final.pdf`. Older jobs that only
 contain a source file still offer the source download.
@@ -380,14 +388,24 @@ flowchart TD
     S["Optional statement review"] --> A["Persistent root author"]
     A <--> M["INITIAL_PROMPT.md · APPROACHES/ · PROVED.md"]
     A -- "continue research" --> A
+    A -- "scheduled or manual pause" --> R["Research audits"]
+    R -- "save reports and resume" --> A
     A -- "complete candidate" --> C["One root critic request"]
     C <--> B["Fresh independent bug-finding subagents"]
     C -- "reject: exact bugs and reset rounds" --> A
     C -- "edited pass below maximum" --> C
     C -- "unchanged pass or edited pass at maximum" --> L["LaTeX editor"]
-    L --> O["Final LaTeX output"]
+    L --> T["Compile PDF"]
+    T -- "compilation errors" --> F["Minor LaTeX fixes"]
+    F --> T
+    T -- "success" --> O["LaTeX source and PDF"]
     A -. "time limit or interruption" .-> P["Preserve files and continue later"]
 ```
+
+The workflow sidebar shows the author and research audits together, with the
+pause-and-resume route separate from the critic's repair loop. Audit activity,
+saved reports, disabled auditors, and availability warnings appear on the audit
+node; the author is marked paused while the auditors run.
 
 ### 1. Statement reviewer
 
@@ -422,7 +440,7 @@ approaches, using these records:
 | File | Contents |
 | --- | --- |
 | `INITIAL_PROMPT.md` | The permanent complete initial author prompt and exact statement. |
-| `APPROACHES/index.md` | A short table of linked node IDs and titles, parents, children, status, and result or remaining question. Its parent column defines the DAG. |
+| `APPROACHES/index.md` | A short navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. Optional for displaying the graph. |
 | `APPROACHES/A001-short-title.md` | One approach with linked Parents and Children, Status, **Context and objective**, and organized **Detailed work**. Each argument defines its terms and explains its relation to the task. |
 | `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
 | `AUDITS/` | Independent reports from the current audit batch only. |
@@ -430,9 +448,13 @@ approaches, using these records:
 
 The **Research files** panel presents the approach DAG as clickable nodes. Hover
 or focus a node to see its status, relationships, and result or open question;
-click it to read the corresponding file. The index table, node selector, collapsible
-sections, and Markdown links provide additional navigation. Older `INDEX.md` and
-`APPROACHES.md` layouts remain readable.
+click it to read the corresponding file. The graph reads each approach file's
+title, `Parents`, `Status`, and summary directly, and derives children from the
+parent links. It works without an index and refreshes when node files change.
+Missing parents, incomplete metadata, duplicate IDs, and cycles are reported.
+The optional index, node selector, collapsible sections, and Markdown links
+provide additional navigation. Older `INDEX.md` and `APPROACHES.md` documents
+remain readable.
 
 Statuses have precise scope: **ACTIVE** means under development; **BLOCKED** means
 unresolved with its obstacle recorded; **CLOSED** means an identified claim or

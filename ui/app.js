@@ -127,7 +127,7 @@ let memoryAnchor = "";
 let memoryVersion = "";
 let memoryTimer;
 let memoryRequest = 0;
-let approachIndex = { version: "", content: "", files: [] };
+let approachGraphData = { nodes: [], files: [], indexFile: "" };
 let approachGraphSignature = "";
 let researchAuditJob = null;
 let researchAuditDirty = false;
@@ -878,7 +878,7 @@ function memoryLinkTarget(href, from = memoryFile) {
   }
   const name = parts.join("/");
   if (!/^(?:PROVED\.md|APPROACHES\.md|audit\.md|APPROACHES\/(?:index|INDEX|A\d{3,}(?:-[A-Za-z0-9_-]+)?)\.md|(?:AUDITS|audit_history)\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md)$/.test(name)) return null;
-  return { name: /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "APPROACHES" : name, anchor };
+  return { name, anchor };
 }
 
 // Build inline Markdown with DOM nodes, never with HTML from a file.
@@ -1053,67 +1053,35 @@ function revealMemoryAnchor() {
   }
 }
 
-// The index parent column is authoritative. Only existing node files become buttons.
-function parseApproachGraph(content, files) {
-  const nodes = files.filter((name) => /^APPROACHES\/A\d{3,}(?:-[A-Za-z0-9_-]+)?\.md$/.test(name))
-    .map((name) => {
-      const filename = name.split("/").at(-1);
-      const id = filename.match(/^A\d+/)[0];
-      return { id, file: name, title: filename.replace(/\.md$/, "").replace(/^A\d+-?/, "").replace(/[-_]/g, " ") || id,
-        parents: [], children: [], status: "UNLISTED", result: "This file is not yet listed in the index.", indexed: false };
-    });
-  const byFile = new Map(nodes.map((node) => [node.file, node]));
-  const byId = new Map(nodes.map((node) => [node.id, node]));
+// Each node's own Parents field defines its incoming edges; the index is optional.
+function parseApproachGraph(records) {
+  const nodes = records.map(record => ({...record, parents: [...new Set(record.parents || [])],
+    title: plainMarkdown(record.title || record.id), children: [],
+    result: plainMarkdown(record.result || "No summary has been saved in this file yet.")}));
+  const counts = new Map();
+  for (const node of nodes) counts.set(node.id, (counts.get(node.id) || 0) + 1);
+  const byId = new Map(nodes.filter(node => counts.get(node.id) === 1).map(node => [node.id, node]));
   const warnings = [];
-  if (byId.size !== nodes.length) warnings.push("Some files share an approach ID; use unique stable IDs in the index.");
-  const lines = content.split(/\r?\n/);
-  for (let row = 0; row + 1 < lines.length; row += 1) {
-    if (!lines[row].includes("|") || !markdownTableDivider(lines[row + 1])) continue;
-    const headings = markdownTableCells(lines[row]).map((cell) => plainMarkdown(cell).toLowerCase());
-    const parentColumn = headings.findIndex((value) => /parent/.test(value));
-    if (parentColumn < 0) continue;
-    const statusColumn = headings.findIndex((value) => /status/.test(value));
-    const resultColumn = headings.findIndex((value) => /result|question|summary|outcome|obstacle/.test(value));
-    const titleColumn = headings.findIndex((value) => /title|approach|node/.test(value));
-    row += 1;
-    while (row + 1 < lines.length && lines[row + 1].trim() && lines[row + 1].includes("|")) {
-      const cells = markdownTableCells(lines[++row]);
-      // The node link belongs in its own identity/title cell, never the parent column.
-      const identityCells = [cells[0], titleColumn > 0 ? cells[titleColumn] : ""];
-      let linkedNode = null;
-      let label = "";
-      for (const cell of identityCells) {
-        for (const match of (cell || "").matchAll(/\[([^\]]+)\]\(([^()\s]+)\)/g)) {
-          const target = memoryLinkTarget(match[2], "APPROACHES/index.md");
-          if (target && byFile.has(target.name)) { linkedNode = byFile.get(target.name); label = match[1]; break; }
-        }
-        if (linkedNode) break;
-      }
-      if (!linkedNode) continue;
-      const node = linkedNode;
-      const title = plainMarkdown(titleColumn >= 0 ? cells[titleColumn] || label : label)
-        .replace(new RegExp(`^${node.id}\\b[\\s:—–-]*`), "").trim();
-      node.title = title || node.title;
-      node.parents = [...new Set((cells[parentColumn] || "").match(/\bA\d{3,}\b/g) || [])];
-      const status = plainMarkdown(cells[statusColumn] || "").toUpperCase();
-      node.status = ["ACTIVE", "BLOCKED", "CLOSED", "RESOLVED"].includes(status) ? status : "UNSPECIFIED";
-      node.result = plainMarkdown(cells[resultColumn] || "") || "No result or remaining question recorded in the index yet.";
-      node.indexed = true;
+  if (byId.size !== nodes.length) warnings.push("Some approach files share an ID; their ambiguous connections are not shown.");
+  for (const node of nodes) {
+    if (node.readStatus && node.readStatus !== "ready") warnings.push(`${node.id}: file temporarily unavailable; retrying on refresh.`);
+    else {
+      if (node.hasParents === false) warnings.push(`${node.id}: Parents field is missing; its dependencies are unknown.`);
+      if (node.status === "UNSPECIFIED") warnings.push(`${node.id}: Status field is missing or unrecognized.`);
     }
   }
   const edges = [];
   const missing = new Set();
   for (const node of nodes) {
+    if (!byId.has(node.id)) continue;
     for (const parent of node.parents) {
       if (byId.has(parent)) {
         edges.push({ from: parent, to: node.id });
         byId.get(parent).children.push(node.id);
-      } else missing.add(parent);
+      } else if (!counts.has(parent)) missing.add(parent);
     }
   }
   if (missing.size) warnings.push(`Parent files missing from the workspace: ${[...missing].join(", ")}.`);
-  const unlisted = nodes.filter((node) => !node.indexed).length;
-  if (unlisted) warnings.push(`${unlisted} ${unlisted === 1 ? "file is" : "files are"} not linked in the parent table; shown without inferred dependencies.`);
   const indegrees = new Map(nodes.map((node) => [node.id, 0]));
   for (const edge of edges) indegrees.set(edge.to, indegrees.get(edge.to) + 1);
   const queue = nodes.filter((node) => indegrees.get(node.id) === 0);
@@ -1129,7 +1097,7 @@ function parseApproachGraph(content, files) {
     }
   }
   if (visited < nodes.length) {
-    warnings.push("The parent table contains a cycle. Check the dependencies; cyclic nodes are displayed together.");
+    warnings.push("The approach files contain a dependency cycle. Check their Parents fields; cyclic nodes are displayed together.");
     const depth = Math.max(0, ...queue.map((node) => node.depth)) + 1;
     for (const node of nodes) if (indegrees.get(node.id) > 0) node.depth = depth;
   }
@@ -1147,7 +1115,7 @@ function inspectApproachNode(node) {
 }
 
 function renderApproachGraph() {
-  const signature = JSON.stringify([approachIndex.content, approachIndex.files]);
+  const signature = JSON.stringify(approachGraphData);
   if (signature === approachGraphSignature) {
     for (const button of ui.approachGraphCanvas.querySelectorAll("button")) {
       button.setAttribute("aria-current", String(button.dataset.file === memoryFile));
@@ -1155,12 +1123,14 @@ function renderApproachGraph() {
     return;
   }
   approachGraphSignature = signature;
-  const graph = parseApproachGraph(approachIndex.content, approachIndex.files);
+  const graph = parseApproachGraph(approachGraphData.nodes);
   ui.approachGraphSummary.textContent = graph.nodes.length
     ? `${graph.nodes.length} approach files · ${graph.edges.length} connections · Parent → child. Select a node to read its file.`
-    : "Saved approach files will appear here. The index parent table defines their connections.";
+    : "Saved approach files will appear here. Each file’s Parents field defines its connections.";
+  if (approachGraphData.status === "unavailable") graph.warnings.push("The approach folder is temporarily unavailable; retrying on refresh.");
   ui.approachGraphWarning.textContent = graph.warnings.join(" ");
   show(ui.approachGraphWarning, graph.warnings.length > 0);
+  show(ui.approachIndex, Boolean(approachGraphData.indexFile));
   ui.approachGraphCanvas.replaceChildren();
   ui.approachGraphInspector.textContent = "Hover or focus a node for its result and dependencies. Select it to read the full record.";
   const columnRows = new Map();
@@ -1224,15 +1194,18 @@ function renderApproachGraph() {
 
 function renderMemoryChoices(file) {
   const files = file.files || [];
+  const graphView = memoryFile.startsWith("APPROACHES");
   show(ui.memoryApproachPicker, files.length > 0);
   if (!files.length) return;
-  const selected = ["APPROACHES", "AUDITS", "audit_history"].includes(memoryFile) ? file.name : memoryFile;
-  const choices = files.includes(selected) ? files : [...files, selected];
+  const selected = ["AUDITS", "audit_history"].includes(memoryFile) ? file.name : memoryFile;
+  const available = graphView ? ["APPROACHES", ...files] : files;
+  const choices = available.includes(selected) ? available : [...available, selected];
   if (JSON.stringify([...ui.memoryApproach.options].map((option) => option.value)) !== JSON.stringify(choices)) {
     ui.memoryApproach.replaceChildren(...choices.map((name) => {
       const option = document.createElement("option");
       option.value = name;
-      option.textContent = /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "Index"
+      option.textContent = name === "APPROACHES" ? "Approach graph"
+        : /^APPROACHES\/(?:index|INDEX)\.md$/.test(name) ? "Index"
         : name === "APPROACHES.md" ? "Historical notebook"
           : name === "audit.md" ? "Historical audit notebook" : name.slice(name.lastIndexOf("/") + 1, -3);
       return option;
@@ -1247,18 +1220,25 @@ async function loadMemory() {
   const job = currentJob;
   const requestId = ++memoryRequest;
   try {
+    if (memoryFile.startsWith("APPROACHES")) {
+      const graph = await request(jobPath("/approach-graph"));
+      if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+      approachGraphData = graph;
+      renderApproachGraph();
+      renderMemoryChoices({files: graph.files});
+      if (memoryFile === "APPROACHES") {
+        ui.memoryMessage.textContent = graph.status === "unavailable"
+          ? "The approach folder is unavailable right now. Trying again shortly…"
+          : graph.nodes.length ? "Select an approach to read its saved work."
+            : "The author has not created any approach files yet.";
+        show(ui.memoryMessage, true);
+        ui.memoryUpdated.textContent = "";
+        return;
+      }
+    }
     const file = await request(jobPath("/memory", { file: memoryFile, version: memoryVersion }));
     if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
-    if (memoryFile.startsWith("APPROACHES")) {
-      const index = memoryFile === "APPROACHES" || /^APPROACHES\/(?:index|INDEX)\.md$/.test(memoryFile)
-        ? file : await request(jobPath("/memory", { file: "APPROACHES", version: approachIndex.version }));
-      if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
-      if (index.status === "ready" && /^APPROACHES\/(?:index|INDEX)\.md$/.test(index.name)) {
-        approachIndex = { version: index.version, files: index.files || [], content: index.unchanged ? approachIndex.content : index.content };
-      } else approachIndex = { version: "", content: "", files: index.files || [] };
-      renderApproachGraph();
-    }
-    renderMemoryChoices(file);
+    renderMemoryChoices(memoryFile.startsWith("APPROACHES") ? {...file, files: approachGraphData.files} : file);
     ui.memoryFilename.textContent = file.name;
     if (file.status === "ready") {
       if (!file.unchanged) {
@@ -1351,7 +1331,7 @@ function syncMemoryPanel() {
     memoryJob = identity;
     ++memoryRequest;
     clearTimeout(memoryTimer);
-    approachIndex = { version: "", content: "", files: [] };
+    approachGraphData = { nodes: [], files: [], indexFile: "" };
     approachGraphSignature = "";
     ui.memoryPanel.open = false;
     selectMemoryFile(memoryTabs[0]);
@@ -1522,7 +1502,7 @@ function ingest(entries, reset = false) {
   }
 }
 
-// Render the critic/repair cycle as a real loop, not five linear steps.
+// Show the author/audit cycle alongside the separate critic/repair cycle.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
   const latexOnly = ["latex", "final-resume"].includes(state.problemMode);
@@ -1533,34 +1513,58 @@ function renderWorkflow() {
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
   const seen = new Set(seenInThisJob);
+  const auditConfig = state.researchAudits || state.workflow?.settings?.research_audits || {};
+  const auditStatus = state.researchAuditStatus || {};
+  const selectedAuditors = (auditConfig.models || []).filter(model => model !== "none").length;
+  const runningAuditors = Array.isArray(auditStatus.runningSlots)
+    ? auditStatus.runningSlots.length : Number(auditStatus.runningSlots || 0);
+  const authorStage = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
+  const auditing = authorStage && ["running", "pausing", "paused"].includes(state.phase)
+    && Boolean(state.auditHoldingAuthor || auditStatus.batchActive || runningAuditors);
   const compiling = ["latex_compile", "latex_repair"].includes(state.activeNode);
   if (seen.has("latex_repair")) seen.add("latex_compile");
   if (criticResume) {
     seen.add("statement_reviewer");
     seen.add("author");
   }
-  const makeNode = (name, number) => {
-    const item = nodes[name];
+  const makeNode = (name, number, overrides = {}) => {
+    const item = overrides.item || nodes[name];
     const row = document.createElement("li");
     const current = state.activeNode === name || (name === "latex_compile" && compiling);
-    const active = state.phase !== "done" && current;
+    const paused = current && ["paused", "pausing"].includes(state.phase);
+    const active = ["running", "reviewing", "stopping"].includes(state.phase) && current;
     const failed = state.phase === "done" && current
       && (state.error || name === "failure_summary");
-    const status = active ? "active" : failed ? "failed"
-      : seen.has(name) ? "complete" : "";
+    const status = overrides.status ?? (paused ? "paused" : active ? "active" : failed ? "failed"
+      : seen.has(name) ? "complete" : "");
     row.className = `workflow-node ${status}`;
     row.dataset.node = name;
-    if (active) row.setAttribute("aria-current", "step");
+    if (status === "active") row.setAttribute("aria-current", "step");
     const dot = document.createElement("span");
     dot.className = "node-dot";
-    dot.textContent = failed ? "!" : seen.has(name) && !active ? "✓" : number;
+    dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ"
+      : status === "complete" ? "✓" : status === "disabled" ? "–" : number;
     const copy = document.createElement("div");
     copy.className = "node-copy";
     const title = document.createElement("strong");
     title.textContent = item.label;
     const description = document.createElement("span");
-    description.textContent = item.description;
+    const descriptions = {
+      author: "Explore approaches and build a proof.",
+      critic: "Check the proof, fix issues, or return bugs.",
+      latex_compile: "Compile, fix errors, and retry until a PDF is ready.",
+    };
+    description.textContent = descriptions[name] || item.description;
     copy.append(title, description);
+    const noteText = overrides.note || (paused ? (auditing
+      ? state.phase === "pausing" ? "Pausing for audits" : "Paused for audits" : "Paused")
+      : current && state.phase === "prepared" ? "Ready to start" : "");
+    if (noteText) {
+      const note = document.createElement("span");
+      note.className = "node-status";
+      note.textContent = noteText;
+      copy.append(note);
+    }
     if (name === "critic" && state.round) {
       const round = document.createElement("span");
       round.className = "node-round";
@@ -1573,12 +1577,6 @@ function renderWorkflow() {
       loaded.className = "node-resume-note";
       loaded.textContent = "Loaded from the source job";
       copy.append(loaded);
-    }
-    if (name === "failure_summary") {
-      const condition = document.createElement("span");
-      condition.className = "failure-condition";
-      condition.textContent = "At an interruption or time limit";
-      copy.append(condition);
     }
     row.append(dot, copy);
     return row;
@@ -1605,7 +1603,7 @@ function renderWorkflow() {
   loop.className = "workflow-loop";
   const loopTitle = document.createElement("strong");
   loopTitle.className = "loop-title";
-  loopTitle.textContent = "Author and critic";
+  loopTitle.textContent = "Research and verification";
   const loopNodes = document.createElement("ol");
   loopNodes.className = "loop-nodes";
   const candidateRoute = document.createElement("li");
@@ -1632,23 +1630,58 @@ function renderWorkflow() {
   selfRoute.className = "loop-self";
   selfRoute.textContent = "↻ Edited PASS → repeat below limit";
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
+  let authorGroup = author;
+  if (state.fileManagement !== false) {
+    authorGroup = document.createElement("li");
+    authorGroup.className = "author-audit-group";
+    const group = document.createElement("ol");
+    group.className = "author-audit-nodes" + (!selectedAuditors && !auditing ? " audits-disabled" : "");
+    group.setAttribute("aria-label", "Author and research audits: pause, audit, then resume the same author");
+    const warnings = (auditStatus.warnings || []).length;
+    const problem = warnings || auditStatus.batchError || auditStatus.lastError;
+    const latest = [...(state.trace || [])].reverse().find(entry => entry.kind === "research_audit"
+      && ["completed", "cancelled"].includes(entry.status) && (auditConfig.models || []).includes(entry.model));
+    const status = auditing ? "active" : !selectedAuditors ? "disabled" : problem ? "warning"
+      : latest?.status === "completed" ? "complete" : "";
+    const note = auditing ? (state.phase === "pausing" ? "Waiting for author"
+      : state.phase === "running" && !state.auditHoldingAuthor ? "Checking auditors" : runningAuditors
+        ? `${runningAuditors} auditor${runningAuditors === 1 ? "" : "s"} active` : "Finishing batch")
+      : !selectedAuditors ? "Disabled" : problem ? "Needs attention"
+        : latest?.status === "completed" ? "Reports saved" : latest?.status === "cancelled" ? "Cancelled"
+          : authorStage ? state.phase === "paused" ? "Ready while paused" : "Scheduled" : "Waiting for author";
+    const description = auditing ? (state.auditHoldingAuthor
+      ? "Review saved work, then resume the author." : "Check availability before pausing the author.")
+      : !selectedAuditors ? "Select auditors to review the author's work."
+        : `${selectedAuditors} selected · every ${auditConfig.intervalHours ?? 2} author hours or on demand.`;
+    const audit = makeNode("research_audit", "↻", {status, note,
+      item: {label: "Research audits", description}});
+    const connection = document.createElement("li");
+    connection.className = "audit-cycle-route";
+    connection.textContent = "⇄";
+    connection.setAttribute("aria-hidden", "true");
+    const caption = document.createElement("li");
+    caption.className = "audit-cycle-caption";
+    caption.textContent = "Pause author → audit → resume author";
+    group.append(author, connection, audit, caption);
+    authorGroup.append(group);
+  }
   const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
   passStem.className = "critic-pass-stem";
   passStem.setAttribute("aria-hidden", "true");
   loopNodes.append(
-    author, candidateRoute, critic, selfRoute, passStem, rejectRoute,
+    authorGroup, candidateRoute, critic, selfRoute, passStem, rejectRoute,
   );
   loop.append(loopTitle, loopNodes);
 
-  // Failure branches left; accepted proofs run directly from critic to editor.
+  // Accepted proofs continue to editing; interruptions retain saved progress.
   const branch = document.createElement("li");
   branch.className = "workflow-branch";
   const passRoute = arrow("Unchanged PASS or edited PASS at limit", true);
   passRoute.classList.add("critic-pass");
   const editor = makeNode("latex_editor", startsAtAuthor ? "3" : "4");
   editor.classList.add("post-loop");
-  branch.append(failureNode, failureRoute, loop, passRoute, editor);
+  branch.append(loop, passRoute, editor);
   if (nodes.latex_compile) {
     const compileRoute = arrow("Compile and check");
     compileRoute.classList.add("compile-route");
@@ -1656,6 +1689,9 @@ function renderWorkflow() {
     compiler.classList.add("compile-node");
     branch.append(compileRoute, compiler);
   }
+  failureRoute.className = "flow-arrow interruption-route";
+  failureRoute.textContent = "On interruption or time limit ↓";
+  branch.append(failureRoute, failureNode);
 
   if (startsAtAuthor) {
     ui.workflowNodes.replaceChildren(branch);
@@ -1748,7 +1784,7 @@ function renderResearchAudits(canEdit) {
     - Math.max(0, (progress.elapsedSeconds || 0) - (progress.lastStartedSeconds || 0))));
   const countdown = [Math.floor(remaining / 3600), Math.floor(remaining / 60) % 60, remaining % 60]
     .map((part) => String(part).padStart(2, "0")).join(":");
-  const auditing = Boolean(state.auditHoldingAuthor || (state.phase === "running" && status.batchActive))
+  const auditing = Boolean(state.auditHoldingAuthor || status.batchActive)
     || running > 0;
   const author = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
   ui.researchAuditCountdownLabel.textContent = auditing ? "Research audits" : "Next audit";
@@ -1758,10 +1794,12 @@ function renderResearchAudits(canEdit) {
     : state.phase === "running" ? "author time" : "paused";
   show(ui.researchAuditToolbar, Boolean((enabled || auditing) && author
     && ["running", "pausing", "paused"].includes(state.phase)));
-  ui.startResearchAudit.disabled = !author || state.phase !== "running" || !enabled || auditing
+  ui.startResearchAudit.disabled = !author || !["running", "paused"].includes(state.phase)
+    || state.manuallyStopped || !enabled || auditing || Boolean(status.batchActive)
     || researchAuditDirty || researchAuditSaving || researchAuditStarting;
   ui.startResearchAudit.textContent = researchAuditStarting ? "Starting…" : "Start audit now";
   ui.startResearchAudit.title = researchAuditDirty ? "Apply your audit settings first."
+    : state.phase === "paused" ? "Run the selected auditors now, then resume the author automatically."
     : "Run the selected auditors now and reset the audit interval.";
   renderResearchAuditActivity();
   const modelWarnings = Array.isArray(status.warnings) ? status.warnings : [];
@@ -1784,7 +1822,7 @@ function renderResearchAuditActivity() {
   const choices = state.workflow?.settings?.research_audits?.choices || [];
   const warnings = Array.isArray(status.warnings) ? status.warnings : [];
   const running = Array.isArray(status.runningSlots) ? status.runningSlots : [];
-  const live = Boolean(state.auditHoldingAuthor || (state.phase === "running" && status.batchActive));
+  const live = Boolean(state.auditHoldingAuthor || (["running", "paused"].includes(state.phase) && status.batchActive));
   const events = (state.trace || []).filter((entry) => entry.kind === "research_audit");
   const rows = (config.models || []).flatMap((model, index) => {
     if (model === "none") return [];
@@ -1892,7 +1930,7 @@ async function startResearchAudit() {
     if (job !== currentJob) return;
     researchAuditStarting = false;
     researchAuditFeedback = error.message === "Not found."
-      ? "Pause the author, restart the web UI, and resume to enable Start audit now."
+      ? "Pause the author and restart the web UI to enable Start audit now."
       : error.message;
     renderResearchAudits(!ui.researchAuditsControl.hidden);
   }
@@ -1909,7 +1947,8 @@ function render(next) {
   ingest(newEntries, !incremental);
 
   const phase = state.phase;
-  const auditHolding = Boolean(state.auditHoldingAuthor) && ["pausing", "paused"].includes(phase);
+  const auditHolding = Boolean(state.auditHoldingAuthor || state.researchAuditStatus?.batchActive)
+    && ["pausing", "paused"].includes(phase);
   const working = ["reviewing", "running", "stopping", "pausing"].includes(phase) || auditHolding;
   const reviewOnlyResult = phase === "done"
     && state.statementReviewOnly && Boolean(state.review);
@@ -2307,11 +2346,10 @@ ui.memoryPanel.addEventListener("toggle", () => {
   clearTimeout(memoryTimer);
   if (ui.memoryPanel.open) loadMemory();
 });
-ui.memoryApproach.onchange = () => selectMemoryDocument(
-  /^APPROACHES\/(?:index|INDEX)\.md$/.test(ui.memoryApproach.value)
-    ? "APPROACHES" : ui.memoryApproach.value,
-);
-ui.approachIndex.onclick = () => selectMemoryDocument("APPROACHES");
+ui.memoryApproach.onchange = () => selectMemoryDocument(ui.memoryApproach.value);
+ui.approachIndex.onclick = () => {
+  if (approachGraphData.indexFile) selectMemoryDocument(approachGraphData.indexFile);
+};
 for (const tab of memoryTabs) {
   tab.onclick = () => selectMemoryFile(tab);
   tab.onkeydown = (event) => {

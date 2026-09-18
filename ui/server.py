@@ -481,6 +481,40 @@ def restored_model(value):
     return LEGACY_MODEL_ALIASES.get(value, value)
 
 
+def approach_metadata(name, content):
+    """Extract graph labels from one node's own header and summary sections."""
+
+    identity = Path(name).name.split("-", 1)[0].removesuffix(".md")
+    fallback = Path(name).stem[len(identity):].lstrip("-").replace("-", " ") or identity
+    # Metadata belongs before the first section, not in examples or later prose.
+    header = re.split(r"(?m)^\s*##\s+", content, maxsplit=1)[0]
+    title = re.search(r"(?m)^#\s+(.+?)\s*$", header)
+    title = re.sub(r"^" + re.escape(identity) + r"\b[\s:—–-]*", "", title[1]) if title else fallback
+    fields = {}
+    for line in header.splitlines():
+        match = re.match(r"^\s*(Parents?|Children|Status)\s*:\s*(.*?)\s*$", line.replace("**", ""), re.I)
+        if match:
+            key = match[1].lower()
+            fields["parent" if key == "parents" else key] = match[2]
+    parents = list(dict.fromkeys(re.findall(r"\bA\d{3,}\b", fields.get("parent", ""))))
+    status = fields.get("status", "").strip().rstrip(".").upper()
+    if status == "PARKED":  # Older research notes used this name.
+        status = "BLOCKED"
+    if status not in {"ACTIVE", "BLOCKED", "CLOSED", "RESOLVED"}:
+        status = "UNSPECIFIED"
+    sections = re.split(r"(?m)^##\s+(.+?)\s*$", content)
+    summaries = {sections[i].strip().lower(): sections[i + 1].strip()
+                 for i in range(1, len(sections) - 1, 2)}
+    preferred = "obstacles" if status == "BLOCKED" else "conclusions" if status in {"CLOSED", "RESOLVED"} else "context and objective"
+    summary = summaries.get(preferred) or summaries.get("context and objective") or ""
+    summary = re.split(r"\n\s*\n", summary, maxsplit=1)[0].strip()
+    if len(summary) > 1000:
+        summary = summary[:997].rstrip() + "…"
+    return {"id": identity, "file": name, "title": title or fallback,
+            "parents": parents, "status": status, "result": summary,
+            "hasParents": "parent" in fields}
+
+
 class App:
     """Own one review-and-solve workflow."""
 
@@ -502,6 +536,7 @@ class App:
         self._audit_pause_engine = None
         self._checkpoint_cache = []
         self._checkpoint_cache_signature = None
+        self._approach_cache = {}
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -617,7 +652,7 @@ class App:
         self._start_research_audits(token)
         return worker
 
-    def _start_research_audits(self, token):
+    def _start_research_audits(self, token, *, paused=False):
         """Monitor optional audits separately from the workflow reader."""
 
         with self.lock:
@@ -625,8 +660,9 @@ class App:
                 # Automatic resume keeps the same audit clock and monitor.
                 self._audit_token = token
                 return
+            paused = paused and self.state["phase"] == "paused" and self.worker_token is None
             if (not self.state.get("fileManagement", True)
-                    or token is None or self.worker_token is not token or self._audit_token is token
+                    or (not paused and (token is None or self.worker_token is not token or self._audit_token is token))
                     or all(model == "none" for model in self.state["researchAudits"]["models"])):
                 return
             workspace = self.state.get("goalWorkspace") or self.run_dir
@@ -692,6 +728,7 @@ class App:
 
         try:
             threading.Thread(target=monitor, daemon=True).start()
+            return engine
         except Exception as exc:
             engine.close()
             with self.lock:
@@ -726,9 +763,11 @@ class App:
         """Wait for the author reader to settle before any audit reads its files."""
 
         with self.lock:
-            if (self.research_audits is not engine or self.state["phase"] != "running"
+            if (self.research_audits is not engine or self.state["phase"] not in {"running", "paused"}
                     or self.state["activeNode"] != "author" or self.state["stage"] not in {"solve", "repair"}):
                 return False
+            if self.state["phase"] == "paused":
+                return self.worker_token is None and self._audit_pause_engine is engine
             self._audit_pause_engine = engine
             self.state["auditHoldingAuthor"] = True
             self.pause(_for_audit=True)
@@ -760,7 +799,7 @@ class App:
                 self._audit_token = self._audit_pause_engine = None
             try:
                 if (self.state["phase"] == "paused" and self.worker_token is None
-                        and not self.state["error"] and self.state.get("goalThreadId")):
+                        and not self.state["error"]):
                     self.resume()
             except Exception as exc:
                 self.state["error"] = f"Audits finished, but the author could not resume: {exc}"
@@ -802,19 +841,35 @@ class App:
         with self.lock:
             if not self.state.get("fileManagement", True):
                 raise ValueError("Research audits require file management for this run.")
-            if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
-                    or self.state["stage"] not in {"solve", "repair"} or self.worker_token is None
+            paused = self.state["phase"] == "paused"
+            if (self.state["phase"] not in {"running", "paused"} or self.state["activeNode"] != "author"
+                    or self.state["stage"] not in {"solve", "repair"}
+                    or (self.worker_token is not None if paused else self.worker_token is None)
                     or self.state["manuallyStopped"] or self._audit_pause_engine is not None
                     or self.state["auditHoldingAuthor"]):
-                raise ValueError("Start an audit while the author is running.")
+                raise ValueError("Start an audit while the author is running or fully paused.")
             settings = self.state["researchAudits"]
             if all(model == "none" for model in settings["models"]):
                 raise ValueError("Select and save at least one auditor first.")
-            if self.research_audits is None:
-                self._start_research_audits(self.worker_token)
-            if self.research_audits is None:
+            if self.research_audits is not None and self.research_audits.status().get("batchActive"):
+                raise ValueError("A research audit batch is already in progress.")
+            if paused or self.research_audits is None:
+                if self._start_research_audits(self.worker_token, paused=paused) is None:
+                    raise ValueError("The research audit scheduler is unavailable.")
+            if self.research_audits is None or self.research_audits.closed:
                 raise ValueError("The research audit scheduler is unavailable.")
-            self.research_audits.update(settings, active=True, start_now=True)
+            previous_error = self.state["error"]
+            if paused:
+                # Reserve the paused workspace during preflight as well as the audit.
+                self._audit_pause_engine = self.research_audits
+                self.state.update(auditHoldingAuthor=True, error="")
+            try:
+                self.research_audits.update(settings, active=not paused, paused_for_audit=paused, start_now=True)
+            except Exception:
+                if paused:
+                    self._audit_pause_engine = None
+                    self.state.update(auditHoldingAuthor=False, error=previous_error)
+                raise
             self.state["researchAuditProgress"] = self.research_audits.checkpoint()
             self.state["researchAuditStatus"] = self.research_audits.status()
             self._save_job_settings(self.state)
@@ -974,7 +1029,7 @@ class App:
             )
         return value.strip() if isinstance(value, str) else ""
 
-    def memory_file(self, name, version=""):
+    def memory_file(self, name, version="", *, include_files=True, listing_only=False):
         """Display one author-owned file on demand, without modifying it."""
 
         approach = name in {"APPROACHES", "APPROACHES.md"} or bool(APPROACH_MEMORY_FILE.fullmatch(name))
@@ -991,7 +1046,8 @@ class App:
         result["workspace"] = directory.name
         try:
             if os.name == "nt":
-                return self._memory_file_portable(directory, name, version, result, approach)
+                return self._memory_file_portable(directory, name, version, result, approach,
+                                                  include_files=include_files, listing_only=listing_only)
             # Pin directories while reading so a concurrent rename or symlink swap
             # cannot redirect the viewer outside the selected author's workspace.
             with ExitStack() as opened:
@@ -1008,32 +1064,27 @@ class App:
                             return result
                         filename = "APPROACHES.md"
                         result["name"] = filename
+                        if listing_only:
+                            try:
+                                if stat.S_ISREG(os.stat(filename, dir_fd=parent, follow_symlinks=False).st_mode):
+                                    result["files"] = [filename]
+                            except FileNotFoundError:
+                                pass
                     else:
                         opened.callback(os.close, folder)
-                        entries = []
-                        names = os.listdir(folder)
-                        index = "index.md" if "index.md" in names else "INDEX.md"
-                        for entry in names:
-                            relative = f"APPROACHES/{entry}"
-                            if not APPROACH_MEMORY_FILE.fullmatch(relative) or entry in {"INDEX.md", "index.md"}:
-                                continue
-                            try:
-                                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
-                                    entries.append(relative)
-                            except FileNotFoundError:
-                                continue
-                        result["files"] = [f"APPROACHES/{index}", *sorted(entries)]
-                        try:
-                            if stat.S_ISREG(os.stat("APPROACHES.md", dir_fd=parent, follow_symlinks=False).st_mode):
-                                result["files"].append("APPROACHES.md")
-                        except FileNotFoundError:
-                            pass
-                        if name == "APPROACHES.md":
-                            filename = name
+                        if not include_files and APPROACH_MEMORY_FILE.fullmatch(name):
+                            # Read a known node without rescanning the whole directory.
+                            parent, filename = folder, name.split("/")[1]
                         else:
-                            parent = folder
-                            filename = index if name == "APPROACHES" else name.split("/")[1]
-                            result["name"] = f"APPROACHES/{filename}"
+                            self._list_approach_files(folder, parent, result, listing_only)
+                            index = next((Path(item).name for item in result["files"]
+                                          if Path(item).name in {"index.md", "INDEX.md"}), "INDEX.md")
+                            if name != "APPROACHES.md":
+                                parent = folder
+                                filename = index if name == "APPROACHES" else name.split("/")[1]
+                                result["name"] = f"APPROACHES/{filename}"
+                    if listing_only:
+                        return {**result, "status": "ready"}
                 elif audit:
                     result["files"] = []
                     try:
@@ -1084,7 +1135,55 @@ class App:
             return {**result, "status": "unavailable"}
 
     @staticmethod
-    def _memory_file_portable(directory, name, version, result, approach):
+    def _list_approach_files(folder, parent, result, existing_only):
+        names = os.listdir(folder)
+        index = "index.md" if "index.md" in names else "INDEX.md"
+        entries = []
+        for entry in names:
+            relative = f"APPROACHES/{entry}"
+            if not APPROACH_MEMORY_FILE.fullmatch(relative):
+                continue
+            try:
+                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
+                    entries.append(relative)
+            except FileNotFoundError:
+                continue
+        index_path = f"APPROACHES/{index}"
+        result["files"] = ([index_path] if not existing_only or index_path in entries else []) + sorted(
+            entry for entry in entries if Path(entry).name not in {"index.md", "INDEX.md"})
+        try:
+            if stat.S_ISREG(os.stat("APPROACHES.md", dir_fd=parent, follow_symlinks=False).st_mode):
+                result["files"].append("APPROACHES.md")
+        except FileNotFoundError:
+            pass
+
+    def approach_graph(self):
+        """Read node metadata independently of the optional index; cache unchanged files."""
+
+        with self.lock:
+            listing = self.memory_file("APPROACHES", listing_only=True)
+            files = listing.get("files", [])
+            cache, nodes = {}, []
+            for name in files:
+                if not re.fullmatch(r"APPROACHES/A\d{3,}(?:-[A-Za-z0-9_-]+)?\.md", name):
+                    continue
+                previous = self._approach_cache.get(name, {})
+                document = self.memory_file(name, previous.get("version", ""), include_files=False)
+                if document.get("unchanged"):
+                    cached = previous
+                else:
+                    node = approach_metadata(name, document.get("content", ""))
+                    node["readStatus"] = document["status"]
+                    # Failed reads must be retried even if the file's stat is unchanged.
+                    cached = {"version": document.get("version", "") if document["status"] == "ready" else "", "node": node}
+                cache[name] = cached
+                nodes.append(cached["node"])
+            self._approach_cache = cache
+            return {"nodes": nodes, "files": files, "status": listing["status"],
+                    "indexFile": next((name for name in files if Path(name).name in {"index.md", "INDEX.md"}), "")}
+
+    @staticmethod
+    def _memory_file_portable(directory, name, version, result, approach, *, include_files=True, listing_only=False):
         """Keep the read-only viewer available where directory descriptors are unsupported."""
 
         def linked(path):
@@ -1099,21 +1198,26 @@ class App:
             if folder.exists():
                 if not folder.is_dir():
                     return {**result, "status": "unavailable"}
-                entries = list(folder.iterdir())
+                entries = list(folder.iterdir()) if include_files else []
                 index = "index.md" if any(entry.name == "index.md" for entry in entries) else "INDEX.md"
-                result["files"] = [f"APPROACHES/{index}", *sorted(
+                index_path = folder / index
+                result["files"] = ([f"APPROACHES/{index}"] if not listing_only or (not linked(index_path) and index_path.is_file()) else []) + sorted(
                     f"APPROACHES/{entry.name}" for entry in entries
                     if entry.name not in {"INDEX.md", "index.md"} and APPROACH_MEMORY_FILE.fullmatch(f"APPROACHES/{entry.name}")
                     and not linked(entry) and entry.is_file()
-                )]
+                )
                 legacy = directory / "APPROACHES.md"
                 if not linked(legacy) and legacy.is_file():
                     result["files"].append("APPROACHES.md")
                 name = f"APPROACHES/{index}" if name == "APPROACHES" else name
             elif name == "APPROACHES":
                 name = "APPROACHES.md"
+                if listing_only and not linked(directory / name) and (directory / name).is_file():
+                    result["files"] = [name]
             result["name"] = name
             path = directory / name
+            if listing_only:
+                return {**result, "status": "ready"}
         elif name in {"AUDITS", "audit_history", "audit.md"} or AUDIT_MEMORY_FILE.fullmatch(name):
             audit_folder = "audit_history" if name in {"audit_history", "audit.md"} or name.startswith("audit_history/") else "AUDITS"
             folder = directory / audit_folder
@@ -3747,6 +3851,7 @@ class Server(ThreadingHTTPServer):
         for previous in self.jobs.values():
             if not previous.run_dir or not (
                 previous.has_active_worker()
+                or previous.state.get("auditHoldingAuthor")
                 or previous.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
             ):
                 continue
@@ -3761,6 +3866,16 @@ class Server(ThreadingHTTPServer):
             app = self.get_job(run_id)
             self._check_author_workspace_idle(app.run_dir)
             app.resume()
+        return app
+
+    def start_research_audit_job(self, run_id):
+        """Reserve a paused workspace before launching its auditors."""
+
+        with self.jobs_lock:
+            app = self.get_job(run_id)
+            if app.state["phase"] == "paused":
+                self._check_author_workspace_idle(app.run_dir)
+            app.start_research_audit_now()
         return app
 
     def resume_critic_job(self, run_id, include_audit_checkpoint=True):
@@ -4165,6 +4280,11 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             apps = list({id(app): app for app in self.jobs.values()}.values())
         for app in apps:
+            with app.lock:
+                app._audit_pause_engine = None
+                app.state["auditHoldingAuthor"] = False
+                if app.research_audits is not None:
+                    app.research_audits.close()
             if app.process:
                 try:
                     app.process.send_signal(signal.SIGINT)
@@ -4225,6 +4345,13 @@ class Handler(BaseHTTPRequestHandler):
                                  "application/pdf" if pdf else "application/x-tex; charset=utf-8",
                                  headers={"Content-Disposition": f'attachment; filename="final.{"pdf" if pdf else "tex"}"'})
             except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
+        if request.path == "/approach-graph":
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.get_job(run_id).approach_graph())
+            except ValueError as exc:
                 return self.send({"error": str(exc)}, status=400)
         if request.path == "/memory":
             if not self.authorized():
@@ -4300,6 +4427,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.delete_job(run_id))
             if request.path == "/resume":
                 app = self.server.resume_paused_job(run_id)
+            elif request.path == "/start-research-audit":
+                app = self.server.start_research_audit_job(run_id)
             elif request.path == "/resume-critic":
                 app = self.server.resume_critic_job(run_id)
             elif request.path == "/resume-checkpoint":
@@ -4322,8 +4451,6 @@ class Handler(BaseHTTPRequestHandler):
                 app.set_author_time_limit(body.get("hours"))
             elif request.path == "/set-research-audits":
                 app.set_research_audits(body)
-            elif request.path == "/start-research-audit":
-                app.start_research_audit_now()
             elif request.path == "/steer-author":
                 app.steer_author(body.get("instruction"))
             elif request.path == "/stop":
@@ -4336,7 +4463,7 @@ class Handler(BaseHTTPRequestHandler):
                 app.clear_trace()
             elif request.path not in {
                 "/review", "/direct", "/finalize",
-                "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
+                "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume", "/start-research-audit",
             }:
                 return self.send({"error": "Not found."}, status=404)
             self.send(app.snapshot())
