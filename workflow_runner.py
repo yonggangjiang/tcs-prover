@@ -60,7 +60,9 @@ _USAGE_KEYS = ("totalTokens", "inputTokens", "cachedInputTokens", "outputTokens"
 # Codex caps: bytes one tool call may inject, subagent concurrency, and the
 # provider usage window at which the run pauses itself instead of being cut off.
 DEFAULT_TOOL_OUTPUT_TOKENS = 6000
-DEFAULT_SUBAGENT_THREADS = 2
+# Codex concurrency slots for the author's session, counting the author itself:
+# 3 slots = the author plus at most two subagents at a time (Codex's own default is 4).
+DEFAULT_SUBAGENT_THREADS = 3
 DEFAULT_WEB_ACTIONS_PER_HOUR = 12
 DEFAULT_QUOTA_PAUSE_PERCENT = 90
 DEFAULT_SUBAGENT_CALL_CAP = 40

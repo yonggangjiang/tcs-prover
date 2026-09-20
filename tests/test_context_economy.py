@@ -199,7 +199,7 @@ class ProviderBudgetTests(ContextEconomyTests):
         config = next(p["config"] for m, p in runtime.rpc.calls if m == "thread/start")
         self.assertEqual(config["tool_output_token_limit"], module.DEFAULT_TOOL_OUTPUT_TOKENS)
         self.assertIs(config["include_apps_instructions"], False)
-        self.assertEqual(config["agents"], {"max_concurrent_threads_per_session": 2,
+        self.assertEqual(config["agents"], {"max_concurrent_threads_per_session": 3,
                                             "default_subagent_reasoning_effort": "high"})
         command = module.subprocess.Popen.call_args.args[0]
         # codex app-server has no --ignore-user-config flag (only `exec` does).

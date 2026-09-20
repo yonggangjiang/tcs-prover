@@ -174,7 +174,7 @@ to `workflow_runner.py` (or added to the launch options of a job):
 | `quota_pause_percent` | `90` | Pause the run when the provider's usage window (Codex `account/rateLimits` events) reaches this percentage, instead of being cut off mid-compaction; `0` disables. Each decile crossed is logged as a **Usage quota** status. |
 | `web_actions_per_hour` | `12` | Searches and page fetches across all threads per rolling hour; above it the author is told once per hour to stop searching. |
 | `tool_output_tokens` | `6000` | Codex `tool_output_token_limit`: the most one tool call can inject into the conversation. |
-| `subagent_threads` | `2` | Codex `agents.max_concurrent_threads_per_session` for the author's subagents. |
+| `subagent_threads` | `3` | Codex `agents.max_concurrent_threads_per_session`: concurrency slots for the author's session, counting the author itself, so `3` allows two subagents at a time (Codex's own default is `4`, i.e. three subagents). Applies to both the managed and the simple author prompt, because the author node enables `multi_agent` in both. Remove `multi_agent` from the author node's `features` in `workflows/author_critic.yaml` to disable subagents entirely. |
 | `subagent_effort` | inherit | Codex `agents.default_subagent_reasoning_effort`; set `high` to run verification and lookup subagents cheaper than the author (the prompt asks the author to request `ultra` only for new mathematics). |
 | `apps_instructions` | `false` | Keep Codex's app instructions out of the author's prompt prefix (they cost a few thousand cached tokens per call and the author never uses apps). |
 | `subagent_call_cap` | `40` | A subagent that has made this many model calls is asked to write its single report and stop. |
