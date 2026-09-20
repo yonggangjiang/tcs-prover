@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -34,15 +35,44 @@ MARKER = "[STATEMENT]"
 MODELS = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-pro")
 MODEL, EFFORT = "gpt-6-astra", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
-SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
+SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 MAX_CRITIC_ROUNDS = 100
 MAX_AUTHOR_HOURS = 168
 DEFAULT_AUTHOR_HOURS = MAX_AUTHOR_HOURS
 STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
+TOOLS = ROOT / "tools"
 _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
+# Optional lifecycle prompts: sent only when the workflow binds them.
+_GOAL_LIFECYCLE_OPTIONAL = ("pause", "checkpoint", "subagent_compaction")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
+# Context economics of the long-lived author thread. Every token in the
+# window is re-sent on every model call, so the window is capped explicitly
+# (Codex model_auto_compact_token_limit) and the author is asked to write a
+# PLAN checkpoint shortly before the cap is reached.
+DEFAULT_COMPACTION_TOKENS = 150000
+DEFAULT_CHECKPOINT_TOKENS = 120000
+TOKEN_REPORT_SECONDS = 600
+TOKEN_USAGE_FILENAME = "token-usage.json"
+UNSAVED_SUBAGENT_FILENAME = "unsaved-subagent-results.md"
+_USAGE_KEYS = ("totalTokens", "inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens")
+# Codex caps: bytes one tool call may inject, subagent concurrency, and the
+# provider usage window at which the run pauses itself instead of being cut off.
+DEFAULT_TOOL_OUTPUT_TOKENS = 6000
+DEFAULT_SUBAGENT_THREADS = 2
+DEFAULT_WEB_ACTIONS_PER_HOUR = 12
+DEFAULT_QUOTA_PAUSE_PERCENT = 90
+DEFAULT_SUBAGENT_CALL_CAP = 40
+DEFAULT_TURN_MINUTES_CAP = 45
+WEB_BUDGET_MESSAGE = (
+    "Web action budget reached: {count} searches or fetches in the last hour (budget {budget}). "
+    "Do not search or fetch again this hour. Use the pages you already saved and your records."
+)
+SUBAGENT_FINISH_MESSAGE = (
+    "You have used {calls} model calls, the budget for one task. Finish now: write your single RESULT "
+    "report with what you established and what remains open, send it to the root author, and stop."
+)
 
 
 DEEPSEEK_MODEL_CATALOG = ROOT / "deepseek-models.json"
@@ -214,11 +244,15 @@ def speed_arguments(speed, model=MODEL):
 
 
 def context_cache_arguments():
-    """Let each compaction window grow after its carried stable prefix."""
+    """Codex flags for the author's context window.
 
-    return [
-        "-c", 'model_auto_compact_token_limit_scope="body_after_prefix"',
-    ]
+    The window is governed by the explicit ``model_auto_compact_token_limit``
+    set on the thread (``compaction_tokens``); no scope override is passed, so
+    that limit bounds the whole context rather than only the part after the
+    carried prefix.
+    """
+
+    return []
 
 
 def prompt_file(path, default):
@@ -262,6 +296,8 @@ def environment(model=None):
     env["RUST_LOG"] = "error"
     env.pop("LOG_FORMAT", None)
     env.pop("RUST_BACKTRACE", None)
+    # The author reads its records through the capped record tool.
+    env["TCS_PROVER_TOOLS"] = str(TOOLS)
     return env
 
 
@@ -1083,7 +1119,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
     stage = stages["initial"]
-    values = dict(original_prompt=prompt, directory=directory,
+    values = dict(original_prompt=prompt, directory=directory, statement=str(options.get("goal_statement") or ""),
                   solution="", bugs="", round=0, revision_number=0, instruction=initial_instruction)
 
     def render(name):
@@ -1110,6 +1146,149 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     goal = {}
     pause_reason = ""
     last_usage = {}
+    # Turns this controller started; any other root turn was auto-started by the
+    # goal loop and receives the continuation instruction as a steer.
+    started_turns = set()
+    checkpoint_sent = False
+    compaction_tokens = _positive_int(options.get("compaction_tokens", DEFAULT_COMPACTION_TOKENS))
+    checkpoint_tokens = _positive_int(options.get("checkpoint_tokens", DEFAULT_CHECKPOINT_TOKENS))
+    token_budget = _positive_int(options.get("token_budget", 0))
+    output_token_budget = _positive_int(options.get("output_token_budget", 0))
+    # Final answers of subagents, kept so a fatal error cannot lose them.
+    child_answers = deque(maxlen=12)
+    meter = {"threads": {}, "calls": 0, "reported": time.monotonic(), "started": time.monotonic()}
+    tool_output_tokens = _positive_int(options.get("tool_output_tokens", DEFAULT_TOOL_OUTPUT_TOKENS))
+    subagent_threads = _positive_int(options.get("subagent_threads", DEFAULT_SUBAGENT_THREADS))
+    subagent_effort = str(options.get("subagent_effort") or "")
+    web_actions_per_hour = _positive_int(options.get("web_actions_per_hour", DEFAULT_WEB_ACTIONS_PER_HOUR))
+    quota_pause_percent = _positive_int(options.get("quota_pause_percent", DEFAULT_QUOTA_PAUSE_PERCENT))
+    web_actions = deque()
+    web_warned = [0.0]
+    quota = {"usedPercent": None, "resetsAt": None, "reported": -1, "checkpointed": False}
+    subagent_call_cap = _positive_int(options.get("subagent_call_cap", DEFAULT_SUBAGENT_CALL_CAP))
+    turn_minutes_cap = _positive_int(options.get("turn_minutes_cap", DEFAULT_TURN_MINUTES_CAP))
+    child_turns = {}
+    capped_children = set()
+    turn_started_at = [time.monotonic()]
+
+    def cap_subagent(owner, calls):
+        """Ask a subagent that exhausted its call budget to report and stop."""
+        if (not subagent_call_cap or owner in capped_children or owner == thread
+                or calls < subagent_call_cap or not child_turns.get(owner) or pausing.is_set()):
+            return
+        capped_children.add(owner)
+        emit("status", label="Subagent call cap", threadId=owner,
+             text=f"Subagent {owner} reached {calls} model calls; asked to report and stop.")
+        try:
+            steer(SUBAGENT_FINISH_MESSAGE.format(calls=calls), ("cap", owner), kind="subagent",
+                  target=owner, expected_turn=child_turns[owner])
+        except (runtime.Error, OSError) as exc:
+            emit("diagnostic", text=f"Could not cap subagent {owner}: {exc}")
+
+    def quota_update(params):
+        """Follow the provider's usage window; pause before it cuts the run off."""
+        primary = (params.get("rateLimits") or {}).get("primary") or {}
+        used = primary.get("usedPercent")
+        if isinstance(used, bool) or not isinstance(used, (int, float)):
+            return
+        quota["usedPercent"], quota["resetsAt"] = used, primary.get("resetsAt")
+        resets = _epoch_text(primary.get("resetsAt"))
+        step = int(used // 10)
+        if step > quota["reported"]:
+            quota["reported"] = step
+            emit("status", label="Usage quota", threadId=thread, usedPercent=used, resetsAt=primary.get("resetsAt"),
+                 text=f"Provider usage window at {used:g}% (resets {resets}).")
+        if quota_pause_percent and used >= quota_pause_percent:
+            raise runtime.Error(f"Usage quota at {used:g}% of the provider window; paused before the provider "
+                                f"cuts the run off. Resume after the reset ({resets}) or raise quota_pause_percent.")
+        if (quota_pause_percent and used >= quota_pause_percent - 5 and "checkpoint" in prompts
+                and not quota["checkpointed"] and state["turn"] and not pausing.is_set()):
+            # Ask for the PLAN now so the pause lands on saved work.
+            quota["checkpointed"] = True
+            steer(render("checkpoint"), ("checkpoint", state["turn"], "quota"), kind="checkpoint")
+
+    def web_action():
+        now = time.monotonic()
+        web_actions.append(now)
+        while web_actions and now - web_actions[0] > 3600:
+            web_actions.popleft()
+        if (web_actions_per_hour and len(web_actions) > web_actions_per_hour and now - web_warned[0] > 3600
+                and state["turn"] and not pausing.is_set()):
+            web_warned[0] = now
+            emit("status", label="Web action budget", threadId=thread,
+                 text=f"{len(web_actions)} web actions in the last hour; budget {web_actions_per_hour}.")
+            steer(WEB_BUDGET_MESSAGE.format(count=len(web_actions), budget=web_actions_per_hour),
+                  ("web", int(now)), kind="web")
+
+    def meter_totals():
+        totals = {key: 0 for key in _USAGE_KEYS}
+        for entry in meter["threads"].values():
+            for key in _USAGE_KEYS:
+                totals[key] += entry["base"].get(key, 0) + entry["current"].get(key, 0)
+        totals["calls"] = meter["calls"]
+        totals["threads"] = len(meter["threads"])
+        totals["elapsedSeconds"] = round(time.monotonic() - meter["started"], 1)
+        return totals
+
+    def meter_update(params):
+        """Account every thread's usage; pause the run when a budget is exceeded."""
+        usage = (params.get("tokenUsage") or {}).get("total") or {}
+        if not isinstance(usage, dict):
+            return
+        owner = params.get("threadId") or "unknown"
+        entry = meter["threads"].setdefault(owner, {"base": {key: 0 for key in _USAGE_KEYS}, "current": {}, "calls": 0})
+        current = {key: _positive_int(usage.get(key, 0)) for key in _USAGE_KEYS}
+        previous = entry["current"]
+        if previous == current or not any(current.values()):
+            # Codex re-emits the same cumulative usage (and zero-usage compaction markers).
+            return
+        if previous and current["totalTokens"] < previous.get("totalTokens", 0):
+            # The thread's counter restarted (resume or new session); keep the old total.
+            for key in _USAGE_KEYS:
+                entry["base"][key] += previous.get(key, 0)
+        entry["current"] = current
+        entry["calls"] += 1
+        meter["calls"] += 1
+        cap_subagent(owner, entry["calls"])
+        totals = meter_totals()
+        exceeded = ""
+        if token_budget and totals["totalTokens"] >= token_budget:
+            exceeded = f"total tokens {totals['totalTokens']:,} reached the budget of {token_budget:,}"
+        elif output_token_budget and totals["outputTokens"] >= output_token_budget:
+            exceeded = f"output tokens {totals['outputTokens']:,} reached the budget of {output_token_budget:,}"
+        now = time.monotonic()
+        if exceeded or now - meter["reported"] >= TOKEN_REPORT_SECONDS:
+            meter["reported"] = now
+            emit("status", label="Token meter", threadId=thread, usage=totals,
+                 text=(f"{totals['calls']} model calls across {totals['threads']} thread(s): "
+                       f"{totals['inputTokens']:,} input ({totals['cachedInputTokens']:,} cached), "
+                       f"{totals['outputTokens']:,} output ({totals['reasoningOutputTokens']:,} reasoning)."))
+            try:
+                _private_atomic_write(Path(directory) / TOKEN_USAGE_FILENAME, json.dumps(
+                    {"totals": totals, "quota": {"usedPercent": quota["usedPercent"], "resetsAt": quota["resetsAt"]},
+                     "threads": {key: {**{k: value["base"].get(k, 0) + value["current"].get(k, 0) for k in _USAGE_KEYS},
+                                       "calls": value["calls"]}
+                                 for key, value in meter["threads"].items()}}, indent=2))
+            except OSError as exc:
+                emit("diagnostic", text=f"Could not save the token meter: {exc}")
+        if exceeded:
+            raise runtime.Error(f"Token budget reached: {exceeded}. Raise token_budget or output_token_budget to continue.")
+
+    def flush_child_answers(reason):
+        if not child_answers:
+            return
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        parts = [f"\n\n## Unsaved subagent results at {stamp}\n\nReason: {reason}\n"]
+        for owner, text_value in list(child_answers):
+            parts.append(f"\n### Thread {owner}\n\n{text_value.strip()}\n")
+        try:
+            with open(Path(directory) / UNSAVED_SUBAGENT_FILENAME, "a", encoding="utf-8") as stream:
+                stream.write("".join(parts))
+            emit("status", label="Unsaved subagent results kept",
+                 text=f"Saved {len(child_answers)} subagent result(s) to {UNSAVED_SUBAGENT_FILENAME}.", threadId=thread)
+        except OSError as exc:
+            emit("diagnostic", text=f"Could not save subagent results: {exc}")
+        child_answers.clear()
 
     def is_root(message):
         params = message.get("params") or {}
@@ -1132,14 +1311,21 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if event is not None:
             emit("codex_event", event=event, root=is_root(event))
 
-    def steer(instruction, identity, compaction=False):
+    def steer(instruction, identity, compaction=False, kind=None, target=None, expected_turn=None):
+        kind = kind or ("compaction" if compaction else "steer")
+        target = target or thread
         request = rpc.request("turn/steer", {
-            "threadId": thread, "expectedTurnId": state["turn"],
+            "threadId": target, "expectedTurnId": state["turn"] if expected_turn is None else expected_turn,
             "input": [{"type": "text", "text": instruction}],
         })
-        pending_steers[request] = (identity, instruction, compaction)
-        emit("request", label="Author context re-anchor after compaction" if compaction
-             else "Live author instruction sent", text=instruction, threadId=thread)
+        pending_steers[request] = (identity, instruction, kind)
+        labels = {"compaction": "Author context re-anchor after compaction",
+                  "steer": "Live author instruction sent",
+                  "continuation": "Continuation instruction sent",
+                  "checkpoint": "Pre-compaction checkpoint requested",
+                  "subagent": "Subagent re-anchor after compaction",
+                  "web": "Web action budget reached"}
+        emit("request", label=labels.get(kind, "Instruction sent"), text=instruction, threadId=target)
 
     def watch():
         pause_started = None
@@ -1196,6 +1382,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         result = rpc.call("turn/start", {"threadId": thread, "cwd": str(directory),
             "input": [{"type": "text", "text": instruction}], "summary": summary})
         state["turn"] = (result.get("turn") or {}).get("id")
+        if state["turn"]:
+            started_turns.add(state["turn"])
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         if not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
@@ -1238,6 +1426,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
                 "web_search": "live", "tools": {"web_search": True},
+                **({"model_auto_compact_token_limit": compaction_tokens} if compaction_tokens else {}),
+                **({"tool_output_token_limit": tool_output_tokens} if tool_output_tokens else {}),
+                # Codex app instructions are a few thousand cached tokens on every
+                # call and the author never uses apps.
+                **({} if options.get("apps_instructions") else {"include_apps_instructions": False}),
+                **({"agents": {**({"max_concurrent_threads_per_session": subagent_threads} if subagent_threads else {}),
+                               **({"default_subagent_reasoning_effort": subagent_effort} if subagent_effort else {})}}
+                   if "multi_agent" in features and (subagent_threads or subagent_effort) else {}),
                 "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
                              **{feature: True for feature in features}}},
         }
@@ -1277,26 +1473,69 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 raise runtime.Error("Workflow time limit reached.")
             message = rpc.read()
             params = message.get("params", {})
+            if message.get("method") == "thread/tokenUsage/updated" and isinstance(params, dict):
+                meter_update(params)
+            elif message.get("method") == "account/rateLimits/updated" and isinstance(params, dict):
+                quota_update(params)
+            elif (message.get("method") == "item/completed" and isinstance(params, dict)
+                    and (params.get("item") or {}).get("type") == "webSearch"):
+                web_action()
             if not is_root(message):
+                # Subagent traffic: keep final answers, re-anchor compacted subagents.
+                if message.get("method") == "turn/started" and isinstance(params, dict):
+                    child_turn = params.get("turn") or {}
+                    child = params.get("threadId") or child_turn.get("threadId")
+                    if child and child_turn.get("id"):
+                        child_turns[child] = child_turn["id"]
+                if message.get("method") == "item/completed" and isinstance(params, dict):
+                    item = params.get("item") or {}
+                    owner = params.get("threadId") or item.get("threadId")
+                    if (item.get("type") in {"agentMessage", "agent_message"}
+                            and item.get("phase") in {None, "final_answer"}
+                            and isinstance(item.get("text"), str) and item["text"].strip()):
+                        child_answers.append((owner or "subagent", item["text"]))
+                    if (item.get("type") == "contextCompaction" and "subagent_compaction" in prompts
+                            and owner and owner != thread and not pausing.is_set()):
+                        key = ("subagent", owner, params.get("turnId"), item.get("id"))
+                        if key not in seen_compactions:
+                            seen_compactions.add(key)
+                            try:
+                                steer(render("subagent_compaction"), key, kind="subagent",
+                                      target=owner, expected_turn=params.get("turnId"))
+                            except (runtime.Error, OSError) as exc:
+                                emit("diagnostic", text=f"Could not re-anchor subagent {owner}: {exc}")
                 continue
             request = message.get("id")
             if request in pending_steers and "method" not in message:
-                identity, instruction, compaction = pending_steers.pop(request)
+                identity, instruction, kind = pending_steers.pop(request)
                 if "error" in message:
-                    if compaction:
+                    if kind == "compaction":
                         pending_compaction = instruction
                     emit("diagnostic", text=f"Instruction raced with turn completion: {message['error']}")
-                elif not compaction:
+                elif kind == "steer":
                     state["steer"] = identity
                     emit("status", label="Author instruction accepted", authorSteerDelivered=identity,
                          text="The current conversation has received the live instruction.", threadId=thread)
             method, turn = message.get("method"), params.get("turn") or {}
+            if ("checkpoint" in prompts and turn_minutes_cap and not checkpoint_sent and state["turn"] and running
+                    and not pausing.is_set() and time.monotonic() - turn_started_at[0] >= turn_minutes_cap * 60):
+                # A very long turn is where unrecorded reasoning piles up; ask for the PLAN.
+                checkpoint_sent = True
+                steer(render("checkpoint"), ("checkpoint", state["turn"], "time"), kind="checkpoint")
             if method == "turn/started":
                 running, answers = True, []
                 state["turn"] = turn.get("id")
+                turn_started_at[0] = time.monotonic()
+                checkpoint_sent = False
                 if pending_compaction and state["turn"] and not pausing.is_set():
                     steer(pending_compaction, "retry", True)
                     pending_compaction = None
+                if (state["turn"] and state["turn"] not in started_turns and "continuation" in prompts
+                        and options.get("continuation_steer", True) and not pausing.is_set()):
+                    # The goal loop reopened the turn by itself; deliver the continuation
+                    # instruction so the author re-derives its plan instead of drifting.
+                    started_turns.add(state["turn"])
+                    steer(render("continuation"), ("continuation", state["turn"]), kind="continuation")
             elif method == "item/completed":
                 item = params.get("item") or {}
                 collect(item, answers)
@@ -1304,6 +1543,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     key = (params.get("turnId"), item.get("id"))
                     if key not in seen_compactions:
                         seen_compactions.add(key)
+                        checkpoint_sent = False
                         state["turn"] = params.get("turnId") or state["turn"]
                         pending_compaction = render("compaction")
                         if state["turn"]:
@@ -1313,6 +1553,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 status = (params.get("goal") or {}).get("status")
             elif method == "thread/tokenUsage/updated":
                 last_usage = (params.get("tokenUsage") or {}).get("last") or {}
+                if ("checkpoint" in prompts and checkpoint_tokens and not checkpoint_sent and state["turn"]
+                        and not pausing.is_set() and _positive_int(last_usage.get("inputTokens", 0)) >= checkpoint_tokens):
+                    checkpoint_sent = True
+                    steer(render("checkpoint"), ("checkpoint", state["turn"]), kind="checkpoint")
             elif method == "turn/completed":
                 running, state["turn"] = False, None
                 if last_usage and hasattr(runtime, "emit_cache_usage"):
@@ -1357,6 +1601,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             pause_reason = "Workflow time limit reached." if expired.is_set() else (str(exc) or type(exc).__name__)
             emit("diagnostic", text=pause_reason, threadId=thread)
             emit("status", label="Author paused", text=pause_reason, threadId=thread)
+            flush_child_answers(pause_reason)
     finally:
         stop.set()
         if rpc and thread and state["active"]:
@@ -1372,6 +1617,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             runtime.stop_process(process)
     if pausing.is_set():
         raise WorkflowPaused(pause_reason or "Workflow paused.", reason=pause_reason, thread_id=thread)
+
+
+def _epoch_text(value):
+    """Render a provider epoch timestamp for a status line."""
+
+    try:
+        return datetime.fromtimestamp(float(value), timezone.utc).isoformat(timespec="minutes")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "at an unknown time"
+
+
+def _positive_int(value):
+    """Read a nonnegative integer option; anything else counts as zero."""
+
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
 
 
 def _sha256(value):
@@ -1946,7 +2210,7 @@ def load_workflow(path):
             if isinstance(lifecycle, list) and all(isinstance(key, str) for key in lifecycle):
                 lifecycle = {key: key for key in lifecycle}
             required = set(_GOAL_LIFECYCLE)
-            if not isinstance(lifecycle, dict) or not required <= set(lifecycle) or set(lifecycle) - required - {"pause"} or not all(
+            if not isinstance(lifecycle, dict) or not required <= set(lifecycle) or set(lifecycle) - required - set(_GOAL_LIFECYCLE_OPTIONAL) or not all(
                 isinstance(ref, str) and ref in prompts for ref in lifecycle.values()
             ):
                 raise ValueError(f"Goal node {name} must bind its lifecycle prompts.")
@@ -2066,7 +2330,7 @@ def prepare(workflow, options):
         else:
             if options.get("author_input") is None and prompts[node["prompt"]].count(node["marker"]) != 1:
                 raise ValueError(f"Goal prompt must contain exactly one {node['marker']}.")
-            fields = {"original_prompt", "directory", "solution", "bugs", "round", "revision_number", "instruction"} | set(node["resume"])
+            fields = {"original_prompt", "directory", "statement", "solution", "bugs", "round", "revision_number", "instruction"} | set(node["resume"])
             if "recovery" in node:
                 _template_parts(prompts[node["recovery"]["prompt"]], fields)
             lifecycle = node["lifecycle"]
@@ -2319,9 +2583,10 @@ def _execute(workflow, state, options, prompts):
                     if recovery and evaluate(recovery["when"], context):
                         feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
                         instruction = render_template(prompts[recovery["prompt"]], {
-                            "original_prompt": prompt, "directory": str(directory),
+                            "original_prompt": prompt, "directory": str(directory), "statement": task,
                             "instruction": "", "revision_number": 1, **feedback,
                         })
+                    options["goal_statement"] = task
                     session = goal_session(
                         sys.modules[__name__], prompt, prompts=session_prompts,
                         settings=_settings(node, options), options=options,

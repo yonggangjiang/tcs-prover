@@ -16,7 +16,7 @@ hides research records and scheduled audits. The critic and LaTeX writer still r
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
 attempt history, and proved results across interruptions or context compaction.
-Astra with Ultra reasoning and Fast generation are the defaults for every
+Astra with Ultra reasoning and Standard generation are the defaults for every
 role. DeepSeek V4 Pro is an additional
 model option that uses the same harness pipeline through DeepSeek's official
 API.
@@ -37,7 +37,7 @@ python3 -m pip install -r requirements.txt
 python3 web_ui.py
 ```
 
-The Web UI opens locally with Astra, Ultra, and Fast defaults for
+The Web UI opens locally with Astra, Ultra, and Standard-speed defaults for
 the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
 is needed only when you select DeepSeek for one or more roles.
 
@@ -123,7 +123,7 @@ This sends the entire file directly to the proof author, exactly like enabling
 open a browser. With no command-line overrides, it uses the same defaults as the
 web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
 limit, Astra and Ultra for all proof
-roles, the built-in role prompts, and Fast generation speed. The
+roles, the built-in role prompts, and Standard generation speed. The
 activity log requests concise public reasoning summaries by default.
 
 ### Optional settings
@@ -148,7 +148,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
 | `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
-| `-speedMode MODE` | `fast` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation. DeepSeek calls always use standard service because Fast is provider-specific. |
+| `-speedMode MODE` | `standard` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation. DeepSeek calls always use standard service because Fast is provider-specific. |
 | `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. |
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
@@ -156,6 +156,60 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 
 Prompt-file paths are resolved from the terminal's current working directory.
 Run `python3 web_ui.py --help` to see every spelling and allowed value.
+
+### Context economy, budgets, and the record tool
+
+The author's conversation is re-sent on every model call, so the harness now
+manages the context explicitly. These options are passed with `--set NAME=VALUE`
+to `workflow_runner.py` (or added to the launch options of a job):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `compaction_tokens` | `150000` | Codex `model_auto_compact_token_limit` for the author thread; `0` leaves the provider default. |
+| `checkpoint_tokens` | `120000` | When the last request's input reaches this size, the author is asked once per window to rewrite its PLAN before the compaction. |
+| `token_budget` | unlimited | Total tokens across the author and all subagent threads; reaching it pauses the run like the time limit. |
+| `output_token_budget` | unlimited | The same for output tokens. |
+| `continuation_steer` | `true` | Deliver the `continuation` prompt into every turn the goal loop reopens by itself, so the author re-derives its PLAN instead of drifting. |
+| `turn_minutes_cap` | `45` | A root turn older than this receives the checkpoint request once, so a long turn writes its PLAN before it loses it. |
+| `quota_pause_percent` | `90` | Pause the run when the provider's usage window (Codex `account/rateLimits` events) reaches this percentage, instead of being cut off mid-compaction; `0` disables. Each decile crossed is logged as a **Usage quota** status. |
+| `web_actions_per_hour` | `12` | Searches and page fetches across all threads per rolling hour; above it the author is told once per hour to stop searching. |
+| `tool_output_tokens` | `6000` | Codex `tool_output_token_limit`: the most one tool call can inject into the conversation. |
+| `subagent_threads` | `2` | Codex `agents.max_concurrent_threads_per_session` for the author's subagents. |
+| `subagent_effort` | inherit | Codex `agents.default_subagent_reasoning_effort`; set `high` to run verification and lookup subagents cheaper than the author (the prompt asks the author to request `ultra` only for new mathematics). |
+| `apps_instructions` | `false` | Keep Codex's app instructions out of the author's prompt prefix (they cost a few thousand cached tokens per call and the author never uses apps). |
+| `subagent_call_cap` | `40` | A subagent that has made this many model calls is asked to write its single report and stop. |
+
+Note that `codex app-server` still loads `~/.codex/config.toml`; the runner passes
+`service_tier="fast"` only for Fast mode, so a `service_tier = "priority"` line in
+that file would silently keep Standard runs on the priority tier. Remove it there
+when you want Standard pricing.
+
+The controller emits a **Token meter** status every ten minutes and writes
+`token-usage.json` (totals and per-thread usage) into the run directory.
+The meter counts each thread's real calls (Codex re-emits cumulative usage, which
+is ignored). Subagents whose context is compacted receive the `subagent_compaction`
+prompt on their own thread, and the compaction message to the author carries the
+exact statement, so `INITIAL_PROMPT.md` never has to be re-read. If the run dies on an error, the last subagent results that
+never reached the records are appended to `unsaved-subagent-results.md`.
+
+`tools/records.py` prints capped views of the records: `overview` (PLAN, live
+nodes, settled node IDs, lemma IDs and which lack a `**Verified.**` line, audit
+state; `--full` lists everything), `node A012 [A019 ...] [--section ...]`,
+`lemma L034 [L035 ...] [--full]`, `brief L034` (a verification packet: the lemma in
+full plus the statements it cites, for a single-task verifier subagent), `grep
+PATTERN`, `audits`, and `validate` (index rows, statuses, headers, links, and
+parent/child reciprocity, replacing the ad-hoc checker scripts the author used to
+write). The author prompt requires it
+in place of `cat`, limits web fetches, and uses only single-task subagents with a
+short brief (verification once per lemma, at most two subagents at a time).
+
+Research audits are time-boxed (`timeoutMinutes` in `workflows/research_audit.yaml`,
+default 25) and return machine-readable `VERDICT`, `DIRECTION`, and `PREMISE`
+lines that the controller merges into `audit-digest.md`. Each batch also runs a
+**fresh-eyes solver** (`solver:` in the same file) that sees only the statement
+and a one-page brief of the PLAN and lemma statements, never the records, and
+must propose a complete candidate algorithm; its report lands in `AUDITS/` as
+`*-fresh-eyes-*.md`. Set `solver.enabled: false` to disable it.
 
 ## How to use checkpoints
 
@@ -440,10 +494,12 @@ approaches, using these records:
 | File | Contents |
 | --- | --- |
 | `INITIAL_PROMPT.md` | The permanent complete initial author prompt and exact statement. |
-| `APPROACHES/index.md` | A short navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. Optional for displaying the graph. |
-| `APPROACHES/A001-short-title.md` | One approach with linked Parents and Children, Status, **Context and objective**, and organized **Detailed work**. Each argument defines its terms and explains its relation to the task. |
+| `APPROACHES/index.md` | A mandatory `## PLAN` section (target, best route, the single MISSING step, the weakest sufficient object, object-or-process, an existence ledger, a formulation ledger, call and branch budgets, audit responses), rewritten from scratch every turn, followed by the navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. |
+| `APPROACHES/A001-short-title.md` | One approach with a one-sentence Abstract, linked Parents and Children, Status, whether it closes the PLAN's MISSING step, **Context and objective**, organized **Detailed work**, and **Obstacles** (where negative results about the author's own sub-proposals live). Openings stay short and link lemma IDs instead of restating them. |
 | `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
-| `AUDITS/` | Independent reports from the current audit batch only. |
+| `AUDITS/` | Independent reports from the current audit batch only, plus the fresh-eyes solver report (`*-fresh-eyes-*.md`). |
+| `audit-digest.md` | The controller's one-page merge of the current batch: verdict tallies per node, directions, premise gaps, and executive summaries. The author reads this first. |
+| `token-usage.json`, `unsaved-subagent-results.md` | Controller-managed: the cross-thread token meter, and subagent results salvaged when a run dies on an error. |
 | `audit_history/` | Previous audit reports, moved here by the controller when the next batch starts. |
 
 The **Research files** panel presents the approach DAG as clickable nodes. Hover
@@ -472,8 +528,10 @@ their advice. Provider failures leave earlier reports safely in history. Legacy
 `audit.md` remains available under audit history.
 
 The author creates and maintains its mathematical records. On managed-mode
-compaction or resumption it reads `INITIAL_PROMPT.md` and recovers the relevant
-work from that layout. The runner retains the conversation and operational
+compaction or resumption it recovers with one call of the capped record tool
+(`tools/records.py overview`, exported to the author as `$TCS_PROVER_TOOLS`)
+instead of re-reading whole files; the controller's compaction message repeats
+the strategy rules it must keep. The runner retains the conversation and operational
 checkpoints. `--resume-research` continues saved author work with a fresh budget.
 
 ### 3. Critic loop

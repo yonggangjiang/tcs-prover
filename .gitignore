@@ -13,5 +13,7 @@
 !requirements.txt
 !tests/
 !tests/*.py
+!tools/
+!tools/**/*
 **/__pycache__/
 *.pyc
