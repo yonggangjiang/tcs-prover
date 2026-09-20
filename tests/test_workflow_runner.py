@@ -40,7 +40,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(settings['features'], ['multi_agent'])
             value = review_report()
         elif 'latex' in schema['properties']:
-            value = {'latex': LATEX}
+            value = {'latex': LATEX, 'verdict': 'preserved', 'bugs': ''}
         else:
             raise AssertionError(stage)
         runtime.validate_json_schema(value, schema)
@@ -70,8 +70,11 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(self.goal_calls), 1)
             self.assertFalse((directory/'research.sqlite3').exists())
 
-    def test_edited_pass_repeats_to_max_then_outputs_latest_proof(self):
-        reports, events = [], []
+    def test_edited_pass_at_limit_returns_to_author_without_approval(self):
+        reports, events, recoveries = [], [], []
+        def author(runtime, prompt, **settings):
+            recoveries.append(settings['initial_instruction'])
+            yield {'outcome': 'failure', 'output': 'Still unresolved'}
         def model(prompt, schema, stage, **settings):
             self.assertEqual(stage, 'critic')
             self.assertEqual(settings['features'], ['multi_agent'])
@@ -79,17 +82,19 @@ class PipelineTests(unittest.TestCase):
             report = review_report(PROOF + ' repaired' * (len(reports) + 1))
             reports.append(report)
             return report, json.dumps(report)
-        with workspace() as directory, patch.object(runtime, 'structured', side_effect=model), patch.object(runtime, 'emit', side_effect=lambda *args, **kwargs: events.append((args, kwargs))):
+        with workspace() as directory, patch.object(runtime, 'goal_session', side_effect=author), patch.object(runtime, 'structured', side_effect=model), patch.object(runtime, 'emit', side_effect=lambda *args, **kwargs: events.append((args, kwargs))):
             state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],
                 {'statement': 'Task', 'solution': PROOF}, {'start_node': 'critic', 'critic_rounds': 3})
-            self.assertFalse(state.get('failed'))
+            self.assertTrue(state['failed'])
+            self.assertFalse(state['proof_verified'])
             self.assertEqual(len(reports), 3)
-            self.assertEqual(state['output'], PROOF + ' repaired' * 3)
-            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), state['output'])
+            self.assertEqual(state['output'], '')
+            self.assertEqual(state['solution'], PROOF + ' repaired' * 3)
+            self.assertEqual((directory/'saved-candidate.md').read_text().strip(), state['solution'])
+            self.assertEqual(len(recoveries), 1)
+            self.assertIn('has not received an unchanged acceptance', recoveries[0])
             approvals = [i for i, (_, fields) in enumerate(events) if fields.get('label') == 'Critic approved']
-            critic_results = [i for i, (args, _) in enumerate(events) if args[0] == 'critic_result']
-            self.assertEqual(len(approvals), 1)
-            self.assertGreater(approvals[0], critic_results[-1])
+            self.assertEqual(approvals, [])
 
     def test_unchanged_pass_after_repair_finishes_before_max(self):
         repaired = PROOF + ' repaired'
@@ -112,7 +117,7 @@ class PipelineTests(unittest.TestCase):
             if len(rounds) == 2:
                 report = review_report(PROOF + ' safe repair', verdict='reject')
             else:
-                report = review_report((PROOF if len(rounds) == 1 else revised) + ' repaired' * len(rounds))
+                report = review_report((PROOF if len(rounds) == 1 else revised) + ' repaired' * min(len(rounds), 3))
             return report, json.dumps(report)
         with workspace() as directory, patch.object(runtime, 'goal_session', side_effect=author) as session, patch.object(runtime, 'structured', side_effect=model):
             result = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'], {'statement': 'Task'})
@@ -120,7 +125,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(feedback[0]['bugs'], 'A gap remains.')
             self.assertEqual(feedback[0]['solution'], PROOF + ' safe repair')
             self.assertEqual(feedback[0]['round'], 2)
-            self.assertEqual(result['output'], revised + ' repaired' * 4)
+            self.assertEqual(result['output'], revised + ' repaired' * 3)
+            self.assertTrue(result['proof_verified'])
             self.assertEqual(len(rounds), 4)
             self.assertEqual((directory/'saved-candidate.md').read_text().strip(), result['output'])
 
@@ -161,7 +167,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(stage, 'final')
                 self.assertEqual(prompt, runtime.FINAL_PROMPT.strip() + '\n\nSOLUTION:\n' + source)
                 self.assertEqual(settings['features'], [])
-                return {'latex': LATEX}, json.dumps({'latex': LATEX})
+                value = {'latex': LATEX, 'verdict': 'preserved', 'bugs': ''}
+                return value, json.dumps(value)
             with self.subTest(initial=initial), workspace() as directory, patch.object(runtime, 'structured', side_effect=model) as editor, patch.object(runtime, '_run_command', return_value={'status': 'pass', 'output': ''}) as command, patch.object(runtime, 'emit') as emit:
                 state = runtime.execute_workflows([ROOT/'workflows/clean_up.yaml'], dict(initial))
                 self.assertEqual(editor.call_count, 1)

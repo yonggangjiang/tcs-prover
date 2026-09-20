@@ -17,6 +17,7 @@ import uuid
 
 import yaml
 import workflow_runner as runtime
+from ui.audit_context import audit_identity, audit_prompt, research_snapshot
 
 
 CONFIG_PATH = runtime.WORKFLOWS / "research_audit.yaml"
@@ -145,7 +146,28 @@ def audit_activity(message):
     return []
 
 
-def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
+def has_usage_measurement(record):
+    """Recognize reported counters/cost without assuming provider accounting."""
+    token_fields = {
+        "input_tokens", "output_tokens", "cached_input_tokens", "cache_read_input_tokens",
+        "cache_write_input_tokens", "cache_creation_input_tokens", "reasoning_output_tokens",
+        "total_tokens", "inputTokens", "outputTokens", "cachedInputTokens",
+        "cacheReadInputTokens", "cacheWriteInputTokens", "cacheCreationInputTokens",
+        "reasoningOutputTokens", "totalTokens",
+    }
+    counters = [record.get("usage")]
+    per_model = record.get("modelUsage")
+    if isinstance(per_model, dict):
+        counters.extend(per_model.values())
+    if any(isinstance(value, dict) and any(
+        type(value.get(key)) is int and value[key] >= 0 for key in token_fields
+    ) for value in counters):
+        return True
+    cost = record.get("totalCostUsd")
+    return type(cost) in (int, float) and math.isfinite(cost) and cost >= 0
+
+
+def run_auditor(model, prompt, workspace, cancelled, on_activity=None, on_usage=None):
     """One fresh CLI session, with read-only tools and no delegated agents."""
     if cancelled.is_set():
         return None
@@ -211,6 +233,8 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                     command, cwd=workspace, stdin=subprocess.PIPE, stdout=output, stderr=errors,
                     text=True, encoding="utf-8", env=environment, **options,
                 )
+                usage_records = []
+                outcome = "failed"
                 try:
                     if on_activity:
                         on_activity("starting", "CLI started; waiting for a model response.")
@@ -233,8 +257,18 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                                 continue
                             if not isinstance(message, dict):
                                 continue
+                            if provider == "codex" and message.get("type") == "turn.completed" and isinstance(message.get("usage"), dict):
+                                usage_records.append({"basis": "turn.completed", "usage": message["usage"]})
                             if provider == "claude" and (message.get("type") == "result" or "result" in message):
                                 final_result = message
+                                if (isinstance(message.get("usage"), dict)
+                                        or isinstance(message.get("modelUsage"), dict)
+                                        or "total_cost_usd" in message):
+                                    # Provider counters are preserved as reported:
+                                    # cache accounting differs between providers.
+                                    usage_records[:] = [{"basis": "result", "usage": message.get("usage"),
+                                                         "modelUsage": message.get("modelUsage"),
+                                                         "totalCostUsd": message.get("total_cost_usd")}]
                                 report = message.get("result", "")
                                 actual_model = ", ".join(message.get("modelUsage") or {}) or actual_model
                             elif provider == "kimi" and message.get("role") == "assistant" and not message.get("tool_calls"):
@@ -257,8 +291,12 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                         consume()
                         if cancelled.wait(0.2):
                             _stop(process)
+                            consume(final=True)
+                            outcome = "cancelled"
                             return None
                     if cancelled.is_set():
+                        consume(final=True)
+                        outcome = "cancelled"
                         return None
                     consume(final=True)
                     if process.returncode:
@@ -274,9 +312,19 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                             raise RuntimeError(str(final_result.get("result") or "Claude audit request failed."))
                     if not isinstance(report, str) or not report.strip():
                         raise RuntimeError("The auditor returned an empty report.")
+                    outcome = "completed"
                     return {"text": report, "model": actual_model}
                 finally:
                     _stop(process)
+                    if on_usage:
+                        try:
+                            on_usage({"usageRecords": usage_records,
+                                      "coverage": "reported" if any(has_usage_measurement(row) for row in usage_records) else "missing",
+                                      "outcome": outcome})
+                        except Exception:
+                            # Telemetry is best effort: its callback must not discard
+                            # a paid report or mask the original provider exception.
+                            pass
 
 
 class ResearchAudits:
@@ -304,6 +352,10 @@ class ResearchAudits:
         self.running = {}
         self.warnings = {row["slot"]: row for row in selected_warnings(progress.get("warnings"))}
         self.last_error = ""
+        # Baselines contain file identities only, never earlier auditors' advice.
+        self.context_baselines = progress.get("contextBaselines", {})
+        if not isinstance(self.context_baselines, dict):
+            self.context_baselines = {}
 
     def _advance(self):
         now = self.clock()
@@ -315,7 +367,8 @@ class ResearchAudits:
         with self.lock:
             self._advance()
             return {"elapsedSeconds": self.elapsed, "lastStartedSeconds": self.last_started,
-                    "warnings": [dict(self.warnings[slot]) for slot in sorted(self.warnings)]}
+                    "warnings": [dict(self.warnings[slot]) for slot in sorted(self.warnings)],
+                    "contextBaselines": dict(self.context_baselines)}
 
     def status(self):
         with self.lock:
@@ -443,7 +496,8 @@ class ResearchAudits:
         models = {row["value"]: row for row in self.config["models"]}
         try:
             # Freeze one current prompt for the batch, including all parallel auditors.
-            prompt = (load_config() if self.reload_prompt else self.config).get("prompt")
+            batch_config = load_config() if self.reload_prompt else self.config
+            prompt = batch_config.get("prompt")
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("research_audit.yaml must contain a nonempty prompt.")
             eligible = []
@@ -470,6 +524,9 @@ class ResearchAudits:
                     return
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             workspace = self.run_dir.resolve()
+            # The author is paused before reading bytes, so every auditor gets
+            # hints for the same workspace revision. No content is truncated.
+            snapshot = research_snapshot(workspace)
             archived = self._rotate_reports()
             if archived:
                 self._event("archived", 0, "", f"Moved {len(archived)} previous audit files to {self.config.get('history', 'audit_history')}/.",
@@ -481,24 +538,34 @@ class ResearchAudits:
                     if not cancel.is_set():
                         self._event("starting", slot, value, f"Starting audit in the paused author workspace at {stamp}.")
                         model = models[value]
+                        identity = audit_identity(model, prompt, batch_config)
+                        selected_prompt = audit_prompt(prompt, snapshot, self.context_baselines.get(str(slot)),
+                                                      identity, slot, batch_config)
+                        request_id = uuid.uuid4().hex
                         request = {"kind": "request", "stage": "audit", "status": "prompt", "slot": slot,
                                    "model": model["model"], "provider": model["provider"],
-                                   "reasoningEffort": model.get("effort"), "auditStartedAt": stamp}
+                                   "reasoningEffort": model.get("effort"), "auditStartedAt": stamp,
+                                   "requestId": request_id}
                         role = "Agent instructions" if model["provider"] == "kimi" else "Prompt to model"
                         label = f"Audit-{slot} — {model['label']}"
-                        self.on_event({**request, "label": f"{label} — {role}", "text": prompt})
+                        self.on_event({**request, "label": f"{label} — {role}", "text": selected_prompt})
                         if model["provider"] == "kimi":
                             self.on_event({**request, "label": f"{label} — User message", "text": KIMI_START_PROMPT})
                         options = {}
                         if self.provider is run_auditor:
                             options["on_activity"] = lambda status, text, slot=slot, value=value, cancel=cancel: self._activity(slot, value, cancel, status, text)
-                        futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = (slot, value, cancel)
+                            options["on_usage"] = lambda accounting, slot=slot, model=dict(model), request_id=request_id: self.on_event({
+                                "kind": "audit_usage", "stage": "audit", "status": "usage", "requestId": request_id,
+                                "slot": slot, "model": model["model"], "provider": model["provider"],
+                                **accounting,
+                            })
+                        futures[pool.submit(self.provider, model, selected_prompt, workspace, cancel, **options)] = (slot, value, cancel, identity, request_id)
                 for future in as_completed(futures):
-                    slot, value, cancel = futures[future]
+                    slot, value, cancel, identity, request_id = futures[future]
                     try:
                         result = future.result()
                         if cancel.is_set():
-                            self._event("cancelled", slot, value, "Research audit cancelled.")
+                            self._event("cancelled", slot, value, "Research audit cancelled.", requestId=request_id)
                             continue
                         if (not isinstance(result, dict)
                                 or not isinstance(result.get("text"), str) or not result["text"].strip()
@@ -525,8 +592,15 @@ class ResearchAudits:
                                 os.unlink(temporary)
                             if self.settings["models"][slot - 1] == value:
                                 self.warnings.pop(slot, None)
+                            previous = self.context_baselines.get(str(slot), {})
+                            count = previous.get("reviews", 0) if isinstance(previous, dict) and previous.get("identity") == identity else 0
+                            count = count if type(count) is int and count >= 0 else 0
+                            self.context_baselines[str(slot)] = {
+                                "identity": identity, "snapshot": snapshot, "reviews": count + 1,
+                            }
                         self._event("completed", slot, value, f"Report saved to {self.config['output']}/{filename}.",
-                                    actualModel=result["model"], report=f"{self.config['output']}/{filename}")
+                                    actualModel=result["model"], report=f"{self.config['output']}/{filename}",
+                                    requestId=request_id)
                     except Exception as exc:
                         self._warning(slot, value, exc)
                     finally:

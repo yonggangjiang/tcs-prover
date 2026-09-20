@@ -194,8 +194,8 @@
               <div id="speedModeSetting" class="round-setting">
                 <label for="speedMode">Generation speed</label>
                 <select id="speedMode" aria-describedby="speedHelp">
-                  <option value="fast" selected>Fast &mdash; 1.5&times; speed</option>
-                  <option value="standard">Standard &mdash; normal speed</option>
+                  <option value="standard" selected>Standard &mdash; normal speed</option>
+                  <option value="fast">Fast &mdash; 1.5&times; speed</option>
                 </select>
                 <p id="speedHelp" class="help">
                   Fast is the default for ChatGPT models and uses credits at a
@@ -220,9 +220,9 @@
                   step="1" value="2" aria-describedby="roundHelp">
                 <p id="roundHelp" class="help">
                   Default 2 rounds. Each critic call uses fresh independent
-                  subagents and fixes issues. An unchanged PASS proceeds immediately;
-                  an edited PASS repeats until the limit, then proceeds.
-                  Unfixable issues return to the author and reset the count.
+                  subagents to check the proof. An unchanged PASS proceeds immediately;
+                  an edited PASS repeats until the limit, then returns to the author.
+                  Rejections return to the author and reset the count.
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">

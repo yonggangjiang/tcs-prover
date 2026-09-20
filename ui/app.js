@@ -710,7 +710,7 @@ function describe(entry) {
       label: `${entry.label || "Critic result"} · ${report.verdict || "returned"}`,
       text: report.verdict === "reject"
         ? (report.bugs || "Unfixable issues return to the proof author.")
-        : "The critic passed this round. An unchanged proof proceeds immediately; an edited proof repeats until the round limit.",
+        : "The critic passed this round. Only an unchanged proof proceeds; an edited proof is reviewed again or returned to the author at the round limit.",
       time: entry.time, checks: report.checks || [], replace: true, pinned: true,
     };
   }
@@ -1979,7 +1979,7 @@ function render(next) {
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
-    ui.speedMode.value = state.speedMode || "fast";
+    ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
@@ -2005,7 +2005,7 @@ function render(next) {
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
-    ui.speedMode.value = state.speedMode || "fast";
+    ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     syncPrompts(state);
     updateModelSummary();

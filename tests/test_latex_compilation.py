@@ -18,6 +18,13 @@ LATEX = r"\documentclass{article}\begin{document}\section{Proof}\label{proof}See
 BROKEN = LATEX.replace("See Section", r"\undefinedcommand See Section")
 
 
+def latex_report(latex, schema):
+    report = {"latex": latex}
+    if "verdict" in schema["properties"]:
+        report.update(verdict="preserved", bugs="")
+    return report
+
+
 class LatexCompilationTests(unittest.TestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -47,7 +54,7 @@ class LatexCompilationTests(unittest.TestCase):
                 self.assertEqual(settings["model"], "gpt-5.6-sol")
                 self.assertFalse((self.directory / "final.tex").exists())
                 self.assertFalse(any(kind == "final_result" for kind, _ in self.events))
-            value = {"latex": candidates[len(calls) - 1]}
+            value = latex_report(candidates[len(calls) - 1], schema)
             return value, json.dumps(value)
 
         def command(argv, **kwargs):
@@ -70,9 +77,9 @@ class LatexCompilationTests(unittest.TestCase):
             with self.subTest(missing=missing), patch.object(runtime.shutil, "which", side_effect=lambda name: None if name == missing else "/tools/" + name):
                 calls = []
 
-                def model(*args, **kwargs):
+                def model(prompt, schema, *args, **kwargs):
                     calls.append(1)
-                    return {"latex": LATEX}, ""
+                    return latex_report(LATEX, schema), ""
 
                 with self.assertRaisesRegex(runtime.Error, "Install latexmk"):
                     self.execute(model)
@@ -93,7 +100,7 @@ class LatexCompilationTests(unittest.TestCase):
 
         with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime.subprocess, "run", side_effect=command), patch.object(runtime, "workflow_remaining", side_effect=lambda options: remaining[0]):
             with self.assertRaisesRegex(runtime.Error, "time limit"):
-                self.execute(lambda *args, **kwargs: ({"latex": BROKEN}, ""))
+                self.execute(lambda prompt, schema, *args, **kwargs: (latex_report(BROKEN, schema), ""))
         self.assertFalse((self.directory / "final.pdf").exists())
         self.assertFalse((self.directory / "final.tex").exists())
         self.assertIn("Compilation error", (self.directory / "latex-compile.log").read_text())
@@ -119,13 +126,13 @@ class LatexCompilationTests(unittest.TestCase):
     def test_real_latex_failure_then_repair_produces_pdf_and_stable_references(self):
         calls = []
 
-        def model(prompt, *args, **kwargs):
+        def model(prompt, schema, *args, **kwargs):
             calls.append(prompt)
             self.assertLessEqual(len(calls), 2, prompt[-2000:])
             if len(calls) == 2:
                 self.assertIn("Undefined control sequence", prompt)
                 self.assertFalse((self.directory / "final.pdf").exists())
-            return {"latex": BROKEN if len(calls) == 1 else LATEX}, ""
+            return latex_report(BROKEN if len(calls) == 1 else LATEX, schema), ""
 
         self.execute(model)
         self.assertEqual(len(calls), 2)

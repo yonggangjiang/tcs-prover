@@ -6,11 +6,21 @@ nodes:
     prompt: solution_input
     instructions: final
     inputs: {solution: "get(state, 'solution', get(state, 'source', ''))"}
-    response: {latex: string}
-    require: ["strip(result.latex) != ''"]
+    response: {verdict: [preserved, unresolved], latex: string, bugs: string}
+    require:
+      - "bool(strip(result.latex)) if result.verdict == 'preserved' else bool(strip(result.bugs))"
+      - "not strip(result.bugs) if result.verdict == 'preserved' else True"
+    outcome: result.verdict
     after:
-      - set: {output: result.latex}
-    next: latex_compile
+      - set: {output: "result.latex if outcome == 'preserved' else ''", editing_report: result}
+    next:
+      preserved: latex_compile
+      unresolved:
+        to: end
+        after:
+          - set: {failed: 'True', proof_verified: 'False'}
+          - write: {path: latex-source.tex, text: result.latex}
+          - emit: {kind: diagnostic, label: Mathematical review required, text: '=result.bugs'}
 
   latex_compile:
     run: command
@@ -68,14 +78,28 @@ prompts:
     LATEX SOURCE:
     {latex}
   final: |-
+      You are an exposition editor, not a new proof author. Preserve the supplied argument's
+      mathematical content exactly: hypotheses, claims, inference steps, dependencies, complexity,
+      probability guarantees, and qualifications. You may reorganize prose, expand notation from
+      definitions already supplied, deduplicate exposition, and repair LaTeX. Do not invent a missing
+      argument, replace a lemma or algorithm, import a new theorem, or silently correct a mathematical
+      defect. The checks below detect such defects; they do not authorize mathematical repairs.
+
+      Return JSON with verdict, latex, and bugs. Use verdict=preserved with empty bugs only when the
+      document is a faithful exposition and no substantive mathematical issue remains unresolved.
+      If a mathematical correction or missing justification is needed, return verdict=unresolved,
+      precise locations and objections in bugs, and any faithful partial LaTeX in latex (possibly
+      empty). The controller stops publication for unresolved output. Formatting does not reverify
+      mathematical changes, and a successful compilation is not proof verification.
+
       Prune the input mathematical proof into a good paper by using the following guidance. Clarity is the
       main concern, not a target length: make the argument easy for a human expert to follow, with enough
       explanation to understand it and no unnecessary prose or machinery.
 
       # Part I. Writing, organization, and readability
 
-      First shape the manuscript for its reader using the guidance in this part. Then apply the repeated
-      review-and-repair checklist in Part II to the resulting text before handover. These are two phases
+      First shape the manuscript for its reader using the guidance in this part. Then apply the
+      fidelity and presentation checklist in Part II to the resulting text before handover. These are two phases
       of your work on the same manuscript.
 
       ## 1. Write for a reader and preserve the mathematics
@@ -91,8 +115,8 @@ prompts:
 
       In this writing phase, organize and explain the existing argument rather than replacing it or
       guessing repairs. Flag suspected mathematical defects for Part II; do not assume that correctness
-      has already been independently verified. That review phase may make justified repairs and verified
-      simplifications, subject to the same theorem-preservation requirement.
+      has already been independently verified. Resolve a suspicion only by locating the existing
+      justification in the supplied argument; otherwise return verdict=unresolved.
 
       The writing principles below are defaults, not a demand for uniform style. Preserve an effective
       voice and structure, and make deliberate exceptions when they improve understanding.
@@ -201,8 +225,8 @@ prompts:
         and cited but not formalized. Keep process history proportional to its relevance, with extensive
         logs in a supplement when supplied.
       - Judge economy by the work required of the reader, not line count. Do not remove a hypothesis,
-        justification, useful example, or motivation merely to shorten the manuscript. Verified changes to
-        proof machinery belong to Part II.
+        justification, useful example, or motivation merely to shorten the manuscript. Flag suspected
+        defects in the proof machinery in Part II; do not change that machinery.
 
       ## 7. Read back the structure
 
@@ -214,28 +238,27 @@ prompts:
       declared omissions must be understandable without the later proof. Revise organization until these
       tests work, then proceed to Part II.
 
-      # Part II. Repeated review and repair before handover
+      # Part II. Fidelity and presentation checks before handover
 
       Now read the resulting manuscript as a skeptical reader encountering it for the first time. Check
       local understanding, logical completeness, and scholarly support using every item below. Do not rely
       on explanations that exist only in your working notes.
 
-      For each concrete flag, track its location, what is wrong or missing, the repair, and the evidence
-      in the revised text that resolves it. Repair every actionable flag, including defects inherited from
-      the input. A heading, keyword, citation, or declaration of success does not count as the required
+      For each concrete flag, track its location, what is wrong or missing, and the supplied evidence
+      that resolves it. Repair presentation defects. Return substantive mathematical defects inherited
+      from the input as unresolved. A heading, keyword, citation, or declaration of success does not count as the required
       explanation or proof. For a requirement with several parts, verify every part at its actual point of
       use.
 
-      After repairs, check affected dependencies and remove any repetition the repairs introduced. Then
-      reread the entire revised manuscript and apply the whole checklist again, not only the previously
-      flagged passages. Repeat until a complete pass flags no further actionable issue and makes no
-      changes. Any subsequent edit requires another complete pass.
+      After presentation edits, check affected dependencies and remove introduced repetition. Perform
+      one complete fidelity pass against the input. Recheck further affected passages when a new edit
+      or issue warrants it; do not repeatedly restart every unchanged check after cosmetic edits.
 
       Missing evidence or unavailable tools leave a check unresolved, not passed. Pursue the available
-      evidence and complete all supported repairs; do not invent facts, weaken the theorem, or loop
+      evidence already supporting the supplied argument; do not invent facts, weaken the theorem, or loop
       indefinitely on an unavailable check. Never claim an all-clear result while a substantive flag
-      remains. Use a brief source-format editorial comment to identify unresolved issues needing the
-      author's attention. Any qualification essential to the truth or supported status of a mathematical
+      remains. Return verdict=unresolved with the issue in bugs; an editorial comment alone cannot
+      authorize handover. Any qualification essential to the truth or supported status of a mathematical
       or scholarly assertion must also be visible in the manuscript's prose; a hidden comment cannot
       justify presenting an unsupported claim as established. Keep process-only limitations, the working
       checklist, and the audit out of the mathematical prose.
@@ -282,20 +305,19 @@ prompts:
       ## 3. Are the logical transitions explicit and valid?
 
       - Check hypotheses, quantifiers, implication directions, scope, and dependencies in both formulas
-        and prose. Repair a false or overstrong auxiliary sentence by stating the precise true fact
-        needed, then verify all later uses.
-      - For a classification, invariant, normal form, encoding, pairing, or diagram, prove every required
-        direction. Invariance alone does not prove completeness. Give reconstruction, inverse, or transfer
-        arguments where the conclusion needs them.
+        and prose. A false or overstrong auxiliary mathematical sentence requires verdict=unresolved;
+        do not substitute a different fact and treat it as already reviewed.
+      - For a classification, invariant, normal form, encoding, pairing, or diagram, check every required
+        direction. Invariance alone does not prove completeness. Check that the supplied reconstruction,
+        inverse, or transfer arguments establish the conclusion; flag a missing argument as unresolved.
       - Name the exact bridge theorem when moving between algebraic, combinatorial, analytic, or geometric
-        descriptions; state the part used, check its hypotheses, and define the resulting object. Give a
-        short local justification for standard background, and credit nontrivial research results or
-        special versions.
-      - Demonstrate asserted equivalences of formulas or normalizations with the needed substitutions,
+        descriptions; state the part used, check its hypotheses, and define the resulting object. Retain
+        supplied justifications for background and credit nontrivial research results or special versions.
+      - Check asserted equivalences of formulas or normalizations against the supplied substitutions,
         identities, or coefficient extraction. A relevant citation does not establish the particular
         equivalence.
-      - For "similarly" or "by symmetry," identify the symmetry or give the changed argument, including
-        signs, endpoints, and assumptions. Do not hide a genuinely different case.
+      - For "similarly" or "by symmetry," check that the supplied argument identifies the symmetry or
+        handles the changed signs, endpoints, and assumptions. Flag an omitted distinct case as unresolved.
       - Check meaningful initial and boundary conditions in recurrences and formulas, including zero,
         empty, minimal, and exceptional cases.
 
@@ -309,37 +331,32 @@ prompts:
         compactness argument, or tubular neighborhood as appropriate.
       - When continuity is used uniformly over a family, identify the relevant compact set or give a
         uniform estimate. Pointwise continuity alone is insufficient.
-      - For an instruction to search, dovetail, enumerate, or follow a path, specify the procedure and its
-        success condition, prove termination, and state exactly what it returns.
+      - For an instruction to search, dovetail, enumerate, or follow a path, check that the supplied proof
+        specifies the procedure, success condition, termination argument, and exact returned object.
 
       ## 5. Is the retained machinery necessary and illuminating?
 
-      - Distinguish the theorem's requirements from auxiliary choices made in its proof. Preserve the
-        original claim, not avoidable arities, encodings, or cumbersome illustrative witnesses.
-      - Actively compare a long derivative, coordinate, case, or invariant calculation with a plausible
-        conceptual route using an identity, quadratic form, symmetry, direct comparison, or standard
-        model. Use a demonstrably simpler rigorous argument when it establishes the same needed claims; do
-        not substitute an unverified new proof.
-      - Prefer the direct known theorem supplying the conclusion actually needed over a stronger theorem
-        whose extra structure is discarded. Check its hypotheses and normalization in this manuscript.
+      - Distinguish the theorem's requirements from auxiliary choices made in its proof. Explain the
+        role of the supplied arities, encodings, and witnesses without changing them.
+      - Present long derivative, coordinate, case, or invariant calculations with their supplied
+        conceptual explanation. Simplify the exposition without substituting a new proof.
+      - Explain exactly which part of a supplied theorem is used. Do not replace its source or add a
+        new theorem; check the supplied theorem's hypotheses and normalization in this manuscript.
       - Verify any identification with a standard model through an actual correspondence or gluing
         argument. Matching a numerical invariant is not proof of an isomorphism, homeomorphism, or
         classification.
-      - Test a smaller plausible or standard example and verify its defining properties. If the original
-        claim specifies a size or presentation, preserve it by a valid transfer argument or compact
-        separate verification. Do not imply minimality without proof.
-      - Remove unused auxiliary generality, redundant proof routes, and artificial interpretations with no
-        distinct payoff. If removing an advertised strengthening, remove its unused formulation as well as
-        the novelty claim without narrowing the original main theorem. Retain equivalence explanations
-        only where the reader needs them.
-      - If a simplification changes an earlier proof map, notation, or dependency, update all affected
-        passages and apply the full checklist again.
+      - Check the defining properties of the supplied examples. Preserve specified sizes and
+        presentations; do not replace a witness or imply minimality without a supplied proof.
+      - Reduce duplicated exposition around auxiliary results and interpretations while preserving all
+        mathematical claims and necessary dependencies. Retain equivalence explanations where needed.
+      - If exposition changes move a proof or notation, update the affected pointers and recheck those
+        passages. A changed mathematical dependency requires verdict=unresolved.
 
       ## 6. Does the manuscript explain and support its relationship to prior work?
 
-      - Start with the main theorem and its distinctive combination of properties. Use public-paper search
-        to find the closest related results and alternative constructions, then read the relevant primary
-        sources. Do not limit related work to borrowed steps or the author's presumed influences.
+      - Start with the main theorem and its distinctive combination of properties. Use supplied sources
+        and verify their primary-source support when a citation is uncertain or materially affects a
+        claim. Do not launch a new literature survey or add unsupported novelty comparisons.
       - Break compound constructions into recognizable mechanisms and compare their combination and
         components with known families and refinements. Background theorems do not substitute for the
         provenance of the central result or construction.
@@ -389,8 +406,8 @@ prompts:
 
       - Reread each major statement on its own and compare the revised manuscript with the input. Preserve
         the original main theorem's hypotheses, quantifiers, conclusions, and scope, and every necessary
-        justification. Auxiliary statements may be corrected or simplified only with their downstream
-        dependencies verified. Reject semantic smoothing, unsupported new claims, or changes in claim
+        justification. Auxiliary mathematical statements must retain their supplied content and
+        dependencies. Reject semantic smoothing, unsupported new claims, or changes in claim
         status hidden in connective prose.
       - Verify every recorded repair in the final text at the point where it is needed, including all
         parts of compound requirements. Confirm the old defect no longer appears elsewhere and that
@@ -405,13 +422,12 @@ prompts:
         not occur.
       - Keep qualifications needed for mathematical honesty visible to the reader. If a material gap
         cannot be resolved without new evidence or changing the theorem, preserve the intended statement
-        but identify the gap and do not present the proof as complete. Use a concise editorial comment for
-        the action needed from the author rather than manufacturing a proof.
-      - After the final economy and readability adjustments, run the complete Part II checklist once more.
-        Handover is clean only when that full pass finds no actionable flags and makes no changes; report
-        any genuinely unresolved issue as specified above rather than calling it solved.
+        but identify the gap and return verdict=unresolved with the required author action in bugs.
+      - After the final economy and readability adjustments, verify the affected passages and ensure the
+        complete fidelity pass has covered the final document. Handover requires no unresolved substantive
+        issues; report any unresolved issue through the structured verdict instead of calling it solved.
 
-      Return only the complete revised manuscript in LaTeX.
+      Return only the requested JSON, with the manuscript in the latex field.
   solution_input: |-
     {instructions}
 

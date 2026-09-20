@@ -16,7 +16,7 @@ hides research records and scheduled audits. The critic and LaTeX writer still r
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
 attempt history, and proved results across interruptions or context compaction.
-Astra with Ultra reasoning and Fast generation are the defaults for every
+Astra with Ultra reasoning and Standard generation are the defaults for every
 role. DeepSeek V4 Pro is an additional
 model option that uses the same harness pipeline through DeepSeek's official
 API.
@@ -37,7 +37,7 @@ python3 -m pip install -r requirements.txt
 python3 web_ui.py
 ```
 
-The Web UI opens locally with Astra, Ultra, and Fast defaults for
+The Web UI opens locally with Astra, Ultra, and Standard defaults for
 the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
 is needed only when you select DeepSeek for one or more roles.
 
@@ -123,7 +123,7 @@ This sends the entire file directly to the proof author, exactly like enabling
 open a browser. With no command-line overrides, it uses the same defaults as the
 web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
 limit, Astra and Ultra for all proof
-roles, the built-in role prompts, and Fast generation speed. The
+roles, the built-in role prompts, and Standard generation speed. The
 activity log requests concise public reasoning summaries by default.
 
 ### Optional settings
@@ -139,7 +139,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-criticRounds N` | `2` | Maximum consecutive edited critic passes before using the latest solution; `1` to `100`. An unchanged pass accepts immediately. Rejection returns to the author and resets the count. |
+| `-criticRounds N` | `2` | Maximum consecutive edited critic passes before returning the unverified revision to the author; `1` to `100`. Only an unchanged pass accepts. Rejection returns to the author and resets the count. |
 | `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
 | `-authorModel MODEL` | `gpt-6-astra` | Author model: `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or official `deepseek-v4-pro`. |
 | `-criticModel MODEL` | `gpt-6-astra` | Critic model; same choices as the author. |
@@ -148,7 +148,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
 | `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
-| `-speedMode MODE` | `fast` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation. DeepSeek calls always use standard service because Fast is provider-specific. |
+| `-speedMode MODE` | `standard` | Normal service by default; `fast` remains opt-in for accelerated generation. This changes neither model nor reasoning effort. Explicit saved settings are retained. DeepSeek always uses standard service. |
 | `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. |
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
@@ -171,7 +171,8 @@ You do not need to keep the old browser tab open.
 A saved proof candidate contains the checked statement and latest complete
 argument. Continuing it starts a fresh root critic request from that candidate.
 Within the request, the critic uses its own fresh independent subagents to
-find bugs and then repairs the argument itself.
+find bugs and return precise objections to the author. Acceptance requires the
+exact candidate to pass without edits.
 
 To continue from the Web UI:
 
@@ -245,7 +246,8 @@ python3 web_ui.py --resume-critic runs/2026-08-26_16-33-26_example
 
 This loads the saved complete proof, checked statement, and role prompts into
 a new browser-visible job. An unchanged pass advances to the LaTeX editor;
-edited passes repeat until the configured maximum, then use the latest solution.
+edited passes repeat until the configured maximum, then return to the author
+because that revision has not yet passed unchanged.
 A critic rejection returns the exact candidate
 and bug report to the normal proof-author repair loop; the harness workflow is
 not shortened or replaced.
@@ -394,8 +396,10 @@ flowchart TD
     C <--> B["Fresh independent bug-finding subagents"]
     C -- "reject: exact bugs and reset rounds" --> A
     C -- "edited pass below maximum" --> C
-    C -- "unchanged pass or edited pass at maximum" --> L["LaTeX editor"]
-    L --> T["Compile PDF"]
+    C -- "edited pass at maximum" --> A
+    C -- "unchanged pass" --> L["LaTeX editor"]
+    L -- "faithful exposition" --> T["Compile PDF"]
+    L -- "mathematical gap" --> G["Stop publication and report gap"]
     T -- "compilation errors" --> F["Minor LaTeX fixes"]
     F --> T
     T -- "success" --> O["LaTeX source and PDF"]
@@ -440,7 +444,7 @@ approaches, using these records:
 | File | Contents |
 | --- | --- |
 | `INITIAL_PROMPT.md` | The permanent complete initial author prompt and exact statement. |
-| `APPROACHES/index.md` | A short navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. Optional for displaying the graph. |
+| `APPROACHES/index.md` | Compact working frontier: exact gap, diverse routes, weakest sufficient interfaces, next tests, and audit decisions; followed by the linked DAG table. Optional for displaying the graph. |
 | `APPROACHES/A001-short-title.md` | One approach with linked Parents and Children, Status, **Context and objective**, and organized **Detailed work**. Each argument defines its terms and explains its relation to the task. |
 | `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
 | `AUDITS/` | Independent reports from the current audit batch only. |
@@ -482,17 +486,18 @@ Each round is one root critic LLM request with `multi_agent` enabled. Its prompt
 tells it to launch fresh independent subagents for aggressive bug finding:
 mathematical errors, omitted details, undefined terms, and other gaps. They are
 instructed not to communicate with one another and to report back to the critic.
-The critic considers those reports and repairs the complete argument itself.
+The critic considers those reports against the exact candidate.
 
-If it cannot fix every issue, it returns the latest safely repaired candidate
-and exact unresolved bugs to the author. The author continues the proof task; in managed mode it also records the
+If any correction or missing argument is required, it returns a rejection,
+the candidate, and exact objections to the author. The author continues the proof task; in managed mode it also records the
 objections and rechecks affected lemmas in its research files. This
 rejection resets the consecutive critic-round count.
 
 An unchanged pass accepts immediately. An edited pass sends the latest solution
 to another fresh critic round while below the configured maximum (default 2).
-At that maximum, an edited pass accepts the latest solution and proceeds to
-LaTeX formatting. The setting is a maximum for consecutive edited passes, not
+At that maximum, an edited pass returns to the author for repair and fresh review.
+Only a byte-identical unchanged pass sets `proof_verified=true`. The setting is
+a maximum for consecutive edited passes, not
 a requirement to obtain a fixed number of passes. Model review is not formal
 proof verification.
 
@@ -500,7 +505,10 @@ proof verification.
 
 The editor makes one LLM call with the editing prompt and accepted solution,
 or the supplied `.tex` contents in standalone mode. It returns a JSON object
-whose `latex` field contains the complete document. A final compilation node
+with `verdict`, `latex`, and `bugs`. The `preserved` verdict requires faithful
+exposition of the supplied mathematics; `unresolved` stops publication and records
+the mathematical objection. The writer cannot approve its own mathematical
+repairs. This remains model review, not a formal equivalence check. A final compilation node
 runs `latexmk` with `pdflatex`, repeating TeX passes as needed to stabilize
 references. Compiler errors go back to the writer for minor compilation fixes,
 then the document is compiled again until it succeeds, the job is stopped,
@@ -514,6 +522,43 @@ source is retained as `latex-source.tex`, and compiler output is saved in
 repeated model repair calls.
 
 ## Project structure
+
+### Directed min-cut review and efficiency changes
+
+The investigation and the two proposals are documented separately:
+
+- [Trajectory and reference-proof comparison](docs/mincut-trajectory-review.md).
+- [Reasoning and verification changes](docs/reasoning-changes.md).
+- [Efficiency measurements, xean comparison, and cost proposals](docs/efficiency-review.md).
+- [Using and evaluating this branch](docs/astra-suggestion.md).
+
+New managed runs keep a compact frontier inside the existing approach index.
+They test the weakest sufficient bridge, track the precise scope of negative
+results, and preserve consequential audit decisions across compaction. Saved
+`INITIAL_PROMPT.md` files and explicitly saved prompts remain authoritative for
+existing runs; upgrading does not silently rewrite historical instructions.
+
+Research audits retain their configured schedule and independent sessions.
+The default prompt receives bounded changed-file metadata after the author is
+paused, with distinct auditing focuses and full reassessment on the first and
+every fourth successful review for that slot. Changed tasks, models or prompts
+force a full review. Missing/failed reviews do not advance that auditor's
+baseline. Set `context.fullEvery: 1` in `research_audit.yaml` for full reviews
+every time, or remove `[RESEARCH_CONTEXT]` and `[AUDIT_FOCUS]` from a custom
+prompt to preserve it verbatim. No model access to a needed dependency is removed.
+
+To measure a saved run without a model call:
+
+```bash
+python3 tools/analyze_run.py runs/<run-folder> > /tmp/run-usage.json
+```
+
+The streaming report distinguishes root and subagent counters, cache hits,
+counter resets, audit coverage, and repeated commands. It never invents prices
+or treats missing audit usage as zero. New audit calls preserve available raw
+provider accounting in `audit_usage` events, including failed calls. Historical
+logs remain untouched. Neither lower cost nor autonomous rediscovery has yet
+been demonstrated by a matched live experiment.
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
 engine and model/goal transport. The author research records remain plain

@@ -440,7 +440,7 @@ def main():
         help=(
             "allow up to N consecutive critic repair rounds "
             f"(default: {DEFAULT_CRITIC_ROUNDS}); an unchanged pass finishes "
-            "early, an edited pass finishes at N, and rejection returns to the author"
+            "early; an edited pass at N or a rejection returns to the author"
         ),
     )
     parser.add_argument(

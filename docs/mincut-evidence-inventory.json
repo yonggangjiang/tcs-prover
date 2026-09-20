@@ -1,0 +1,2070 @@
+{
+  "review_date": "2026-09-20",
+  "method": "Stream-parse every transcript JSONL line; inventory every approach, index, lemma heading, and audit; targeted mathematical reading is described separately in mincut-trajectory-review.md. This is not certification of all proofs.",
+  "runs": [
+    {
+      "directory": "runs/2026-09-11_20-36-05_design-and-analyze-an-algorithm-for-exact-global",
+      "transcript_bytes": 1281650101,
+      "transcript_lines": 459240,
+      "first_event_utc": "2026-09-11T18:36:05.741043+00:00",
+      "last_event_utc": "2026-09-12T14:07:01.219616+00:00",
+      "completed_items_deduplicated_by_thread_and_item": {
+        "userMessage": 28,
+        "agentMessage": 677,
+        "commandExecution": 1036,
+        "reasoning": 13303,
+        "fileChange": 148,
+        "subAgentActivity": 1845,
+        "webSearch": 248,
+        "collabAgentToolCall": 3,
+        "contextCompaction": 79
+      },
+      "files": [
+        {
+          "path": "APPROACHES/A001-flow-reduction.md",
+          "bytes": 1457197,
+          "sha256": "0c252732beb3bfd40874d2bfdfd12993a850ae63d9d1c6b3465d1e6692eaa5e3",
+          "title": "A001 \u2014 Flow and cut reductions",
+          "status": "ACTIVE (principal)."
+        },
+        {
+          "path": "APPROACHES/A002-literature-audit.md",
+          "bytes": 4734,
+          "sha256": "13433029c84a2df1abaf3541c77e9d79b3e9a600f7bcb545b444739bf2e22a7e",
+          "title": "A002 \u2014 Literature theorem audit",
+          "status": "RESOLVED (bounded literature audit; not a solution to the statement)."
+        },
+        {
+          "path": "APPROACHES/A003-branching-packing.md",
+          "bytes": 7508,
+          "sha256": "8656bd0da104aafbbe3eda9ea054694cc755731aa4ac156fb16b206720025f1f",
+          "title": "A003 \u2014 Branching and packing",
+          "status": "PARKED (the witness search is resolved; witness construction is not)."
+        },
+        {
+          "path": "APPROACHES/A004-optimization-perturbation.md",
+          "bytes": 6944,
+          "sha256": "c0c1874d4279a2f894e0e8621415e023c375af4d3dccb18df7c6c7d705a6ead0",
+          "title": "A004 \u2014 Optimization and perturbation",
+          "status": "PARKED as an independent formulation route; its dynamic flow construction is ACTIVE inside A001."
+        },
+        {
+          "path": "APPROACHES/INDEX.md",
+          "bytes": 4987,
+          "sha256": "36abc1f74a2160128fd9488a35248c9652bcb617bb35020e403e73d6f55614ec",
+          "title": "Attempted approaches",
+          "status": null
+        },
+        {
+          "path": "PROVED.md",
+          "bytes": 1239965,
+          "sha256": "325f0a6f46d1be516e9afb207d1ab4b1bf03e9b94011de3d6ca85b8fc8280b32",
+          "title": "Proved lemmas",
+          "lemma_ids": [
+            "L001",
+            "L002",
+            "L003",
+            "L004",
+            "L005",
+            "L006",
+            "L007",
+            "L008",
+            "L009",
+            "L010",
+            "L011",
+            "L012",
+            "L013",
+            "L014",
+            "L015",
+            "L016",
+            "L017",
+            "L018",
+            "L019",
+            "L020",
+            "L021",
+            "L022",
+            "L023",
+            "L024",
+            "L025",
+            "L026",
+            "L027",
+            "L028",
+            "L029",
+            "L030",
+            "L031",
+            "L032",
+            "L033",
+            "L034",
+            "L035",
+            "L036",
+            "L037",
+            "L038",
+            "L039",
+            "L040",
+            "L041",
+            "L042",
+            "L043",
+            "L044",
+            "L045",
+            "L046",
+            "L047",
+            "L048",
+            "L049",
+            "L050",
+            "L051",
+            "L052",
+            "L053",
+            "L054",
+            "L055",
+            "L056",
+            "L057",
+            "L058",
+            "L059",
+            "L060",
+            "L061",
+            "L062",
+            "L063",
+            "L064",
+            "L065",
+            "L066",
+            "L067",
+            "L068",
+            "L069",
+            "L070",
+            "L071",
+            "L072",
+            "L073",
+            "L074",
+            "L075",
+            "L076",
+            "L077",
+            "L078",
+            "L079",
+            "L080",
+            "L081",
+            "L082",
+            "L083",
+            "L084",
+            "L085",
+            "L086",
+            "L087",
+            "L088",
+            "L089",
+            "L090",
+            "L091",
+            "L092",
+            "L093",
+            "L094",
+            "L095",
+            "L096",
+            "L097",
+            "L098",
+            "L099",
+            "L100",
+            "L101",
+            "L102",
+            "L103",
+            "L104",
+            "L105",
+            "L106",
+            "L107",
+            "L108",
+            "L109",
+            "L110",
+            "L111",
+            "L112",
+            "L113",
+            "L114",
+            "L115",
+            "L116",
+            "L117",
+            "L118",
+            "L119",
+            "L120",
+            "L121",
+            "L122",
+            "L123",
+            "L124",
+            "L125",
+            "L126",
+            "L127",
+            "L128",
+            "L129",
+            "L130",
+            "L131",
+            "L132",
+            "L133",
+            "L134",
+            "L135",
+            "L136",
+            "L137",
+            "L138",
+            "L139",
+            "L140",
+            "L141",
+            "L142",
+            "L143",
+            "L144",
+            "L145",
+            "L146",
+            "L147",
+            "L148",
+            "L149",
+            "L150",
+            "L151",
+            "L152",
+            "L153",
+            "L154",
+            "L155",
+            "L156",
+            "L157",
+            "L158",
+            "L159",
+            "L160",
+            "L161",
+            "L162",
+            "L163",
+            "L164",
+            "L165",
+            "L166",
+            "L167",
+            "L168",
+            "L169",
+            "L170",
+            "L171",
+            "L172",
+            "L173",
+            "L174",
+            "L175",
+            "L176",
+            "L177",
+            "L178",
+            "L179",
+            "L180",
+            "L181",
+            "L182",
+            "L183",
+            "L184",
+            "L185",
+            "L186",
+            "L187",
+            "L188",
+            "L189",
+            "L190",
+            "L191",
+            "L192",
+            "L193",
+            "L194",
+            "L195",
+            "L196",
+            "L197",
+            "L198",
+            "L199",
+            "L200",
+            "L201",
+            "L202",
+            "L203",
+            "L204"
+          ]
+        }
+      ]
+    },
+    {
+      "directory": "runs/2026-09-12_17-24-47_directed-mincut-migrated",
+      "transcript_bytes": 143816265,
+      "transcript_lines": 99800,
+      "first_event_utc": "2026-09-12T15:24:47.808832+00:00",
+      "last_event_utc": "2026-09-13T07:20:30.840103+00:00",
+      "completed_items_deduplicated_by_thread_and_item": {
+        "userMessage": 36,
+        "agentMessage": 583,
+        "commandExecution": 2701,
+        "reasoning": 6927,
+        "subAgentActivity": 1750,
+        "webSearch": 171,
+        "fileChange": 130,
+        "collabAgentToolCall": 14,
+        "contextCompaction": 56,
+        "imageView": 4
+      },
+      "files": [
+        {
+          "path": "APPROACHES/A001-flow-reduction.md",
+          "bytes": 162215,
+          "sha256": "b0221e6f5924cad4393b74ae7a7da170fd41b539c121daeea7658b8f6480c337",
+          "title": "A001 \u2014 Exact rooted reductions and terminal wrapping",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A002-literature-audit.md",
+          "bytes": 6631,
+          "sha256": "d75fe58fcf7d0a2eb974a319d8b74ced3f3b5d080bbf26de64568b2c99941722",
+          "title": "A002 \u2014 Historical literature audit",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A003-branching-packing.md",
+          "bytes": 11471,
+          "sha256": "23ea48d293ac9af11914ae601d6fdea9fc06ecb9bc92803d2e922c1c7e798ae4",
+          "title": "A003 \u2014 Arborescence packing and one-entry witnesses",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A004-optimization-perturbation.md",
+          "bytes": 28641,
+          "sha256": "a7e5d5fe2453a0520599cb359bba946bb472e47d75745795cacf1809009c1d3c",
+          "title": "A004 \u2014 Direct optimization and perturbation alternatives",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A005-dynamic-thresholds.md",
+          "bytes": 42527,
+          "sha256": "7842a628c1ce87f52125e0d4fff52bb80b4177d916d6f08c3445597121356219",
+          "title": "A005 \u2014 Dynamic thresholds, clipping and residual reuse",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A006-balanced-certificates.md",
+          "bytes": 33260,
+          "sha256": "6f65539f0efbe55688a4916f363af1eaba0d57f6bddb895c628e777082aed4d4",
+          "title": "A006 \u2014 Balanced certificates and rooted completion",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A007-circulation-selection.md",
+          "bytes": 53939,
+          "sha256": "456b43e4cf05b60dd3750c0eef979aec892bb74491bde4cc61191eb8002085f5",
+          "title": "A007 \u2014 Circulation selection and cut-tree reweighting",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A008-retained-sums.md",
+          "bytes": 47105,
+          "sha256": "3eaba6b1897842788c55e3826d297da148c10078a79966583f3e007deaf8deb1",
+          "title": "A008 \u2014 Accumulated certificates and retained-flow reoptimization",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A009-alternation.md",
+          "bytes": 75292,
+          "sha256": "92598002038235c751e436ccfc744c87a290f5610fa0fb9c48b6eeeab3b21d30",
+          "title": "A009 \u2014 Alternating optimizations and transportation faces",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A010-canonical-faces.md",
+          "bytes": 81309,
+          "sha256": "e018a514a3f6dc82a19fa2e0722661dc01d29f1fea0552d94061cbf789b206df",
+          "title": "A010 \u2014 Canonical dual faces and utility selectors",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A011-transit-normalization.md",
+          "bytes": 124039,
+          "sha256": "91c476391e60be96d927f33256afe4eb3e3ca5351281a6c7ac16174f4d32de0e",
+          "title": "A011 \u2014 Transit reductions and source-budget normalization",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A012-deficit-stock.md",
+          "bytes": 71746,
+          "sha256": "6c7688cc8f0beb68c7c37662b3698d701116311c6aa89302e6afad638744194f",
+          "title": "A012 \u2014 Deficit-DAG normalization and stored-flow obstructions",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A013-local-certification.md",
+          "bytes": 113063,
+          "sha256": "4776d784d66c6ab3dc7833343623051289cceda3aebb9eb4aaf801199f86710b",
+          "title": "A013 \u2014 Local region certificates and leader-outlet faces",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A014-interval-certificates.md",
+          "bytes": 49657,
+          "sha256": "90413207eaa9d0d441cdfe8ca0911bd19e86cc112e830046cf30ba2d5b92e96e",
+          "title": "A014 \u2014 Reservoir batches and cyclic interval certificates",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A015-interval-repair.md",
+          "bytes": 118000,
+          "sha256": "842daaed2ec789970107cbb46d6b2e4e9aa807df6d318cc79697432d723c7b24",
+          "title": "A015 \u2014 Interval repair and historical crossing obstructions",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A016-d1-history.md",
+          "bytes": 65705,
+          "sha256": "79240d7146baadd9b33e4db2a095f3a85c02b6631615cb8ef0ee456bac1cd7c2",
+          "title": "A016 \u2014 Sparse D1 historical search and one repair",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A017-extreme-splits.md",
+          "bytes": 86641,
+          "sha256": "dedf118a9709fab2903c934b45fc2dacc6890bc6f84abacd0fcc8c089d0a1da2",
+          "title": "A017 \u2014 Extreme splits and graphic-face boundary oracles",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A018-grid-anchors.md",
+          "bytes": 54957,
+          "sha256": "98bcb639208e7bbfb47207044a3dec8570c0aad25dc2faf4376fe3ae5594014d",
+          "title": "A018 \u2014 Grid rounding, compatible trees and anchored batches",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A019-laminar-reservoirs.md",
+          "bytes": 57137,
+          "sha256": "f9747f8286ab4bdb7a6385d3428bf5422c8e2e72cb9bc3f3c51ec56b7d9af849",
+          "title": "A019 \u2014 Laminar splits and exchange-ready tree reservoirs",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A020-special-factors.md",
+          "bytes": 65628,
+          "sha256": "502f5b132feb6476e31c43d00cc9f9d19960c19133d14d465af9f1212ed50dc3",
+          "title": "A020 \u2014 Apex-forest and series-parallel split factors",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A021-blocking-phases.md",
+          "bytes": 47121,
+          "sha256": "b15c1611310dc1a3e3487c2c29df4ad1688f3767c172621ca0b013c8d77b3933",
+          "title": "A021 \u2014 Fixed-face blocking phases and distance two",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A022-d3-lifting.md",
+          "bytes": 79611,
+          "sha256": "e01da8547d110a9d398c3e3f18ef84cb75028bd7ad8189d9c102f9db0ca89105",
+          "title": "A022 \u2014 Distance-three phases and actual tree lifting",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A023-historical-connectivity.md",
+          "bytes": 66332,
+          "sha256": "3c9fce3ac0c6b30b703371ee974f75c85759674e0f975781f3137e2a1a3d8049",
+          "title": "A023 \u2014 Historical connectivity and source-dependent search",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A024-permanent-splitters.md",
+          "bytes": 52785,
+          "sha256": "fe72fb269b4cba8196c07b7203387ad0402580f895fb7cba20d2689a2cd78e00",
+          "title": "A024 \u2014 Permanent splitters and full exchange BFS",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A025-general-phase.md",
+          "bytes": 45213,
+          "sha256": "3c915fb43c11ae0cba426542028fd1d63c5344b78a7af17929e2dd1257f5cb04",
+          "title": "A025 \u2014 General fixed phases on explicit tree incidence",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A026-compact-phase-lp.md",
+          "bytes": 41071,
+          "sha256": "8864cc85092061a6d1e065d2a207a1672ea2bd3b521b0f420c024a9b6f8ff60f",
+          "title": "A026 \u2014 Compact historical factors and the exact phase LP",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A027-entropy-optimizer.md",
+          "bytes": 95945,
+          "sha256": "cf812f16d6845f9538d4dab5556327006bde96bcc4873a2a225d962f7af35a30",
+          "title": "A027 \u2014 Port entropy and the unresolved numerical optimizer",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A028-current-literature-and-sensitivity.md",
+          "bytes": 15542,
+          "sha256": "6d9309055db6d9084bf762815f8b009e8cec0d6da899dc92414b61895ed4e5a0",
+          "title": "A028 \u2014 Current literature and sensitivity-oracle scope",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A029-global-root-obstruction.md",
+          "bytes": 12460,
+          "sha256": "94812490612d47478b8c25f45a6bb18e80b90bc06fb9029128a73aa963b95816",
+          "title": "A029 \u2014 Full balanced certificates fail for every root and orientation",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A030-exceptional-set-contraction.md",
+          "bytes": 88281,
+          "sha256": "9fcb500e319a7b4809b054d88dab4b073c49135ecf8c6eb71898104a62ad225a",
+          "title": "A030 \u2014 Exceptional-set contraction with explicit coverage of discarded cuts",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A031-blocking-phase-count.md",
+          "bytes": 15899,
+          "sha256": "16acf463255aa5a867571dcd680e82d036f81ce353fdeae2ddaa7a83f5540d90",
+          "title": "A031 \u2014 Total count of fixed-face blocking phases",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A032-port-projection-flow-compiler.md",
+          "bytes": 21447,
+          "sha256": "e08c41afa7f62e1d53f50d85054c77aca2dcb75df5d01d6d90f24c6ff34bba26",
+          "title": "A032 \u2014 Ordinary-flow compilation of the compact port projection",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A033-two-entry-recovery.md",
+          "bytes": 118907,
+          "sha256": "85eacadd5a3c595840ba6acecb092b10ecdedafc3fae298e561ce874e07b2e1f",
+          "title": "A033 \u2014 Two-entry arborescence recovery and small tree domains",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A034-literature-based-exact-flow-reduction.md",
+          "bytes": 28647,
+          "sha256": "d8f5fae4e639249aef2def5786aa60e64b9650c803469d68d3762220a45664a2",
+          "title": "A034 \u2014 Exact partial sparsification as a maximum-flow reduction",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A035-approximate-reduction-exactification.md",
+          "bytes": 149304,
+          "sha256": "7b2a1f0177eda857c5192228dfcfc7aa195515a0d3face4bbd0a77426377eb8d",
+          "title": "A035 \u2014 Exact recovery after approximate terminal shrinking",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A036-one-respecting-maxflow-reduction.md",
+          "bytes": 49958,
+          "sha256": "d9486d8d6bfe436e52be6bf28c1dfb534f8087af590a2149f8c2cba0b549e7e1",
+          "title": "A036 \u2014 One-respecting recovery and the actual maxflow-reduction bottleneck",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A037-cost-sensitive-packing-boost.md",
+          "bytes": 63484,
+          "sha256": "3897a85e12d421b9d1a13aec26069a3998c41a8ad3b6e33c0ede2e49e003509c",
+          "title": "A037 \u2014 Boosting a cost-sensitive low-congestion packing oracle",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A038-cost-sensitive-packing-oracle.md",
+          "bytes": 305187,
+          "sha256": "bc1e29235d417513700feed1ec60429ab3c12ea988f5a176fbcbab6aa29f5832",
+          "title": "A038 \u2014 Cost-sensitive low-congestion arborescence oracle",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A039-one-feedback-vertex-cost-oracle.md",
+          "bytes": 42481,
+          "sha256": "36e9d29c5e6dfecc867992e8281ca1c5138a7e9f416b7b029366c9404e8cdb44",
+          "title": "A039 \u2014 One-feedback-vertex cost oracle by one minimum-cost flow",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A040-laminar-price-normalization.md",
+          "bytes": 57326,
+          "sha256": "fab1bc344af45300b216dc8efaa84b749b565c7d0d3d9d8f4b511304bd0359be",
+          "title": "A040 \u2014 Relaxed price baselines and arbitrary-entry cluster lifting",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A041-joint-entry-profiles-and-zero-anchors.md",
+          "bytes": 26850,
+          "sha256": "c3494071404b44d6ba9ad70d4daf0736c728c7e24931cbb7c32c47e773485c3a",
+          "title": "A041 \u2014 Joint entry profiles and a single zero-price anchor",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A042-random-zero-parent-cycle-contraction.md",
+          "bytes": 22650,
+          "sha256": "d5017ec16e7cc79cf39e5959039fbe6d934e4a3b67981897c765114f4941136d",
+          "title": "A042 \u2014 Random zero-parent cycle contraction and its congestion barrier",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A043-terminal-expander-flow-packing.md",
+          "bytes": 32272,
+          "sha256": "8fe29dcc8078f5fd182074de56d1e4c4257eadf356dbf43bc3909762c5968a88",
+          "title": "A043 \u2014 Terminal-expander packing by adaptive flows and bounded Palm estimates",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A044-implicit-product-routing-and-color-requests.md",
+          "bytes": 26433,
+          "sha256": "8f2f6b269c6a0ba4713e367d9cd4f93450923bffb069bce5190087280d37be85",
+          "title": "A044 \u2014 Implicit product routing and color-dependent terminal requests",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A045-earliest-copy-palm-projection.md",
+          "bytes": 18806,
+          "sha256": "43201db72d5b010df6f7b0609ef8ec79132c196a6574ad0876adcc36bec2ae2e",
+          "title": "A045 \u2014 Earliest-copy projection and simultaneous Palm marginals",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A046-tight-set-flow-refinement.md",
+          "bytes": 93724,
+          "sha256": "1b176f0b9d7406787fe70586a9a9afe21a466c81faceb3e9ae81f98e5b35128e",
+          "title": "A046 \u2014 Tight-set flow refinement and entry-profile preserving contractions",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A047-one-shot-cycle-pivots.md",
+          "bytes": 8124,
+          "sha256": "f9618dcd46d6ced82ad5ad7b8840e313eb44ab2c20191bf634ef1411159fba98",
+          "title": "A047 \u2014 One-shot zero parents and flow-selected cycle pivots",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A048-reciprocal-connectivity-and-oriented-encodings.md",
+          "bytes": 27191,
+          "sha256": "758871dacf0062fb9899ede4bdd91d683766aa604e32980eb583a5e59d95d121",
+          "title": "A048 \u2014 Reciprocal connectivity and oriented threshold encodings",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A049-directed-decomposition-and-progress.md",
+          "bytes": 47145,
+          "sha256": "ef38be9d362db0a8256db1698c5e19260c13ecafb0aa849b3b546b5850cd0260",
+          "title": "A049 \u2014 Directed decomposition, routing containers and physical progress",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A050-eager-root-closure-and-path-peeling.md",
+          "bytes": 26556,
+          "sha256": "07e0956af12089f80750248635f73a7a62c6e54331d1a5018d5faac278549615",
+          "title": "A050 \u2014 Eager root closure and prescribed path peeling",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A051-dominator-certificates-and-domain-reduction.md",
+          "bytes": 42471,
+          "sha256": "b2b45b99c42821eaf71f762b9e5600cc890e65739a28847eff5a7a5e93471b5d",
+          "title": "A051 \u2014 Dominator certificates and exact domain reduction",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A052-multihead-threshold-encodings.md",
+          "bytes": 80304,
+          "sha256": "75fe9e4534367b4ab279504faf734005e153f6437adb06f495f3aad55338ad33",
+          "title": "A052 \u2014 Multiple boundary heads and threshold-preserving encodings",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A053-partial-heavy-tree-completion.md",
+          "bytes": 56628,
+          "sha256": "615ecc5c801ebddd9ec65e15b0dad8d792fc1007975dc8942b9c7f0c270f30cc",
+          "title": "A053 \u2014 Partial heavy trees and local reset completion",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A054-induced-candidate-discovery.md",
+          "bytes": 45481,
+          "sha256": "cf97d1785eb5cc460b15c17e2f3d59f238aa686042003fe12f22e5c256db21a9",
+          "title": "A054 \u2014 Induced candidate discovery and fat completion",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A055-sampled-source-forests.md",
+          "bytes": 15223,
+          "sha256": "e9843007e1f4dc4dd0847e8a4521b6bc7d21df5d0178c9bfde9a600ede5143e8",
+          "title": "A055 \u2014 Sampled predecessors and fixed zero-forest roots",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A056-filtered-factor-and-compression-certificates.md",
+          "bytes": 32262,
+          "sha256": "9bdf9aa911d0527ca1f59b368828c140a1ce28361d6270f19554c8d9a2feb9e0",
+          "title": "A056 \u2014 Filtered factors and measured compression certificates",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A057-capacity-activation-and-row-witnesses.md",
+          "bytes": 45200,
+          "sha256": "612878bcb930d5e7346763fecbcd839a34e6e96a1c22e82334471a5d0ffdf6e8",
+          "title": "A057 \u2014 Capacity activation and acyclic row witnesses",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A058-correlated-block-activation.md",
+          "bytes": 58715,
+          "sha256": "f8033210599b48022f9c15942e2f4e147559c1bba89c6bd5c414d1dd9159c1df",
+          "title": "A058 \u2014 Correlated activation on fixed heavy SCCs",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A059-correlated-cost-oracle.md",
+          "bytes": 23353,
+          "sha256": "89c1118c18391e34b69cb0b0785eae6d845b270a9aafb2658d9a87e3c2771d09",
+          "title": "A059 \u2014 Cost-sensitive correlated blocks and effective marginals",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A060-paired-zero-forests.md",
+          "bytes": 19676,
+          "sha256": "643e6435f067ee921df55d9ef0537fee72c284ffe0787150ef93755005e23ef0",
+          "title": "A060 \u2014 Paired zero forests and the inward-root obstruction",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A061-normalized-activation-encoding.md",
+          "bytes": 18437,
+          "sha256": "a90c73507835717055812ccaf6917a8a634153e20e728dc5f8641b1ee2a88800",
+          "title": "A061 \u2014 Normalized failure of activation retains the general problem",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A062-independent-sampling-survival.md",
+          "bytes": 17770,
+          "sha256": "829da9b2e341a0d4d9355e8571d5396ce239b29c09652d05365ca7876f2450d2",
+          "title": "A062 \u2014 Independent sampling can erase the rooted minimum",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A063-near-tight-domain-anchors.md",
+          "bytes": 229238,
+          "sha256": "6769ca341372267d9000b91879f1e8d79259d0f38dc82583f54c7373b0f6bec4",
+          "title": "A063 \u2014 Near-tight domains, internal anchors, and entry-flow deficits",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A064-weighted-generative-packing.md",
+          "bytes": 63577,
+          "sha256": "4acbc60f05052eeac01d8343948e73652339b34277c25a1de13aa2353cca4cb1",
+          "title": "A064 \u2014 Weighted generative arborescence packing through shared routing trees",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A065-correlated-tree-marginals.md",
+          "bytes": 95997,
+          "sha256": "3248b6053531a1d1f628e045b2773d02e58c52336d594e4c96ff160f389b0936",
+          "title": "A065 \u2014 Correlated colors and effective tree-marginal estimation",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A066-local-color-query-estimation.md",
+          "bytes": 151960,
+          "sha256": "8fb9c5e0a7f2b0de54a95d2a425cf7d87b71f542028e1ceb16ff7d1fb2ca50af",
+          "title": "A066 \u2014 Local color queries and importance estimates for the actual tree law",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A067-joint-prefix-avoidance.md",
+          "bytes": 75902,
+          "sha256": "c783c09b526e6116ce221856023649b5b82e435a5fb102b48a2e61940ce51f73",
+          "title": "A067 \u2014 Joint prefix avoidance under a forced Palm path",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A068-stochastic-upper-load-boost.md",
+          "bytes": 42996,
+          "sha256": "e07b88df7a9c195d5aee9726cacd9a83c2a6b1d7139f99e3a315c8d4aaabe55c",
+          "title": "A068 \u2014 Boosting with bounded stochastic upper-load data",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A069-price-credit-prefix-flow.md",
+          "bytes": 44585,
+          "sha256": "56892bac75a6adbd5bad1cbd8d9ca91242432995e6703a1d3652468ec0073d9a",
+          "title": "A069 \u2014 Price-credit prefix flows and the role of coupling",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A070-correlated-paid-head-completion.md",
+          "bytes": 22508,
+          "sha256": "73245da5c4ae84b5a96300eda5ab1d3f3881e1e2eeb9b24a0576b22c746670d2",
+          "title": "A070 \u2014 Correlated completion at a sampled paid head",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A071-simultaneous-correlated-repairs.md",
+          "bytes": 61846,
+          "sha256": "13c3eb6e68e75f4279641c8986d7661a21887323fffa174888038f667a82e781",
+          "title": "A071 \u2014 Simultaneous correlated repairs and head-throughput certificates",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A072-random-parent-structures.md",
+          "bytes": 132795,
+          "sha256": "cc53960997a63c89953cf683a2dc2cf27a182351c7aa060e1048072343eb9dd5",
+          "title": "A072 \u2014 Random parent structures beyond a fixed acyclic prefix",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A073-shared-branching-backbones.md",
+          "bytes": 49608,
+          "sha256": "768f8a1278a017468927743960e0bf229a6dac3c2524a69fe3785c3fabed5b40",
+          "title": "A073 \u2014 Shared branching backbones with certified incoming throughput",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A074-circulation-cycle-contraction.md",
+          "bytes": 42722,
+          "sha256": "c3a4c9a4a9099592877ea9250dabfd7e9595d3f811d50a7c2fe7d8360d65cdbf",
+          "title": "A074 \u2014 Circulation-generated cycle contraction and residual forests",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/index.md",
+          "bytes": 39433,
+          "sha256": "aff2ce67c8dba4790ad96f890462bba8d1c122d350b3ba43f3bdd46c68097cf0",
+          "title": "Attempted approaches",
+          "status": null
+        },
+        {
+          "path": "AUDITS/2026-09-12T173058Z-audit-1-gpt-6-astra-c84e071f.md",
+          "bytes": 12876,
+          "sha256": "9b09ba10b3b6dad21f03cd2ed27c370548f97da7e47c5518ca6cebb0cdb0e70f",
+          "title": "Audit-1 \u2014 2026-09-12T17:30:58+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-12T174439Z-audit-3-kimi-code-k3-81d4bf2f.md",
+          "bytes": 23683,
+          "sha256": "96ad043bca212e16ef2baf8bf8634a1a8638314f82457d9d6343737fac12af45",
+          "title": "Audit-3 \u2014 2026-09-12T17:44:39+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-12T175214Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-3ce370e9.md",
+          "bytes": 13141,
+          "sha256": "12162a669b26a6b69193b1d50d0ce0f13090b3676da05c9f10f24e6546d22efc",
+          "title": "Audit-2 \u2014 2026-09-12T17:52:14+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-12T200228Z-audit-1-gpt-6-astra-cfdd50fb.md",
+          "bytes": 15164,
+          "sha256": "08fb0204709eb23a31095332a4ae7611428f4c14b4703c270a5ec2b54a8c97bd",
+          "title": "Audit-1 \u2014 2026-09-12T20:02:28+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-12T204502Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-cb819ce1.md",
+          "bytes": 14804,
+          "sha256": "b1f26aab3a17beca9bbdd9ba16be679bec22be741519db09ae490f7d8f461118",
+          "title": "Audit-2 \u2014 2026-09-12T20:45:02+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-12T205451Z-audit-3-kimi-code-k3-d73c2b90.md",
+          "bytes": 27272,
+          "sha256": "3cfa3e3e1b5dfabebafefb1b7055380e40c6ba9a372f00e6026e354d47b15cc0",
+          "title": "Audit-3 \u2014 2026-09-12T20:54:51+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-12T230439Z-audit-1-gpt-6-astra-36ffd25f.md",
+          "bytes": 14565,
+          "sha256": "f48bf9e3bfb250189d68e8c4afe69860601916d3fee7dbac9997f62978f50358",
+          "title": "Audit-1 \u2014 2026-09-12T23:04:39+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-12T232219Z-audit-3-kimi-code-k3-e8255f6b.md",
+          "bytes": 24266,
+          "sha256": "e01022a3039e710abde4b3b67f2ef7cde8e7f759e2700cd069c52bb6c434bfdc",
+          "title": "Audit-3 \u2014 2026-09-12T23:22:19+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-12T232759Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-c5a107d9.md",
+          "bytes": 16039,
+          "sha256": "a03cb329aeda92e31dec7e51c25f5839c698c391e205d4718b747224dd9f0039",
+          "title": "Audit-2 \u2014 2026-09-12T23:27:59+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-13T013842Z-audit-1-gpt-6-astra-fef74510.md",
+          "bytes": 14470,
+          "sha256": "fba1547ab913d24486b1776a47c174b088243353bb0ea7dff887f88e7e31f60d",
+          "title": "Audit-1 \u2014 2026-09-13T01:38:42+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-13T015728Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-a87c2154.md",
+          "bytes": 11540,
+          "sha256": "db83bee469fe5147586c41e6ab0a4f92abd0655d986c1b040c9ecf05bb1f5635",
+          "title": "Audit-2 \u2014 2026-09-13T01:57:28+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-13T020215Z-audit-3-kimi-code-k3-22f22742.md",
+          "bytes": 17156,
+          "sha256": "ce156aa60b828f140b57cea61a264535812c2274c9289d55ec3f5f7cb3f7fd73",
+          "title": "Audit-3 \u2014 2026-09-13T02:02:15+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-13T041401Z-audit-1-gpt-6-astra-d67c48ab.md",
+          "bytes": 14061,
+          "sha256": "ec37af8cf3f999dd45d9a00c995032c8996b6ed112b0b5db11f26e582a24e2d8",
+          "title": "Audit-1 \u2014 2026-09-13T04:14:01+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-13T042911Z-audit-3-kimi-code-k3-4c389b43.md",
+          "bytes": 20078,
+          "sha256": "4f440223cfd7dee6b6432ae933b0d19fb4834b870973d6c9a01b54a9d22f9669",
+          "title": "Audit-3 \u2014 2026-09-13T04:29:11+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-13T043157Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-7332c038.md",
+          "bytes": 13822,
+          "sha256": "0ad3decca164f013a69ff14800edb58c30cbcbf10f4f33523a8c5edb042095a1",
+          "title": "Audit-2 \u2014 2026-09-13T04:31:57+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-13T064256Z-audit-1-gpt-6-astra-5b3a4057.md",
+          "bytes": 15391,
+          "sha256": "369a14b0ba596c97fd9e5779e05564ac5814348cad43c887fbdf562b9dd9aaf6",
+          "title": "Audit-1 \u2014 2026-09-13T06:42:56+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-13T071339Z-audit-3-kimi-code-k3-209578dd.md",
+          "bytes": 23175,
+          "sha256": "512e2224db1868cdc14691f83f19b7161b86406e13867b7d3b4b6fd3cc5fb5dd",
+          "title": "Audit-3 \u2014 2026-09-13T07:13:39+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "AUDITS/2026-09-13T071458Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-316151d0.md",
+          "bytes": 12159,
+          "sha256": "7c0e17dd99b71ad236db000c729b11e9684b86bf50a25ca8574f4627a64b80c5",
+          "title": "Audit-2 \u2014 2026-09-13T07:14:58+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "PROVED.md",
+          "bytes": 3216334,
+          "sha256": "8ac95a1ac449ef8fb3535cc27b976af818ba4d8d7596f4c2125005adafdbdd25",
+          "title": "Proved lemmas",
+          "lemma_ids": [
+            "L001",
+            "L002",
+            "L003",
+            "L004",
+            "L005",
+            "L006",
+            "L007",
+            "L008",
+            "L009",
+            "L010",
+            "L011",
+            "L012",
+            "L013",
+            "L014",
+            "L015",
+            "L016",
+            "L017",
+            "L018",
+            "L019",
+            "L020",
+            "L021",
+            "L022",
+            "L023",
+            "L024",
+            "L025",
+            "L026",
+            "L027",
+            "L028",
+            "L029",
+            "L030",
+            "L031",
+            "L032",
+            "L033",
+            "L034",
+            "L035",
+            "L036",
+            "L037",
+            "L038",
+            "L039",
+            "L040",
+            "L041",
+            "L042",
+            "L043",
+            "L044",
+            "L045",
+            "L046",
+            "L047",
+            "L048",
+            "L049",
+            "L050",
+            "L051",
+            "L052",
+            "L053",
+            "L054",
+            "L055",
+            "L056",
+            "L057",
+            "L058",
+            "L059",
+            "L060",
+            "L061",
+            "L062",
+            "L063",
+            "L064",
+            "L065",
+            "L066",
+            "L067",
+            "L068",
+            "L069",
+            "L070",
+            "L071",
+            "L072",
+            "L073",
+            "L074",
+            "L075",
+            "L076",
+            "L077",
+            "L078",
+            "L079",
+            "L080",
+            "L081",
+            "L082",
+            "L083",
+            "L084",
+            "L085",
+            "L086",
+            "L087",
+            "L088",
+            "L089",
+            "L090",
+            "L091",
+            "L092",
+            "L093",
+            "L094",
+            "L095",
+            "L096",
+            "L097",
+            "L098",
+            "L099",
+            "L100",
+            "L101",
+            "L102",
+            "L103",
+            "L104",
+            "L105",
+            "L106",
+            "L107",
+            "L108",
+            "L109",
+            "L110",
+            "L111",
+            "L112",
+            "L113",
+            "L114",
+            "L115",
+            "L116",
+            "L117",
+            "L118",
+            "L119",
+            "L120",
+            "L121",
+            "L122",
+            "L123",
+            "L124",
+            "L125",
+            "L126",
+            "L127",
+            "L128",
+            "L129",
+            "L130",
+            "L131",
+            "L132",
+            "L133",
+            "L134",
+            "L135",
+            "L136",
+            "L137",
+            "L138",
+            "L139",
+            "L140",
+            "L141",
+            "L142",
+            "L143",
+            "L144",
+            "L145",
+            "L146",
+            "L147",
+            "L148",
+            "L149",
+            "L150",
+            "L151",
+            "L152",
+            "L153",
+            "L154",
+            "L155",
+            "L156",
+            "L157",
+            "L158",
+            "L159",
+            "L160",
+            "L161",
+            "L162",
+            "L163",
+            "L164",
+            "L165",
+            "L166",
+            "L167",
+            "L168",
+            "L169",
+            "L170",
+            "L171",
+            "L172",
+            "L173",
+            "L174",
+            "L175",
+            "L176",
+            "L177",
+            "L178",
+            "L179",
+            "L180",
+            "L181",
+            "L182",
+            "L183",
+            "L184",
+            "L185",
+            "L186",
+            "L187",
+            "L188",
+            "L189",
+            "L190",
+            "L191",
+            "L192",
+            "L193",
+            "L194",
+            "L195",
+            "L196",
+            "L197",
+            "L198",
+            "L199",
+            "L200",
+            "L201",
+            "L202",
+            "L203",
+            "L204",
+            "L205",
+            "L206",
+            "L207",
+            "L208",
+            "L209",
+            "L210",
+            "L211",
+            "L212",
+            "L213",
+            "L214",
+            "L215",
+            "L216",
+            "L217",
+            "L218",
+            "L219",
+            "L220",
+            "L221",
+            "L222",
+            "L223",
+            "L224",
+            "L225",
+            "L226",
+            "L227",
+            "L228",
+            "L229",
+            "L230",
+            "L231",
+            "L232",
+            "L233",
+            "L234",
+            "L235",
+            "L236",
+            "L237",
+            "L238",
+            "L239",
+            "L240",
+            "L241",
+            "L242",
+            "L243",
+            "L244",
+            "L245",
+            "L246",
+            "L247",
+            "L248",
+            "L249",
+            "L250",
+            "L251",
+            "L252",
+            "L253",
+            "L254",
+            "L255",
+            "L256",
+            "L257",
+            "L258",
+            "L259",
+            "L260",
+            "L261",
+            "L262",
+            "L263",
+            "L264",
+            "L265",
+            "L266",
+            "L267",
+            "L268",
+            "L269",
+            "L270",
+            "L271",
+            "L272",
+            "L273",
+            "L274",
+            "L275",
+            "L276",
+            "L277",
+            "L278",
+            "L279",
+            "L280",
+            "L281",
+            "L282",
+            "L283",
+            "L284",
+            "L285",
+            "L286",
+            "L287",
+            "L288",
+            "L289",
+            "L290",
+            "L291",
+            "L292",
+            "L293",
+            "L294",
+            "L295",
+            "L296",
+            "L297",
+            "L298",
+            "L299",
+            "L300",
+            "L301",
+            "L302",
+            "L303",
+            "L304",
+            "L305",
+            "L306",
+            "L307",
+            "L308",
+            "L309",
+            "L310",
+            "L311",
+            "L312",
+            "L313",
+            "L314",
+            "L315",
+            "L316",
+            "L317",
+            "L318",
+            "L319",
+            "L320",
+            "L321",
+            "L322",
+            "L323",
+            "L324",
+            "L325",
+            "L326",
+            "L327",
+            "L328",
+            "L329"
+          ]
+        }
+      ]
+    },
+    {
+      "directory": "runs/2026-09-13_15-00-00_directed-mincut-prepared",
+      "transcript_bytes": 5520261,
+      "transcript_lines": 8652,
+      "first_event_utc": "2026-09-13T14:39:01.943719+00:00",
+      "last_event_utc": "2026-09-13T14:59:43.617648+00:00",
+      "completed_items_deduplicated_by_thread_and_item": {
+        "userMessage": 1,
+        "agentMessage": 22,
+        "commandExecution": 55,
+        "reasoning": 254,
+        "subAgentActivity": 73,
+        "webSearch": 20,
+        "fileChange": 8
+      },
+      "files": [
+        {
+          "path": "APPROACHES/A001-flow-reduction.md",
+          "bytes": 18182,
+          "sha256": "15dd0d6daa09c14bb99e2d9acf9a9f5a49258909848215992cad4d241c4f73d8",
+          "title": "A001 \u2014 Exact target and remaining algorithmic obligations",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A003-branching-packing.md",
+          "bytes": 2415,
+          "sha256": "9c09e8524334c4ece5d2476ead1d5c5249eb3526d9f27dcee1ffbe2b35fc7148",
+          "title": "A003 \u2014 Exact recovery from a supplied one-entry tree",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A033-two-entry-recovery.md",
+          "bytes": 4200,
+          "sha256": "0c1b6fdccc0b593f3e594f93c4f5cea8ebf48cd6440c4a24166e3e8921205b8b",
+          "title": "A033 \u2014 Two-interval candidates and the missing global work bound",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A037-cost-sensitive-packing-boost.md",
+          "bytes": 3721,
+          "sha256": "ed2354d3c476ceace2c8a73273d607631b4fb2547bd0ca5448a7bd3f7cea73bc",
+          "title": "A037 \u2014 The all-price tree-distribution contract",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A064-weighted-generative-packing.md",
+          "bytes": 2854,
+          "sha256": "017bb31d1b790a6537b4d91c5f10a255f4e87838fe94d2ba94930fb24c5f3f04",
+          "title": "A064 \u2014 Coarse tree laws as a supporting primitive",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A073-shared-branching-backbones.md",
+          "bytes": 3707,
+          "sha256": "381674e96e99594804e9ebb7579fb4bf768d5c2ff553703ec006e0430be617c7",
+          "title": "A073 \u2014 Shared prefixes and completed parent rows",
+          "status": "PARKED."
+        },
+        {
+          "path": "APPROACHES/A074-circulation-cycle-contraction.md",
+          "bytes": 5684,
+          "sha256": "52ae0e4908f6857c7d82e8866bcb212ad60e5f0dfe38866b19543222089e6560",
+          "title": "A074 \u2014 A capped circulation generates a forest or cyclic support",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A075-cycle-cover-bank.md",
+          "bytes": 19002,
+          "sha256": "d249435e5ee52586cfebb0a0b58557733f8b8f75f91c64ad9d72888effded15e",
+          "title": "A075 \u2014 Construct all local cycle covers with charged input",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A076-nonwinning-pruning-counterexample.md",
+          "bytes": 2922,
+          "sha256": "7ca929ba6a29029b90ff7cafa41f1592562abfa785d80fc25b2d99ef29b4cebd",
+          "title": "A076 \u2014 A nonwinning constrained cut can split every optimum",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A077-union-admission-localization.md",
+          "bytes": 12530,
+          "sha256": "8d0a4986db0c96f3b32e4a93d2edfff9121ebeb7c57ccec739b56e53a2364a05",
+          "title": "A077 \u2014 Safe localization from unconstrained terminal queries",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A078-shared-quotient-work.md",
+          "bytes": 9292,
+          "sha256": "0da7fb229efeffb470b0ade93c3c81847fd3d55e6ea776b93144b97eba4c3964",
+          "title": "A078 \u2014 Share quotient construction and completed-parent estimation",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A080-generated-forest-completion.md",
+          "bytes": 15153,
+          "sha256": "37e9497c04990f52920c9b893f6174fa1122bfab458839e917e4830e64b617ae",
+          "title": "A080 \u2014 Complete the forests actually generated by capped circulation",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/index.md",
+          "bytes": 5317,
+          "sha256": "79c265d8f9872f7df86a4c250bd8c2f144ebbe5dce4248143a6a7da71e2b31a2",
+          "title": "Attempted approaches",
+          "status": null
+        },
+        {
+          "path": "PROVED.md",
+          "bytes": 86852,
+          "sha256": "a9013414cba0d641c90add259f90910f0136891b05b4c5de57f45e6dbe53b1f8",
+          "title": "Proved lemmas",
+          "lemma_ids": [
+            "L001",
+            "L002",
+            "L013",
+            "L315",
+            "L316",
+            "L329",
+            "L330",
+            "L331",
+            "L332",
+            "L333",
+            "L334",
+            "L335",
+            "L336",
+            "L337",
+            "L338",
+            "L339",
+            "L340"
+          ]
+        },
+        {
+          "path": "audit_history/2026-09-12T173058Z-audit-1-gpt-6-astra-c84e071f.md",
+          "bytes": 12876,
+          "sha256": "9b09ba10b3b6dad21f03cd2ed27c370548f97da7e47c5518ca6cebb0cdb0e70f",
+          "title": "Audit-1 \u2014 2026-09-12T17:30:58+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-12T174439Z-audit-3-kimi-code-k3-81d4bf2f.md",
+          "bytes": 23683,
+          "sha256": "96ad043bca212e16ef2baf8bf8634a1a8638314f82457d9d6343737fac12af45",
+          "title": "Audit-3 \u2014 2026-09-12T17:44:39+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-12T175214Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-3ce370e9.md",
+          "bytes": 13141,
+          "sha256": "12162a669b26a6b69193b1d50d0ce0f13090b3676da05c9f10f24e6546d22efc",
+          "title": "Audit-2 \u2014 2026-09-12T17:52:14+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "audit_history/2026-09-12T200228Z-audit-1-gpt-6-astra-cfdd50fb.md",
+          "bytes": 15164,
+          "sha256": "08fb0204709eb23a31095332a4ae7611428f4c14b4703c270a5ec2b54a8c97bd",
+          "title": "Audit-1 \u2014 2026-09-12T20:02:28+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-12T204502Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-cb819ce1.md",
+          "bytes": 14804,
+          "sha256": "b1f26aab3a17beca9bbdd9ba16be679bec22be741519db09ae490f7d8f461118",
+          "title": "Audit-2 \u2014 2026-09-12T20:45:02+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "audit_history/2026-09-12T205451Z-audit-3-kimi-code-k3-d73c2b90.md",
+          "bytes": 27272,
+          "sha256": "3cfa3e3e1b5dfabebafefb1b7055380e40c6ba9a372f00e6026e354d47b15cc0",
+          "title": "Audit-3 \u2014 2026-09-12T20:54:51+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-12T230439Z-audit-1-gpt-6-astra-36ffd25f.md",
+          "bytes": 14565,
+          "sha256": "f48bf9e3bfb250189d68e8c4afe69860601916d3fee7dbac9997f62978f50358",
+          "title": "Audit-1 \u2014 2026-09-12T23:04:39+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-12T232219Z-audit-3-kimi-code-k3-e8255f6b.md",
+          "bytes": 24266,
+          "sha256": "e01022a3039e710abde4b3b67f2ef7cde8e7f759e2700cd069c52bb6c434bfdc",
+          "title": "Audit-3 \u2014 2026-09-12T23:22:19+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-12T232759Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-c5a107d9.md",
+          "bytes": 16039,
+          "sha256": "a03cb329aeda92e31dec7e51c25f5839c698c391e205d4718b747224dd9f0039",
+          "title": "Audit-2 \u2014 2026-09-12T23:27:59+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "audit_history/2026-09-13T013842Z-audit-1-gpt-6-astra-fef74510.md",
+          "bytes": 14470,
+          "sha256": "fba1547ab913d24486b1776a47c174b088243353bb0ea7dff887f88e7e31f60d",
+          "title": "Audit-1 \u2014 2026-09-13T01:38:42+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-13T015728Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-a87c2154.md",
+          "bytes": 11540,
+          "sha256": "db83bee469fe5147586c41e6ab0a4f92abd0655d986c1b040c9ecf05bb1f5635",
+          "title": "Audit-2 \u2014 2026-09-13T01:57:28+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "audit_history/2026-09-13T020215Z-audit-3-kimi-code-k3-22f22742.md",
+          "bytes": 17156,
+          "sha256": "ce156aa60b828f140b57cea61a264535812c2274c9289d55ec3f5f7cb3f7fd73",
+          "title": "Audit-3 \u2014 2026-09-13T02:02:15+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-13T041401Z-audit-1-gpt-6-astra-d67c48ab.md",
+          "bytes": 14061,
+          "sha256": "ec37af8cf3f999dd45d9a00c995032c8996b6ed112b0b5db11f26e582a24e2d8",
+          "title": "Audit-1 \u2014 2026-09-13T04:14:01+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-13T042911Z-audit-3-kimi-code-k3-4c389b43.md",
+          "bytes": 20078,
+          "sha256": "4f440223cfd7dee6b6432ae933b0d19fb4834b870973d6c9a01b54a9d22f9669",
+          "title": "Audit-3 \u2014 2026-09-13T04:29:11+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-13T043157Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-7332c038.md",
+          "bytes": 13822,
+          "sha256": "0ad3decca164f013a69ff14800edb58c30cbcbf10f4f33523a8c5edb042095a1",
+          "title": "Audit-2 \u2014 2026-09-13T04:31:57+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "audit_history/2026-09-13T064256Z-audit-1-gpt-6-astra-5b3a4057.md",
+          "bytes": 15391,
+          "sha256": "369a14b0ba596c97fd9e5779e05564ac5814348cad43c887fbdf562b9dd9aaf6",
+          "title": "Audit-1 \u2014 2026-09-13T06:42:56+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-13T071339Z-audit-3-kimi-code-k3-209578dd.md",
+          "bytes": 23175,
+          "sha256": "512e2224db1868cdc14691f83f19b7161b86406e13867b7d3b4b6fd3cc5fb5dd",
+          "title": "Audit-3 \u2014 2026-09-13T07:13:39+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-13T071458Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-316151d0.md",
+          "bytes": 12159,
+          "sha256": "7c0e17dd99b71ad236db000c729b11e9684b86bf50a25ca8574f4627a64b80c5",
+          "title": "Audit-2 \u2014 2026-09-13T07:14:58+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        }
+      ]
+    },
+    {
+      "directory": "runs/2026-09-13_17-06-14_design-and-analyze-an-algorithm-for-exact-global",
+      "transcript_bytes": 68484347,
+      "transcript_lines": 81550,
+      "first_event_utc": "2026-09-13T15:06:15.154560+00:00",
+      "last_event_utc": "2026-09-13T22:06:42.196332+00:00",
+      "completed_items_deduplicated_by_thread_and_item": {
+        "userMessage": 13,
+        "agentMessage": 338,
+        "commandExecution": 1092,
+        "reasoning": 3580,
+        "webSearch": 209,
+        "subAgentActivity": 1012,
+        "fileChange": 79,
+        "contextCompaction": 30,
+        "collabAgentToolCall": 21
+      },
+      "files": [
+        {
+          "path": "APPROACHES/A001-verified-benchmarks.md",
+          "bytes": 83329,
+          "sha256": "d5c426cefd0e7b89e0b232b9be07e87d31a20ea6f49e773417f55c3cb0680e60",
+          "title": "A001 \u2014 Verified algorithmic benchmarks",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A002-rooted-flow-reductions.md",
+          "bytes": 4330,
+          "sha256": "12c450cd9a6225aa2173fe6e2aa9f1ec0357c6e63b5f629d2483cd65db2f7979",
+          "title": "A002 \u2014 Rooted and terminal-flow reductions",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A003-undirected-transfers.md",
+          "bytes": 7693,
+          "sha256": "48717abfbbabc8ae4665fff9a7c30c050557b0317bfa7b7e9c3320156331c6ff",
+          "title": "A003 \u2014 Direct transfers from undirected cuts",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A004-approximation-exactness.md",
+          "bytes": 5005,
+          "sha256": "7b23f8f3ea2f4090984a6ba877c9761de808af8bb9976aa0dfa56d917db229ec",
+          "title": "A004 \u2014 Exactness from approximation and integrality",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A005-nonempty-gadget.md",
+          "bytes": 4529,
+          "sha256": "8fb93017112e7e75b16533ee419ec27498f03690218714576a564d7f3b409952",
+          "title": "A005 \u2014 Encoding a nonempty cut by a flow gadget",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A006-tree-packing-reduction.md",
+          "bytes": 16543,
+          "sha256": "aae167e1b06f39f814570de770a55900aee048f71bde10c2f7afd96975195708",
+          "title": "A006 \u2014 Tree search and a sufficient packing primitive",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A007-product-weighted-arborescences.md",
+          "bytes": 5561,
+          "sha256": "f7270d316913f228aa342de98650c91bb3ed6ad274ff5cf88c54140191766594",
+          "title": "A007 \u2014 Product-weighted random arborescences",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A008-weighted-packing-oracles.md",
+          "bytes": 9378,
+          "sha256": "42130b462d50e314a350fe62592f17cfa59cd39b82155ada26ca0a400e46d1e5",
+          "title": "A008 \u2014 Computing a feasible packing by weighted oracles",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A009-bounded-tree-crossings.md",
+          "bytes": 7980,
+          "sha256": "4e71c45f169e1583bd2c56841ec5e0398e9316bc0cadbe4abe8d88abb426834a",
+          "title": "A009 \u2014 Cuts crossing a given tree several times",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A010-circulation-residuals.md",
+          "bytes": 7258,
+          "sha256": "bc8ac94fed3a85b32afe9d9b328241eeab3530028c365ab21450a57e7d3294cf",
+          "title": "A010 \u2014 Circulation subtraction and residual cuts",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A011-monotone-branching-maintenance.md",
+          "bytes": 5829,
+          "sha256": "d2150f592c48b2533c3f167165180260fba6e22d1072d1943e71f8e88cdfd033",
+          "title": "A011 \u2014 Monotone minimum-cost arborescence maintenance",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A012-selecting-saturating-circulations.md",
+          "bytes": 4655,
+          "sha256": "88449f5d176bce7cdd983e369e089baaa11476a90a798e792300570d36d5c4df",
+          "title": "A012 \u2014 Selecting a circulation that saturates an unknown optimum",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A013-shared-regions-promise-search.md",
+          "bytes": 59291,
+          "sha256": "2eb436a5d2158fd865addd0c2a071d17d61fac6dd7399597011ed561e3d26901",
+          "title": "A013 \u2014 Shared region representations for the tree-crossing promise",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A014-dual-revision-contractions.md",
+          "bytes": 5982,
+          "sha256": "24c43b1d00a45f2f5a815d06532666a8823ef9e9746321d32fa9a12deaa3cecc",
+          "title": "A014 \u2014 Revising dual certificates and reusing contractions",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A015-graph-aware-circulations.md",
+          "bytes": 4640,
+          "sha256": "24a3801b30ef8559252614570f18c2079c7777765f69b70d7c245fb71ea57785",
+          "title": "A015 \u2014 Graph-aware circulation selection and exact cut extraction",
+          "status": "BLOCKED."
+        },
+        {
+          "path": "APPROACHES/A016-threshold-cost-oracles.md",
+          "bytes": 4969,
+          "sha256": "54307cb54dbfde30be0b0310d71512970a59e83274f62368c513c9e22d72252b",
+          "title": "A016 \u2014 Packing with a threshold-cost tree oracle",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A017-capacity-independent-thresholds.md",
+          "bytes": 8726,
+          "sha256": "a2e9f5105b062a8112e858300e497abf3d3ed6b6ea9772c94304f047960995b1",
+          "title": "A017 \u2014 Capacity-independent load thresholds and tree sampling",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A018-residual-forest-extraction.md",
+          "bytes": 36722,
+          "sha256": "e6f466bcc4db2efe5dd3baadf8786b87041698eb2c3d7beb6bd32bfa576f8927",
+          "title": "A018 \u2014 Exact extraction remains general with two residual forests",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A019-dynamic-threshold-trees.md",
+          "bytes": 42551,
+          "sha256": "8e8ffda7ab7e562602e212665f28fcc07acbe93fa9588a591a952b8a460a5d19",
+          "title": "A019 \u2014 Dynamic threshold-cost trees under load events",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A020-small-strong-components.md",
+          "bytes": 22156,
+          "sha256": "29d6b08b1e92228468dad5b1f961fe73ffb49099c68d9c431ccbc47a49c0dc11",
+          "title": "A020 \u2014 Exact factorization through small fixed strong components",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A021-lazy-tree-recourse.md",
+          "bytes": 15385,
+          "sha256": "ce51c543c7a792cb8f9fe1b9cdacbd9c5fd7dbeda844251a24916bf469b47d20",
+          "title": "A021 \u2014 Lazy threshold retention can have quadratic tree recourse",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A022-entropy-packing-formulation.md",
+          "bytes": 21100,
+          "sha256": "0db2344987b4796a4fb3900c87615f44c83c7f112c0bf2e962aa13e2a5d91df8",
+          "title": "A022 \u2014 A finite entropy formulation for feasible arborescence sampling",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A023-exponential-activity-range.md",
+          "bytes": 13951,
+          "sha256": "f7996d64ea1ef702f329df2f512e1962af75898172d7f847c9fb5aaf4065de27",
+          "title": "A023 \u2014 Feasible arborescence distributions can require exponential activity ratios",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A024-monotone-entropy-corrections.md",
+          "bytes": 11770,
+          "sha256": "0e48253896d6816adb760054a2577552ae3e954cb9de74e7ef56d8017cbc4509",
+          "title": "A024 \u2014 Monotone activity corrections and marginal detection",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A025-compact-path-tree-updates.md",
+          "bytes": 36078,
+          "sha256": "9d2806c2639e98707263fdac9765598761630c37fef9775bbd43a22d0956079e",
+          "title": "A025 \u2014 Compact path reversals maintain exact tree-load events",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A026-positive-elimination-sampling.md",
+          "bytes": 27866,
+          "sha256": "1bd116eba430bb2abba4e0430f6bcd5208d9ba75a9c0f6cfff6905e97ca4f72e",
+          "title": "A026 \u2014 Positive elimination gives a rigorous finite arborescence sampler",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A027-dyadic-unweighted-tree-sampling.md",
+          "bytes": 18974,
+          "sha256": "83159b041adc90e9b9bd0b2ee9852d7c8edfd1eed08193d4209432dd9be25f53",
+          "title": "A027 \u2014 Exact unweighted gadgets for dyadic arborescence activities",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A028-static-exchange-compression.md",
+          "bytes": 12272,
+          "sha256": "2ea46c8c5ff2651926e236646509f32623a3d89942030fa83df2d229356d8a4b",
+          "title": "A028 \u2014 Static compression of weighted tree-exchange paths",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A029-coupled-ensemble-corrections.md",
+          "bytes": 24010,
+          "sha256": "a216eea147d68f8442d1b6abb22c0788479cd20c90c92d4de7f55d908ecbd89d",
+          "title": "A029 \u2014 Coupling retained tree ensembles through activity corrections",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A030-coupling-recourse-lower-bound.md",
+          "bytes": 16862,
+          "sha256": "80a0e0651d4de4def9361ad2155ddca4309f7f1fa644aab7e4cc9e433e5ccd29",
+          "title": "A030 \u2014 A legal activity halving can force linear expected tree changes",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A031-capacity-normalization-sampling.md",
+          "bytes": 7605,
+          "sha256": "0c00aeb3aded8f4d225fd2c1d6931fd5d5a27fdfeb42ba67058ac2c766f5e1af",
+          "title": "A031 \u2014 Independent capacity normalization can destroy directed connectivity",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A032-exponential-cost-tree-sampling.md",
+          "bytes": 22107,
+          "sha256": "a8089acc10d4ce5c6e367d505f84ecbfd92543c7ff29cd198a122fe7eaf0bbf2",
+          "title": "A032 \u2014 Independent exponential costs can miss the unique optimal cut",
+          "status": "CLOSED."
+        },
+        {
+          "path": "APPROACHES/A033-marginal-variation-and-batched-corrections.md",
+          "bytes": 16954,
+          "sha256": "7b6a5fb794c626752834df7f34347e3125a9d647d28cdb8516495e5954df7529",
+          "title": "A033 \u2014 Marginal variation and batched activity corrections",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A034-selecting-balanced-exact-splits.md",
+          "bytes": 25906,
+          "sha256": "62c851622f6733ecf4e879ebbab494c8f806c3a8e95e5c99fa73f911f26fd9b2",
+          "title": "A034 \u2014 Selecting balanced exact splits from nonnegative source weights",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A035-frozen-laminar-certificate-monitoring.md",
+          "bytes": 18230,
+          "sha256": "013b1f20c2a29dc5ee20c06d3d4ca2a5745f6a5ab087eddb3ef0315cf369e4bd",
+          "title": "A035 \u2014 Monitoring a frozen laminar certificate without nested arc copies",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A036-pivot-flow-and-residual-component-splitting.md",
+          "bytes": 23877,
+          "sha256": "098703fed7f41adb3931f811adfb33b207a23672dabfd3fd526f05f59e3fe132",
+          "title": "A036 \u2014 Pivot flows and exact residual component splits",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A037-distance-ball-repair-of-laminar-certificates.md",
+          "bytes": 23204,
+          "sha256": "a72578c32da819b1024080d4a26d1fb3b4f6ddf00ef86ec29c1fff938450e415",
+          "title": "A037 \u2014 Distance-ball repair of one failed laminar certificate set",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A038-one-anchor-repair-after-a-length-increase.md",
+          "bytes": 36812,
+          "sha256": "9d62c55356c9c9619026f2ad090035091dbb564c888d1371937860396d7c721b",
+          "title": "A038 \u2014 Complete one-anchor certificate repair after one length increase",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A039-local-hierarchy-updates-and-boundary-reporting.md",
+          "bytes": 37543,
+          "sha256": "665aebf4b7eac1037e0f902b36e40f01ed589c498e82d4b9c11c616aea32539a",
+          "title": "A039 \u2014 Local hierarchy updates and boundary eligibility reporting",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A040-prefix-rounding-for-laminar-dual-certificates.md",
+          "bytes": 31755,
+          "sha256": "696a8a2061fc03daf19392578e09a24d03d0d7d8ed84a72f0ed232e8e62ea51e",
+          "title": "A040 \u2014 Prefix rounding for laminar dual certificates",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A041-omitted-constraints-and-frozen-epoch-scan-budgets.md",
+          "bytes": 32148,
+          "sha256": "f15f361e6fec5251eba5e555e65491f81146753dffecd50c9ae80bfd1225f29a",
+          "title": "A041 \u2014 Omitted constraints and frozen-epoch scan budgets",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A042-laminar-connectivity-via-edge-activation-thresholds.md",
+          "bytes": 28421,
+          "sha256": "156fcb9dd4a648e4e9924d65b344c2b81ad5ceb40cf8530aec145970695957fb",
+          "title": "A042 \u2014 Laminar connectivity through edge activation thresholds",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A043-fixed-in-out-tree-rerooting-and-exact-loads.md",
+          "bytes": 30303,
+          "sha256": "76fcfca368ec8d911d54785a14c0c9c973cd29bad95d33761d1b84e07cad1f99",
+          "title": "A043 \u2014 Fixed in/out-tree rerooting and exact loads",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A044-connectivity-testers-under-quotient-refinement.md",
+          "bytes": 69407,
+          "sha256": "b54aa53a80b4195ce2f1a6a9414a3c4d54934014fa9a9422d4d6e6f5ee3f24da",
+          "title": "A044 \u2014 Connectivity testers under quotient refinement",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A045-refused-omissions-do-not-force-dual-mass-growth.md",
+          "bytes": 17901,
+          "sha256": "3d5310e61fb70a3c11dc9d4def320f02472687b5c52b7ee57517d2cd62619ad4",
+          "title": "A045 \u2014 Refused omissions do not force dual mass growth",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A046-batched-minimum-superset-chains.md",
+          "bytes": 34668,
+          "sha256": "2949c9554582134ab489314f37c20e116119282c3894e7f3a6f21a46c409c047",
+          "title": "A046 \u2014 Batched minimum-superset chains",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A047-capped-source-batches-and-residual-recursion.md",
+          "bytes": 57880,
+          "sha256": "9b9194d49087b4e937cb52abf933b2bf1086cbd036893da9cbac68997b7a2396",
+          "title": "A047 \u2014 Capped source batches and residual recursion",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A048-weighted-source-orders-can-have-superlinear-total-input.md",
+          "bytes": 23611,
+          "sha256": "d62cbc23b778ab58af3a6b3af06e1133990014099b07438d2b9e91a64697a137",
+          "title": "A048 \u2014 Weighted source orders can have superlinear total input",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A049-imbalance-support-and-undirected-leaf-solvers.md",
+          "bytes": 13701,
+          "sha256": "a3d4f36b49d1bd2b857ac6504fffed5b685911bd90da0bd9cdb9f5397bfe32b5",
+          "title": "A049 \u2014 Imbalance support and undirected leaf solvers",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A050-incoming-excess-ordering-obstruction.md",
+          "bytes": 26004,
+          "sha256": "3656bfd6d1c6daedc0d74022b987eb39639ce7beae7385e7c0dcef6063824264",
+          "title": "A050 \u2014 Incoming-excess ordering obstruction",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A051-undirected-tree-distributions-with-balanced-mean-tail-degrees.md",
+          "bytes": 24895,
+          "sha256": "33ac955eaf7440647fbaf75a219ef1d530b820d64f0cbd6f1badd1a3a8afef84",
+          "title": "A051 \u2014 Undirected tree distributions with balanced mean tail degrees",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A052-laplacian-entropy-duals-for-undirected-tree-exposure.md",
+          "bytes": 31692,
+          "sha256": "37dab5c8ef3a1f135b89b8438490894c5bf6b40487fcabdf24115ac8b7efd5b0",
+          "title": "A052 \u2014 Laplacian entropy duals for undirected tree exposure",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A053-gaussian-commutator-sketches-do-not-sparsify-the-hessian.md",
+          "bytes": 18316,
+          "sha256": "34f928196bd895fc5109c339eb7e80fa67a79c3e93d91f1721b3ebb6691df7e2",
+          "title": "A053 \u2014 Gaussian commutator sketches do not sparsify the Hessian",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A054-linear-parameter-range-for-undirected-tree-entropy.md",
+          "bytes": 22972,
+          "sha256": "25017803ef7a6dcd6a19622aa9e931a9f3fd09bb7fe5ce21bb3833031a37058a",
+          "title": "A054 \u2014 Linear parameter range for undirected tree entropy",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A055-routing-mean-deficits-through-unused-capacities.md",
+          "bytes": 82249,
+          "sha256": "a6edc5c5ed882753824a9d53ffa0a7cbf68edf4ad9483d2f87edaa087a911e8b",
+          "title": "A055 \u2014 Routing mean deficits through unused capacities",
+          "status": "ACTIVE."
+        },
+        {
+          "path": "APPROACHES/A056-constant-entropy-objective-accuracy-exposes-minimum-cuts.md",
+          "bytes": 17450,
+          "sha256": "cb91cc8b8036562a1caa3b36fc60d3194972bbffb16a584e56795fb3315220d4",
+          "title": "A056 \u2014 Constant entropy objective accuracy exposes minimum cuts",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A057-projected-gaussian-hessian-estimators-can-need-square-root-many-probes.md",
+          "bytes": 23508,
+          "sha256": "0c69faa3e4950a354448c8150cdd7f561f9db5ee23dc207b14b351e4d83dbc9b",
+          "title": "A057 \u2014 Projected Gaussian Hessian estimators can need square-root many probes",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A058-linear-range-for-the-flow-relaxed-entropy-objective.md",
+          "bytes": 24642,
+          "sha256": "cfeeb9515cf6d26172fcc03314c8493caf28c8841b5b6ab8422ce05afc6fdf8d",
+          "title": "A058 \u2014 Linear range for the flow-relaxed entropy objective",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A059-positive-parameter-gaps-give-cuts-or-entropy-descent.md",
+          "bytes": 21392,
+          "sha256": "d32a5bb03b9c59482e3921b0cbd383c24d666c5fa21a735d063435e6ffb77457",
+          "title": "A059 \u2014 Positive parameter gaps give cuts or entropy descent",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/A060-polynomial-sublevel-radius-and-dyadic-entropy-parameters.md",
+          "bytes": 18201,
+          "sha256": "6c6e841a78bf507df66c3b1ccb6916794bd9e0d0573c478898085d250d40f894",
+          "title": "A060 \u2014 Polynomial sublevel radius and dyadic entropy parameters",
+          "status": "RESOLVED."
+        },
+        {
+          "path": "APPROACHES/index.md",
+          "bytes": 22276,
+          "sha256": "81b8319b95853862a718a1a380cca69003dedf2ca7c247da778665796ef8f626",
+          "title": "Attempted approaches",
+          "status": null
+        },
+        {
+          "path": "AUDITS/2026-09-13T200031Z-audit-1-gpt-6-astra-20908ab8.md",
+          "bytes": 17749,
+          "sha256": "5994879e4f4a2c7f3503c46edeb9d2ca9c58f25e7cd957302aabdea2d11f69b4",
+          "title": "Audit-1 \u2014 2026-09-13T20:00:31+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "AUDITS/2026-09-13T200852Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-05095af2.md",
+          "bytes": 17243,
+          "sha256": "525a251818157f5c23072a08c7a6240d2f3d37a735c824650691a979eb6b543c",
+          "title": "Audit-2 \u2014 2026-09-13T20:08:52+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        },
+        {
+          "path": "AUDITS/2026-09-13T201325Z-audit-3-kimi-code-k3-d0251787.md",
+          "bytes": 24554,
+          "sha256": "0b89743e5f45d2ff3fdd187e2f5c860dcb50413b3285f63c74abc21190e0f617",
+          "title": "Audit-3 \u2014 2026-09-13T20:13:25+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "PROVED.md",
+          "bytes": 904102,
+          "sha256": "47bd7564ddd7249c6d14d5c38be73131bfcb3570eb2b7bef9cf607282d22491d",
+          "title": "Proved lemmas",
+          "lemma_ids": [
+            "L001",
+            "L002",
+            "L003",
+            "L004",
+            "L005",
+            "L006",
+            "L007",
+            "L008",
+            "L009",
+            "L010",
+            "L011",
+            "L012",
+            "L013",
+            "L014",
+            "L015",
+            "L016",
+            "L017",
+            "L018",
+            "L019",
+            "L020",
+            "L021",
+            "L022",
+            "L023",
+            "L024",
+            "L025",
+            "L026",
+            "L027",
+            "L028",
+            "L029",
+            "L030",
+            "L031",
+            "L032",
+            "L033",
+            "L034",
+            "L035",
+            "L036",
+            "L037",
+            "L038",
+            "L039",
+            "L040",
+            "L041",
+            "L042",
+            "L043",
+            "L044",
+            "L045",
+            "L046",
+            "L047",
+            "L048",
+            "L049",
+            "L050",
+            "L051",
+            "L052",
+            "L053",
+            "L054",
+            "L055",
+            "L056",
+            "L057",
+            "L058",
+            "L059",
+            "L060",
+            "L061",
+            "L062",
+            "L063",
+            "L064",
+            "L065",
+            "L066",
+            "L067",
+            "L068",
+            "L069",
+            "L070",
+            "L071",
+            "L072",
+            "L073"
+          ]
+        },
+        {
+          "path": "audit_history/2026-09-13T172233Z-audit-1-gpt-6-astra-4b7fb27c.md",
+          "bytes": 12985,
+          "sha256": "1d624830377f446ef775ee8dbac15f988958f292cd1ed9fa265331e9c54e45a0",
+          "title": "Audit-1 \u2014 2026-09-13T17:22:33+00:00 \u2014 gpt-6-astra"
+        },
+        {
+          "path": "audit_history/2026-09-13T174157Z-audit-3-kimi-code-k3-6e3c6013.md",
+          "bytes": 22776,
+          "sha256": "267927d9cdf46ba3c0eb0ad150d27abaef599d7f2b0183de3e5588544d16930f",
+          "title": "Audit-3 \u2014 2026-09-13T17:41:57+00:00 \u2014 kimi-code/k3"
+        },
+        {
+          "path": "audit_history/2026-09-13T174922Z-audit-2-claude-haiku-4-5-20251001--claude-fable-5-1-1ad9413a.md",
+          "bytes": 19291,
+          "sha256": "fc96934463126925c32ff8ef6ce9e8e3fa93e589381116c5ddc0b021cda32817",
+          "title": "Audit-2 \u2014 2026-09-13T17:49:22+00:00 \u2014 claude-haiku-4-5-20251001, claude-fable-5-1"
+        }
+      ]
+    }
+  ]
+}

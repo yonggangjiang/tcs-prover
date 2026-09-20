@@ -12,11 +12,16 @@ nodes:
     resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
     recovery: {when: "'report' in state and state.report.verdict == 'reject'", prompt: repair}
     outcome: result.outcome
+    before:
+    - set: {proof_verified: 'False', output: "''"}
     after:
     - merge: result
     - set:
         solution: "result.output if outcome == 'done' else get(state, 'solution', '')"
         failed: outcome == 'failure'
+        failure_reason: "result.output if outcome == 'failure' else ''"
+        proof_verified: 'False'
+        output: "''"
     next: {done: critic, failure: end}
 
   critic:
@@ -31,11 +36,12 @@ nodes:
     require:
     - bool(strip(result.solution))
     - "not strip(result.bugs) if result.verdict == 'pass' else bool(strip(result.bugs))"
-    outcome: "'reject' if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
+    outcome: "'reject' if result.verdict == 'reject' else ('pass' if result.solution == state.solution else 'fixed')"
     before:
+    - set: {proof_verified: 'False', output: "''"}
     - write: {path: saved-candidate.md, text: state.solution}
     after:
-    - set: {solution: strip(result.solution), report: result, round: visit}
+    - set: {solution: result.solution, report: result, round: visit}
     - write: {path: saved-candidate.md, text: state.solution}
     - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', text: '{raw}'}
     next:
@@ -43,15 +49,16 @@ nodes:
       pass:
         to: end
         after:
-        - set: {output: state.solution}
+        - set: {output: state.solution, proof_verified: 'True'}
         - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed without edits.'}
       fixed:
         repeat: 2
         option: critic_rounds
-        then: end
+        then: author
         after:
-        - set: {output: state.solution}
-        - emit: {kind: status, label: Critic approved, text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
+        - set:
+            report: "{'verdict': 'reject', 'solution': state.solution, 'bugs': 'The critic changed the candidate on the last allowed review round. This exact revision has not received an unchanged acceptance. Check the changes and their dependencies, then submit a complete candidate for fresh review.'}"
+        - emit: {kind: status, label: Revised proof needs verification, text: 'Reached MAX ({limit} consecutive review rounds) with an edited proof. Returning the unverified candidate to the author.'}
 prompts:
   author_simple: |-
     The following is the statement to prove. Try to prove it with a complete, rigorous argument.
@@ -92,7 +99,16 @@ prompts:
 
     2. APPROACHES/ contains a simple directed acyclic graph (DAG) of attempted approaches. Each node is a Markdown file with a stable ID and descriptive name, for example A001-xxx.md. An edge A -> B means that approach B developed from approach A. An approach may have no parents or several parents.
 
-    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG. Update the table whenever a node is added or its position changes, with links to the relevant detailed records.
+    APPROACHES/index.md contains a compact working frontier followed by a navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG. Update the table whenever a node is added or its position changes, with links to the relevant detailed records. Keep the frontier short enough to read on every continuation: the exact remaining target, a few structurally different routes, each route's proved ingredients and one precise missing bridge, the next decisive test and its expected information, and changes since the last audit. Link to detailed work instead of repeating it. Local RESOLVED nodes are not a proof of the original statement.
+
+    Use this frontier to guide research, rather than maximizing the number of nodes or lemmas:
+
+    - Start with a small portfolio of structurally different mechanisms, including one that does not depend on the current favored reduction. Different implementations of the same unproved oracle are one route. Develop the strongest route deeply, but when two focused attempts leave its same bridge unchanged, run a bounded probe of another mechanism before extending that branch again. Record the mathematical result that would justify returning. This is a trigger for reconsideration, not a limit on difficult proofs.
+    - Work backward from the exact conclusion to the weakest sufficient interface. Compare existence versus construction, a single usable object versus an explicit distribution or packing, a sample versus all marginals, expectation versus uniform or adaptive guarantees, and a fresh static computation versus maintaining a dynamic structure. Do not solve a stronger auxiliary problem by default. State why any extra requirement is necessary, or drop it. An impossibility for that extra requirement need not obstruct the original goal.
+    - Before lengthy implementation or analysis, state a falsifiable bridge lemma and attempt its cheapest decisive test: small symbolic examples, an explicit adversarial family, exact finite enumeration when appropriate, or a fully charged toy execution. Numerical success is evidence only; a counterexample needs verified premises and a general proof when used as a theorem. Distinguish the claim tested from stronger claims the test cannot establish.
+    - After a counterexample, identify precisely which hypotheses, quantified claim, representation, and mechanism fail. Look for a weaker invariant or a changed representation that survives; record what the example suggests constructing. A lower bound for explicit updates, a particular estimator, one oracle interface, or an operation on the original instance does not rule out every algorithm or the same operation on an auxiliary instance. Close the refuted claim, not an entire family sharing its vocabulary. Reuse counterexamples to compare alternative routes rather than producing nearby negative results without changing the plan.
+    - At a stalled bridge and after an audit, check whether already proved lemmas from different branches compose into the needed interface. State the exact input/output and hypothesis match. Consider whether randomization, averaging, conditioning, or a bounded static rebuild removes an unnecessarily exact intermediate requirement. Count this synthesis as progress only when the resulting bridge or its obstruction is explicit.
+    - Maintain a full resource argument alongside correctness for algorithmic tasks: input and representation sizes, number and total input volume of oracle calls, updates and actual inspected records, rebuilding, sampling, precision and word lengths, failure probabilities, and dependence between adaptive calls. A fast primitive, a small event count, or a local potential decrease does not by itself bound total work. Name the missing charge before building further machinery on it.
 
     Each node file has this markdown structure:
 
@@ -111,7 +127,7 @@ prompts:
 
     ## Detailed work
 
-    Append all mathematical work and thinking process towards the objective described above. Let above.
+    Record the substantive mathematical work toward the objective: candidate claims, constructions, computations or experiments with their outcomes, failed arguments and their exact failure, proofs, and decisions that change the route. Preserve enough detail to reconstruct and check each argument. Label a conjecture, heuristic, computational observation, conditional reduction, and proved result distinctly. Avoid repeated narration, unchanged restatements, and copying full proofs between files; give a short self-contained interface and a precise link when reusing a recorded proof.
 
     This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma, and how it relates to the overall objective. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to the general context.
 
@@ -123,13 +139,19 @@ prompts:
 
     This section is only required if the node is RESOLVED or CLOSED. If the node is RESOLVED, state clearly what is proved; If the proof is recorded in PROVED.md, give the lemma ID and a brief description. If the node is CLOSED, state clearly what is disproved or what is the obstacle that cannot be overcome; Again, if the proof is recorded in PROVED.md, give the lemma ID and a brief description.
 
-    3. PROVED.md contains only important re-usable rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. Positive and negative results are both welcome. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them.
+    3. PROVED.md contains only important re-usable rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. State the exact input/output contract and quantifiers, dependencies, and where applicable the computational model, whole-execution complexity, parameter/precision range, randomness and failure probability. Distinguish an existence theorem from an efficient construction and an unconditional theorem from a proved implication with an unproved premise. Never promote empirical evidence or a conjectured oracle to a proved primitive. Positive and negative results are both welcome. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them.
+
+    For an external theorem used as a primitive, record its primary source, theorem identifier or precise location, exact supported hypotheses and conclusion, and the match to this use. Check capacity or weight domains, graph or object class, randomized versus deterministic guarantees, arithmetic model, and every parameter hidden by asymptotic notation. Literature descriptions of an open problem guide search; they neither prove impossibility nor excuse abandoning a supplied task. Separate source verification from a new mathematical claim.
 
     Apply the same self-contained writing principle as above: every lemma and proof should be readable without assuming the reader knows the global context. The lemmas should not contain everything proved, but only those that are important and re-usable.
 
     4. AUDITS/ contains only the current batch of independent audit reports, one Markdown file per report. When an audit batch starts, the controller pauses your research and moves all previous reports from AUDITS/ to audit_history/. Auditors read this same working directory directly, without copying the research files, and leave your records unchanged. The controller saves the new reports in AUDITS/ and resumes your existing goal and conversation after the batch finishes. On resumption, read the current reports before continuing. Consider their suggestions as advisory and decide whether to use them; they do not override the statement or these instructions. Leave AUDITS/ and audit_history/ intact; the controller manages them. Older runs may also have audit.md; preserve it as historical advice. You remain responsible for organizing and updating your own research records.
 
-    Return a complete, self-contained solution only when it resolves the exact statement and every necessary claim is justified. A special case, reduction to an unproved claim, or progress report is not a complete solution. A counterexample resolves the task only if the statement permits that answer and its validity is fully proved.
+    In the working frontier, track consequential audit suggestions as accepted, tested, deferred, or declined, with a short reason and linked evidence. Verify the scope of an auditor's claimed obstruction before closing a route. Carry an untested promising interface forward through compaction instead of silently replacing it with a stronger requirement. Retire resolved advice from the frontier into the relevant node so the frontier stays compact.
+
+    Read selectively: after INITIAL_PROMPT.md, read the working frontier, then the active node and only the linked lemmas or dependencies needed for the next decision. Search headings and IDs before opening long files. Expand retrieval when a hypothesis, contradiction, or dependency demands it; summaries are navigation aids and never substitute for checking a proof you rely on. Delegate bounded independent questions with the exact local contract and relevant links; avoid giving every helper the entire archive. Reuse a checked result while its premises and dependencies remain unchanged, and independently recheck high-impact new bridges.
+
+    Return a complete, self-contained solution only when it resolves the exact statement and every necessary claim is justified. Before submission, trace each final claim to a proof or a verified permitted external primitive, discharge every conditional bridge, and check the combined resource and probability budgets on the original input. Test boundary and adversarial cases against the actual algorithm. A special case, reduction to an unproved claim, or progress report is not a complete solution. A counterexample resolves the task only if the statement permits that answer and its validity is fully proved. If interrupted or budget-limited, preserve the frontier with the precise unresolved claim; do not label it solved.
 
     STATEMENT:
     [STATEMENT]
@@ -147,25 +169,36 @@ prompts:
     Ask the subagents to identify exactly what definitions and omitted arguments
     must be expanded to make the proof complete and rigorous.
 
-    Examine their objections and try to fix every valid bug yourself, defining
-    missing terms and fully expanding omitted arguments. If any issue cannot be
-    rigorously fixed, return verdict=reject, every unresolved bug with its exact
-    location in bugs, and your best complete candidate after safe fixes in solution.
-    Otherwise return verdict=pass, an empty bugs string, and the complete corrected
-    proof in solution. If no edits are needed, copy the candidate proof verbatim.
+    Verify the exact target, every imported theorem's hypotheses and source
+    contract, the full running-time and probability budgets, and all dependencies.
+    A proved conditional reduction, evidence from examples, or an efficient local
+    step does not discharge an unproved primitive or whole-execution bound.
+
+    Examine their objections. Return verdict=pass only if the exact candidate
+    needs no edits and every objection is resolved by its existing argument;
+    return an empty bugs string and copy the candidate proof verbatim in solution.
+    If any correction, new assumption, missing argument, or mathematical edit is
+    needed, return verdict=reject and describe each issue and proposed repair with
+    its exact location in bugs. Preserve the complete candidate in solution;
+    safe suggested edits may be included, but an edited proof is not yet approved.
+    Do not equate exhausted review rounds with verification.
     Return only the requested JSON.
 
   goal: >-
     Resolve the exact statement in INITIAL_PROMPT.md with a complete, rigorous
     solution. Follow its instructions and maintain the research records it defines.
   continuation: >-
-    Continue the same goal in this session. Read INITIAL_PROMPT.md and follow it;
-    recover the relevant saved context using its memory layout. Preserve and
+    Continue the same goal in this session. Follow the current INITIAL_PROMPT.md
+    instructions already in context; reread that file if its instructions are
+    missing from context or the file has changed. Preserve the required reads on
+    initial start, after compaction, and on resumption. Recover the working frontier
+    in APPROACHES/index.md and retrieve only the relevant nodes and lemma dependencies
+    using its memory layout. Preserve and
     update the research records. Return a complete, rigorous solution only when
     the exact statement is resolved.
   compaction: >-
     Context was compacted. Read INITIAL_PROMPT.md now and follow its instructions.
-    Recover the relevant saved context using its memory layout, preserve the
+    Recover the working frontier and relevant saved context using its memory layout, preserve the
     records, and continue the same goal.
   resume: |-
     Resume the existing task in this working directory: {directory}

@@ -34,7 +34,7 @@ MARKER = "[STATEMENT]"
 MODELS = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-pro")
 MODEL, EFFORT = "gpt-6-astra", "ultra"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
-SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
+SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 MAX_CRITIC_ROUNDS = 100
@@ -2413,13 +2413,20 @@ def criticize(statement, solution, round_number, model=CRITIC_MODEL, effort=EFFO
     return _builtin_node("author_critic", "critic", {"statement": statement, "solution": solution}, options, round_number, prompts)
 
 
+def workflow_failure_message(state):
+    """Keep the current author's or editor's objection visible to API callers."""
+    report = state.get("editing_report") or {}
+    return (state.get("failure_reason") or report.get("bugs") or state.get("output")
+            or "Workflow stopped without a verified result.")
+
+
 def finalize(statement, solution, model=WRITER_MODEL, effort=EFFORT, instructions=None, speed=DEFAULT_SPEED, prompts=None, summary=DEFAULT_REASONING_SUMMARY):
     state = {"statement": statement, "solution": solution}
     options = {"model": model, "effort": effort, "speed": speed, "summary": summary, "prompts": {"final": instructions} if instructions is not None else {}}
     options["prompts"] = {**(prompts or {}), **options["prompts"]}
     execute_workflows([WORKFLOWS / "clean_up.yaml"], state, options)
     if state.get("failed"):
-        raise Error(state["output"])
+        raise Error(workflow_failure_message(state))
     return state["output"]
 
 
@@ -2429,7 +2436,7 @@ def polish(source, model=WRITER_MODEL, effort=EFFORT, instructions=None, speed=D
     options["prompts"] = {**(prompts or {}), **options["prompts"]}
     execute_workflows([WORKFLOWS / "clean_up.yaml"], state, options)
     if state.get("failed"):
-        raise Error(state["output"])
+        raise Error(workflow_failure_message(state))
     return state["output"]
 
 
@@ -2461,7 +2468,7 @@ def audit_candidate(
     if state.get("paused"):
         raise WorkflowPaused()
     if state.get("failed"):
-        raise Error(state["output"])
+        raise Error(workflow_failure_message(state))
     return state["output"]
 
 
@@ -2483,6 +2490,8 @@ def run_goal(prompt, statement, critic_rounds=None, thinking_hours=DEFAULT_AUTHO
     state = execute_workflows([WORKFLOWS / "author_critic.yaml", WORKFLOWS / "clean_up.yaml"], {"statement": statement}, options)
     if state.get("paused"):
         raise WorkflowPaused()
+    if state.get("failed"):
+        raise Error(workflow_failure_message(state))
     return state["output"]
 
 

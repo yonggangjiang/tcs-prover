@@ -13,5 +13,10 @@
 !requirements.txt
 !tests/
 !tests/*.py
+!docs/
+!docs/*.md
+!docs/mincut-evidence-inventory.json
+!tools/
+!tools/*.py
 **/__pycache__/
 *.pyc
