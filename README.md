@@ -221,6 +221,9 @@ live instruction telling it to answer each DIRECTION in its PLAN. `model:
 author` uses the author's own model (falling back to auditor slot 1); `model:
 slot-1` uses auditor slot 1 only. The previous solver batch stays in `AUDITS/`;
 older ones move to `audit_history/`. Set `solver.enabled: false` to disable.
+A batch of three solvers at ultra effort takes about 20 to 25 minutes and costs
+roughly 3 to 4 million tokens, about 90 percent of them cached; lower `count`
+or raise `intervalMinutes` to trade coverage for cost.
 
 ## How to use checkpoints
 
