@@ -110,13 +110,47 @@ class AuditIntegrationTests(unittest.TestCase):
     def test_initial_none_has_no_audit_engine_or_counter(self):
         token = self.app.worker_token = self.app.active_token = object()
         self.app.state["phase"] = "running"
-        with patch.object(audits, "ResearchAudits") as constructor:
+        with patch.object(audits, "solver_would_run", return_value=False), \
+                patch.object(audits, "ResearchAudits") as constructor:
             self.app._start_research_audits(token)
         constructor.assert_not_called()
         self.assertIsNone(self.app.research_audits)
         self.assertEqual(self.app.state["researchAuditProgress"], {})
         self.assertFalse(self.app.state["auditHoldingAuthor"])
         self.assertIs(self.app.worker_token, token)
+
+    def test_solvers_start_the_engine_without_auditors_and_deliver_reports_live(self):
+        token = self.app.worker_token = self.app.active_token = object()
+        self.app.state.update(phase="running", authorModel="gpt-6-astra")
+        self.assertTrue(all(model == "none" for model in self.app.state["researchAudits"]["models"]))
+        with patch.object(threading.Thread, "start"):
+            self.app._start_research_audits(token)
+        engine = self.app.research_audits
+        self.assertIsNotNone(engine)
+        self.addCleanup(engine.close)
+        self.assertEqual(engine.author_model, "gpt-6-astra")
+        self.assertIs(engine.after_solver_batch.__func__, server.App._deliver_solver_reports)
+        # Delivery while the author runs writes one live instruction; otherwise only a trace line.
+        self.app.process = Mock(poll=Mock(return_value=None))
+        engine.after_solver_batch(engine, ["AUDITS/x-fresh-eyes-certified_step--m-0123abcd.md"])
+        steer = json.loads((self.app.run_dir / server.AUTHOR_STEER_FILENAME).read_text())
+        self.assertIn("AUDITS/x-fresh-eyes-certified_step--m-0123abcd.md", steer["instruction"])
+        self.assertIn("AUDIT RESPONSES", steer["instruction"])
+        self.assertIn("strongest version", steer["instruction"])
+        self.assertEqual(self.app.state["trace"][-1]["label"], "Fresh-eyes solver reports delivered to the author")
+        (self.app.run_dir / server.AUTHOR_STEER_FILENAME).unlink()
+        self.app.process = None
+        engine.after_solver_batch(engine, ["AUDITS/y.md"])
+        self.assertFalse((self.app.run_dir / server.AUTHOR_STEER_FILENAME).exists())
+        self.assertEqual(self.app.state["trace"][-1]["label"], "Fresh-eyes solver reports saved")
+        # An author model outside the catalog and no auditor: no engine.
+        self.app.research_audits = None
+        self.app._audit_token = None
+        other = self.app.worker_token = self.app.active_token = object()
+        self.app.state["authorModel"] = "not-in-catalog"
+        with patch.object(audits, "ResearchAudits") as constructor:
+            self.app._start_research_audits(other)
+        constructor.assert_not_called()
 
     def test_recovered_model_warning_is_saved_immediately_with_live_activity(self):
         token = self.app.worker_token = self.app.active_token = object()

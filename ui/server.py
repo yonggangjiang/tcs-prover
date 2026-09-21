@@ -663,7 +663,7 @@ class App:
             paused = paused and self.state["phase"] == "paused" and self.worker_token is None
             if (not self.state.get("fileManagement", True)
                     or (not paused and (token is None or self.worker_token is not token or self._audit_token is token))
-                    or all(model == "none" for model in self.state["researchAudits"]["models"])):
+                    or not self._audits_or_solvers_configured()):
                 return
             workspace = self.state.get("goalWorkspace") or self.run_dir
 
@@ -680,7 +680,9 @@ class App:
                 engine = audits.ResearchAudits(workspace, on_event=record,
                                                progress=self.state["researchAuditProgress"],
                                                before_batch=self._pause_for_research_audit,
-                                               after_batch=self._resume_after_research_audit)
+                                               after_batch=self._resume_after_research_audit,
+                                               author_model=self.state.get("authorModel"),
+                                               after_solver_batch=self._deliver_solver_reports)
             except Exception as exc:
                 self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
                 return
@@ -735,6 +737,39 @@ class App:
                 self.research_audits = None
                 self._audit_token = None
                 self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
+
+    def _audits_or_solvers_configured(self):
+        """Whether an auditor is selected or the fresh-eyes solvers can run for this author."""
+
+        settings = self.state["researchAudits"]
+        if any(model != "none" for model in settings["models"]):
+            return True
+        try:
+            return audits.solver_would_run(settings, self.state.get("authorModel"))
+        except Exception:
+            return False
+
+    def _deliver_solver_reports(self, engine, paths):
+        """Hand new fresh-eyes solver reports to the running author as one live instruction."""
+
+        with self.lock:
+            if self.research_audits is not engine or not paths:
+                return
+            running = (self.state["phase"] == "running" and self.state["activeNode"] == "author"
+                       and self.state["stage"] in {"solve", "repair"}
+                       and self.process is not None and self.process.poll() is None)
+            listing = "\n".join(f"- {path}" for path in paths)
+            instruction = audits.SOLVER_DELIVERY_MESSAGE.format(
+                count=len(paths), listing=listing, digest=audits.DIGEST_FILENAME)
+            if not running:
+                self.add_trace({"kind": "status", "stage": "audit", "node": "author",
+                                "label": "Fresh-eyes solver reports saved",
+                                "text": "The author is not running; it reads the digest at its next turn start."})
+                return
+            command_id = self._write_author_steer(instruction)
+            self.add_trace({"kind": "status", "stage": "audit", "node": "author",
+                            "label": "Fresh-eyes solver reports delivered to the author",
+                            "text": instruction, "commandId": command_id})
 
     def _update_research_audits(self):
         """Tick author time; keep audits alive during their own temporary pause."""

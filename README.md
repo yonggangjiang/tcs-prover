@@ -205,11 +205,22 @@ short brief (verification once per lemma, at most two subagents at a time).
 
 Research audits are time-boxed (`timeoutMinutes` in `workflows/research_audit.yaml`,
 default 25) and return machine-readable `VERDICT`, `DIRECTION`, and `PREMISE`
-lines that the controller merges into `audit-digest.md`. Each batch also runs a
-**fresh-eyes solver** (`solver:` in the same file) that sees only the statement
+lines that the controller merges into `audit-digest.md`.
+
+**Fresh-eyes solvers** (`solver:` in the same file) run on their own schedule,
+independently of the audit batches, so they also run when every auditor slot is
+"none". After `firstAfterMinutes` of author time (default 20) and then every
+`intervalMinutes` (default 60), the controller starts `count` solvers (default
+3) in parallel, each assigned a different technique family from `seeds`
+(rotating through the list across batches). A solver sees only the statement
 and a one-page brief of the PLAN and lemma statements, never the records, and
-must propose a complete candidate algorithm; its report lands in `AUDITS/` as
-`*-fresh-eyes-*.md`. Set `solver.enabled: false` to disable it.
+must propose a complete candidate algorithm under its family. The author is not
+paused. Reports land in `AUDITS/` as `*-fresh-eyes-<seed>--*.md`, the digest is
+rebuilt from every report in the folder, and the running author receives one
+live instruction telling it to answer each DIRECTION in its PLAN. `model:
+author` uses the author's own model (falling back to auditor slot 1); `model:
+slot-1` uses auditor slot 1 only. The previous solver batch stays in `AUDITS/`;
+older ones move to `audit_history/`. Set `solver.enabled: false` to disable.
 
 ## How to use checkpoints
 
@@ -497,8 +508,8 @@ approaches, using these records:
 | `APPROACHES/index.md` | A mandatory `## PLAN` section (target, best route, the single MISSING step, the weakest sufficient object, object-or-process, an existence ledger, a formulation ledger, call and branch budgets, audit responses), rewritten from scratch every turn, followed by the navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. |
 | `APPROACHES/A001-short-title.md` | One approach with a one-sentence Abstract, linked Parents and Children, Status, whether it closes the PLAN's MISSING step, **Context and objective**, organized **Detailed work**, and **Obstacles** (where negative results about the author's own sub-proposals live). Openings stay short and link lemma IDs instead of restating them. |
 | `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
-| `AUDITS/` | Independent reports from the current audit batch only, plus the fresh-eyes solver report (`*-fresh-eyes-*.md`). |
-| `audit-digest.md` | The controller's one-page merge of the current batch: verdict tallies per node, directions, premise gaps, and executive summaries. The author reads this first. |
+| `AUDITS/` | Independent reports from the current audit batch, plus the last two batches of fresh-eyes solver reports (`*-fresh-eyes-<seed>--*.md`). |
+| `audit-digest.md` | The controller's one-page merge of everything in `AUDITS/`: verdict tallies per node, directions, premise gaps, and executive summaries. The author reads this first. |
 | `token-usage.json`, `unsaved-subagent-results.md` | Controller-managed: the cross-thread token meter, and subagent results salvaged when a run dies on an error. |
 | `audit_history/` | Previous audit reports, moved here by the controller when the next batch starts. |
 

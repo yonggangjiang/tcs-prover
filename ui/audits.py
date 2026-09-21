@@ -45,12 +45,78 @@ def timeout_seconds(config):
     return minutes * 60 if math.isfinite(minutes) and minutes > 0 else 0
 
 
+DEFAULT_SOLVER_INTERVAL_MINUTES = 60
+DEFAULT_SOLVER_FIRST_AFTER_MINUTES = 20
+DEFAULT_SOLVER_COUNT = 3
+DEFAULT_SOLVER_SEEDS = [
+    {"name": "standard_primitives", "text": (
+        "STANDARD PRIMITIVES. Use polylogarithmically many calls of known near-linear routines of the "
+        "field, classical rounding or decomposition theorems as black boxes, or an iterative process "
+        "that maintains one candidate with a provable per-step guarantee.")},
+]
+
+
+SOLVER_DELIVERY_MESSAGE = (
+    "Controller: {count} fresh-eyes solver report(s) were saved:\n{listing}\n"
+    "{digest} was rebuilt from every report in AUDITS/. At your next PLAN rewrite, read the "
+    "DIRECTION lines of {digest} and add one AUDIT RESPONSES line per direction: ADOPTED (node "
+    "ID), REJECTED (a refuting lemma, or a written refutation of the strongest version of the "
+    "direction), or DEFERRED (reason). Before rejecting a direction that names a specific "
+    "auxiliary instance, rounding, or per-step guarantee, open that report with the record tool "
+    "(audits) and test its strongest version against the current MISSING STEP. A report that "
+    "marks none of its gaps CONJECTURE is tested first: open a node for it, restate its step "
+    "problem in your own words, and send its key lemma with the report to one fresh verification "
+    "subagent. If a direction would close the MISSING STEP, open its node before continuing "
+    "your current route."
+)
+
+
+def solver_would_run(settings, author_model=None, config=None):
+    """Whether the fresh-eyes solvers can run for these audit settings and this author model."""
+    config = config or load_config()
+    solver = solver_settings(config)
+    if not solver["enabled"]:
+        return False
+    settings = normalize_settings(settings, config)
+    catalog = {row["value"] for row in config["models"]}
+    reference = solver["model"]
+    if reference == "author":
+        candidates = [author_model] + [value for value in settings["models"] if value != "none"]
+    elif reference == "slot-1":
+        candidates = [value for value in settings["models"] if value != "none"]
+    else:
+        candidates = [reference]
+    return any(value and value != "none" and value in catalog for value in candidates)
+
+
 def solver_settings(config):
-    """The fresh-eyes solver: enabled flag, model reference, and its prompt."""
+    """The fresh-eyes solvers: schedule, count, seeds, model reference, and prompt."""
     solver = config.get("solver") if isinstance(config.get("solver"), dict) else {}
     prompt = config.get("solver_prompt")
     enabled = bool(solver.get("enabled")) and isinstance(prompt, str) and bool(prompt.strip())
-    return {"enabled": enabled, "model": solver.get("model") or "slot-1", "prompt": prompt if enabled else ""}
+
+    def minutes(key, default):
+        try:
+            value = float(solver.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) and value >= 0 else default
+
+    seeds = solver.get("seeds")
+    if not isinstance(seeds, list) or not seeds:
+        seeds = DEFAULT_SOLVER_SEEDS
+    seeds = [{"name": re.sub(r"[^a-zA-Z0-9_]", "_", str(row.get("name") or f"seed{index}"))[:40],
+              "text": str(row.get("text") or "")}
+             for index, row in enumerate(seeds, 1) if isinstance(row, dict) and str(row.get("text") or "").strip()]
+    try:
+        count = int(solver.get("count", DEFAULT_SOLVER_COUNT))
+    except (TypeError, ValueError):
+        count = DEFAULT_SOLVER_COUNT
+    return {"enabled": enabled and bool(seeds), "model": str(solver.get("model") or "author"),
+            "prompt": prompt if enabled else "", "seeds": seeds,
+            "count": max(1, min(count, len(seeds) or 1)),
+            "intervalSeconds": minutes("intervalMinutes", DEFAULT_SOLVER_INTERVAL_MINUTES) * 60,
+            "firstAfterSeconds": minutes("firstAfterMinutes", DEFAULT_SOLVER_FIRST_AFTER_MINUTES) * 60}
 
 
 def statement_text(run_dir):
@@ -107,6 +173,32 @@ def solver_brief(run_dir, limit=SOLVER_BRIEF_LIMIT):
     if len(data) > limit:
         text = data[:limit].decode("utf-8", errors="ignore") + "\n[brief cut at the size limit]"
     return text
+
+
+def report_label(path):
+    """A short label for one saved report: 'audit-2 model' or 'fresh-eyes seed model'."""
+    name = Path(path).name
+    # A seeded solver file separates the seed from the model with a double dash; a seedless
+    # (older) solver file keeps its whole model name.
+    match = re.match(r"^\d{4}-?\d{2}-?\d{2}T\d{6}Z-(audit-\d+|fresh-eyes-[a-zA-Z0-9_]+(?=--)|fresh-eyes)-{1,2}(.+?)-[0-9a-f]{8}\.md$", name)
+    if match:
+        return f"{match.group(1)} {match.group(2)}"
+    return name[:-3] if name.endswith(".md") else name
+
+
+def digest_from_folder(run_dir, config, stamp):
+    """Rebuild audit-digest.md from every report currently in the output folder."""
+    directory = Path(run_dir) / config.get("output", "AUDITS")
+    reports = []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.md")):
+            try:
+                reports.append((report_label(path), path.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                continue
+    if not reports:
+        return ""
+    return write_digest(run_dir, config, reports, stamp)
 
 
 def write_digest(run_dir, config, reports, stamp):
@@ -409,7 +501,7 @@ class ResearchAudits:
 
     def __init__(self, run_dir, on_event=None, progress=None, *, clock=time.monotonic,
                  provider=run_auditor, config=None, before_batch=None, after_batch=None,
-                 preflight=resolve_executable):
+                 preflight=resolve_executable, author_model=None, after_solver_batch=None):
         self.run_dir = Path(run_dir)
         self.reload_prompt = config is None
         self.config = config or load_config()
@@ -417,12 +509,20 @@ class ResearchAudits:
         self.on_event = on_event or (lambda event: None)
         self.before_batch = before_batch or (lambda engine: True)
         self.after_batch = after_batch or (lambda engine: None)
+        self.after_solver_batch = after_solver_batch or (lambda engine, paths: None)
+        self.author_model = author_model
         self.preflight = preflight
         self.clock, self.provider = clock, provider
         self.lock = threading.RLock()
         progress = progress or {}
         self.elapsed = max(0, float(progress.get("elapsedSeconds", 0)))
         self.last_started = max(0, float(progress.get("lastStartedSeconds", 0)))
+        self.solver_last_started = max(0, float(progress.get("solverLastStartedSeconds", 0)))
+        self.solver_batches = max(0, int(progress.get("solverBatches", 0) or 0))
+        self.solver_thread = None
+        self.solver_cancel = threading.Event()
+        previous = progress.get("solverPreviousFiles")
+        self.solver_previous_files = [str(name) for name in previous] if isinstance(previous, list) else []
         self.last_tick = clock()
         self.active = self.closed = self.initialized = False
         self.thread = None
@@ -440,6 +540,8 @@ class ResearchAudits:
         with self.lock:
             self._advance()
             return {"elapsedSeconds": self.elapsed, "lastStartedSeconds": self.last_started,
+                    "solverLastStartedSeconds": self.solver_last_started, "solverBatches": self.solver_batches,
+                    "solverPreviousFiles": list(self.solver_previous_files),
                     "warnings": [dict(self.warnings[slot]) for slot in sorted(self.warnings)]}
 
     def status(self):
@@ -447,6 +549,8 @@ class ResearchAudits:
             warnings = [dict(self.warnings[slot]) for slot in sorted(self.warnings)]
             return {"runningSlots": [slot for slot, cancel in self.running.items() if not cancel.is_set()],
                     "batchActive": self.thread is not None and self.thread.is_alive(),
+                    "solverActive": self.solver_thread is not None and self.solver_thread.is_alive(),
+                    "solverBatches": self.solver_batches,
                     "warnings": warnings,
                     "batchError": self.last_error,
                     "lastError": "\n".join([row["message"] for row in warnings]
@@ -471,11 +575,28 @@ class ResearchAudits:
             if self.initialized and enabled and all(model == "none" for model in previous["models"]):
                 self.last_started = self.elapsed
             self.initialized = True
-            self.settings, self.active = settings, bool(active and enabled)
+            solver = solver_settings(self.config)
+            solver_ready = (solver["enabled"] and self._solver_model(solver, settings) is not None
+                            and (self.run_dir / "INITIAL_PROMPT.md").is_file())
+            self.settings, self.active = settings, bool(active and (enabled or solver_ready))
             self.warnings = {row["slot"]: row for row in selected_warnings(list(self.warnings.values()), settings)}
             for slot, cancel in self.running.items():
                 if (not active and not paused_for_audit) or settings["models"][slot - 1] == "none":
                     cancel.set()
+            if not active and not paused_for_audit:
+                self.solver_cancel.set()
+            solver_busy = self.solver_thread is not None and self.solver_thread.is_alive()
+            due = solver["firstAfterSeconds"] if self.solver_batches == 0 else solver["intervalSeconds"]
+            if (solver_ready and active and not solver_busy and not start_now
+                    and self.elapsed - self.solver_last_started >= due):
+                self.solver_last_started = self.elapsed
+                self.solver_cancel = threading.Event()
+                try:
+                    self.solver_thread = threading.Thread(target=self._solver_batch, args=(solver, settings, self.solver_cancel), daemon=True)
+                    self.solver_thread.start()
+                except Exception as exc:
+                    self.solver_thread = None
+                    self._event("warning", 0, "", f"Could not start the fresh-eyes solvers: {exc}")
             if (enabled and not busy and ((start_now and (active or paused_for_audit))
                     or (active and self.elapsed - self.last_started >= settings["intervalHours"] * 3600))):
                 previous_start, previous_thread = self.last_started, self.thread
@@ -501,6 +622,157 @@ class ResearchAudits:
             self.closed = True
             for cancel in self.running.values():
                 cancel.set()
+            self.solver_cancel.set()
+
+    def _write_digest(self, stamp):
+        try:
+            text = digest_from_folder(self.run_dir, self.config, stamp)
+            if text:
+                self._event("digest", 0, "", f"Rebuilt {DIGEST_FILENAME} from the reports in {self.config['output']}/.")
+        except Exception as exc:
+            self._event("warning", 0, "", f"Could not write {DIGEST_FILENAME}: {exc}")
+
+    def _rotate_solver_reports(self, keep_names):
+        """Move fresh-eyes reports of older batches to history; keep the previous batch."""
+        output = self.run_dir / self.config["output"]
+        history = self.run_dir / self.config.get("history", "audit_history")
+        if not output.is_dir() or output.is_symlink():
+            return
+        history.mkdir(mode=0o700, exist_ok=True)
+        for path in sorted(output.glob("*-fresh-eyes-*.md")):
+            if path.is_symlink() or not path.is_file() or path.name in keep_names:
+                continue
+            destination, version = history / path.name, 1
+            while True:
+                try:
+                    os.link(path, destination, follow_symlinks=False)
+                    break
+                except FileExistsError:
+                    version += 1
+                    destination = history / f"{path.stem}-previous-{version}{path.suffix}"
+            path.unlink()
+
+    def _solver_batch(self, solver, settings, cancel):
+        """Run seeded fresh solvers on the statement and a brief; never pause the author."""
+        try:
+            model = self._solver_model(solver, settings)
+            if model is None or not (self.run_dir / "INITIAL_PROMPT.md").is_file():
+                return
+            try:
+                if not self.preflight(model):
+                    raise RuntimeError("The solver model is unavailable")
+            except Exception as exc:
+                self._event("warning", 0, model["value"], f"Fresh-eyes solvers skipped: {exc}")
+                return
+            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            file_stamp = stamp.replace(":", "").replace("+0000", "Z")
+            statement = statement_text(self.run_dir)
+            brief = solver_brief(self.run_dir)
+            with self.lock:
+                batch_index = self.solver_batches
+                self.solver_batches += 1
+                self._rotate_solver_reports(set(self.solver_previous_files))
+                self.solver_previous_files = []
+            seeds = solver["seeds"]
+            offset = (batch_index * solver["count"]) % len(seeds)
+            chosen = [seeds[(offset + index) % len(seeds)] for index in range(solver["count"])]
+            self._event("starting", 0, model["value"],
+                        f"Starting {len(chosen)} fresh-eyes solver(s) [{', '.join(seed['name'] for seed in chosen)}] "
+                        f"on the statement and brief at {stamp}; the author keeps running.")
+            saved = []
+            with tempfile.TemporaryDirectory(prefix="tcs-fresh-eyes-") as root:
+                with ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+                    futures = {}
+                    for seed in chosen:
+                        workspace = Path(root) / seed["name"]
+                        workspace.mkdir()
+                        (workspace / "STATEMENT.md").write_text(statement + "\n", encoding="utf-8")
+                        (workspace / "BRIEF.md").write_text(brief + "\n", encoding="utf-8")
+                        prompt = solver["prompt"].replace("{seed}", seed["text"])
+                        self.on_event({"kind": "request", "stage": "audit", "status": "prompt", "slot": 0,
+                                       "model": model["model"], "provider": model["provider"],
+                                       "reasoningEffort": model.get("effort"), "auditStartedAt": stamp,
+                                       "label": f"Fresh-eyes solver [{seed['name']}] — {model['label']} — Prompt to model",
+                                       "text": prompt})
+                        options = {}
+                        if self.provider is run_auditor:
+                            options["on_activity"] = lambda status, text, value=model["value"]: self._event(status, 0, value, text)
+                        futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = seed
+                    timeout = timeout_seconds(self.config)
+                    expired = threading.Event()
+
+                    def expire():
+                        expired.set()
+                        cancel.set()
+
+                    timer = threading.Timer(timeout, expire) if timeout else None
+                    if timer:
+                        timer.daemon = True
+                        timer.start()
+                    try:
+                        for future in as_completed(futures):
+                            seed = futures[future]
+                            try:
+                                result = future.result()
+                                if cancel.is_set():
+                                    self._event("cancelled", 0, model["value"],
+                                                f"Fresh-eyes solver [{seed['name']}] "
+                                                + ("stopped at the time box; no report saved." if expired.is_set() else "cancelled."))
+                                    continue
+                                if (not isinstance(result, dict) or not isinstance(result.get("text"), str)
+                                        or not result["text"].strip() or not isinstance(result.get("model"), str)):
+                                    raise RuntimeError("the solver returned an empty or malformed report")
+                                directory = self.run_dir / self.config["output"]
+                                model_name = re.sub(r"[^a-zA-Z0-9_-]", "-", result["model"])[:80]
+                                filename = f"{file_stamp}-fresh-eyes-{seed['name']}--{model_name}-{uuid.uuid4().hex[:8]}.md"
+                                with self.lock:
+                                    directory.mkdir(mode=0o700, exist_ok=True)
+                                    if directory.is_symlink():
+                                        raise RuntimeError("The audit report directory cannot be a symlink.")
+                                    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".audit-", suffix=".tmp")
+                                    try:
+                                        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                                            stream.write(f"# Fresh-eyes solver [{seed['name']}] — {stamp} — {result['model']}\n\n"
+                                                         f"{result['text'].strip()}\n\n## Technique family\n{seed['text']}\n")
+                                        os.link(temporary, directory / filename)
+                                    finally:
+                                        os.unlink(temporary)
+                                saved.append(f"{self.config['output']}/{filename}")
+                                with self.lock:
+                                    self.solver_previous_files.append(filename)
+                                self._event("completed", 0, model["value"],
+                                            f"Fresh-eyes solver [{seed['name']}] report saved to {self.config['output']}/{filename}.",
+                                            actualModel=result["model"], report=f"{self.config['output']}/{filename}")
+                            except Exception as exc:
+                                self._event("warning", 0, model["value"],
+                                            f"Fresh-eyes solver [{seed['name']}] skipped: {str(exc) or type(exc).__name__}.")
+                    finally:
+                        if timer:
+                            timer.cancel()
+            if saved:
+                self._write_digest(stamp)
+                try:
+                    self.after_solver_batch(self, saved)
+                except Exception as exc:
+                    self._event("warning", 0, "", f"Could not deliver the solver reports: {exc}")
+        except Exception as exc:
+            self._event("warning", 0, "", f"Fresh-eyes solver batch failed: {str(exc) or type(exc).__name__}")
+
+    def _solver_model(self, solver, settings):
+        """Resolve 'author', 'slot-1', or a catalog value to a model row."""
+        models = {row["value"]: row for row in self.config["models"]}
+        reference = solver["model"]
+        candidates = []
+        if reference == "author":
+            candidates = [self.author_model] + [value for value in settings["models"] if value != "none"]
+        elif reference == "slot-1":
+            candidates = [value for value in settings["models"] if value != "none"]
+        else:
+            candidates = [reference]
+        for value in candidates:
+            if value and value != "none" and value in models:
+                return models[value]
+        return None
 
     def _event(self, status, slot, model, text, **details):
         self.on_event({"kind": "research_audit", "stage": "audit", "status": status,
@@ -550,6 +822,8 @@ class ResearchAudits:
             raise RuntimeError("The audit report directory must contain files, not subdirectories.")
         archived = {}
         for path in paths:
+            if "-fresh-eyes-" in path.name and path.name.endswith(".md"):
+                continue  # solver reports rotate on the solver schedule
             destination, version = archive / path.name, 1
             while True:
                 try:
@@ -599,16 +873,8 @@ class ResearchAudits:
             if archived:
                 self._event("archived", 0, "", f"Moved {len(archived)} previous audit files to {self.config.get('history', 'audit_history')}/.",
                             archivedPaths=archived)
-            solver = solver_settings(self.config)
-            solver_model = None
-            if solver["enabled"] and (self.run_dir / "INITIAL_PROMPT.md").is_file():
-                reference = solver["model"]
-                if reference == "slot-1":
-                    reference = selected[0][1]
-                solver_model = models.get(reference)
             saved_reports = []
-            solver_workspace = tempfile.TemporaryDirectory(prefix="tcs-fresh-eyes-") if solver_model else None
-            with ThreadPoolExecutor(max_workers=len(selected) + (1 if solver_model else 0)) as pool:
+            with ThreadPoolExecutor(max_workers=len(selected)) as pool:
                 futures = {}
                 for slot, value in selected:
                     cancel = self.running[slot]
@@ -627,23 +893,6 @@ class ResearchAudits:
                         if self.provider is run_auditor:
                             options["on_activity"] = lambda status, text, slot=slot, value=value, cancel=cancel: self._activity(slot, value, cancel, status, text)
                         futures[pool.submit(self.provider, model, prompt, workspace, cancel, **options)] = (slot, value, cancel)
-                solver_cancel = threading.Event()
-                if solver_model:
-                    # The solver never sees the records: only the statement and a one-page brief.
-                    solver_dir = Path(solver_workspace.name)
-                    (solver_dir / "STATEMENT.md").write_text(statement_text(self.run_dir) + "\n", encoding="utf-8")
-                    (solver_dir / "BRIEF.md").write_text(solver_brief(self.run_dir) + "\n", encoding="utf-8")
-                    value = solver_model["value"]
-                    self._event("starting", 0, value, f"Starting the fresh-eyes solver with the statement and brief at {stamp}.")
-                    self.on_event({"kind": "request", "stage": "audit", "status": "prompt", "slot": 0,
-                                   "model": solver_model["model"], "provider": solver_model["provider"],
-                                   "reasoningEffort": solver_model.get("effort"), "auditStartedAt": stamp,
-                                   "label": f"Fresh-eyes solver — {solver_model['label']} — Prompt to model",
-                                   "text": solver["prompt"]})
-                    options = {}
-                    if self.provider is run_auditor:
-                        options["on_activity"] = lambda status, text, value=value: self._event(status, 0, value, text)
-                    futures[pool.submit(self.provider, solver_model, solver["prompt"], solver_dir, solver_cancel, **options)] = (0, value, solver_cancel)
                 timeout = timeout_seconds(self.config)
                 expired = threading.Event()
                 cancels = [cancel for _, _, cancel in futures.values()]
@@ -705,19 +954,11 @@ class ResearchAudits:
                         finally:
                             with self.lock:
                                 self.running.pop(slot, None)
-                                if all(cancel.is_set() for cancel in self.running.values()) and self.running:
-                                    solver_cancel.set()
                 finally:
                     if timer:
                         timer.cancel()
             if saved_reports:
-                try:
-                    write_digest(self.run_dir, self.config, saved_reports, stamp)
-                    self._event("digest", 0, "", f"Wrote {DIGEST_FILENAME} from {len(saved_reports)} report(s).")
-                except Exception as exc:
-                    self._event("warning", 0, "", f"Could not write {DIGEST_FILENAME}: {exc}")
-            if solver_workspace:
-                solver_workspace.cleanup()
+                self._write_digest(stamp)
         except Exception as exc:
             self._warning(0, "", exc)
         finally:

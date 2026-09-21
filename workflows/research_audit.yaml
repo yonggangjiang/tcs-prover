@@ -7,13 +7,64 @@ defaults:
 # executive summary first so a cancelled run still leaves nothing half-written.
 timeoutMinutes: 25
 
-# A fresh-eyes solver runs with every batch when a research run has
-# INITIAL_PROMPT.md. It sees only the statement and a one-page brief (PLAN and
-# lemma statements), never the records, and must propose a complete candidate
-# algorithm. "slot-1" means the model selected for auditor slot 1.
+# Fresh-eyes solvers run on their own schedule while the author keeps working,
+# independently of the audit batches, so they also run when every auditor slot
+# is "none". Each batch starts `count` solvers in parallel, each with a
+# different technique seed (rotating through `seeds` across batches). A solver
+# sees only the statement and a one-page brief (PLAN and lemma statements),
+# never the records. Reports land in AUDITS/ as *-fresh-eyes-<seed>-*.md,
+# audit-digest.md is rebuilt from the whole folder, and the running author
+# receives one live message. "author" means the author's own model; "slot-1"
+# means the model selected for auditor slot 1.
 solver:
   enabled: true
-  model: slot-1
+  model: author
+  count: 3
+  firstAfterMinutes: 20
+  intervalMinutes: 60
+  seeds:
+    - name: certified-step
+      text: >-
+        ITERATIVE CERTIFIED STEP. Maintain one candidate object of the kind the
+        consuming lemma needs and improve it in polylogarithmically many rounds.
+        Each round is one computation of a standard near-linear primitive
+        (maximum flow, minimum-cost flow, matching, shortest paths, or a
+        near-linear linear program) on an auxiliary instance built from the
+        current candidate and a target; certify the instance feasible using only
+        an existence theorem from the brief, never by constructing the object
+        whose existence is known; make the round's output integral by a rounding
+        that preserves the guarantee in expectation; prove a per-round
+        contraction of the gap between the candidate and the target. Give the
+        auxiliary instance explicitly, its feasibility proof, the rounding, and
+        the contraction inequality.
+    - name: blackbox-rounding
+      text: >-
+        BLACK-BOX PRIMITIVES PLUS ROUNDING. Reduce the missing step to
+        polylogarithmically many calls of a known near-linear primitive plus a
+        randomized rounding of a fractional object that is used only through
+        existence and certificates and is never constructed. State every call
+        precisely and prove that the rounding preserves what the consuming
+        lemma needs.
+    - name: recursion
+      text: >-
+        RECURSION. Reduce the missing step to smaller instances of itself or of
+        the original problem with a provable size shrinkage per level and exact
+        preservation of an optimum across levels; bound the total work by a
+        geometric series.
+    - name: structure
+      text: >-
+        STRUCTURAL CHARACTERIZATION. Characterize the required object through a
+        classical decomposition, packing, or covering theorem of the field, then derive a
+        direct construction whose correctness follows from the characterization;
+        say which classical theorem is used constructively and how its
+        algorithmic form is obtained in near-linear time.
+    - name: potential
+      text: >-
+        POTENTIAL FUNCTION. Define a potential over candidate objects that is
+        bounded by a polylogarithm of the input size, show that one cheap
+        operation decreases it by a constant fraction of the remaining gap
+        whenever the candidate is not yet acceptable, and derive the algorithm
+        from the operation.
 
 # Model IDs and maximum supported reasoning effort belong here, not in Python.
 # Refresh explicit IDs when providers release stronger models.
@@ -96,23 +147,36 @@ prompt: |-
   The controller parses these lines into the digest the author reads first; keep
   them one line each. Then the phases, in order.
 
+# {seed} is replaced by the technique family assigned to each solver.
 solver_prompt: |-
   You are a solver, not a reviewer. Your working directory contains only
   STATEMENT.md (the exact task) and BRIEF.md (the author's current PLAN and the
   statements of the lemmas on its best route, without proofs). Read both. Do not
-  assume the brief's framing is right. Answer in order, in at most 1,500 words:
+  assume the brief's framing is right: the brief may have blocked the right
+  route on a weak variant, and its lemmas may be true while its ledger is wrong.
+  You have about 20 minutes and no records to read; spend the time on
+  mathematics, and use web search only to confirm the exact statement of a
+  black-box primitive you rely on.
+  Your assigned technique family for this session is:
+  {seed}
+  Attack the MISSING step with this family first; switch only after showing in
+  writing that the family cannot produce the weakest sufficient object.
+  Answer in order, in at most 1,500 words:
   1. What is the WEAKEST object the brief's proved lemmas actually consume (quote
      the lemma)? Is the brief's MISSING step stronger than that? If so, restate
      the missing step for the weakest object.
   2. For every existence theorem in the brief, name the auxiliary flow, LP, or
-     transportation problem whose feasibility it certifies, on which network, and
-     what one computation of that problem yields.
+     transportation problem whose feasibility it certifies, on which network
+     (built from the input, or from a current candidate and a target), and what
+     one computation of that problem yields.
   3. Give a complete candidate algorithm for the missing step using only
      standard primitives unless you show they cannot suffice: polylogarithmically
      many calls to a known near-linear routine of the field, classical rounding
      or decomposition theorems used as black boxes, or an iterative process that
-     maintains one candidate with a provable per-step guarantee. State that
-     guarantee precisely and the number of steps.
+     maintains one candidate with a provable per-step guarantee. For a process,
+     state its one-round STEP PROBLEM as a computational task (input, output,
+     guarantee) and give the round as one computation plus one rounding with
+     the per-round inequality. State the number of rounds or calls.
   4. List every gap in your candidate honestly, ranked; mark each VERIFIED,
      CHECKED-SMALL, or CONJECTURE.
   Begin your answer with a section headed "## Directions" containing one line per
