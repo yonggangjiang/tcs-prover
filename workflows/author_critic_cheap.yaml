@@ -1,0 +1,270 @@
+# Cost-optimized variant of author_critic.yaml for the simple author (no research
+# files). It keeps the per-request reasoning depth of Astra-Ultra and the critic's
+# rigor, and removes the multipliers around them. The README section
+# "Cost-optimized workflow" explains every choice and how to run it.
+options:
+  # Codex sends `ultra` to the API as the model's multi_agent_reasoning_effort
+  # (xhigh for gpt-6-astra; models without one get max) and adds a proactive,
+  # recursive delegation instruction. Keep the per-request effort, drop the
+  # delegation. Check the catalog with `codex debug models`.
+  ultra_effort: {gpt-6-astra: xhigh, default: max}
+  # Codex compacts when the last input + output + the reasoning produced since
+  # the latest user message reach the limit: 94-123K of reported input for a
+  # reasoning-heavy author at 150K. Checkpoint early enough to land before it,
+  # and never interrupt long reasoning with a time-based checkpoint.
+  compaction_tokens: 150000
+  checkpoint_tokens: 80000
+  turn_minutes_cap: 0
+  # Delegation only as the author prompt requests it: one subagent at a time
+  # (multi-agent V2 adds the root to this count).
+  subagent_threads: 1
+  subagent_call_cap: 40
+  web_actions_per_hour: 6
+  # Leave out prompt blocks and tools a proof author never uses: the skills
+  # catalog, personality prose, app and plugin tools and plugin
+  # recommendations, image tools. The plan tool is off by default in Codex
+  # 0.153.4; the entry only guards against a user config that enables it.
+  codex_config:
+    skills: {include_instructions: false}
+    personality: none
+    tools: {update_plan: {enabled: false}}
+    features:
+      apps: false
+      plugins: false
+      tool_suggest: false
+      image_generation: false
+      view_image: false
+
+nodes:
+  author:
+    run: goal
+    role: author
+    stage: solve
+    prompt: author
+    lifecycle: [goal, continuation, compaction, repair, resume, checkpoint, subagent_compaction]
+    features: [multi_agent]
+    task: state.statement
+    marker: '[STATEMENT]'
+    resume:
+      bugs: state.report.bugs
+      round: state.round
+      candidate_file: "run_directory + '/saved-candidate.md'"
+      candidate_note: "'is your last final answer (read the file if that answer is no longer in your context)' if normalized_text(get(state, 'solution', '')) == normalized_text(get(state, 'author_output', '')) else 'is not in this conversation; read it before revising'"
+    recovery: {when: "'report' in state and state.report.verdict == 'reject'", prompt: repair}
+    outcome: result.outcome
+    after:
+    - merge: result
+    - set:
+        solution: "result.output if outcome == 'done' else get(state, 'solution', '')"
+        author_output: "result.output if outcome == 'done' else get(state, 'author_output', '')"
+        failed: outcome == 'failure'
+    next: {done: critic, failure: end}
+
+  # First audit of every new candidate: one full-depth reader. A candidate with
+  # a confirmed central bug goes back to the author without paying for the panel.
+  critic:
+    run: structured
+    role: critic
+    stage: critic
+    prompt: screen_input
+    instructions: critic
+    inputs: {statement: state.statement, solution: state.solution}
+    response: {verdict: [fatal, fixable, clean], bugs: string}
+    normalize:
+      verdict: "'fixable' if result.verdict == 'fatal' and not strip(result.bugs) else result.verdict"
+      bugs: "'' if result.verdict == 'clean' else result.bugs"
+    provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
+    outcome: "'reject' if result.verdict == 'fatal' else 'audit'"
+    before:
+    - write: {path: saved-candidate.md, text: state.solution}
+    after:
+    - set: {screen: "'(none)' if result.verdict == 'clean' else result.bugs"}
+    next:
+      reject:
+        to: author
+        after:
+        - set:
+            rejections: "get(state, 'rejections', 0) + 1"
+            report: "{'verdict': 'reject', 'solution': state.solution, 'bugs': result.bugs}"
+        - set: {round: state.rejections}
+        - emit: {kind: critic_result, label: 'Critic first audit', report: '=state.report', round: '=state.round', text: '{raw}'}
+      audit: critic_panel
+
+  # Two independent audits run by the controller (fresh contexts, no subagent
+  # tools, checkpointed), then one judge that fixes local bugs and decides.
+  critic_panel:
+    run: structured
+    role: critic
+    stage: critic
+    prompt: judge_input
+    instructions: critic
+    parallel:
+      items:
+      - "attempts to break the argument: try to construct counterexamples to each key lemma and to the final claim; test boundary, degenerate, and extreme cases; check every quantifier order, inequality direction, and constant."
+      - "completeness and fidelity: whether the theorem proved is exactly the statement; whether every cited external result is stated with its hypotheses and those hypotheses hold where it is applied; whether every term is defined and no omitted step needs more than one routine line; for algorithms, correctness, the running-time or resource bound, and any probability bound."
+      prompt: audit_input
+      instructions: [critic]
+      inputs: {statement: state.statement, solution: state.solution, focus: item}
+      response: {verdict: [issues, no_issues], report: string}
+      provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
+      checkpoint:
+        file: critic-panel-audits.json
+        identity: {statement: state.statement, solution: state.solution, instructions: instructions, panel: "'author_critic_cheap/panel-2'"}
+    inputs:
+      statement: state.statement
+      solution: state.solution
+      screen: "get(state, 'screen', '(none)')"
+      audits: json(parallel)
+    response: {verdict: [pass, reject], edits: [none, harmless, substantive], solution: string, bugs: string}
+    # Inconsistent answers fail safe. Harmless (cosmetic) rewrites are never
+    # applied, so no unaudited text replaces the reviewed proof. Text returned
+    # under "none" counts as a substantive edit (re-audited) only when it is a
+    # full-length different proof; placeholders and abridged copies are
+    # ignored. Substantive edits without most of the text become a reject.
+    normalize:
+      edits: "'none' if result.verdict == 'reject' or result.edits == 'harmless' else ('substantive' if result.edits == 'substantive' or (strip(result.solution) and normalized_text(result.solution) != normalized_text(state.solution) and len(strip(result.solution)) >= 0.9 * len(strip(state.solution)) and len(strip(result.solution)) + 200 >= len(strip(state.solution))) else 'none')"
+      verdict: "'reject' if result.verdict == 'pass' and result.edits == 'substantive' and len(strip(result.solution)) < 0.5 * len(strip(state.solution)) else result.verdict"
+      bugs: "'' if result.verdict == 'pass' else (result.bugs if strip(result.bugs) else 'The critic did not return its decision in usable form. These audit reports were not adjudicated; check each one yourself and fix the real ones in place: ' + json(parallel))"
+      solution: "'' if result.verdict == 'reject' or result.edits == 'none' else result.solution"
+    provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
+    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.edits == 'substantive' else 'pass')"
+    after:
+    - set:
+        solution: "strip(result.solution) if result.edits != 'none' and strip(result.solution) else state.solution"
+        screen: "'(none: this round re-checks the critic-corrected proof)'"
+    - set: {report: "{'verdict': result.verdict, 'solution': state.solution, 'bugs': result.bugs}"}
+    - write: {path: saved-candidate.md, text: state.solution}
+    - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=state.report', round: '=visit', text: '{raw}'}
+    next:
+      reject:
+        to: author
+        after:
+        - set: {rejections: "get(state, 'rejections', 0) + 1"}
+        - set: {round: state.rejections}
+      pass:
+        to: end
+        after:
+        - set: {output: state.solution}
+        - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed.'}
+      fixed:
+        repeat: 2
+        option: critic_rounds
+        then: end
+        after:
+        - set: {output: state.solution}
+        - emit: {kind: status, label: Critic approved, text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
+
+prompts:
+  # The goal prompt is sent once and is kept through compactions, so it carries
+  # the standing rules; every later steer stays short.
+  author: |-
+    Resolve the exact statement below with a complete, rigorous proof. If the statement is false as written, a complete, rigorous disproof also resolves it.
+
+    How to work. These rules control cost; they never lower the standard of rigor.
+    1. Do the mathematics in your own reasoning. Call a tool only when its result would change your next step, for example a short script that tests a conjecture or a lemma on small instances, or checks a calculation. Put independent computations into one script and print only what you need: a count, pass or fail, the smallest counterexample. Before relying on an algorithmic or combinatorial claim that small instances can test, test it by brute force.
+    2. This run is unattended. Send no progress messages, plans, or commentary: nobody reads them, and every message stays in your context.
+    3. Search the web only for the exact statement and hypotheses of a specific known result that you need, or, once per stalled missing step (rule 5), for a known result or technique that would close exactly that step. Stop once you have it, never survey a topic, and record what you found with its source so you never search for it again.
+    4. Your conversation does not survive context compaction; two files in the working directory do. PROOF_STATE.md (at most 150 lines, exact statements, no narration) holds: the exact statement; definitions and notation; established results L1, L2, ... as exact statements with one-line proof ideas, or, for a published result, its exact hypotheses and source; failed approaches, each with the exact step that failed and why; the current route, its single missing step, and its stall count (the number of checkpoints since that step last moved); the next action. LEMMAS.md is append-only: the complete proof of each non-routine result you established, under its label, written once; never reuse a label, and if a result turns out wrong, append a line withdrawing it. Read LEMMAS.md only for a proof you are about to use or for your final answer. When asked for a checkpoint, first append to LEMMAS.md the complete proofs of the results established since your last checkpoint, then update PROOF_STATE.md by editing only the sections that changed, keeping every recorded result unless you found it wrong. After a checkpoint, compaction can come at any moment: record each further non-routine result as soon as you establish it, in the same command as your next computation.
+    5. While working, do not re-derive, re-check, or polish established results unless new evidence contradicts one; refer to them by label. The missing step has moved when you proved a new lemma toward it or reduced it to a strictly simpler claim; refuting one variant of your own construction is not movement. It is stalled when it has not moved for two consecutive turns or its stall count reaches 2 (your own messages do not survive compaction; the count in PROOF_STATE.md does). Then write one line stating the strongest version of your current construction that your obstacles do not refute (a counterexample to one variant, such as one weighting, ordering, rounding, or parameter choice, refutes that variant, not the family), and pursue it unless you can refute it in a few lines. If that version also stalls (two more turns or two more checkpoints), or you refute it, abandon the family (one line: what you abandon and why) and try a materially different one.
+    6. Work alone, with one exception that I request explicitly: when the missing step is stalled (rule 5), spawn one fresh subagent with fork_turns "none" and a self-contained brief of at most 8 KB: the statement; the definitions and established results it needs, as exact statements; the missing step; each approach you tried, with the exact form that failed; and one technique family you have not tried. Tell it that your framing may be wrong and that a failed form does not rule out its family, and ask it for a complete argument for the step (or for a weaker step that suffices) or a precise obstruction. At most one subagent at a time; it reports once and stops. Keep working meanwhile; when you have nothing else to do, call wait_agent with timeout_ms 1800000, at most twice per subagent. Its report is a candidate, not verified mathematics, and it does not survive compaction: check it, then record the outcome at once (a checked proof in LEMMAS.md, an obstruction under failed approaches in PROOF_STATE.md). Never use subagents to re-verify steps: an independent critic audits your final proof.
+    7. Your final answer must be complete and self-contained: the complete proof of every result of yours that it uses (take them from LEMMAS.md), and each published result it cites stated exactly, with its hypotheses and source, where you check that they hold. When you have it, check once that it proves exactly the statement (quantifiers, model of computation, parameters, bounds, every case) and that every step is justified. Then call update_goal with status "complete" and give the proof, written once, as the final message of that same turn: the controller takes only that message, so never end that turn by pointing to an earlier one. Never return partial progress, a plan, or a reduction to an unproved claim as a final answer.
+
+    STATEMENT:
+    [STATEMENT]
+  goal: >-
+    Resolve the exact statement of this task (it is repeated after every context
+    compaction) with a complete, rigorous proof, or a rigorous disproof if it is
+    false as written. When it is complete, call update_goal with status
+    "complete" and give the full proof as the final message of that same turn.
+  continuation: >-
+    Continue the same statement. Do not re-read your files unless your context
+    was compacted since you last read them. In one line, name the single missing
+    step and your next move. If that step is stalled (rule 5: no movement for two
+    turns, or a stall count of 2 in PROOF_STATE.md), apply rules 5 and 6: state
+    the strongest unrefuted version of your construction in one line and pursue
+    it unless you can refute it in a few lines. Return a final answer only when
+    the proof is complete.
+  checkpoint: >-
+    Checkpoint: append to LEMMAS.md the complete proof of every non-routine
+    result established since your last checkpoint, then update PROOF_STATE.md by
+    editing only the sections that changed (at most 150 lines in total, exact
+    statements, no narration), keeping every recorded result unless you found it
+    wrong. Add 1 to the stall count if the missing step has not moved since the
+    last checkpoint, otherwise set it to 0; at 2, apply rules 5 and 6. Then
+    continue.
+  compaction: |-
+    Your context was compacted. Read PROOF_STATE.md once, if it exists, and do not redo recorded work. If the critic has rejected a candidate in this conversation, keep repairing the one named in the latest rejection and finish as rule 7 says; otherwise continue from the recorded next action. The exact statement is:
+    {statement}
+  subagent_compaction: >-
+    Your context was compacted. Restate your assigned task in one line, finish
+    only that task, report once, and stop.
+  resume: |-
+    Resume the same task in this working directory: {directory}
+    Continue from your earlier work in this conversation. If that work is not in this conversation, read PROOF_STATE.md once, if it exists, and continue from its next action.
+
+    ORIGINAL AUTHOR PROMPT:
+    {original_prompt}
+  repair: |-
+    The critic rejected your candidate (rejection {round}). The candidate it reviewed is saved in {candidate_file}; it {candidate_note}. Unresolved bugs:
+
+    {bugs}
+
+    Reviewers can be wrong, and their LOCAL and CENTRAL labels are advisory. First check each bug yourself (verify any claimed counterexample against every hypothesis); if it is not a real error, keep that part and say why in one sentence at that point of the revised proof. A confirmed bug is LOCAL if it can be fixed in place without changing a main lemma, reduction, invariant, or construction (supplying a missing proof of a true claim is LOCAL), and CENTRAL if it breaks one of them or the statement may be false. Fix LOCAL bugs in place and keep everything else unchanged. For a confirmed CENTRAL bug, do not patch around it: replace the broken construction with a materially different one (another member of the same family qualifies only if you can say in one line why the failure does not apply to it), and test its first non-routine step on the smallest meaningful instance before writing it out. Once the revised proof is complete, finish as rule 7 says: call update_goal with status "complete" and give the complete revised proof as the final message of that turn.
+
+  # Shared review standard: the instructions of the first audit, both panel
+  # audits, and the judge.
+  critic: |-
+    You are an independent reviewer of a candidate proof of the exact statement given below. Work alone.
+    A bug is a load-bearing error or gap: a false or unjustified claim the conclusion depends on; a missing case or boundary case; a hidden or unverified hypothesis, including the hypotheses of a cited result at the point where it is applied; circular reasoning; an undefined term or symbol; or a proof of a different, weaker, or special-case statement. Words such as "clearly", "standard", or "similarly" do not justify a non-routine step, and an unjustified load-bearing step is a bug even when you cannot show it false.
+    Not a bug: a routine step a competent reader completes in one line, a typo, notation, or a wrong citation number or attribution when the cited mathematics is correct and applies. Never reject for these.
+    The candidate may instead claim that the statement is false as written. Review such a disproof by the same standard: it must refute exactly this statement, for example with a counterexample that provably satisfies every hypothesis and violates the conclusion. A correct disproof resolves the task; it is not a proof of a different statement.
+    For each bug, quote its exact location, explain why the step is false or not justified by what precedes it (give a counterexample when you can), and label it LOCAL (fixable in place, including a missing argument you can supply) or CENTRAL (it breaks a main lemma, reduction, invariant, or construction, or closing it needs a new idea). Drop an objection only when you find the step justified.
+    Use web search only to confirm the exact statement and hypotheses of an external result the candidate cites, and stop once it is confirmed.
+  screen_input: |
+    {instructions}
+
+    STATEMENT:
+    {statement}
+
+    CANDIDATE PROOF:
+    {solution}
+
+    YOUR TASK (first audit): First check that the candidate proves exactly the statement (quantifiers, model of computation, parameters, bounds, and every case), or, if it claims the statement is false, that it refutes exactly the statement as written. Then verify the whole proof step by step and list every bug you find.
+    - verdict "fatal": at least one CENTRAL bug that you have confirmed (check any counterexample against every hypothesis, and re-read every line the failing step depends on), or the candidate proves a different or weaker statement. If you are not sure that a bug is CENTRAL, label it LOCAL; the next stage adjudicates it.
+    - verdict "fixable": every bug you found is LOCAL.
+    - verdict "clean": you found no bug.
+    bugs: every bug you found, each with its location, explanation, and LOCAL or CENTRAL label; empty only for "clean".
+    Return only the requested JSON.
+  audit_input: |
+    {instructions}
+
+    STATEMENT:
+    {statement}
+
+    CANDIDATE PROOF:
+    {solution}
+
+    YOUR TASK (independent audit): Verify the whole proof yourself and list every bug you find. Give special attention to {focus}
+    Return verdict "issues" with every bug in report (location, explanation, LOCAL or CENTRAL, and the fix if you see one), or verdict "no_issues" with an empty report.
+    Return only the requested JSON.
+  judge_input: |
+    {instructions}
+
+    STATEMENT:
+    {statement}
+
+    CANDIDATE PROOF:
+    {solution}
+
+    FIRST AUDIT (its bugs and LOCAL/CENTRAL labels are unverified):
+    {screen}
+
+    INDEPENDENT AUDITS (JSON):
+    {audits}
+
+    YOUR TASK (final decision): Read the proof yourself and examine every reported bug; discard the ones that are not real. Fix every real LOCAL bug yourself, defining missing terms and expanding omitted arguments, and check each fix.
+    - verdict "reject" if a real bug remains that you cannot fix rigorously here. Your corrected text is then discarded, so list in bugs every real bug (location, explanation, LOCAL or CENTRAL), including each LOCAL bug you fixed, with its exact fix under it. On reject, return edits "none" and an empty solution.
+    - verdict "pass" otherwise, with empty bugs.
+    - edits: "none" if you changed nothing; "harmless" if you changed only typos, notation, formatting, or citation details and no mathematical statement or argument step (a changed symbol, index, constant, sign, or inequality inside a formula is substantive); "substantive" if you changed or added any mathematical statement or argument step.
+    - solution: on pass with "substantive" edits, the complete corrected proof, every line of it, never abbreviated; otherwise an empty string. Never copy an unchanged proof, and do not rewrite the proof for harmless edits: they are not applied.
+    Return only the requested JSON.
