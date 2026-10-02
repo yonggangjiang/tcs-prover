@@ -748,6 +748,12 @@ textarea:focus, input:focus, select:focus {
   width: min(100%, 260px);
   background: #fcfcfb;
 }
+#authorWorkflow {
+  width: min(100%, 320px);
+  background: #fcfcfb;
+}
+.file-management-setting:has(input:disabled) { cursor: not-allowed; opacity: 0.6; }
+.file-management-setting input:disabled { cursor: not-allowed; }
 .model-setting select { width: min(100%, 260px); background: #fcfcfb; }
 .model-setting .effort-label {
   margin-top: 10px;

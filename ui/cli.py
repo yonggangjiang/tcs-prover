@@ -13,7 +13,7 @@ from urllib.parse import quote
 import workflow_runner as runtime
 from .review import review_worker_main
 from .server import (
-    App, Server, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
+    App, Server, AUTHOR_WORKFLOWS, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
     DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, EFFORTS, HOST,
     MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
@@ -21,6 +21,19 @@ from .server import (
 )
 
 ACTIVE_PHASES = {"reviewing", "running", "stopping"}
+WORKFLOW_ALIASES = {"cheap": "author_critic_cheap"}
+
+
+def workflow_argument(value):
+    """Accept an author/critic workflow name, or the alias cheap."""
+
+    name = WORKFLOW_ALIASES.get(value, value)
+    if name not in AUTHOR_WORKFLOWS:
+        raise argparse.ArgumentTypeError(
+            f"invalid workflow {value!r} (choose author_critic, author_critic_cheap, or cheap)"
+        )
+    return name
+
 
 class ConciseHeadlessOutput:
     """Print only headless workflow transitions and diagnostics."""
@@ -173,8 +186,13 @@ def direct_cli_options(
     speed_mode=DEFAULT_SPEED,
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
+    author_workflow=None,
 ):
-    """Load optional prompt files and validate direct-workflow CLI settings."""
+    """Load optional prompt files and validate direct-workflow CLI settings.
+
+    Terminal runs keep the managed author_critic default; author_critic_cheap
+    always runs the simple author without research files, audits, or solvers.
+    """
 
     prompt_files = {
         "author": author_prompt_file,
@@ -201,8 +219,11 @@ def direct_cli_options(
         speed_mode=speed_mode,
         reasoning_summary=reasoning_summary,
         include_review=False,
+        author_workflow=author_workflow,
     )
     return {
+        "author_workflow": options["authorWorkflow"],
+        "file_management": options["fileManagement"],
         "critic_rounds": options["criticRounds"],
         "thinking_hours": options["thinkingHours"],
         "author_model": options["authorModel"],
@@ -246,6 +267,9 @@ def research_resume_cli_settings(args, argv):
         path = getattr(args, f"{role}_prompt_file")
         if path:
             options[f"{role}Prompt"] = read_utf8(path, f"{role} prompt")
+    # A continuation keeps its saved workflow; a supplied one must match it.
+    if getattr(args, "workflow", None) is not None:
+        options["authorWorkflow"] = args.workflow
     return options
 
 
@@ -409,7 +433,17 @@ def main():
 
     if sys.argv[1:2] == ["--review-worker"]:
         return review_worker_main(sys.argv[2:])
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python3 web_ui.py statement.md                   "
+            "managed author_critic run\n"
+            "  python3 web_ui.py statement.md --workflow cheap  "
+            "cost-optimized author_critic_cheap run"
+        ),
+    )
     parser.add_argument(
         "input_path", nargs="?",
         help="UTF-8 .md statement file or folder of top-level .md files",
@@ -432,6 +466,17 @@ def main():
     parser.add_argument(
         "--verbose-events", action="store_true",
         help="print every public JSONL event during a Markdown terminal run",
+    )
+    parser.add_argument(
+        "-workflow", "--workflow", dest="workflow", type=workflow_argument,
+        default=None, metavar="NAME",
+        help=(
+            "author/critic workflow for a Markdown run: author_critic (default; "
+            "managed research files) or author_critic_cheap (alias: cheap; the "
+            "cost-optimized simple author with no research files, audits, or "
+            "fresh-eyes solvers). A resumed job keeps its saved workflow and "
+            "rejects a different NAME"
+        ),
     )
     parser.add_argument(
         "-criticRounds", "--criticRounds", "--critic-rounds",
@@ -497,6 +542,8 @@ def main():
     resume_source = None
     if sum(bool(value) for value in (args.input_path, args.resume_critic, args.resume_research)) > 1:
         parser.error("Choose only one of input_path, --resume-critic, or --resume-author.")
+    if args.workflow is not None and not (args.input_path or args.resume_critic or args.resume_research):
+        parser.error("--workflow applies to a Markdown run or a resumed job; in the web UI choose Advanced → Workflow.")
     if args.resume_critic or args.resume_research:
         try:
             resume_source = (
@@ -525,6 +572,7 @@ def main():
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
+                author_workflow=args.workflow,
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
@@ -569,6 +617,9 @@ def main():
                 resume_settings["finalPrompt"] = read_utf8(
                     args.final_prompt_file, "final prompt"
                 )
+            # Only an explicit --workflow is forwarded; it must match the saved job.
+            if args.workflow is not None:
+                resume_settings["authorWorkflow"] = args.workflow
             if args.resume_research:
                 resume_app = server.start_saved_research_job(
                     resume_source["run_dir"],

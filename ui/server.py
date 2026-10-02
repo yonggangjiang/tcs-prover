@@ -58,6 +58,32 @@ RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "aud
 APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
 AUDIT_MEMORY_FILE = re.compile(r"(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
+# Author/critic graphs a proof job may run before clean_up.yaml. Jobs saved
+# before this choice existed ran author_critic.yaml. The cost-optimized graph
+# defines only simple-author prompts, so it always runs without research files.
+DEFAULT_AUTHOR_WORKFLOW = "author_critic"
+AUTHOR_WORKFLOWS = ("author_critic", "author_critic_cheap")
+SIMPLE_ONLY_WORKFLOWS = frozenset({"author_critic_cheap"})
+
+
+def author_workflow_name(value=None):
+    """Validate one job's author/critic workflow; None selects the default."""
+
+    if value is None:
+        return DEFAULT_AUTHOR_WORKFLOW
+    if not isinstance(value, str) or value not in AUTHOR_WORKFLOWS:
+        raise ValueError(
+            f"Unknown workflow {value!r}; choose author_critic or author_critic_cheap."
+        )
+    return value
+
+
+def known_author_workflow(value):
+    """Read a saved workflow name; old or unknown values mean author_critic."""
+
+    return value if isinstance(value, str) and value in AUTHOR_WORKFLOWS else DEFAULT_AUTHOR_WORKFLOW
+
+
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
 
@@ -171,17 +197,48 @@ def prepare_runs_directory(path):
     grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
 
 
-def default_prompts():
+def default_prompts(workflow=DEFAULT_AUTHOR_WORKFLOW):
     """Read workflow prompts at use time, including edits made while serving."""
 
-    author_critic = runtime.builtin_workflow("author_critic")["prompts"]
+    workflow = author_workflow_name(workflow)
+    prompts = runtime.builtin_workflow(workflow)["prompts"]
+    if not {"author", "critic"} <= set(prompts):
+        # Each job's prompt files replace the YAML prompts with these names.
+        raise ValueError(f"Workflow {workflow}.yaml must define prompts named author and critic.")
     return {
         "review": REVIEW_PROMPT,
-        "author": author_critic["author"],
-        "author_simple": author_critic["author_simple"],
-        "critic": author_critic["critic"],
+        "author": prompts["author"],
+        # A simple-only workflow uses its one author prompt in both modes.
+        "author_simple": prompts.get("author_simple", prompts["author"]),
+        "critic": prompts["critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
     }
+
+
+def optional_default_prompts(workflow):
+    """Read a known workflow's prompts; None while an optional workflow's YAML is unreadable.
+
+    Workflow files may be edited while serving. A broken optional workflow must not
+    take down the home page, the job list, or a restart; launching it still fails.
+    """
+
+    try:
+        return default_prompts(workflow)
+    except ValueError:
+        if workflow == DEFAULT_AUTHOR_WORKFLOW:
+            raise
+        return None
+
+
+def web_author_workflow(body, source=None):
+    """Read a job's workflow choice; a retry keeps the existing job's choice."""
+
+    saved = known_author_workflow(source.get("authorWorkflow")) if source else None
+    value = body.get("authorWorkflow")
+    workflow = author_workflow_name(saved if value is None else value)
+    if source and workflow != saved:
+        raise ValueError("Start a new job to change the workflow.")
+    return workflow
 
 
 def web_prompt_options(body, roles, source=None):
@@ -419,6 +476,7 @@ def empty_state(trace=None, trace_version=0):
         "skipStatementReview": False,
         "statementReviewOnly": False,
         "fileManagement": False,
+        "authorWorkflow": DEFAULT_AUTHOR_WORKFLOW,
         "preparedRun": False,
         "draft": "",
         "reviewStatement": "",
@@ -473,6 +531,17 @@ def empty_state(trace=None, trace_version=0):
         "trace": trace if trace is not None else [],
         "traceVersion": trace_version,
     }
+
+
+def home_state():
+    """Return the new-job form, with prompt defaults for every selectable workflow."""
+
+    state = empty_state()
+    choices = {name: optional_default_prompts(name) for name in AUTHOR_WORKFLOWS}
+    state["workflow"]["settings"]["promptsByWorkflow"] = {
+        name: prompts for name, prompts in choices.items() if prompts is not None
+    }
+    return state
 
 
 def restored_model(value):
@@ -595,6 +664,7 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+            "authorWorkflow",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         self._save(
@@ -1293,8 +1363,10 @@ class App:
         with self.lock:
             state = dict(self.state)
             graph = state["workflow"]
+            # The prompt editor's defaults come from this job's own workflow.
+            prompts = optional_default_prompts(known_author_workflow(state.get("authorWorkflow"))) or {}
             state["workflow"] = {
-                **graph, "settings": {**graph["settings"], "prompts": default_prompts()},
+                **graph, "settings": {**graph["settings"], "prompts": prompts},
             }
             include_transcript = state["phase"] not in {
                 "reviewing", "running", "stopping", "pausing",
@@ -1342,11 +1414,16 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         research_audits=None,
         file_management=True,
+        author_workflow=None,
     ):
         """Normalize and validate settings shared by both input modes."""
 
         if not isinstance(file_management, bool):
             raise ValueError("File management must be enabled or disabled.")
+        author_workflow = author_workflow_name(author_workflow)
+        if author_workflow in SIMPLE_ONLY_WORKFLOWS:
+            # No managed prompts exist, so research files, audits, and solvers stay off.
+            file_management = False
         review_model = str(review_model or "")
         author_model = str(author_model or "")
         critic_model = str(critic_model or "")
@@ -1362,7 +1439,9 @@ class App:
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "final": final_prompt,
         }
-        defaults = default_prompts()
+        # Prompt files override the YAML prompts of the same names, so they must
+        # hold the selected workflow's own text.
+        defaults = default_prompts(author_workflow)
         if not file_management:
             defaults["author"] = defaults["author_simple"]
         prompts = {
@@ -1451,6 +1530,7 @@ class App:
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
             "fileManagement": file_management,
+            "authorWorkflow": author_workflow,
             "researchAudits": audits.normalize_settings(research_audits) if file_management else {
                 **audits.default_settings(), "models": ["none", "none", "none"]},
         }
@@ -1473,6 +1553,7 @@ class App:
         continuation_source="", stopped_stage="",
         research_audits=None,
         file_management=True,
+        author_workflow=None,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -1493,6 +1574,7 @@ class App:
             author_prompt = critic_prompt = final_prompt = None
             critic_rounds = DEFAULT_CRITIC_ROUNDS
             thinking_hours = DEFAULT_THINKING_HOURS
+            author_workflow = None
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -1513,6 +1595,7 @@ class App:
             reasoning_summary=reasoning_summary,
             research_audits=research_audits if not review_only else None,
             file_management=file_management,
+            author_workflow=author_workflow,
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -1803,11 +1886,16 @@ class App:
         options.extend(["--set", "goal_pause_file=" + json.dumps(str(self.run_dir / PAUSE_REQUEST_FILENAME))])
         return options
 
+    def _proof_workflows_locked(self):
+        """Return this job's saved author/critic graph followed by final cleanup."""
+
+        return [f"{author_workflow_name(self.state.get('authorWorkflow'))}.yaml", "clean_up.yaml"]
+
     def _launch_solver_locked(self, statement):
         """Start the author/critic graph followed by final cleanup."""
 
         return self._launch_workflow_locked(
-            ["author_critic.yaml", "clean_up.yaml"], statement,
+            self._proof_workflows_locked(), statement,
             [*self._proof_options_locked(), "--elapsed-seconds", str(self._elapsed_seconds())],
             "solve", "author",
         )
@@ -1950,7 +2038,7 @@ class App:
                 resume_options = (["--set", "goal_require_resume=true"]
                                   if self.state.get("goalThreadId") else [])
                 process, token = self._launch_workflow_locked(
-                    ["author_critic.yaml", "clean_up.yaml"], "",
+                    self._proof_workflows_locked(), "",
                     [*self._proof_options_locked(), *resume_options,
                      "--elapsed-seconds", str(checkpoint["elapsedSeconds"]),
                      "--start-node", checkpoint["node"]],
@@ -2015,7 +2103,7 @@ class App:
         """Resume the same graph at its critic with the saved candidate."""
 
         return self._launch_workflow_locked(
-            ["author_critic.yaml", "clean_up.yaml"], "",
+            self._proof_workflows_locked(), "",
             [*self._proof_options_locked(), "--start-node", "critic"],
             "critic", "critic", state={"statement": statement, "solution": solution},
         )
@@ -2037,6 +2125,7 @@ class App:
         allow_external_source=False,
         research_audits=None,
         file_management=True,
+        author_workflow=None,
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -2046,6 +2135,7 @@ class App:
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
         if continuation_source:
+            author_workflow = continued_author_workflow(continuation_source, author_workflow)
             file_management = saved_file_management(continuation_source)
             saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
             if saved_prompt.is_file():
@@ -2071,6 +2161,7 @@ class App:
             include_review=False,
             research_audits=research_audits,
             file_management=file_management,
+            author_workflow=author_workflow,
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2254,6 +2345,7 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         audit_checkpoint="",
         recover_audit_checkpoint=True,
+        author_workflow=None,
     ):
         """Create a new job that audits one complete saved candidate proof."""
 
@@ -2262,6 +2354,9 @@ class App:
             raise ValueError("A saved statement and complete proof are required.")
         if "\0" in statement or "\0" in solution:
             raise ValueError("Saved critic inputs cannot contain NUL characters.")
+        if source_run:
+            # A rejection reopens the source author session, so the graph cannot change.
+            author_workflow = continued_author_workflow(source_run, author_workflow)
         file_management = saved_file_management(source_run) if source_run else True
         options = self._workflow_options(
             critic_rounds=critic_rounds,
@@ -2280,6 +2375,7 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             file_management=file_management,
+            author_workflow=author_workflow,
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2308,7 +2404,10 @@ class App:
                     runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
                     str(audit_checkpoint),
                 )
-            if not recover_audit_checkpoint and critic_uses_parallel_audits():
+            # The cost-optimized critic checkpoints its panel audits as well.
+            if not recover_audit_checkpoint and (
+                critic_uses_parallel_audits() or options["authorWorkflow"] in SIMPLE_ONLY_WORKFLOWS
+            ):
                 self._save(
                     runtime.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME,
                     (
@@ -2423,6 +2522,9 @@ class App:
                 elif (
                     record.get("kind") == "request"
                     and record_stage == "critic"
+                    # A cost-optimized round makes four critic requests; its
+                    # critic_result events carry the round number instead.
+                    and self.state.get("authorWorkflow") not in SIMPLE_ONLY_WORKFLOWS
                 ):
                     with self.lock:
                         self.state["round"] += 1
@@ -2852,6 +2954,26 @@ def saved_file_management(run_dir):
     return not isinstance(settings, dict) or settings.get("fileManagement") is not False
 
 
+def saved_author_workflow(run_dir):
+    """Old runs used author_critic; only an explicit known name selects another graph."""
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return DEFAULT_AUTHOR_WORKFLOW
+    return known_author_workflow(settings.get("authorWorkflow") if isinstance(settings, dict) else None)
+
+
+def continued_author_workflow(source_run, requested=None):
+    """A continuation keeps its source job's workflow and rejects a different one."""
+
+    saved = saved_author_workflow(source_run)
+    if requested is not None and author_workflow_name(requested) != saved:
+        raise ValueError(
+            "A continued job must keep its original workflow; start a new job to change it."
+        )
+    return saved
+
+
 def saved_goal_options(run_dir):
     """Recover generic session/workspace settings without reading author files."""
 
@@ -3153,7 +3275,7 @@ def restore_saved_app(app):
     records = _run_records(run_dir)
     state = empty_state(app.state["trace"], app.state["traceVersion"])
     # Historical jobs predate the opt-in switch and used managed author records.
-    state.update(fileManagement=True, authorPrompt=default_prompts()["author"])
+    state.update(fileManagement=True)
     state["runId"] = run_dir.name
     draft_path = run_dir / "draft.md"
     try:
@@ -3194,12 +3316,15 @@ def restore_saved_app(app):
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                "authorWorkflow",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
                     if key in {
                         "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
                     } and not isinstance(settings[key], bool):
+                        continue
+                    if key == "authorWorkflow" and settings[key] not in AUTHOR_WORKFLOWS:
                         continue
                     if (
                         key == "problemMode"
@@ -3224,8 +3349,13 @@ def restore_saved_app(app):
                     )
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
+    if state["authorWorkflow"] in SIMPLE_ONLY_WORKFLOWS:
+        state["fileManagement"] = False
+    # Saved prompt files below win; these defaults cover runs that lack them.
+    defaults = optional_default_prompts(state["authorWorkflow"]) or default_prompts()
+    state["authorPrompt"] = defaults["author" if state["fileManagement"] else "author_simple"]
+    state["criticPrompt"] = defaults["critic"]
     if not state["fileManagement"]:
-        state["authorPrompt"] = default_prompts()["author_simple"]
         state["researchAudits"] = {**audits.default_settings(), "models": ["none", "none", "none"]}
     warnings = audits.selected_warnings(state["researchAuditProgress"].get("warnings"), state["researchAudits"])
     state["researchAuditStatus"].update(warnings=warnings, lastError="\n".join(item["message"] for item in warnings))
@@ -3604,7 +3734,8 @@ def saved_critic_source(path):
         solution_path = run_dir / "SOLUTION.md"
     solution = read_utf8(solution_path, "saved complete proof")
     statement = saved_statement(run_dir)
-    defaults = default_prompts()
+    workflow = saved_author_workflow(run_dir)
+    defaults = default_prompts(workflow)
     prompts = {}
     if not saved_file_management(run_dir):
         defaults["author"] = defaults["author_simple"]
@@ -3631,6 +3762,7 @@ def saved_critic_source(path):
         "critic_prompt": prompts["critic"],
         "final_prompt": prompts["final"],
         "audit_checkpoint": audit_checkpoint,
+        "author_workflow": workflow,
     }
 
 
@@ -3652,7 +3784,8 @@ def saved_research_source(path):
     for role in ("author", "critic", "writer"):
         if f"{role}Model" in settings:
             settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
-    defaults = default_prompts()
+    settings["authorWorkflow"] = known_author_workflow(settings.get("authorWorkflow"))
+    defaults = default_prompts(settings["authorWorkflow"])
     if settings.get("fileManagement") is False:
         defaults["author"] = defaults["author_simple"]
     for role in ("author", "critic", "final"):
@@ -3701,6 +3834,9 @@ class Server(ThreadingHTTPServer):
         app = self.get_job(run_id) if run_id else (
             self.app if self.fixed_app else App(runs=self.runs)
         )
+        author_workflow = web_author_workflow(body, app.state if run_id else None)
+        if author_workflow in SIMPLE_ONLY_WORKFLOWS:
+            body = {**body, "fileManagement": False}
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         review_only_option = (
             {"review_only": body.get("statementReviewOnly")}
@@ -3729,6 +3865,7 @@ class Server(ThreadingHTTPServer):
             **review_only_option,
             research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
             file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
+            author_workflow=author_workflow,
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3744,6 +3881,9 @@ class Server(ThreadingHTTPServer):
         app = self.get_job(run_id) if run_id else (
             self.app if self.fixed_app else App(runs=self.runs)
         )
+        author_workflow = web_author_workflow(body)
+        if author_workflow in SIMPLE_ONLY_WORKFLOWS:
+            body = {**body, "fileManagement": False}
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_direct_statement(
             statement=body.get("statement", ""),
@@ -3759,6 +3899,7 @@ class Server(ThreadingHTTPServer):
             **web_prompt_options(body, ("author", "critic", "final")),
             research_audits=body.get("researchAudits"),
             file_management=body.get("fileManagement", False),
+            author_workflow=author_workflow,
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -3838,6 +3979,7 @@ class Server(ThreadingHTTPServer):
                 source["audit_checkpoint"] if include_audit_checkpoint else ""
             ),
             recover_audit_checkpoint=include_audit_checkpoint,
+            author_workflow=settings.get("authorWorkflow") or source["author_workflow"],
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3872,6 +4014,7 @@ class Server(ThreadingHTTPServer):
             allow_external_source=True,
             research_audits=options.get("researchAudits"),
             file_management=options.get("fileManagement", True),
+            author_workflow=options.get("authorWorkflow"),
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
@@ -3928,6 +4071,7 @@ class Server(ThreadingHTTPServer):
                 "criticModel", "writerModel", "reasoningEffort",
                 "authorEffort", "criticEffort", "writerEffort",
                 "speedMode", "reasoningSummary", "authorPrompt",
+                "authorWorkflow",
             )
         }
         return self.start_saved_critic_job(
@@ -4167,6 +4311,7 @@ class Server(ThreadingHTTPServer):
                 review_only=source_state["statementReviewOnly"],
                 file_management=source_state.get("fileManagement", True),
                 research_audits=source_state.get("researchAudits"),
+                author_workflow=source_state.get("authorWorkflow"),
                 **common,
             )
         elif plan["action"] == "author":
@@ -4186,6 +4331,7 @@ class Server(ThreadingHTTPServer):
                 "final_prompt": source_state["finalPrompt"],
                 "file_management": source_state.get("fileManagement", True),
                 "research_audits": source_state.get("researchAudits"),
+                "author_workflow": source_state.get("authorWorkflow"),
                 **common,
             }
             app.start_direct_statement(
@@ -4402,7 +4548,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             try:
                 if not run_id and not self.server.fixed_app:
-                    state = empty_state()
+                    state = home_state()
                     state["traceFrom"] = 0
                     return self.send(state)
                 values = query.get("after")

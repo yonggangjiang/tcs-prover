@@ -36,6 +36,7 @@ const ui = {
   statementReviewOnly: $("statementReviewOnly"),
   fileManagement: $("fileManagement"), fileManagementSetting: $("fileManagementSetting"),
   fileManagementHelp: $("fileManagementHelp"),
+  authorWorkflow: $("authorWorkflow"), authorWorkflowSetting: $("authorWorkflowSetting"),
   speedModeSetting: $("speedModeSetting"),
   criticRoundSetting: $("criticRoundSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
@@ -116,6 +117,8 @@ let promptValues = {};
 let promptDrafts = {};
 let promptOriginals = {};
 let promptOverrides = {};
+// These workflows define only a simple author, so they never manage research files.
+const simpleOnlyWorkflows = new Set(["author_critic_cheap"]);
 // Retire browser-persisted prompts: every new job starts from the workflow files.
 try { localStorage.removeItem("tcs-prover-role-prompts"); } catch (_) {}
 const timelineRows = new Map();
@@ -448,11 +451,19 @@ function setProblemMode(mode) {
   show(ui.reviewOnlySetting, statement);
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
+  // Only a new job chooses its workflow; a simple-only workflow locks file management off.
+  const simpleOnly = simpleOnlyWorkflows.has(selectedAuthorWorkflow());
+  if (simpleOnly) ui.fileManagement.checked = false;
+  ui.fileManagement.disabled = simpleOnly;
+  ui.authorWorkflow.disabled = Boolean(state.runId);
+  show(ui.authorWorkflowSetting, !latexOnly && !reviewOnly);
   show(ui.fileManagementSetting, !latexOnly && !reviewOnly);
   show(ui.researchAuditsSetting, !latexOnly && !reviewOnly && ui.fileManagement.checked);
-  ui.fileManagementHelp.textContent = ui.fileManagement.checked
-    ? "On · Organize approach files, proved lemmas, and optional research audits."
-    : "Off · Focus on proving the statement with a simple author prompt.";
+  ui.fileManagementHelp.textContent = simpleOnly
+    ? "Off · The cost-optimized workflow always uses its simple author prompt."
+    : ui.fileManagement.checked
+      ? "On · Organize approach files, proved lemmas, and optional research audits."
+      : "Off · Focus on proving the statement with a simple author prompt.";
   ui.authorPromptTab.dataset.prompt = selectedAuthorPrompt();
   ui.authorPromptTab.textContent = ui.fileManagement.checked ? "Author · managed" : "Author · simple";
   ui.problem.required = statement;
@@ -522,7 +533,9 @@ function updateModelSummary() {
       + `${role(ui.writerModel.value, ui.writerEffort.value)} writer`;
     return;
   }
-  ui.modelSummary.textContent = `${speed} · ${log} · ` + review
+  const workflow = selectedAuthorWorkflow() === "author_critic_cheap"
+    ? "Cost-optimized workflow · " : "";
+  ui.modelSummary.textContent = `${workflow}${speed} · ${log} · ` + review
     + `${role(ui.authorModel.value, ui.authorEffort.value)} author · `
     + `${role(ui.criticModel.value, ui.criticEffort.value)} critic · `
     + `${role(ui.writerModel.value, ui.writerEffort.value)} writer`;
@@ -541,8 +554,19 @@ const promptHelp = {
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
+// A job keeps its saved workflow; a new job uses the Advanced selection.
+function selectedAuthorWorkflow(source = state) {
+  return (source.runId ? source.authorWorkflow : ui.authorWorkflow?.value) || "author_critic";
+}
+
+// Default prompts come from the selected workflow's YAML, when the page has them.
+function workflowPrompts(source = state) {
+  const settings = source.workflow?.settings || {};
+  return settings.promptsByWorkflow?.[selectedAuthorWorkflow(source)] || settings.prompts || {};
+}
+
 function syncPrompts(source = state) {
-  const defaults = source.workflow?.settings?.prompts || {};
+  const defaults = workflowPrompts(source);
   promptOverrides = {};
   promptValues = Object.fromEntries(Object.keys(promptLabels).map((name) => [
     name, savedPrompt(source, name) || defaults[name] || "",
@@ -559,13 +583,17 @@ function savedPrompt(source, name) {
 }
 
 function updatePromptHelp() {
-  const defaults = state.workflow?.settings?.prompts || {};
+  const defaults = workflowPrompts();
   const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
   ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
     + (isDefault ? "current default" : "this job's prompt");
+  // The cost-optimized critic is a shared review standard for single calls.
+  const help = activePrompt === "critic" && simpleOnlyWorkflows.has(selectedAuthorWorkflow())
+    ? "The shared review standard for the first audit, both panel audits, and the judge; each call works alone, without subagents."
+    : promptHelp[activePrompt];
   ui.promptEditorHelp.textContent = (isDefault ? "" :
     "This overrides the default for this job only. ")
-    + promptHelp[activePrompt]
+    + help
     + " New jobs load defaults from the workflow files; browser edits are not remembered.";
 }
 
@@ -588,7 +616,7 @@ async function currentPromptDefaults() {
   const next = await request(jobPath("/state"));
   if (job !== currentJob) return null;
   state.workflow = next.workflow;
-  return state.workflow.settings.prompts;
+  return workflowPrompts();
 }
 
 async function openPromptEditor() {
@@ -625,7 +653,7 @@ function savePrompts() {
   promptValues = Object.fromEntries(
     Object.entries(promptDrafts).map(([name, prompt]) => [name, prompt.trim()])
   );
-  const defaults = state.workflow?.settings?.prompts || {};
+  const defaults = workflowPrompts();
   // Send only deliberate edits. Unedited roles are resolved on the server at launch.
   for (const [name, prompt] of Object.entries(promptValues)) {
     if (prompt === (promptOriginals[name] || "").trim()) continue;
@@ -1983,6 +2011,7 @@ function render(next) {
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
+    ui.authorWorkflow.value = state.authorWorkflow || "author_critic";
     ui.fileManagement.checked = Boolean(state.fileManagement);
     syncPrompts(state);
     updateModelSummary();
@@ -1996,6 +2025,7 @@ function render(next) {
     setProblemMode(state.problemMode || "statement");
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
+    ui.authorWorkflow.value = state.authorWorkflow || "author_critic";
     ui.fileManagement.checked = state.fileManagement !== false;
     ui.reviewModel.value = state.reviewModel || "gpt-6-astra";
     ui.authorModel.value = state.authorModel || "gpt-6-astra";
@@ -2156,6 +2186,7 @@ async function startReview(statement, feedback = "") {
       criticEffort: ui.criticEffort.value,
       writerEffort: ui.writerEffort.value,
       promptOverrides,
+      authorWorkflow: selectedAuthorWorkflow(),
       fileManagement: managesResearchFiles(),
       criticRounds: Number(ui.criticRounds.value),
       thinkingHours: Number(ui.thinkingHours.value),
@@ -2288,6 +2319,8 @@ ui.fileManagement.onchange = () => {
     selectPrompt(selectedAuthorPrompt());
   }
 };
+// The prompt editor reloads the selected workflow's defaults when it opens.
+ui.authorWorkflow.onchange = ui.fileManagement.onchange;
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }

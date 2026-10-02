@@ -82,6 +82,18 @@
             </label>
             <details class="advanced">
               <summary>Advanced</summary>
+              <div id="authorWorkflowSetting" class="round-setting">
+                <label for="authorWorkflow">Workflow</label>
+                <select id="authorWorkflow" aria-describedby="authorWorkflowHelp">
+                  <option value="author_critic" selected>Standard (author_critic)</option>
+                  <option value="author_critic_cheap">Cost-optimized (author_critic_cheap)</option>
+                </select>
+                <p id="authorWorkflowHelp" class="help">
+                  Cost-optimized runs the simple author without research files,
+                  research audits, or fresh-eyes solvers, followed by a staged
+                  critic. A started job keeps its workflow.
+                </p>
+              </div>
               <div class="model-grid">
                 <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
