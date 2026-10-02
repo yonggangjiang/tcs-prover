@@ -153,6 +153,7 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
 | `-finalPromptFile PATH` | built-in prompt | Load a UTF-8 LaTeX prompt. |
+| `-workflow NAME` | `author_critic` | `author_critic_cheap` (or `cheap`) runs the cost-optimized workflow in simple mode; see [Cost-optimized workflow](#cost-optimized-workflow). Resumed jobs keep their saved workflow. |
 
 Prompt-file paths are resolved from the terminal's current working directory.
 Run `python3 web_ui.py --help` to see every spelling and allowed value.
@@ -174,7 +175,7 @@ to `workflow_runner.py` (or added to the launch options of a job):
 | `quota_pause_percent` | `90` | Pause the run when the provider's usage window (Codex `account/rateLimits` events) reaches this percentage, instead of being cut off mid-compaction; `0` disables. Each decile crossed is logged as a **Usage quota** status. |
 | `web_actions_per_hour` | `12` | Searches and page fetches across all threads per rolling hour; above it the author is told once per hour to stop searching. |
 | `tool_output_tokens` | `6000` | Codex `tool_output_token_limit`: the most one tool call can inject into the conversation. |
-| `subagent_threads` | `3` | Codex `agents.max_concurrent_threads_per_session`: concurrency slots for the author's session, counting the author itself, so `3` allows two subagents at a time (Codex's own default is `4`, i.e. three subagents). Applies to both the managed and the simple author prompt, because the author node enables `multi_agent` in both. Remove `multi_agent` from the author node's `features` in `workflows/author_critic.yaml` to disable subagents entirely. |
+| `subagent_threads` | `3` | Codex `agents.max_concurrent_threads_per_session`. In the Codex 0.153.4 catalog, Astra, Sol (`gpt-5.6-sol`) and Terra use multi-agent V2, which adds the root thread to this number itself (`resolve_multi_agent_v2_config`). Luna and DeepSeek use V1, which counts only subagents. Either way `N` allows `N` subagents at a time: the default `3` allows three, not two. Applies to both the managed and the simple author prompt, because the author node enables `multi_agent` in both. Remove `multi_agent` from the author node's `features` to disable subagents entirely; the runner then also sets `agents.enabled=false`, the only switch that removes V2's collaboration tools. |
 | `subagent_effort` | inherit | Codex `agents.default_subagent_reasoning_effort`; set `high` to run verification and lookup subagents cheaper than the author (the prompt asks the author to request `ultra` only for new mathematics). |
 | `apps_instructions` | `false` | Keep Codex's app instructions out of the author's prompt prefix (they cost a few thousand cached tokens per call and the author never uses apps). |
 | `subagent_call_cap` | `40` | A subagent that has made this many model calls is asked to write its single report and stop. |
@@ -225,6 +226,136 @@ A batch of three solvers at ultra effort takes about 20 to 25 minutes and costs
 roughly 3 to 4 million tokens, about 90 percent of them cached; lower `count`
 or raise `intervalMinutes` to trade coverage for cost.
 
+## Cost-optimized workflow
+
+`workflows/author_critic_cheap.yaml` is a cheaper version of the simple author
+(**Manage research files: Off**). It keeps what decides the mathematics:
+
+- the same model;
+- the same reasoning effort per request as Astra-Ultra;
+- one persistent author thread that keeps its own reasoning between turns;
+- a critic in which three independent full-depth reviewers plus a judge read
+  every candidate the author submits.
+
+It removes the cost multipliers around them. Keep Astra and Ultra selected; the
+workflow handles the rest.
+
+- **Web UI:** Advanced → **Workflow** → **Cost-optimized (author_critic_cheap)**.
+  The job always runs without research files, audits, or fresh-eyes solvers.
+- **Terminal:** `python3 web_ui.py statement.md --workflow cheap` (or
+  `--workflow author_critic_cheap`). Resumed and continued jobs keep their
+  saved workflow.
+- **Generic runner:** run it in a fresh directory, because the author and the
+  controller write `PROOF_STATE.md`, `LEMMAS.md`, `saved-candidate.md`,
+  `critic-panel-audits.json` and the LaTeX files there:
+
+  ```bash
+  REPO=/path/to/tcs-prover
+  mkdir my-run && cd my-run
+  python3 "$REPO/workflow_runner.py" "$REPO/workflows/author_critic_cheap.yaml" "$REPO/workflows/clean_up.yaml" < ../statement.md
+  ```
+
+### Why Ultra is expensive
+
+Codex 0.153.4 sends `ultra` to the API as the model's
+`multi_agent_reasoning_effort`: `xhigh` for `gpt-6-astra`, and `max` for models
+without one. It also switches the multi-agent instruction, for the root and
+every subagent, from "Do not spawn sub-agents unless ... explicitly asked" to
+"Proactive multi-agent delegation is active ... you should do so". Forked
+subagents inherit the parent's history, model and effort, so delegation
+recurses. In the 2026-09-13 run, subagent threads were 70.5% of input and
+messages between agents were 41% of all tokens. The simple author has no
+subagent policy, so it is the most exposed.
+
+`codex debug models` shows the mapping and makes no model call. The workflow
+assumes `gpt-6-astra.multi_agent_reasoning_effort` is `xhigh`, as in the
+catalog fetched on 2026-10-01. If it changes, edit `options.ultra_effort` in
+`workflows/author_critic_cheap.yaml`; it is read at every launch. With
+`workflow_runner.py` you can instead pass the whole mapping, for example
+`--set 'ultra_effort={"gpt-6-astra": "max", "default": "max"}'`.
+
+### What changes and why the mathematics is unaffected
+
+| Change | What it saves | Why capability is kept |
+| --- | --- | --- |
+| `ultra_effort: {gpt-6-astra: xhigh, default: max}` remaps an Ultra selection, for the author, the critic calls and the subagents | Proactive and recursive delegation. | The API receives exactly the effort Codex sends for Ultra on that model. |
+| Delegation only when the author requests it: one subagent at a time, once the missing step is stalled. The subagent starts fresh (`fork_turns` none) from a brief of at most 8 KB that lists what failed and one untried technique family. The author waits for it at most twice, with 30-minute waits, never polls, and never delegates re-verification. `subagent_threads: 1`, `subagent_call_cap: 40` | Spawned threads, inherited contexts, polling calls. | Fresh-eyes attempts stay available for real dead ends, the case where seeded solvers helped in the 2026-09-21 pilot. |
+| Prefix trims in `codex_config`: skills catalog, personality prose, app and plugin tools and plugin recommendations, image tools. The runner merges them into the thread config, because Codex replaces whole config tables there. The plan-tool entry is defensive: that tool is off by default. | Part of the roughly 15K-token prefix that every call re-reads. | None of these is used for proofs. The base instructions, shell, `apply_patch`, web search and goal tools stay. |
+| Silent author and tool discipline: no commentary, one script per batch of computations with minimal printing, and web search only for exact statements or (once per stall) a closing technique, 6 actions per hour | Output tokens, which cost several times input and stay in context until compaction. Also model round trips: every tool call re-sends the whole context. | Reasoning is unchanged. Experiments that change the next step still run, and testable claims are brute-forced before the proof relies on them. |
+| Memory across compaction in two files. `PROOF_STATE.md` (at most 150 lines, with a stall count) is edited in place at a checkpoint at 80K input, before compaction fires at 94-123K of reported input for a 150K limit; later results are recorded as soon as they are proved. `LEMMAS.md` keeps each complete proof of the author's own results, appended once; published results are cited with their hypotheses. No 45-minute time checkpoint. | Re-deriving lost work. Codex's remote compaction keeps user messages and drops the author's own messages, so a checkpoint written as a message was lost. | Results recorded before a compaction, their proofs and failed routes survive it exactly, and the final answer can still contain every proof. |
+| No re-derivation or polishing. When the missing step stops moving (two turns or two checkpoints), the author first steelmans its construction, then switches family. | Repeated turns on a stuck route, without blocking a family on a naive variant (the failure in the 2026-09-20 run). | It follows the managed prompt's "steelman before block" rule. |
+| Staged critic. One full-depth first audit may return a candidate to the author only for a confirmed central bug. Otherwise the controller runs two independent, checkpointed audits with different foci and no subagent tools, then a judge that fixes local bugs and decides. | Every round on a doomed candidate. Model-written subagent briefs that re-typed the proof. Wait and messaging calls. Re-paying finished audits after a crash. | Every candidate the author submits is read by three independent full-depth reviewers plus a judge, as with the subagent critic. |
+| No copied proofs. The judge returns text only for substantive edits, which re-run the two panel audits and the judge, up to `-criticRounds` passes. At that limit the latest rewrite is accepted without another audit, as in the standard workflow. Cosmetic edits are not applied, and placeholder or abridged text is ignored. Repair messages carry bugs and the absolute path of `saved-candidate.md`. | Proof-length output on every pass. Proof-length user messages, which survive every later compaction. | No unaudited cosmetic rewrite can replace a reviewed proof. |
+| Precise bug standard. Routine one-line steps and citation slips are fixed, not rejected. Unjustified load-bearing steps are still bugs. Disproofs are judged as disproofs. Labels are advisory, so the author checks each reported bug before rebuilding. | Spurious rejections, each costing an author turn plus a critic round. | Real gaps are still rejected. |
+| One-hour timeouts on critic requests | Discarded calls: workflow structured nodes were killed after 900 s, losing everything spent. | Long audits can finish. |
+
+The author finishes by calling `update_goal` with status `complete` and giving
+the whole proof as the final message of that turn. The controller takes only
+that message.
+
+### Expected savings
+
+The quota tracks credit weights, not raw tokens. Output (mostly reasoning) was
+about half of the 2026-09-20 bill.
+
+The reviewers replayed that run's trace as a simple-mode author, weighting
+uncached input 1, cached input 0.1 and output 5 to 8:
+
+- **Author:** 13-17% cheaper. This assumes the baseline delegates as little as
+  the managed 2026-09-20 author did. If the simple author delegates like the
+  2026-09-13 run, the saving is far larger, up to about half.
+- **Critic:** 55% cheaper for a clean round, 89% for a round that the first
+  audit rejects, and 14% for a substantive fix that re-runs the panel.
+- **State files:** `PROOF_STATE.md` and `LEMMAS.md` add about 2-4%.
+- **Whole run:** about 25% for 8 hours with one rejected round and one clean
+  round, before counting the delegation that Ultra would have added.
+
+The compaction ceiling stays at 150K. Lowering it saves raw cached tokens but
+almost no credit once the extra summaries are counted.
+
+### Workflow options
+
+Any workflow can set runner defaults in a top-level `options:` block. The
+allowed names are `compaction_tokens`, `checkpoint_tokens`, `turn_minutes_cap`,
+`continuation_steer`, `token_budget`, `output_token_budget`,
+`quota_pause_percent`, `tool_output_tokens`, `subagent_threads`,
+`subagent_effort`, `subagent_call_cap`, `web_actions_per_hour`,
+`apps_instructions`, `ultra_effort` (an effort, or a mapping from model or
+`default` to an effort below ultra), and `codex_config`.
+
+`codex_config` is a mapping of Codex config overrides. It reaches the author's
+app-server and thread config and the workflow's structured calls. It is
+rejected if it sets a key the runner manages: model and provider settings,
+reasoning effort and summary, compaction and tool-output limits, web search,
+service tier, sandbox, approvals, `agents`, or the features and tools the
+runner toggles. The defaults apply to that file only, and CLI flags and `--set`
+always win.
+
+### Runner fixes that also apply to the standard workflow
+
+- Structured calls without the `multi_agent` feature (the LaTeX writer, compile
+  repair, statement review), and goal nodes without it, now get
+  `agents.enabled=false`. For multi-agent V2 models, `--disable multi_agent`
+  alone left the collaboration tools in place, and under Ultra the proactive
+  delegation instruction too.
+- The old `tools.view_image=false` override is now `features.view_image=false`,
+  the key Codex actually reads.
+
+### Before a long run
+
+Compare a short pilot with the simple author on the same statement:
+
+- **Baseline:** in the Web UI, choose Standard with **Manage research files**
+  Off. Or run `workflow_runner.py` with `$REPO/workflows/author_critic.yaml
+  $REPO/workflows/clean_up.yaml --set file_management=false`. Do not use the
+  terminal command `web_ui.py statement.md` as the baseline: it runs the managed
+  author with fresh-eyes solvers.
+- **What to compare:** quota points per hour from the **Usage quota** status
+  lines, and per-thread totals from `token-usage.json`.
+- **Inspecting the prefix:** `codex debug prompt-input -m gpt-6-astra` with the
+  same `-c` overrides prints the context messages the author starts with. It
+  does not list tools or base instructions.
+
 ## How to use checkpoints
 
 TCS Prover writes durable artifacts while a job progresses. When the Web UI is
@@ -239,7 +370,8 @@ You do not need to keep the old browser tab open.
 A saved proof candidate contains the checked statement and latest complete
 argument. Continuing it starts a fresh root critic request from that candidate.
 Within the request, the critic uses its own fresh independent subagents to
-find bugs and then repairs the argument itself.
+find bugs and then repairs the argument itself. Cost-optimized jobs instead run
+a first audit, two independent audits and a judge, without subagents.
 
 To continue from the Web UI:
 
@@ -590,14 +722,16 @@ repeated model repair calls.
 The root has two Python entry points. `workflow_runner.py` provides the graph
 engine and model/goal transport. The author research records remain plain
 Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches the UI or Markdown proof jobs. The
-`workflows/` directory contains exactly two YAML definitions:
+`workflows/` directory contains these YAML definitions:
 
 ```text
 workflow_runner.py          Graph engine, model transport, and workflow CLI
 web_ui.py                   UI and Markdown-job launcher
 workflows/
   author_critic.yaml         Author/critic prompts, response schema, and logic
+  author_critic_cheap.yaml   Cost-optimized simple author and staged critic
   clean_up.yaml              LaTeX prompts, response schema, and logic
+  research_audit.yaml        Scheduled research audits and fresh-eyes solvers
 transcript/
   view_transcript.py         Transcript reader, CLI, and viewer server
   transcript_ui/            Transcript viewer HTML, JavaScript, and CSS
