@@ -60,8 +60,9 @@ _USAGE_KEYS = ("totalTokens", "inputTokens", "cachedInputTokens", "outputTokens"
 # Codex caps: bytes one tool call may inject, subagent concurrency, and the
 # provider usage window at which the run pauses itself instead of being cut off.
 DEFAULT_TOOL_OUTPUT_TOKENS = 6000
-# Codex concurrency slots for the author's session, counting the author itself:
-# 3 slots = the author plus at most two subagents at a time (Codex's own default is 4).
+# Codex agents.max_concurrent_threads_per_session for the author's session.
+# Multi-agent V2 models (gpt-6-astra) add the root to it themselves, so N allows
+# N subagents at a time (Codex 0.153.4 resolve_multi_agent_v2_config).
 DEFAULT_SUBAGENT_THREADS = 3
 DEFAULT_WEB_ACTIONS_PER_HOUR = 12
 DEFAULT_QUOTA_PAUSE_PERCENT = 90
@@ -596,8 +597,13 @@ def structured_tool_arguments(stage, features=()):
     return [
         "-c", 'web_search="live"',
         "-c", "tools.web_search=true",
-        "-c", "tools.view_image=false",
+        # view_image is a feature flag; Codex ignores the old tools.view_image key.
+        "-c", "features.view_image=false",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
+        # Models whose catalog selects multi-agent V2 (gpt-6-astra) keep the
+        # collaboration tools, and under ultra the proactive-delegation hint,
+        # even with multi_agent disabled; only agents.enabled=false removes them.
+        *([] if "multi_agent" in features else ["-c", "agents.enabled=false"]),
     ]
 
 
@@ -626,7 +632,7 @@ def structured_retry_prompt(prompt, raw, schema_value):
 
 def run_structured_attempt(
     prompt, schema_value, stage, model, effort, speed, summary,
-    timeout=None, activity_label=None, features=(),
+    timeout=None, activity_label=None, features=(), config_overrides=(),
 ):
     """Run one structured Codex process and return its last-message text."""
 
@@ -639,7 +645,8 @@ def run_structured_attempt(
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         schema_arguments = output_schema_arguments(model, schema)
         command = [
-            codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            # A workflow's config overrides come first, so the runner's own flags win.
+            codex(), *config_overrides, "-m", model, "-c", f'model_reasoning_effort="{effort}"',
             *provider_arguments(model),
             *speed_arguments(speed, model), *context_cache_arguments(),
             "-c", f'model_reasoning_summary="{summary}"',
@@ -949,7 +956,7 @@ def structured(
     prompt, schema_value, stage, model=MODEL, effort=EFFORT,
     speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
     timeout=None, attempts=STRUCTURED_MAX_ATTEMPTS,
-    request_label=None, activity_label=None, features=(),
+    request_label=None, activity_label=None, features=(), config_overrides=(),
 ):
     """Run one read-only structured Codex call and relay its visible events."""
 
@@ -989,6 +996,7 @@ def structured(
                 attempt_prompt, schema_value, stage, model, attempt_effort,
                 speed, summary, timeout=timeout,
                 activity_label=activity_label or request_label, features=features,
+                **({"config_overrides": config_overrides} if config_overrides else {}),
             )
         except StructuredAttemptTimeout as exc:
             emit(
@@ -1162,6 +1170,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     tool_output_tokens = _positive_int(options.get("tool_output_tokens", DEFAULT_TOOL_OUTPUT_TOKENS))
     subagent_threads = _positive_int(options.get("subagent_threads", DEFAULT_SUBAGENT_THREADS))
     subagent_effort = str(options.get("subagent_effort") or "")
+    if subagent_effort == "ultra" and hasattr(runtime, "_ultra_remapped"):
+        # An ultra subagent would get the proactive-delegation instruction back.
+        subagent_effort = runtime._ultra_remapped(model, subagent_effort, options)
     web_actions_per_hour = _positive_int(options.get("web_actions_per_hour", DEFAULT_WEB_ACTIONS_PER_HOUR))
     quota_pause_percent = _positive_int(options.get("quota_pause_percent", DEFAULT_QUOTA_PAUSE_PERCENT))
     web_actions = deque()
@@ -1406,7 +1417,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if options.get("goal_require_resume") and not options.get("goal_thread_id"):
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation.")
         process = subprocess.Popen([
-            runtime.codex(), "app-server", "--enable", "goals",
+            runtime.codex(), "app-server",
+            # A workflow's config overrides (e.g. prefix trims) come first, so the
+            # runner's own flags win; the thread config below carries them too.
+            *(runtime.codex_config_arguments(options["codex_config"])
+              if options.get("codex_config") and hasattr(runtime, "codex_config_arguments") else []),
+            "--enable", "goals",
             "-c", 'web_search="live"', "-c", "tools.web_search=true",
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
@@ -1436,9 +1452,20 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 **({"agents": {**({"max_concurrent_threads_per_session": subagent_threads} if subagent_threads else {}),
                                **({"default_subagent_reasoning_effort": subagent_effort} if subagent_effort else {})}}
                    if "multi_agent" in features and (subagent_threads or subagent_effort) else {}),
+                # Without multi_agent the author must not delegate; multi-agent V2
+                # models keep the collaboration tools unless agents are disabled.
+                **({} if "multi_agent" in features else {"agents": {"enabled": False}}),
                 "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
+                             # A user-level multi_agent_v2 = true would otherwise
+                             # override agents.enabled=false below.
+                             **({} if "multi_agent" in features else {"multi_agent_v2": False}),
                              **{feature: True for feature in features}}},
         }
+        if options.get("codex_config") and hasattr(runtime, "merged_codex_config"):
+            # Codex applies this config after the process -c overrides and replaces
+            # whole tables (features, tools), so carry the workflow's overrides in
+            # it; the runner's own keys still win.
+            thread_options["config"] = runtime.merged_codex_config(options["codex_config"], thread_options["config"])
         if hasattr(runtime, "model_provider"):
             thread_options["modelProvider"] = runtime.model_provider(model)
         resumed = False
@@ -2088,6 +2115,144 @@ def _check_parallel(config, prompts):
             check_expression(expression)
 
 
+# Runner options a workflow may default in its top-level `options` block. The
+# defaults apply to that workflow file only; CLI flags and --set always win.
+WORKFLOW_OPTIONS = {
+    "compaction_tokens": "count", "checkpoint_tokens": "count", "turn_minutes_cap": "count",
+    "token_budget": "count", "output_token_budget": "count", "quota_pause_percent": "count",
+    "tool_output_tokens": "count", "subagent_threads": "count", "subagent_call_cap": "count",
+    "web_actions_per_hour": "count", "continuation_steer": "flag", "apps_instructions": "flag",
+    "subagent_effort": "effort", "ultra_effort": "effort", "codex_config": "config",
+}
+
+
+# Settings the runner itself chooses per node; a workflow's codex_config cannot override them.
+_RUNNER_CODEX_KEYS = {
+    "model", "model_provider", "model_providers", "model_reasoning_effort", "model_reasoning_summary",
+    "model_auto_compact_token_limit", "tool_output_token_limit", "include_apps_instructions",
+    "web_search", "service_tier", "sandbox_mode", "approval_policy", "agents",
+}
+_RUNNER_CODEX_NESTED_KEYS = {
+    "features": {"goals", "multi_agent", "multi_agent_v2", "fast_mode", "shell_tool"},
+    "tools": {"web_search"},
+}
+_CODEX_KEY = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+def _check_codex_scalar(item, path):
+    if isinstance(item, bool) or isinstance(item, str) or (isinstance(item, float) and math.isfinite(item)):
+        return
+    if type(item) is int and -2**63 <= item < 2**63:
+        return
+    raise ValueError(f"Workflow option {path} must be a string, boolean, or finite number.")
+
+
+def _check_codex_config(value, path="codex_config"):
+    if not isinstance(value, dict) or not all(isinstance(key, str) and _CODEX_KEY.match(key) for key in value):
+        raise ValueError(f"Workflow option {path} must map plain key names (letters, digits, _ and -) to values.")
+    if path == "codex_config":
+        managed = set(value) & _RUNNER_CODEX_KEYS
+        managed |= {f"{table}.{key}" for table, keys in _RUNNER_CODEX_NESTED_KEYS.items()
+                    if isinstance(value.get(table), dict) for key in set(value[table]) & keys}
+        if managed:
+            raise ValueError(f"Workflow option codex_config cannot set runner-managed keys: {', '.join(sorted(managed))}.")
+    for key, item in value.items():
+        if isinstance(item, dict):
+            _check_codex_config(item, f"{path}.{key}")
+        elif isinstance(item, list):
+            for entry in item:
+                _check_codex_scalar(entry, f"{path}.{key}")
+        else:
+            _check_codex_scalar(item, f"{path}.{key}")
+
+
+def _check_ultra_effort(value):
+    """An effort below ultra, or a mapping from model (or "default") to one."""
+
+    choices = value if isinstance(value, dict) else {"default": value}
+    if not choices or not all(isinstance(model, str) and (model == "default" or model in MODELS) for model in choices):
+        raise ValueError("Workflow option ultra_effort must be an effort or map known models (or default) to efforts.")
+    if not all(effort in EFFORTS and effort != "ultra" for effort in choices.values()):
+        raise ValueError("Workflow option ultra_effort must name reasoning efforts below ultra.")
+
+
+def _ultra_remapped(model, effort, options):
+    """Replace an ultra selection by the workflow's per-model equivalent, if it set one."""
+
+    remap = options.get("ultra_effort")
+    if effort != "ultra" or not remap:
+        return effort
+    target = remap.get(model, remap.get("default")) if isinstance(remap, dict) else remap
+    return chosen_effort(target) if target else effort
+
+
+def _check_workflow_options(options):
+    """Validate a workflow's option defaults against the runner options they set."""
+
+    if not isinstance(options, dict):
+        raise ValueError("Workflow options must be a mapping.")
+    for name, value in options.items():
+        kind = WORKFLOW_OPTIONS.get(name)
+        if kind is None:
+            raise ValueError(f"Unknown workflow option {name!r}.")
+        if kind == "count" and (type(value) is not int or value < 0):
+            raise ValueError(f"Workflow option {name} must be a nonnegative integer.")
+        if kind == "flag" and not isinstance(value, bool):
+            raise ValueError(f"Workflow option {name} must be true or false.")
+        if kind == "effort" and name == "ultra_effort":
+            _check_ultra_effort(value)
+        elif kind == "effort" and value not in EFFORTS:
+            raise ValueError(f"Workflow option {name} must be a reasoning effort.")
+        if kind == "config":
+            _check_codex_config(value)
+    return dict(options)
+
+
+def _check_merged_options(options):
+    """Validate the new structured options again after CLI --set values were merged in."""
+
+    if options.get("codex_config") is not None:
+        _check_codex_config(options["codex_config"])
+    if options.get("ultra_effort") is not None:
+        _check_ultra_effort(options["ultra_effort"])
+    return options
+
+
+def merged_codex_config(base, overlay):
+    """Deep-merge two config mappings; `overlay` wins on conflicting leaves."""
+
+    merged = dict(base)
+    for key, value in overlay.items():
+        merged[key] = (merged_codex_config(merged[key], value)
+                       if isinstance(value, dict) and isinstance(merged.get(key), dict) else value)
+    return merged
+
+
+def codex_config_arguments(config, prefix=""):
+    """Flatten a nested mapping into Codex `-c key=value` overrides with TOML values."""
+
+    arguments = []
+    for key, value in (config or {}).items():
+        name = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            arguments += codex_config_arguments(value, name)
+        else:
+            arguments += ["-c", f"{name}={_toml_value(value)}"]
+    return arguments
+
+
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    # JSON string escapes are valid TOML basic-string escapes; keep other
+    # Unicode literal (TOML rejects surrogate-pair escapes) and escape DEL.
+    return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
 def _expand_node(node):
     """Desugar authoring shortcuts; execution uses the original node format."""
 
@@ -2121,8 +2286,9 @@ def load_workflow(path):
         workflow = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ValueError(f"Cannot read workflow {path}: {exc}") from exc
-    if not isinstance(workflow, dict) or set(workflow) != {"prompts", "nodes"}:
-        raise ValueError("A workflow must contain only prompts and nodes.")
+    if not isinstance(workflow, dict) or not {"prompts", "nodes"} <= set(workflow) <= {"prompts", "nodes", "options"}:
+        raise ValueError("A workflow must contain only prompts and nodes, plus optional options.")
+    workflow["options"] = _check_workflow_options(workflow.get("options", {}))
     prompts, nodes = workflow["prompts"], workflow["nodes"]
     if not isinstance(prompts, dict) or not all(
         isinstance(name, str) and isinstance(value, str) and value.strip()
@@ -2294,9 +2460,13 @@ def __getattr__(name):
 
 def _settings(node, options):
     role = node.get("role", "")
+    model = chosen_model(options.get(f"{role}_model") or node.get("model") or options.get("model", MODEL))
+    effort = chosen_effort(options.get(f"{role}_effort") or node.get("effort") or options.get("effort", EFFORT))
     return {
-        "model": chosen_model(options.get(f"{role}_model") or node.get("model") or options.get("model", MODEL)),
-        "effort": chosen_effort(options.get(f"{role}_effort") or node.get("effort") or options.get("effort", EFFORT)),
+        "model": model,
+        # Codex sends ultra as the model's multi-agent effort plus a proactive
+        # delegation instruction; a workflow can keep that depth without it.
+        "effort": _ultra_remapped(model, effort, options),
         "speed": chosen_speed(options.get("speed", DEFAULT_SPEED)),
         "summary": chosen_reasoning_summary(options.get("summary", DEFAULT_REASONING_SUMMARY)),
     }
@@ -2369,9 +2539,11 @@ def _structured_options(node, options):
     settings = _settings(node, options)
     provider = model_provider(settings["model"])
     settings.update(node.get("provider_options", {}).get(provider, {}))
-    settings["effort"] = effective_effort(settings["model"], settings["effort"])
+    settings["effort"] = effective_effort(settings["model"], _ultra_remapped(settings["model"], settings["effort"], options))
     if "attempts" in node:
         settings["attempts"] = node["attempts"]
+    if options.get("codex_config"):
+        settings["config_overrides"] = codex_config_arguments(options["codex_config"])
     return settings
 
 
@@ -2568,7 +2740,9 @@ def _execute(workflow, state, options, prompts):
                 state[config["result"]] = result
                 raw = result["output"]
             else:
-                context = {"state": state, "visit": visits}
+                # run_directory is where `write` actions put their files; the author
+                # may work elsewhere (goal_cwd), so prompts can name absolute paths.
+                context = {"state": state, "visit": visits, "run_directory": str(Path.cwd())}
                 revision = revisions.get(current, 0)
                 if current not in sessions:
                     task = text(evaluate(node["task"], context))
@@ -2638,7 +2812,8 @@ def execute(path, state=None, *, options=None):
     """Execute any graph in the documented format; no node-name dispatch."""
 
     workflow = load_workflow(path)
-    options = {} if options is None else options
+    # The workflow's own option defaults sit below anything the caller passed.
+    options = _check_merged_options({**workflow["options"], **({} if options is None else options)})
     return _execute(workflow, {} if state is None else state, options, prepare(workflow, options))
 
 
@@ -2650,7 +2825,9 @@ def execute_workflows(paths, state, options=None):
     prepared = []
     for index, path in enumerate(paths):
         workflow = load_workflow(path)
-        local_options = dict(options)
+        # Option defaults declared by this workflow file apply to it alone;
+        # CLI flags and --set always win.
+        local_options = _check_merged_options({**workflow["options"], **options})
         if index:
             local_options.pop("start_node", None)
         elif "start_node" in local_options and local_options["start_node"] not in workflow["nodes"]:
