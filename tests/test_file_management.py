@@ -31,8 +31,9 @@ class FileManagementTests(unittest.TestCase):
         self.assertFalse(server.empty_state()["fileManagement"])
         overrides = {"author": "Managed [STATEMENT]", "author_simple": "Simple [STATEMENT]"}
         for managed, expected in ((False, "Simple"), (True, "Managed")):
+            # The managed author exists only in author_critic; new jobs default to the cheap graph.
             app = self.manager.start_direct_job({
-                "statement": "Exact statement", "fileManagement": managed,
+                "statement": "Exact statement", "authorWorkflow": "author_critic", "fileManagement": managed,
                 "promptOverrides": overrides,
                 "researchAudits": {"models": ["gpt-6-astra", "none", "none"], "intervalHours": 1},
             })
@@ -48,7 +49,8 @@ class FileManagementTests(unittest.TestCase):
     def test_invalid_mode_is_rejected_before_creating_a_run(self):
         for invalid in ("false", 0, None):
             with self.assertRaisesRegex(ValueError, "File management"):
-                self.manager.start_direct_job({"statement": "Task", "fileManagement": invalid})
+                self.manager.start_direct_job({"statement": "Task", "authorWorkflow": "author_critic",
+                                               "fileManagement": invalid})
         self.assertEqual(list(self.runs.iterdir()), [])
 
     def test_simple_lifecycle_never_requests_managed_records(self):
@@ -70,7 +72,7 @@ class FileManagementTests(unittest.TestCase):
         self.assertEqual(prompts["resume"], workflow["prompts"]["resume_simple"])
 
     def test_fresh_simple_run_and_saved_continuation_use_simple_lifecycle(self):
-        app = self.manager.start_direct_job({"statement": "Exact statement"})
+        app = self.manager.start_direct_job({"statement": "Exact statement", "authorWorkflow": "author_critic"})
         app.trace_file.write_text("")
         self.assertEqual(app.state["authorPrompt"], server.default_prompts()["author_simple"])
         saved = server.saved_research_source(app.run_dir)
@@ -88,7 +90,7 @@ class FileManagementTests(unittest.TestCase):
         self.assertTrue(restored.state["fileManagement"])
 
     def test_simple_recovery_without_saved_prompt_uses_simple_default(self):
-        source = self.manager.start_direct_job({"statement": "Exact statement"})
+        source = self.manager.start_direct_job({"statement": "Exact statement", "authorWorkflow": "author_critic"})
         (source.run_dir / "prompts/author.txt").unlink()
         (source.run_dir / runtime.SAVED_CANDIDATE_FILENAME).write_text("Candidate")
         self.assertEqual(server.saved_critic_source(source.run_dir)["author_prompt"],

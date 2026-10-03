@@ -38,8 +38,8 @@
           <div class="intro">
             <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
             <h1>What should we solve?</h1>
-            <p id="introDescription">Start with a rough TCS problem. The agent will clarify it,
-              ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
+            <p id="introDescription">Enter the exact statement to send directly to the proof
+              author, followed by independent proof verification and LaTeX editing.</p>
           </div>
           <div class="composer">
             <fieldset class="problem-mode">
@@ -49,7 +49,14 @@
                   <input type="radio" name="problemMode" value="statement" checked>
                   <span>
                     <strong>Statement</strong>
-                    <small>Review and approve a rough problem statement</small>
+                    <small>Prove a statement, or a folder of statements</small>
+                  </span>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="problemMode" value="critic">
+                  <span>
+                    <strong>Critic only</strong>
+                    <small>Check a complete proof without the author</small>
                   </span>
                 </label>
                 <label class="mode-option">
@@ -65,6 +72,16 @@
               <label for="problem">Problem statement</label>
               <textarea id="problem" rows="12" required
                 placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
+            </div>
+            <div id="criticFields" hidden>
+              <label for="proofInput">Complete proof</label>
+              <textarea id="proofInput" rows="16" aria-describedby="proofHelp"
+                placeholder="Paste the complete proof of the statement above…"></textarea>
+              <p id="proofHelp" class="help">
+                Only the independent critic runs: it checks this proof and fixes what
+                it can. A pass continues to the LaTeX editor; a rejection ends the job
+                with the critic's report.
+              </p>
             </div>
             <div id="latexFields" hidden>
               <div>
@@ -85,13 +102,15 @@
               <div id="authorWorkflowSetting" class="round-setting">
                 <label for="authorWorkflow">Workflow</label>
                 <select id="authorWorkflow" aria-describedby="authorWorkflowHelp">
-                  <option value="author_critic" selected>Standard (author_critic)</option>
-                  <option value="author_critic_cheap">Cost-optimized (author_critic_cheap)</option>
+                  <option value="author_critic_cheap" selected>Cost-optimized (author_critic_cheap) — default</option>
+                  <option value="author_critic">Standard (author_critic)</option>
                 </select>
                 <p id="authorWorkflowHelp" class="help">
-                  Cost-optimized runs the simple author without research files,
-                  research audits, or fresh-eyes solvers, followed by a staged
-                  critic. A started job keeps its workflow.
+                  Cost-optimized, the default, runs the simple author without research
+                  files, research audits, or fresh-eyes solvers, followed by one critic
+                  call per round that fixes what it can, without subagents. Standard
+                  adds the managed author and a critic with independent subagents. A
+                  started job keeps its workflow.
                 </p>
               </div>
               <div class="model-grid">
@@ -186,12 +205,22 @@
                 <button id="editPromptsButton" class="secondary compact"
                   type="button">Edit prompts</button>
               </div>
+              <label id="latexWriterSetting" class="advanced-toggle" for="latexWriter">
+                <input id="latexWriter" type="checkbox">
+                <span>
+                  <strong>Run the LaTeX writer</strong>
+                  <small>Off by default: the job ends with the critic-approved proof
+                    (final-proof.md). Turn on to also typeset it and compile a PDF.</small>
+                </span>
+              </label>
               <label id="skipReviewSetting" class="advanced-toggle"
                 for="skipStatementReview">
-                <input id="skipStatementReview" type="checkbox">
+                <input id="skipStatementReview" type="checkbox" checked>
                 <span>
                   <strong>Skip statement review</strong>
-                  <small>Send the statement directly to the proof author.</small>
+                  <small>On by default: send the statement directly to the proof
+                    author. Turn off to have the statement checked and approved
+                    first.</small>
                 </span>
               </label>
               <label id="reviewOnlySetting" class="advanced-toggle"
@@ -234,7 +263,7 @@
                   Default 2 rounds. Each critic call uses fresh independent
                   subagents and fixes issues. An unchanged PASS proceeds immediately;
                   an edited PASS repeats until the limit, then proceeds.
-                  Unfixable issues return to the author and reset the count.
+                  <span id="roundRejectHelp">Unfixable issues return to the author and reset the count.</span>
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
@@ -263,9 +292,20 @@
               </details>
             </details>
             <div class="composer-actions">
-              <span id="modelSummary">Astra/Ultra review · Astra/Ultra author, critic, writer</span>
-              <button id="checkButton">Check statement</button>
+              <span id="modelSummary">Cost-optimized workflow · Astra/Ultra author, critic</span>
+              <div class="composer-buttons">
+                <button id="runFolderButton" class="secondary" type="button"
+                  aria-describedby="runFolderHelp">Run a folder…</button>
+                <button id="checkButton">Start proof author</button>
+              </div>
             </div>
+            <p id="runFolderHelp" class="help folder-help">
+              Run a folder starts one parallel proof job for each Markdown file directly
+              inside the folder you choose, with the settings above. Each job skips
+              statement review.
+            </p>
+            <input id="folderInput" type="file" webkitdirectory multiple hidden
+              aria-label="Folder of Markdown statements">
           </div>
           <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
             <div class="jobs-heading">
@@ -275,6 +315,7 @@
               </div>
               <span id="jobsCount"></span>
             </div>
+            <p id="batchStatus" class="batch-status" role="status" hidden></p>
             <ol id="jobsList" class="jobs-list"></ol>
           </section>
         </section>

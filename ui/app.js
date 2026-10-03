@@ -16,6 +16,7 @@ const ui = {
   notice: $("notice"), problem: $("problem"), proposed: $("proposed"),
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
+  criticFields: $("criticFields"), proofInput: $("proofInput"),
   latexFields: $("latexFields"), latexInput: $("latexInput"),
   feedback: $("feedback"), notes: $("notes"), editHint: $("editHint"),
   reviewModel: $("reviewModel"), authorModel: $("authorModel"),
@@ -26,12 +27,13 @@ const ui = {
   writerModelSetting: $("writerModelSetting"),
   reviewEffort: $("reviewEffort"), authorEffort: $("authorEffort"),
   criticEffort: $("criticEffort"), writerEffort: $("writerEffort"),
-  criticRounds: $("criticRounds"),
+  criticRounds: $("criticRounds"), roundRejectHelp: $("roundRejectHelp"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
   skipReviewSetting: $("skipReviewSetting"),
   skipStatementReview: $("skipStatementReview"),
+  latexWriter: $("latexWriter"), latexWriterSetting: $("latexWriterSetting"),
   reviewOnlySetting: $("reviewOnlySetting"),
   statementReviewOnly: $("statementReviewOnly"),
   fileManagement: $("fileManagement"), fileManagementSetting: $("fileManagementSetting"),
@@ -51,6 +53,8 @@ const ui = {
   finalPromptTab: $("finalPromptTab"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
+  batchStatus: $("batchStatus"),
+  runFolder: $("runFolderButton"), runFolderHelp: $("runFolderHelp"), folderInput: $("folderInput"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   stop: $("stopButton"),
   pause: $("pauseButton"), resume: $("resumeButton"), downloadTex: $("downloadTexButton"),
@@ -99,8 +103,9 @@ const ui = {
 };
 ui.problemModes = document.querySelectorAll('input[name="problemMode"]');
 
+// New jobs send the statement straight to the author unless review is turned on.
 let state = {
-  phase: "input", problemMode: "statement", skipStatementReview: false,
+  phase: "input", problemMode: "statement", skipStatementReview: true,
   statementReviewOnly: false,
   trace: [], traceVersion: 0,
   workflow: { nodes: {}, edges: [] },
@@ -181,7 +186,7 @@ function jobUrl(runId, token = false) {
 function clearJobView() {
   previousPhase = "";
   state = {
-    phase: "input", problemMode: "statement", skipStatementReview: false,
+    phase: "input", problemMode: "statement", skipStatementReview: true,
     statementReviewOnly: false,
     trace: [], traceVersion: 0,
     workflow: { nodes: {}, edges: [] },
@@ -328,6 +333,17 @@ function renderJobs(jobs) {
     times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
       : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
+    // Tell critic-only jobs and the jobs of one folder batch apart.
+    const tagText = [
+      job.criticOnly ? "Critic only" : "",
+      job.sourceFile ? `From ${job.sourceFile}` : "",
+    ].filter(Boolean).join(" · ");
+    if (tagText) {
+      const tags = document.createElement("small");
+      tags.className = "job-tags";
+      tags.textContent = tagText;
+      copy.append(tags);
+    }
     const checkpoints = job.checkpoints || [];
     if (checkpoints.length) {
       const checkpointHeading = document.createElement("span");
@@ -430,35 +446,50 @@ function selectedAuthorPrompt() {
 
 function setProblemMode(mode) {
   const latexOnly = mode === "latex";
-  const statement = !latexOnly;
-  mode = latexOnly ? "latex" : "statement";
+  // Critic only: a supplied statement and proof; no statement review and no author.
+  const criticOnly = mode === "critic";
+  const statement = !latexOnly && !criticOnly;
+  mode = latexOnly ? "latex" : criticOnly ? "critic" : "statement";
   const reviewOnly = statement && ui.statementReviewOnly.checked;
   if (reviewOnly) ui.skipStatementReview.checked = false;
   const skipReview = statement && !reviewOnly
     && ui.skipStatementReview.checked;
+  const author = statement && !reviewOnly;
+  const critic = author || criticOnly;
+  // The LaTeX writer runs in LaTeX polish mode, or after the critic only when turned on.
+  const writer = latexOnly || (critic && Boolean(ui.latexWriter?.checked));
   for (const input of ui.problemModes) input.checked = input.value === mode;
-  show(ui.statementFields, statement);
+  show(ui.statementFields, !latexOnly);
+  show(ui.criticFields, criticOnly);
   show(ui.latexFields, latexOnly);
   show(ui.reviewModelSetting, statement && !skipReview);
-  show(ui.authorModelSetting, !latexOnly && !reviewOnly);
-  show(ui.criticModelSetting, !latexOnly && !reviewOnly);
-  show(ui.writerModelSetting, !reviewOnly);
+  show(ui.authorModelSetting, author);
+  show(ui.criticModelSetting, critic);
+  show(ui.writerModelSetting, writer);
   show(ui.reviewPromptTab, statement && !skipReview);
-  show(ui.authorPromptTab, !latexOnly && !reviewOnly);
-  show(ui.criticPromptTab, !latexOnly && !reviewOnly);
-  show(ui.finalPromptTab, !reviewOnly);
+  show(ui.authorPromptTab, author);
+  show(ui.criticPromptTab, critic);
+  show(ui.finalPromptTab, writer);
   show(ui.skipReviewSetting, statement);
   show(ui.reviewOnlySetting, statement);
-  show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
-  show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
+  show(ui.criticRoundSetting, critic);
+  ui.roundRejectHelp.textContent = criticOnly
+    ? "Unfixable issues end the job with the critic's report."
+    : "Unfixable issues return to the author and reset the count.";
+  show(ui.thinkingHoursSetting, critic);
+  // A folder batch starts one direct proof job per file.
+  show(ui.runFolder, author);
+  show(ui.runFolderHelp, author);
   // Only a new job chooses its workflow; a simple-only workflow locks file management off.
   const simpleOnly = simpleOnlyWorkflows.has(selectedAuthorWorkflow());
   if (simpleOnly) ui.fileManagement.checked = false;
   ui.fileManagement.disabled = simpleOnly;
   ui.authorWorkflow.disabled = Boolean(state.runId);
-  show(ui.authorWorkflowSetting, !latexOnly && !reviewOnly);
-  show(ui.fileManagementSetting, !latexOnly && !reviewOnly);
-  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly && ui.fileManagement.checked);
+  show(ui.authorWorkflowSetting, critic);
+  if (ui.latexWriterSetting) show(ui.latexWriterSetting, critic);
+  if (ui.latexWriter) ui.latexWriter.disabled = Boolean(state.runId);
+  show(ui.fileManagementSetting, author);
+  show(ui.researchAuditsSetting, author && ui.fileManagement.checked);
   ui.fileManagementHelp.textContent = simpleOnly
     ? "Off · The cost-optimized workflow always uses its simple author prompt."
     : ui.fileManagement.checked
@@ -466,13 +497,22 @@ function setProblemMode(mode) {
       : "Off · Focus on proving the statement with a simple author prompt.";
   ui.authorPromptTab.dataset.prompt = selectedAuthorPrompt();
   ui.authorPromptTab.textContent = ui.fileManagement.checked ? "Author · managed" : "Author · simple";
-  ui.problem.required = statement;
+  ui.problem.required = !latexOnly;
+  ui.proofInput.required = criticOnly;
   ui.latexInput.required = latexOnly;
+  ui.problem.placeholder = criticOnly
+    ? "Paste the exact statement that the proof below proves…"
+    : "Paste a theorem, conjecture, lower bound, or algorithmic task…";
   ui.check.textContent = latexOnly ? "Polish LaTeX"
+    : criticOnly ? "Start critic"
     : reviewOnly ? "Review statement only"
     : skipReview ? "Start proof author" : "Check statement";
   ui.introDescription.textContent = latexOnly
     ? "Provide an existing writing. Only the final LaTeX editor will run."
+    : criticOnly
+      ? "Provide a statement and its complete proof. Statement review and the proof "
+        + "author are skipped: the independent critic checks the proof, and a pass "
+        + "continues to LaTeX editing."
     : reviewOnly
       ? "Check and rewrite the statement, save the result and reviewer notes, then "
         + "stop without starting the proof author."
@@ -488,6 +528,9 @@ function setProblemMode(mode) {
   }
   if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
     selectPrompt("final");
+  }
+  if (criticOnly && !["critic", "final"].includes(activePrompt) && ui.promptDialog.open) {
+    selectPrompt("critic");
   }
   updateModelSummary();
 }
@@ -505,9 +548,13 @@ function updateModelSummary() {
   )}`;
   const mode = selectedProblemMode();
   const reviewOnly = mode === "statement" && ui.statementReviewOnly.checked;
+  const writer = ui.latexWriter?.checked
+    ? ` · ${role(ui.writerModel.value, ui.writerEffort.value)} writer` : "";
   let selectedModels = reviewOnly ? [ui.reviewModel.value]
     : mode === "latex" ? [ui.writerModel.value]
-    : [ui.authorModel.value, ui.criticModel.value, ui.writerModel.value];
+    : mode === "critic" ? [ui.criticModel.value]
+    : [ui.authorModel.value, ui.criticModel.value];
+  if (mode !== "latex" && !reviewOnly && ui.latexWriter?.checked) selectedModels.push(ui.writerModel.value);
   if (mode === "statement" && !reviewOnly && !ui.skipStatementReview.checked) {
     selectedModels.push(ui.reviewModel.value);
   }
@@ -535,10 +582,14 @@ function updateModelSummary() {
   }
   const workflow = selectedAuthorWorkflow() === "author_critic_cheap"
     ? "Cost-optimized workflow · " : "";
+  if (mode === "critic") {
+    ui.modelSummary.textContent = `${workflow}${speed} · ${log} · Critic only · `
+      + `${role(ui.criticModel.value, ui.criticEffort.value)} critic${writer}`;
+    return;
+  }
   ui.modelSummary.textContent = `${workflow}${speed} · ${log} · ` + review
     + `${role(ui.authorModel.value, ui.authorEffort.value)} author · `
-    + `${role(ui.criticModel.value, ui.criticEffort.value)} critic · `
-    + `${role(ui.writerModel.value, ui.writerEffort.value)} writer`;
+    + `${role(ui.criticModel.value, ui.criticEffort.value)} critic${writer}`;
 }
 
 const promptLabels = {
@@ -587,9 +638,9 @@ function updatePromptHelp() {
   const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
   ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
     + (isDefault ? "current default" : "this job's prompt");
-  // The cost-optimized critic is a shared review standard for single calls.
+  // The cost-optimized critic is one call that works alone.
   const help = activePrompt === "critic" && simpleOnlyWorkflows.has(selectedAuthorWorkflow())
-    ? "The shared review standard for the first audit, both panel audits, and the judge; each call works alone, without subagents."
+    ? "One critic call receives the statement and latest proof, fixes every bug it can, and rejects only for a critical bug it cannot fix; it works alone, without subagents."
     : promptHelp[activePrompt];
   ui.promptEditorHelp.textContent = (isDefault ? "" :
     "This overrides the default for this job only. ")
@@ -628,6 +679,7 @@ async function openPromptEditor() {
     promptDrafts = { ...promptValues };
     promptOriginals = { ...promptValues };
     activePrompt = selectedProblemMode() === "latex" ? "final"
+      : selectedProblemMode() === "critic" ? "critic"
       : ui.skipStatementReview.checked ? selectedAuthorPrompt() : "review";
     selectPrompt(activePrompt);
     ui.promptDialog.showModal();
@@ -1582,7 +1634,7 @@ function renderWorkflow() {
       critic: "Check the proof, fix issues, or return bugs.",
       latex_compile: "Compile, fix errors, and retry until a PDF is ready.",
     };
-    description.textContent = descriptions[name] || item.description;
+    description.textContent = overrides.description || descriptions[name] || item.description;
     copy.append(title, description);
     const noteText = overrides.note || (paused ? (auditing
       ? state.phase === "pausing" ? "Pausing for audits" : "Paused for audits" : "Paused")
@@ -1623,6 +1675,18 @@ function renderWorkflow() {
     ui.workflowNodes.replaceChildren(makeNode("latex_editor", "1"));
     if (nodes.latex_compile) {
       ui.workflowNodes.append(arrow("Compile and check"), makeNode("latex_compile", "2"));
+    }
+    return;
+  }
+  if (state.criticOnly) {
+    // No statement review and no author: the critic decides, then LaTeX editing.
+    const critic = makeNode("critic", "1", {
+      description: "Check the supplied proof and fix issues. A rejection ends the job with its report.",
+    });
+    const pass = arrow("Unchanged PASS or edited PASS at limit", true);
+    ui.workflowNodes.replaceChildren(critic, pass, makeNode("latex_editor", "2"));
+    if (nodes.latex_compile) {
+      ui.workflowNodes.append(arrow("Compile and check"), makeNode("latex_compile", "3"));
     }
     return;
   }
@@ -1988,7 +2052,7 @@ function render(next) {
     ["reviewing", "running", "stopping", "pausing", "paused", "prepared", "done"].includes(phase)
       && !reviewOnlyResult,
   );
-  show(ui.workflowRail, phase !== "input" && managesResearchFiles());
+  show(ui.workflowRail, phase !== "input" && (managesResearchFiles() || Boolean(state.criticOnly)));
   show(ui.activityToggle, Boolean(currentJob));
   syncMemoryPanel();
   ui.notice.textContent = state.error || "";
@@ -1998,7 +2062,9 @@ function render(next) {
     const rounds = state.workflow?.settings?.critic_rounds || {};
     const hours = state.workflow?.settings?.thinking_hours || {};
     ui.problem.value = state.draft || "";
+    ui.proofInput.value = "";
     ui.latexInput.value = state.latexInput || "";
+    show(ui.batchStatus, false);
     ui.reviewModel.value = state.reviewModel || "gpt-6-astra";
     ui.authorModel.value = state.authorModel || "gpt-6-astra";
     ui.criticModel.value = state.criticModel || "gpt-6-astra";
@@ -2012,6 +2078,7 @@ function render(next) {
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
     ui.authorWorkflow.value = state.authorWorkflow || "author_critic";
+    if (ui.latexWriter) ui.latexWriter.checked = state.latexWriter !== false;
     ui.fileManagement.checked = Boolean(state.fileManagement);
     syncPrompts(state);
     updateModelSummary();
@@ -2178,22 +2245,8 @@ async function startReview(statement, feedback = "") {
   try {
     const next = await request(jobPath(skipReview ? "/direct" : "/review"), {
       statement, feedback, reviewModel: ui.reviewModel.value,
-      authorModel: ui.authorModel.value,
-      criticModel: ui.criticModel.value,
-      writerModel: ui.writerModel.value,
       reviewEffort: ui.reviewEffort.value,
-      authorEffort: ui.authorEffort.value,
-      criticEffort: ui.criticEffort.value,
-      writerEffort: ui.writerEffort.value,
-      promptOverrides,
-      authorWorkflow: selectedAuthorWorkflow(),
-      fileManagement: managesResearchFiles(),
-      criticRounds: Number(ui.criticRounds.value),
-      thinkingHours: Number(ui.thinkingHours.value),
-      researchAudits: managesResearchFiles() ? researchAuditValues()
-        : { intervalHours: 0, models: ["none", "none", "none"] },
-      speedMode: ui.speedMode.value,
-      reasoningSummary: ui.reasoningSummary.value,
+      ...proofJobSettings(),
       statementReviewOnly: reviewOnly,
     });
     if (job !== currentJob) return;
@@ -2205,6 +2258,175 @@ async function startReview(statement, feedback = "") {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   }
+}
+
+// The author, critic, and writer settings that /review, /direct, and each job of a
+// folder batch share.
+function proofJobSettings() {
+  return {
+    authorModel: ui.authorModel.value,
+    criticModel: ui.criticModel.value,
+    writerModel: ui.writerModel.value,
+    authorEffort: ui.authorEffort.value,
+    criticEffort: ui.criticEffort.value,
+    writerEffort: ui.writerEffort.value,
+    promptOverrides,
+    authorWorkflow: selectedAuthorWorkflow(),
+    latexWriter: Boolean(ui.latexWriter?.checked),
+    fileManagement: managesResearchFiles(),
+    criticRounds: Number(ui.criticRounds.value),
+    thinkingHours: Number(ui.thinkingHours.value),
+    researchAudits: managesResearchFiles() ? researchAuditValues()
+      : { intervalHours: 0, models: ["none", "none", "none"] },
+    speedMode: ui.speedMode.value,
+    reasoningSummary: ui.reasoningSummary.value,
+  };
+}
+
+// The /critic request: a supplied statement and proof, reviewed by the critic only.
+function criticOnlyRequest(statement, proof) {
+  return {
+    statement, proof,
+    authorWorkflow: selectedAuthorWorkflow(),
+    latexWriter: Boolean(ui.latexWriter?.checked),
+    criticModel: ui.criticModel.value,
+    criticEffort: ui.criticEffort.value,
+    writerModel: ui.writerModel.value,
+    writerEffort: ui.writerEffort.value,
+    promptOverrides: Object.fromEntries(Object.entries(promptOverrides)
+      .filter(([name]) => ["critic", "final"].includes(name))),
+    criticRounds: Number(ui.criticRounds.value),
+    thinkingHours: Number(ui.thinkingHours.value),
+    speedMode: ui.speedMode.value,
+    reasoningSummary: ui.reasoningSummary.value,
+  };
+}
+
+async function startCriticOnly() {
+  const statement = ui.problem.value;
+  const proof = ui.proofInput.value;
+  const missing = !statement.trim() ? [ui.problem, "Enter a problem statement."]
+    : !proof.trim() ? [ui.proofInput, "Enter the complete proof for the critic to check."] : null;
+  if (missing) {
+    ui.notice.textContent = missing[1];
+    show(ui.notice, true);
+    missing[0].focus();
+    return;
+  }
+  clearTimeout(timer);
+  clearTimeout(jobsTimer);
+  if (!promptValues.critic) syncPrompts();
+  try {
+    const next = await request("/critic", criticOnlyRequest(statement, proof));
+    currentJob = next.runId;
+    history.pushState(null, "", jobUrl(currentJob));
+    render(next);
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+}
+
+// Like the terminal folder mode: only Markdown files directly inside the chosen
+// folder, never its subfolders, in a deterministic order by name.
+function folderMarkdownFiles(files) {
+  const byName = (first, second) => {
+    const a = first.name.toLowerCase(), b = second.name.toLowerCase();
+    if (a !== b) return a < b ? -1 : 1;
+    return first.name < second.name ? -1 : first.name > second.name ? 1 : 0;
+  };
+  return [...(files || [])].filter((file) => {
+    const path = file.webkitRelativePath || "";
+    return path.split("/").length === 2 && /^.+\.md$/i.test(file.name);
+  }).sort(byName);
+}
+
+// The server caps one folder request; check before sending megabytes for nothing.
+const maxFolderRequestBytes = 8 * 1024 * 1024;
+
+// Read each Markdown file; empty files are reported instead of sent.
+async function folderStatements(files) {
+  const statements = [], empty = [];
+  for (const file of folderMarkdownFiles(files)) {
+    if (file.size > maxFolderRequestBytes) throw new Error(`${file.name} is larger than 8 MB.`);
+    const statement = await file.text();
+    if (statement.trim()) statements.push({ name: file.name, statement });
+    else empty.push(file.name);
+  }
+  return { statements, empty };
+}
+
+// One folder batch at a time: a repeated change event must not start its jobs twice.
+let folderBatchBusy = false;
+
+async function startFolderBatch(files) {
+  const chosen = [...(files || [])];
+  if (!chosen.length || folderBatchBusy) return;
+  folderBatchBusy = true;
+  ui.runFolder.disabled = true;
+  try {
+    await sendFolderBatch(chosen);
+  } finally {
+    folderBatchBusy = false;
+    ui.runFolder.disabled = false;
+  }
+}
+
+async function sendFolderBatch(chosen) {
+  const folderName = (chosen[0].webkitRelativePath || "").split("/")[0];
+  const folder = folderName || "the selected folder";
+  show(ui.notice, false);
+  show(ui.batchStatus, false);
+  let found;
+  try {
+    found = await folderStatements(chosen);
+  } catch (error) {
+    ui.notice.textContent = `Could not read the files in ${folder}: ${error.message}`;
+    show(ui.notice, true);
+    return;
+  }
+  const { statements, empty } = found;
+  const skipped = empty.length
+    ? `Skipped ${empty.length} empty file${empty.length === 1 ? "" : "s"}: ${empty.join(", ")}.` : "";
+  if (!statements.length) {
+    ui.notice.textContent = `No Markdown statements were found directly inside ${folder}.`
+      + (skipped ? ` ${skipped}` : "") + " Choose a folder that contains non-empty .md files.";
+    show(ui.notice, true);
+    return;
+  }
+  const count = statements.length;
+  const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
+    + "Each runs the selected workflow and uses its own quota.\n\n"
+    + `Folder: ${folder}\nWorkflow: ${selectedAuthorWorkflow()}\n`
+    + "Each job sends its statement directly to the proof author "
+    + "(statement review is skipped)." + (skipped ? `\n\n${skipped}` : "");
+  if (!confirm(question)) return;
+  // The folder's name labels the summary the server writes for this folder run.
+  const body = { statements, folder: folderName, ...proofJobSettings() };
+  const size = new TextEncoder().encode(JSON.stringify(body)).length;
+  if (size > maxFolderRequestBytes) {
+    ui.notice.textContent = `These statements are too large to send together `
+      + `(${(size / 1048576).toFixed(1)} MB; the limit is 8 MB). Split the folder.`;
+    show(ui.notice, true);
+    return;
+  }
+  clearTimeout(jobsTimer);
+  try {
+    const result = await request("/direct-batch", body);
+    const started = (result.startedJobs || []).length;
+    ui.batchStatus.textContent = `Started ${started} job${started === 1 ? "" : "s"} from ${folder}.`
+      + (result.summaryPath ? `\nSummary of this folder run, rewritten as jobs finish: ${result.summaryPath}` : "")
+      + (skipped ? `\n${skipped}` : "");
+    show(ui.batchStatus, true);
+    if (!currentJob) {
+      renderJobs(result.jobs || []);
+      ui.jobsPanel.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+  if (!currentJob) loadJobs();
 }
 
 async function startLatexOnly() {
@@ -2290,8 +2512,18 @@ ui.homeLink.onclick = (event) => {
   event.preventDefault();
   goHome();
 };
-ui.check.onclick = () => selectedProblemMode() === "latex"
-  ? startLatexOnly() : startReview(ui.problem.value);
+ui.check.onclick = () => {
+  const mode = selectedProblemMode();
+  if (mode === "latex") return startLatexOnly();
+  if (mode === "critic") return startCriticOnly();
+  return startReview(ui.problem.value);
+};
+// A folder batch reads the chosen folder's top-level Markdown files in the browser.
+ui.runFolder.onclick = () => {
+  ui.folderInput.value = "";
+  ui.folderInput.click();
+};
+ui.folderInput.onchange = () => startFolderBatch(ui.folderInput.files);
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
@@ -2309,6 +2541,7 @@ ui.skipStatementReview.onchange = () => {
   if (ui.skipStatementReview.checked) ui.statementReviewOnly.checked = false;
   setProblemMode(selectedProblemMode());
 };
+if (ui.latexWriter) ui.latexWriter.onchange = () => setProblemMode(selectedProblemMode());
 ui.statementReviewOnly.onchange = () => {
   if (ui.statementReviewOnly.checked) ui.skipStatementReview.checked = false;
   setProblemMode(selectedProblemMode());

@@ -590,9 +590,10 @@ label span { color: var(--muted); font-weight: 450; }
 .problem-mode legend { margin-bottom: 8px; font-weight: 650; }
 .mode-options {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
 }
+#criticFields { margin-top: 16px; }
 .mode-option {
   display: flex;
   align-items: flex-start;
@@ -629,7 +630,15 @@ label span { color: var(--muted); font-weight: 450; }
 }
 .jobs-heading h2 { margin: 0; font-size: 1.15rem; }
 .jobs-heading > span { color: var(--muted); font-size: 0.78rem; }
-.jobs-list { display: grid; gap: 9px; margin: 12px 0 0; padding: 0; list-style: none; }
+/* minmax(0, 1fr): a long one-line job title is truncated instead of widening the page. */
+.jobs-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 9px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
 .job-card {
   align-items: flex-start;
   padding: 13px 14px;
@@ -653,6 +662,16 @@ label span { color: var(--muted); font-weight: 450; }
   font-variant-numeric: tabular-nums;
 }
 .job-status { display: block; margin-top: 4px; color: var(--muted); font-size: 0.74rem; }
+.job-tags { display: block; margin-top: 4px; color: var(--muted); font-size: 0.72rem; }
+.batch-status {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border-radius: 9px;
+  color: #23664f;
+  background: var(--accent-soft);
+  font-size: 0.8rem;
+  white-space: pre-line;
+}
 .job-status.running, .job-status.reviewing { color: var(--accent); }
 .job-status.stopping { color: var(--danger); }
 .job-actions { display: flex; flex: 0 0 auto; flex-wrap: wrap; gap: 5px; }
@@ -865,6 +884,14 @@ textarea:focus, input:focus, select:focus {
   color: var(--muted);
   font-size: 0.76rem;
 }
+.composer-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 9px;
+}
+.folder-help { margin-top: 8px; text-align: right; }
 
 /* Buttons use one clear primary action and quiet supporting controls. */
 button {
@@ -1165,6 +1192,9 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   .mode-options { grid-template-columns: 1fr; }
   .model-grid { grid-template-columns: 1fr; }
   .composer-actions, .timeline-head { align-items: stretch; flex-direction: column; }
+  .composer-buttons { flex-direction: column-reverse; }
+  .composer-buttons button { width: 100%; }
+  .folder-help { text-align: left; }
   .filters { justify-content: flex-start; overflow-x: auto; }
   .actions, .run-actions { flex-direction: column-reverse; }
   .actions button, .run-actions button { width: 100%; }

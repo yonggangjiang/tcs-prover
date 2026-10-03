@@ -83,17 +83,19 @@ class PromptDefaultsTests(unittest.TestCase):
     def test_explicit_browser_edit_applies_to_one_job_only(self):
         self.edit_yaml("Current")
         custom = "Deliberate per-job instructions. [STATEMENT]"
+        # These checks edit author_critic.yaml; new jobs otherwise default to the cheap graph.
         edited = self.manager.start_direct_job({
             "statement": "First task", "promptOverrides": {"author_simple": custom},
+            "authorWorkflow": "author_critic",
         })
-        fresh = self.manager.start_direct_job({"statement": "Next task"})
+        fresh = self.manager.start_direct_job({"statement": "Next task", "authorWorkflow": "author_critic"})
         self.assertEqual(edited.state["authorPrompt"], custom)
         self.assertEqual(fresh.state["authorPrompt"], server.default_prompts()["author_simple"])
         self.assertEqual(edited.state["criticPrompt"], fresh.state["criticPrompt"])
 
     def test_review_retry_and_run_history_keep_the_job_prompt(self):
         self.edit_yaml("Original")
-        app = self.manager.start_job({"statement": "Task to review"})
+        app = self.manager.start_job({"statement": "Task to review", "authorWorkflow": "author_critic"})
         original = app.state["authorPrompt"]
         app.state["phase"] = "reviewed"
         self.edit_yaml("Current")

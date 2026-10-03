@@ -13,6 +13,18 @@ lemmas when **Manage research files** is enabled. This switch is off by default
 on the home screen: `author_simple` asks only for a rigorous proof, and the UI
 hides research records and scheduled audits. The critic and LaTeX writer still run.
 
+New jobs default to the [cost-optimized workflow](#cost-optimized-workflow)
+(`workflows/author_critic_cheap.yaml`) and skip statement review, in the web UI
+and in the terminal. Choose **Standard (author_critic)** under Advanced, or pass
+`--workflow author_critic`, for the original workflow. The LaTeX writer is off
+by default: a job ends with the critic-approved proof in `final-proof.md`, and the
+writer's model settings stay hidden. Check **Run the LaTeX writer** under
+Advanced, or pass `--latex`, to also produce `final.tex` and a PDF. Saved jobs
+from before this option keep running the writer. Two more ways to start
+work: [Critic only](#critic-only) reviews a proof you already have, and
+[folder runs](#parallel-folder-runs) start one job per statement file and save
+a [summary](#folder-run-summary) of the whole run.
+
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
 attempt history, and proved results across interruptions or context compaction.
@@ -38,8 +50,11 @@ python3 web_ui.py
 ```
 
 The Web UI opens locally with Astra, Ultra, and Standard-speed defaults for
-the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
-is needed only when you select DeepSeek for one or more roles.
+the reviewer, proof author, critic, and LaTeX writer. New jobs use the
+cost-optimized workflow and start directly with the proof author. **Skip
+statement review** is on; turn it off to have the statement checked first. The
+DeepSeek setup below is needed only when you select DeepSeek for one or more
+roles.
 
 ## How to use DeepSeek
 
@@ -121,10 +136,24 @@ python3 web_ui.py statement.md
 This sends the entire file directly to the proof author, exactly like enabling
 **Skip statement review** in Statement mode. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
-web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
-limit, Astra and Ultra for all proof
-roles, the built-in role prompts, and Standard generation speed. The
-activity log requests concise public reasoning summaries by default.
+web UI:
+- the cost-optimized workflow, without research files;
+- a maximum of 2 consecutive edited critic passes;
+- a 168-hour total workflow limit;
+- Astra and Ultra for all proof roles;
+- the built-in role prompts;
+- Standard generation speed.
+
+The activity log requests concise public reasoning summaries by default. Pass
+`--workflow author_critic` for the original workflow, which manages research
+files and runs fresh-eyes solvers in the terminal.
+
+To review a proof you already have, without statement review or an author, add
+`--critic-only` (see [Critic only](#critic-only)):
+
+```bash
+python3 web_ui.py statement.md --critic-only proof.md
+```
 
 ### Optional settings
 
@@ -153,7 +182,10 @@ python3 web_ui.py statement.md --author-model gpt-5.6-terra --speed-mode standar
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
 | `-finalPromptFile PATH` | built-in prompt | Load a UTF-8 LaTeX prompt. |
-| `-workflow NAME` | `author_critic` | `author_critic_cheap` (or `cheap`) runs the cost-optimized workflow in simple mode; see [Cost-optimized workflow](#cost-optimized-workflow). Resumed jobs keep their saved workflow. |
+| `-workflow NAME` | `author_critic_cheap` | The cost-optimized workflow (also `cheap`), without research files; see [Cost-optimized workflow](#cost-optimized-workflow). `author_critic` runs the original workflow, which manages research files. Resumed jobs keep their saved workflow. |
+| `-latex` | off | Also run the LaTeX writer after the critic approves, producing `final.tex` and a PDF. Without it the job ends with `final-proof.md`. |
+| `-summary RUN...` | off | Write the [folder run summary](#folder-run-summary) for existing jobs and print its path: a batch folder in `runs/batches/`, or run folders in `runs/`. `-summaryName NAME` sets the folder name shown for run folders. |
+| `-criticOnly PATH` | off | Review the proof in `PATH` against the statement file: no statement review and no author. A single statement file only, not a folder or a resume. See [Critic only](#critic-only). |
 
 Prompt-file paths are resolved from the terminal's current working directory.
 Run `python3 web_ui.py --help` to see every spelling and allowed value.
@@ -226,6 +258,45 @@ A batch of three solvers at ultra effort takes about 20 to 25 minutes and costs
 roughly 3 to 4 million tokens, about 90 percent of them cached; lower `count`
 or raise `intervalMinutes` to trade coverage for cost.
 
+## Critic only
+
+**Critic only** reviews a proof you already have: it skips both statement
+review and the proof author.
+
+- **Web UI:** choose the **Critic only** mode, paste the statement and the
+  complete proof, and click **Start critic**. Advanced keeps the workflow,
+  critic and LaTeX-writer settings, critic rounds and time limit.
+- **Terminal:**
+
+  ```bash
+  python3 web_ui.py statement.md --critic-only proof.md
+  ```
+
+The critic of the selected workflow reviews the proof, fixes what it can, and
+rechecks its own fixes up to the critic-round limit. Then:
+
+- **Pass:** the job ends with the approved proof in `final-proof.md`, or, with
+  the LaTeX writer turned on, continues to the LaTeX editor as in a normal job.
+- **Rejection:** the job ends with the critic's report as its output ("The
+  critic rejected the proof; see its report."). No author is started.
+  - The report is saved as `failure-summary.md`.
+  - The proof you supplied is kept as `supplied-proof.md`.
+  - The critic's best fixed version is kept as `saved-candidate.md`.
+- **Exit status (terminal):** `0` when the critic passes and the PDF compiles,
+  `1` when it rejects.
+
+Resuming or continuing a critic-only job keeps it critic-only.
+
+With `workflow_runner.py`, start at the critic with `"critic_only": true` in
+the state file:
+
+```bash
+python3 workflow_runner.py workflows/author_critic_cheap.yaml workflows/clean_up.yaml --start-node critic --state-file state.json
+```
+
+Here `state.json` holds `{"statement": ..., "solution": ..., "critic_only":
+true}`.
+
 ## Cost-optimized workflow
 
 `workflows/author_critic_cheap.yaml` is a cheaper version of the simple author
@@ -234,20 +305,20 @@ or raise `intervalMinutes` to trade coverage for cost.
 - the same model;
 - the same reasoning effort per request as Astra-Ultra;
 - one persistent author thread that keeps its own reasoning between turns;
-- a critic in which three independent full-depth reviewers plus a judge read
-  every candidate the author submits.
+- a full-depth critic that reads every candidate the author submits and fixes
+  every bug it can.
 
 It removes the cost multipliers around them. Keep Astra and Ultra selected; the
 workflow handles the rest.
 
-- **Web UI:** Advanced → **Workflow** → **Cost-optimized (author_critic_cheap)**.
-  The job always runs without research files, audits, or fresh-eyes solvers.
-- **Terminal:** `python3 web_ui.py statement.md --workflow cheap` (or
-  `--workflow author_critic_cheap`). Resumed and continued jobs keep their
-  saved workflow.
+- **Web UI:** it is the default (Advanced → **Workflow** → **Cost-optimized
+  (author_critic_cheap)**). The job always runs without research files, audits,
+  or fresh-eyes solvers.
+- **Terminal:** `python3 web_ui.py statement.md` uses it by default (also
+  `--workflow cheap`). Resumed and continued jobs keep their saved workflow.
 - **Generic runner:** run it in a fresh directory, because the author and the
-  controller write `PROOF_STATE.md`, `LEMMAS.md`, `saved-candidate.md`,
-  `critic-panel-audits.json` and the LaTeX files there:
+  controller write `PROOF_STATE.md`, `LEMMAS.md`, `saved-candidate.md` and the
+  LaTeX files there:
 
   ```bash
   REPO=/path/to/tcs-prover
@@ -274,9 +345,9 @@ catalog fetched on 2026-10-01. If it changes, edit `options.ultra_effort` in
 `workflow_runner.py` you can instead pass the whole mapping, for example
 `--set 'ultra_effort={"gpt-6-astra": "max", "default": "max"}'`.
 
-### What changes and why the mathematics is unaffected
+### What changes and what it keeps
 
-| Change | What it saves | Why capability is kept |
+| Change | What it saves | What is kept |
 | --- | --- | --- |
 | `ultra_effort: {gpt-6-astra: xhigh, default: max}` remaps an Ultra selection, for the author, the critic calls and the subagents | Proactive and recursive delegation. | The API receives exactly the effort Codex sends for Ultra on that model. |
 | Delegation only when the author requests it: one subagent at a time, once the missing step is stalled. The subagent starts fresh (`fork_turns` none) from a brief of at most 8 KB that lists what failed and one untried technique family. The author waits for it at most twice, with 30-minute waits, never polls, and never delegates re-verification. `subagent_threads: 1`, `subagent_call_cap: 40` | Spawned threads, inherited contexts, polling calls. | Fresh-eyes attempts stay available for real dead ends, the case where seeded solvers helped in the 2026-09-21 pilot. |
@@ -284,9 +355,9 @@ catalog fetched on 2026-10-01. If it changes, edit `options.ultra_effort` in
 | Silent author and tool discipline: no commentary, one script per batch of computations with minimal printing, and web search only for exact statements or (once per stall) a closing technique, 6 actions per hour | Output tokens, which cost several times input and stay in context until compaction. Also model round trips: every tool call re-sends the whole context. | Reasoning is unchanged. Experiments that change the next step still run, and testable claims are brute-forced before the proof relies on them. |
 | Memory across compaction in two files. `PROOF_STATE.md` (at most 150 lines, with a stall count) is edited in place at a checkpoint at 80K input, before compaction fires at 94-123K of reported input for a 150K limit; later results are recorded as soon as they are proved. `LEMMAS.md` keeps each complete proof of the author's own results, appended once; published results are cited with their hypotheses. No 45-minute time checkpoint. | Re-deriving lost work. Codex's remote compaction keeps user messages and drops the author's own messages, so a checkpoint written as a message was lost. | Results recorded before a compaction, their proofs and failed routes survive it exactly, and the final answer can still contain every proof. |
 | No re-derivation or polishing. When the missing step stops moving (two turns or two checkpoints), the author first steelmans its construction, then switches family. | Repeated turns on a stuck route, without blocking a family on a naive variant (the failure in the 2026-09-20 run). | It follows the managed prompt's "steelman before block" rule. |
-| Staged critic. One full-depth first audit may return a candidate to the author only for a confirmed central bug. Otherwise the controller runs two independent, checkpointed audits with different foci and no subagent tools, then a judge that fixes local bugs and decides. | Every round on a doomed candidate. Model-written subagent briefs that re-typed the proof. Wait and messaging calls. Re-paying finished audits after a crash. | Every candidate the author submits is read by three independent full-depth reviewers plus a judge, as with the subagent critic. |
-| No copied proofs. The judge returns text only for substantive edits, which re-run the two panel audits and the judge, up to `-criticRounds` passes. At that limit the latest rewrite is accepted without another audit, as in the standard workflow. Cosmetic edits are not applied, and placeholder or abridged text is ignored. Repair messages carry bugs and the absolute path of `saved-candidate.md`. | Proof-length output on every pass. Proof-length user messages, which survive every later compaction. | No unaudited cosmetic rewrite can replace a reviewed proof. |
-| Precise bug standard. Routine one-line steps and citation slips are fixed, not rejected. Unjustified load-bearing steps are still bugs. Disproofs are judged as disproofs. Labels are advisory, so the author checks each reported bug before rebuilding. | Spurious rejections, each costing an author turn plus a critic round. | Real gaps are still rejected. |
+| A single critic node right after the author: one full-depth call with no subagent tools. It reads the proof, fixes every bug it can, and returns `reject` only for a critical bug it cannot fix. Otherwise it returns `pass`, with `edits: none` when it changed nothing. | Model-spawned subagents that re-read the proof, the briefs that re-typed it, and the wait and messaging calls. | The critic still checks the exact statement and every step at the author's depth. It is now one reviewer instead of several independent ones; that is the trade-off of this design. |
+| No copied proofs. The critic returns text only when it applied fixes. The same node then re-checks the corrected proof, up to `-criticRounds` passes; at that limit the latest correction is accepted without another check, as in the standard workflow. It is told to make no cosmetic edits. Text returned without applied edits counts only when it is a full-length different proof, so placeholders and abridged copies are ignored there; applied edits that return less than half of the proof become a reject. Repair messages carry bugs and the absolute path of `saved-candidate.md`. | Proof-length output on every pass. Proof-length user messages, which survive every later compaction. | Every applied fix is re-checked before acceptance, except the last one at the round limit. |
+| Precise bug standard. Routine one-line steps and citation slips are not bugs. Unjustified load-bearing steps still are. Disproofs are judged as disproofs. The author checks each reported bug before rebuilding. | Spurious rejections, each costing an author turn plus a critic round. | Real gaps are still rejected. |
 | One-hour timeouts on critic requests | Discarded calls: workflow structured nodes were killed after 900 s, losing everything spent. | Long audits can finish. |
 
 The author finishes by calling `update_goal` with status `complete` and giving
@@ -304,11 +375,12 @@ uncached input 1, cached input 0.1 and output 5 to 8:
 - **Author:** 13-17% cheaper. This assumes the baseline delegates as little as
   the managed 2026-09-20 author did. If the simple author delegates like the
   2026-09-13 run, the saving is far larger, up to about half.
-- **Critic:** 55% cheaper for a clean round, 89% for a round that the first
-  audit rejects, and 14% for a substantive fix that re-runs the panel.
+- **Critic:** each round is one `xhigh` call. By the same arithmetic that is
+  roughly 80-90% cheaper than a round of the original critic with
+  model-spawned subagents (about 1.4M credit-weighted units per round).
 - **State files:** `PROOF_STATE.md` and `LEMMAS.md` add about 2-4%.
-- **Whole run:** about 25% for 8 hours with one rejected round and one clean
-  round, before counting the delegation that Ultra would have added.
+- **Whole run:** about 25-30% for 8 hours with one rejected round and one
+  clean round, before counting the delegation that Ultra would have added.
 
 The compaction ceiling stays at 150K. Lowering it saves raw cached tokens but
 almost no credit once the extra summaries are counted.
@@ -347,9 +419,10 @@ Compare a short pilot with the simple author on the same statement:
 
 - **Baseline:** in the Web UI, choose Standard with **Manage research files**
   Off. Or run `workflow_runner.py` with `$REPO/workflows/author_critic.yaml
-  $REPO/workflows/clean_up.yaml --set file_management=false`. Do not use the
-  terminal command `web_ui.py statement.md` as the baseline: it runs the managed
-  author with fresh-eyes solvers.
+  $REPO/workflows/clean_up.yaml --set file_management=false`. The terminal
+  command `web_ui.py statement.md` now runs the cost-optimized workflow itself,
+  and `--workflow author_critic` there runs the managed author with fresh-eyes
+  solvers, so neither is the simple-author baseline.
 - **What to compare:** quota points per hour from the **Usage quota** status
   lines, and per-thread totals from `token-usage.json`.
 - **Inspecting the prefix:** `codex debug prompt-input -m gpt-6-astra` with the
@@ -370,8 +443,8 @@ You do not need to keep the old browser tab open.
 A saved proof candidate contains the checked statement and latest complete
 argument. Continuing it starts a fresh root critic request from that candidate.
 Within the request, the critic uses its own fresh independent subagents to
-find bugs and then repairs the argument itself. Cost-optimized jobs instead run
-a first audit, two independent audits and a judge, without subagents.
+find bugs and then repairs the argument itself. Cost-optimized jobs instead use
+one critic call without subagents.
 
 To continue from the Web UI:
 
@@ -408,7 +481,7 @@ button:
 | --- | --- | --- |
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
 | Proof author, repair, or interrupted failure summary | **Continue proof author** | Uses `INITIAL_PROMPT.md`, the approach index and route files, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads the active work before continuing. Unmigrated older runs retain their `APPROACHES.md` layout. Visible partial text is not treated as a complete proof. |
-| Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The critic requests new independent bug-finding reports. |
+| Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The standard critic requests new independent bug-finding reports; a cost-optimized job reruns its single critic call. |
 | LaTeX editor | **Retry LaTeX editor** | Retries the single editor call with the saved accepted solution or standalone LaTeX source. Older jobs without an exact final input fall back to their latest critic checkpoint. |
 
 These continuation actions create a new run folder while preserving the source
@@ -466,6 +539,18 @@ job starts. The jobs then run concurrently, and every override applies to every
 file. Be aware that a large folder can therefore use many simultaneous Codex
 jobs and credits.
 
+The web UI does the same with **Run a folder…** in Statement mode:
+- **Files:** it picks a folder and keeps the `.md` files directly inside it,
+  sorted by name. Empty files are listed and skipped.
+- **Confirmation:** it asks before starting, because every job uses its own
+  quota.
+- **Jobs:** it starts one ordinary job per file with the current Advanced
+  settings, sending each statement straight to the author. The jobs appear in
+  the job list, tagged with their file name, and run in parallel.
+- **Validation:** a folder may hold up to 200 statements of at most 100,000
+  characters each, and every statement and the shared settings are checked
+  before any job starts.
+
 Terminal output is concise by default: it reports only the current workflow
 step, diagnostics, errors, and the start/finish result for each input file.
 Prompts, model events, reasoning summaries, tool activity, and proof bodies are
@@ -476,6 +561,60 @@ then include an `inputFile` field. A failed job does not cancel its siblings.
 The exit status is `0` when every proof succeeds, `1` for invalid input or any
 failed proof, and `130` after Ctrl-C. Ctrl-C stops all active folder jobs and
 their subprocess trees.
+
+### Folder run summary
+
+Every folder run, from the terminal or the web UI, gets a folder
+`runs/batches/<start time>_<folder name>/`:
+- `batch.json` lists the run's jobs.
+- `summary.md` is the report. It is written when the jobs start and rewritten
+  whenever one of them stops working, including after a later resume, so it
+  always shows the latest state.
+- `summary.json` holds the same data for scripts.
+
+The terminal prints the path of `summary.md`, and the web UI shows it after
+starting the jobs.
+
+The report has two parts:
+- **Whole run:**
+  - the models, efforts and settings (workflow, critic rounds, LaTeX writer,
+    speed, thinking-time limit, and the workflow's runner options);
+  - how many problems were solved (critic-approved), and why the others are
+    not solved, for example paused at the usage quota;
+  - tokens and estimated credits for the author, its subagents and the
+    critic;
+  - how far the provider's usage window moved;
+  - wall-clock and summed working time.
+- **Each problem:**
+  - whether it was solved, with the first line of the answer;
+  - the critic's verdict in every round: **yes** (passed unchanged),
+    **repaired** (the critic fixed bugs itself) or **no** (rejected, back to
+    the author);
+  - its status, working time, tokens, credits, model calls, and its shell
+    commands, web searches, compactions and subagents.
+
+A continued job is listed with the run it continues, and its tokens and time
+are added to that problem.
+
+The numbers come from each job's `transcript.jsonl`, not from
+`token-usage.json`. The transcript also counts the critic's requests and the
+author's last minutes before it finished.
+
+Estimated credits use the published standard-speed rates per million tokens:
+250 uncached input, 25 cached input and 1,250 output for gpt-6-astra. Fast
+speed counts 2.5 times as much. They are estimates, because the provider does
+not publish how credits map to the usage window.
+
+To write or refresh a summary for jobs that already exist, name a batch folder,
+or the run folders (a new batch then lists them in statement-file order):
+
+```bash
+python3 web_ui.py --summary runs/batches/2026-10-02_19-28-38_jobs
+python3 web_ui.py --summary runs/2026-10-02_19-28-* --summary-name jobs
+```
+
+A web UI server keeps the code it started with. Restart it after updating, so
+its jobs rewrite their summaries when they finish.
 
 ## Read a transcript as a human narrative
 
@@ -511,9 +650,11 @@ public reasoning summaries retained by TCS Prover, not private chain-of-thought.
 They read incrementally, so even very large transcripts do not need to fit in
 memory.
 
-Choose **Statement** to review or edit a rough problem before approval. Include
-the computational model, problem description, and asymptotic goal in the
-statement for algorithmic tasks. Choose **LaTeX polish** to edit an existing
+Choose **Statement** to prove a statement (or, with **Skip statement review**
+off, to review and edit a rough problem before approval). Include the
+computational model, problem description, and asymptotic goal in the statement
+for algorithmic tasks. Choose **Critic only** to review a proof you already have
+(see [Critic only](#critic-only)). Choose **LaTeX polish** to edit an existing
 theorem and proof with a single editor call.
 **Advanced** controls each node's model, reasoning effort, prompt, public activity-log
 detail, workflow time limit, and critic-round limit. The log can show status
@@ -629,9 +770,10 @@ Home-screen jobs default to **Manage research files: Off**. The `author_simple`
 prompt in `workflows/author_critic.yaml` asks the author to prove the supplied
 statement. Its goal, continuation, compaction, resume, and repair prompts also
 avoid requiring a file layout. The mode is saved with the job and retained on
-continuation. Existing runs without the setting retain managed mode. Direct
-CLI jobs retain managed mode for compatibility; the generic runner also accepts
-`--set file_management=false` to use the simple prompt family.
+continuation. Existing runs without the setting retain managed mode. Terminal
+jobs now default to the cost-optimized workflow, which is always simple; with
+`--workflow author_critic` they keep managed mode. The generic runner also
+accepts `--set file_management=false` to use the simple prompt family.
 
 Turn **Manage research files** on before starting a job to enable the full
 research workspace and scheduled advisers. The managed author explores diverse
@@ -729,7 +871,7 @@ workflow_runner.py          Graph engine, model transport, and workflow CLI
 web_ui.py                   UI and Markdown-job launcher
 workflows/
   author_critic.yaml         Author/critic prompts, response schema, and logic
-  author_critic_cheap.yaml   Cost-optimized simple author and staged critic
+  author_critic_cheap.yaml   Cost-optimized simple author and single-node critic
   clean_up.yaml              LaTeX prompts, response schema, and logic
   research_audit.yaml        Scheduled research audits and fresh-eyes solvers
 transcript/
@@ -739,6 +881,7 @@ ui/
   server.py                 HTTP endpoints, job state, and process management
   review.py                 Independent statement-review procedure
   cli.py                    UI startup and Markdown file/folder runs
+  batch_summary.py          Folder-run summaries (runs/batches/)
   index.html, app.js, styles.css
 tests/                      Offline regression tests
 ```

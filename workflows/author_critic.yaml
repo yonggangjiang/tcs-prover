@@ -31,7 +31,7 @@ nodes:
     require:
     - bool(strip(result.solution))
     - "not strip(result.bugs) if result.verdict == 'pass' else bool(strip(result.bugs))"
-    outcome: "'reject' if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
+    outcome: "(('stop' if get(state, 'critic_only', False) else 'reject') if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed'))"
     before:
     - write: {path: saved-candidate.md, text: state.solution}
     after:
@@ -40,6 +40,12 @@ nodes:
     - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', text: '{raw}'}
     next:
       reject: author
+      # A critic-only job has no author: a rejection ends it with the report.
+      stop:
+        to: end
+        after:
+        - set: {failed: "True", output: "'The critic rejected the proof. Unresolved bugs:\\n\\n' + result.bugs"}
+        - emit: {kind: failure_result, label: Critic rejected the proof, output: '=state.output'}
       pass:
         to: end
         after:

@@ -51,8 +51,9 @@ class WorkflowChoiceTests(unittest.TestCase):
 
     def assert_graphs(self, argv, workflow):
         runner = argv.index(str(server.ROOT / "workflow_runner.py"))
-        self.assertEqual(argv[runner + 1:runner + 3],
-                         [str(server.WORKFLOWS / f"{workflow}.yaml"), str(server.WORKFLOWS / "clean_up.yaml")])
+        # New jobs end at the critic: the LaTeX writer is off unless a job turns it on.
+        self.assertEqual(argv[runner + 1], str(server.WORKFLOWS / f"{workflow}.yaml"))
+        self.assertNotIn(str(server.WORKFLOWS / "clean_up.yaml"), argv)
 
     def start_cheap_job(self, **body):
         return self.launch(lambda: self.manager.start_direct_job(
@@ -108,13 +109,72 @@ class WorkflowChoiceTests(unittest.TestCase):
         self.assertIsNone(app.research_audits)
         self.assertEqual(app.snapshot()["workflow"]["settings"]["prompts"]["critic"], self.cheap["critic"])
 
-    def test_standard_web_job_is_unchanged(self):
-        app, argv = self.launch(lambda: self.manager.start_direct_job({"statement": "Exact statement"}))
+    def test_standard_web_job_runs_when_chosen(self):
+        app, argv = self.launch(lambda: self.manager.start_direct_job(
+            {"statement": "Exact statement", "authorWorkflow": STANDARD}))
         self.assert_graphs(argv, STANDARD)
         self.assertEqual(app.state["authorWorkflow"], STANDARD)
         self.assertEqual((app.run_dir / "prompts/author.txt").read_text().strip(),
                          self.standard["author_simple"].strip())
         self.assertEqual((app.run_dir / "prompts/critic.txt").read_text().strip(), self.standard["critic"].strip())
+
+    def test_new_web_jobs_without_a_choice_run_the_cheap_graph(self):
+        self.assertEqual(server.NEW_JOB_AUTHOR_WORKFLOW, CHEAP)
+        app, argv = self.launch(lambda: self.manager.start_direct_job({"statement": "Exact statement"}))
+        self.assert_graphs(argv, CHEAP)
+        self.assertEqual((app.state["authorWorkflow"], app.state["fileManagement"]), (CHEAP, False))
+        self.assertEqual((app.run_dir / "prompts/author.txt").read_text().strip(), self.cheap["author"].strip())
+        settings = json.loads((app.run_dir / server.JOB_SETTINGS_FILENAME).read_text())
+        self.assertEqual((settings["authorWorkflow"], settings["skipStatementReview"]), (CHEAP, True))
+
+        reviewed = self.manager.start_job({"statement": "Rough task"})
+        self.assertEqual((reviewed.state["phase"], reviewed.state["authorWorkflow"]), ("reviewing", CHEAP))
+        reviewed.state.update(phase="reviewed", review={"statement": "Exact statement", "notes": ""})
+        _, argv = self.launch(lambda: reviewed.approve())
+        self.assert_graphs(argv, CHEAP)
+
+        # Review-only jobs never run a proof graph and keep recording author_critic.
+        review_only = self.manager.start_job({"statement": "Rough task", "statementReviewOnly": True})
+        self.assertTrue(review_only.state["statementReviewOnly"])
+        self.assertEqual(review_only.state["authorWorkflow"], STANDARD)
+        self.assertEqual(json.loads((review_only.run_dir / server.JOB_SETTINGS_FILENAME).read_text())
+                         ["authorWorkflow"], STANDARD)
+
+    def test_home_form_defaults_to_cheap_and_skipped_review_but_restores_keep_legacy_defaults(self):
+        home = server.home_state()
+        self.assertEqual((home["authorWorkflow"], home["skipStatementReview"]), (CHEAP, True))
+        self.assertFalse(home["fileManagement"])
+        self.assertFalse(home["criticOnly"])
+        self.assertEqual(home["authorPrompt"].strip(), self.cheap["author"].strip())
+        self.assertEqual(home["workflow"]["settings"]["prompts"]["critic"], self.cheap["critic"])
+        # The restore-facing state keeps the legacy defaults.
+        empty = server.empty_state()
+        self.assertEqual((empty["authorWorkflow"], empty["skipStatementReview"]), (STANDARD, False))
+
+        # A saved job that went through statement review restores as reviewed and author_critic.
+        directory = self.runs / "legacy-reviewed"
+        directory.mkdir(parents=True)
+        (directory / "checked-statement.md").write_text("# Checked statement\n\nExact statement\n")
+        (directory / "prompts").mkdir()
+        for role in ("review", "author", "critic", "final"):
+            (directory / "prompts" / f"{role}.txt").write_text(f"Saved {role} [STATEMENT]\n")
+        (directory / "transcript.jsonl").write_text(json.dumps(
+            {"kind": "review_result", "stage": "review", "review": {"statement": "Exact statement", "notes": ""}}) + "\n")
+        restored = server.restore_saved_app(server.App(directory / "transcript.jsonl", self.runs))
+        self.assertFalse(restored.state["skipStatementReview"])
+        self.assertEqual(restored.state["phase"], "reviewed")
+        self.assertEqual(restored.state["authorWorkflow"], STANDARD)
+        self.assertEqual(restored._proof_workflows_locked(), ["author_critic.yaml", "clean_up.yaml"])
+
+        # A saved direct job without the setting still restores as skipped.
+        direct = self.runs / "legacy-direct"
+        direct.mkdir()
+        (direct / "checked-statement.md").write_text(
+            "# Statement sent directly to the proof author\n\nExact statement\n\n# Statement review\n\nSkipped by the user.\n")
+        (direct / "transcript.jsonl").write_text("")
+        restored = server.restore_saved_app(server.App(direct / "transcript.jsonl", self.runs))
+        self.assertTrue(restored.state["skipStatementReview"])
+        self.assertEqual(restored.state["authorWorkflow"], STANDARD)
 
     def test_reviewed_cheap_statement_is_approved_into_the_cheap_graph(self):
         app = self.manager.start_job({"statement": "Rough task", "authorWorkflow": CHEAP})
@@ -170,7 +230,8 @@ class WorkflowChoiceTests(unittest.TestCase):
         restored = server.restore_saved_app(server.App(app.trace_file, self.runs))
         self.assertEqual(restored.state["authorWorkflow"], CHEAP)
         self.assertEqual(restored.state["criticPrompt"], self.cheap["critic"].strip())
-        self.assertEqual(restored._proof_workflows_locked(), [f"{CHEAP}.yaml", "clean_up.yaml"])
+        self.assertEqual(restored._proof_workflows_locked(), [f"{CHEAP}.yaml"])
+        self.assertFalse(server.saved_latex_writer(app.run_dir))
         self.assertIn("nodes", restored.snapshot()["workflow"], "The sidebar graph keeps its own key")
         self.assertEqual(server.saved_author_workflow(app.run_dir), CHEAP)
         self.assertEqual(server.saved_research_source(app.run_dir)["settings"]["authorWorkflow"], CHEAP)
@@ -207,7 +268,13 @@ class WorkflowChoiceTests(unittest.TestCase):
             self.assertEqual(restored.state["authorWorkflow"], CHEAP)
             with self.assertRaisesRegex(ValueError, "Cannot read workflow"):
                 self.manager.start_direct_job({"statement": "Task", "authorWorkflow": CHEAP})
-            _, argv = self.launch(lambda: self.manager.start_direct_job({"statement": "Task"}))
+            # The cheap graph is the new-job default, so a job without a choice fails too.
+            with self.assertRaisesRegex(ValueError, "Cannot read workflow"):
+                self.manager.start_direct_job({"statement": "Task"})
+            # The home form still loads; it keeps the cheap default and offers Standard.
+            self.assertEqual(server.home_state()["authorWorkflow"], CHEAP)
+            _, argv = self.launch(lambda: self.manager.start_direct_job(
+                {"statement": "Task", "authorWorkflow": STANDARD}))
         self.assert_graphs(argv, STANDARD)
 
     def test_invalid_workflow_is_rejected_before_creating_a_run(self):
@@ -295,20 +362,50 @@ class WorkflowCliTests(unittest.TestCase):
             self.assertEqual(cli.main(), 0)
         return launched
 
-    def test_markdown_run_default_is_unchanged_and_flag_selects_cheap_simple_mode(self):
-        default = self.run_markdown()
-        self.assertEqual((default["workflow"], default["managed"]), (STANDARD, True))
-        self.assertEqual(default["graphs"], ["author_critic.yaml", "clean_up.yaml"])
-        self.assertEqual(default["settings"]["file_management"], "true")
-        self.assertEqual(default["author"].strip(), server.default_prompts()["author"].strip())
+    def test_markdown_run_defaults_to_cheap_and_flag_selects_the_managed_standard_graph(self):
         cheap_author = server.default_prompts(CHEAP)["author"].strip()
-        for flags in (("--workflow", "cheap"), ("-workflow", CHEAP), (f"--workflow={CHEAP}",)):
+        for flags in ((), ("--workflow", "cheap"), ("-workflow", CHEAP), (f"--workflow={CHEAP}",)):
             with self.subTest(flags=flags):
                 launched = self.run_markdown(*flags)
                 self.assertEqual((launched["workflow"], launched["managed"]), (CHEAP, False))
-                self.assertEqual(launched["graphs"], [f"{CHEAP}.yaml", "clean_up.yaml"])
+                self.assertEqual(launched["graphs"], [f"{CHEAP}.yaml"])
                 self.assertEqual(launched["settings"]["file_management"], "false")
                 self.assertEqual(launched["author"].strip(), cheap_author)
+        # --workflow author_critic gives the earlier managed terminal behaviour.
+        for flags in (("--workflow", STANDARD), ("-workflow", STANDARD), (f"--workflow={STANDARD}",)):
+            with self.subTest(flags=flags):
+                standard = self.run_markdown(*flags)
+                self.assertEqual((standard["workflow"], standard["managed"]), (STANDARD, True))
+                self.assertEqual(standard["graphs"], ["author_critic.yaml"])
+                self.assertEqual(standard["settings"]["file_management"], "true")
+                self.assertEqual(standard["author"].strip(), server.default_prompts()["author"].strip())
+
+    def test_markdown_run_records_its_source_file_and_folder_runs_get_unique_folders(self):
+        folder = self.directory / "statements"
+        folder.mkdir()
+        for name in ("b.md", "A.md", "c.MD"):
+            (folder / name).write_text("Exact statement.\n", encoding="utf-8")
+        (folder / "notes.txt").write_text("Not a statement.\n", encoding="utf-8")
+        (folder / "nested").mkdir()
+        (folder / "nested" / "d.md").write_text("Nested statement.\n", encoding="utf-8")
+        launched = []
+
+        def launch(app, statement):
+            launched.append((app.state["sourceFile"], app.run_dir.name, app.state["authorWorkflow"]))
+            return object(), object()
+
+        with mock.patch.object(server.App, "_launch_solver_locked", autospec=True, side_effect=launch):
+            code = cli.run_headless_markdown(folder, runs=self.runs, output_stream=io.StringIO(),
+                                             error_stream=io.StringIO())
+        self.assertEqual(code, 0)
+        # Top-level .md files only, in name order; identical statements in one second still
+        # get distinct run folders.
+        self.assertEqual([item[0] for item in launched], ["A.md", "b.md", "c.MD"])
+        self.assertEqual(len({item[1] for item in launched}), 3)
+        self.assertEqual({item[2] for item in launched}, {CHEAP})
+        for source_file, run_name, _ in launched:
+            settings = json.loads((self.runs / run_name / server.JOB_SETTINGS_FILENAME).read_text())
+            self.assertEqual(settings["sourceFile"], source_file)
 
     def test_unknown_workflow_flag_is_rejected(self):
         with mock.patch.object(cli.sys, "argv", ["web_ui.py", str(self.statement), "--workflow", "bogus"]), \

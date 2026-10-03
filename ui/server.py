@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import workflow_runner as runtime
 from . import audits
+from . import batch_summary
 from .review import REVIEW_PROMPT
 
 
@@ -64,10 +65,26 @@ LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 DEFAULT_AUTHOR_WORKFLOW = "author_critic"
 AUTHOR_WORKFLOWS = ("author_critic", "author_critic_cheap")
 SIMPLE_ONLY_WORKFLOWS = frozenset({"author_critic_cheap"})
+# A job created without an explicit choice (the web form, /review, /direct,
+# /critic, a folder batch, or a terminal run) uses the cost-optimized graph.
+# DEFAULT_AUTHOR_WORKFLOW keeps meaning the graph of a saved job that never
+# recorded one, so restores and continuations never change an old job.
+NEW_JOB_AUTHOR_WORKFLOW = "author_critic_cheap"
+# A critic-only job has no author: a rejection ends it with the critic's report.
+CRITIC_REJECTED_MESSAGE = "The critic rejected the proof; see its report."
+# The result of a job that skips the LaTeX writer: the critic-approved proof.
+FINAL_PROOF_FILENAME = "final-proof.md"
+MAX_REQUEST_BYTES = 100_000
+# A complete proof, or a folder of statements, may exceed the normal JSON cap.
+MAX_DOCUMENT_REQUEST_BYTES = 8 * 1024 * 1024
+DOCUMENT_REQUEST_PATHS = frozenset({"/critic", "/direct-batch"})
+MAX_BATCH_STATEMENTS = 200
+MAX_BATCH_STATEMENT_CHARS = 100_000
+MAX_SOURCE_FILE_CHARS = 255
 
 
 def author_workflow_name(value=None):
-    """Validate one job's author/critic workflow; None selects the default."""
+    """Validate one job's author/critic workflow; None selects the legacy default."""
 
     if value is None:
         return DEFAULT_AUTHOR_WORKFLOW
@@ -231,14 +248,52 @@ def optional_default_prompts(workflow):
 
 
 def web_author_workflow(body, source=None):
-    """Read a job's workflow choice; a retry keeps the existing job's choice."""
+    """Read a job's workflow choice; a retry keeps the existing job's choice.
+
+    A new job without a choice gets NEW_JOB_AUTHOR_WORKFLOW.
+    """
 
     saved = known_author_workflow(source.get("authorWorkflow")) if source else None
     value = body.get("authorWorkflow")
-    workflow = author_workflow_name(saved if value is None else value)
+    if value is None:
+        value = saved if source else NEW_JOB_AUTHOR_WORKFLOW
+    workflow = author_workflow_name(value)
     if source and workflow != saved:
         raise ValueError("Start a new job to change the workflow.")
     return workflow
+
+
+def source_file_name(value=None):
+    """Validate the optional name of the file a job's input came from (display only)."""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str) or "\0" in value or len(value) > MAX_SOURCE_FILE_CHARS:
+        raise ValueError(
+            f"A source file name must be text of at most {MAX_SOURCE_FILE_CHARS} characters."
+        )
+    return value.strip()
+
+
+def batch_folder_name(value):
+    """The chosen folder's name for a folder-run summary, or "" if unusable."""
+
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value or len(value) > 255 or any(character in value for character in "/\\\0"):
+        return ""
+    return value
+
+
+def workflow_option_defaults(workflow):
+    """The runner defaults a workflow file sets, for the folder-run summary."""
+
+    try:
+        options = runtime.builtin_workflow(workflow).get("options") or {}
+    except Exception:  # A summary detail must never stop a launch.
+        return {}
+    return options if isinstance(options, dict) else {}
 
 
 def web_prompt_options(body, roles, source=None):
@@ -428,6 +483,32 @@ REVIEW_ONLY_GRAPH = {
     "edges": [],
 }
 
+# A critic-only job reviews a supplied proof: no statement review and no author.
+CRITIC_ONLY_GRAPH = {
+    "settings": PUBLIC_GRAPH["settings"],
+    "nodes": {
+        "critic": {
+            **PUBLIC_GRAPH["nodes"]["critic"],
+            "description": (
+                "Checks the supplied proof and fixes what it can. A pass continues to "
+                "the LaTeX editor; a rejection ends the job with the critic's report."
+            ),
+        },
+        **{name: PUBLIC_GRAPH["nodes"][name]
+           for name in ("latex_editor", "latex_compile", "latex_repair")},
+    },
+    "edges": [
+        *(edge for edge in PUBLIC_GRAPH["edges"]
+          if edge["from"] in {"critic", "latex_editor", "latex_compile", "latex_repair"}
+          and edge["to"] not in {"author", "failure_summary"}),
+        {
+            "from": "critic", "to": "end",
+            "label": "Report rejection", "when": "critic rejects",
+            "prompt_change": "End the job with the critic's report; no author runs.",
+        },
+    ],
+}
+
 
 def event_node(record, current=""):
     """Keep explicit node context across node-less events in a shared stage."""
@@ -475,6 +556,9 @@ def empty_state(trace=None, trace_version=0):
         "problemMode": "statement",
         "skipStatementReview": False,
         "statementReviewOnly": False,
+        "criticOnly": False,
+        "sourceFile": "",
+        "latexWriter": True,
         "fileManagement": False,
         "authorWorkflow": DEFAULT_AUTHOR_WORKFLOW,
         "preparedRun": False,
@@ -534,13 +618,23 @@ def empty_state(trace=None, trace_version=0):
 
 
 def home_state():
-    """Return the new-job form, with prompt defaults for every selectable workflow."""
+    """Return the new-job form, with prompt defaults for every selectable workflow.
+
+    New jobs default to the cost-optimized workflow and send the statement
+    directly to the author. empty_state() keeps the legacy defaults that
+    restored jobs rely on.
+    """
 
     state = empty_state()
     choices = {name: optional_default_prompts(name) for name in AUTHOR_WORKFLOWS}
     state["workflow"]["settings"]["promptsByWorkflow"] = {
         name: prompts for name, prompts in choices.items() if prompts is not None
     }
+    state.update(authorWorkflow=NEW_JOB_AUTHOR_WORKFLOW, skipStatementReview=True, latexWriter=False)
+    prompts = choices.get(NEW_JOB_AUTHOR_WORKFLOW)
+    if prompts is not None:
+        state.update(authorPrompt=prompts["author_simple"], criticPrompt=prompts["critic"])
+        state["workflow"]["settings"]["prompts"] = prompts
     return state
 
 
@@ -636,12 +730,19 @@ class App:
             slug = slug[:48].rstrip("-") or "problem"
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             prepare_runs_directory(self.runs)
-            self.run_dir = self.runs / f"{stamp}_{slug}"
-            number = 2
-            while self.run_dir.exists():
-                self.run_dir = self.runs / f"{stamp}_{slug}-{number}"
-                number += 1
-            self.run_dir.mkdir(mode=0o700)
+            # Jobs started together (a folder batch, a terminal folder run, or
+            # concurrent requests) can share a second and a slug. mkdir is the
+            # atomic claim, so a name taken by another thread is skipped.
+            number = 1
+            while True:
+                name = f"{stamp}_{slug}" if number == 1 else f"{stamp}_{slug}-{number}"
+                try:
+                    (self.runs / name).mkdir(mode=0o700)
+                except FileExistsError:
+                    number += 1
+                    continue
+                break
+            self.run_dir = self.runs / name
             self.trace_file = self.run_dir / "transcript.jsonl"
         prepare_private_directory(self.run_dir)
         self._save("draft.md", f"# Draft problem\n\n{statement}\n")
@@ -664,15 +765,17 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
-            "authorWorkflow",
+            "authorWorkflow", "latexWriter",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
+        settings = {key: options[key] for key in keys if key in options}
+        # Recorded only when set, so other jobs' settings files stay unchanged.
+        for key in ("criticOnly", "sourceFile"):
+            if options.get(key):
+                settings[key] = options[key]
         self._save(
             JOB_SETTINGS_FILENAME,
-            json.dumps(
-                {key: options[key] for key in keys if key in options},
-                ensure_ascii=False, indent=2, sort_keys=True,
-            ) + "\n",
+            json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
 
     def _prepare_continuation(
@@ -1415,12 +1518,17 @@ class App:
         research_audits=None,
         file_management=True,
         author_workflow=None,
+        latex_writer=None,
     ):
         """Normalize and validate settings shared by both input modes."""
 
         if not isinstance(file_management, bool):
             raise ValueError("File management must be enabled or disabled.")
         author_workflow = author_workflow_name(author_workflow)
+        # New jobs skip the LaTeX writer unless asked; saved jobs pass their own value.
+        latex_writer = False if latex_writer is None else latex_writer
+        if not isinstance(latex_writer, bool):
+            raise ValueError("The LaTeX writer must be enabled or disabled.")
         if author_workflow in SIMPLE_ONLY_WORKFLOWS:
             # No managed prompts exist, so research files, audits, and solvers stay off.
             file_management = False
@@ -1531,6 +1639,7 @@ class App:
             "reasoningSummary": reasoning_summary,
             "fileManagement": file_management,
             "authorWorkflow": author_workflow,
+            "latexWriter": latex_writer,
             "researchAudits": audits.normalize_settings(research_audits) if file_management else {
                 **audits.default_settings(), "models": ["none", "none", "none"]},
         }
@@ -1554,6 +1663,7 @@ class App:
         research_audits=None,
         file_management=True,
         author_workflow=None,
+        latex_writer=None,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -1596,6 +1706,8 @@ class App:
             research_audits=research_audits if not review_only else None,
             file_management=file_management,
             author_workflow=author_workflow,
+            latex_writer=(saved_latex_writer(continuation_source) if latex_writer is None and continuation_source
+                          else latex_writer),
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -1889,7 +2001,9 @@ class App:
     def _proof_workflows_locked(self):
         """Return this job's saved author/critic graph followed by final cleanup."""
 
-        return [f"{author_workflow_name(self.state.get('authorWorkflow'))}.yaml", "clean_up.yaml"]
+        workflows = [f"{author_workflow_name(self.state.get('authorWorkflow'))}.yaml"]
+        # Without the LaTeX writer the job ends with the critic-approved proof.
+        return workflows + (["clean_up.yaml"] if self.state.get("latexWriter", True) else [])
 
     def _launch_solver_locked(self, statement):
         """Start the author/critic graph followed by final cleanup."""
@@ -2025,6 +2139,11 @@ class App:
             workflow_state = dict(checkpoint["state"])
             workflow_state.pop("paused", None)
             workflow_state.pop("failed", None)
+            if self.state.get("criticOnly"):
+                if checkpoint.get("node") == "author":
+                    raise ValueError("A critic-only job has no proof author to resume.")
+                # Every relaunch of a critic-only job must keep ending on rejection.
+                workflow_state["critic_only"] = True
             previous = dict(self.state)
             if checkpoint.get("goalThreadId"):
                 self.state["goalThreadId"] = checkpoint["goalThreadId"]
@@ -2102,10 +2221,14 @@ class App:
     def _launch_critic_resume_locked(self, statement, solution):
         """Resume the same graph at its critic with the saved candidate."""
 
+        state = {"statement": statement, "solution": solution}
+        if self.state.get("criticOnly"):
+            # The graph ends a critic-only job on rejection instead of starting an author.
+            state["critic_only"] = True
         return self._launch_workflow_locked(
             self._proof_workflows_locked(), "",
             [*self._proof_options_locked(), "--start-node", "critic"],
-            "critic", "critic", state={"statement": statement, "solution": solution},
+            "critic", "critic", state=state,
         )
 
 
@@ -2126,6 +2249,8 @@ class App:
         research_audits=None,
         file_management=True,
         author_workflow=None,
+        latex_writer=None,
+        source_file="",
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -2134,6 +2259,7 @@ class App:
             raise ValueError("Enter a problem statement.")
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
+        source_file = source_file_name(source_file)
         if continuation_source:
             author_workflow = continued_author_workflow(continuation_source, author_workflow)
             file_management = saved_file_management(continuation_source)
@@ -2162,6 +2288,8 @@ class App:
             research_audits=research_audits,
             file_management=file_management,
             author_workflow=author_workflow,
+            latex_writer=(saved_latex_writer(continuation_source) if latex_writer is None and continuation_source
+                          else latex_writer),
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2182,7 +2310,13 @@ class App:
                 "problemMode": "statement",
                 "skipStatementReview": True,
                 "statementReviewOnly": False,
+                "sourceFile": source_file,
             })
+            if continuation_source:
+                # A continued job joins the folder run of the job it continues.
+                batch_summary.register_continuation(
+                    self.runs, continuation_source, self.run_dir.name, source_file,
+                )
             self._save(
                 "checked-statement.md",
                 "# Statement sent directly to the proof author\n\n"
@@ -2195,6 +2329,7 @@ class App:
                 "problemMode": "statement",
                 "skipStatementReview": True,
                 "draft": statement,
+                "sourceFile": source_file,
                 **options,
                 "workflow": DIRECT_GRAPH,
                 "startedAt": datetime.now(timezone.utc).isoformat(),
@@ -2346,18 +2481,39 @@ class App:
         audit_checkpoint="",
         recover_audit_checkpoint=True,
         author_workflow=None,
+        latex_writer=None,
+        critic_only=False,
+        source_file="",
     ):
-        """Create a new job that audits one complete saved candidate proof."""
+        """Create a new job that audits one complete saved candidate proof.
 
+        A critic-only job (critic_only=True) skips both statement review and the
+        author: a pass continues to the LaTeX editor, and a rejection ends the
+        job with the critic's report. Its continuations stay critic-only.
+        """
+
+        if not isinstance(critic_only, bool):
+            raise ValueError("Critic only must be enabled or disabled.")
         statement, solution = str(statement).strip(), str(solution).strip()
+        if critic_only and not source_run:
+            if not statement:
+                raise ValueError("Enter a problem statement.")
+            if not solution:
+                raise ValueError("Enter the complete proof for the critic to check.")
+            if "\0" in statement or "\0" in solution:
+                raise ValueError("The statement and proof cannot contain NUL characters.")
         if not statement or not solution:
             raise ValueError("A saved statement and complete proof are required.")
         if "\0" in statement or "\0" in solution:
             raise ValueError("Saved critic inputs cannot contain NUL characters.")
+        source_file = source_file_name(source_file)
         if source_run:
             # A rejection reopens the source author session, so the graph cannot change.
             author_workflow = continued_author_workflow(source_run, author_workflow)
         file_management = saved_file_management(source_run) if source_run else True
+        if critic_only:
+            # No author runs, so there are no research files, audits, or solvers.
+            file_management = False
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -2376,18 +2532,25 @@ class App:
             include_review=False,
             file_management=file_management,
             author_workflow=author_workflow,
+            latex_writer=(saved_latex_writer(source_run) if latex_writer is None and source_run
+                          else latex_writer),
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
-            source_label = Path(source_run).name if source_run else "saved-proof"
-            self._new_run(statement, f"critic-resume-{source_label}")
+            if source_run:
+                self._new_run(statement, f"critic-resume-{Path(source_run).name}")
+            elif critic_only:
+                self._new_run(statement, f"critic-only-{statement}")
+            else:
+                self._new_run(statement, "critic-resume-saved-proof")
             if not self.fixed_trace:
                 self.pinned = []
             self._prepare_continuation(
                 source_run, "critic", allow_external_source=True,
             )
-            if source_run:
+            if source_run and not critic_only:
+                # Only an author continuation reopens the source workspace and session.
                 options.update(saved_goal_options(source_run))
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
@@ -2396,18 +2559,32 @@ class App:
                 "problemMode": "critic-resume",
                 "skipStatementReview": True,
                 "statementReviewOnly": False,
+                "criticOnly": critic_only,
+                "sourceFile": source_file,
             })
-            self._save("checked-statement.md", f"# Checked statement\n\n{statement}\n")
+            if source_run:
+                batch_summary.register_continuation(
+                    self.runs, source_run, self.run_dir.name, source_file,
+                )
+            if critic_only:
+                self._save(
+                    "checked-statement.md",
+                    f"# Checked statement\n\n{statement}\n\n# Reviewer notes\n\n"
+                    "Statement review and the proof author were skipped: this "
+                    "critic-only job reviews a supplied proof.\n",
+                )
+                if not source_run:
+                    # The critic may replace saved-candidate.md with a fixed proof.
+                    self._save("supplied-proof.md", solution + "\n")
+            else:
+                self._save("checked-statement.md", f"# Checked statement\n\n{statement}\n")
             self._save(runtime.SAVED_CANDIDATE_FILENAME, solution + "\n")
             if audit_checkpoint and critic_uses_parallel_audits():
                 self._save(
                     runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
                     str(audit_checkpoint),
                 )
-            # The cost-optimized critic checkpoints its panel audits as well.
-            if not recover_audit_checkpoint and (
-                critic_uses_parallel_audits() or options["authorWorkflow"] in SIMPLE_ONLY_WORKFLOWS
-            ):
+            if not recover_audit_checkpoint and critic_uses_parallel_audits():
                 self._save(
                     runtime.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME,
                     (
@@ -2424,10 +2601,13 @@ class App:
             self.state = {
                 **empty_state(trace, version),
                 "problemMode": "critic-resume",
+                "skipStatementReview": critic_only,
+                "criticOnly": critic_only,
+                "sourceFile": source_file,
                 "draft": statement,
                 "sourceRun": str(source_run),
                 **options,
-                "workflow": PUBLIC_GRAPH,
+                "workflow": CRITIC_ONLY_GRAPH if critic_only else PUBLIC_GRAPH,
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
@@ -2467,6 +2647,8 @@ class App:
         """Store tagged solver events and build the visible final answer."""
 
         problem, answers, order, final, failed = "", {}, [], False, False
+        # A critic-only graph reports a rejection as a failure_result from the critic.
+        critic_rejected = False
         latest_critic_solution = ""
         last_work_node = self.state["activeNode"]
         try:
@@ -2522,9 +2704,6 @@ class App:
                 elif (
                     record.get("kind") == "request"
                     and record_stage == "critic"
-                    # A cost-optimized round makes four critic requests; its
-                    # critic_result events carry the round number instead.
-                    and self.state.get("authorWorkflow") not in SIMPLE_ONLY_WORKFLOWS
                 ):
                     with self.lock:
                         self.state["round"] += 1
@@ -2580,6 +2759,12 @@ class App:
                     except (OSError, UnicodeError, TypeError, ValueError):
                         # The explicit approval in the transcript remains recoverable.
                         pass
+                    if not self.state.get("latexWriter", True):
+                        # No LaTeX writer runs: the approved proof is the result.
+                        with self.lock:
+                            self.state["output"] = latest_critic_solution
+                            final = True
+                            self._save(FINAL_PROOF_FILENAME, latest_critic_solution + "\n")
                 if record.get("kind") == "final_result":
                     with self.lock:
                         self.state["output"] = record.get("output", "")
@@ -2594,6 +2779,7 @@ class App:
                     continue
                 if record.get("kind") == "failure_result":
                     failed = True
+                    critic_rejected = record_stage == "critic"
                     with self.lock:
                         self.state["output"] = (
                             record.get("output") or record.get("summary")
@@ -2681,10 +2867,14 @@ class App:
                 # A complete terminal record is durable and wins even when Stop
                 # killed the child before it closed stdout cleanly.
                 self._clear_manual_stop()
-                self.state["error"] = (
-                    "Workflow incomplete. See the saved checkpoint and failure report."
-                    if failed else ""
-                )
+                if failed and critic_rejected and self.state.get("criticOnly"):
+                    # The job finished: its output is the critic's report.
+                    self.state["error"] = CRITIC_REJECTED_MESSAGE
+                else:
+                    self.state["error"] = (
+                        "Workflow incomplete. See the saved checkpoint and failure report."
+                        if failed else ""
+                    )
             elif stopped:
                 self.state["error"] = "Stopped."
                 self.state["output"] = self.state["output"] or (
@@ -2697,6 +2887,14 @@ class App:
             self._update_research_audits()
             if self.research_audits is not None:
                 self._save_job_settings(self.state)
+        # Outside the lock: the summary reads every job of the folder run.
+        self._refresh_batch_summaries()
+
+    def _refresh_batch_summaries(self):
+        """Rewrite the summary of each folder run that lists this job."""
+
+        if self.run_dir is not None:
+            batch_summary.refresh_for_run(self.runs, self.run_dir.name)
 
     def clear_trace(self):
         """Clear the saved transcript only when no request is active."""
@@ -2954,6 +3152,16 @@ def saved_file_management(run_dir):
     return not isinstance(settings, dict) or settings.get("fileManagement") is not False
 
 
+def saved_latex_writer(run_dir):
+    """Whether a saved job runs the LaTeX writer; jobs saved before the choice did."""
+
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return True
+    return not (isinstance(settings, dict) and settings.get("latexWriter") is False)
+
+
 def saved_author_workflow(run_dir):
     """Old runs used author_critic; only an explicit known name selects another graph."""
     try:
@@ -2961,6 +3169,22 @@ def saved_author_workflow(run_dir):
     except (OSError, UnicodeError, ValueError):
         return DEFAULT_AUTHOR_WORKFLOW
     return known_author_workflow(settings.get("authorWorkflow") if isinstance(settings, dict) else None)
+
+
+def saved_job_flags(run_dir):
+    """Read whether a saved job was critic-only and which input file it came from."""
+
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        settings = {}
+    settings = settings if isinstance(settings, dict) else {}
+    source_file = settings.get("sourceFile")
+    try:
+        source_file = source_file_name(source_file if isinstance(source_file, str) else None)
+    except ValueError:
+        source_file = ""
+    return {"critic_only": settings.get("criticOnly") is True, "source_file": source_file}
 
 
 def continued_author_workflow(source_run, requested=None):
@@ -3186,6 +3410,8 @@ def saved_run_checkpoints(run_dir):
             "status": "ready",
             "completedAt": _artifact_time(candidate_path),
             "description": (
+                "Run a fresh critic-only review of the saved proof; no author runs."
+                if source["critic_only"] else
                 "Continue at independent critic review without rerunning the "
                 "proof author."
             ),
@@ -3316,16 +3542,24 @@ def restore_saved_app(app):
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
-                "authorWorkflow",
+                "authorWorkflow", "criticOnly", "sourceFile", "latexWriter",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
                     if key in {
                         "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                        "criticOnly", "latexWriter",
                     } and not isinstance(settings[key], bool):
                         continue
                     if key == "authorWorkflow" and settings[key] not in AUTHOR_WORKFLOWS:
                         continue
+                    if key == "sourceFile":
+                        if not isinstance(settings[key], str):
+                            continue
+                        try:
+                            settings[key] = source_file_name(settings[key])
+                        except ValueError:
+                            continue
                     if (
                         key == "problemMode"
                         and settings[key] not in {
@@ -3420,6 +3654,11 @@ def restore_saved_app(app):
         state["workflow"] = REVIEW_ONLY_GRAPH
     elif state["skipStatementReview"]:
         state["workflow"] = DIRECT_GRAPH
+    # Only a critic job without an author can be critic-only.
+    if state["problemMode"] != "critic-resume":
+        state["criticOnly"] = False
+    if state["criticOnly"]:
+        state.update(skipStatementReview=True, workflow=CRITIC_ONLY_GRAPH)
 
     transcript_speed = None
     observed_role_settings = set()
@@ -3428,6 +3667,12 @@ def restore_saved_app(app):
         goal_thread = goal_thread_from_record(record)
         if goal_thread:
             state["goalThreadId"] = goal_thread
+        if (
+            state["criticOnly"] and record.get("kind") == "failure_result"
+            and record.get("stage") == "critic"
+        ):
+            # The critic rejected the supplied proof; its report is the output.
+            state["error"] = CRITIC_REJECTED_MESSAGE
         delivered = record.get("authorSteerDelivered")
         if (record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
                 and record.get("root") is not False and isinstance(delivered, str) and delivered):
@@ -3503,6 +3748,8 @@ def restore_saved_app(app):
         required_roles = {"review"}
     elif state["problemMode"] in {"latex", "final-resume"}:
         required_roles = {"writer"}
+    elif state["criticOnly"]:
+        required_roles = {"critic", "writer"}
     elif state["problemMode"] in {"algorithmic", "critic-resume"}:
         required_roles = {"author", "critic", "writer"}
     else:
@@ -3536,7 +3783,7 @@ def restore_saved_app(app):
     state["lastActivityAt"] = last_time if isinstance(last_time, str) else ""
     state["finishedAt"] = state["lastActivityAt"]
     state["phase"] = "done"
-    for filename in ("final.tex", "failure-summary.md", "partial-output.md"):
+    for filename in ("final.tex", FINAL_PROOF_FILENAME, "failure-summary.md", "partial-output.md"):
         path = run_dir / filename
         if path.is_file():
             try:
@@ -3589,7 +3836,8 @@ def restore_saved_app(app):
             )
     try:
         checkpoint = json.loads((run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-        if checkpoint["status"] in {"paused", "pausing"} and not (run_dir / "final.tex").is_file() and manual_stop is None:
+        finished = (run_dir / "final.tex").is_file() or (run_dir / FINAL_PROOF_FILENAME).is_file()
+        if checkpoint["status"] in {"paused", "pausing"} and not finished and manual_stop is None:
             state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
                          error=checkpoint.get("error", ""))
             if checkpoint.get("goalThreadId"):
@@ -3763,6 +4011,7 @@ def saved_critic_source(path):
         "final_prompt": prompts["final"],
         "audit_checkpoint": audit_checkpoint,
         "author_workflow": workflow,
+        **saved_job_flags(run_dir),
     }
 
 
@@ -3781,6 +4030,10 @@ def saved_research_source(path):
             raise ValueError(f"Cannot read saved author settings: {exc}") from exc
         if not isinstance(settings, dict):
             raise ValueError("Saved author settings must be an object.")
+    if settings.get("criticOnly") is True:
+        raise ValueError(
+            "This critic-only job has no proof author to continue; start a new job instead."
+        )
     for role in ("author", "critic", "writer"):
         if f"{role}Model" in settings:
             settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
@@ -3866,12 +4119,40 @@ class Server(ThreadingHTTPServer):
             research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
             file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
             author_workflow=author_workflow,
+            latex_writer=body.get("latexWriter", app.state.get("latexWriter", True) if run_id else None),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
         self.app = app  # Preserve the small single-app testing interface.
         return app
 
+
+    @staticmethod
+    def _direct_options(body):
+        """Translate one /direct (or folder batch) body into new-job author settings."""
+
+        author_workflow = web_author_workflow(body)
+        if author_workflow in SIMPLE_ONLY_WORKFLOWS:
+            body = {**body, "fileManagement": False}
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        return {
+            "critic_rounds": body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            "thinking_hours": body.get("thinkingHours", DEFAULT_THINKING_HOURS),
+            "author_model": body.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            "critic_model": body.get("criticModel", DEFAULT_CRITIC_MODEL),
+            "writer_model": body.get("writerModel", DEFAULT_WRITER_MODEL),
+            "reasoning_effort": legacy_effort,
+            "author_effort": body.get("authorEffort", legacy_effort),
+            "critic_effort": body.get("criticEffort", legacy_effort),
+            "writer_effort": body.get("writerEffort", legacy_effort),
+            **web_prompt_options(body, ("author", "critic", "final")),
+            "research_audits": body.get("researchAudits"),
+            "file_management": body.get("fileManagement", False),
+            "author_workflow": author_workflow,
+            "latex_writer": body.get("latexWriter"),
+            "speed_mode": body.get("speedMode", DEFAULT_SPEED),
+            "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
+        }
 
     def start_direct_job(self, body, run_id=""):
         """Create a statement job that starts directly with the author."""
@@ -3881,29 +4162,120 @@ class Server(ThreadingHTTPServer):
         app = self.get_job(run_id) if run_id else (
             self.app if self.fixed_app else App(runs=self.runs)
         )
-        author_workflow = web_author_workflow(body)
-        if author_workflow in SIMPLE_ONLY_WORKFLOWS:
-            body = {**body, "fileManagement": False}
-        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_direct_statement(
-            statement=body.get("statement", ""),
+            statement=body.get("statement", ""), **self._direct_options(body),
+        )
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        self.app = app
+        return app
+
+    def start_direct_batch(self, body, run_id=""):
+        """Start one direct proof job per statement, all sharing one set of settings.
+
+        Every statement and the shared settings are validated before any job
+        starts. Each job is an ordinary /direct job (statement review skipped)
+        in its own run folder, and the jobs run in parallel.
+        """
+
+        if run_id:
+            raise ValueError("Start a folder of statements from the home screen.")
+        items = body.get("statements")
+        if not isinstance(items, list) or not 1 <= len(items) <= MAX_BATCH_STATEMENTS:
+            raise ValueError(
+                f"Send between 1 and {MAX_BATCH_STATEMENTS} statements in one folder batch."
+            )
+        statements = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Statement {index} must have a name and a statement.")
+            try:
+                name = source_file_name(item.get("name"))
+            except ValueError as exc:
+                raise ValueError(f"Statement {index}: {exc}") from exc
+            label = name or f"Statement {index}"
+            statement = item.get("statement")
+            if not isinstance(statement, str) or not statement.strip():
+                raise ValueError(f"{label} has no statement.")
+            if "\0" in statement:
+                raise ValueError(f"{label} contains a NUL character.")
+            if len(statement) > MAX_BATCH_STATEMENT_CHARS:
+                raise ValueError(
+                    f"{label} is longer than {MAX_BATCH_STATEMENT_CHARS:,} characters."
+                )
+            statements.append((name, statement.strip()))
+        options = self._direct_options(
+            {key: value for key, value in body.items() if key != "statements"}
+        )
+        # The jobs share these settings: reject them once, before any job starts.
+        App._workflow_options(include_review=False, **options)
+        batch = batch_summary.create_batch(
+            self.runs, folder=batch_folder_name(body.get("folder")),
+            sources=[name for name, _ in statements], workflow=options["author_workflow"],
+            origin="web", workflow_options=workflow_option_defaults(options["author_workflow"]),
+            custom_prompts=[name for name in ("author", "critic", "final")
+                            if options.get(f"{name}_prompt") is not None],
+        )
+        started = []
+        try:
+            for name, statement in statements:
+                app = App(runs=self.runs)
+                app.start_direct_statement(statement, source_file=name, **options)
+                batch_summary.add_run(self.runs, batch["id"], app.run_dir.name, name)
+                app.state["batchId"] = batch["id"]
+                started.append(app)
+                with self.jobs_lock:
+                    self.jobs[app.state["runId"]] = app
+        except Exception as exc:
+            # A launch failed after validation (for example, the disk is full). Stop
+            # the jobs this request started so a retry cannot duplicate them.
+            for app in started:
+                try:
+                    app.stop()
+                except (OSError, ValueError):
+                    pass
+            failed = statements[len(started)][0] or f"statement {len(started) + 1}"
+            stopped = (
+                f" The {len(started)} job{'s' if len(started) != 1 else ''} it had "
+                "already started were stopped." if started else ""
+            )
+            detail = str(exc).rstrip(".") or type(exc).__name__
+            raise ValueError(f"Could not start the job for {failed}: {detail}.{stopped}") from exc
+        try:
+            batch_summary.write_summary(self.runs, batch["id"])
+        except (OSError, ValueError):
+            pass  # Each job rewrites the summary when it stops working.
+        return started
+
+    def start_critic_job(self, body, run_id=""):
+        """Create a critic-only job: a supplied statement and proof, no review or author."""
+
+        if run_id and not self.fixed_app:
+            raise ValueError("Start a critic-only review from the home screen.")
+        app = self.get_job(run_id) if run_id else (
+            self.app if self.fixed_app else App(runs=self.runs)
+        )
+        statement, proof = body.get("statement", ""), body.get("proof", "")
+        if not isinstance(statement, str) or not isinstance(proof, str):
+            raise ValueError("Send the statement and the proof as text.")
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        app.start_critic_resume(
+            statement=statement,
+            solution=proof,
+            critic_only=True,
+            author_workflow=web_author_workflow(body),
+            latex_writer=body.get("latexWriter"),
             critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
             thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
-            author_model=body.get("authorModel", DEFAULT_AUTHOR_MODEL),
             critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
             writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
             reasoning_effort=legacy_effort,
-            author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("author", "critic", "final")),
-            research_audits=body.get("researchAudits"),
-            file_management=body.get("fileManagement", False),
-            author_workflow=author_workflow,
+            **web_prompt_options(body, ("critic", "final")),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
-            reasoning_summary=body.get(
-                "reasoningSummary", DEFAULT_REASONING_SUMMARY
-            ),
+            reasoning_summary=body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
+            source_file=body.get("sourceFile"),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3980,6 +4352,9 @@ class Server(ThreadingHTTPServer):
             ),
             recover_audit_checkpoint=include_audit_checkpoint,
             author_workflow=settings.get("authorWorkflow") or source["author_workflow"],
+            # A critic-only source has no author, so its continuations stay critic-only.
+            critic_only=source["critic_only"],
+            source_file=source["source_file"],
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -4015,6 +4390,7 @@ class Server(ThreadingHTTPServer):
             research_audits=options.get("researchAudits"),
             file_management=options.get("fileManagement", True),
             author_workflow=options.get("authorWorkflow"),
+            source_file=saved_job_flags(source["run_dir"])["source_file"],
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
@@ -4110,16 +4486,21 @@ class Server(ThreadingHTTPServer):
             or source_app.has_active_worker()
         ):
             return None
+        critic_only = bool(state.get("criticOnly"))
         if state.get("phase") == "paused":
-            return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
+            return {"action": "resume", "label": "Resume", "description": (
+                "Continue the critic-only review in the same run folder." if critic_only
+                else "Continue in the same run folder using the saved author session and notebooks.")}
         if state.get("phase") == "prepared":
             return {"action": "prepared", "label": "Start prepared run",
                     "description": "Start a fresh author session in this prepared research workspace."}
         stage = state.get("stoppedStage") or state.get("stage")
+        # A critic job never offers an author continuation; a critic-only job has no author.
+        critic_job = critic_only or state.get("problemMode") == "critic-resume"
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
             and not (source_app.run_dir / "final.tex").is_file()
-            and state.get("problemMode") != "critic-resume"
+            and not critic_job
         ):
             try:
                 saved_statement(source_app.run_dir)
@@ -4136,16 +4517,16 @@ class Server(ThreadingHTTPServer):
                         "the saved time budget."
                     ),
                 }
-        if (
-            stage in {"solve", "repair", "failure"}
-            and state.get("problemMode") == "critic-resume"
-        ):
+        if stage in {"solve", "repair", "failure"} and critic_job:
             if not state.get("checkpoints"):
                 return None
             return {
                 "action": "critic",
                 "label": "Continue from critic",
                 "description": (
+                    "Restores the saved proof for a fresh critic-only review in a new "
+                    "job; a rejection still ends it with the critic's report."
+                    if critic_only else
                     "Restores the saved critic checkpoint so any required "
                     "author repair receives its exact recovery assignment."
                 ),
@@ -4197,6 +4578,9 @@ class Server(ThreadingHTTPServer):
                 "action": "critic",
                 "label": "Continue critic",
                 "description": (
+                    "Restores the saved proof for a fresh critic-only review in a new "
+                    "run with a renewed time budget; no author runs."
+                    if critic_only else
                     "Restores the saved proof for a fresh critic call and "
                     "independent subagents in a new run with a renewed time budget."
                 ),
@@ -4332,6 +4716,7 @@ class Server(ThreadingHTTPServer):
                 "file_management": source_state.get("fileManagement", True),
                 "research_audits": source_state.get("researchAudits"),
                 "author_workflow": source_state.get("authorWorkflow"),
+                "source_file": saved_job_flags(source_run)["source_file"],
                 **common,
             }
             app.start_direct_statement(
@@ -4383,7 +4768,8 @@ class Server(ThreadingHTTPServer):
             apps = list(self.jobs.values())
         jobs = []
         for app in apps:
-            state = app.snapshot()
+            # The list needs no transcript; ask only for records after the current one.
+            state = app.snapshot(after=app.state.get("traceVersion"))
             job = {
                 key: state[key] for key in (
                     "runId", "phase", "draft", "activeNode", "startedAt",
@@ -4392,6 +4778,8 @@ class Server(ThreadingHTTPServer):
                     "settingsWarning",
                 )
             }
+            job["criticOnly"] = bool(state.get("criticOnly"))
+            job["sourceFile"] = state.get("sourceFile") or ""
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
                 if state["problemMode"] == "algorithmic"
@@ -4599,13 +4987,32 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Expected a JSON request.")
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= size <= 100_000:
-                raise ValueError("Request is too large.")
+            limit = (
+                MAX_DOCUMENT_REQUEST_BYTES if request.path in DOCUMENT_REQUEST_PATHS
+                else MAX_REQUEST_BYTES
+            )
+            if not 0 <= size <= limit:
+                raise ValueError(
+                    "Request is too large."
+                    + (f" The limit is {limit // (1024 * 1024)} MB." if limit >= 1024 * 1024 else "")
+                )
             body = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object.")
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
+            if request.path == "/direct-batch":
+                started = self.server.start_direct_batch(body, run_id)
+                batch_id = started[0].state.get("batchId", "") if started else ""
+                return self.send({
+                    "startedJobs": [app.state["runId"] for app in started],
+                    "jobs": self.server.job_list(),
+                    "batchId": batch_id,
+                    "summaryPath": str(
+                        batch_summary.batches_directory(self.server.runs) / batch_id
+                        / batch_summary.SUMMARY_FILENAME
+                    ) if batch_id else "",
+                })
             if request.path == "/resume":
                 app = self.server.resume_paused_job(run_id)
             elif request.path == "/start-research-audit":
@@ -4622,6 +5029,8 @@ class Handler(BaseHTTPRequestHandler):
                 app = self.server.start_job(body, run_id)
             elif request.path == "/direct":
                 app = self.server.start_direct_job(body, run_id)
+            elif request.path == "/critic":
+                app = self.server.start_critic_job(body, run_id)
             elif request.path == "/finalize":
                 app = self.server.start_latex_job(body, run_id)
             else:
@@ -4643,7 +5052,7 @@ class Handler(BaseHTTPRequestHandler):
             elif request.path == "/clear-trace":
                 app.clear_trace()
             elif request.path not in {
-                "/review", "/direct", "/finalize",
+                "/review", "/direct", "/critic", "/finalize",
                 "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume", "/start-research-audit",
             }:
                 return self.send({"error": "Not found."}, status=404)

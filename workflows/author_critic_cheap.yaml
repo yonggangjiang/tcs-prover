@@ -60,78 +60,33 @@ nodes:
         failed: outcome == 'failure'
     next: {done: critic, failure: end}
 
-  # First audit of every new candidate: one full-depth reader. A candidate with
-  # a confirmed central bug goes back to the author without paying for the panel.
+  # The only critic node: one full-depth reviewer reads the proof, fixes every
+  # bug it can, and rejects only for a critical bug it cannot fix. An edited
+  # pass is re-checked by this same node, up to the critic-rounds limit.
   critic:
     run: structured
     role: critic
     stage: critic
-    prompt: screen_input
+    prompt: critic_input
     instructions: critic
     inputs: {statement: state.statement, solution: state.solution}
-    response: {verdict: [fatal, fixable, clean], bugs: string}
+    response: {verdict: [pass, reject], edits: [none, applied], solution: string, bugs: string}
+    # Inconsistent answers fail safe. A copy of the reviewed proof counts as no
+    # edit. Text returned under "none" counts as an applied edit (and is
+    # re-checked) only when it is a full-length different proof, so
+    # placeholders and abridged copies are ignored; applied edits without at
+    # least half of the proof become a reject.
     normalize:
-      verdict: "'fixable' if result.verdict == 'fatal' and not strip(result.bugs) else result.verdict"
-      bugs: "'' if result.verdict == 'clean' else result.bugs"
+      edits: "'none' if result.verdict == 'reject' or normalized_text(result.solution) == normalized_text(state.solution) else ('applied' if result.edits == 'applied' or (strip(result.solution) and len(strip(result.solution)) >= 0.9 * len(strip(state.solution)) and len(strip(result.solution)) + 200 >= len(strip(state.solution))) else 'none')"
+      verdict: "'reject' if result.verdict == 'pass' and result.edits == 'applied' and len(strip(result.solution)) < 0.5 * len(strip(state.solution)) else result.verdict"
+      bugs: "'' if result.verdict == 'pass' else (result.bugs if strip(result.bugs) else 'The critic did not return its decision in usable form; re-check the whole proof for gaps before resubmitting.')"
+      solution: "'' if result.verdict == 'reject' or result.edits == 'none' else result.solution"
     provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
-    outcome: "'reject' if result.verdict == 'fatal' else 'audit'"
+    outcome: "(('stop' if get(state, 'critic_only', False) else 'reject') if result.verdict == 'reject' else ('fixed' if result.edits == 'applied' else 'pass'))"
     before:
     - write: {path: saved-candidate.md, text: state.solution}
     after:
-    - set: {screen: "'(none)' if result.verdict == 'clean' else result.bugs"}
-    next:
-      reject:
-        to: author
-        after:
-        - set:
-            rejections: "get(state, 'rejections', 0) + 1"
-            report: "{'verdict': 'reject', 'solution': state.solution, 'bugs': result.bugs}"
-        - set: {round: state.rejections}
-        - emit: {kind: critic_result, label: 'Critic first audit', report: '=state.report', round: '=state.round', text: '{raw}'}
-      audit: critic_panel
-
-  # Two independent audits run by the controller (fresh contexts, no subagent
-  # tools, checkpointed), then one judge that fixes local bugs and decides.
-  critic_panel:
-    run: structured
-    role: critic
-    stage: critic
-    prompt: judge_input
-    instructions: critic
-    parallel:
-      items:
-      - "attempts to break the argument: try to construct counterexamples to each key lemma and to the final claim; test boundary, degenerate, and extreme cases; check every quantifier order, inequality direction, and constant."
-      - "completeness and fidelity: whether the theorem proved is exactly the statement; whether every cited external result is stated with its hypotheses and those hypotheses hold where it is applied; whether every term is defined and no omitted step needs more than one routine line; for algorithms, correctness, the running-time or resource bound, and any probability bound."
-      prompt: audit_input
-      instructions: [critic]
-      inputs: {statement: state.statement, solution: state.solution, focus: item}
-      response: {verdict: [issues, no_issues], report: string}
-      provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
-      checkpoint:
-        file: critic-panel-audits.json
-        identity: {statement: state.statement, solution: state.solution, instructions: instructions, panel: "'author_critic_cheap/panel-2'"}
-    inputs:
-      statement: state.statement
-      solution: state.solution
-      screen: "get(state, 'screen', '(none)')"
-      audits: json(parallel)
-    response: {verdict: [pass, reject], edits: [none, harmless, substantive], solution: string, bugs: string}
-    # Inconsistent answers fail safe. Harmless (cosmetic) rewrites are never
-    # applied, so no unaudited text replaces the reviewed proof. Text returned
-    # under "none" counts as a substantive edit (re-audited) only when it is a
-    # full-length different proof; placeholders and abridged copies are
-    # ignored. Substantive edits without most of the text become a reject.
-    normalize:
-      edits: "'none' if result.verdict == 'reject' or result.edits == 'harmless' else ('substantive' if result.edits == 'substantive' or (strip(result.solution) and normalized_text(result.solution) != normalized_text(state.solution) and len(strip(result.solution)) >= 0.9 * len(strip(state.solution)) and len(strip(result.solution)) + 200 >= len(strip(state.solution))) else 'none')"
-      verdict: "'reject' if result.verdict == 'pass' and result.edits == 'substantive' and len(strip(result.solution)) < 0.5 * len(strip(state.solution)) else result.verdict"
-      bugs: "'' if result.verdict == 'pass' else (result.bugs if strip(result.bugs) else 'The critic did not return its decision in usable form. These audit reports were not adjudicated; check each one yourself and fix the real ones in place: ' + json(parallel))"
-      solution: "'' if result.verdict == 'reject' or result.edits == 'none' else result.solution"
-    provider_options: {openai: {timeout: 3600}, deepseek: {timeout: 3600}}
-    outcome: "'reject' if result.verdict == 'reject' else ('fixed' if result.edits == 'substantive' else 'pass')"
-    after:
-    - set:
-        solution: "strip(result.solution) if result.edits != 'none' and strip(result.solution) else state.solution"
-        screen: "'(none: this round re-checks the critic-corrected proof)'"
+    - set: {solution: "strip(result.solution) if result.edits == 'applied' and strip(result.solution) else state.solution"}
     - set: {report: "{'verdict': result.verdict, 'solution': state.solution, 'bugs': result.bugs}"}
     - write: {path: saved-candidate.md, text: state.solution}
     - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=state.report', round: '=visit', text: '{raw}'}
@@ -141,11 +96,17 @@ nodes:
         after:
         - set: {rejections: "get(state, 'rejections', 0) + 1"}
         - set: {round: state.rejections}
+      # A critic-only job has no author: a rejection ends it with the report.
+      stop:
+        to: end
+        after:
+        - set: {failed: "True", output: "'The critic rejected the proof. Unresolved bugs:\\n\\n' + result.bugs"}
+        - emit: {kind: failure_result, label: Critic rejected the proof, output: '=state.output'}
       pass:
         to: end
         after:
         - set: {output: state.solution}
-        - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed.'}
+        - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed without edits.'}
       fixed:
         repeat: 2
         option: critic_rounds
@@ -205,22 +166,24 @@ prompts:
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
   repair: |-
-    The critic rejected your candidate (rejection {round}). The candidate it reviewed is saved in {candidate_file}; it {candidate_note}. Unresolved bugs:
+    The critic rejected your candidate. The candidate it reviewed is saved in {candidate_file}; it {candidate_note}. Unresolved bugs:
 
     {bugs}
 
-    Reviewers can be wrong, and their LOCAL and CENTRAL labels are advisory. First check each bug yourself (verify any claimed counterexample against every hypothesis); if it is not a real error, keep that part and say why in one sentence at that point of the revised proof. A confirmed bug is LOCAL if it can be fixed in place without changing a main lemma, reduction, invariant, or construction (supplying a missing proof of a true claim is LOCAL), and CENTRAL if it breaks one of them or the statement may be false. Fix LOCAL bugs in place and keep everything else unchanged. For a confirmed CENTRAL bug, do not patch around it: replace the broken construction with a materially different one (another member of the same family qualifies only if you can say in one line why the failure does not apply to it), and test its first non-routine step on the smallest meaningful instance before writing it out. Once the revised proof is complete, finish as rule 7 says: call update_goal with status "complete" and give the complete revised proof as the final message of that turn.
+    The critic can be wrong. First check each bug yourself (verify any claimed counterexample against every hypothesis); if it is not a real error, keep that part and say why in one sentence at that point of the revised proof. A confirmed bug is LOCAL if it can be fixed in place without changing a main lemma, reduction, invariant, or construction (supplying a missing proof of a true claim is LOCAL), and CENTRAL if it breaks one of them or the statement may be false. Fix LOCAL bugs in place and keep everything else unchanged. For a confirmed CENTRAL bug, do not patch around it: replace the broken construction with a materially different one (another member of the same family qualifies only if you can say in one line why the failure does not apply to it), and test its first non-routine step on the smallest meaningful instance before writing it out. Once the revised proof is complete, finish as rule 7 says: call update_goal with status "complete" and give the complete revised proof as the final message of that turn.
 
-  # Shared review standard: the instructions of the first audit, both panel
-  # audits, and the judge.
+  # The critic's review standard, editable per job; critic_input adds the
+  # statement, the proof, and the fixed decision rules.
   critic: |-
-    You are an independent reviewer of a candidate proof of the exact statement given below. Work alone.
-    A bug is a load-bearing error or gap: a false or unjustified claim the conclusion depends on; a missing case or boundary case; a hidden or unverified hypothesis, including the hypotheses of a cited result at the point where it is applied; circular reasoning; an undefined term or symbol; or a proof of a different, weaker, or special-case statement. Words such as "clearly", "standard", or "similarly" do not justify a non-routine step, and an unjustified load-bearing step is a bug even when you cannot show it false.
-    Not a bug: a routine step a competent reader completes in one line, a typo, notation, or a wrong citation number or attribution when the cited mathematics is correct and applies. Never reject for these.
-    The candidate may instead claim that the statement is false as written. Review such a disproof by the same standard: it must refute exactly this statement, for example with a counterexample that provably satisfies every hypothesis and violates the conclusion. A correct disproof resolves the task; it is not a proof of a different statement.
-    For each bug, quote its exact location, explain why the step is false or not justified by what precedes it (give a counterexample when you can), and label it LOCAL (fixable in place, including a missing argument you can supply) or CENTRAL (it breaks a main lemma, reduction, invariant, or construction, or closing it needs a new idea). Drop an objection only when you find the step justified.
+    Act as a rigorous proof critic, working alone. Review the candidate proof of the exact statement below and fix every bug you can.
+
+    First check that the candidate proves exactly the statement (quantifiers, model of computation, parameters, bounds, and every case), or, if it claims the statement is false, that it refutes exactly the statement as written. Then verify every claim and inference step by step, and try to break the argument: look for a counterexample to each key lemma and to the final claim; test boundary, degenerate, and extreme cases; check every quantifier order, inequality direction, and constant; and, for an algorithm, check its correctness, its running-time or resource bound, and any probability bound.
+
+    A bug is a load-bearing error or gap: a false or unjustified claim the conclusion depends on; a missing case or boundary case; a hidden or unverified hypothesis, including the hypotheses of a cited result at the point where it is applied; circular reasoning; an undefined term or symbol; or a proof of a different, weaker, or special-case statement. Words such as "clearly", "standard", or "similarly" do not justify a non-routine step, and an unjustified load-bearing step is a bug even when you cannot show it false. Not a bug: a routine step a competent reader completes in one line, a typo or notation choice that changes no mathematical statement, or a wrong citation number or attribution when the cited mathematics is correct and applies; never reject for these, and do not edit them. A wrong symbol, index, constant, sign, or inequality inside a formula is a bug even when it looks like a typo; fix it. A disproof is judged by the same standard: it must refute exactly this statement, for example with a counterexample that provably satisfies every hypothesis and violates the conclusion.
+
     Use web search only to confirm the exact statement and hypotheses of an external result the candidate cites, and stop once it is confirmed.
-  screen_input: |
+  critic_input: |
+    CRITIC INSTRUCTIONS:
     {instructions}
 
     STATEMENT:
@@ -229,42 +192,9 @@ prompts:
     CANDIDATE PROOF:
     {solution}
 
-    YOUR TASK (first audit): First check that the candidate proves exactly the statement (quantifiers, model of computation, parameters, bounds, and every case), or, if it claims the statement is false, that it refutes exactly the statement as written. Then verify the whole proof step by step and list every bug you find.
-    - verdict "fatal": at least one CENTRAL bug that you have confirmed (check any counterexample against every hypothesis, and re-read every line the failing step depends on), or the candidate proves a different or weaker statement. If you are not sure that a bug is CENTRAL, label it LOCAL; the next stage adjudicates it.
-    - verdict "fixable": every bug you found is LOCAL.
-    - verdict "clean": you found no bug.
-    bugs: every bug you found, each with its location, explanation, and LOCAL or CENTRAL label; empty only for "clean".
-    Return only the requested JSON.
-  audit_input: |
-    {instructions}
-
-    STATEMENT:
-    {statement}
-
-    CANDIDATE PROOF:
-    {solution}
-
-    YOUR TASK (independent audit): Verify the whole proof yourself and list every bug you find. Give special attention to {focus}
-    Return verdict "issues" with every bug in report (location, explanation, LOCAL or CENTRAL, and the fix if you see one), or verdict "no_issues" with an empty report.
-    Return only the requested JSON.
-  judge_input: |
-    {instructions}
-
-    STATEMENT:
-    {statement}
-
-    CANDIDATE PROOF:
-    {solution}
-
-    FIRST AUDIT (its bugs and LOCAL/CENTRAL labels are unverified):
-    {screen}
-
-    INDEPENDENT AUDITS (JSON):
-    {audits}
-
-    YOUR TASK (final decision): Read the proof yourself and examine every reported bug; discard the ones that are not real. Fix every real LOCAL bug yourself, defining missing terms and expanding omitted arguments, and check each fix.
-    - verdict "reject" if a real bug remains that you cannot fix rigorously here. Your corrected text is then discarded, so list in bugs every real bug (location, explanation, LOCAL or CENTRAL), including each LOCAL bug you fixed, with its exact fix under it. On reject, return edits "none" and an empty solution.
-    - verdict "pass" otherwise, with empty bugs.
-    - edits: "none" if you changed nothing; "harmless" if you changed only typos, notation, formatting, or citation details and no mathematical statement or argument step (a changed symbol, index, constant, sign, or inequality inside a formula is substantive); "substantive" if you changed or added any mathematical statement or argument step.
-    - solution: on pass with "substantive" edits, the complete corrected proof, every line of it, never abbreviated; otherwise an empty string. Never copy an unchanged proof, and do not rewrite the proof for harmless edits: they are not applied.
+    DECISION: Fix every bug you can fix rigorously here: correct errors, define missing terms, supply missing cases and arguments, and check each fix. A bug you cannot fix rigorously here is critical.
+    - verdict "reject" only if a critical bug remains. Your corrected text is then discarded, so list in bugs every bug you found: its exact location (quote it), why it breaks the argument (give a counterexample when you can), and, for each bug you fixed, the exact fix. Return edits "none" and an empty solution.
+    - verdict "pass" if the proof has no bug or you fixed all of them; bugs is then empty.
+    - edits: "none" if you changed nothing; "applied" if you fixed at least one bug.
+    - solution: when edits is "applied", the complete corrected proof, every line of it, never abbreviated; otherwise an empty string. Never copy an unchanged proof.
     Return only the requested JSON.

@@ -1,4 +1,5 @@
-"""Serve the TCS Prover UI or prove one or more Markdown statements."""
+"""Serve the TCS Prover UI, prove one or more Markdown statements, or check a
+supplied proof with the critic only."""
 
 import argparse
 import errno
@@ -11,13 +12,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 import workflow_runner as runtime
+from . import batch_summary
 from .review import review_worker_main
 from .server import (
-    App, Server, AUTHOR_WORKFLOWS, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
-    DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
-    DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, EFFORTS, HOST,
-    MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
-    saved_critic_source, saved_research_source,
+    App, Server, AUTHOR_WORKFLOWS, CRITIC_REJECTED_MESSAGE, DEFAULT_AUTHOR_MODEL,
+    DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT,
+    DEFAULT_REASONING_SUMMARY, DEFAULT_SPEED, DEFAULT_THINKING_HOURS,
+    DEFAULT_WRITER_MODEL, EFFORTS, HOST, MODELS, NEW_JOB_AUTHOR_WORKFLOW, PORT,
+    REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
+    saved_critic_source, saved_research_source, workflow_option_defaults,
 )
 
 ACTIVE_PHASES = {"reviewing", "running", "stopping"}
@@ -187,13 +190,17 @@ def direct_cli_options(
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
     author_workflow=None,
+    latex_writer=False,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
-    Terminal runs keep the managed author_critic default; author_critic_cheap
-    always runs the simple author without research files, audits, or solvers.
+    Terminal runs default to author_critic_cheap, which always runs the simple
+    author without research files, audits, or solvers; author_critic keeps the
+    managed author with research files.
     """
 
+    if author_workflow is None:
+        author_workflow = NEW_JOB_AUTHOR_WORKFLOW
     prompt_files = {
         "author": author_prompt_file,
         "critic": critic_prompt_file,
@@ -220,9 +227,11 @@ def direct_cli_options(
         reasoning_summary=reasoning_summary,
         include_review=False,
         author_workflow=author_workflow,
+        latex_writer=latex_writer,
     )
     return {
         "author_workflow": options["authorWorkflow"],
+        "latex_writer": options["latexWriter"],
         "file_management": options["fileManagement"],
         "critic_rounds": options["criticRounds"],
         "thinking_hours": options["thinkingHours"],
@@ -300,7 +309,21 @@ def run_headless_markdown(
     files = markdown_inputs(path)
     statements = [(source, read_utf8(source, "statement")) for source in files]
     options = direct_cli_options(**settings)
-    batch = Path(path).expanduser().resolve().is_dir()
+    folder = Path(path).expanduser().resolve()
+    batch = folder.is_dir()
+    batch_id = ""
+    if batch:
+        # One summary for the whole folder run, rewritten as its jobs finish.
+        batch_id = batch_summary.create_batch(
+            runs, folder=folder.name, folder_path=str(folder),
+            sources=[source.name for source, _ in statements],
+            workflow=options["author_workflow"], origin="terminal",
+            workflow_options=workflow_option_defaults(options["author_workflow"]),
+            custom_prompts=[
+                role for role in ("author", "critic", "final")
+                if settings.get(f"{role}_prompt_file")
+            ],
+        )["id"]
     output_lock = threading.Lock()
     apps = []
     try:
@@ -316,7 +339,11 @@ def run_headless_markdown(
                 )
             app = App(runs=runs, output_stream=job_output)
             apps.append((source, app))
-            app.start_direct_statement(statement=statement, **options)
+            app.start_direct_statement(
+                statement=statement, source_file=source.name, **options,
+            )
+            if batch_id:
+                batch_summary.add_run(runs, batch_id, app.run_dir.name, source.name)
             print(
                 f"[{source.name}] Proof started in {app.run_dir}",
                 file=error_stream, flush=True,
@@ -324,10 +351,19 @@ def run_headless_markdown(
     except KeyboardInterrupt:
         _stop_headless_apps(apps)
         print("All active proofs stopped.", file=error_stream, flush=True)
+        _print_batch_summary(runs, batch_id, error_stream)
         return 130
     except Exception:
         _stop_headless_apps(apps)
+        _print_batch_summary(runs, batch_id, error_stream)
         raise
+    if batch_id:
+        path = _write_batch_summary(runs, batch_id)
+        if path:
+            print(
+                f"Folder run summary (rewritten as jobs finish): {path}",
+                file=error_stream, flush=True,
+            )
 
     try:
         while any(app.snapshot()["phase"] in ACTIVE_PHASES for _, app in apps):
@@ -335,6 +371,7 @@ def run_headless_markdown(
     except KeyboardInterrupt:
         _stop_headless_apps(apps)
         print("All active proofs stopped.", file=error_stream, flush=True)
+        _print_batch_summary(runs, batch_id, error_stream)
         return 130
 
     failed = False
@@ -352,7 +389,25 @@ def run_headless_markdown(
                 f"[{source.name}] Proof finished in {app.run_dir}",
                 file=error_stream, flush=True,
             )
+    _print_batch_summary(runs, batch_id, error_stream)
     return 1 if failed else 0
+
+
+def _write_batch_summary(runs, batch_id):
+    """Rewrite one folder run's summary; return its path, or None if that failed."""
+
+    try:
+        return batch_summary.write_summary(runs, batch_id)
+    except (OSError, ValueError):
+        return None
+
+
+def _print_batch_summary(runs, batch_id, error_stream):
+    if not batch_id:
+        return
+    path = _write_batch_summary(runs, batch_id)
+    if path:
+        print(f"Folder run summary: {path}", file=error_stream, flush=True)
 
 
 def run_headless_critic_resume(
@@ -428,6 +483,98 @@ def run_headless_critic_resume(
     return 0
 
 
+def run_headless_critic_only(
+    statement_path, proof_path, runs=RUNS, output_stream=None, error_stream=None,
+    verbose_events=False, critic_rounds=DEFAULT_CRITIC_ROUNDS,
+    thinking_hours=DEFAULT_THINKING_HOURS,
+    critic_model=DEFAULT_CRITIC_MODEL, writer_model=DEFAULT_WRITER_MODEL,
+    reasoning_effort=DEFAULT_REASONING_EFFORT,
+    critic_effort=None, writer_effort=None,
+    speed_mode=DEFAULT_SPEED,
+    reasoning_summary=DEFAULT_REASONING_SUMMARY,
+    critic_prompt_file=None, final_prompt_file=None,
+    author_workflow=None,
+    latex_writer=False,
+):
+    """Check one supplied proof with the critic only: no statement review, no author.
+
+    Returns 0 when the critic passes and the LaTeX editor succeeds, and 1 when
+    the critic rejects (its report is saved in the run folder) or a stage fails.
+    """
+
+    output_stream = sys.stdout if output_stream is None else output_stream
+    error_stream = sys.stderr if error_stream is None else error_stream
+    files = markdown_inputs(statement_path)
+    if len(files) != 1 or Path(statement_path).expanduser().resolve().is_dir():
+        raise ValueError("A critic-only review needs one statement file, not a folder.")
+    source = files[0]
+    statement = read_utf8(source, "statement")
+    proof = read_utf8(proof_path, "proof")
+    prompts = {
+        "critic_prompt": read_utf8(critic_prompt_file, "critic prompt") if critic_prompt_file else None,
+        "final_prompt": read_utf8(final_prompt_file, "final prompt") if final_prompt_file else None,
+    }
+    lock = threading.Lock()
+    job_output = (
+        output_stream if verbose_events
+        else ConciseHeadlessOutput(output_stream, lock, source.name)
+    )
+    app = App(runs=runs, output_stream=job_output)
+    try:
+        app.start_critic_resume(
+            statement=statement,
+            solution=proof,
+            critic_only=True,
+            author_workflow=author_workflow or NEW_JOB_AUTHOR_WORKFLOW,
+            latex_writer=latex_writer,
+            critic_rounds=critic_rounds,
+            thinking_hours=thinking_hours,
+            critic_model=critic_model,
+            writer_model=writer_model,
+            reasoning_effort=reasoning_effort,
+            critic_effort=critic_effort,
+            writer_effort=writer_effort,
+            speed_mode=speed_mode,
+            reasoning_summary=reasoning_summary,
+            source_file=source.name,
+            **prompts,
+        )
+        print(
+            f"[{source.name}] Critic-only review started in {app.run_dir}",
+            file=error_stream, flush=True,
+        )
+        while app.snapshot()["phase"] in ACTIVE_PHASES:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        try:
+            app.stop()
+        except ValueError:
+            pass
+        print(f"[{source.name}] Critic-only review stopped.", file=error_stream, flush=True)
+        return 130
+    error = app.snapshot().get("error", "")
+    if error == CRITIC_REJECTED_MESSAGE:
+        print(
+            f"[{source.name}] The critic rejected the proof. Report: "
+            f"{app.run_dir / 'failure-summary.md'}",
+            file=error_stream, flush=True,
+        )
+        return 1
+    if error:
+        print(
+            f"[{source.name}] Critic-only review failed: {error}",
+            file=error_stream, flush=True,
+        )
+        return 1
+    print(
+        f"[{source.name}] The critic passed the proof. "
+        + (f"LaTeX: {app.run_dir / 'final.tex'}" if latex_writer
+           else f"Proof: {app.run_dir / 'final-proof.md'}"),
+        file=error_stream, flush=True,
+    )
+    return 0
+
+
 def main():
     """Run Markdown proofs from the terminal or start the browser interface."""
 
@@ -437,16 +584,31 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Markdown runs skip statement review and start with the proof author.\n\n"
             "examples:\n"
-            "  python3 web_ui.py statement.md                   "
-            "managed author_critic run\n"
-            "  python3 web_ui.py statement.md --workflow cheap  "
-            "cost-optimized author_critic_cheap run"
+            "  python3 web_ui.py statement.md                           "
+            "cost-optimized run (default)\n"
+            "  python3 web_ui.py statement.md --workflow author_critic  "
+            "managed run with research files\n"
+            "  python3 web_ui.py statements/                            "
+            "one parallel job per top-level .md file\n"
+            "  python3 web_ui.py statement.md --critic-only proof.md    "
+            "check proof.md with the critic only"
         ),
     )
     parser.add_argument(
         "input_path", nargs="?",
         help="UTF-8 .md statement file or folder of top-level .md files",
+    )
+    parser.add_argument(
+        "-criticOnly", "--criticOnly", "--critic-only", dest="critic_only",
+        metavar="PROOF",
+        help=(
+            "check PROOF, a UTF-8 file with a complete proof of the statement in "
+            "input_path, with the critic only: no statement review and no author. "
+            "A pass continues to the LaTeX editor (exit status 0); a rejection ends "
+            "the job with the critic's report (exit status 1)"
+        ),
     )
     parser.add_argument(
         "--resume-critic", metavar="RUN",
@@ -462,20 +624,42 @@ def main():
             "budget; saved settings are kept unless explicitly overridden"
         ),
     )
+    parser.add_argument(
+        "-summary", "--summary", dest="summary", nargs="+", metavar="RUN",
+        help=(
+            "write the folder-run summary of existing jobs and print its path: a batch "
+            "folder under runs/batches/, or run folders under runs/ (a new batch then "
+            "lists them, and its summary is kept up to date when they resume)"
+        ),
+    )
+    parser.add_argument(
+        "-summaryName", "--summaryName", "--summary-name", dest="summary_name",
+        metavar="NAME", default="",
+        help="folder name shown in a summary written for run folders",
+    )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
         "--verbose-events", action="store_true",
         help="print every public JSONL event during a Markdown terminal run",
     )
     parser.add_argument(
+        "-latex", "--latex", dest="latex", action="store_true",
+        help=(
+            "also run the LaTeX writer and compile a PDF after the critic approves "
+            "(off by default: a new run ends with the approved proof in "
+            "final-proof.md). A resumed job keeps its saved choice"
+        ),
+    )
+    parser.add_argument(
         "-workflow", "--workflow", dest="workflow", type=workflow_argument,
         default=None, metavar="NAME",
         help=(
-            "author/critic workflow for a Markdown run: author_critic (default; "
-            "managed research files) or author_critic_cheap (alias: cheap; the "
-            "cost-optimized simple author with no research files, audits, or "
-            "fresh-eyes solvers). A resumed job keeps its saved workflow and "
-            "rejects a different NAME"
+            "author/critic workflow for a Markdown or critic-only run: "
+            "author_critic_cheap (alias: cheap; the default; the cost-optimized "
+            "simple author with no research files, audits, or fresh-eyes solvers) "
+            "or author_critic (the managed author with research files, the earlier "
+            "terminal default). A resumed job keeps its saved workflow and rejects "
+            "a different NAME"
         ),
     )
     parser.add_argument(
@@ -485,7 +669,8 @@ def main():
         help=(
             "allow up to N consecutive critic repair rounds "
             f"(default: {DEFAULT_CRITIC_ROUNDS}); an unchanged pass finishes "
-            "early, an edited pass finishes at N, and rejection returns to the author"
+            "early, an edited pass finishes at N, and rejection returns to the author "
+            "(with --critic-only, a rejection ends the job)"
         ),
     )
     parser.add_argument(
@@ -540,6 +725,35 @@ def main():
         )
     args = parser.parse_args()
     resume_source = None
+    if args.summary:
+        if args.input_path or args.critic_only or args.resume_critic or args.resume_research:
+            parser.error("--summary cannot be combined with a statement, --critic-only, or a resume.")
+        try:
+            path = batch_summary.summarize_existing(RUNS, args.summary, args.summary_name)
+        except (OSError, ValueError) as exc:
+            print(f"Cannot write the summary: {exc}", file=sys.stderr)
+            return 1
+        print(path)
+        return 0
+    if args.summary_name:
+        parser.error("--summary-name applies only with --summary.")
+    if args.critic_only is not None:
+        if args.resume_critic or args.resume_research:
+            parser.error("--critic-only cannot be combined with --resume-critic or --resume-author.")
+        if not args.input_path:
+            parser.error(
+                "--critic-only needs the statement file: "
+                "python3 web_ui.py statement.md --critic-only proof.md"
+            )
+        statement_path = Path(args.input_path).expanduser()
+        if statement_path.is_dir():
+            parser.error(
+                f"--critic-only checks the proof of one statement file, not a folder: {args.input_path}"
+            )
+        if not statement_path.is_file():
+            parser.error(f"The statement file does not exist: {args.input_path}")
+        if not Path(args.critic_only).expanduser().is_file():
+            parser.error(f"The proof file does not exist: {args.critic_only}")
     if sum(bool(value) for value in (args.input_path, args.resume_critic, args.resume_research)) > 1:
         parser.error("Choose only one of input_path, --resume-critic, or --resume-author.")
     if args.workflow is not None and not (args.input_path or args.resume_critic or args.resume_research):
@@ -555,6 +769,28 @@ def main():
             return 1
     if args.input_path:
         runtime.configure_standard_streams()
+        if args.critic_only is not None:
+            try:
+                return run_headless_critic_only(
+                    args.input_path, args.critic_only,
+                    critic_rounds=args.critic_rounds,
+                    thinking_hours=args.thinking_hours,
+                    critic_model=args.critic_model,
+                    writer_model=args.writer_model,
+                    reasoning_effort=args.reasoning_effort,
+                    critic_effort=args.critic_effort,
+                    writer_effort=args.writer_effort,
+                    speed_mode=args.speed_mode,
+                    reasoning_summary=args.reasoning_summary,
+                    critic_prompt_file=args.critic_prompt_file,
+                    final_prompt_file=args.final_prompt_file,
+                    author_workflow=args.workflow,
+                    latex_writer=args.latex,
+                    verbose_events=args.verbose_events,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"Cannot start critic-only review: {exc}", file=sys.stderr)
+                return 1
         try:
             return run_headless_markdown(
                 args.input_path,
@@ -573,6 +809,7 @@ def main():
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
                 author_workflow=args.workflow,
+                latex_writer=args.latex,
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:

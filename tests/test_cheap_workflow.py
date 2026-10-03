@@ -19,36 +19,22 @@ UI_OPTIONS = {"author_effort": "ultra", "critic_effort": "ultra", "writer_effort
               "effort": "ultra", "critic_rounds": 2}
 
 
-def screen(verdict="clean", bugs=""):
-    return {"verdict": verdict, "bugs": bugs}
-
-
-def audit(verdict="no_issues", report=""):
-    return {"verdict": verdict, "report": report}
-
-
-def judge(verdict="pass", edits="none", solution="", bugs=""):
+def review(verdict="pass", edits="none", solution="", bugs=""):
     return {"verdict": verdict, "edits": edits, "solution": solution, "bugs": bugs}
 
 
 class Critic:
     """Scripted structured calls, recognised by the response schema."""
 
-    def __init__(self, screens=(), judges=(), audit_value=None):
-        self.screens, self.judges = list(screens), list(judges)
-        self.audit_value = audit_value or audit()
+    def __init__(self, reviews=()):
+        self.reviews = list(reviews)
         self.calls = []
 
     def __call__(self, prompt, schema, stage, **settings):
-        fields = set(schema["properties"])
-        if "latex" in fields:
+        if "latex" in schema["properties"]:
             kind, value = "final", {"latex": LATEX}
-        elif "edits" in fields:
-            kind, value = "judge", self.judges.pop(0)
-        elif "report" in fields:
-            kind, value = "audit", self.audit_value
         else:
-            kind, value = "screen", self.screens.pop(0)
+            kind, value = "critic", self.reviews.pop(0)
         self.calls.append((kind, prompt, settings))
         runtime.validate_json_schema(value, schema)
         return value, json.dumps(value)
@@ -64,27 +50,30 @@ class WorkflowDefinitionTests(unittest.TestCase):
         for managed in (True, False):
             prompts = runtime.prepare(workflow, {**workflow["options"], **UI_OPTIONS, "file_management": managed})
             self.assertEqual(prompts["author"].count("[STATEMENT]"), 1)
-        self.assertEqual(set(workflow["nodes"]), {"author", "critic", "critic_panel"})
-        self.assertEqual(workflow["nodes"]["critic"]["stage"], "critic")
-        self.assertEqual(workflow["nodes"]["critic_panel"]["stage"], "critic")
-        self.assertEqual(workflow["nodes"]["critic_panel"]["next"]["fixed"]["option"], "critic_rounds")
+        # Exactly one critic node, directly after the author.
+        self.assertEqual(list(workflow["nodes"]), ["author", "critic"])
+        self.assertEqual(workflow["nodes"]["author"]["next"], {"done": "critic", "failure": "end"})
+        critic = workflow["nodes"]["critic"]
+        self.assertEqual((critic["run"], critic["stage"]), ("structured", "critic"))
+        self.assertNotIn("parallel", critic)
+        self.assertEqual(critic["schema"]["properties"]["verdict"]["enum"], ["pass", "reject"])
+        self.assertEqual(critic["schema"]["properties"]["edits"]["enum"], ["none", "applied"])
+        self.assertEqual(critic["next"]["reject"]["to"], "author")
+        self.assertEqual(critic["next"]["fixed"]["option"], "critic_rounds")
         self.assertIn("checkpoint", workflow["nodes"]["author"]["lifecycle"])
 
-    def test_every_structured_request_has_a_long_timeout_and_no_subagents(self):
-        nodes = runtime.load_workflow(CHEAP)["nodes"]
-        requests = [nodes["critic"], nodes["critic_panel"], nodes["critic_panel"]["parallel"]]
-        for request in requests:
-            self.assertGreaterEqual(request["provider_options"]["openai"]["timeout"], 1800)
-            self.assertNotIn("multi_agent", request.get("features", []))
+    def test_the_critic_request_has_a_long_timeout_and_no_subagents(self):
+        critic = runtime.load_workflow(CHEAP)["nodes"]["critic"]
+        self.assertGreaterEqual(critic["provider_options"]["openai"]["timeout"], 1800)
+        self.assertNotIn("multi_agent", critic.get("features", []))
 
     def test_ultra_keeps_its_per_request_depth_without_delegation(self):
         workflow = runtime.load_workflow(CHEAP)
         options = {**workflow["options"], **UI_OPTIONS}
         nodes = workflow["nodes"]
-        panel = {"role": nodes["critic_panel"]["role"], **nodes["critic_panel"]["parallel"]}
-        for node in (nodes["author"], nodes["critic"], nodes["critic_panel"], panel):
+        for node in (nodes["author"], nodes["critic"]):
             self.assertEqual(runtime._settings(node, options)["effort"], "xhigh")
-        self.assertEqual(runtime._structured_options(panel, options)["effort"], "xhigh")
+        self.assertEqual(runtime._structured_options(nodes["critic"], options)["effort"], "xhigh")
         self.assertEqual(runtime._settings(nodes["author"], {**options, "author_effort": "high"})["effort"], "high")
         # Codex sends ultra as max for models without a multi-agent effort.
         self.assertEqual(runtime._settings(nodes["critic"], {**options, "critic_model": "gpt-5.6-sol"})["effort"], "max")
@@ -183,121 +172,110 @@ class CheapPipelineTests(unittest.TestCase):
             saved = (directory / "saved-candidate.md").read_text().strip()
         return result, events, saved
 
-    def test_clean_candidate_gets_three_reads_and_no_copied_proof(self):
-        critic = Critic(screens=[screen()], judges=[judge()])
+    def test_clean_pass_makes_one_critic_call_and_no_copied_proof(self):
+        critic = Critic([review()])
         result, events, saved = self.run_cheap(critic, chain=True)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge", "final"])
+        self.assertEqual(critic.kinds(), ["critic", "final"])
         self.assertEqual(result["solution"], PROOF)
         self.assertEqual(result["output"], LATEX)
         self.assertEqual(saved, PROOF)
-        for kind, prompt, settings in critic.calls[:4]:
-            self.assertIn(PROOF, prompt)
-            self.assertEqual(settings["effort"], "xhigh")
-            self.assertEqual(settings["timeout"], 3600)
-            self.assertIn("skills.include_instructions=false", settings["config_overrides"])
-            self.assertEqual(settings.get("features", []), [])
-        self.assertNotIn("config_overrides", critic.calls[4][2])
+        _, prompt, settings = critic.calls[0]
+        self.assertIn(PROOF, prompt)
+        self.assertIn("fix every bug you can", prompt)
+        self.assertEqual(settings["effort"], "xhigh")
+        self.assertEqual(settings["timeout"], 3600)
+        self.assertIn("skills.include_instructions=false", settings["config_overrides"])
+        self.assertEqual(settings.get("features", []), [])
+        self.assertNotIn("config_overrides", critic.calls[1][2])
         labels = [fields.get("label") for _, fields in events]
         self.assertEqual(labels.count("Critic approved"), 1)
         report = next(fields["report"] for args, fields in events if args[0] == "critic_result")
         self.assertEqual(report, {"verdict": "pass", "solution": PROOF, "bugs": ""})
 
-    def test_fatal_first_audit_returns_to_author_without_the_panel(self):
-        critic = Critic(screens=[screen("fatal", "Lemma 2 fails for n = 1."), screen()], judges=[judge()])
+    def test_reject_returns_the_bugs_to_the_same_author(self):
+        critic = Critic([review("reject", bugs="Lemma 2 fails for n = 1."), review()])
         result, events, _ = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "screen", "audit", "audit", "judge"])
+        self.assertEqual(critic.kinds(), ["critic", "critic"])
         self.assertEqual(self.session.call_count, 1)
         self.assertEqual(self.feedback[0]["bugs"], "Lemma 2 fails for n = 1.")
         self.assertEqual(self.feedback[0]["round"], 1)
-        self.assertEqual(self.feedback[0]["candidate_note"], "is your last final answer (read the file if that answer is no longer in your context)")
+        self.assertEqual(self.feedback[0]["candidate_note"],
+                         "is your last final answer (read the file if that answer is no longer in your context)")
+        path = Path(self.feedback[0]["candidate_file"])
+        self.assertTrue(path.is_absolute())
+        self.assertEqual(path.name, "saved-candidate.md")
         self.assertEqual(result["output"], PROOF + " revised")
         rejected = next(fields["report"] for args, fields in events if args[0] == "critic_result")
         self.assertEqual(rejected, {"verdict": "reject", "solution": PROOF, "bugs": "Lemma 2 fails for n = 1."})
 
-    def test_fatal_verdict_without_bugs_is_audited_instead_of_rejected(self):
-        critic = Critic(screens=[screen("fatal", " ")], judges=[judge()])
-        result, _, _ = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge"])
-        self.assertEqual(result["output"], PROOF)
-
-    def test_substantive_edits_rerun_the_panel_up_to_the_round_limit(self):
-        edits = [judge(edits="substantive", solution=PROOF + " fix" * n) for n in (1, 2, 3)]
-        critic = Critic(screens=[screen("fixable", "Define f.")], judges=edits)
+    def test_applied_edits_are_rechecked_by_the_same_node_up_to_the_round_limit(self):
+        fixes = [review(edits="applied", solution=PROOF + " fix" * n) for n in (1, 2, 3)]
+        critic = Critic(fixes)
         result, events, saved = self.run_cheap(critic, options={"critic_rounds": 3})
-        self.assertEqual(critic.kinds(), ["screen"] + ["audit", "audit", "judge"] * 3)
-        self.assertIn("Define f.", critic.calls[3][1])
-        self.assertIn(PROOF + " fix", critic.calls[4][1])
-        self.assertNotIn("Define f.", critic.calls[6][1])
+        self.assertEqual(critic.kinds(), ["critic"] * 3)
+        self.assertIn(PROOF + " fix fix", critic.calls[2][1])
         self.assertEqual(result["output"], PROOF + " fix fix fix")
         self.assertEqual(saved, result["output"])
         self.assertEqual([fields.get("label") for _, fields in events].count("Critic approved"), 1)
 
-    def test_harmless_edits_pass_without_another_round_and_are_not_applied(self):
-        # Cosmetic rewrites are never applied, so no unaudited text replaces the reviewed proof.
-        critic = Critic(screens=[screen()], judges=[judge(edits="harmless", solution=PROOF + " (typo fixed)")])
+    def test_a_clean_recheck_accepts_the_corrected_proof(self):
+        critic = Critic([review(edits="applied", solution=PROOF + " with the missing case."), review()])
         result, _, _ = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge"])
-        self.assertEqual(result["output"], PROOF)
+        self.assertEqual(critic.kinds(), ["critic", "critic"])
+        self.assertEqual(result["output"], PROOF + " with the missing case.")
 
-    def test_placeholder_text_under_no_edits_keeps_the_reviewed_proof(self):
-        critic = Critic(screens=[screen()], judges=[judge(solution="N/A")])
-        result, _, saved = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge"])
-        self.assertEqual(result["output"], PROOF)
-        self.assertEqual(saved, PROOF)
-
-    def test_harmless_label_without_full_text_keeps_the_reviewed_proof(self):
-        for text in ("", PROOF[:20] + " [... rest unchanged ...]"):
-            with self.subTest(text=text):
-                critic = Critic(screens=[screen()], judges=[judge(edits="harmless", solution=text)])
-                result, _, _ = self.run_cheap(critic)
-                self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge"])
-                self.assertEqual(result["output"], PROOF)
-
-    def test_substantive_fix_with_abridged_text_is_rejected_with_the_audits(self):
-        critic = Critic(screens=[screen(), screen()], judges=[judge(edits="substantive", solution="Short."), judge()],
-                        audit_value=audit("issues", "Case n = 0 is missing."))
-        result, _, _ = self.run_cheap(critic)
-        self.assertIn("were not adjudicated", self.feedback[0]["bugs"])
-        self.assertIn("Case n = 0 is missing.", self.feedback[0]["bugs"])
-        self.assertEqual(result["output"], PROOF + " revised")
-
-    def test_repair_names_the_candidate_file_by_absolute_path(self):
-        critic = Critic(screens=[screen("fatal", "Lemma 2 fails for n = 1."), screen()], judges=[judge()])
+    def test_reject_after_a_fix_points_the_author_to_the_corrected_file(self):
+        critic = Critic([review(edits="applied", solution=PROOF + " fixed."),
+                         review("reject", bugs="Step 4 is still open."), review()])
         self.run_cheap(critic)
-        path = Path(self.feedback[0]["candidate_file"])
-        self.assertTrue(path.is_absolute())
-        self.assertEqual(path.name, "saved-candidate.md")
+        self.assertEqual(self.feedback[0]["candidate_note"], "is not in this conversation; read it before revising")
 
-    def test_changed_proof_labelled_unedited_is_reaudited(self):
-        critic = Critic(screens=[screen()], judges=[judge(solution=PROOF + " silently changed"), judge()])
+    def test_edits_without_the_corrected_text_become_a_reject(self):
+        for text in ("", "Short."):
+            with self.subTest(text=text):
+                self.feedback, self.revisions = [], [PROOF + " revised"]
+                critic = Critic([review(edits="applied", solution=text), review()])
+                result, _, _ = self.run_cheap(critic)
+                self.assertIn("re-check the whole proof", self.feedback[0]["bugs"])
+                self.assertEqual(result["output"], PROOF + " revised")
+
+    def test_reject_without_bugs_still_tells_the_author_what_to_do(self):
+        critic = Critic([review("reject", bugs=" "), review()])
+        self.run_cheap(critic)
+        self.assertIn("re-check the whole proof", self.feedback[0]["bugs"])
+
+    def test_a_changed_proof_labelled_none_is_rechecked(self):
+        critic = Critic([review(solution=PROOF + " silently changed"), review()])
         result, _, _ = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge", "audit", "audit", "judge"])
+        self.assertEqual(critic.kinds(), ["critic", "critic"])
         self.assertEqual(result["output"], PROOF + " silently changed")
 
-    def test_verbatim_copy_counts_as_no_edit(self):
-        critic = Critic(screens=[screen()], judges=[judge(solution=PROOF + "\n")])
-        result, _, _ = self.run_cheap(critic)
-        self.assertEqual(critic.kinds(), ["screen", "audit", "audit", "judge"])
+    def test_placeholders_and_copies_under_none_keep_the_reviewed_proof(self):
+        for text in ("N/A", PROOF + "\n", PROOF[:20] + " [... rest unchanged ...]"):
+            with self.subTest(text=text):
+                critic = Critic([review(solution=text)])
+                result, _, saved = self.run_cheap(critic)
+                self.assertEqual(critic.kinds(), ["critic"])
+                self.assertEqual(result["output"], PROOF)
+                self.assertEqual(saved, PROOF)
+
+    def test_a_verbatim_copy_labelled_applied_needs_no_recheck(self):
+        critic = Critic([review(edits="applied", solution=PROOF + "\n")])
+        result, events, _ = self.run_cheap(critic, options={"critic_rounds": 1})
+        self.assertEqual(critic.kinds(), ["critic"])
         self.assertEqual(result["output"], PROOF)
+        self.assertIn("Round 1 passed without edits.", [fields.get("text") for _, fields in events])
 
-    def test_judge_reject_keeps_the_candidate_and_sends_only_bugs(self):
-        critic = Critic(screens=[screen(), screen()],
-                        judges=[judge("reject", bugs="The bound in Lemma 3 is off by log n."), judge()])
-        result, _, _ = self.run_cheap(critic)
-        self.assertEqual(self.feedback[0]["bugs"], "The bound in Lemma 3 is off by log n.")
-        self.assertEqual(self.feedback[0]["candidate_note"], "is your last final answer (read the file if that answer is no longer in your context)")
-        self.assertEqual(result["output"], PROOF + " revised")
-
-    def test_declared_edits_without_text_become_a_reject_not_an_approval(self):
-        critic = Critic(screens=[screen(), screen()], judges=[judge(edits="substantive"), judge()],
-                        audit_value=audit("issues", "Case n = 0 is missing."))
-        result, _, _ = self.run_cheap(critic)
-        self.assertIn("Case n = 0 is missing.", self.feedback[0]["bugs"])
-        self.assertEqual(result["output"], PROOF + " revised")
+    def test_decision_rules_survive_an_edited_critic_prompt(self):
+        critic = Critic([review()])
+        self.run_cheap(critic, options={"prompts": {"critic": "An older review standard."}})
+        prompt = critic.calls[0][1]
+        self.assertIn("An older review standard.", prompt)
+        self.assertIn('verdict "reject" only if a critical bug remains', prompt)
+        self.assertIn('"none" if you changed nothing', prompt)
 
     def test_critic_resume_rejection_points_a_new_author_to_the_saved_candidate(self):
-        critic = Critic(screens=[screen("fatal", "Gap in step 4."), screen()], judges=[judge()])
+        critic = Critic([review("reject", bugs="Gap in step 4."), review()])
         result, _, _ = self.run_cheap(critic, state={"statement": "Task", "solution": PROOF},
                                       options={"start_node": "critic"})
         instruction = self.author_kwargs["initial_instruction"]
@@ -393,11 +371,11 @@ class StructuredCommandTests(unittest.TestCase):
     def test_old_mocks_without_config_overrides_keep_working(self):
         def legacy(prompt, schema, stage, model, effort, speed, summary, timeout=None,
                    activity_label=None, features=()):
-            return json.dumps({"verdict": "clean", "bugs": ""})
+            return json.dumps({"verdict": "pass", "edits": "none", "solution": "", "bugs": ""})
         schema = runtime.load_workflow(CHEAP)["nodes"]["critic"]["schema"]
         with patch.object(runtime, "run_structured_attempt", side_effect=legacy), patch.object(runtime, "emit"):
             report, _ = runtime.structured("Prompt", schema, "critic", attempts=1)
-        self.assertEqual(report["verdict"], "clean")
+        self.assertEqual(report["verdict"], "pass")
 
 
 if __name__ == "__main__":
