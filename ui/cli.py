@@ -17,7 +17,7 @@ from .review import review_worker_main
 from .server import (
     App, Server, AUTHOR_WORKFLOWS, CRITIC_REJECTED_MESSAGE, DEFAULT_AUTHOR_MODEL,
     DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT,
-    DEFAULT_REASONING_SUMMARY, DEFAULT_SPEED, DEFAULT_THINKING_HOURS,
+    DEFAULT_QUOTA_PAUSE_REMAINING, DEFAULT_REASONING_SUMMARY, DEFAULT_SPEED, DEFAULT_THINKING_HOURS,
     DEFAULT_WRITER_MODEL, EFFORTS, HOST, MODELS, NEW_JOB_AUTHOR_WORKFLOW, PORT,
     REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
     saved_critic_source, saved_research_source, workflow_option_defaults,
@@ -191,6 +191,7 @@ def direct_cli_options(
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
     author_workflow=None,
     latex_writer=False,
+    quota_pause_remaining=None,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
@@ -228,10 +229,12 @@ def direct_cli_options(
         include_review=False,
         author_workflow=author_workflow,
         latex_writer=latex_writer,
+        quota_pause_remaining=quota_pause_remaining,
     )
     return {
         "author_workflow": options["authorWorkflow"],
         "latex_writer": options["latexWriter"],
+        "quota_pause_remaining": options["quotaPauseRemaining"],
         "file_management": options["fileManagement"],
         "critic_rounds": options["criticRounds"],
         "thinking_hours": options["thinkingHours"],
@@ -257,6 +260,7 @@ def research_resume_cli_settings(args, argv):
     fields = {
         "criticRounds": ("critic_rounds", "critic-rounds"),
         "thinkingHours": ("thinking_hours", "thinking-hours"),
+        "quotaPauseRemaining": ("quota_pause_remaining", "quota-pause-remaining"),
         "reasoningEffort": ("reasoning_effort", "reasoning-effort"),
         "speedMode": ("speed_mode", "speed-mode"),
         "reasoningSummary": ("reasoning_summary", "reasoning-summary"),
@@ -495,6 +499,7 @@ def run_headless_critic_only(
     critic_prompt_file=None, final_prompt_file=None,
     author_workflow=None,
     latex_writer=False,
+    quota_pause_remaining=None,
 ):
     """Check one supplied proof with the critic only: no statement review, no author.
 
@@ -527,6 +532,7 @@ def run_headless_critic_only(
             critic_only=True,
             author_workflow=author_workflow or NEW_JOB_AUTHOR_WORKFLOW,
             latex_writer=latex_writer,
+            quota_pause_remaining=quota_pause_remaining,
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
             critic_model=critic_model,
@@ -679,6 +685,14 @@ def main():
         metavar="HOURS",
         help=f"total elapsed-workflow limit (default: {DEFAULT_THINKING_HOURS})",
     )
+    parser.add_argument(
+        "-quotaPauseRemaining", "--quotaPauseRemaining", "--quota-pause-remaining",
+        dest="quota_pause_remaining", type=int, default=None, metavar="PERCENT",
+        help=(
+            "pause the job when this percent of the weekly Codex quota is left "
+            f"(default: {DEFAULT_QUOTA_PAUSE_REMAINING}; 0 never pauses)"
+        ),
+    )
     model_defaults = {
         "author": DEFAULT_AUTHOR_MODEL,
         "critic": DEFAULT_CRITIC_MODEL,
@@ -786,6 +800,7 @@ def main():
                     final_prompt_file=args.final_prompt_file,
                     author_workflow=args.workflow,
                     latex_writer=args.latex,
+                    quota_pause_remaining=args.quota_pause_remaining,
                     verbose_events=args.verbose_events,
                 )
             except (OSError, TypeError, ValueError) as exc:
@@ -810,6 +825,7 @@ def main():
                 final_prompt_file=args.final_prompt_file,
                 author_workflow=args.workflow,
                 latex_writer=args.latex,
+                quota_pause_remaining=args.quota_pause_remaining,
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
@@ -857,6 +873,8 @@ def main():
             # Only an explicit --workflow is forwarded; it must match the saved job.
             if args.workflow is not None:
                 resume_settings["authorWorkflow"] = args.workflow
+            if args.quota_pause_remaining is not None:
+                resume_settings["quotaPauseRemaining"] = args.quota_pause_remaining
             if args.resume_research:
                 resume_app = server.start_saved_research_job(
                     resume_source["run_dir"],
