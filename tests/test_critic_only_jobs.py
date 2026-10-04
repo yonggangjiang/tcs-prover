@@ -616,7 +616,7 @@ Promise.resolve(vm.runInNewContext(setup + code + process.argv[3], {assert, WORK
   assert.deepEqual(JSON.parse(JSON.stringify(sent.body)), {
     statement: 'Exact statement', proof: 'Complete proof.', authorWorkflow: 'author_critic_cheap',
     criticModel: 'gpt-5.6-sol', criticEffort: 'high', writerModel: 'gpt-5.6-luna', writerEffort: 'medium',
-    promptOverrides: {critic: 'Custom critic.'}, criticRounds: 3, thinkingHours: 2, latexWriter: false,
+    promptOverrides: {critic: 'Custom critic.'}, criticRounds: 3, thinkingHours: 2, latexWriter: false, quotaPauseRemaining: 10,
     speedMode: 'fast', reasoningSummary: 'concise',
   });
   assert.equal(currentJob, 'critic-job');
