@@ -125,8 +125,8 @@
                   </select>
                   <label class="effort-label" for="reviewEffort">Reasoning</label>
                   <select id="reviewEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -144,8 +144,8 @@
                   </select>
                   <label class="effort-label" for="authorEffort">Reasoning</label>
                   <select id="authorEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -163,8 +163,8 @@
                   </select>
                   <label class="effort-label" for="criticEffort">Reasoning</label>
                   <select id="criticEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -182,8 +182,8 @@
                   </select>
                   <label class="effort-label" for="writerEffort">Reasoning</label>
                   <select id="writerEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — highest</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -192,11 +192,11 @@
                 </div>
               </div>
               <p id="modelHelp" class="help model-help">
-                Astra and Ultra are the defaults for every role. DeepSeek remains
+                Astra at Max reasoning is the default for every role. DeepSeek remains
                 available through the official API with DEEPSEEK_API_KEY and
                 always runs at standard speed.
               </p>
-              <input id="reasoningEffort" type="hidden" value="ultra">
+              <input id="reasoningEffort" type="hidden" value="max">
               <div class="prompt-setting">
                 <div>
                   <strong>Role prompts</strong>
@@ -277,6 +277,16 @@
                   A continued run starts with a renewed time budget.
                 </p>
               </div>
+              <div id="quotaPauseSetting" class="round-setting">
+                <label for="quotaPauseRemaining">Pause when weekly Codex quota left (%)</label>
+                <input id="quotaPauseRemaining" type="number" min="0" max="99"
+                  step="1" value="10" aria-describedby="quotaPauseHelp">
+                <p id="quotaPauseHelp" class="help">
+                  Default 10%. The job saves its work and pauses when this much
+                  of the weekly usage window is left; continue it after the
+                  reset. 0 never pauses.
+                </p>
+              </div>
               <details id="researchAuditsSetting" class="research-audits research-audits-initial" hidden>
                 <summary>Research audits <span>Optional independent suggestions</span></summary>
                 <div class="research-audit-fields">
@@ -292,7 +302,7 @@
               </details>
             </details>
             <div class="composer-actions">
-              <span id="modelSummary">Cost-optimized workflow · Astra/Ultra author, critic</span>
+              <span id="modelSummary">Cost-optimized workflow · Astra/Max author, critic</span>
               <div class="composer-buttons">
                 <button id="runFolderButton" class="secondary" type="button"
                   aria-describedby="runFolderHelp">Run a folder…</button>

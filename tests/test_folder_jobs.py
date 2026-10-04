@@ -242,7 +242,7 @@ let state = {phase: 'input', workflow: {settings: {}}};
 const simpleOnlyWorkflows = new Set(['author_critic_cheap']);
 const values = {authorWorkflow: 'author_critic_cheap', authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
   writerModel: 'gpt-5.6-luna', authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
-  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168'};
+  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168', quotaPauseRemaining: '15'};
 const ui = new Proxy({fileManagement: {checked: false}}, {get(target, name) {
   return target[name] ||= {dataset: {}, value: values[name], scrollIntoView() { this.scrolled = true; }};
 }});
@@ -295,7 +295,7 @@ const checks = `
     authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol', writerModel: 'gpt-5.6-luna',
     authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
     promptOverrides: {critic: 'Shared critic.'}, authorWorkflow: 'author_critic_cheap', latexWriter: false, fileManagement: false,
-    criticRounds: 2, thinkingHours: 168,
+    criticRounds: 2, thinkingHours: 168, quotaPauseRemaining: 15,
     researchAudits: {intervalHours: 0, models: ['none', 'none', 'none']},
     speedMode: 'fast', reasoningSummary: 'concise',
   });

@@ -29,6 +29,7 @@ const ui = {
   criticEffort: $("criticEffort"), writerEffort: $("writerEffort"),
   criticRounds: $("criticRounds"), roundRejectHelp: $("roundRejectHelp"),
   thinkingHours: $("thinkingHours"),
+  quotaPauseRemaining: $("quotaPauseRemaining"), quotaPauseSetting: $("quotaPauseSetting"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
   skipReviewSetting: $("skipReviewSetting"),
@@ -477,6 +478,7 @@ function setProblemMode(mode) {
     ? "Unfixable issues end the job with the critic's report."
     : "Unfixable issues return to the author and reset the count.";
   show(ui.thinkingHoursSetting, critic);
+  if (ui.quotaPauseSetting) show(ui.quotaPauseSetting, critic);
   // A folder batch starts one direct proof job per file.
   show(ui.runFolder, author);
   show(ui.runFolderHelp, author);
@@ -2069,10 +2071,10 @@ function render(next) {
     ui.authorModel.value = state.authorModel || "gpt-6-astra";
     ui.criticModel.value = state.criticModel || "gpt-6-astra";
     ui.writerModel.value = state.writerModel || "gpt-6-astra";
-    ui.reviewEffort.value = state.reviewEffort || "ultra";
-    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
-    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
-    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    ui.reviewEffort.value = state.reviewEffort || "max";
+    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "max";
+    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
+    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
     ui.speedMode.value = state.speedMode || "fast";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
@@ -2086,6 +2088,7 @@ function render(next) {
     ui.criticRounds.min = rounds.minimum || 1;
     ui.criticRounds.max = rounds.maximum || 100;
     ui.thinkingHours.value = state.thinkingHours || 168;
+    if (ui.quotaPauseRemaining) ui.quotaPauseRemaining.value = state.quotaPauseRemaining ?? 10;
     ui.thinkingHours.min = hours.minimum || 0.01;
     ui.thinkingHours.max = hours.maximum || 168;
     fillResearchAuditControls();
@@ -2098,10 +2101,10 @@ function render(next) {
     ui.authorModel.value = state.authorModel || "gpt-6-astra";
     ui.criticModel.value = state.criticModel || "gpt-6-astra";
     ui.writerModel.value = state.writerModel || "gpt-6-astra";
-    ui.reviewEffort.value = state.reviewEffort || "ultra";
-    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
-    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
-    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    ui.reviewEffort.value = state.reviewEffort || "max";
+    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "max";
+    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
+    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
     ui.speedMode.value = state.speedMode || "fast";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     syncPrompts(state);
@@ -2112,6 +2115,7 @@ function render(next) {
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
     ui.thinkingHours.value = state.thinkingHours || 168;
+    if (ui.quotaPauseRemaining) ui.quotaPauseRemaining.value = state.quotaPauseRemaining ?? 10;
     fillResearchAuditControls();
     checkEdited();
     reviewPending = false;
@@ -2276,6 +2280,7 @@ function proofJobSettings() {
     fileManagement: managesResearchFiles(),
     criticRounds: Number(ui.criticRounds.value),
     thinkingHours: Number(ui.thinkingHours.value),
+    quotaPauseRemaining: Number(ui.quotaPauseRemaining?.value ?? 10),
     researchAudits: managesResearchFiles() ? researchAuditValues()
       : { intervalHours: 0, models: ["none", "none", "none"] },
     speedMode: ui.speedMode.value,
@@ -2297,6 +2302,7 @@ function criticOnlyRequest(statement, proof) {
       .filter(([name]) => ["critic", "final"].includes(name))),
     criticRounds: Number(ui.criticRounds.value),
     thinkingHours: Number(ui.thinkingHours.value),
+    quotaPauseRemaining: Number(ui.quotaPauseRemaining?.value ?? 10),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
   };

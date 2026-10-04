@@ -45,6 +45,8 @@ DEFAULT_REASONING_EFFORT = runtime.EFFORT
 DEFAULT_REVIEW_EFFORT = runtime.REVIEW_EFFORT
 REASONING_SUMMARIES = runtime.REASONING_SUMMARIES
 DEFAULT_REASONING_SUMMARY = runtime.DEFAULT_REASONING_SUMMARY
+# Percent of the Codex usage window left when a job pauses; 0 never pauses.
+DEFAULT_QUOTA_PAUSE_REMAINING = 100 - runtime.DEFAULT_QUOTA_PAUSE_PERCENT
 STOP_TIMEOUT_SECONDS = 2
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
@@ -359,7 +361,7 @@ PUBLIC_GRAPH = {
         "research_audits": {**audits.default_settings(), "choices": audits.model_choices()},
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
-        "model_summary": "Astra/Ultra review · Astra/Ultra author, critic, writer",
+        "model_summary": "Astra/Max review · Astra/Max author, critic, writer",
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
             "minimum": 1,
@@ -559,6 +561,7 @@ def empty_state(trace=None, trace_version=0):
         "criticOnly": False,
         "sourceFile": "",
         "latexWriter": True,
+        "quotaPauseRemaining": DEFAULT_QUOTA_PAUSE_REMAINING,
         "fileManagement": False,
         "authorWorkflow": DEFAULT_AUTHOR_WORKFLOW,
         "preparedRun": False,
@@ -765,7 +768,7 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
-            "authorWorkflow", "latexWriter",
+            "authorWorkflow", "latexWriter", "quotaPauseRemaining",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         settings = {key: options[key] for key in keys if key in options}
@@ -1519,6 +1522,7 @@ class App:
         file_management=True,
         author_workflow=None,
         latex_writer=None,
+        quota_pause_remaining=None,
     ):
         """Normalize and validate settings shared by both input modes."""
 
@@ -1615,6 +1619,7 @@ class App:
             raise ValueError(
                 f"Choose more than 0 and at most {MAX_THINKING_HOURS} hours."
             )
+        quota_pause_remaining = quota_remaining(quota_pause_remaining)
         return {
             "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
             "authorModel": author_model,
@@ -1640,6 +1645,7 @@ class App:
             "fileManagement": file_management,
             "authorWorkflow": author_workflow,
             "latexWriter": latex_writer,
+            "quotaPauseRemaining": quota_pause_remaining,
             "researchAudits": audits.normalize_settings(research_audits) if file_management else {
                 **audits.default_settings(), "models": ["none", "none", "none"]},
         }
@@ -1664,6 +1670,7 @@ class App:
         file_management=True,
         author_workflow=None,
         latex_writer=None,
+        quota_pause_remaining=None,
     ):
         """Start the review and return immediately so the page can poll."""
 
@@ -1708,6 +1715,9 @@ class App:
             author_workflow=author_workflow,
             latex_writer=(saved_latex_writer(continuation_source) if latex_writer is None and continuation_source
                           else latex_writer),
+            quota_pause_remaining=(saved_quota_pause_remaining(continuation_source)
+                                   if quota_pause_remaining is None and continuation_source
+                                   else quota_pause_remaining),
         )
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -1977,6 +1987,8 @@ class App:
             "--author-limit-file", str(author_limit_file),
             "--author-steer-file", str(author_steer_file),
             "--set", "file_management=" + json.dumps(self.state.get("fileManagement", True)),
+            "--set", "quota_pause_percent=" + json.dumps(quota_pause_percent(
+                self.state.get("quotaPauseRemaining", DEFAULT_QUOTA_PAUSE_REMAINING))),
         ]
         for role in ("author", "critic", "writer"):
             options.extend([
@@ -2250,6 +2262,7 @@ class App:
         file_management=True,
         author_workflow=None,
         latex_writer=None,
+        quota_pause_remaining=None,
         source_file="",
     ):
         """Send a statement directly to the proof author without review."""
@@ -2290,6 +2303,9 @@ class App:
             author_workflow=author_workflow,
             latex_writer=(saved_latex_writer(continuation_source) if latex_writer is None and continuation_source
                           else latex_writer),
+            quota_pause_remaining=(saved_quota_pause_remaining(continuation_source)
+                                   if quota_pause_remaining is None and continuation_source
+                                   else quota_pause_remaining),
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -2482,6 +2498,7 @@ class App:
         recover_audit_checkpoint=True,
         author_workflow=None,
         latex_writer=None,
+        quota_pause_remaining=None,
         critic_only=False,
         source_file="",
     ):
@@ -2534,6 +2551,9 @@ class App:
             author_workflow=author_workflow,
             latex_writer=(saved_latex_writer(source_run) if latex_writer is None and source_run
                           else latex_writer),
+            quota_pause_remaining=(saved_quota_pause_remaining(source_run)
+                                   if quota_pause_remaining is None and source_run
+                                   else quota_pause_remaining),
         )
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -3152,6 +3172,39 @@ def saved_file_management(run_dir):
     return not isinstance(settings, dict) or settings.get("fileManagement") is not False
 
 
+def quota_remaining(value):
+    """Validate the usage-window percent left at which a job pauses."""
+
+    if value is None:
+        return DEFAULT_QUOTA_PAUSE_REMAINING
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("The quota pause point must be a whole percentage.")
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise ValueError("The quota pause point must be a whole percentage.") from exc
+    if not number.is_integer() or not 0 <= number <= 99:
+        raise ValueError("Pause when 0 to 99 percent of the weekly quota is left (0 never pauses).")
+    return int(number)
+
+
+def quota_pause_percent(remaining):
+    """The runner's used-percent threshold; 0 turns the pause off."""
+
+    remaining = quota_remaining(remaining)
+    return 0 if remaining == 0 else 100 - remaining
+
+
+def saved_quota_pause_remaining(run_dir):
+    """A saved job's quota pause point; jobs saved before the choice used the default."""
+
+    try:
+        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+        return quota_remaining(settings.get("quotaPauseRemaining") if isinstance(settings, dict) else None)
+    except (OSError, UnicodeError, ValueError):
+        return DEFAULT_QUOTA_PAUSE_REMAINING
+
+
 def saved_latex_writer(run_dir):
     """Whether a saved job runs the LaTeX writer; jobs saved before the choice did."""
 
@@ -3542,7 +3595,7 @@ def restore_saved_app(app):
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
-                "authorWorkflow", "criticOnly", "sourceFile", "latexWriter",
+                "authorWorkflow", "criticOnly", "sourceFile", "latexWriter", "quotaPauseRemaining",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
@@ -3553,6 +3606,11 @@ def restore_saved_app(app):
                         continue
                     if key == "authorWorkflow" and settings[key] not in AUTHOR_WORKFLOWS:
                         continue
+                    if key == "quotaPauseRemaining":
+                        try:
+                            quota_remaining(settings[key])
+                        except ValueError:
+                            continue
                     if key == "sourceFile":
                         if not isinstance(settings[key], str):
                             continue
@@ -4120,6 +4178,8 @@ class Server(ThreadingHTTPServer):
             file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
             author_workflow=author_workflow,
             latex_writer=body.get("latexWriter", app.state.get("latexWriter", True) if run_id else None),
+            quota_pause_remaining=body.get(
+                "quotaPauseRemaining", app.state.get("quotaPauseRemaining") if run_id else None),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -4150,6 +4210,7 @@ class Server(ThreadingHTTPServer):
             "file_management": body.get("fileManagement", False),
             "author_workflow": author_workflow,
             "latex_writer": body.get("latexWriter"),
+            "quota_pause_remaining": body.get("quotaPauseRemaining"),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
         }
@@ -4265,6 +4326,7 @@ class Server(ThreadingHTTPServer):
             critic_only=True,
             author_workflow=web_author_workflow(body),
             latex_writer=body.get("latexWriter"),
+            quota_pause_remaining=body.get("quotaPauseRemaining"),
             critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
             thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
             critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
@@ -4352,6 +4414,7 @@ class Server(ThreadingHTTPServer):
             ),
             recover_audit_checkpoint=include_audit_checkpoint,
             author_workflow=settings.get("authorWorkflow") or source["author_workflow"],
+            quota_pause_remaining=settings.get("quotaPauseRemaining"),
             # A critic-only source has no author, so its continuations stay critic-only.
             critic_only=source["critic_only"],
             source_file=source["source_file"],
@@ -4390,6 +4453,7 @@ class Server(ThreadingHTTPServer):
             research_audits=options.get("researchAudits"),
             file_management=options.get("fileManagement", True),
             author_workflow=options.get("authorWorkflow"),
+            quota_pause_remaining=options.get("quotaPauseRemaining"),
             source_file=saved_job_flags(source["run_dir"])["source_file"],
         )
         self._queue_saved_author_instructions(source["run_dir"], app)
