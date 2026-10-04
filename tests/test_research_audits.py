@@ -958,7 +958,9 @@ class AuditProviderTests(unittest.TestCase):
 
     def test_codex_tools_and_session_are_isolated(self):
         model = next(row for row in audits.load_config()["models"] if row["value"] == "gpt-6-astra")
-        with tempfile.TemporaryDirectory() as directory, patch.object(audits.shutil, "which", return_value="codex"), patch.object(audits.subprocess, "Popen", side_effect=self.fake_process):
+        with tempfile.TemporaryDirectory() as directory, patch.object(audits.shutil, "which", return_value="codex"), \
+                patch.object(audits.subprocess, "Popen", side_effect=self.fake_process), \
+                patch.dict(os.environ, {"TCS_PROVER_SANDBOX": "0"}):
             result = audits.run_auditor(model, "Read and advise", Path(directory), threading.Event())
         self.assertEqual(result["text"], "An independent report")
         self.assertIn("read-only", self.command)

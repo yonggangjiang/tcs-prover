@@ -372,12 +372,16 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
     with tempfile.TemporaryDirectory(prefix="tcs-audit-answer-") as directory:
         answer = Path(directory) / "answer.md"
         if model["provider"] == "codex":
+            sandboxed = runtime.run_sandbox_enabled()
             command = [
-                executable, "-m", model["model"],
+                os.path.realpath(executable) if sandboxed else executable, "-m", model["model"],
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
                 "-c", 'web_search="live"', "-c", "tools.web_search=true",
                 "--disable", "multi_agent", "--enable", "shell_tool",
-                "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
+                # Read-only, and on macOS limited to this audit's workspace.
+                *(runtime.run_sandbox_arguments(workspace, writable=False) if sandboxed
+                  else ["-s", "read-only"]),
+                "-C", str(workspace), "-a", "never", "exec",
                 "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
                 "-o", str(answer), "-",
             ]

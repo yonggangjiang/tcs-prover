@@ -56,6 +56,43 @@ statement review** is on; turn it off to have the statement checked first. The
 DeepSeek setup below is needed only when you select DeepSeek for one or more
 roles.
 
+### Run-folder sandbox (macOS)
+
+On macOS, the commands the models run can read and write only their own run
+folder, `runs/<run>/`. Codex's default sandbox let them read the whole disk.
+- **Unreadable:** other runs, the statement files, this repository, your home
+  folder and `~/.codex`.
+- **Shared scratch:** `/tmp` and `/var/tmp` are closed too, so parallel runs
+  cannot meet there.
+- **Scratch files:** scripts, here-documents and temporary files go to
+  `runs/<run>/.tmp/`, through `TMPDIR` and `TMPPREFIX`.
+- **What still works:** system folders (`/usr`, `/bin`, `/System`,
+  `/Library`, `/opt`, `/Applications`) stay readable. So do the Codex release,
+  `tools/`, and interpreters installed in your home folder that are found on
+  `PATH` (Python, Lean, Sage, PARI/GP, Maxima, Julia, GHC). Commands get your
+  login-shell `PATH`, as before.
+- **Network and web search:** unchanged for the author. Package installs into
+  the run folder still work.
+- **Critic, LaTeX writer, statement reviewer and Codex auditors:** read-only.
+  They can read only their own working folder: an empty folder for the
+  critic, writer and reviewer, and the audit workspace for auditors.
+
+Settings:
+- `TCS_PROVER_SANDBOX_READ`: extra read-only folders, separated by `:`. A
+  folder that contains your home folder, this repository or the runs folder
+  is ignored.
+- `TCS_PROVER_SANDBOX=0`: return to Codex's workspace-write sandbox. Linux and
+  Windows always use workspace-write.
+- Claude and Kimi auditors keep their own tool restrictions.
+
+Two side effects:
+- **Compilers:** `cc` and `c++` print `xcrun: couldn't create cache file`,
+  because Apple's per-user cache folder is outside the run. Compiling still
+  works.
+- **AI command-line tools:** tools in `~/.local/bin`, such as `claude` and
+  `codex`, cannot be started from inside a run. One run tried this on
+  2026-10-03.
+
 ## How to use DeepSeek
 
 ### 1. Obtain an official API key
@@ -399,8 +436,8 @@ allowed names are `compaction_tokens`, `checkpoint_tokens`, `turn_minutes_cap`,
 app-server and thread config and the workflow's structured calls. It is
 rejected if it sets a key the runner manages: model and provider settings,
 reasoning effort and summary, compaction and tool-output limits, web search,
-service tier, sandbox, approvals, `agents`, or the features and tools the
-runner toggles. The defaults apply to that file only, and CLI flags and `--set`
+service tier, sandbox and permission profiles, the shell environment,
+approvals, `agents`, or the features and tools the runner toggles. The defaults apply to that file only, and CLI flags and `--set`
 always win.
 
 ### Runner fixes that also apply to the standard workflow
@@ -598,7 +635,9 @@ are added to that problem.
 
 The numbers come from each job's `transcript.jsonl`, not from
 `token-usage.json`. The transcript also counts the critic's requests and the
-author's last minutes before it finished.
+author's last minutes before it finished. Codex does not report the tokens of
+its context compactions, though the provider's usage window counts them, so
+the totals are a little low: about 6% in a long run with frequent compactions.
 
 Estimated credits use the published standard-speed rates per million tokens:
 250 uncached input, 25 cached input and 1,250 output for gpt-6-astra. Fast

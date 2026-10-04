@@ -229,6 +229,7 @@ class BatchSummaryTests(unittest.TestCase):
         self.assertIn("- Answer: The statement is false.", text)
         self.assertIn("- Judge: no → repaired → yes (3 critic rounds; 2 candidates from the author)", text)
         self.assertIn("critic 1.3M in 3 requests", text)
+        self.assertIn("Not included: the 1 context compaction. Codex does not report their tokens", text)
         self.assertEqual(data["time"]["workingSeconds"], 1800 + 3600)
 
     def test_a_continuation_joins_its_problem_and_unchanged_runs_are_not_reread(self):

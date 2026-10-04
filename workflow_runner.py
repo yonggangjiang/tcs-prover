@@ -273,6 +273,126 @@ def codex():
     return path
 
 
+# On macOS, commands the models run may read and write only their own run
+# folder, plus the system and toolchain folders needed to run programs. Other
+# runs, the statement files, the repository and the home folder stay unreadable.
+# Set TCS_PROVER_SANDBOX=0 to fall back to Codex's workspace-write sandbox, and
+# TCS_PROVER_SANDBOX_READ to a list of extra read-only folders.
+RUN_SANDBOX_PROFILE = "tcs_prover_run"
+SANDBOX_ENV, SANDBOX_READ_ENV = "TCS_PROVER_SANDBOX", "TCS_PROVER_SANDBOX_READ"
+SANDBOX_SYSTEM_READ_ROOTS = (
+    "/bin", "/sbin", "/usr", "/System", "/Library", "/opt", "/Applications", "/private/etc", "/dev",
+)
+# Interpreters installed in the home folder (for example Anaconda) stay usable.
+SANDBOX_TOOLCHAINS = ("python3", "python", "sage", "gp", "maxima", "julia", "lean", "lake", "ghc")
+# Shared scratch folders would let parallel runs see each other's files.
+SANDBOX_SHARED_SCRATCH = ("/private/tmp", "/private/var/tmp")
+SANDBOX_SCRATCH_DIRNAME = ".tmp"
+
+
+def run_sandbox_enabled():
+    """Whether model commands get the run-folder-only sandbox."""
+
+    return sys.platform == "darwin" and os.environ.get(SANDBOX_ENV, "1").strip() != "0"
+
+
+@functools.lru_cache(maxsize=8)
+def login_shell_path(inherited_path):
+    """The PATH a login shell builds from this one.
+
+    Codex normally restores the user's login PATH from a shell snapshot in its
+    home folder, which the sandbox cannot read, so the runner supplies it.
+    """
+
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        result = subprocess.run(
+            [shell, "-lc", 'printf "%s" "$PATH"'], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=20,
+            env={**os.environ, "PATH": inherited_path},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return inherited_path
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value and "\n" not in value else inherited_path
+
+
+def _inside(path, root):
+    return path == root or root in path.parents
+
+
+def sandbox_read_roots(directory, search_path=None):
+    """Read-only folders for model commands: never a parent of the run folder."""
+
+    directory = Path(os.path.realpath(directory))
+    home = Path(os.path.realpath(Path.home()))
+    # Never a folder that holds the home folder, this repository (and so every
+    # run), or the folder of this run's siblings.
+    protected = (home, Path(os.path.realpath(ROOT)), directory.parent)
+    roots = [Path(root) for root in SANDBOX_SYSTEM_READ_ROOTS]
+    # The Codex release itself: its sandboxed helpers run from there.
+    try:
+        executable = Path(os.path.realpath(codex()))
+        roots.append(executable.parent.parent if executable.parent.name == "bin" else executable.parent)
+    except Error:
+        pass
+    # The record tool of the managed author workflow.
+    roots.append(Path(os.path.realpath(TOOLS)))
+    for name in SANDBOX_TOOLCHAINS:
+        found = shutil.which(name, path=search_path)
+        if not found:
+            continue
+        real = Path(os.path.realpath(found))
+        prefix = real.parent.parent if real.parent.name == "bin" else real.parent
+        if _inside(prefix, home):
+            roots.append(prefix)
+    roots.extend(Path(os.path.realpath(item)) for item in
+                 os.environ.get(SANDBOX_READ_ENV, "").split(os.pathsep) if item.strip())
+    result = []
+    for root in roots:
+        if (root.is_absolute() and root.exists() and root not in result
+                and not any(_inside(path, root) for path in protected)):
+            result.append(root)
+    return result
+
+
+def run_sandbox_permissions(directory, writable=True, search_path=None):
+    """The Codex permissions profile for one run folder (`:project_roots`)."""
+
+    directory = Path(os.path.realpath(directory))
+    filesystem = {":minimal": "read", ":project_roots": "write" if writable else "read"}
+    for root in sandbox_read_roots(directory, search_path):
+        filesystem[str(root)] = "read"
+    for scratch in SANDBOX_SHARED_SCRATCH:
+        if not _inside(directory, Path(scratch)):
+            filesystem[f"{scratch}*"] = "deny"
+            filesystem[f"{scratch}/**"] = "deny"
+    # Network as before: on for the author (package installs), off for read-only calls.
+    return {"filesystem": filesystem, "network": {"enabled": writable}}
+
+
+def _toml_inline(value):
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{json.dumps(key)} = {_toml_inline(item)}" for key, item in value.items()) + "}"
+    return json.dumps(value)
+
+
+def run_sandbox_arguments(directory, writable=True, search_path=None):
+    """Codex -c arguments that select the run-folder sandbox."""
+
+    profile = run_sandbox_permissions(directory, writable, search_path)
+    arguments = ["-c", f'default_permissions="{RUN_SANDBOX_PROFILE}"']
+    for key, value in profile.items():
+        arguments += ["-c", f"permissions.{RUN_SANDBOX_PROFILE}.{key}={_toml_inline(value)}"]
+    if writable:
+        # Scratch files, here-documents and temp files go to the run folder.
+        scratch = Path(os.path.realpath(directory)) / SANDBOX_SCRATCH_DIRNAME
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        arguments += ["-c", "shell_environment_policy.set=" + _toml_inline(
+            {"TMPDIR": f"{scratch}/", "TMPPREFIX": f"{scratch}/zsh"})]
+    return arguments
+
+
 def environment(model=None):
     """Use inherited provider credentials with quiet, predictable child logging."""
 
@@ -644,15 +764,19 @@ def run_structured_attempt(
         answer = folder / "answer.json"
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         schema_arguments = output_schema_arguments(model, schema)
+        sandboxed = run_sandbox_enabled()
         command = [
             # A workflow's config overrides come first, so the runner's own flags win.
-            codex(), *config_overrides, "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            os.path.realpath(codex()) if sandboxed else codex(), *config_overrides,
+            "-m", model, "-c", f'model_reasoning_effort="{effort}"',
             *provider_arguments(model),
             *speed_arguments(speed, model), *context_cache_arguments(),
             "-c", f'model_reasoning_summary="{summary}"',
             *structured_tool_arguments(stage, features),
             *[argument for feature in features for argument in ("--enable", feature)],
-            "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
+            # Read-only: the critic, writer and reviewer see only their empty workspace.
+            *(run_sandbox_arguments(workspace, writable=False) if sandboxed else ["-s", "read-only"]),
+            "-C", str(workspace), "-a", "never", "exec",
             "--json", "--ephemeral", "--skip-git-repo-check",
             "--ignore-user-config", *schema_arguments, "-o", str(answer), "-",
         ]
@@ -1416,12 +1540,19 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Workflow time limit reached.")
         if options.get("goal_require_resume") and not options.get("goal_thread_id"):
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation.")
+        sandboxed = getattr(runtime, "run_sandbox_enabled", lambda: False)()
+        app_env = runtime.environment(model)
+        if sandboxed:
+            # Codex cannot read its login-PATH snapshot inside the sandbox.
+            app_env["PATH"] = runtime.login_shell_path(app_env.get("PATH", os.defpath))
         process = subprocess.Popen([
-            runtime.codex(), "app-server",
+            # The real binary path: Codex's sandboxed helpers run from its release folder.
+            os.path.realpath(runtime.codex()) if sandboxed else runtime.codex(), "app-server",
             # A workflow's config overrides (e.g. prefix trims) come first, so the
             # runner's own flags win; the thread config below carries them too.
             *(runtime.codex_config_arguments(options["codex_config"])
               if options.get("codex_config") and hasattr(runtime, "codex_config_arguments") else []),
+            *(runtime.run_sandbox_arguments(directory, search_path=app_env.get("PATH")) if sandboxed else []),
             "--enable", "goals",
             "-c", 'web_search="live"', "-c", "tools.web_search=true",
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
@@ -1430,7 +1561,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             *[argument for feature in features for argument in ("--enable", feature)],
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
-            env=runtime.environment(model))
+            env=app_env)
         rpc = runtime.RPC(process, record)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
@@ -1441,7 +1572,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         rpc.send({"method": "initialized", "params": {}})
         thread_options = {
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
-            "sandbox": "workspace-write", "approvalPolicy": "never",
+            # The named profile is defined on the app-server command line.
+            **({"permissions": runtime.RUN_SANDBOX_PROFILE} if sandboxed else {"sandbox": "workspace-write"}),
+            "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
                 "web_search": "live", "tools": {"web_search": True},
                 **({"model_auto_compact_token_limit": compaction_tokens} if compaction_tokens else {}),
@@ -2131,6 +2264,7 @@ _RUNNER_CODEX_KEYS = {
     "model", "model_provider", "model_providers", "model_reasoning_effort", "model_reasoning_summary",
     "model_auto_compact_token_limit", "tool_output_token_limit", "include_apps_instructions",
     "web_search", "service_tier", "sandbox_mode", "approval_policy", "agents",
+    "default_permissions", "permissions", "shell_environment_policy",
 }
 _RUNNER_CODEX_NESTED_KEYS = {
     "features": {"goals", "multi_agent", "multi_agent_v2", "fast_mode", "shell_tool"},

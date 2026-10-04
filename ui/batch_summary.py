@@ -937,6 +937,11 @@ def render_markdown(data):
               f"{cached_share:.1f}% of input tokens were cached. Calls are model calls for the author and its "
               "subagents, and requests for the critic and the LaTeX writer (one request can make several "
               "model calls when the model runs tools)."]
+    compactions = data["activity"].get("compactions", 0)
+    if compactions:
+        lines += ["", f"Not included: the {compactions:,} context compaction{'s' if compactions != 1 else ''}. "
+                  "Codex does not report their tokens, but the provider counts them, so the real use is "
+                  "somewhat higher than these totals."]
     quota = data["quota"]
     if quota["first"] and quota["last"]:
         first, last = quota["first"], quota["last"]
