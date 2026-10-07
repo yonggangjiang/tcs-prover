@@ -34,6 +34,7 @@ MAX_CRITIC_ROUNDS = runtime.MAX_CRITIC_ROUNDS
 MAX_THINKING_HOURS = runtime.MAX_AUTHOR_HOURS
 DEFAULT_THINKING_HOURS = runtime.DEFAULT_AUTHOR_HOURS
 MODELS = runtime.MODELS
+OFFERED_MODELS = runtime.OFFERED_MODELS
 EFFORTS = runtime.EFFORTS
 SPEEDS, DEFAULT_SPEED = runtime.SPEEDS, runtime.DEFAULT_SPEED
 DEFAULT_REVIEW_MODEL = runtime.REVIEW_MODEL
@@ -242,12 +243,15 @@ PUBLIC_GRAPH = {
         "speeds": list(SPEEDS),
         "speed": DEFAULT_SPEED,
         "review_model": DEFAULT_REVIEW_MODEL,
-        "review_models": list(REVIEW_MODELS),
-        "models": list(MODELS),
+        "review_models": list(OFFERED_MODELS),
+        "models": list(OFFERED_MODELS),
+        "model_efforts": {
+            model: list(efforts) for model, efforts in runtime.MODEL_EFFORTS.items()
+        },
         "research_audits": {**audits.default_settings(), "choices": audits.model_choices()},
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
-        "model_summary": "Astra/Ultra review · Astra/Ultra author, critic, writer",
+        "model_summary": "6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer",
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
             "minimum": 1,
@@ -1338,16 +1342,16 @@ class App:
         }
         if include_review and review_model not in REVIEW_MODELS:
             raise ValueError(
-                "Choose Astra, Sol, Terra, Luna, or DeepSeek V4 Pro for statement "
-                "review."
+                "Choose 6.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro "
+                "for statement review."
             )
         if any(
             model not in MODELS
             for model in (author_model, critic_model, writer_model)
         ):
             raise ValueError(
-                "Choose Astra, Sol, Terra, Luna, or DeepSeek V4 Pro for every proof "
-                "stage."
+                "Choose 6.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro "
+                "for every proof stage."
             )
         efforts = [author_effort, critic_effort, writer_effort]
         if include_review:

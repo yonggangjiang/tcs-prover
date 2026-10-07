@@ -7,16 +7,21 @@ defaults:
 # Refresh explicit IDs when providers release stronger models.
 models:
   - {value: none, label: None}
+  - {value: gpt-6.1-sol, label: GPT 6.1 Sol (Max), provider: codex, model: gpt-6.1-sol, effort: max}
   - {value: gpt-6-astra, label: GPT Astra (Ultra), provider: codex, model: gpt-6-astra, effort: ultra}
-  - {value: gpt-5.6-sol, label: GPT Sol (Ultra), provider: codex, model: gpt-5.6-sol, effort: ultra}
-  - {value: gpt-5.6-terra, label: GPT Terra (Ultra), provider: codex, model: gpt-5.6-terra, effort: ultra}
-  - {value: gpt-5.6-luna, label: GPT Luna (Max), provider: codex, model: gpt-5.6-luna, effort: max}
+  - {value: gpt-6-sol, label: GPT 6 Sol (Ultra), provider: codex, model: gpt-6-sol, effort: ultra}
+  - {value: gpt-6-luna, label: GPT 6 Luna (Max), provider: codex, model: gpt-6-luna, effort: max}
   - {value: claude-fable, label: Claude Fable 5.1 (Max), provider: claude, model: claude-fable-5-1, effort: max}
   - {value: claude-opus, label: Claude Opus (Max), provider: claude, model: opus, effort: max}
   - {value: claude-sonnet, label: Claude Sonnet (Max), provider: claude, model: sonnet, effort: max}
   - {value: claude-haiku, label: Claude Haiku, provider: claude, model: haiku}
   - {value: kimi-k3, label: Kimi K3 (Max), provider: kimi, model: kimi-code/k3, effort: max}
   - {value: kimi-code, label: Kimi Code (Max), provider: kimi, model: kimi-code/kimi-for-coding, effort: max}
+  # Codex lists the 5.6 generation as "Older". These stay selectable only so
+  # audit choices saved by earlier runs remain valid when those runs continue.
+  - {value: gpt-5.6-sol, label: "GPT 5.6 Sol (Ultra, older)", provider: codex, model: gpt-5.6-sol, effort: ultra}
+  - {value: gpt-5.6-terra, label: "GPT 5.6 Terra (Ultra, older)", provider: codex, model: gpt-5.6-terra, effort: ultra}
+  - {value: gpt-5.6-luna, label: "GPT 5.6 Luna (Max, older)", provider: codex, model: gpt-5.6-luna, effort: max}
 
 # Auditors read the paused author's actual workspace; no research copy is made.
 # Before a batch starts, move previous reports from output into history.

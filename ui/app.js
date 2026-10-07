@@ -484,8 +484,15 @@ function setProblemMode(mode) {
 // Keep the compact footer label synchronized with every model setting.
 function updateModelSummary() {
   const deepseekModel = "deepseek-v4-pro";
-  const name = (model) => model === "deepseek-v4-pro" ? "DeepSeek V4 Pro"
-    : model.split("-").at(-1).replace(/^./, (letter) => letter.toUpperCase());
+  // Model ids share suffixes ("sol", "luna"), so name every known model.
+  const modelNames = new Map([
+    ["gpt-6.1-sol", "6.1 Sol"], ["gpt-6-astra", "Astra"],
+    ["gpt-6-sol", "6 Sol"], ["gpt-6-luna", "6 Luna"],
+    ["gpt-5.6-sol", "5.6 Sol"], ["gpt-5.6-terra", "5.6 Terra"],
+    ["gpt-5.6-luna", "5.6 Luna"], ["deepseek-v4-pro", "DeepSeek V4 Pro"],
+  ]);
+  const name = (model) => modelNames.get(model)
+    || model.split("-").at(-1).replace(/^./, (letter) => letter.toUpperCase());
   const effectiveEffort = (model, effort) => model === deepseekModel
     ? (["low", "medium", "high"].includes(effort) ? "high" : "max")
     : effort;
@@ -506,7 +513,7 @@ function updateModelSummary() {
     : `${role(ui.reviewModel.value, ui.reviewEffort.value)} review · `;
   const speed = ui.speedMode.value === "standard"
     ? "Standard speed" : selectedModels.includes(deepseekModel)
-      ? "Fast for ChatGPT · Standard for DeepSeek" : "Fast 1.5×";
+      ? "Fast for ChatGPT · Standard for DeepSeek" : "Fast speed";
   const log = {
     none: "Status-only log",
     concise: "Concise activity log",
@@ -1971,14 +1978,15 @@ function render(next) {
     const hours = state.workflow?.settings?.thinking_hours || {};
     ui.problem.value = state.draft || "";
     ui.latexInput.value = state.latexInput || "";
-    ui.reviewModel.value = state.reviewModel || "gpt-6-astra";
-    ui.authorModel.value = state.authorModel || "gpt-6-astra";
-    ui.criticModel.value = state.criticModel || "gpt-6-astra";
-    ui.writerModel.value = state.writerModel || "gpt-6-astra";
-    ui.reviewEffort.value = state.reviewEffort || "ultra";
-    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
-    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
-    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    setChoice(ui.reviewModel, state.reviewModel || "gpt-6.1-sol");
+    setChoice(ui.authorModel, state.authorModel || "gpt-6.1-sol");
+    setChoice(ui.criticModel, state.criticModel || "gpt-6.1-sol");
+    setChoice(ui.writerModel, state.writerModel || "gpt-6.1-sol");
+    ui.reviewEffort.value = state.reviewEffort || "max";
+    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "max";
+    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
+    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
+    ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
     ui.speedMode.value = state.speedMode || "fast";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
@@ -1997,14 +2005,15 @@ function render(next) {
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
     ui.fileManagement.checked = state.fileManagement !== false;
-    ui.reviewModel.value = state.reviewModel || "gpt-6-astra";
-    ui.authorModel.value = state.authorModel || "gpt-6-astra";
-    ui.criticModel.value = state.criticModel || "gpt-6-astra";
-    ui.writerModel.value = state.writerModel || "gpt-6-astra";
-    ui.reviewEffort.value = state.reviewEffort || "ultra";
-    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "ultra";
-    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "ultra";
-    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "ultra";
+    setChoice(ui.reviewModel, state.reviewModel || "gpt-6.1-sol");
+    setChoice(ui.authorModel, state.authorModel || "gpt-6.1-sol");
+    setChoice(ui.criticModel, state.criticModel || "gpt-6.1-sol");
+    setChoice(ui.writerModel, state.writerModel || "gpt-6.1-sol");
+    ui.reviewEffort.value = state.reviewEffort || "max";
+    ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "max";
+    ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
+    ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
+    ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
     ui.speedMode.value = state.speedMode || "fast";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     syncPrompts(state);
@@ -2104,6 +2113,30 @@ function render(next) {
   if (working) timer = setTimeout(refresh, 700);
   clearInterval(clock);
   if (working) clock = setInterval(renderClock, 1000);
+}
+
+// A saved job may name a model the menus no longer offer (an older GPT-5.6,
+// say). Keep that choice visible instead of leaving the menu blank.
+function setChoice(select, value) {
+  const known = Array.from(select.options || [], (option) => option.value);
+  if (value && known.length && !known.includes(value)) {
+    select.add(new Option(`${value} (older)`, value));
+  }
+  select.value = value;
+}
+
+// Offer only the reasoning levels the selected model supports in the Codex
+// catalog, and move a choice that became invalid to Max.
+function syncEffortChoices(role) {
+  const supported = state.workflow?.settings?.model_efforts?.[ui[`${role}Model`].value];
+  const select = ui[`${role}Effort`];
+  if (!supported || !select.options) return;
+  Array.from(select.options).forEach((option) => {
+    option.disabled = !supported.includes(option.value);
+  });
+  if (!supported.includes(select.value)) {
+    select.value = supported.includes("max") ? "max" : supported.at(-1);
+  }
 }
 
 async function refresh() {
@@ -2264,14 +2297,13 @@ ui.check.onclick = () => selectedProblemMode() === "latex"
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
-ui.reviewModel.onchange = updateModelSummary;
-ui.authorModel.onchange = updateModelSummary;
-ui.criticModel.onchange = updateModelSummary;
-ui.writerModel.onchange = updateModelSummary;
-ui.reviewEffort.onchange = updateModelSummary;
-ui.authorEffort.onchange = updateModelSummary;
-ui.criticEffort.onchange = updateModelSummary;
-ui.writerEffort.onchange = updateModelSummary;
+for (const role of ["review", "author", "critic", "writer"]) {
+  ui[`${role}Model`].onchange = () => {
+    syncEffortChoices(role);
+    updateModelSummary();
+  };
+  ui[`${role}Effort`].onchange = updateModelSummary;
+}
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
 ui.skipStatementReview.onchange = () => {

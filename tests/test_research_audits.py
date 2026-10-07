@@ -26,10 +26,13 @@ def settings(*models, seconds=1):
 class AuditCatalogTests(unittest.TestCase):
     def test_yaml_catalog_exposes_matching_model_and_effort_choices(self):
         expected = {
+            "gpt-6.1-sol": ("GPT 6.1 Sol (Max)", "codex", "gpt-6.1-sol", "max"),
             "gpt-6-astra": ("GPT Astra (Ultra)", "codex", "gpt-6-astra", "ultra"),
-            "gpt-5.6-sol": ("GPT Sol (Ultra)", "codex", "gpt-5.6-sol", "ultra"),
-            "gpt-5.6-terra": ("GPT Terra (Ultra)", "codex", "gpt-5.6-terra", "ultra"),
-            "gpt-5.6-luna": ("GPT Luna (Max)", "codex", "gpt-5.6-luna", "max"),
+            "gpt-6-sol": ("GPT 6 Sol (Ultra)", "codex", "gpt-6-sol", "ultra"),
+            "gpt-6-luna": ("GPT 6 Luna (Max)", "codex", "gpt-6-luna", "max"),
+            "gpt-5.6-sol": ("GPT 5.6 Sol (Ultra, older)", "codex", "gpt-5.6-sol", "ultra"),
+            "gpt-5.6-terra": ("GPT 5.6 Terra (Ultra, older)", "codex", "gpt-5.6-terra", "ultra"),
+            "gpt-5.6-luna": ("GPT 5.6 Luna (Max, older)", "codex", "gpt-5.6-luna", "max"),
             "claude-fable": ("Claude Fable 5.1 (Max)", "claude", "claude-fable-5-1", "max"),
             "claude-opus": ("Claude Opus (Max)", "claude", "opus", "max"),
             "claude-sonnet": ("Claude Sonnet (Max)", "claude", "sonnet", "max"),

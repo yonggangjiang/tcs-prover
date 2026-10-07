@@ -31,9 +31,22 @@ except ImportError as exc:
 ROOT = Path(__file__).resolve().parent
 WORKFLOWS = ROOT / "workflows"
 MARKER = "[STATEMENT]"
-MODELS = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "deepseek-v4-pro")
-MODEL, EFFORT = "gpt-6-astra", "ultra"
+# Models offered in menus and docs, newest first (Codex `model/list`, 0.160).
+OFFERED_MODELS = ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "deepseek-v4-pro")
+# Codex now calls the 5.6 generation "Older". Saved runs and scripts that name
+# it keep working, so it stays accepted but is no longer offered.
+LEGACY_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+MODELS = OFFERED_MODELS + LEGACY_MODELS
+MODEL, EFFORT = "gpt-6.1-sol", "max"
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+# Efforts each model lists in the Codex catalog. Codex does not validate or
+# clamp efforts locally, so the UI offers only these; DeepSeek maps the shared
+# menu itself.
+MODEL_EFFORTS = {
+    **dict.fromkeys(("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"), EFFORTS),
+    **dict.fromkeys(("gpt-6-luna", "gpt-5.6-luna"), EFFORTS[:-1]),
+    "deepseek-v4-pro": EFFORTS,
+}
 SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
@@ -184,7 +197,7 @@ def chosen_model(value):
     """Require one supported base model."""
 
     if value not in MODELS:
-        raise Error("Choose Astra, Sol, Terra, Luna, or DeepSeek V4 Pro.")
+        raise Error("Choose 6.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro.")
     return value
 
 
@@ -197,7 +210,7 @@ def chosen_effort(value):
 
 
 def chosen_speed(value):
-    """Require Standard or OpenAI's 1.5x Fast mode."""
+    """Require Standard or OpenAI's Fast service tier."""
 
     if value not in SPEEDS:
         raise Error("Choose Standard or Fast speed.")

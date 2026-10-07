@@ -16,7 +16,7 @@ from .server import (
     App, Server, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
     DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, EFFORTS, HOST,
-    MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
+    MODELS, OFFERED_MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
     saved_critic_source, saved_research_source,
 )
 
@@ -458,15 +458,22 @@ def main():
         camel = f"{role}Model"
         parser.add_argument(
             f"-{camel}", f"--{camel}", f"--{role}-model",
-            dest=f"{role}_model", choices=MODELS,
+            dest=f"{role}_model", choices=MODELS, metavar="MODEL",
             default=model_defaults[role],
-            help=f"{role} model",
+            help=(
+                f"{role} model: {', '.join(OFFERED_MODELS)} "
+                f"(default: {model_defaults[role]}); the older GPT-5.6 ids "
+                "are still accepted"
+            ),
         )
     parser.add_argument(
         "-reasoningEffort", "--reasoningEffort", "--reasoning-effort",
         dest="reasoning_effort", choices=EFFORTS,
         default=DEFAULT_REASONING_EFFORT,
-        help="fallback reasoning effort for every proof role",
+        help=(
+            "fallback reasoning effort for every proof role "
+            f"(default: {DEFAULT_REASONING_EFFORT})"
+        ),
     )
     for role in ("author", "critic", "writer"):
         camel = f"{role}Effort"

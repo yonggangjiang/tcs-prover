@@ -86,16 +86,16 @@
                 <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
                   <select id="reviewModel">
-                    <option value="gpt-6-astra" selected>Astra — default</option>
-                    <option value="gpt-5.6-sol">Sol</option>
-                    <option value="gpt-5.6-terra">Terra — balanced</option>
-                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
+                    <option value="gpt-6-astra">Astra — frontier</option>
+                    <option value="gpt-6-sol">6 Sol — previous generation</option>
+                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="reviewEffort">Reasoning</label>
                   <select id="reviewEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — Max with task delegation</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -105,16 +105,16 @@
                 <div id="authorModelSetting" class="round-setting model-setting">
                   <label for="authorModel">Proof author</label>
                   <select id="authorModel">
-                    <option value="gpt-6-astra" selected>Astra — default</option>
-                    <option value="gpt-5.6-sol">Sol</option>
-                    <option value="gpt-5.6-terra">Terra — balanced</option>
-                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
+                    <option value="gpt-6-astra">Astra — frontier</option>
+                    <option value="gpt-6-sol">6 Sol — previous generation</option>
+                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="authorEffort">Reasoning</label>
                   <select id="authorEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — Max with task delegation</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -124,16 +124,16 @@
                 <div id="criticModelSetting" class="round-setting model-setting">
                   <label for="criticModel">Independent critic</label>
                   <select id="criticModel">
-                    <option value="gpt-6-astra" selected>Astra — default</option>
-                    <option value="gpt-5.6-sol">Sol</option>
-                    <option value="gpt-5.6-terra">Terra — balanced</option>
-                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
+                    <option value="gpt-6-astra">Astra — frontier</option>
+                    <option value="gpt-6-sol">6 Sol — previous generation</option>
+                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="criticEffort">Reasoning</label>
                   <select id="criticEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — Max with task delegation</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -143,16 +143,16 @@
                 <div id="writerModelSetting" class="round-setting model-setting">
                   <label for="writerModel">LaTeX writer</label>
                   <select id="writerModel">
-                    <option value="gpt-6-astra" selected>Astra — default</option>
-                    <option value="gpt-5.6-sol">Sol</option>
-                    <option value="gpt-5.6-terra">Terra — balanced</option>
-                    <option value="gpt-5.6-luna">Luna — fastest</option>
+                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
+                    <option value="gpt-6-astra">Astra — frontier</option>
+                    <option value="gpt-6-sol">6 Sol — previous generation</option>
+                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
                     <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
                   </select>
                   <label class="effort-label" for="writerEffort">Reasoning</label>
                   <select id="writerEffort">
-                    <option value="ultra" selected>Ultra — highest</option>
-                    <option value="max">Max</option>
+                    <option value="ultra">Ultra — Max with task delegation</option>
+                    <option value="max" selected>Max — default</option>
                     <option value="xhigh">Extra high</option>
                     <option value="high">High</option>
                     <option value="medium">Medium</option>
@@ -161,11 +161,12 @@
                 </div>
               </div>
               <p id="modelHelp" class="help model-help">
-                Astra and Ultra are the defaults for every role. DeepSeek remains
+                6.1 Sol and Max are the defaults for every role. Each model offers
+                only the reasoning levels it supports. DeepSeek remains
                 available through the official API with DEEPSEEK_API_KEY and
                 always runs at standard speed.
               </p>
-              <input id="reasoningEffort" type="hidden" value="ultra">
+              <input id="reasoningEffort" type="hidden" value="max">
               <div class="prompt-setting">
                 <div>
                   <strong>Role prompts</strong>
@@ -194,7 +195,7 @@
               <div id="speedModeSetting" class="round-setting">
                 <label for="speedMode">Generation speed</label>
                 <select id="speedMode" aria-describedby="speedHelp">
-                  <option value="fast" selected>Fast &mdash; 1.5&times; speed</option>
+                  <option value="fast" selected>Fast &mdash; up to 2&times; speed</option>
                   <option value="standard">Standard &mdash; normal speed</option>
                 </select>
                 <p id="speedHelp" class="help">
@@ -251,7 +252,7 @@
               </details>
             </details>
             <div class="composer-actions">
-              <span id="modelSummary">Astra/Ultra review · Astra/Ultra author, critic, writer</span>
+              <span id="modelSummary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</span>
               <button id="checkButton">Check statement</button>
             </div>
           </div>
