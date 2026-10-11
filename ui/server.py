@@ -59,6 +59,13 @@ RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "aud
 APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
 AUDIT_MEMORY_FILE = re.compile(r"(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
 LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
+MAX_REQUEST_BYTES = 100_000
+MAX_DOCUMENT_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_BATCH_STATEMENTS = 200
+MAX_BATCH_STATEMENT_CHARS = 100_000
+MAX_SOURCE_FILE_CHARS = 255
+
+
 def goal_thread_from_record(record):
     """Accept only an explicit root author status, never a subagent thread."""
 
@@ -170,6 +177,18 @@ def prepare_runs_directory(path):
     # RX applies only to ``runs`` itself (no OI/CI), so other run contents keep
     # their protected per-directory ACLs.
     grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
+
+
+def source_file_name(value=None):
+    """Validate the optional name of the file a job's input came from (display only)."""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str) or "\0" in value or len(value) > MAX_SOURCE_FILE_CHARS:
+        raise ValueError(
+            f"A source file name must be text of at most {MAX_SOURCE_FILE_CHARS} characters."
+        )
+    return value.strip()
 
 
 def default_prompts():
@@ -421,6 +440,7 @@ def empty_state(trace=None, trace_version=0):
         "phase": "input",
         "problemMode": "statement",
         "skipStatementReview": False,
+        "sourceFile": "",
         "statementReviewOnly": False,
         "fileManagement": False,
         "preparedRun": False,
@@ -571,12 +591,19 @@ class App:
             slug = slug[:48].rstrip("-") or "problem"
             stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             prepare_runs_directory(self.runs)
-            self.run_dir = self.runs / f"{stamp}_{slug}"
-            number = 2
-            while self.run_dir.exists():
-                self.run_dir = self.runs / f"{stamp}_{slug}-{number}"
-                number += 1
-            self.run_dir.mkdir(mode=0o700)
+            # Jobs started together (a folder batch, a terminal folder run, or
+            # concurrent requests) can share a second and a slug. mkdir is the
+            # atomic claim, so a name taken by another thread is skipped.
+            number = 1
+            while True:
+                name = f"{stamp}_{slug}" if number == 1 else f"{stamp}_{slug}-{number}"
+                try:
+                    (self.runs / name).mkdir(mode=0o700)
+                except FileExistsError:
+                    number += 1
+                    continue
+                break
+            self.run_dir = self.runs / name
             self.trace_file = self.run_dir / "transcript.jsonl"
         prepare_private_directory(self.run_dir)
         self._save("draft.md", f"# Draft problem\n\n{statement}\n")
@@ -599,6 +626,7 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+            "sourceFile",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         self._save(
@@ -2006,9 +2034,11 @@ class App:
         allow_external_source=False,
         research_audits=None,
         file_management=True,
+        source_file=None,
     ):
         """Send a statement directly to the proof author without review."""
 
+        source_file = source_file_name(source_file)
         statement = str(statement).strip()
         if not statement:
             raise ValueError("Enter a problem statement.")
@@ -2041,6 +2071,7 @@ class App:
             research_audits=research_audits,
             file_management=file_management,
         )
+        options["sourceFile"] = source_file
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
@@ -3156,6 +3187,10 @@ def restore_saved_app(app):
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
+            try:
+                state["sourceFile"] = source_file_name(settings.get("sourceFile"))
+            except ValueError:
+                pass
             for key in (
                 "reviewModel", "authorModel", "criticModel", "writerModel",
                 "reasoningEffort", "reviewEffort", "authorEffort",
@@ -3705,6 +3740,28 @@ class Server(ThreadingHTTPServer):
         return app
 
 
+    @staticmethod
+    def _direct_options(body):
+        """Translate one /direct (or folder batch) body into new-job author settings."""
+
+        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+        return {
+            "critic_rounds": body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            "thinking_hours": body.get("thinkingHours", DEFAULT_THINKING_HOURS),
+            "author_model": body.get("authorModel", DEFAULT_AUTHOR_MODEL),
+            "critic_model": body.get("criticModel", DEFAULT_CRITIC_MODEL),
+            "writer_model": body.get("writerModel", DEFAULT_WRITER_MODEL),
+            "reasoning_effort": legacy_effort,
+            "author_effort": body.get("authorEffort", legacy_effort),
+            "critic_effort": body.get("criticEffort", legacy_effort),
+            "writer_effort": body.get("writerEffort", legacy_effort),
+            **web_prompt_options(body, ("author", "critic", "final")),
+            "research_audits": body.get("researchAudits"),
+            "file_management": body.get("fileManagement", False),
+            "speed_mode": body.get("speedMode", DEFAULT_SPEED),
+            "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
+        }
+
     def start_direct_job(self, body, run_id=""):
         """Create a statement job that starts directly with the author."""
 
@@ -3713,30 +3770,77 @@ class Server(ThreadingHTTPServer):
         app = self.get_job(run_id) if run_id else (
             self.app if self.fixed_app else App(runs=self.runs)
         )
-        legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_direct_statement(
-            statement=body.get("statement", ""),
-            critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
-            thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
-            author_model=body.get("authorModel", DEFAULT_AUTHOR_MODEL),
-            critic_model=body.get("criticModel", DEFAULT_CRITIC_MODEL),
-            writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
-            reasoning_effort=legacy_effort,
-            author_effort=body.get("authorEffort", legacy_effort),
-            critic_effort=body.get("criticEffort", legacy_effort),
-            writer_effort=body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("author", "critic", "final")),
-            research_audits=body.get("researchAudits"),
-            file_management=body.get("fileManagement", False),
-            speed_mode=body.get("speedMode", DEFAULT_SPEED),
-            reasoning_summary=body.get(
-                "reasoningSummary", DEFAULT_REASONING_SUMMARY
-            ),
+            statement=body.get("statement", ""), **self._direct_options(body),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
         self.app = app
         return app
+
+    def start_direct_batch(self, body, run_id=""):
+        """Start one direct proof job per statement, all sharing one set of settings.
+
+        Every statement and the shared settings are validated before any job
+        starts. Each job is an ordinary /direct job (statement review skipped)
+        in its own run folder, and the jobs run in parallel.
+        """
+
+        if run_id:
+            raise ValueError("Start a folder of statements from the home screen.")
+        items = body.get("statements")
+        if not isinstance(items, list) or not 1 <= len(items) <= MAX_BATCH_STATEMENTS:
+            raise ValueError(
+                f"Send between 1 and {MAX_BATCH_STATEMENTS} statements in one folder batch."
+            )
+        statements = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Statement {index} must have a name and a statement.")
+            try:
+                name = source_file_name(item.get("name"))
+            except ValueError as exc:
+                raise ValueError(f"Statement {index}: {exc}") from exc
+            label = name or f"Statement {index}"
+            statement = item.get("statement")
+            if not isinstance(statement, str) or not statement.strip():
+                raise ValueError(f"{label} has no statement.")
+            if "\0" in statement:
+                raise ValueError(f"{label} contains a NUL character.")
+            if len(statement) > MAX_BATCH_STATEMENT_CHARS:
+                raise ValueError(
+                    f"{label} is longer than {MAX_BATCH_STATEMENT_CHARS:,} characters."
+                )
+            statements.append((name, statement.strip()))
+        options = self._direct_options(
+            {key: value for key, value in body.items() if key != "statements"}
+        )
+        # The jobs share these settings: reject them once, before any job starts.
+        App._workflow_options(include_review=False, **options)
+        started = []
+        try:
+            for name, statement in statements:
+                app = App(runs=self.runs)
+                app.start_direct_statement(statement, source_file=name, **options)
+                started.append(app)
+                with self.jobs_lock:
+                    self.jobs[app.state["runId"]] = app
+        except Exception as exc:
+            # A launch failed after validation (for example, the disk is full). Stop
+            # the jobs this request started so a retry cannot duplicate them.
+            for app in started:
+                try:
+                    app.stop()
+                except (OSError, ValueError):
+                    pass
+            failed = statements[len(started)][0] or f"statement {len(started) + 1}"
+            stopped = (
+                f" The {len(started)} job{'s' if len(started) != 1 else ''} it had "
+                "already started were stopped." if started else ""
+            )
+            detail = str(exc).rstrip(".") or type(exc).__name__
+            raise ValueError(f"Could not start the job for {failed}: {detail}.{stopped}") from exc
+        return started
 
     def start_latex_job(self, body, run_id=""):
         """Create a job that runs only the final LaTeX editor."""
@@ -4215,6 +4319,7 @@ class Server(ThreadingHTTPServer):
                     "settingsWarning",
                 )
             }
+            job["sourceFile"] = state.get("sourceFile") or ""
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
                 if state["problemMode"] == "algorithmic"
@@ -4422,13 +4527,20 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Expected a JSON request.")
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= size <= 100_000:
+            limit = MAX_DOCUMENT_REQUEST_BYTES if request.path == "/direct-batch" else MAX_REQUEST_BYTES
+            if not 0 <= size <= limit:
                 raise ValueError("Request is too large.")
             body = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object.")
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
+            if request.path == "/direct-batch":
+                started = self.server.start_direct_batch(body, run_id)
+                return self.send({
+                    "startedJobs": [app.state["runId"] for app in started],
+                    "jobs": self.server.job_list(),
+                })
             if request.path == "/resume":
                 app = self.server.resume_paused_job(run_id)
             elif request.path == "/start-research-audit":

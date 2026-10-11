@@ -108,6 +108,19 @@ Options for changing the default model, time limit, and other settings are under
 **Advanced**. GPT-6.1 Sol (`gpt-6.1-sol`) at Max reasoning is the default for
 every node.
 
+## Run a folder from the Web UI
+
+On the home screen in Statement mode, click **Run a folder…** and choose a
+folder containing Markdown statements. Each non-empty, top-level `.md` file
+starts its own parallel proof job using the current author, critic, writer,
+prompt, and research-file settings. Statement review is skipped. The browser
+asks for confirmation before starting the jobs, each of which uses its own quota.
+Subfolders and other file types are ignored; empty files are reported and skipped.
+The job list shows each source filename, including after a server restart.
+
+A batch accepts at most 200 statements, 100,000 characters per statement, and
+8 MB for the complete request. Split larger folders into smaller batches.
+
 ## Terminal runs from Markdown
 
 On a server without a browser, put the complete statement in any UTF-8 Markdown

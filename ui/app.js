@@ -51,6 +51,8 @@ const ui = {
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
+  runFolder: $("runFolderButton"), runFolderHelp: $("runFolderHelp"), folderInput: $("folderInput"),
+  batchStatus: $("batchStatus"),
   stop: $("stopButton"),
   pause: $("pauseButton"), resume: $("resumeButton"), downloadTex: $("downloadTexButton"),
   downloadPdf: $("downloadPdfButton"),
@@ -325,6 +327,12 @@ function renderJobs(jobs) {
     times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
       : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
+    if (job.sourceFile) {
+      const tags = document.createElement("small");
+      tags.className = "job-tags";
+      tags.textContent = `From ${job.sourceFile}`;
+      copy.append(tags);
+    }
     const checkpoints = job.checkpoints || [];
     if (checkpoints.length) {
       const checkpointHeading = document.createElement("span");
@@ -434,6 +442,8 @@ function setProblemMode(mode) {
   const skipReview = statement && !reviewOnly
     && ui.skipStatementReview.checked;
   for (const input of ui.problemModes) input.checked = input.value === mode;
+  show(ui.runFolder, statement && !reviewOnly);
+  show(ui.runFolderHelp, statement && !reviewOnly);
   show(ui.statementFields, statement);
   show(ui.latexFields, latexOnly);
   show(ui.reviewModelSetting, statement && !skipReview);
@@ -2181,21 +2191,8 @@ async function startReview(statement, feedback = "") {
   try {
     const next = await request(jobPath(skipReview ? "/direct" : "/review"), {
       statement, feedback, reviewModel: ui.reviewModel.value,
-      authorModel: ui.authorModel.value,
-      criticModel: ui.criticModel.value,
-      writerModel: ui.writerModel.value,
       reviewEffort: ui.reviewEffort.value,
-      authorEffort: ui.authorEffort.value,
-      criticEffort: ui.criticEffort.value,
-      writerEffort: ui.writerEffort.value,
-      promptOverrides,
-      fileManagement: managesResearchFiles(),
-      criticRounds: Number(ui.criticRounds.value),
-      thinkingHours: Number(ui.thinkingHours.value),
-      researchAudits: managesResearchFiles() ? researchAuditValues()
-        : { intervalHours: 0, models: ["none", "none", "none"] },
-      speedMode: ui.speedMode.value,
-      reasoningSummary: ui.reasoningSummary.value,
+      ...proofJobSettings(),
       statementReviewOnly: reviewOnly,
     });
     if (job !== currentJob) return;
@@ -2207,6 +2204,125 @@ async function startReview(statement, feedback = "") {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   }
+}
+
+function proofJobSettings() {
+  return {
+    authorModel: ui.authorModel.value,
+    criticModel: ui.criticModel.value,
+    writerModel: ui.writerModel.value,
+    authorEffort: ui.authorEffort.value,
+    criticEffort: ui.criticEffort.value,
+    writerEffort: ui.writerEffort.value,
+    promptOverrides,
+    fileManagement: managesResearchFiles(),
+    criticRounds: Number(ui.criticRounds.value),
+    thinkingHours: Number(ui.thinkingHours.value),
+    researchAudits: managesResearchFiles() ? researchAuditValues()
+      : { intervalHours: 0, models: ["none", "none", "none"] },
+    speedMode: ui.speedMode.value,
+    reasoningSummary: ui.reasoningSummary.value,
+  };
+}
+
+// Like the terminal folder mode: only Markdown files directly inside the chosen
+// folder, never its subfolders, in a deterministic order by name.
+function folderMarkdownFiles(files) {
+  const byName = (first, second) => {
+    const a = first.name.toLowerCase(), b = second.name.toLowerCase();
+    if (a !== b) return a < b ? -1 : 1;
+    return first.name < second.name ? -1 : first.name > second.name ? 1 : 0;
+  };
+  return [...(files || [])].filter((file) => {
+    const path = file.webkitRelativePath || "";
+    return path.split("/").length === 2 && /^.+\.md$/i.test(file.name);
+  }).sort(byName);
+}
+
+// The server caps one folder request; check before sending megabytes for nothing.
+const maxFolderRequestBytes = 8 * 1024 * 1024;
+
+// Read each Markdown file; empty files are reported instead of sent.
+async function folderStatements(files) {
+  const statements = [], empty = [];
+  for (const file of folderMarkdownFiles(files)) {
+    if (file.size > maxFolderRequestBytes) throw new Error(`${file.name} is larger than 8 MB.`);
+    const statement = await file.text();
+    if (statement.trim()) statements.push({ name: file.name, statement });
+    else empty.push(file.name);
+  }
+  return { statements, empty };
+}
+
+// One folder batch at a time: a repeated change event must not start its jobs twice.
+let folderBatchBusy = false;
+
+async function startFolderBatch(files) {
+  const chosen = [...(files || [])];
+  if (!chosen.length || folderBatchBusy) return;
+  folderBatchBusy = true;
+  ui.runFolder.disabled = true;
+  try {
+    await sendFolderBatch(chosen);
+  } finally {
+    folderBatchBusy = false;
+    ui.runFolder.disabled = false;
+  }
+}
+
+async function sendFolderBatch(chosen) {
+  const folderName = (chosen[0].webkitRelativePath || "").split("/")[0];
+  const folder = folderName || "the selected folder";
+  show(ui.notice, false);
+  show(ui.batchStatus, false);
+  let found;
+  try {
+    found = await folderStatements(chosen);
+  } catch (error) {
+    ui.notice.textContent = `Could not read the files in ${folder}: ${error.message}`;
+    show(ui.notice, true);
+    return;
+  }
+  const { statements, empty } = found;
+  const skipped = empty.length
+    ? `Skipped ${empty.length} empty file${empty.length === 1 ? "" : "s"}: ${empty.join(", ")}.` : "";
+  if (!statements.length) {
+    ui.notice.textContent = `No Markdown statements were found directly inside ${folder}.`
+      + (skipped ? ` ${skipped}` : "") + " Choose a folder that contains non-empty .md files.";
+    show(ui.notice, true);
+    return;
+  }
+  const count = statements.length;
+  const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
+    + "Each runs the selected workflow and uses its own quota.\n\n"
+    + `Folder: ${folder}\n`
+    + "Each job sends its statement directly to the proof author "
+    + "(statement review is skipped)." + (skipped ? `\n\n${skipped}` : "");
+  if (!confirm(question)) return;
+  const body = { statements, ...proofJobSettings() };
+  const size = new TextEncoder().encode(JSON.stringify(body)).length;
+  if (size > maxFolderRequestBytes) {
+    ui.notice.textContent = `These statements are too large to send together `
+      + `(${(size / 1048576).toFixed(1)} MB; the limit is 8 MB). Split the folder.`;
+    show(ui.notice, true);
+    return;
+  }
+  clearTimeout(jobsTimer);
+  try {
+    const result = await request("/direct-batch", body);
+    const started = (result.startedJobs || []).length;
+    ui.batchStatus.textContent = `Started ${started} job${started === 1 ? "" : "s"} from ${folder}.`
+      + (skipped ? `\n${skipped}` : "");
+    show(ui.batchStatus, true);
+    if (!currentJob) {
+      renderJobs(result.jobs || []);
+      ui.jobsPanel.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
+  if (!currentJob) loadJobs();
 }
 
 async function startLatexOnly() {
@@ -2292,6 +2408,12 @@ ui.homeLink.onclick = (event) => {
   event.preventDefault();
   goHome();
 };
+ui.runFolder.onclick = () => {
+  ui.folderInput.value = "";
+  ui.folderInput.click();
+};
+ui.folderInput.onchange = () => startFolderBatch(ui.folderInput.files);
+
 ui.check.onclick = () => selectedProblemMode() === "latex"
   ? startLatexOnly() : startReview(ui.problem.value);
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);

@@ -1183,3 +1183,30 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; }
 }
+
+.job-tags { display: block; margin-top: 4px; color: var(--muted); font-size: 0.72rem; }
+.batch-status {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border-radius: 9px;
+  color: #23664f;
+  background: var(--accent-soft);
+  font-size: 0.8rem;
+  white-space: pre-line;
+}
+
+.composer-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 9px;
+}
+.folder-help { margin-top: 8px; text-align: right; }
+
+
+@media (max-width: 640px) {
+  .composer-buttons { flex-direction: column-reverse; }
+  .composer-buttons button { width: 100%; }
+  .folder-help { text-align: left; }
+}

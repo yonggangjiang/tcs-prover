@@ -253,9 +253,21 @@
             </details>
             <div class="composer-actions">
               <span id="modelSummary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</span>
-              <button id="checkButton">Check statement</button>
+              <div class="composer-buttons">
+                <button id="runFolderButton" class="secondary" type="button"
+                  aria-describedby="runFolderHelp">Run a folder…</button>
+                <button id="checkButton">Check statement</button>
+              </div>
             </div>
           </div>
+          <p id="runFolderHelp" class="help folder-help">
+            Run a folder starts one parallel proof job for each Markdown file directly
+            inside the folder you choose, with the settings above. Each job skips
+            statement review. Empty files and subfolders are skipped.
+          </p>
+          <input id="folderInput" type="file" webkitdirectory multiple hidden
+            aria-label="Folder of Markdown statements">
+          <p id="batchStatus" class="batch-status" role="status" hidden></p>
           <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
             <div class="jobs-heading">
               <div>
