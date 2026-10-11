@@ -271,30 +271,31 @@ const checks = `
 (async () => {
   const folder = [
     file('statements/b.md', 'Prove B.'), file('statements/A.md', 'Prove A.'),
-    file('statements/c.MD', 'Prove C.'), file('statements/notes.txt', 'Not a statement.'),
-    file('statements/nested/d.md', 'Nested.'), file('statements/.md', 'No name.'),
-    file('statements/empty.md', '  \\n'), file('statements/a.markdown', 'Other suffix.'),
+    file('statements/c.MD', 'Prove C.'), file('statements/notes.txt', 'Text statement.'),
+    file('statements/nested/d.md', 'Nested.'), file('statements/02_cutquery_reachability', 'Extensionless statement.'),
+    file('statements/empty.md', '  \\n'), file('statements/problem.tex', 'TeX statement.'),
   ];
-  assert.deepEqual(folderMarkdownFiles(folder).map(item => item.name), ['A.md', 'b.md', 'c.MD', 'empty.md']);
-  assert.deepEqual(folderMarkdownFiles([file('loose.md', 'No folder.')]), []);
+  assert.deepEqual(folderStatementFiles(folder).map(item => item.name), ['02_cutquery_reachability', 'A.md', 'b.md', 'c.MD', 'empty.md', 'notes.txt', 'problem.tex']);
+  assert.deepEqual(folderStatementFiles([file('loose.md', 'No folder.')]), []);
   const read = await folderStatements(folder);
   assert.deepEqual(JSON.parse(JSON.stringify(read)), {
-    statements: [{name: 'A.md', statement: 'Prove A.'}, {name: 'b.md', statement: 'Prove B.'},
-                 {name: 'c.MD', statement: 'Prove C.'}],
+    statements: [{name: '02_cutquery_reachability', statement: 'Extensionless statement.'}, {name: 'A.md', statement: 'Prove A.'}, {name: 'b.md', statement: 'Prove B.'},
+                 {name: 'c.MD', statement: 'Prove C.'}, {name: 'notes.txt', statement: 'Text statement.'},
+                 {name: 'problem.tex', statement: 'TeX statement.'}],
     empty: ['empty.md'],
   });
 
   await startFolderBatch(folder);
   assert.equal(questions.length, 1);
-  assert.match(questions[0], /^Start 3 parallel jobs\\? Each runs the selected workflow and uses its own quota\\./);
+  assert.match(questions[0], /^Start 6 parallel jobs\\? Each runs the selected workflow and uses its own quota\\./);
   assert.match(questions[0], /Folder: statements\\n/);
   assert.match(questions[0], /statement review is skipped/);
   assert.match(questions[0], /Skipped 1 empty file: empty\\.md\\./);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].path, '/direct-batch');
   const body = JSON.parse(JSON.stringify(sent[0].body));
-  assert.deepEqual(body.statements.map(item => item.name), ['A.md', 'b.md', 'c.MD']);
-  assert.equal(body.statements[0].statement, 'Prove A.');
+  assert.deepEqual(body.statements.map(item => item.name), ['02_cutquery_reachability', 'A.md', 'b.md', 'c.MD', 'notes.txt', 'problem.tex']);
+  assert.equal(body.statements[0].statement, 'Extensionless statement.');
   assert.deepEqual(body, {
     statements: body.statements,
     authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol', writerModel: 'gpt-5.6-luna',
@@ -305,7 +306,7 @@ const checks = `
     speedMode: 'fast', reasoningSummary: 'concise',
   });
   assert.equal(ui.batchStatus.hidden, false);
-  assert.equal(ui.batchStatus.textContent, 'Started 3 jobs from statements.'
+  assert.equal(ui.batchStatus.textContent, 'Started 6 jobs from statements.'
     + '\\nSkipped 1 empty file: empty.md.');
   assert.deepEqual(rendered, [{runId: 'job-0'}]);
   assert.equal(ui.jobsPanel.scrolled, true);
@@ -324,13 +325,13 @@ const checks = `
   assert.equal(sent.length, 2);
   answer = true;
 
-  // A folder without usable Markdown files is an error before any question.
+  // A folder without usable text files is an error before any question.
   questions = [];
-  await startFolderBatch([file('drafts/empty.md', ''), file('drafts/notes.txt', 'x'), file('drafts/sub/a.md', 'x')]);
+  await startFolderBatch([file('drafts/empty.md', ''), file('drafts/notes.txt', ''), file('drafts/sub/a.md', 'x')]);
   assert.equal(questions.length, 0);
   assert.equal(sent.length, 2);
   assert.equal(ui.notice.hidden, false);
-  assert.match(ui.notice.textContent, /No Markdown statements were found directly inside drafts\\. Skipped 1 empty file: empty\\.md\\./);
+  assert.match(ui.notice.textContent, /No statements were found directly inside drafts\\. Skipped 2 empty files: empty\\.md, notes\\.txt\\./);
 
   // A server error is shown, and the job list keeps polling.
   failure = 'Could not start the job for b.md: disk full.';

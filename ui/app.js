@@ -2225,9 +2225,9 @@ function proofJobSettings() {
   };
 }
 
-// Like the terminal folder mode: only Markdown files directly inside the chosen
-// folder, never its subfolders, in a deterministic order by name.
-function folderMarkdownFiles(files) {
+// Read files directly inside the chosen folder, regardless of extension,
+// never its subfolders, in a deterministic order by name.
+function folderStatementFiles(files) {
   const byName = (first, second) => {
     const a = first.name.toLowerCase(), b = second.name.toLowerCase();
     if (a !== b) return a < b ? -1 : 1;
@@ -2235,17 +2235,17 @@ function folderMarkdownFiles(files) {
   };
   return [...(files || [])].filter((file) => {
     const path = file.webkitRelativePath || "";
-    return path.split("/").length === 2 && /^.+\.md$/i.test(file.name);
+    return path.split("/").length === 2;
   }).sort(byName);
 }
 
 // The server caps one folder request; check before sending megabytes for nothing.
 const maxFolderRequestBytes = 8 * 1024 * 1024;
 
-// Read each Markdown file; empty files are reported instead of sent.
+// Read each text file; empty files are reported instead of sent.
 async function folderStatements(files) {
   const statements = [], empty = [];
-  for (const file of folderMarkdownFiles(files)) {
+  for (const file of folderStatementFiles(files)) {
     if (file.size > maxFolderRequestBytes) throw new Error(`${file.name} is larger than 8 MB.`);
     const statement = await file.text();
     if (statement.trim()) statements.push({ name: file.name, statement });
@@ -2287,8 +2287,8 @@ async function sendFolderBatch(chosen) {
   const skipped = empty.length
     ? `Skipped ${empty.length} empty file${empty.length === 1 ? "" : "s"}: ${empty.join(", ")}.` : "";
   if (!statements.length) {
-    ui.notice.textContent = `No Markdown statements were found directly inside ${folder}.`
-      + (skipped ? ` ${skipped}` : "") + " Choose a folder that contains non-empty .md files.";
+    ui.notice.textContent = `No statements were found directly inside ${folder}.`
+      + (skipped ? ` ${skipped}` : "") + " Choose a folder that contains non-empty text files (any extension or none).";
     show(ui.notice, true);
     return;
   }

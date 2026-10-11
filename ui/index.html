@@ -261,12 +261,13 @@
             </div>
           </div>
           <p id="runFolderHelp" class="help folder-help">
-            Run a folder starts one parallel proof job for each Markdown file directly
+            Run a folder starts one parallel proof job for each text file directly
             inside the folder you choose, with the settings above. Each job skips
-            statement review. Empty files and subfolders are skipped.
+            statement review. Any file extension or no extension is accepted.
+            Empty files and subfolders are skipped.
           </p>
           <input id="folderInput" type="file" webkitdirectory multiple hidden
-            aria-label="Folder of Markdown statements">
+            aria-label="Folder of statement files (any extension or none)">
           <p id="batchStatus" class="batch-status" role="status" hidden></p>
           <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
             <div class="jobs-heading">

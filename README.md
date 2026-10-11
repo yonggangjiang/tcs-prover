@@ -111,11 +111,12 @@ every node.
 ## Run a folder from the Web UI
 
 On the home screen in Statement mode, click **Run a folder…** and choose a
-folder containing Markdown statements. Each non-empty, top-level `.md` file
+folder containing text statements. Any filename is accepted, including `.md`,
+`.txt`, `.tex`, and files without an extension. Each non-empty, top-level text file
 starts its own parallel proof job using the current author, critic, writer,
 prompt, and research-file settings. Statement review is skipped. The browser
 asks for confirmation before starting the jobs, each of which uses its own quota.
-Subfolders and other file types are ignored; empty files are reported and skipped.
+Files are read as UTF-8 text. Subfolders are ignored; empty files are reported and skipped.
 The job list shows each source filename, including after a server restart.
 
 A batch accepts at most 200 statements, 100,000 characters per statement, and
