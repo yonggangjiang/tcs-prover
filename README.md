@@ -16,7 +16,7 @@ hides research records and scheduled audits. The critic and LaTeX writer still r
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
 attempt history, and proved results across interruptions or context compaction.
-GPT-6.1 Sol with Max reasoning and Fast generation are the defaults for every
+GPT-6.1 Sol with Max reasoning and Standard generation are the defaults for every
 role. DeepSeek V4 Pro is an additional
 model option that uses the same harness pipeline through DeepSeek's official
 API.
@@ -37,7 +37,7 @@ python3 -m pip install -r requirements.txt
 python3 web_ui.py
 ```
 
-The Web UI opens locally with 6.1 Sol, Max, and Fast defaults for
+The Web UI opens locally with 6.1 Sol, Max, and Standard defaults for
 the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
 is needed only when you select DeepSeek for one or more roles.
 
@@ -138,7 +138,7 @@ This sends the entire file directly to the proof author, exactly like enabling
 open a browser. With no command-line overrides, it uses the same defaults as the
 web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
 limit, 6.1 Sol and Max for all proof
-roles, the built-in role prompts, and Fast generation speed. The
+roles, the built-in role prompts, and Standard generation speed. The
 activity log requests concise public reasoning summaries by default.
 
 ### Optional settings
@@ -163,7 +163,7 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
 | `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
-| `-speedMode MODE` | `fast` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation (up to 2× on 6.1 Sol and Astra, 1.5× on the other models; Fast can draw credits faster). DeepSeek calls always use standard service because Fast is provider-specific. |
+| `-speedMode MODE` | `standard` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation (up to 2× on 6.1 Sol and Astra, 1.5× on the other models; Fast can draw credits faster). DeepSeek calls always use standard service because Fast is provider-specific. |
 | `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. |
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |

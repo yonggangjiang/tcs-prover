@@ -1997,7 +1997,7 @@ function render(next) {
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
     ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
-    ui.speedMode.value = state.speedMode || "fast";
+    ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
@@ -2024,7 +2024,7 @@ function render(next) {
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
     ui.writerEffort.value = state.writerEffort || state.reasoningEffort || "max";
     ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
-    ui.speedMode.value = state.speedMode || "fast";
+    ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     syncPrompts(state);
     updateModelSummary();

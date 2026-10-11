@@ -47,7 +47,7 @@ MODEL_EFFORTS = {
     **dict.fromkeys(("gpt-6-luna", "gpt-5.6-luna"), EFFORTS[:-1]),
     "deepseek-v4-pro": EFFORTS,
 }
-SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "fast"
+SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
 SERVICE_TIER = DEFAULT_SPEED
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 MAX_CRITIC_ROUNDS = 100

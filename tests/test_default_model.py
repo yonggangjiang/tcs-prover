@@ -118,7 +118,9 @@ class RuntimeDefaultTests(unittest.TestCase):
         command = captured_command(launch)
         self.assertEqual(option_after(command, "-m"), MODEL)
         self.assertIn('model_reasoning_effort="max"', command)
-        self.assertIn('service_tier="fast"', command)
+        self.assertEqual(runtime.DEFAULT_SPEED, "standard")
+        self.assertNotIn('service_tier="fast"', command)
+        self.assertEqual(option_after(command, "--disable"), "fast_mode")
 
 
 class ServerDefaultTests(unittest.TestCase):
@@ -596,7 +598,7 @@ const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {sta
     assert.equal(ui[`${role}Effort`].value, 'max');
     assert.deepEqual(disabled(ui, role), []);
   }
-  assert.match(summary(ui), /^Fast speed · Concise activity log · 6\.1 Sol\/Max review/);
+  assert.match(summary(ui), /^Standard speed · Concise activity log · 6\.1 Sol\/Max review/);
 
   // 2. Picking 6 Luna while Ultra is selected disables Ultra, moves the effort to Max, and updates the footer.
   ui.authorEffort.value = 'ultra';
