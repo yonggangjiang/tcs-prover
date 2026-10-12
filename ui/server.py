@@ -2,6 +2,7 @@
 
 import getpass
 import json
+import math
 import os
 import re
 import secrets
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from contextlib import ExitStack
 from datetime import datetime, timezone
@@ -64,6 +66,7 @@ MAX_DOCUMENT_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_BATCH_STATEMENTS = 200
 MAX_BATCH_STATEMENT_CHARS = 100_000
 MAX_SOURCE_FILE_CHARS = 255
+AUTO_RESUME_SECONDS = 10 * 60
 
 
 def goal_thread_from_record(record):
@@ -441,6 +444,7 @@ def empty_state(trace=None, trace_version=0):
         "problemMode": "statement",
         "skipStatementReview": False,
         "sourceFile": "",
+        "autoResumeAt": 0,
         "statementReviewOnly": False,
         "fileManagement": False,
         "preparedRun": False,
@@ -1829,6 +1833,58 @@ class App:
         self._save(".pause.tmp", json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
         (self.run_dir / ".pause.tmp").replace(self.run_dir / PAUSE_FILENAME)
 
+    def _configure_auto_resume(self, checkpoint, now=None):
+        """Persist the retry deadline and distinguish errors from deliberate pauses."""
+
+        now = time.time() if now is None else now
+        if not checkpoint.get("pauseCause"):
+            # Legacy checkpoints: deliberate pauses left a pause-request file;
+            # failed runs recorded an error instead.
+            checkpoint["pauseCause"] = (
+                "error" if checkpoint.get("error")
+                and not (self.run_dir / PAUSE_REQUEST_FILENAME).exists() else "user"
+            )
+        exhausted = (
+            "time limit" in str(checkpoint.get("error", "")).lower()
+            or float(checkpoint.get("elapsedSeconds", 0))
+            >= float(self.state["thinkingHours"]) * 3600
+        )
+        retry = checkpoint["pauseCause"] == "error" and not exhausted
+        deadline = checkpoint.get("autoResumeAt", 0)
+        if not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
+            deadline = now + AUTO_RESUME_SECONDS
+        checkpoint["autoResumeAt"] = deadline if retry else 0
+        self.state["autoResumeAt"] = checkpoint["autoResumeAt"]
+
+    def auto_resume_if_due(self, resume, now=None):
+        """Retry one failed pause under the same lock as manual pause/resume."""
+
+        now = time.time() if now is None else now
+        with self.lock:
+            deadline = self.state.get("autoResumeAt", 0)
+            if (self.state["phase"] != "paused" or not deadline or now < deadline
+                    or self.has_active_worker() or self.state.get("auditHoldingAuthor")
+                    or self.state.get("manuallyStopped")):
+                return False
+            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+            self._configure_auto_resume(checkpoint, now)
+            if not self.state["autoResumeAt"]:
+                self._save_pause(checkpoint)
+                return False
+            # Reserve the next attempt before launching. A failed launch, or a
+            # server restart during it, must not cause retries every polling tick.
+            checkpoint["autoResumeAt"] = now + AUTO_RESUME_SECONDS
+            self.state["autoResumeAt"] = checkpoint["autoResumeAt"]
+            self._save_pause(checkpoint)
+            self.add_trace({"kind": "status", "stage": self.state["stage"],
+                            "label": "Automatic resume", "text": "Retrying after an error pause."})
+            try:
+                resume()
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                "text": f"Automatic resume failed: {exc}. Retrying in 10 minutes."})
+            return True
+
     def _author_checkpoint_state(self):
         """Recover controller input if the author exits before emitting its state."""
 
@@ -1845,6 +1901,15 @@ class App:
         """Interrupt the author while retaining its native session for resume."""
 
         with self.lock:
+            if not _for_audit and self.state["phase"] in {"pausing", "paused"}:
+                try:
+                    checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    pass  # Audit cancellation is also valid before a checkpoint exists.
+                else:
+                    checkpoint.update(pauseCause="user", autoResumeAt=0)
+                    self._save_pause(checkpoint)
+                self.state["autoResumeAt"] = 0
             if not _for_audit and self._audit_pause_engine is not None:
                 # A human pause cancels the audits and their automatic resume.
                 self._audit_pause_engine = None
@@ -1852,17 +1917,18 @@ class App:
                 self._update_research_audits()
                 if self.state["phase"] in {"pausing", "paused"}:
                     return
-            if self.state["phase"] == "pausing":
+            if self.state["phase"] in {"pausing", "paused"}:
                 return
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
                 raise ValueError("Pause is available while the proof author is working.")
             checkpoint_state = self._author_checkpoint_state()
             self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
+                              "pauseCause": "audit" if _for_audit else "user", "autoResumeAt": 0,
                               "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
                               "goalThreadId": self.state.get("goalThreadId", "")})
             self._save(PAUSE_REQUEST_FILENAME, "{}\n")
-            self.state.update(phase="pausing", error="")
+            self.state.update(phase="pausing", error="", autoResumeAt=0)
             self._update_research_audits()
             self._save_job_settings(self.state)
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
@@ -1938,11 +2004,12 @@ class App:
             if checkpoint.get("goalThreadId"):
                 self.state["goalThreadId"] = checkpoint["goalThreadId"]
             self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
-                              resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="")
+                              resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="", autoResumeAt=0)
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
             process = None
             try:
-                self._save_pause({**checkpoint, "status": "running", "error": ""})
+                self._save_pause({**checkpoint, "status": "running", "error": "",
+                                  "pauseCause": "", "autoResumeAt": 0})
                 self._save_job_settings(self.state)
                 resume_options = (["--set", "goal_require_resume=true"]
                                   if self.state.get("goalThreadId") else [])
@@ -2451,11 +2518,13 @@ class App:
                             except (OSError, ValueError):
                                 checkpoint = {}
                             reason = record.get("reason", "")
+                            cause = checkpoint.get("pauseCause") if self.state["phase"] == "pausing" else "error"
                             paused_stage = record["stage"]
                             if (record["node"] == "author"
                                     and record["state"].get("report", {}).get("verdict") == "reject"):
                                 paused_stage = "repair"
                             self._save_pause({**checkpoint, "status": "pausing", "state": record["state"],
+                                              "pauseCause": cause or "error", "autoResumeAt": 0,
                                               "node": record["node"], "error": reason,
                                               "elapsedSeconds": self._elapsed_seconds(),
                                               "goalThreadId": self.state.get("goalThreadId", ""),
@@ -2572,8 +2641,12 @@ class App:
                     workflow_state = {**checkpoint.get("state", {}), **self._author_checkpoint_state()}
                     checkpoint.update(state=workflow_state, node="author",
                                       stage="repair" if workflow_state.get("report") else "solve")
-                self._save_pause({**checkpoint, "status": "paused", "elapsedSeconds": self._elapsed_seconds(),
-                                  "goalThreadId": self.state.get("goalThreadId", ""), "error": error})
+                checkpoint.update(status="paused", elapsedSeconds=self._elapsed_seconds(),
+                                  goalThreadId=self.state.get("goalThreadId", ""), error=error)
+                if not paused:
+                    checkpoint.update(pauseCause="error", autoResumeAt=0)
+                self._configure_auto_resume(checkpoint)
+                self._save_pause(checkpoint)
                 self.state.update(phase="paused", error=error, activeNode=checkpoint["node"], stage=checkpoint["stage"])
             elif final:
                 # A complete terminal record is durable and wins even when Stop
@@ -2644,6 +2717,7 @@ class App:
                 pass
             self.state.update(
                 manuallyStopped=True,
+                autoResumeAt=0,
                 stoppedStage=self.state["stage"],
             )
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
@@ -3476,6 +3550,9 @@ def restore_saved_app(app):
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
     app.state = state
+    if state["phase"] == "paused":
+        app._configure_auto_resume(checkpoint, (run_dir / PAUSE_FILENAME).stat().st_mtime)
+        app._save_pause(checkpoint)
     app.fixed_trace = False
     return app
 
@@ -3676,6 +3753,7 @@ class Server(ThreadingHTTPServer):
         self.app = App(trace_file, self.runs)
         self.fixed_app = trace_file is not None
         self.jobs, self.jobs_lock = {}, threading.RLock()
+        self._retry_stop = threading.Event()
         super().__init__(address, Handler)
         if not self.fixed_app:
             self.jobs.update(restore_saved_jobs(self.runs))
@@ -3687,6 +3765,39 @@ class Server(ThreadingHTTPServer):
         # Only the unguessable launch URL can create this server's session.
         self.token = secrets.token_urlsafe(32)
         self.origin = f"http://{HOST}:{self.server_port}"
+
+    def _retry_paused_jobs(self, now=None):
+        with self.jobs_lock:
+            for run_id, app in list(self.jobs.items()):
+                if self._retry_stop.is_set():
+                    return
+                try:
+                    app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
+                except (OSError, ValueError, TypeError):
+                    # A missing or damaged checkpoint must not stop other jobs.
+                    continue
+
+    def serve_forever(self, poll_interval=0.5):
+        # No browser tab or polling request is needed to retry a paused job.
+        def retry_loop():
+            while not self._retry_stop.wait(1):
+                self._retry_paused_jobs()
+
+        worker = threading.Thread(target=retry_loop, daemon=True)
+        worker.start()
+        try:
+            super().serve_forever(poll_interval)
+        finally:
+            self._retry_stop.set()
+            worker.join(timeout=5)
+
+    def shutdown(self):
+        self._retry_stop.set()
+        super().shutdown()
+
+    def server_close(self):
+        self._retry_stop.set()
+        super().server_close()
 
     def get_job(self, run_id):
         """Return one exact job; tests may use their fixed single app."""

@@ -453,6 +453,11 @@ const checks = `
   assert.equal(ui.authorTimeLimitControl.hidden, false);
   assert.equal(ui.setAuthorTimeLimit.disabled, false);
   ui.resume.onclick(); assert.equal(clicked, '/resume');
+  render({...running, phase: 'paused', autoResumeAt: 2000000000, error: 'Connection lost'});
+  assert.equal(ui.pause.hidden, false);
+  assert.equal(ui.pause.textContent, 'Keep paused');
+  assert.match(ui.runDescription.textContent, /Connection lost.*Automatic retry at/);
+  ui.pause.onclick(); assert.equal(clicked, '/pause');
   render({...running, stage: 'critic', activeNode: 'critic'});
   assert.equal(ui.pause.hidden, true);
   render({...running, phase: 'done', stage: 'final', activeNode: 'latex_compile', canDownloadTex: true, canDownloadPdf: true});

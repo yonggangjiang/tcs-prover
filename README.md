@@ -174,6 +174,15 @@ Run `python3 web_ui.py --help` to see every spelling and allowed value.
 
 ## How to use checkpoints
 
+If a proof author pauses because of a connection loss or another unexpected
+error, TCS Prover retries the saved conversation after 10 minutes. A failed
+resume attempt is retried every 10 minutes. Retry times survive server restarts
+and do not require an open browser tab. The paused job shows its next retry time;
+**Keep paused** cancels automatic retries, and **Resume** retries immediately.
+User-requested pauses and stops, research-audit pauses, and exhausted workflow
+time limits do not trigger this error retry. Saved work and the original time
+budget are preserved.
+
 TCS Prover writes durable artifacts while a job progresses. When the Web UI is
 started again, it scans `runs/*/transcript.jsonl`, restores the historical job
 cards, and lists every resumable critic checkpoint found in those run folders.

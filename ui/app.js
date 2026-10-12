@@ -2076,6 +2076,10 @@ function render(next) {
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : done ? "The output and transcript remain preserved for this job."
         : (node.description || ""));
+  if (phase === "paused" && state.autoResumeAt) {
+    const retryTime = new Date(state.autoResumeAt * 1000).toLocaleTimeString();
+    ui.runDescription.textContent += ` Automatic retry at ${retryTime}. Choose Keep paused to cancel retries.`;
+  }
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
   const authorLimit = Number(state.thinkingHours || 168);
@@ -2099,8 +2103,11 @@ function render(next) {
     ui.authorLimitHours.value = String(authorLimit);
   }
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
-  show(ui.pause, authorRunning || auditHolding);
-  ui.pause.title = auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
+  const retryPending = phase === "paused" && Boolean(state.autoResumeAt);
+  show(ui.pause, authorRunning || auditHolding || retryPending);
+  ui.pause.textContent = retryPending ? "Keep paused" : "Pause";
+  ui.pause.title = retryPending ? "Cancel automatic retries"
+    : auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
   ui.resume.textContent = phase === "prepared" ? "Start prepared run" : "Resume";
   ui.resume.disabled = auditHolding;
