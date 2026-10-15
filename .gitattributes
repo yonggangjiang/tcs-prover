@@ -1,0 +1,2 @@
+# Preserve exact published input bytes, including original trailing spaces.
+experiments/firstproof-batch3/inputs/*.md -text -whitespace

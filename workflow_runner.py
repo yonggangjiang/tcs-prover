@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import retrieval_runtime
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -154,14 +155,14 @@ def critic_limit(value):
 
 
 def author_hours(value):
-    """Require a positive author-time limit of at most one week."""
+    """Accept zero for unlimited, or a finite limit of at most one week."""
 
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise Error("The total workflow time limit must be a number of hours.") from exc
-    if not 0 < value <= MAX_AUTHOR_HOURS:
-        raise Error(f"Choose more than 0 and at most {MAX_AUTHOR_HOURS} hours.")
+    if not math.isfinite(value) or not 0 <= value <= MAX_AUTHOR_HOURS:
+        raise Error(f"Choose 0 for unlimited, or at most {MAX_AUTHOR_HOURS} hours.")
     return value
 
 
@@ -276,6 +277,29 @@ def environment(model=None):
     env.pop("LOG_FORMAT", None)
     env.pop("RUST_BACKTRACE", None)
     return env
+
+
+def retrieval_policy(workspace=None, features=()):
+    """Read controller policy before any process or model call is allowed."""
+    try:
+        policy = retrieval_runtime.policy_for_workspace(workspace)
+        if policy and set(features) - {"multi_agent", "shell_tool"}:
+            raise retrieval_runtime.RetrievalPolicyError("Historical workflow features are limited to the audited default tool set.")
+        return policy
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise Error(str(exc)) from exc
+
+
+def retrieval_environment(policy, role, model=None, inherited=None):
+    try:
+        if policy and model is not None and model_provider(model) != OPENAI_PROVIDER:
+            raise retrieval_runtime.RetrievalPolicyError("Historical isolation currently supports only the default OpenAI provider.")
+        return retrieval_runtime.preflight(
+            policy, role, retrieval_runtime.codex_executable(policy) if policy else "",
+            environment(model) if inherited is None else inherited,
+        )
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise Error(str(exc)) from exc
 
 
 def structured_workspace():
@@ -567,10 +591,9 @@ def output_schema_arguments(model, schema_path):
     return ["--output-schema", str(schema_path)]
 
 def structured_tool_arguments(stage, features=()):
-    """Enable live search; keep other optional tools controlled by YAML."""
+    """Disable native search; keep other optional tools controlled by YAML."""
     return [
-        "-c", 'web_search="live"',
-        "-c", "tools.web_search=true",
+        *retrieval_runtime.native_search_arguments(),
         "-c", "tools.view_image=false",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
     ]
@@ -594,7 +617,7 @@ def structured_retry_prompt(prompt, raw, schema_value):
         f"{prompt}\n\nSTRUCTURED OUTPUT RECOVERY RETRY\n"
         "The previous attempt did not produce one valid final JSON object. "
         "Do not discuss the formatting failure or return a placeholder. "
-        "Re-evaluate the task, using web search if needed, and return the "
+        "Re-evaluate the task using the supplied information and return the "
         "complete substantive answer as exactly one JSON object matching this "
         f"schema:\n{schema}\n\nPREVIOUS INVALID OUTPUT:\n{previous}"
     )
@@ -605,29 +628,34 @@ def run_structured_attempt(
 ):
     """Run one structured Codex process and return its last-message text."""
 
+    policy = retrieval_policy(features=features)
+    child_environment = retrieval_environment(policy, "structured", model)
     timeout = None if timeout is None else float(timeout)
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
-        workspace = structured_workspace()
+        workspace = retrieval_runtime.role_workspace(policy, "structured") if policy else structured_workspace()
         schema = folder / "schema.json"
         answer = folder / "answer.json"
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         schema_arguments = output_schema_arguments(model, schema)
         command = [
-            codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            retrieval_runtime.codex_executable(policy) if policy else codex(),
+            *(["--strict-config"] if policy else []),
+            "-m", model, "-c", f'model_reasoning_effort="{effort}"',
             *provider_arguments(model),
             *speed_arguments(speed, model), *context_cache_arguments(),
             "-c", f'model_reasoning_summary="{summary}"',
             *structured_tool_arguments(stage, features),
             *[argument for feature in features for argument in ("--enable", feature)],
-            "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
+            "-C", str(workspace), *([] if policy else ["-s", "read-only"]),
+            "-a", "never", "exec",
             "--json", "--ephemeral", "--skip-git-repo-check",
-            "--ignore-user-config", *schema_arguments, "-o", str(answer), "-",
+            *([] if policy else ["--ignore-user-config"]), *schema_arguments, "-o", str(answer), "-",
         ]
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", env=environment(model),
+            errors="replace", env=child_environment,
         )
         timed_out = threading.Event()
         heartbeat_stop = threading.Event()
@@ -928,6 +956,7 @@ def structured(
 ):
     """Run one read-only structured Codex call and relay its visible events."""
 
+    retrieval_policy(features=features)
     model = chosen_model(model)
     effort = effective_effort(model, effort)
     speed = effective_speed(model, speed)
@@ -1013,7 +1042,7 @@ def structured(
                 raise Error(f"{exc}{suffix}") from exc
             emit(
                 "status", stage, label="Retrying structured output",
-                text="Retrying once for valid structured output; web search remains available.",
+                text="Retrying once for valid structured output; native web search remains disabled.",
             )
     raise Error(f"Codex {stage} did not return structured output.")
 
@@ -1094,6 +1123,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     through ``send``. The model manages its own work in the supplied workspace.
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
+    policy = retrieval_policy(directory, features)
+    retrieval_role = "author" if node_name == "author" else "structured"
+    if policy and retrieval_role != "author":
+        raise Error("Historical goal sessions are restricted to the configured author node.")
     stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
     stage = stages["initial"]
     values = dict(original_prompt=prompt, directory=directory,
@@ -1197,6 +1230,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         emit("diagnostic", text=f"Could not send live instruction: {exc}")
 
     def start_turn(instruction):
+        if policy:
+            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
         if pause_file and Path(pause_file).is_file():
             pausing.set()
             raise runtime.Error("Pause requested.")
@@ -1228,16 +1263,18 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Workflow time limit reached.")
         if options.get("goal_require_resume") and not options.get("goal_thread_id"):
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation.")
+        child_environment = retrieval_environment(policy, retrieval_role, model, inherited=runtime.environment(model))
         process = subprocess.Popen([
-            runtime.codex(), "app-server", "--enable", "goals",
-            "-c", 'web_search="live"', "-c", "tools.web_search=true",
+            retrieval_runtime.codex_executable(policy) if policy else runtime.codex(),
+            *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
+            *retrieval_runtime.native_search_arguments(),
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
             *runtime.context_cache_arguments(),
             *[argument for feature in features for argument in ("--enable", feature)],
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
-            env=runtime.environment(model))
+            env=child_environment)
         rpc = runtime.RPC(process, record)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
@@ -1246,16 +1283,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             "capabilities": {"experimentalApi": True},
         })
         rpc.send({"method": "initialized", "params": {}})
+        if policy:
+            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
         thread_options = {
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
-                "web_search": "live", "tools": {"web_search": True},
+                "web_search": "disabled", "tools": {"web_search": False},
                 "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
                              **{feature: True for feature in features}}},
         }
         if hasattr(runtime, "model_provider"):
             thread_options["modelProvider"] = runtime.model_provider(model)
+        if policy:
+            thread_options.pop("sandbox")
+            thread_options["permissions"] = retrieval_runtime.PROFILE
+            locked = retrieval_runtime.configuration(policy, retrieval_role)
+            locked_features = locked.pop("features")
+            thread_options["config"].update(locked)
+            thread_options["config"]["features"].update(locked_features)
         resumed = False
         if options.get("goal_thread_id"):
             try:
@@ -2127,6 +2173,8 @@ def workflow_remaining(options):
     started = options.setdefault("_workflow_started", time.monotonic())
     hours = controlled_author_hours(options.get("author_limit_file"),
                                    options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
+    if hours == 0:
+        return math.inf
     return max(0.0, hours * 3600 - options.get("elapsed_seconds", 0)
                - (time.monotonic() - started))
 
@@ -2135,7 +2183,7 @@ def _bounded_request_settings(settings, options):
     remaining = workflow_remaining(options)
     if remaining <= 0:
         raise Error("Workflow time limit reached; saved work remains resumable.")
-    return {**settings, "timeout": min(settings.get("timeout") or 900, remaining),
+    return {**settings, "timeout": None if math.isinf(remaining) else min(settings.get("timeout") or 900, remaining),
             "attempts": 1}
 
 
@@ -2207,6 +2255,15 @@ def _model_call(node, prompts, state, options, visit):
 
 def _run_command(config, context):
     """Run a bounded argv command and check only its declared output files."""
+    if retrieval_policy() is not None:
+        # Model-produced TeX and planted executable names must never reach a
+        # controller process with unrestricted filesystem/network access. A
+        # verified isolated compiler adapter is required before enabling these
+        # nodes; failing here also covers command actions in before/after hooks.
+        raise Error(
+            "Historical external workflow commands are blocked: an isolated compiler/command adapter "
+            "has not been verified. No command was resolved or started; existing source and outputs are preserved."
+        )
     argv = [render_template(value, context) for value in config["argv"]]
     directory = (Path.cwd() / render_template(config.get("cwd", "."), context)).resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)

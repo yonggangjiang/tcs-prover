@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "benchmark": "First Proof Third Batch",
+  "baseTcsCommit": "5e9288d734448b04430e0cb3335d3273f39a9a07",
+  "benchmarkCommit": "5908aab1a1067d0e858294950537d0c471d7bb7f",
+  "publicReleaseUtc": "2026-10-14T19:00:00Z",
+  "confirmedUserChoices": {
+    "confirmedOn": "2026-10-15",
+    "cutoff": "Original test times (October 2 for P01-P09, October 5 for corrected P10)",
+    "inputMode": "Direct batch mode; preserve official inputs",
+    "authorizesLaunch": false,
+    "launchOwner": "user",
+    "executionHost": "MacBook (to be configured)",
+    "latestInstruction": "Commit and push this branch; the user will run the problems on a MacBook later. Preserve the requested absence of configured token and time limits."
+  },
+  "executionOverrides": {"thinkingHours": 0, "tokenBudget": null},
+  "inputLimitation": "P03 raw input omits a diagram macro definition included in the separate full TeX. Exact published raw input is retained under confirmed preserve-input choice; no repair or substitution.",
+  "runs": [
+    {
+      "id": "P01",
+      "problemId": "prob-001",
+      "subject": "logarithmic geometry",
+      "authors": "Leo Herr and Jonathan Wise",
+      "statementUtf8Sha256": "70cf693f553937e32a451bce2f46322f0825db9c24e719b3f7924522de0270d2",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:12Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P02",
+      "problemId": "prob-002",
+      "subject": "statistical inverse problems",
+      "authors": "Markus Reiß and Sven Wang",
+      "statementUtf8Sha256": "5fc00fbef10127b951eacdac60caa22feacf81164f7829d77404f5ad1e52cbd7",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:13Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P03",
+      "problemId": "prob-003",
+      "subject": "quantum topology",
+      "authors": "Adam Sikora",
+      "statementUtf8Sha256": "4195563314dce753676da64f9e69d48dcd6fee359767222dac88fed9f574159f",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:14Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P04",
+      "problemId": "prob-004",
+      "subject": "symplectic geometry",
+      "authors": "Bernd Siebert",
+      "statementUtf8Sha256": "74f122427f29c420cc3a750eb298bd46fa8be506963907d53e705bbee0c9d191",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:15Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P05",
+      "problemId": "prob-005",
+      "subject": "hyperfields",
+      "authors": "Tuong Le and Chayim Lowen",
+      "statementUtf8Sha256": "d5e9db1ee0d8e4e996d6549c96cff7f9a220c1610cc5ccb4ed8904b9feb90c0f",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:15Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P06",
+      "problemId": "prob-006",
+      "subject": "low-dimensional topology",
+      "authors": "Cameron Gordon",
+      "statementUtf8Sha256": "7a3cf063fd71bbb785cc69730bb76d21c32d163cb9268a64069da60632c8b592",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:16Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P07",
+      "problemId": "prob-007",
+      "subject": "complex dynamics",
+      "authors": "Tanya Firsova and Mikhail Mazin",
+      "statementUtf8Sha256": "9baa257d4ec4dc48349cf28c1b168e62aa760732137669354e1b1c249598f718",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:17Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P08",
+      "problemId": "prob-008",
+      "subject": "dynamical systems",
+      "authors": "Simion Filip",
+      "statementUtf8Sha256": "fe9fd4c0be4b0193d862d7c22960afd281290da2970a8ddd6ae0f3970bbe1833",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:18Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P09",
+      "problemId": "prob-009",
+      "subject": "Teichmüller theory",
+      "authors": "Benjamin Dozier, Sidhanth Raman, and Carlos Serván",
+      "statementUtf8Sha256": "424f82e6886c97dc9a2407698e720de97d08fd2b4bbfd2551194df7c7589f9f3",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements.json",
+      "cutoffExclusiveUtc": "2026-10-02T14:13:19Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/submitted.json"
+    },
+    {
+      "id": "P10",
+      "problemId": "prob-010",
+      "subject": "algebraic geometry",
+      "authors": "Charles Doran, James M. Jones, Eric Pichon-Pharabod, and Alan Thompson",
+      "statementUtf8Sha256": "fa510b16dbce45f82e5881bd96f4d1eef94f1bd0f2ca917168ee3f5340550556",
+      "originalInputSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/inputs/problem-statements-doran-corrected.json",
+      "cutoffExclusiveUtc": "2026-10-05T00:37:13Z",
+      "cutoffBasis": "System A original request start; conservative fixed information horizon, not asserted common to all systems",
+      "historicalTimestampSource": "https://raw.githubusercontent.com/1stproof/batch-3/5908aab1a1067d0e858294950537d0c471d7bb7f/batch-3-raw-outputs/astra/problem-10/submitted.json"
+    }
+  ]
+}

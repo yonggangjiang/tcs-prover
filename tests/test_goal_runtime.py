@@ -185,8 +185,8 @@ class GoalTests(unittest.TestCase):
                 config = next(p["config"] for m, p in runtime.rpc.calls if m in {"thread/start", "thread/resume"})
                 self.assertTrue(config["features"]["multi_agent"])
                 self.assertTrue(config["features"]["example_feature"])
-                self.assertEqual(config["web_search"], "live")
-                self.assertTrue(config["tools"]["web_search"])
+                self.assertEqual(config["web_search"], "disabled")
+                self.assertFalse(config["tools"]["web_search"])
                 self.assertEqual(sum(m in {"thread/start", "thread/resume"} for m, _ in runtime.rpc.calls), 1)
                 session.close()
 

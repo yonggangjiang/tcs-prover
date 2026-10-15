@@ -1,0 +1,27 @@
+{
+  "date": "2026-10-15",
+  "baseCommit": "5e9288d734448b04430e0cb3335d3273f39a9a07",
+  "python": "3.15.0",
+  "platform": "Windows 11",
+  "testCommand": "python -m unittest discover -s tests -v",
+  "testsRun": 353,
+  "passed": 340,
+  "skipped": 2,
+  "errors": 10,
+  "failures": 1,
+  "newTestsPassed": 72,
+  "baselineComparison": "All ten symlink-creation privilege errors and the CRLF/LF final_tex assertion reproduced on a pristine archive of the base commit.",
+  "preparedJobsValidated": 10,
+  "officialInputHashesMatched": 10,
+  "savedState": "prepared and held; zero elapsed time; no conversation IDs or transcripts",
+  "brokerLocalPreflight": "passed; duckduckgo_wayback; PDF extraction available; no network requested by preflight",
+  "limitedLiveBrokerChecks": "Harmless DuckDuckGo Lite URL discovery and one pre-cutoff example.com Wayback capture passed; the capture digest and Memento timestamp matched. Full benchmark search availability was not exercised.",
+  "modelsStarted": 0,
+  "proverRunsStarted": 0,
+  "remainingExecutionRequirements": [
+    "Implement and verify a macOS filesystem/network isolation adapter and native binary resolution.",
+    "Implement isolated compiler/command execution; historical external command nodes currently fail closed.",
+    "Regenerate local absolute paths on the MacBook and provision isolated authentication.",
+    "Pass actual role/configuration/search/filesystem/network checks before releasing launch holds."
+  ]
+}

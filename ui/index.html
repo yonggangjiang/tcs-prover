@@ -227,8 +227,8 @@
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
-                <label for="thinkingHours">Total workflow time limit (hours)</label>
-                <input id="thinkingHours" type="number" min="0.01" max="168"
+                <label for="thinkingHours">Workflow hours (0 = unlimited)</label>
+                <input id="thinkingHours" type="number" min="0" max="168"
                   step="0.25" value="168" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
                   Default 168 hours for the whole workflow. The author keeps
@@ -429,8 +429,8 @@
               <span id="authorLimitSummary" class="author-limit-summary">
                 Total limit: 168 hours
               </span>
-              <label for="authorLimitHours">Set limit to</label>
-              <input id="authorLimitHours" type="number" min="0.01"
+              <label for="authorLimitHours">Set hours (0 = unlimited)</label>
+              <input id="authorLimitHours" type="number" min="0"
                 max="168" step="0.5" value="168" inputmode="decimal">
               <span>hours</span>
               <button id="setAuthorTimeLimitButton" class="secondary compact">

@@ -967,7 +967,7 @@ class AuditProviderTests(unittest.TestCase):
         self.assertIn("read-only", self.command)
         self.assertIn("--ephemeral", self.command)
         self.assertIn("--ignore-user-config", self.command)
-        self.assertIn('web_search="live"', self.command)
+        self.assertIn('web_search="disabled"', self.command)
         self.assertEqual(self.command[self.command.index("--disable") + 1], "multi_agent")
         self.assertNotIn("resume", self.command)
 
@@ -1004,7 +1004,7 @@ class AuditProviderTests(unittest.TestCase):
         self.assertNotIn("--bare", self.command)
         self.assertIn("--safe-mode", self.command)
         self.assertIn("--strict-mcp-config", self.command)
-        self.assertEqual(self.command[self.command.index("--tools") + 1], "Read,Glob,Grep,WebSearch,WebFetch")
+        self.assertEqual(self.command[self.command.index("--tools") + 1], "Read,Glob,Grep")
         self.assertNotIn("--fallback-model", self.command)
         self.assertNotIn("ANTHROPIC_API_KEY", self.environment)
         self.assertEqual(self.environment["CLAUDE_CODE_OAUTH_TOKEN"], "subscription-credential")
@@ -1040,7 +1040,7 @@ class AuditProviderTests(unittest.TestCase):
             self.command = command
             agent = Path(command[command.index("--agent-file") + 1]).read_text()
             metadata = audits.yaml.safe_load(agent.split("---", 2)[1])
-            self.assertEqual(metadata["tools"], ["Read", "Grep", "Glob", "WebSearch", "FetchURL"])
+            self.assertEqual(metadata["tools"], ["Read", "Grep", "Glob"])
             self.assertEqual(metadata["subagents"], [])
             self.assertIn("Read and advise", agent)
             json.dump({"role": "assistant", "content": "Working", "tool_calls": [{}]}, kwargs["stdout"])

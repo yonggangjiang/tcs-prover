@@ -281,7 +281,8 @@ PUBLIC_GRAPH = {
         },
         "thinking_hours": {
             "default": DEFAULT_THINKING_HOURS,
-            "minimum": 0.01,
+            "minimum": 0,
+            "zeroMeansUnlimited": True,
             "maximum": MAX_THINKING_HOURS,
         },
     },
@@ -448,6 +449,8 @@ def empty_state(trace=None, trace_version=0):
         "statementReviewOnly": False,
         "fileManagement": False,
         "preparedRun": False,
+        "launchHold": "",
+        "retrievalPolicyPath": "",
         "draft": "",
         "reviewStatement": "",
         "reviewFeedback": "",
@@ -630,6 +633,7 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+            "launchHold", "retrievalPolicyPath",
             "sourceFile",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
@@ -655,6 +659,14 @@ class App:
         )
         if source == self.run_dir.resolve():
             raise ValueError("A continuation must use a new run directory.")
+        source_settings_path = source / JOB_SETTINGS_FILENAME
+        if source_settings_path.exists():
+            source_settings = json.loads(source_settings_path.read_text(encoding="utf-8"))
+            if source_settings.get("retrievalPolicyPath") or source_settings.get("launchHold"):
+                raise ValueError(
+                    "Historical runs cannot be cloned into an unrestricted continuation. "
+                    "Resume the same prepared workspace or prepare a new historical run with its policy."
+                )
         self._save(
             CONTINUATION_SOURCE_FILENAME,
             json.dumps({
@@ -692,6 +704,10 @@ class App:
         """Monitor optional audits separately from the workflow reader."""
 
         with self.lock:
+            if self.state.get("retrievalPolicyPath"):
+                # This experiment retains the default of no scheduled auditors.
+                # Do not start a second runner outside its role-specific policy.
+                return
             if self.research_audits is not None and self._audit_pause_engine is self.research_audits:
                 # Automatic resume keeps the same audit clock and monitor.
                 self._audit_token = token
@@ -873,6 +889,8 @@ class App:
 
     def start_research_audit_now(self):
         """Run the saved auditors now and restart their interval clock."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if not self.state.get("fileManagement", True):
@@ -1425,9 +1443,9 @@ class App:
             thinking_hours = float(thinking_hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total workflow time limit must be a number.") from exc
-        if not 0 < thinking_hours <= MAX_THINKING_HOURS:
+        if not math.isfinite(thinking_hours) or not 0 <= thinking_hours <= MAX_THINKING_HOURS:
             raise ValueError(
-                f"Choose more than 0 and at most {MAX_THINKING_HOURS} hours."
+                f"Choose 0 for unlimited, or at most {MAX_THINKING_HOURS} hours."
             )
         return {
             "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
@@ -1476,6 +1494,8 @@ class App:
         file_management=True,
     ):
         """Start the review and return immediately so the page can poll."""
+
+        self._check_input_replacement()
 
         statement = str(statement).strip()
         feedback = str(feedback or "").strip()
@@ -1726,6 +1746,12 @@ class App:
     def _launch_workflow_locked(self, workflows, source, options, stage, node, state=None):
         """Launch YAML graphs in this job, preserving worker ownership on errors."""
 
+        self._check_launch_hold()
+        child_environment = os.environ.copy()
+        # Never let one parallel job inherit another job's retrieval policy.
+        child_environment.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
+        if self.state.get("retrievalPolicyPath"):
+            child_environment["TCS_PROVER_RETRIEVAL_POLICY"] = self.state["retrievalPolicyPath"]
         token = self.active_token = object()
         if state is not None:
             self._save("workflow-input.json", json.dumps(state, ensure_ascii=False))
@@ -1738,6 +1764,7 @@ class App:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", bufsize=1, cwd=self.run_dir,
+            env=child_environment,
             **isolated_process_options(),
         )
         self.worker_token = token
@@ -1846,8 +1873,9 @@ class App:
             )
         exhausted = (
             "time limit" in str(checkpoint.get("error", "")).lower()
-            or float(checkpoint.get("elapsedSeconds", 0))
-            >= float(self.state["thinkingHours"]) * 3600
+            or (float(self.state["thinkingHours"]) > 0 and
+                float(checkpoint.get("elapsedSeconds", 0))
+                >= float(self.state["thinkingHours"]) * 3600)
         )
         retry = checkpoint["pauseCause"] == "error" and not exhausted
         deadline = checkpoint.get("autoResumeAt", 0)
@@ -1955,10 +1983,22 @@ class App:
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
 
+    def _check_launch_hold(self):
+        """A held run must fail before credentials, workers or elapsed clocks."""
+        if self.state.get("launchHold"):
+            raise ValueError("Prepared run is held: " + str(self.state["launchHold"]))
+
+    def _check_input_replacement(self):
+        """A reused UI job must not erase its historical policy or hold."""
+        self._check_launch_hold()
+        if self.state.get("retrievalPolicyPath"):
+            raise ValueError("Historical run inputs and policy are fixed. Create a separate new job instead.")
+
     def start_prepared_run(self):
         """Start a curated workspace in place, with no inherited author session."""
 
         with self.lock:
+            self._check_launch_hold()
             if self.state["phase"] != "prepared" or self.has_active_worker():
                 raise ValueError("This workspace is no longer waiting to start.")
             statement = saved_statement(self.run_dir)
@@ -1990,6 +2030,8 @@ class App:
 
     def resume(self):
         """Reopen this run with a new CLI process and the saved goal/thread."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if self.state.get("auditHoldingAuthor"):
@@ -2105,6 +2147,8 @@ class App:
     ):
         """Send a statement directly to the proof author without review."""
 
+        self._check_input_replacement()
+
         source_file = source_file_name(source_file)
         statement = str(statement).strip()
         if not statement:
@@ -2190,6 +2234,8 @@ class App:
     ):
         """Polish one combined theorem-and-proof input without earlier stages."""
 
+        self._check_input_replacement()
+
         source = str(source).strip()
         if not source:
             raise ValueError("Enter the theorem and proof.")
@@ -2247,6 +2293,8 @@ class App:
         critic_model=DEFAULT_CRITIC_MODEL, critic_effort=None,
     ):
         """Retry normal finalization with its exact statement/proof contract."""
+
+        self._check_input_replacement()
 
         statement, solution = str(statement).strip(), str(solution).strip()
         if not statement or not solution:
@@ -2323,6 +2371,8 @@ class App:
         recover_audit_checkpoint=True,
     ):
         """Create a new job that audits one complete saved candidate proof."""
+
+        self._check_input_replacement()
 
         statement, solution = str(statement).strip(), str(solution).strip()
         if not statement or not solution:
@@ -2406,6 +2456,8 @@ class App:
 
     def approve(self, edited_statement=None):
         """Solve the reviewed statement, including any direct author edit."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if self.state.get("statementReviewOnly", False):
@@ -2742,9 +2794,9 @@ class App:
             hours = float(hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total time limit must be a number of hours.") from exc
-        if not 0 < hours <= MAX_THINKING_HOURS:
+        if not math.isfinite(hours) or not 0 <= hours <= MAX_THINKING_HOURS:
             raise ValueError(
-                f"Set the total time limit above 0 and at most "
+                f"Set 0 for unlimited, or a total time limit at most "
                 f"{MAX_THINKING_HOURS} hours."
             )
         with self.lock:
@@ -2766,7 +2818,7 @@ class App:
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"], "node": "author",
                 "label": "Total time limit set",
-                "text": f"The total workflow time limit is now {hours:g} hours.",
+                "text": "The workflow has no configured time limit." if hours == 0 else f"The total workflow time limit is now {hours:g} hours.",
                 "authorLimitHours": hours,
             })
             return hours
@@ -2806,6 +2858,8 @@ class App:
 
     def reset(self):
         """Return to the first screen when no child is active."""
+
+        self._check_input_replacement()
 
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -3272,9 +3326,13 @@ def restore_saved_app(app):
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                "launchHold", "retrievalPolicyPath",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
+                    if key in {"launchHold", "retrievalPolicyPath"} and not isinstance(settings[key], str):
+                        state["launchHold"] = "Invalid saved historical launch controls; repair before launch."
+                        continue
                     if key in {
                         "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
                     } and not isinstance(settings[key], bool):
@@ -3545,7 +3603,8 @@ def restore_saved_app(app):
     except (OSError, ValueError, KeyError, TypeError):
         pass
     if state["preparedRun"] and not records and not state["output"]:
-        state.update(phase="prepared", stage="solve", activeNode="author", finishedAt="", error="")
+        state.update(phase="prepared", stage="solve", activeNode="author", startedAt="",
+                     resumedAt="", elapsedSeconds=0, finishedAt="", error="")
     state["checkpoints"] = saved_run_checkpoints(run_dir)
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
@@ -4153,6 +4212,8 @@ class Server(ThreadingHTTPServer):
         if state.get("phase") == "paused":
             return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
         if state.get("phase") == "prepared":
+            if state.get("launchHold"):
+                return None
             return {"action": "prepared", "label": "Start prepared run",
                     "description": "Start a fresh author session in this prepared research workspace."}
         stage = state.get("stoppedStage") or state.get("stage")
@@ -4428,6 +4489,7 @@ class Server(ThreadingHTTPServer):
                     "finishedAt", "lastActivityAt", "error", "problemMode",
                     "manuallyStopped", "stoppedStage",
                     "settingsWarning",
+                    "launchHold", "retrievalPolicyPath",
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""

@@ -7,10 +7,17 @@
 !workflows/
 !workflows/**/*
 !.gitignore
+!.gitattributes
 !README.md
 !web_ui.py
 !workflow_runner.py
 !requirements.txt
+!retrieval_runtime.py
+!historical_search.py
+!historical_*.py
+!prepare_firstproof.py
+!experiments/
+!experiments/**/*
 !tests/
 !tests/*.py
 **/__pycache__/

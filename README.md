@@ -1,5 +1,85 @@
 # TCS Prover
 
+## Historical search branch: `web-search-cut`
+
+This branch disables built-in web search for all proof roles. The First Proof
+third-batch experiment adds an independent, author-only historical retrieval
+service. `historical_search.py` discovers candidate URLs through DuckDuckGo Lite and
+returns only strictly pre-cutoff Wayback snapshots whose capture timestamp,
+original URL and content digest match the archive record. Current search
+snippets and page titles are never returned. Unknown dates, missing captures,
+unsupported content and redirects fail closed. There is no live-content fallback.
+
+The prepared `duckduckgo_wayback` provider needs no API key. Challenges and rate
+limits fail closed without a fallback endpoint. The optional `brave_wayback`
+provider needs `BRAVE_SEARCH_API_KEY`; its value is never written to run files.
+`--preflight` validates local configuration without a network request. A sealed
+historical-corpus provider is also available
+for deterministic offline validation. Current search ranking and archive
+coverage differ from the original search service; this is a historically
+constrained retrieval experiment, not an exact replay or a model-training
+contamination guarantee.
+
+Prepare the ten pinned official inputs without starting any model work:
+
+```console
+python prepare_firstproof.py
+```
+
+The command validates all ten input hashes, then creates held jobs under
+`runs/firstproof-b3-p01` through `runs/firstproof-b3-p10`. Controller policies
+live separately under `.experiment-control/firstproof-batch3`. Existing
+destinations are never overwritten. Each job uses unchanged direct-folder
+defaults with Fast speed, no configured time or token budget, exact original input, and its original System A
+request timestamp as an exclusive retrieval cutoff. P10 uses the corrected
+October 4 input and October 5 rerun cutoff. P03's missing diagram macro in the
+published raw input is preserved rather than silently reconstructed.
+
+The user will launch on a MacBook later. These jobs remain on a persisted launch
+hold. Opening the web UI or restoring jobs does not start them. Approval alone does not
+bypass technical preflight: the historical runtime must also establish a
+clean configuration, role-specific tool access, restricted filesystem reads
+and blocked subprocess network access. The existing Windows elevated sandbox
+requires root read access and therefore does not satisfy this experiment's
+read boundary. Native MXC capability must pass actual no-model canaries;
+a `ready` status by itself is insufficient. No fallback broadens filesystem
+access or enables live search. An unavailable isolation backend blocks launch.
+
+The current model and critic loop retain TCS defaults. Fast speed and unlimited
+research time are requested overrides; `thinkingHours: 0` disables both the total
+workflow deadline and model-request deadline. No goal token budget is set.
+Service/account limits and bounded tool/network operations still apply. Ordinary
+new jobs retain the existing 168-hour default. The original benchmark systems,
+models, search index and budgets differed.
+See `experiments/firstproof-batch3/manifest.json` for pinned source URLs, hashes,
+individual cutoffs and the user's confirmed preparation choices. Keep reports,
+published solutions, other runs and preparation evidence outside solver-visible
+filesystems. Same-workspace resumes retain policy; cloning a historical run
+through generic continuation is rejected to prevent dropping its restrictions.
+
+### MacBook handoff: execution is not ready yet
+
+The inputs, broker and preparation command are portable; the current runtime
+isolation adapter is **Windows MXC only**. It deliberately refuses execution on
+macOS. Before launching on the MacBook:
+
+1. Implement and verify a macOS filesystem/network isolation adapter and trusted
+   native Codex binary resolution. Real positive/negative access canaries must
+   pass; selecting a sandbox mode is insufficient.
+2. Implement isolated compiler execution. Historical external command nodes
+   currently fail closed: ordinary `latexmk` resolution/execution could otherwise
+   run an executable planted in the author workspace with controller privileges.
+3. Create a local Python 3.11+ environment, install `requirements.txt`, and rerun
+   `python prepare_firstproof.py` there. Do not copy the generated Windows run
+   directories or controller policies: they contain machine-specific absolute
+   paths. Provision authentication in the isolated controller-owned Codex homes.
+4. Verify every policy, input hash, broker, role configuration and runtime boundary
+   before releasing the holds and starting the ten jobs.
+
+Generated runs, controller policies, virtual environments and credentials are
+excluded from Git. The tracked manifest, exact input bytes, preparation script,
+implementation and tests are sufficient to recreate the held preparation.
+
 A local web UI that gives a persistent root author LLM a mathematical statement,
 lets it explore approaches with independent subagents, checks its candidate
 through a critic loop, and

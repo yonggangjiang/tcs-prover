@@ -210,14 +210,14 @@ class PipelineTests(unittest.TestCase):
         checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
         self.assertIn('time limit', checkpoint['reason'])
 
-    def test_live_web_search_is_enabled_for_all_structured_stages_and_retries(self):
+    def test_native_web_search_is_disabled_for_all_structured_stages_and_retries(self):
         for stage in ('review', 'critic', 'final'):
             for features in ([], ['multi_agent']):
                 arguments = runtime.structured_tool_arguments(stage, features)
-                self.assertIn('web_search="live"', arguments)
-                self.assertIn('tools.web_search=true', arguments)
-                self.assertNotIn('tools.web_search=false', arguments)
-        self.assertIn('using web search if needed', runtime.structured_retry_prompt('Task', '', {}))
+                self.assertIn('web_search="disabled"', arguments)
+                self.assertIn('tools.web_search=false', arguments)
+                self.assertNotIn('tools.web_search=true', arguments)
+        self.assertIn('using the supplied information', runtime.structured_retry_prompt('Task', '', {}))
 
 
 if __name__=='__main__':

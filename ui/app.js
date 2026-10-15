@@ -312,7 +312,8 @@ function renderJobs(jobs) {
       running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: "Finished",
       prepared: "Ready to start",
     };
-    status.textContent = job.manuallyStopped
+    status.textContent = job.launchHold ? "Prepared · awaiting review"
+      : job.manuallyStopped
       ? `Stopped at ${job.stoppedStage || "saved stage"}`
       : labels[job.phase] || job.phase;
     const times = document.createElement("small");
@@ -327,6 +328,12 @@ function renderJobs(jobs) {
     times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
       : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
+    if (job.launchHold) {
+      const hold = document.createElement("small");
+      hold.className = "job-tags";
+      hold.textContent = job.launchHold;
+      copy.append(hold);
+    }
     if (job.sourceFile) {
       const tags = document.createElement("small");
       tags.className = "job-tags";
@@ -2007,8 +2014,8 @@ function render(next) {
     ui.criticRounds.value = state.criticRounds || 2;
     ui.criticRounds.min = rounds.minimum || 1;
     ui.criticRounds.max = rounds.maximum || 100;
-    ui.thinkingHours.value = state.thinkingHours || 168;
-    ui.thinkingHours.min = hours.minimum || 0.01;
+    ui.thinkingHours.value = state.thinkingHours ?? 168;
+    ui.thinkingHours.min = hours.minimum ?? 0;
     ui.thinkingHours.max = hours.maximum || 168;
     fillResearchAuditControls();
     setProblemMode(state.problemMode || "statement");
@@ -2033,7 +2040,7 @@ function render(next) {
     appendFormattedText(ui.notes, state.review.notes);
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
-    ui.thinkingHours.value = state.thinkingHours || 168;
+    ui.thinkingHours.value = state.thinkingHours ?? 168;
     fillResearchAuditControls();
     checkEdited();
     reviewPending = false;
@@ -2082,7 +2089,7 @@ function render(next) {
   }
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
-  const authorLimit = Number(state.thinkingHours || 168);
+  const authorLimit = Number(state.thinkingHours ?? 168);
   const maximumAuthorLimit = Number(
     state.workflow?.settings?.thinking_hours?.maximum || 168
   );
@@ -2097,7 +2104,7 @@ function render(next) {
   const authorLimitText = authorLimit.toLocaleString(undefined, {
     maximumFractionDigits: 2,
   });
-  ui.authorLimitSummary.textContent = `Total limit: ${authorLimitText} hours`;
+  ui.authorLimitSummary.textContent = authorLimit === 0 ? "No workflow time limit" : `Total limit: ${authorLimitText} hours`;
   ui.authorLimitHours.max = String(maximumAuthorLimit);
   if (canSetAuthorLimit && document.activeElement !== ui.authorLimitHours) {
     ui.authorLimitHours.value = String(authorLimit);
@@ -2109,8 +2116,8 @@ function render(next) {
   ui.pause.title = retryPending ? "Cancel automatic retries"
     : auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
-  ui.resume.textContent = phase === "prepared" ? "Start prepared run" : "Resume";
-  ui.resume.disabled = auditHolding;
+  ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run" : "Resume";
+  ui.resume.disabled = auditHolding || Boolean(state.launchHold);
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.downloadPdf, Boolean(state.canDownloadPdf));
   show(ui.stop, working);
@@ -2475,8 +2482,8 @@ ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
 ui.setAuthorTimeLimit.onclick = () => {
   const hours = Number(ui.authorLimitHours.value);
   const maximum = Number(ui.authorLimitHours.max || 168);
-  if (!(hours > 0 && hours <= maximum)) {
-    ui.notice.textContent = `Set the limit above 0 and at most ${maximum} hours.`;
+  if (!(Number.isFinite(hours) && hours >= 0 && hours <= maximum)) {
+    ui.notice.textContent = `Set 0 for unlimited, or at most ${maximum} hours.`;
     show(ui.notice, true);
     ui.authorLimitHours.focus();
     return;

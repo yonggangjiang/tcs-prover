@@ -1,0 +1,1 @@
+\begin{Ques}\label[Ques]{ques:main} Let $\mathbb{H}$ be a hyperfield with multivalued addition operator $\boxplus$. Let $x, y, z \in \mathbb{H}$ be elements. Suppose that $0 \in x \boxplus y \boxplus z$. Does it then follow that \[     0 \in x^3 \boxplus y^3 \boxplus z^3 \boxplus -xyz \boxplus -xyz \boxplus -xyz\text{?} \] end{Ques}

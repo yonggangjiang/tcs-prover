@@ -149,6 +149,9 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
     """One fresh CLI session, with read-only tools and no delegated agents."""
     if cancelled.is_set():
         return None
+    policy = runtime.retrieval_policy(workspace)
+    if policy:
+        raise runtime.Error("Optional research audits are disabled for historical runs.")
     provider = model["provider"]
     effort = model.get("effort")
     executable = resolve_executable(model)
@@ -158,7 +161,7 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
             command = [
                 executable, "-m", model["model"],
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
-                "-c", 'web_search="live"', "-c", "tools.web_search=true",
+                *runtime.retrieval_runtime.native_search_arguments(),
                 "--disable", "multi_agent", "--enable", "shell_tool",
                 "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
                 "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
@@ -171,8 +174,8 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                 *(["--effort", effort] if effort else []),
                 "--no-session-persistence", "--safe-mode", "--restricted",
                 "--permission-mode", "dontAsk", "--permission-prompts", "none",
-                "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
-                "--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch",
+                "--tools", "Read,Glob,Grep",
+                "--allowedTools", "Read,Glob,Grep",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                 "--disable-slash-commands", "--no-chrome",
             ]
@@ -180,7 +183,7 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
             profile = Path(directory) / "research-auditor.md"
             profile.write_text("---\n" + yaml.safe_dump({
                 "name": "research-auditor", "description": "Independent research audit",
-                "tools": ["Read", "Grep", "Glob", "WebSearch", "FetchURL"], "subagents": [],
+                "tools": ["Read", "Grep", "Glob"], "subagents": [],
             }) + "---\n\n" + prompt, encoding="utf-8")
             skills = Path(directory) / "skills"
             skills.mkdir()
