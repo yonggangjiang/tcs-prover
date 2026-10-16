@@ -22,6 +22,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+try:
     import yaml
     from jsonschema.exceptions import SchemaError
     from jsonschema.validators import validator_for
@@ -408,6 +416,58 @@ def is_deepseek_model(model):
 
     return chosen_model(model) == DEEPSEEK_MODEL
 
+def inherited_openai_base_url_arguments(command=(), overrides=None, environment=None):
+    """Inherit only the built-in OpenAI URL while ignoring other user settings."""
+    selected = {}
+    for index, argument in enumerate(command):
+        value = None
+        if argument in ("-c", "--config") and index + 1 < len(command):
+            value = command[index + 1]
+        elif argument.startswith("--config="):
+            value = argument.split("=", 1)[1]
+        elif argument.startswith("-c") and len(argument) > 2:
+            value = argument[2:]
+        if value is not None:
+            key, separator, literal = value.partition("=")
+            if separator:
+                try:
+                    parsed = (
+                        tomllib.loads("value=" + literal)["value"]
+                        if tomllib else literal.strip()
+                    )
+                except ValueError:
+                    parsed = literal.strip()
+                selected[key.strip()] = parsed
+    selected.update(overrides or {})
+    explicit_openai = any(
+        key == "model_providers.openai" or key.startswith("model_providers.openai.")
+        for key in selected
+    )
+    providers = selected.get("model_providers")
+    explicit_openai |= isinstance(providers, dict) and "openai" in providers
+    if (selected.get("model_provider", "openai") != "openai"
+            or "openai_base_url" in selected or explicit_openai):
+        return []
+    effective = {**os.environ, **(environment or {})}
+    if effective.get("OPENAI_BASE_URL", "").strip() or tomllib is None:
+        return []
+    user_home = Path(effective.get("HOME") or Path.home())
+    configured_home = effective.get("CODEX_HOME")
+    if configured_home == "~" or (configured_home or "").startswith("~/"):
+        home = user_home / configured_home[2:]
+    else:
+        home = Path(configured_home).expanduser() if configured_home else user_home / ".codex"
+    try:
+        with (home / "config.toml").open("rb") as stream:
+            value = tomllib.load(stream).get("openai_base_url")
+    except (OSError, ValueError):
+        return []
+    if not isinstance(value, str) or not value.strip():
+        return []
+    quoted = json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+    return ["-c", "openai_base_url=" + quoted]
+
+
 def provider_arguments(model):
     """Define an isolated custom provider without editing user configuration."""
 
@@ -606,6 +666,7 @@ def run_structured_attempt(
     """Run one structured Codex process and return its last-message text."""
 
     timeout = None if timeout is None else float(timeout)
+    child_environment = environment(model)
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
         workspace = structured_workspace()
@@ -615,6 +676,9 @@ def run_structured_attempt(
         schema_arguments = output_schema_arguments(model, schema)
         command = [
             codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            *inherited_openai_base_url_arguments(
+                overrides={"model_provider": model_provider(model)}, environment=child_environment,
+            ),
             *provider_arguments(model),
             *speed_arguments(speed, model), *context_cache_arguments(),
             "-c", f'model_reasoning_summary="{summary}"',
@@ -627,7 +691,7 @@ def run_structured_attempt(
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", env=environment(model),
+            errors="replace", env=child_environment,
         )
         timed_out = threading.Event()
         heartbeat_stop = threading.Event()
@@ -1037,6 +1101,22 @@ class RPC:
         self.process, self.record = process, record
         self.number, self.waiting = 0, deque()
         self.write_lock = threading.Lock()
+        self.stderr_tail = deque(maxlen=12)
+        self.stderr_reader = None
+        if getattr(process, "stderr", None) is not None:
+            def drain_errors():
+                for line in process.stderr:
+                    value = line.strip()
+                    # Startup diagnostics must not publish environment credentials.
+                    for name in ("OPENAI_API_KEY", "CODEX_API_KEY", DEEPSEEK_KEY_ENV,
+                                 DEEPSEEK_TOKEN_ENV, "OPENROUTER_API_KEY"):
+                        secret = os.environ.get(name)
+                        if secret:
+                            value = value.replace(secret, "[redacted]")
+                    if value:
+                        self.stderr_tail.append(value[:800])
+            self.stderr_reader = threading.Thread(target=drain_errors, daemon=True)
+            self.stderr_reader.start()
 
     def send(self, message):
         with self.write_lock:
@@ -1048,7 +1128,10 @@ class RPC:
 
         line = self.process.stdout.readline()
         if not line:
-            raise Error("Codex app-server stopped unexpectedly.")
+            if self.stderr_reader:
+                self.stderr_reader.join(timeout=0.2)
+            detail = "\n".join(self.stderr_tail)
+            raise Error("Codex app-server stopped unexpectedly." + ("\n" + detail if detail else ""))
         message = json.loads(line)
         if self.record:
             self.record(message)
@@ -1235,7 +1318,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
             *runtime.context_cache_arguments(),
             *[argument for feature in features for argument in ("--enable", feature)],
-        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=runtime.environment(model))
         rpc = runtime.RPC(process, record)

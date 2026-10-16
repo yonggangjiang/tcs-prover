@@ -362,6 +362,17 @@ Every job card shows its full local start and finish date and time, including
 seconds. Active jobs show that they have not finished yet, so repeated problem
 titles remain distinguishable.
 
+Every run shows its workflow sidebar, including when research-file management
+is off. The run overview displays the exact checked statement, the original
+wording when it differs, current stage, active time and remaining workflow
+budget, local process status, recent public activity, and saved model settings.
+Completed answers and preserved partial work have separate labels and a readable
+output panel. A finished process without a final result is marked **Incomplete**.
+After a server interruption, an unfinished author is restored as **Paused**;
+**Resume** reopens its saved conversation in the same workspace and retains its
+time budget. These recovered interruptions wait for Resume rather than starting
+historical jobs automatically.
+
 While a proof author or author repair is running, **Guide the running proof
 author** sends a live instruction into the running author session. It does not
 discard the memory files or restart the problem. The

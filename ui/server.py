@@ -491,6 +491,7 @@ def empty_state(trace=None, trace_version=0):
         "finishedAt": "",
         "lastActivityAt": "",
         "output": "",
+        "resultKind": "",
         "error": "",
         "manuallyStopped": False,
         "stoppedStage": "",
@@ -1293,6 +1294,13 @@ class App:
 
         with self.lock:
             state = dict(self.state)
+            state["workerActive"] = self.has_active_worker()
+            state["processAlive"] = bool(self.process is not None and self.process.poll() is None)
+            state["activeElapsedSeconds"] = self._elapsed_seconds()
+            try:
+                state["statement"] = saved_statement(self.run_dir) if self.run_dir else ""
+            except ValueError:
+                state["statement"] = ""
             graph = state["workflow"]
             state["workflow"] = {
                 **graph, "settings": {**graph["settings"], "prompts": default_prompts()},
@@ -1703,6 +1711,7 @@ class App:
                 review_only = self.state.get("statementReviewOnly", False)
                 self.state.update(
                     phase="done" if review_only else "reviewed",
+                    resultKind="review" if review_only else "",
                     review=report,
                     error="",
                     output=report["statement"] if review_only else "",
@@ -1763,7 +1772,7 @@ class App:
                 self.worker_token = None
             raise
         self.state.update(
-            phase="running", stage=stage, activeNode=node, round=0, output="",
+            phase="running", stage=stage, activeNode=node, round=0, output="", resultKind="",
         )
         return process, token
 
@@ -1816,13 +1825,23 @@ class App:
     def _elapsed_seconds(self):
         """Count active time across pauses without charging the paused interval."""
 
+        if self.state["phase"] == "paused" and self.run_dir:
+            try:
+                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+                if checkpoint.get("status") in {"paused", "pausing"}:
+                    return float(checkpoint["elapsedSeconds"])
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         try:
             started_at = datetime.fromisoformat(self.state.get("resumedAt") or self.state["startedAt"])
             if started_at.tzinfo is None:
                 started_at = started_at.replace(tzinfo=timezone.utc)
-            elapsed_seconds = max(
-                0.0, (datetime.now(timezone.utc) - started_at).total_seconds()
-            )
+            end = datetime.now(timezone.utc)
+            if self.state["phase"] not in {"reviewing", "running", "stopping", "pausing"}:
+                end = datetime.fromisoformat(self.state.get("finishedAt") or self.state.get("lastActivityAt") or self.state["startedAt"])
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+            elapsed_seconds = max(0.0, (end - started_at).total_seconds())
         except (KeyError, TypeError, ValueError):
             elapsed_seconds = 0.0
         return float(self.state.get("elapsedSeconds", 0)) + elapsed_seconds
@@ -2548,8 +2567,12 @@ class App:
                         # The explicit approval in the transcript remains recoverable.
                         pass
                 if record.get("kind") == "final_result":
+                    if not isinstance(record.get("output"), str) or not record["output"].strip():
+                        problem = "The workflow returned an empty final answer. Continue from a saved checkpoint."
+                        continue
                     with self.lock:
                         self.state["output"] = record.get("output", "")
+                        self.state["resultKind"] = "final"
                         final = True
                         self._save("final.tex", self.state["output"])
                         if self.state.get("manuallyStopped"):
@@ -2562,6 +2585,7 @@ class App:
                 if record.get("kind") == "failure_result":
                     failed = True
                     with self.lock:
+                        self.state["resultKind"] = "failure"
                         self.state["output"] = (
                             record.get("output") or record.get("summary")
                             or record.get("text", "")
@@ -2647,7 +2671,7 @@ class App:
                     checkpoint.update(pauseCause="error", autoResumeAt=0)
                 self._configure_auto_resume(checkpoint)
                 self._save_pause(checkpoint)
-                self.state.update(phase="paused", error=error, activeNode=checkpoint["node"], stage=checkpoint["stage"])
+                self.state.update(phase="paused", error=error, activeNode=checkpoint["node"], stage=checkpoint["stage"], finishedAt="")
             elif final:
                 # A complete terminal record is durable and wins even when Stop
                 # killed the child before it closed stdout cleanly.
@@ -2663,6 +2687,8 @@ class App:
                 )
             elif problem or code:
                 self.state["error"] = problem or f"The solver exited with code {code}."
+            elif not final:
+                self.state["error"] = "The workflow exited without a final answer. Continue from a saved checkpoint."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
             self._update_research_audits()
@@ -3372,6 +3398,8 @@ def restore_saved_app(app):
     transcript_speed = None
     observed_role_settings = set()
     post_review_request = False
+    last_work_node = ""
+    author_finished = False
     for record in records:
         goal_thread = goal_thread_from_record(record)
         if goal_thread:
@@ -3384,6 +3412,19 @@ def restore_saved_app(app):
         if stage:
             state["stage"] = stage
             state["activeNode"] = event_node(record, state["activeNode"])
+            if stage in {"solve", "repair", "critic", "final"}:
+                last_work_node = state["activeNode"]
+        if record.get("kind") == "request" and stage in {"solve", "repair"}:
+            author_finished = False
+        if record.get("kind") == "author_result":
+            author_finished = True
+        if record.get("kind") == "failure_result":
+            state["resultKind"] = "failure"
+            state["output"] = record.get("output") or record.get("summary") or record.get("text", "")
+        elif (record.get("kind") in {"final_result", "workflow_result"}
+                and isinstance(record.get("output"), str) and record["output"].strip()):
+            state["resultKind"] = "final"
+            state["output"] = record["output"]
         if isinstance(record.get("round"), int):
             state["round"] = record["round"]
         if record.get("kind") == "request":
@@ -3485,15 +3526,25 @@ def restore_saved_app(app):
     state["finishedAt"] = state["lastActivityAt"]
     state["phase"] = "done"
     for filename in ("final.tex", "failure-summary.md", "partial-output.md"):
+        if state["resultKind"] == "final" and filename != "final.tex":
+            continue
         path = run_dir / filename
         if path.is_file():
             try:
-                state["output"] = path.read_text(encoding="utf-8")
+                output = path.read_text(encoding="utf-8")
+                if not output.strip():
+                    continue
+                state["output"] = output
+                if filename == "final.tex" and state["output"].strip():
+                    state["resultKind"] = "final"
+                elif filename == "failure-summary.md":
+                    state["resultKind"] = "failure"
                 break
             except (OSError, UnicodeError):
                 pass
     if state["statementReviewOnly"] and state["review"]:
         state["output"] = state["review"].get("statement", "")
+        state["resultKind"] = "review"
     elif (
         state["problemMode"] == "statement"
         and not state["skipStatementReview"]
@@ -3535,15 +3586,58 @@ def restore_saved_app(app):
             state["output"] = (
                 "This job was manually stopped. Continue it from the home page."
             )
+    checkpoint = {}
     try:
         checkpoint = json.loads((run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-        if checkpoint["status"] in {"paused", "pausing"} and not (run_dir / "final.tex").is_file() and manual_stop is None:
-            state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
-                         error=checkpoint.get("error", ""))
-            if checkpoint.get("goalThreadId"):
-                state["goalThreadId"] = checkpoint["goalThreadId"]
     except (OSError, ValueError, KeyError, TypeError):
-        pass
+        checkpoint = {}
+    if (manual_stop is None and state["resultKind"] != "final"
+            and last_work_node == "author" and not author_finished
+            and checkpoint.get("status") not in {"paused", "pausing"}):
+        # A server/process crash leaves the last resume checkpoint marked running.
+        # There is no worker attached to a restored job, and partial text is not a proof.
+        statement = checkpoint.get("state", {}).get("statement")
+        if not statement:
+            try:
+                statement = saved_statement(run_dir)
+            except ValueError:
+                statement = state["draft"]
+        if statement:
+            elapsed = checkpoint.get("elapsedSeconds", state.get("elapsedSeconds", 0))
+            try:
+                segment_start = datetime.fromisoformat(state.get("resumedAt") or state["startedAt"])
+                segment_end = datetime.fromisoformat(state["lastActivityAt"])
+                elapsed += max(0, (segment_end - segment_start).total_seconds())
+            except (TypeError, ValueError):
+                pass
+            recovered_state = checkpoint.get("state") or {"statement": statement}
+            rejection = next((record for record in reversed(records)
+                              if record.get("kind") == "critic_result"), {})
+            if state["stage"] == "repair" and rejection.get("report", {}).get("verdict") == "reject":
+                recovered_state = {**recovered_state, "report": rejection["report"],
+                                   "solution": rejection["report"].get("solution", ""),
+                                   "round": rejection.get("round", state["round"])}
+            checkpoint = {
+                **checkpoint, "status": "paused", "node": "author",
+                "state": recovered_state,
+                "stage": "repair" if state["stage"] == "repair" else "solve",
+                "goalThreadId": checkpoint.get("goalThreadId") or state["goalThreadId"],
+                "elapsedSeconds": elapsed,
+                "error": "The previous author process ended without a final answer. Resume continues its saved conversation.",
+                "pauseCause": "interrupted", "autoResumeAt": 0,
+            }
+    if (checkpoint.get("status") in {"paused", "pausing"}
+            and state["resultKind"] != "final" and manual_stop is None):
+        state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
+                     error=checkpoint.get("error", ""), finishedAt="",
+                     elapsedSeconds=checkpoint.get("elapsedSeconds", state.get("elapsedSeconds", 0)),
+                     resumedAt=state["lastActivityAt"])
+        if checkpoint.get("goalThreadId"):
+            state["goalThreadId"] = checkpoint["goalThreadId"]
+    elif state["phase"] == "done" and manual_stop is None and not state["resultKind"]:
+        state["error"] = state["error"] or "This run ended without a final answer. Continue from a saved checkpoint."
+    elif state["resultKind"] == "failure":
+        state["error"] = state["error"] or "Workflow incomplete. See the saved checkpoint and failure report."
     if state["preparedRun"] and not records and not state["output"]:
         state.update(phase="prepared", stage="solve", activeNode="author", finishedAt="", error="")
     state["checkpoints"] = saved_run_checkpoints(run_dir)
@@ -3551,7 +3645,8 @@ def restore_saved_app(app):
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
     app.state = state
     if state["phase"] == "paused":
-        app._configure_auto_resume(checkpoint, (run_dir / PAUSE_FILENAME).stat().st_mtime)
+        pause_path = run_dir / PAUSE_FILENAME
+        app._configure_auto_resume(checkpoint, pause_path.stat().st_mtime if pause_path.exists() else time.time())
         app._save_pause(checkpoint)
     app.fixed_trace = False
     return app
@@ -4428,9 +4523,11 @@ class Server(ThreadingHTTPServer):
                     "finishedAt", "lastActivityAt", "error", "problemMode",
                     "manuallyStopped", "stoppedStage",
                     "settingsWarning",
+                    "resultKind", "stage",
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
+            job["stageLabel"] = state["workflow"]["nodes"].get(state["activeNode"], {}).get("label", "")
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
                 if state["problemMode"] == "algorithmic"

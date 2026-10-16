@@ -1,5 +1,6 @@
 """Goal transport behavior with a scripted local RPC double; no model calls."""
 from collections import deque
+import io
 from pathlib import Path
 import tempfile
 import threading
@@ -8,6 +9,19 @@ import unittest
 from unittest.mock import patch
 
 import workflow_runner as module
+
+
+class StartupDiagnosticTests(unittest.TestCase):
+    def test_early_exit_explains_startup_failure_and_redacts_credentials(self):
+        process = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO(""),
+                                  stderr=io.StringIO("Error: Operation not permitted\nAPI key: test-secret\n"))
+        with patch.dict(module.os.environ, {"OPENAI_API_KEY": "test-secret"}):
+            rpc = module.RPC(process)
+            with self.assertRaises(module.Error) as failure:
+                rpc.read()
+        self.assertIn("Operation not permitted", str(failure.exception))
+        self.assertIn("[redacted]", str(failure.exception))
+        self.assertNotIn("test-secret", str(failure.exception))
 
 
 def event(method, **params):

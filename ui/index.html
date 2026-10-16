@@ -33,6 +33,31 @@
       <main class="work-pane">
         <p id="notice" class="notice" role="alert" hidden></p>
 
+        <section id="runOverview" class="run-overview" aria-labelledby="runProblemTitle" hidden>
+          <p class="eyebrow">CURRENT PROBLEM</p>
+          <h2 id="runProblemTitle"></h2>
+          <dl class="run-facts">
+            <div><dt>Current stage</dt><dd id="runStage"></dd></div>
+            <div><dt>Active time</dt><dd id="runActiveTime"></dd></div>
+            <div><dt>Workflow limit</dt><dd id="runBudget"></dd></div>
+            <div><dt>Local process</dt><dd id="runHealth"></dd></div>
+          </dl>
+          <p id="runNextStep" class="run-next-step" role="status"></p>
+          <p id="runLatestAction" class="run-latest-action"></p>
+          <details id="statementDetails" class="run-context" open>
+            <summary id="statementHeading">Statement being solved</summary>
+            <pre id="runStatement" class="statement-copy"></pre>
+          </details>
+          <details id="originalStatementDetails" class="run-context" hidden>
+            <summary>Original statement</summary>
+            <pre id="runOriginalStatement" class="statement-copy"></pre>
+          </details>
+          <details class="run-context">
+            <summary>Run settings and history</summary>
+            <dl id="runMetadata" class="run-metadata"></dl>
+          </details>
+        </section>
+
         <!-- The first screen intentionally contains only one obvious task. -->
         <section id="inputPanel" class="input-view">
           <div class="intro">
@@ -323,6 +348,12 @@
             </div>
             <span id="roundBadge" class="round-badge" hidden></span>
           </div>
+
+          <details id="resultPanel" class="run-result" hidden>
+            <summary id="resultHeading">Final answer</summary>
+            <p id="resultDescription" class="help"></p>
+            <pre id="resultOutput" class="statement-copy"></pre>
+          </details>
 
           <details id="memoryPanel" class="memory-panel" hidden>
             <summary>

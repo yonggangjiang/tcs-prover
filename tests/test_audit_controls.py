@@ -75,23 +75,23 @@ render({...author, phase: 'paused', auditHoldingAuthor: false});
 assert.equal(ui.resume.disabled, false);
 assert.equal(ui.pause.hidden, true);
 assert.equal(ui.stop.hidden, true);
-assert.equal(polls, 2);
+assert.equal(polls, 3); // Observe automatic retries and resumes from another window.
 render({...author, phase: 'running', auditHoldingAuthor: false});
 assert.equal(ui.pause.hidden, false);
 assert.equal(ui.resume.hidden, true);
-assert.equal(polls, 3);
+assert.equal(polls, 4);
 render({...author, phase: 'paused'});
 assert.match(ui.runDescription.textContent, /resume automatically in the same conversation/);
 assert.equal(ui.resume.disabled, true);
-assert.equal(polls, 4);
+assert.equal(polls, 5);
 render({...author, phase: 'paused', auditHoldingAuthor: false,
   researchAuditStatus: {batchActive: true}});
 assert.equal(ui.resume.disabled, true);
-assert.equal(polls, 5); // Keep polling through the batch's final cleanup.
+assert.equal(polls, 6); // Keep polling through the batch's final cleanup.
 render({...author, phase: 'paused', auditHoldingAuthor: false,
   researchAuditStatus: {batchActive: false}});
 assert.equal(ui.resume.disabled, false);
-assert.equal(polls, 5);
+assert.equal(polls, 7);
 `;
 vm.runInNewContext(setup + renderer + handlers + checks, {assert});
 """

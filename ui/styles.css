@@ -392,6 +392,29 @@ button { min-height: 42px; }
 
 .composer { padding: 22px; box-shadow: 0 16px 45px #1d261f0a; }
 
+.run-overview, .run-result {
+  margin: 0 0 26px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.run-overview h2 { margin: 0 0 18px; font-size: 1.25rem; line-height: 1.4; overflow-wrap: anywhere; }
+.run-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin: 0; }
+.run-facts dt, .run-metadata dt { color: var(--muted); font-size: 0.73rem; }
+.run-facts dd { margin: 5px 0 0; font-size: 0.85rem; font-weight: 650; overflow-wrap: anywhere; }
+.run-next-step { margin: 18px 0 6px; padding: 11px 13px; border-radius: 8px; background: var(--accent-soft); font-size: 0.83rem; }
+.run-latest-action { margin: 0 0 16px; color: var(--muted); font-size: 0.77rem; overflow-wrap: anywhere; }
+.run-context { border-top: 1px solid var(--line); }
+.run-context > summary, .run-result > summary { padding: 12px 0; cursor: pointer; font-size: 0.86rem; font-weight: 650; }
+.statement-copy { max-height: 360px; overflow: auto; margin: 0 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; font-size: 0.86rem; line-height: 1.7; }
+.run-metadata { margin: 0 0 8px; font-size: 0.78rem; }
+.run-metadata > div { display: grid; grid-template-columns: 155px minmax(0, 1fr); gap: 12px; padding: 5px 0; }
+.run-metadata dd { margin: 0; overflow-wrap: anywhere; }
+.run-result { padding-block: 8px; }
+.run-result .statement-copy { max-height: 560px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.job-error { display: block; max-width: 75ch; margin-top: 7px; color: var(--danger); font-size: 0.76rem; }
+
 /* The author's notebooks stay tucked away until the reader opens them. */
 .memory-panel {
   margin: 0 0 22px;
@@ -1140,9 +1163,12 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
   .workflow-nodes { display: block; overflow: visible; }
   .node-copy span:not(.node-round):not(.node-status) { display: none; }
   .work-pane { padding-top: 32px; }
+  .run-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 620px) {
+  .run-overview, .run-result { padding-inline: 16px; }
+  .run-metadata > div { grid-template-columns: 1fr; gap: 1px; }
   .author-audit-nodes { grid-template-columns: minmax(0, 1fr); }
   .author-audit-nodes > [data-node="research_audit"] { grid-column: 1; grid-row: 3; }
   .audit-cycle-route { grid-column: 1; grid-row: 2; justify-self: start; padding: 0 5px; transform: rotate(90deg); }

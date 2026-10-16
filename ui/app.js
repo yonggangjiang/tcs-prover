@@ -79,6 +79,13 @@ const ui = {
   applyResearchAudits: $("applyResearchAuditsButton"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
+  runOverview: $("runOverview"), runProblemTitle: $("runProblemTitle"),
+  runStage: $("runStage"), runActiveTime: $("runActiveTime"), runBudget: $("runBudget"),
+  runHealth: $("runHealth"), runNextStep: $("runNextStep"), runLatestAction: $("runLatestAction"),
+  statementHeading: $("statementHeading"), runStatement: $("runStatement"),
+  originalStatementDetails: $("originalStatementDetails"), runOriginalStatement: $("runOriginalStatement"),
+  runMetadata: $("runMetadata"), resultPanel: $("resultPanel"), resultHeading: $("resultHeading"),
+  resultDescription: $("resultDescription"), resultOutput: $("resultOutput"),
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
   modelSummary: $("modelSummary"),
   lastActivity: $("lastActivity"), timeline: $("timelineList"),
@@ -107,6 +114,7 @@ let state = {
   workflow: { nodes: {}, edges: [] },
 };
 let previousPhase = "";
+let stateReceivedAt = Date.now();
 let timer;
 let clock;
 let jobsTimer;
@@ -309,7 +317,7 @@ function renderJobs(jobs) {
     status.className = `job-status ${job.phase}`;
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
-      running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: "Finished",
+      running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: completedRunLabel(job),
       prepared: "Ready to start",
     };
     status.textContent = job.manuallyStopped
@@ -327,6 +335,13 @@ function renderJobs(jobs) {
     times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
       : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
+    if (job.phase === "running" && job.stageLabel) status.textContent = `Running · ${job.stageLabel}`;
+    if (job.error && !job.manuallyStopped) {
+      const reason = document.createElement("small");
+      reason.className = "job-error";
+      reason.textContent = job.error;
+      copy.append(reason);
+    }
     if (job.sourceFile) {
       const tags = document.createElement("small");
       tags.className = "job-tags";
@@ -1519,6 +1534,126 @@ function ingest(entries, reset = false) {
   }
 }
 
+function completedRunLabel(job) {
+  if (job.manuallyStopped) return "Stopped";
+  if (job.resultKind === "review" || job.statementReviewOnly) return "Review complete";
+  if (job.resultKind === "failure" || job.error) return "Incomplete";
+  return job.resultKind === "final" || job.canDownloadTex ? "Answer ready" : "Incomplete";
+}
+
+function localDateTime(value) {
+  return value ? new Date(value).toLocaleString([], {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }) : "—";
+}
+
+function runElapsedSeconds() {
+  if (Number.isFinite(state.activeElapsedSeconds)) {
+    const ticking = ["reviewing", "running", "stopping", "pausing"].includes(state.phase);
+    return state.activeElapsedSeconds + (ticking ? Math.max(0, Date.now() - stateReceivedAt) / 1000 : 0);
+  }
+  const start = state.resumedAt || state.startedAt;
+  if (!start) return 0;
+  const end = state.finishedAt || state.lastActivityAt || start;
+  return Number(state.elapsedSeconds || 0) + Math.max(0, (new Date(end) - new Date(start)) / 1000);
+}
+
+function durationText(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(total / 3600), minutes = Math.floor(total / 60) % 60;
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
+}
+
+function renderRunOverview() {
+  show(ui.runOverview, state.phase !== "input");
+  if (state.phase === "input") return;
+  const latex = state.problemMode === "latex";
+  const original = latex ? state.latexInput : state.draft;
+  const statement = (latex ? state.latexInput : state.statement)
+    || state.review?.statement || state.reviewStatement || original || "";
+  const title = String(original || statement).trim().split("\n").find(line => line.trim()) || "Untitled problem";
+  ui.runProblemTitle.textContent = title.replace(/^#+\s*/, "").slice(0, 220);
+  ui.runProblemTitle.title = title;
+  ui.runStage.textContent = state.phase === "reviewed" ? "Waiting for approval"
+    : state.phase === "prepared" ? "Ready to start"
+    : state.phase === "done" ? completedRunLabel(state)
+    : `${state.workflow?.nodes?.[state.activeNode]?.label || state.stage || "Starting"}`
+      + (["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
+      + (state.activeNode === "critic" && state.round ? ` · round ${state.round}/${state.criticRounds}` : "");
+  const seconds = runElapsedSeconds(), limit = Number(state.thinkingHours || 168) * 3600;
+  ui.runActiveTime.textContent = durationText(seconds);
+  ui.runBudget.textContent = `${state.thinkingHours || 168}h · ${durationText(Math.max(0, limit - seconds))} left`;
+  ui.runHealth.textContent = state.processAlive ? "Running"
+    : state.workerActive ? "Starting / closing"
+    : state.phase === "paused" ? "Paused · saved conversation"
+    : ["reviewed", "prepared"].includes(state.phase) ? "Waiting for you" : "No active process";
+  const nextSteps = {
+    review: "After review, approve the checked statement to start the proof author.",
+    solve: "The author is searching for a complete proof. Its candidate then goes to the independent critic.",
+    repair: "The author is addressing critic objections. A revised candidate returns to independent review.",
+    critic: "The critic checks the candidate. Rejected proofs return to the author; accepted proofs go to the LaTeX editor.",
+    final: "The accepted proof is being formatted and compiled. Source and PDF downloads appear when compilation succeeds.",
+  };
+  ui.runNextStep.textContent = state.phase === "reviewed" ? "Statement review finished. Approval is needed before proof search can begin."
+    : state.phase === "paused" ? "No final answer yet. Resume continues the saved conversation and preserves the work already done."
+    : state.phase === "prepared" ? "Start this prepared workspace to begin proof search."
+    : state.phase === "done" ? (state.resultKind === "final" || state.canDownloadTex
+      ? "The final answer is saved below. Source and PDF downloads are available for saved artifacts."
+      : state.resultKind === "review" ? "The statement review is saved."
+        : "No completed answer was produced. Saved partial work and checkpoints remain available; open the home page to continue from a checkpoint.")
+    : state.statementReviewOnly ? "This job will save the checked statement and reviewer notes, then finish."
+    : nextSteps[state.stage] || "Waiting for the next workflow update.";
+  const latest = [...(state.trace || [])].reverse().find(entry => !entry.heartbeat
+    && !["request", "review_result", "critic_result", "author_result", "final_result", "failure_result", "partial_result"].includes(entry.kind)
+    && describe(entry)?.text);
+  const card = latest && describe(latest);
+  ui.runLatestAction.textContent = card
+    ? `Latest activity · ${clockText(latest.time)} · ${card.label}: ${String(card.text).replace(/\s+/g, " ").slice(0, 260)}`
+    : "Public activity appears below as the model works.";
+  ui.statementHeading.textContent = latex ? "Original writing"
+    : state.phase === "reviewing" ? "Statement being reviewed"
+    : state.phase === "reviewed" ? "Reviewed statement · awaiting approval" : "Statement being solved";
+  if (ui.runStatement.textContent !== statement) ui.runStatement.textContent = statement;
+  const changed = Boolean(original && original.trim() !== statement.trim());
+  show(ui.originalStatementDetails, changed);
+  if (ui.runOriginalStatement.textContent !== (original || "")) ui.runOriginalStatement.textContent = original || "";
+  const metadata = [
+    ["Run", state.runId || "—"], ["Started", localDateTime(state.startedAt)],
+    ["Last event", localDateTime(state.lastActivityAt)],
+    ["Finished", state.phase === "done" ? localDateTime(state.finishedAt) : "Not finished"],
+    ...(state.sourceFile ? [["Input file", state.sourceFile]] : []),
+    ["Statement reviewer", state.skipStatementReview ? "Skipped" : `${state.reviewModel} · ${state.reviewEffort || state.reasoningEffort}`],
+    ["Proof author", `${state.authorModel} · ${state.authorEffort || state.reasoningEffort}`],
+    ["Independent critic", `${state.criticModel} · ${state.criticEffort || state.reasoningEffort} · max ${state.criticRounds} consecutive rounds`],
+    ["LaTeX writer", `${state.writerModel} · ${state.writerEffort || state.reasoningEffort}`],
+    ["Generation", state.speedMode || "standard"], ["Activity summaries", state.reasoningSummary || "concise"],
+    ["Research files", state.fileManagement === false ? "Off" : "Managed"],
+    ["Conversation", state.goalThreadId ? "Saved · resumes in this workspace" : "Not started"],
+  ];
+  const signature = JSON.stringify(metadata);
+  if (ui.runMetadata.dataset.signature !== signature) {
+    ui.runMetadata.dataset.signature = signature;
+    ui.runMetadata.replaceChildren(...metadata.map(([label, value]) => {
+      const row = document.createElement("div"), term = document.createElement("dt"), description = document.createElement("dd");
+      term.textContent = label; description.textContent = value; row.append(term, description); return row;
+    }));
+  }
+  const savedOutput = Boolean(state.output && ["done", "paused"].includes(state.phase));
+  show(ui.resultPanel, savedOutput);
+  const final = state.resultKind === "final" || state.canDownloadTex;
+  ui.resultHeading.textContent = final ? (state.canDownloadTex ? "Final answer · LaTeX source" : "Final answer")
+    : state.resultKind === "failure" ? "Failure report" : "Saved partial work";
+  ui.resultDescription.textContent = final ? "The complete saved output is shown here."
+    : "This is preserved work from an incomplete run; it has not completed the proof and critic workflow.";
+  if (savedOutput && ui.resultOutput.textContent !== state.output) ui.resultOutput.textContent = state.output;
+  const identity = `${state.runId}:${state.resultKind || "partial"}`;
+  if (ui.resultPanel.dataset.identity !== identity) {
+    ui.resultPanel.dataset.identity = identity;
+    ui.resultPanel.open = final || state.resultKind === "failure";
+  }
+}
+
 // Show the author/audit cycle alongside the separate critic/repair cycle.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
@@ -1723,17 +1858,17 @@ function renderWorkflow() {
 
 function renderClock() {
   ui.elapsed.textContent = state.startedAt && state.phase !== "input"
-    ? elapsedText(state.resumedAt || state.startedAt, state.finishedAt || Date.now(), Number(state.elapsedSeconds || 0)) : "";
+    ? durationText(runElapsedSeconds()) : "";
+  renderRunOverview();
   if (state.lastActivityAt) {
     const ago = Math.max(0, Math.floor(
       (Date.now() - new Date(state.lastActivityAt)) / 1000
     ));
-    const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase)
-      || Boolean(state.auditHoldingAuthor);
-    const activity = working
-      ? (ago < 2 ? "Working · public activity now"
-        : `Still working · waiting ${ago}s for the next public event`)
-      : `Updated ${ago < 2 ? "just now" : `${ago}s ago`}`;
+    const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase);
+    const age = ago < 2 ? "just now" : `${durationText(ago)} ago`;
+    const activity = working && state.processAlive
+      ? `Local process running · last public event ${age}`
+      : `Last public event ${age}`;
     ui.lastActivity.textContent = `${activity} · `
       + `${state.traceVersion || 0} events recorded`;
   }
@@ -1961,6 +2096,7 @@ function render(next) {
     incremental ? [...(state.trace || []), ...newEntries] : newEntries
   );
   state = { ...next, trace: combined };
+  stateReceivedAt = Date.now();
   ingest(newEntries, !incremental);
 
   const phase = state.phase;
@@ -1977,7 +2113,7 @@ function render(next) {
     ["reviewing", "running", "stopping", "pausing", "paused", "prepared", "done"].includes(phase)
       && !reviewOnlyResult,
   );
-  show(ui.workflowRail, phase !== "input" && managesResearchFiles());
+  show(ui.workflowRail, phase !== "input");
   show(ui.activityToggle, Boolean(currentJob));
   syncMemoryPanel();
   ui.notice.textContent = state.error || "";
@@ -2060,9 +2196,10 @@ function render(next) {
     : phase === "prepared" ? "Ready to start" : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
-        : done ? "Finished" : (node.label || "Codex is working");
+        : done ? completedRunLabel(state) : (node.label || "Codex is working");
   ui.runLabel.textContent = auditHolding ? "RESEARCH AUDITS"
-    : phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED" : done ? "RUN COMPLETE" : (node.short_label || "CODEX");
+    : phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED"
+    : done ? (state.resultKind === "final" || state.canDownloadTex ? "ANSWER READY" : "RUN INCOMPLETE") : (node.short_label || "CODEX");
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
     : auditHolding ? (phase === "pausing" ? "Pausing author for research audits…" : "Author paused for research audits")
     : phase === "prepared" ? "Prepared research workspace" : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing Codex…"
@@ -2074,7 +2211,9 @@ function render(next) {
       : phase === "prepared" ? "Review the reorganized research files, then start a fresh author session in this workspace."
       : phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
-      : done ? "The output and transcript remain preserved for this job."
+      : done ? (state.resultKind === "final" || state.canDownloadTex
+        ? "The final answer and transcript are saved for this job."
+        : "The run ended without a completed answer. Saved work and available checkpoints are preserved.")
         : (node.description || ""));
   if (phase === "paused" && state.autoResumeAt) {
     const retryTime = new Date(state.autoResumeAt * 1000).toLocaleTimeString();
@@ -2127,9 +2266,10 @@ function render(next) {
   previousPhase = phase;
 
   clearTimeout(timer);
-  if (working) timer = setTimeout(refresh, 700);
+  const waiting = ["paused", "prepared", "reviewed"].includes(phase);
+  if (working || waiting) timer = setTimeout(refresh, working ? 700 : 2500);
   clearInterval(clock);
-  if (working) clock = setInterval(renderClock, 1000);
+  if (working || waiting) clock = setInterval(renderClock, 1000);
 }
 
 // A saved job may name a model the menus no longer offer (an older GPT-5.6,

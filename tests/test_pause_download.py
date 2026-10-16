@@ -404,6 +404,7 @@ for (const problemMode of ['latex', 'statement']) {
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const renderer = source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
+const outcome = source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('));
 const handlers = source.slice(source.indexOf('ui.stop.onclick ='), source.indexOf('ui.home.onclick ='));
 const setup = `
 let state = {}, previousPhase = 'running', currentJob = 'same-job', timer, clock;
@@ -437,6 +438,8 @@ const checks = `
   assert.equal(ui.downloadTex.hidden, true);
   assert.equal(ui.downloadPdf.hidden, true);
   assert.equal(ui.pause.hidden, false);
+  render({...running, fileManagement: false});
+  assert.equal(ui.workflowRail.hidden, false); // The workflow is useful without notebooks.
   assert.equal(ui.stop.hidden, false);
   assert.equal(ui.resume.hidden, true);
   ui.pause.onclick(); assert.equal(clicked, '/pause');
@@ -473,7 +476,7 @@ const checks = `
   assert.equal(ui.downloadPdf.disabled, false);
 })();
 `;
-Promise.resolve(vm.runInNewContext(setup + renderer + handlers + checks, {assert}))
+Promise.resolve(vm.runInNewContext(setup + outcome + renderer + handlers + checks, {assert}))
   .catch(error => {console.error(error); process.exitCode = 1;});
 """
         result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js")],
