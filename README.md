@@ -13,6 +13,30 @@ lemmas when **Manage research files** is enabled. This switch is off by default
 on the home screen: `author_simple` asks only for a rigorous proof, and the UI
 hides research records and scheduled audits. The critic and LaTeX writer still run.
 
+On macOS and Linux, authors can submit `PROOF_FILE: proof.md` after writing a
+complete proof in their working directory. Windows authors submit the complete
+proof inline because secure file-reference handoff is not available there. Before review, the controller captures the file contents,
+saves the actual candidate, and gives the critic `proof.md`, `statement.md`, and
+a manifest with SHA-256 hashes in a fresh read-only workspace. A complete inline
+proof uses the same snapshot path. Repairs capture the new candidate; a stale
+author file is never substituted for a critic's edits. Historical critics and
+their subagents can read the snapshot with shell tools, with external file
+access, networking, native search, and MCP disabled. Missing, linked, unsafe,
+non-UTF-8, empty, or larger-than-8-MiB proof files are rejected before review.
+
+In a run, expand **Run settings and history → Critic review inputs and decisions**
+to read every recorded review's exact input, full rejection reasons, and complete
+decision. Retries and repeated round numbers retain separate history. The
+workflow rail distinguishes rejection, active review, and approval; the search
+panel distinguishes the latest request from cumulative failed requests.
+
+Critic history groups each author's submission into a **review cycle**, with
+rounds and request retries inside it. A **pass with fixes** starts another round;
+a **clean pass** accepts the unchanged proof; a **pass with changes accepted at
+the review limit** accepts the latest revision without another critic round.
+The workflow rail, timeline, and expandable metadata show these outcomes
+separately. Missing historical transition evidence is shown as unknown.
+
 The Codex CLI provides the local author session and model-call runtime. The
 author keeps the same conversation while it works; files preserve its assignment,
 attempt history, and proved results across interruptions or context compaction.
@@ -24,7 +48,7 @@ API.
 
 ## Install and run
 
-Requires Python 3.9+, the Codex CLI, and a TeX distribution with `latexmk`
+Requires Python 3.11+, the Codex CLI, and a TeX distribution with `latexmk`
 and `pdflatex` available on `PATH` (for example, TeX Live, MacTeX, or MiKTeX).
 Install Codex CLI through this
 [official website](https://learn.chatgpt.com/docs/codex/cli).
@@ -33,9 +57,34 @@ Install Codex CLI through this
 codex login
 git clone https://github.com/yonggangjiang/tcs-prover.git
 cd tcs-prover
-python3 -m pip install -r requirements.txt
-python3 web_ui.py
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+python web_ui.py
 ```
+
+`web_ui.py` uses this checkout's `.venv` when present, even if `python` points
+to an older system or Conda interpreter. Each checkout needs its own environment;
+switching branches does not copy an environment from another worktree.
+
+When `.experiment-control/current-run.json` selects a current batch, the same
+command opens its existing dashboard. It checks the authenticated local server
+before opening the browser and does not start a second owner of running jobs.
+`python web_ui.py --no-browser` prints the current dashboard URL. A temporarily
+unreachable controller produces an error instead of restoring duplicate jobs.
+The selection contains version `1` and absolute `runsRoot`, `controllerStatus`,
+and `dashboardStatus` paths; it is local machine state and is not committed.
+
+The home page shows folders under `runs/` as batch cards, including their problem
+counts, start dates, and status. Click a card to see its problems, then open a
+problem to inspect its reasoning and outputs. **All batches** takes you back to
+the folder cards. Jobs stored directly under `runs/` appear in their own card.
+
+The current First Proof batch is marked **Current**:
+`firstproof-batch3-search-v4`. Its ten workspaces remain under that folder.
+Previous batches are available for read-only browsing; opening them does not
+resume jobs or change their saved files. Batch selection is included in page
+links so repeated problem names stay associated with the correct run. All run
+folders remain in their original locations.
 
 The Web UI opens locally with 6.1 Sol, Max, and Standard defaults for
 the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
@@ -108,6 +157,59 @@ Options for changing the default model, time limit, and other settings are under
 **Advanced**. GPT-6.1 Sol (`gpt-6.1-sol`) at Max reasoning is the default for
 every node.
 
+Advanced includes **Web cutoff**, which is off for new jobs:
+
+| Web cutoff | Cutoff value | Search behavior |
+| --- | --- | --- |
+| Off | Not used | Native web search enabled without a time restriction. |
+| On | `-1` | Web-search tools disabled. |
+| On | UTC timestamp, e.g. `2026-10-02T14:13:12Z` | Author can search and read verified archives strictly before that instant. |
+
+For a timestamp cutoff, enable **Skip statement review**, use Codex models for all
+proof roles, and disable optional research auditors. Before model work, the
+controller saves a separate policy and checks the native sandbox for both author
+and structured roles. A failed check blocks launch. The saved search mode and
+cutoff are retained on resume; changing the defaults does not change existing
+runs. Older main runs without a recorded search mode retain unrestricted search; an
+explicit disabled mode or historical policy always takes precedence.
+
+`-1` removes the web-search tools; it is not the historical sandbox or a restriction
+on model training knowledge. Timestamp mode also blocks shell networking and
+outside-file access so the author cannot bypass the archive gate with `curl`.
+
+The run page shows the exact statement, stage, active time, workflow limit,
+local process health, model settings, and final or partial output. Its search
+panel shows whether search is unrestricted, disabled, or restricted to archives.
+For archive search it shows the saved cutoff, provider, author-only access, and
+broker operation counts. Pending means an accepted call has no recorded terminal event; it does
+not establish that the call is still running. Verified candidates are archive
+checks, not the number of sources delivered to the model. These counters do not
+replace the trajectory auditor or establish absence of model-training knowledge.
+
+To update the dashboard while an older controller owns running jobs, use the
+gateway without restarting that controller:
+
+```console
+python -m ui.live_gateway \
+  --legacy-launch-status /absolute/path/to/launch-status.json \
+  --legacy-runs /absolute/path/to/existing-runs \
+  --new-runs /absolute/path/to/separate-new-runs \
+  --status-file /absolute/path/to/dashboard-status.json \
+  --port 8772
+```
+
+Open the `url` in the private dashboard status file. The gateway serves the new
+assets, reads legacy metadata without restoring jobs, and forwards existing
+job actions to their original controller. A separate controller handles new
+jobs. The two run directories must not overlap. Keep the gateway running while
+using it; the original controller remains responsible for the older batch.
+An older server without the new search capabilities cannot enable historical
+search through the updated frontend. Operators can set `TCS_PROVER_UI_AUTH_HOME`
+to the local Codex login directory; only its authentication file is copied.
+Set `TCS_PROVER_UI_RETRIEVAL_STATE` to an existing controller's retrieval-state
+directory to share host pacing across old and new historical jobs. Both are
+trusted local settings and cannot be supplied by the browser.
+
 ## Run a folder from the Web UI
 
 On the home screen in Statement mode, click **Run a folder…** and choose a
@@ -120,7 +222,9 @@ Files are read as UTF-8 text. Subfolders are ignored; empty files are reported a
 The job list shows each source filename, including after a server restart.
 
 A batch accepts at most 200 statements, 100,000 characters per statement, and
-8 MB for the complete request. Split larger folders into smaller batches.
+8 MB for the complete request. Historical batches accept at most 10 statements
+and check every sandbox before starting any of them. Split larger folders into
+smaller batches.
 
 ## Terminal runs from Markdown
 
@@ -648,3 +752,142 @@ Run the regression suite without making model calls:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+
+## Historical web retrieval
+
+When **Web cutoff** is on with a UTC timestamp, built-in web search is disabled
+for proof roles and an independent, author-only historical retrieval service
+enforces the saved cutoff. The default `codex_wayback` provider discovers candidate URLs through
+a separate Codex CLI session with general web search enabled, then
+returns only strictly pre-cutoff Wayback snapshots whose capture timestamp,
+original URL and content digest match the archive record. Current search
+snippets and page titles are never returned. Unknown dates, missing captures,
+unsupported content and redirects fail closed. There is no live-content fallback.
+
+Discovery sessions start fresh with only Codex authentication, no inherited
+conversation, project instructions, skills, MCP servers, or proof workspace.
+Their shell and local file tools are disabled. Candidate URLs come from completed
+native web-search result rows; model-written suggestions are accepted only when
+they match that URL list. All candidates remain untrusted until the archive gate
+authorizes their content independently. Raw current-web traces
+remain in protected controller state and never enter the proof conversation.
+This uses the existing Codex login; no separate API key is needed. Current
+search ranking and discovery-model selection still differ from a historical
+search index.
+
+The optional `scholarly_wayback` provider needs no API key and targets research
+papers. It discards current abstracts, titles, dates, and scores; publication-date
+filters only narrow discovery and never authorize content. Both APIs are explicit
+sources, with partial availability reported. The optional `brave_wayback`
+provider needs `BRAVE_SEARCH_API_KEY`; its value is never written to run files.
+The legacy `duckduckgo_wayback` option remains available, but its public Lite page
+frequently challenges automated requests. It is no longer the prepared default;
+challenges are rejected without bypassing them or switching endpoints.
+`--preflight` validates local configuration without a network request. A sealed
+historical-corpus provider is also available
+for deterministic offline validation. Current search ranking and archive
+coverage differ from the original search service; this is a historically
+constrained retrieval experiment, not an exact replay or a model-training
+contamination guarantee.
+
+Broker processes share controller-owned request pacing: arXiv permits one active
+request and at least three seconds between starts. Wayback permits up to four
+active requests, with at least three seconds between starts; slow archive responses
+do not hold the shared scheduling lock. Crossref uses one active request and a
+one-second interval. Transport errors and HTTP 408/429/500/502/503/504 receive at
+most two retries with 5/10-second backoff and a 300-second network operation
+deadline. Prepared batches examine up to six candidate URLs per search to bound
+traffic across ten jobs. Individual connection failures delay only their own request. Explicit
+`Retry-After` signals and HTTP 429/503 impose shared provider cooldowns.
+Challenges, redirects, invalid provenance and cutoff failures
+are never retried as transient errors. Unavailable services are distinguished from
+valid empty results, and partial searches are marked incomplete. Verified raw
+captures persist in a bounded controller-owned cache outside solver workspaces;
+every read rechecks source, timestamps and both digests. This avoids repeat archive
+fetches across broker restarts and jobs without relaxing any cutoff. Complete URL
+discovery results also have a short-lived, bounded in-memory cache. Known archived
+arXiv CAPTCHA pages and publisher redirect stubs are rejected as unusable content;
+the broker tries older verified captures without following or executing redirects.
+
+To check actual network availability through fresh MCP broker processes before
+starting proof models, run harmless search/open validation after preparation and
+authentication provisioning:
+
+```console
+.venv/bin/python validate_historical_search.py \
+  --policy-file .experiment-control/firstproof-batch3/P01/broker-policy.json \
+  --cutoff 2026-10-02T14:13:12Z \
+  --output .experiment-control/firstproof-batch3/search-validation \
+  --query 'Python documentation sorting' --repeats 1
+```
+
+This searches and opens a verified result in a fresh broker process. It checks readable results, strict
+cutoff compliance, matching digests and audit records, and saves the complete
+evidence. The protected shared archive cache starts empty and remains enabled,
+as in a fresh batch. `--concurrent10` starts ten distinct harmless queries together.
+Neither mode sends a benchmark statement or starts a proof model. The Codex
+discovery provider does invoke isolated discovery models. A passing check cannot
+guarantee future provider availability or archive coverage. `open(url)` returns
+the full verified extracted document, without a fixed character budget.
+Optional `offset` and `length` request a page with `next_offset`; `find(url,
+pattern)` searches the full verified document for literal text and returns
+matching offsets. Find defaults to ten matches, with optional `max_matches` and
+continuation; neither open nor find uses the old 20,000-character ceiling.
+Transport, parser resource protections, and the model's context limits still
+apply. `max_content_chars` remains a search-excerpt setting only. Pass the returned
+raw-body `sha256` on later calls to pin the same capture; a changed capture fails
+closed. Offsets count Unicode code points in the extracted text. Each page/find
+reply retains source/capture provenance and has a broker receipt covering its
+complete document content. No live-page fallback is used.
+The Codex-only adaptation of
+[Time Travel Benchmark](https://github.com/trivikrama-madhusudhana/time-travel-benchmark)
+uses its controller-owned MCP gateway, asynchronous tool handling, and event-log
+provenance checks. Its OpenReward service requires a separate key, and its shipped
+GPT runner uses the Responses API. TCS Prover keeps model work in Codex CLI and
+uses the Codex general-discovery/Wayback backend described above; no OpenReward or
+separate OpenAI API key is needed. The
+[adaptation notes](third_party/time-travel-benchmark/UPSTREAM.md) pin the reviewed
+upstream revision and explain the differences. The
+[Codex search configuration](https://developers.openai.com/codex/config-reference/)
+does not document an arbitrary historical cutoff for native cached/live search,
+so historical proof sessions disable native web search and enable it only in
+the protected URL-discovery helper. Unrestricted jobs use native live search.
+
+Each broker accepts up to four concurrent retrieval calls with independent
+provider state and deadlines. Additional calls receive an immediate busy response
+instead of waiting behind several five-minute searches and hitting Codex's
+ten-minute tool timeout. A bounded finalization allowance lets a search return
+verified partial results when its network deadline expires. Protocol control messages remain responsive. Shared
+provider pacing, archive verification, and protected caching still apply across
+all calls and jobs. Cancellation suppresses the response; already-started work
+retains its bounded operation budget. These network limits do not limit the
+overall proof effort.
+
+Audit a running or completed batch without sending queries or invoking a model:
+
+```console
+.venv/bin/python audit_historical_trajectory.py \
+  --control-root .experiment-control/firstproof-batch3-search-v4 \
+  --output .experiment-control/firstproof-batch3-search-v4/trajectory-source-audit.json
+```
+
+The auditor matches actual returned sources to that problem's broker log using
+the source URL, exclusive cutoff, capture timestamp and archived-body hash. It
+also identifies unexpected retrieval tools and separates failed or pending calls
+from valid empty results. This checks recorded provenance, not mathematical
+correctness, model-training knowledge, or an independent reconstruction of every
+archived byte. The gateway performs byte verification before returning content.
+
+### Pinned benchmark preparation
+
+`prepare_firstproof.py` prepares the ten pinned inputs in
+`experiments/firstproof-batch3/manifest.json` without starting model work.
+`launch_firstproof.py` checks configuration, isolation and compilation;
+`launch_firstproof.py --start` releases the preparation hold and launches the jobs.
+Use fresh run and controller directories for each batch; existing work is never
+overwritten. Both scripts accept `--problems P09 P10` to select a subset.
+Regenerate policies on each host because their paths are machine-specific.
+Generated runs, controller state, credentials and virtual environments stay out
+of Git. Historical search is supported on macOS Seatbelt and Windows MXC when
+their runtime canaries pass; unavailable isolation blocks launch.

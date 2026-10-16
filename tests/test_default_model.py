@@ -548,6 +548,7 @@ function select(rows) {
     options: rows.map((row) => new Option(row.text, row.value)), current: '',
     dataset: {}, classList: {toggle() {}}, setAttribute() {}, focus() {},
     add(option) { this.options.push(option); },
+    querySelector(selector) { const value = selector.match(/value="([^"]+)"/)?.[1]; return this.options.find(option => option.value === value); },
     get value() { return this.current; },
     set value(value) { this.current = this.options.some((option) => option.value === value) ? value : ''; },
   };
@@ -563,7 +564,8 @@ function load() {
   elements.problemModes = [{value: 'statement', checked: true}, {value: 'latex', checked: false}];
   const ui = new Proxy(elements, {get(target, name) { return target[name] ??= stub(); }});
   const slice = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
-  const code = slice('function selectedProblemMode(', 'const promptLabels =')
+  const code = slice('function retrievalConfiguration(', 'function renderJobs(')
+    + slice('function selectedProblemMode(', 'const promptLabels =')
     + slice('function render(next)', 'async function refresh()');
   const handlers = slice('for (const role of ["review", "author", "critic", "writer"]) {', 'ui.speedMode.onchange');
   const setup = `
@@ -571,7 +573,7 @@ function load() {
     const document = {activeElement: null};
     const show = (element, visible) => element.hidden = !visible;
     const retainTrace = (entries) => entries;
-    const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {};
+    const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {}, renderBatchNavigation = () => {};
     const renderResearchAudits = () => {}, fillResearchAuditControls = () => {}, appendFormattedText = () => {};
     const syncPrompts = () => {}, checkEdited = () => {}, refresh = () => {};
     const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};

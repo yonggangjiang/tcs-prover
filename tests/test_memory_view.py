@@ -415,7 +415,7 @@ const tabs = Object.values(markup).filter(attrs => attrs['data-memory']).map(att
 }));
 const approachTab = tabs.find(tab => tab.dataset.memory === 'APPROACHES');
 const lemmaTab = tabs.find(tab => tab.dataset.memory === 'PROVED.md');
-const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', memoryJob: null,
+const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', currentBatch: '', memoryJob: null,
   memoryFile: source.match(/let memoryFile = "([^"]+)"/)[1],
   state: {trace: []},
   memoryVersion: '', memoryRequest: 0, memoryTimer: null, memoryAnchor: '',
@@ -579,6 +579,23 @@ const settle = async value => {
   ui.memoryPanel.open = false;
   await settleGraph(files);
   assert.equal(context.approachGraphData, anotherJobGraph);
+  assert.equal(pending.length, 0);
+
+  // A repeated run id in another batch must not reuse files or late responses.
+  ui.memoryPanel.open = true;
+  context.loadMemory();
+  const previousBatchGraph = pending.shift();
+  context.currentBatch = 'different-batch';
+  context.syncMemoryPanel();
+  assert.equal(ui.memoryPanel.open, false);
+  ui.memoryPanel.open = true;
+  context.loadMemory();
+  await settleGraph(['APPROACHES/A020.md']);
+  const otherBatchGraph = context.approachGraphData;
+  previousBatchGraph.resolve({files, nodes: [{file: files[1]}], indexFile: files[0]});
+  await new Promise(setImmediate);
+  assert.equal(context.approachGraphData, otherBatchGraph);
+  assert.equal(ui.memoryApproach.options[1].value, 'APPROACHES/A020.md');
   assert.equal(pending.length, 0);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """

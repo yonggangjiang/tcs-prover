@@ -33,6 +33,24 @@
       <main class="work-pane">
         <p id="notice" class="notice" role="alert" hidden></p>
 
+        <nav id="batchNavigation" class="batch-navigation" aria-label="Batch navigation" hidden>
+          <button id="allBatchesButton" class="ghost compact">← All batches</button>
+          <span class="batch-navigation-divider" aria-hidden="true">/</span>
+          <button id="batchProblemsButton" class="ghost compact"></button>
+          <span id="selectedBatchBadge" class="batch-badge" hidden></span>
+        </nav>
+        <p id="batchReadOnlyNotice" class="batch-readonly" hidden>Previous batch · You can read saved work and download results.</p>
+
+        <section id="batchesPanel" class="batches-panel" aria-labelledby="batchesHeading">
+          <div class="batches-heading">
+            <div><p class="eyebrow">RESEARCH WORKSPACE</p><h1 id="batchesHeading">Problem batches</h1>
+              <p class="section-copy">Open a batch to follow its problems, proofs, and saved work.</p></div>
+            <button id="newProblemButton" class="secondary">New problem</button>
+          </div>
+          <p id="batchesStatus" class="help" role="status">Loading batches…</p>
+          <ol id="batchesList" class="batches-list"></ol>
+        </section>
+
         <section id="runOverview" class="run-overview" aria-labelledby="runProblemTitle" hidden>
           <p class="eyebrow">CURRENT PROBLEM</p>
           <h2 id="runProblemTitle"></h2>
@@ -44,6 +62,26 @@
           </dl>
           <p id="runNextStep" class="run-next-step" role="status"></p>
           <p id="runLatestAction" class="run-latest-action"></p>
+          <section id="retrievalPanel" class="retrieval-panel" aria-labelledby="retrievalHeading">
+            <div class="retrieval-heading">
+              <div><p class="eyebrow">RESEARCH SOURCES</p><h3 id="retrievalHeading">Web search</h3></div>
+              <span id="retrievalStatus" class="retrieval-badge"></span>
+            </div>
+            <p id="retrievalDescription" class="retrieval-description"></p>
+            <div id="retrievalCutoffDisplay" class="retrieval-cutoff" hidden>
+              <span id="retrievalCutoffLabel">Only captures strictly before</span>
+              <strong id="retrievalCutoffValue"></strong>
+              <span id="retrievalPolicyNote"></span>
+            </div>
+            <dl id="retrievalCounts" class="retrieval-counts" hidden></dl>
+            <p id="retrievalRequestSummary" class="retrieval-request-summary" hidden></p>
+            <ul id="retrievalFailures" class="retrieval-failures" aria-label="Failed retrieval requests by reason" hidden></ul>
+            <details id="retrievalDetails" class="retrieval-details" hidden>
+              <summary>Source checks and coverage</summary>
+              <p id="retrievalLimitation"></p>
+              <p id="retrievalCountNote"></p>
+            </details>
+          </section>
           <details id="statementDetails" class="run-context" open>
             <summary id="statementHeading">Statement being solved</summary>
             <pre id="runStatement" class="statement-copy"></pre>
@@ -55,11 +93,14 @@
           <details class="run-context">
             <summary>Run settings and history</summary>
             <dl id="runMetadata" class="run-metadata"></dl>
+            <details id="criticReviewHistory" class="critic-review-history">
+              <summary>Critic review inputs and decisions</summary>
+            </details>
           </details>
         </section>
 
         <!-- The first screen intentionally contains only one obvious task. -->
-        <section id="inputPanel" class="input-view">
+        <section id="inputPanel" class="input-view" hidden>
           <div class="intro">
             <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
             <h1>What should we solve?</h1>
@@ -107,6 +148,25 @@
             </label>
             <details class="advanced">
               <summary>Advanced</summary>
+              <section id="retrievalSetting" class="retrieval-setting" aria-labelledby="retrievalSettingHeading">
+                <div class="retrieval-setting-heading">
+                  <div><h3 id="retrievalSettingHeading">Web search cutoff</h3><p>Choose unrestricted search, a historical cutoff, or no web-search tools.</p></div>
+                  <span class="setting-badge">Optional</span>
+                </div>
+                <label for="retrievalMode">Time cutoff</label>
+                <select id="retrievalMode" aria-describedby="retrievalSettingHelp">
+                  <option value="live" selected>Off — unrestricted model web search</option>
+                  <option value="historical">On — use the cutoff below</option>
+                </select>
+                <div id="retrievalCutoffSetting" class="retrieval-cutoff-setting" hidden>
+                  <label for="retrievalCutoffUtc">Cutoff time (UTC), or -1 to disable web-search tools</label>
+                  <input id="retrievalCutoffUtc" type="text" autocomplete="off" spellcheck="false"
+                    placeholder="2026-10-02T14:13:12Z" aria-describedby="retrievalCutoffHelp">
+                  <p id="retrievalCutoffHelp" class="help">Enter -1 to disable all web-search tools, or an exact UTC timestamp including seconds and Z. Historical search returns only verified captures strictly before that time. The choice stays fixed after the job starts.</p>
+                </div>
+                <p id="retrievalSettingHelp" class="help">The model's native web search is enabled without a date restriction.</p>
+                <p id="retrievalConfigurationNotice" class="retrieval-configuration-notice" role="status" hidden></p>
+              </section>
               <div class="model-grid">
                 <div id="reviewModelSetting" class="round-setting model-setting">
                   <label for="reviewModel">Statement reviewer</label>
@@ -252,8 +312,8 @@
                 </p>
               </div>
               <div id="thinkingHoursSetting" class="round-setting">
-                <label for="thinkingHours">Total workflow time limit (hours)</label>
-                <input id="thinkingHours" type="number" min="0.01" max="168"
+                <label for="thinkingHours">Workflow hours (0 = unlimited)</label>
+                <input id="thinkingHours" type="number" min="0" max="168"
                   step="0.25" value="168" aria-describedby="timeHelp">
                 <p id="timeHelp" class="help">
                   Default 168 hours for the whole workflow. The author keeps
@@ -294,16 +354,17 @@
           <input id="folderInput" type="file" webkitdirectory multiple hidden
             aria-label="Folder of statement files (any extension or none)">
           <p id="batchStatus" class="batch-status" role="status" hidden></p>
-          <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
+        </section>
+        <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
             <div class="jobs-heading">
               <div>
-                <p class="eyebrow">SAVED WORK</p>
-                <h2 id="jobsHeading">Your jobs and checkpoints</h2>
+                <p class="eyebrow">BATCH PROBLEMS</p>
+                <h2 id="jobsHeading">Problems and checkpoints</h2>
               </div>
               <span id="jobsCount"></span>
             </div>
             <ol id="jobsList" class="jobs-list"></ol>
-          </section>
+            <p id="jobsEmpty" class="help" hidden>No problems have been saved in this batch yet.</p>
         </section>
 
         <!-- The author can edit or explain a rejected statement here. -->
@@ -440,6 +501,7 @@
                 <button class="filter" data-filter="prompt">Prompts</button>
               </div>
             </div>
+            <p id="traceNotice" class="help trace-notice" role="status" hidden></p>
             <ol id="timelineList" class="timeline" role="log"
               aria-live="off" aria-relevant="additions text"></ol>
             <button id="jumpLatest" class="jump-latest secondary compact" hidden>
@@ -460,8 +522,8 @@
               <span id="authorLimitSummary" class="author-limit-summary">
                 Total limit: 168 hours
               </span>
-              <label for="authorLimitHours">Set limit to</label>
-              <input id="authorLimitHours" type="number" min="0.01"
+              <label for="authorLimitHours">Set hours (0 = unlimited)</label>
+              <input id="authorLimitHours" type="number" min="0"
                 max="168" step="0.5" value="168" inputmode="decimal">
               <span>hours</span>
               <button id="setAuthorTimeLimitButton" class="secondary compact">

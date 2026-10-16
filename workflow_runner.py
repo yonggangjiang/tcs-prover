@@ -17,6 +17,8 @@ import sys
 import tempfile
 import threading
 import time
+import retrieval_runtime
+import proof_handoff
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -162,14 +164,14 @@ def critic_limit(value):
 
 
 def author_hours(value):
-    """Require a positive author-time limit of at most one week."""
+    """Accept zero for unlimited, or a finite limit of at most one week."""
 
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise Error("The total workflow time limit must be a number of hours.") from exc
-    if not 0 < value <= MAX_AUTHOR_HOURS:
-        raise Error(f"Choose more than 0 and at most {MAX_AUTHOR_HOURS} hours.")
+    if not math.isfinite(value) or not 0 <= value <= MAX_AUTHOR_HOURS:
+        raise Error(f"Choose 0 for unlimited, or at most {MAX_AUTHOR_HOURS} hours.")
     return value
 
 
@@ -284,6 +286,30 @@ def environment(model=None):
     env.pop("LOG_FORMAT", None)
     env.pop("RUST_BACKTRACE", None)
     return env
+
+
+def retrieval_policy(workspace=None, features=()):
+    """Read controller policy before any process or model call is allowed."""
+    try:
+        policy = retrieval_runtime.policy_for_workspace(workspace)
+        if policy and set(features) - {"multi_agent", "shell_tool"}:
+            raise retrieval_runtime.RetrievalPolicyError("Historical workflow features are limited to the audited default tool set.")
+        retrieval_runtime.search_mode(workspace, policy=policy)
+        return policy
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise Error(str(exc)) from exc
+
+
+def retrieval_environment(policy, role, model=None, inherited=None):
+    try:
+        if policy and model is not None and model_provider(model) != OPENAI_PROVIDER:
+            raise retrieval_runtime.RetrievalPolicyError("Historical isolation currently supports only the default OpenAI provider.")
+        return retrieval_runtime.preflight(
+            policy, role, retrieval_runtime.codex_executable(policy) if policy else "",
+            environment(model) if inherited is None else inherited,
+        )
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise Error(str(exc)) from exc
 
 
 def structured_workspace():
@@ -626,12 +652,11 @@ def output_schema_arguments(model, schema_path):
         return []
     return ["--output-schema", str(schema_path)]
 
-def structured_tool_arguments(stage, features=()):
-    """Enable live search; keep other optional tools controlled by YAML."""
+def structured_tool_arguments(stage, features=(), policy=None):
+    """Apply the run's search mode; keep other optional tools controlled by YAML."""
     return [
-        "-c", 'web_search="live"',
-        "-c", "tools.web_search=true",
-        "-c", "tools.view_image=false",
+        *retrieval_runtime.native_search_arguments(policy=policy),
+        "-c", "features.view_image=false",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
     ]
 
@@ -654,39 +679,86 @@ def structured_retry_prompt(prompt, raw, schema_value):
         f"{prompt}\n\nSTRUCTURED OUTPUT RECOVERY RETRY\n"
         "The previous attempt did not produce one valid final JSON object. "
         "Do not discuss the formatting failure or return a placeholder. "
-        "Re-evaluate the task, using web search if needed, and return the "
+        "Re-evaluate the task using the supplied information and return the "
         "complete substantive answer as exactly one JSON object matching this "
         f"schema:\n{schema}\n\nPREVIOUS INVALID OUTPUT:\n{previous}"
     )
 
 def run_structured_attempt(
     prompt, schema_value, stage, model, effort, speed, summary,
-    timeout=None, activity_label=None, features=(),
+    timeout=None, activity_label=None, features=(), input_files=None,
 ):
     """Run one structured Codex process and return its last-message text."""
 
+    policy = retrieval_policy(features=features)
+    if input_files is not None:
+        # The tuple holds captured text, never paths to mutable author files.
+        if (not isinstance(input_files, tuple) or len(input_files) != 3
+                or {name for name, _ in input_files} != {"proof.md", "statement.md", "manifest.json"}
+                or not all(isinstance(value, str) for _, value in input_files)):
+            raise Error("Invalid proof snapshot bundle.")
+        snapshot_features = tuple(dict.fromkeys((*features, "shell_tool")))
+
+        def review(snapshot_policy, workspace):
+            for name, value in input_files:
+                descriptor = os.open(workspace / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | getattr(os, "O_NOFOLLOW", 0), 0o400)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(value.encode("utf-8"))
+            environment_value = retrieval_environment(snapshot_policy, "critic", model)
+            emit("status", stage, label="Proof snapshot ready",
+                 text="The critic and its subagents can read proof.md and statement.md in their read-only workspace.",
+                 snapshotWorkspace=str(workspace), snapshotManifest=json.loads(dict(input_files)["manifest.json"]))
+            return _run_structured_process(
+                prompt, schema_value, stage, model, effort, speed, summary,
+                timeout=timeout, activity_label=activity_label, features=snapshot_features,
+                policy=snapshot_policy, child_environment=environment_value, workspace=workspace,
+            )
+
+        if policy:
+            try:
+                with retrieval_runtime.critic_session(policy) as snapshot_policy:
+                    return review(snapshot_policy, retrieval_runtime.role_workspace(snapshot_policy, "critic"))
+            except retrieval_runtime.RetrievalPolicyError as exc:
+                raise Error(str(exc)) from exc
+        # Keep the exact reviewed artifacts for diagnosis after the process exits.
+        return review(None, Path(tempfile.mkdtemp(prefix="tcs-proof-review-")))
+    child_environment = retrieval_environment(policy, "structured", model)
+    workspace = retrieval_runtime.role_workspace(policy, "structured") if policy else structured_workspace()
+    return _run_structured_process(
+        prompt, schema_value, stage, model, effort, speed, summary,
+        timeout=timeout, activity_label=activity_label, features=features,
+        policy=policy, child_environment=child_environment, workspace=workspace,
+    )
+
+
+def _run_structured_process(
+    prompt, schema_value, stage, model, effort, speed, summary,
+    *, timeout, activity_label, features, policy, child_environment, workspace,
+):
     timeout = None if timeout is None else float(timeout)
-    child_environment = environment(model)
     with tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
-        workspace = structured_workspace()
         schema = folder / "schema.json"
         answer = folder / "answer.json"
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         schema_arguments = output_schema_arguments(model, schema)
         command = [
-            codex(), "-m", model, "-c", f'model_reasoning_effort="{effort}"',
-            *inherited_openai_base_url_arguments(
+            retrieval_runtime.codex_executable(policy) if policy else codex(),
+            *(["--strict-config"] if policy else []),
+            "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+            *([] if policy else inherited_openai_base_url_arguments(
                 overrides={"model_provider": model_provider(model)}, environment=child_environment,
-            ),
+            )),
             *provider_arguments(model),
             *speed_arguments(speed, model), *context_cache_arguments(),
             "-c", f'model_reasoning_summary="{summary}"',
-            *structured_tool_arguments(stage, features),
+            *structured_tool_arguments(stage, features, policy),
             *[argument for feature in features for argument in ("--enable", feature)],
-            "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
+            "-C", str(workspace), *([] if policy else ["-s", "read-only"]),
+            "-a", "never", "exec",
             "--json", "--ephemeral", "--skip-git-repo-check",
-            "--ignore-user-config", *schema_arguments, "-o", str(answer), "-",
+            *([] if policy else ["--ignore-user-config"]), *schema_arguments, "-o", str(answer), "-",
         ]
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -988,15 +1060,26 @@ def structured(
     prompt, schema_value, stage, model=MODEL, effort=EFFORT,
     speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
     timeout=None, attempts=STRUCTURED_MAX_ATTEMPTS,
-    request_label=None, activity_label=None, features=(),
+    request_label=None, activity_label=None, features=(), input_files=None,
 ):
     """Run one read-only structured Codex call and relay its visible events."""
 
+    retrieval_policy(features=features)
     model = chosen_model(model)
     effort = effective_effort(model, effort)
     speed = effective_speed(model, speed)
     summary = reasoning_summary(model, summary)
     require_model_credentials(model)
+    if input_files is not None:
+        prompt += (
+            "\n\nREAD-ONLY PROOF FILES:\n"
+            "Your working directory contains proof.md (the exact candidate), "
+            "statement.md (the exact task), and manifest.json (content hashes and provenance). "
+            "Read both files completely; use successive ranges if tool output is truncated. "
+            "Give independent subagents these same files and working directory. "
+            "Review only this snapshot. Do not resolve links into the author's workspace. "
+            "Return the complete proof text in solution, never a file pointer."
+        )
     prompt = structured_prompt_for_model(prompt, schema_value, model)
     if timeout is None and is_deepseek_model(model):
         timeout = STRUCTURED_ATTEMPT_TIMEOUT_SECONDS.get(stage, 900)
@@ -1028,6 +1111,7 @@ def structured(
                 attempt_prompt, schema_value, stage, model, attempt_effort,
                 speed, summary, timeout=timeout,
                 activity_label=activity_label or request_label, features=features,
+                **({"input_files": input_files} if input_files is not None else {}),
             )
         except StructuredAttemptTimeout as exc:
             emit(
@@ -1077,7 +1161,7 @@ def structured(
                 raise Error(f"{exc}{suffix}") from exc
             emit(
                 "status", stage, label="Retrying structured output",
-                text="Retrying once for valid structured output; web search remains available.",
+                text="Retrying once for valid structured output; the saved web-search policy remains in effect.",
             )
     raise Error(f"Codex {stage} did not return structured output.")
 
@@ -1118,6 +1202,7 @@ class RPC:
             self.stderr_reader = threading.Thread(target=drain_errors, daemon=True)
             self.stderr_reader.start()
 
+
     def send(self, message):
         with self.write_lock:
             self.process.stdin.write(json.dumps(message) + "\n")
@@ -1135,6 +1220,12 @@ class RPC:
         message = json.loads(line)
         if self.record:
             self.record(message)
+        # This is a runtime warning, not model-authored text. Continuing after
+        # it can strand goal completion and repeatedly spend requests while
+        # every functions.exec call fails, including historical retrieval.
+        if (message.get("method") == "warning"
+                and "code mode is unavailable" in str((message.get("params") or {}).get("message", "")).lower()):
+            raise Error("Required model tool runtime is unavailable: " + message["params"]["message"])
         # This small noninteractive client cannot answer server-side questions.
         if "id" in message and "method" in message:
             raise Error(f"Interactive Codex request is unsupported: {message['method']}.")
@@ -1177,6 +1268,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     through ``send``. The model manages its own work in the supplied workspace.
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
+    policy = retrieval_policy(directory, features)
+    retrieval_role = "author" if node_name == "author" else "structured"
+    if policy and retrieval_role != "author":
+        raise Error("Historical goal sessions are restricted to the configured author node.")
     stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
     stage = stages["initial"]
     values = dict(original_prompt=prompt, directory=directory,
@@ -1280,6 +1375,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         emit("diagnostic", text=f"Could not send live instruction: {exc}")
 
     def start_turn(instruction):
+        if policy:
+            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
         if pause_file and Path(pause_file).is_file():
             pausing.set()
             raise runtime.Error("Pause requested.")
@@ -1311,16 +1408,18 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Workflow time limit reached.")
         if options.get("goal_require_resume") and not options.get("goal_thread_id"):
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation.")
+        child_environment = retrieval_environment(policy, retrieval_role, model, inherited=runtime.environment(model))
         process = subprocess.Popen([
-            runtime.codex(), "app-server", "--enable", "goals",
-            "-c", 'web_search="live"', "-c", "tools.web_search=true",
+            retrieval_runtime.codex_executable(policy) if policy else runtime.codex(),
+            *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
+            *retrieval_runtime.native_search_arguments(directory, policy=policy),
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
             *runtime.context_cache_arguments(),
             *[argument for feature in features for argument in ("--enable", feature)],
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
-            env=runtime.environment(model))
+            env=child_environment)
         rpc = runtime.RPC(process, record)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
@@ -1329,16 +1428,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             "capabilities": {"experimentalApi": True},
         })
         rpc.send({"method": "initialized", "params": {}})
+        if policy:
+            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
         thread_options = {
             "model": model, "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
             "sandbox": "workspace-write", "approvalPolicy": "never",
             "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
-                "web_search": "live", "tools": {"web_search": True},
+                **retrieval_runtime.native_search_configuration(directory, policy=policy),
                 "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
                              **{feature: True for feature in features}}},
         }
         if hasattr(runtime, "model_provider"):
             thread_options["modelProvider"] = runtime.model_provider(model)
+        if policy:
+            thread_options.pop("sandbox")
+            thread_options["permissions"] = retrieval_runtime.PROFILE
+            locked = retrieval_runtime.configuration(policy, retrieval_role)
+            locked_features = locked.pop("features")
+            thread_options["config"].update(locked)
+            thread_options["config"]["features"].update(locked_features)
         resumed = False
         if options.get("goal_thread_id"):
             try:
@@ -1496,16 +1604,23 @@ def _clipped(value, limit=1600):
     return value[:max(0, limit - len(suffix))].rstrip() + suffix
 
 
-def _private_atomic_write(path, content):
+def _private_atomic_write(path, content, *, staging_directory=None):
     """Atomically replace one private run-local UTF-8 state file."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    staging = path.parent
+    if staging_directory is not None:
+        staging = Path(staging_directory).resolve()
+        workspace = path.parent.resolve()
+        if staging == workspace or workspace in staging.parents:
+            raise Error("Protected state must be staged outside the writable run workspace.")
+        staging.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", newline="\n", delete=False,
-            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+            dir=staging, prefix=f".{path.name}.", suffix=".tmp",
         ) as stream:
             temporary = Path(stream.name)
             stream.write(content)
@@ -1921,6 +2036,29 @@ def _check_parallel(config, prompts):
 def _expand_node(node):
     """Desugar authoring shortcuts; execution uses the original node format."""
 
+    bindings = node.get("inputs")
+    if isinstance(bindings, dict) and "proof_handoff" in bindings:
+        # A reserved constant input keeps deployed YAML readable by older
+        # controllers while new workers normalize it before prompt handling.
+        if "proof_handoff" in node:
+            raise ValueError("Choose top-level or input proof_handoff, not both.")
+        expression = bindings["proof_handoff"]
+        try:
+            if node.get("run") != "structured" or not isinstance(expression, str):
+                raise ValueError("Invalid compatibility binding.")
+            parsed = ast.parse(expression.strip(), mode="eval").body
+            if not isinstance(parsed, ast.Dict) or len(parsed.keys) != 2:
+                raise ValueError("Expected one constant mapping.")
+            handoff = ast.literal_eval(parsed)
+            if (set(handoff) != {"candidate", "statement"}
+                    or not all(isinstance(value, str) and value.isidentifier() for value in handoff.values())
+                    or handoff["candidate"] == handoff["statement"]):
+                raise ValueError("Expected distinct state field names.")
+        except (ValueError, TypeError, SyntaxError, RecursionError) as exc:
+            raise ValueError("Proof handoff input must be a constant mapping of distinct candidate and statement state fields.") from exc
+        node["proof_handoff"] = handoff
+        node["inputs"] = {key: value for key, value in bindings.items() if key != "proof_handoff"}
+
     if "response" in node:
         if "schema" in node:
             raise ValueError("Choose response or schema, not both.")
@@ -1966,7 +2104,7 @@ def load_workflow(path):
     targets = set(nodes) | {"end"}
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
     specific = {
-        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize"},
+        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff"},
         "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features"},
         "command": {"command", "require", "error"},
     }
@@ -2000,6 +2138,12 @@ def load_workflow(path):
         _check_actions(node.get("after", []))
         if kind == "structured":
             _check_request_options(node)
+            if "proof_handoff" in node:
+                handoff = node["proof_handoff"]
+                if (not isinstance(handoff, dict) or set(handoff) != {"candidate", "statement"}
+                        or not all(isinstance(value, str) and value.isidentifier() for value in handoff.values())
+                        or handoff["candidate"] == handoff["statement"]):
+                    raise ValueError("Proof handoff must name distinct candidate and statement state fields.")
             normalized = node.get("normalize", {})
             if not isinstance(normalized, dict) or not all(isinstance(key, str) for key in normalized):
                 raise ValueError("Result normalization must map field names to expressions.")
@@ -2210,6 +2354,8 @@ def workflow_remaining(options):
     started = options.setdefault("_workflow_started", time.monotonic())
     hours = controlled_author_hours(options.get("author_limit_file"),
                                    options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
+    if hours == 0:
+        return math.inf
     return max(0.0, hours * 3600 - options.get("elapsed_seconds", 0)
                - (time.monotonic() - started))
 
@@ -2218,11 +2364,11 @@ def _bounded_request_settings(settings, options):
     remaining = workflow_remaining(options)
     if remaining <= 0:
         raise Error("Workflow time limit reached; saved work remains resumable.")
-    return {**settings, "timeout": min(settings.get("timeout") or 900, remaining),
+    return {**settings, "timeout": None if math.isinf(remaining) else min(settings.get("timeout") or 900, remaining),
             "attempts": 1}
 
 
-def _parallel_requests(config, prompts, state, options, visit):
+def _parallel_requests(config, prompts, state, options, visit, input_files=None):
     """Run independent structured requests, restoring exact-input checkpoints."""
     settings = _structured_options(config, options)
     model, effort = settings["model"], settings["effort"]
@@ -2238,7 +2384,7 @@ def _parallel_requests(config, prompts, state, options, visit):
     emit("status", stage, label="Three independent audits started" if len(reports) == 3 else "Independent requests started", text=f"The controller restored {restored} completed audits and is launching {len(reports) - restored} explicit parallel model requests.", node=stage, auditCount=len(reports), restoredAuditCount=restored, launchedAuditCount=len(reports)-restored, reasoningEffort=effort, timeoutSeconds=settings.get("timeout"))
     def run_one(index, item):
         prompt = _request_prompt(config, prompts, {**context, "item": item})
-        report, _ = structured(prompt, config["schema"], stage, features=config.get("features", []), request_label=f"Independent critic audit {index + 1}", activity_label=f"Independent audit {index + 1}", **_bounded_request_settings(settings, options))
+        report, _ = structured(prompt, config["schema"], stage, features=config.get("features", []), request_label=f"Independent critic audit {index + 1}", activity_label=f"Independent audit {index + 1}", **({"input_files": input_files} if input_files is not None else {}), **_bounded_request_settings(settings, options))
         report = dict(report)
         if config.get("item_field"):
             report[config["item_field"]] = item
@@ -2263,7 +2409,41 @@ def _parallel_requests(config, prompts, state, options, visit):
     return reports
 
 
-def _model_call(node, prompts, state, options, visit):
+def _prepare_node_files(node, state, visit, workspace=None):
+    """Resolve an explicitly submitted artifact before checkpoints and prompts."""
+    handoff = node.get("proof_handoff")
+    if handoff is None:
+        return None
+    candidate_key, statement_key = handoff["candidate"], handoff["statement"]
+    candidate, statement = state.get(candidate_key), state.get(statement_key)
+    if not isinstance(candidate, str) or not isinstance(statement, str) or not statement.strip():
+        raise Error("Proof handoff needs a candidate and the exact problem statement.")
+    try:
+        snapshot = proof_handoff.resolve_author_proof(candidate, workspace or Path.cwd())
+    except proof_handoff.ProofHandoffError as exc:
+        raise Error(f"Cannot hand the submitted proof to the critic: {exc}") from exc
+    if snapshot is not None:
+        candidate = snapshot.text
+    if not candidate.strip():
+        raise Error("Cannot hand an empty proof to the critic.")
+    source = {"kind": "file", **snapshot.receipt()} if snapshot else {"kind": "inline"}
+    files = (("proof.md", candidate), ("statement.md", statement))
+    manifest = {
+        "schemaVersion": 1, "visit": visit, "source": source,
+        "files": {name: {"sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                         "sizeBytes": len(value.encode("utf-8"))} for name, value in files},
+    }
+    # Repair feedback, saved candidates and exact-proof comparisons all use the
+    # captured content. A subsequent review captures any critic/author edits anew.
+    state[candidate_key] = candidate
+    state["proof_handoff"] = manifest
+    emit("proof_handoff", node.get("stage", "model"), label="Submitted proof captured",
+         text="Captured the exact candidate and statement for an isolated read-only review.",
+         manifest=manifest, round=visit)
+    return (*files, ("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"))
+
+
+def _model_call(node, prompts, state, options, visit, input_files=None):
     """Run a configured request, optionally collecting independent inputs first."""
     context = {"state": state, "visit": visit}
     parallel = node.get("parallel")
@@ -2272,11 +2452,11 @@ def _model_call(node, prompts, state, options, visit):
         config.update(parallel)
         context["parallel"] = options.get("parallel_results")
         if context["parallel"] is None:
-            context["parallel"] = _parallel_requests(config, prompts, state, options, visit)
+            context["parallel"] = _parallel_requests(config, prompts, state, options, visit, input_files=input_files)
     prompt = _request_prompt(node, prompts, context)
     settings = _structured_options(node, options)
     settings.update({key: node[key] for key in ("request_label", "activity_label") if key in node})
-    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), **_bounded_request_settings(settings, options))
+    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []), **({"input_files": input_files} if input_files is not None else {}), **_bounded_request_settings(settings, options))
     if parallel and parallel.get("output"):
         report[parallel["output"]] = context["parallel"]
     for key, expression in node.get("normalize", {}).items():
@@ -2290,8 +2470,15 @@ def _model_call(node, prompts, state, options, visit):
 
 def _run_command(config, context):
     """Run a bounded argv command and check only its declared output files."""
+    policy = retrieval_policy()
     argv = [render_template(value, context) for value in config["argv"]]
     directory = (Path.cwd() / render_template(config.get("cwd", "."), context)).resolve()
+    if policy is not None:
+        import isolated_compiler
+        try:
+            return isolated_compiler.compile_command(policy, config, argv, directory)
+        except isolated_compiler.CompilerIsolationError as exc:
+            raise Error(str(exc)) from exc
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     outputs = [directory / name for name in config.get("produces", [])]
     for path in outputs:
@@ -2388,9 +2575,10 @@ def _execute(workflow, state, options, prompts):
             visits += 1
             emit("status", node.get("stage", current), label=f"Workflow step: {current}",
                  node=current, visit=visits)
+            input_files = _prepare_node_files(node, state, visits, options.get("goal_cwd"))
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
             if node["run"] == "structured":
-                result, raw = _model_call(node, prompts, state, options, visits)
+                result, raw = _model_call(node, prompts, state, options, visits, input_files=input_files)
             elif node["run"] == "command":
                 config = dict(node["command"])
                 config["timeout"] = min(config["timeout"], workflow_remaining(options))
@@ -2498,8 +2686,9 @@ def _builtin_node(workflow_name, node_name, state, options, visit=1, prompts=Non
     workflow = builtin_workflow(workflow_name)
     resolved = {**workflow["prompts"], **(prompts or {}), **options.get("prompts", {})}
     node = workflow["nodes"][node_name]
+    input_files = _prepare_node_files(node, state, visit, options.get("goal_cwd"))
     _apply_actions(node.get("before", []), {"state": state, "visit": visit}, node.get("stage", "model"), 0)
-    result, raw = _model_call(node, resolved, state, options, visit)
+    result, raw = _model_call(node, resolved, state, options, visit, input_files=input_files)
     _complete_node(node, state, result, raw, visit, 0)
     return result
 

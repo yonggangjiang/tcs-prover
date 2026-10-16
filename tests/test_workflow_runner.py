@@ -90,15 +90,25 @@ class PipelineTests(unittest.TestCase):
             critic_results = [i for i, (args, _) in enumerate(events) if args[0] == 'critic_result']
             self.assertEqual(len(approvals), 1)
             self.assertGreater(approvals[0], critic_results[-1])
+            self.assertEqual([events[i][1]['outcome'] for i in critic_results], ['fixed'] * 3)
+            acceptance = events[approvals[0]][1]
+            self.assertEqual(acceptance['acceptanceReason'], 'round_limit')
+            self.assertEqual(acceptance['roundLimit'], 3)
+            self.assertEqual(acceptance['round'], 3)
 
     def test_unchanged_pass_after_repair_finishes_before_max(self):
         repaired = PROOF + ' repaired'
         report = review_report(repaired)
-        with workspace(), patch.object(runtime, 'structured', return_value=(report, json.dumps(report))) as model:
+        with workspace(), patch.object(runtime, 'structured', return_value=(report, json.dumps(report))) as model, patch.object(runtime, 'emit') as emit:
             state = runtime.execute_workflows([ROOT/'workflows/author_critic.yaml'],
                 {'statement': 'Task', 'solution': PROOF}, {'start_node': 'critic', 'critic_rounds': 5})
             self.assertEqual(model.call_count, 2)
             self.assertEqual(state['output'], repaired)
+            decisions = [call.kwargs for call in emit.call_args_list if call.args[0] == 'critic_result']
+            self.assertEqual([entry['outcome'] for entry in decisions], ['fixed', 'pass'])
+            approval = next(call.kwargs for call in emit.call_args_list if call.kwargs.get('label') == 'Critic approved')
+            self.assertEqual(approval['acceptanceReason'], 'clean_pass')
+            self.assertEqual(approval['round'], 2)
 
     def test_rejection_at_max_returns_to_same_author_and_resets_rounds(self):
         revised = PROOF + ' with the objection resolved.'
@@ -210,14 +220,17 @@ class PipelineTests(unittest.TestCase):
         checkpoint = next(call.kwargs for call in emit.call_args_list if call.args[0] == 'workflow_paused')
         self.assertIn('time limit', checkpoint['reason'])
 
-    def test_live_web_search_is_enabled_for_all_structured_stages_and_retries(self):
-        for stage in ('review', 'critic', 'final'):
-            for features in ([], ['multi_agent']):
-                arguments = runtime.structured_tool_arguments(stage, features)
-                self.assertIn('web_search="live"', arguments)
-                self.assertIn('tools.web_search=true', arguments)
-                self.assertNotIn('tools.web_search=false', arguments)
-        self.assertIn('using web search if needed', runtime.structured_retry_prompt('Task', '', {}))
+    def test_native_web_search_modes_cover_structured_stages_and_retries(self):
+        for mode in ('live', 'disabled'):
+            with patch.dict(runtime.os.environ, {runtime.retrieval_runtime.MODE_ENV: mode}):
+                for stage in ('review', 'critic', 'final'):
+                    for features in ([], ['multi_agent']):
+                        arguments = runtime.structured_tool_arguments(stage, features)
+                        self.assertIn(f'web_search="{mode}"', arguments)
+                        self.assertIn('tools.web_search=' + str(mode == 'live').lower(), arguments)
+                        historical = runtime.structured_tool_arguments(stage, features, policy={'mode': 'historical'})
+                        self.assertIn('web_search="disabled"', historical)
+        self.assertIn('using the supplied information', runtime.structured_retry_prompt('Task', '', {}))
 
 
 if __name__=='__main__':

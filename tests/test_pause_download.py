@@ -374,7 +374,8 @@ const state = {phase: 'running', problemMode: 'latex', activeNode: 'latex_repair
   workflow: JSON.parse(process.argv[2]), trace: [{node: 'latex_editor'}, {node: 'latex_compile'}, {node: 'latex_repair'}]};
 const context = {ui, state, document: {createElement: () => new Element()}, nodeFromStage: () => 'latex_editor'};
 vm.createContext(context);
-vm.runInContext(source.slice(source.indexOf('function renderWorkflow()'), source.indexOf('function renderClock()')), context);
+vm.runInContext(source.slice(source.indexOf('// Group the recorded critic calls'), source.indexOf('function renderCriticReviewHistory()'))
+  + source.slice(source.indexOf('function renderWorkflow()'), source.indexOf('function renderClock()')), context);
 const flattened = node => [node, ...node.children.flatMap(flattened)];
 for (const problemMode of ['latex', 'statement']) {
   state.problemMode = problemMode;
@@ -403,8 +404,8 @@ for (const problemMode of ['latex', 'statement']) {
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const renderer = source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
-const outcome = source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('));
+const renderer = source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('))
+  + source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
 const handlers = source.slice(source.indexOf('ui.stop.onclick ='), source.indexOf('ui.home.onclick ='));
 const setup = `
 let state = {}, previousPhase = 'running', currentJob = 'same-job', timer, clock;
@@ -418,7 +419,7 @@ const show = (element, visible) => element.hidden = !visible;
 const managesResearchFiles = () => true;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
-const renderClock = () => {}, refresh = () => {};
+const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};
 const renderResearchAudits = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 const jobPath = path => path + '?job=same-job', sessionToken = 'secret';
@@ -438,8 +439,6 @@ const checks = `
   assert.equal(ui.downloadTex.hidden, true);
   assert.equal(ui.downloadPdf.hidden, true);
   assert.equal(ui.pause.hidden, false);
-  render({...running, fileManagement: false});
-  assert.equal(ui.workflowRail.hidden, false); // The workflow is useful without notebooks.
   assert.equal(ui.stop.hidden, false);
   assert.equal(ui.resume.hidden, true);
   ui.pause.onclick(); assert.equal(clicked, '/pause');
@@ -474,9 +473,17 @@ const checks = `
   assert.equal(requested, '/download-pdf?job=same-job');
   assert.equal(download, 'final.pdf');
   assert.equal(ui.downloadPdf.disabled, false);
+  render({...running, readOnly: true, traceTruncated: true, traceNotice: 'Showing the most recent saved events.',
+    canDownloadTex: true, canDownloadPdf: true});
+  for (const name of ['pause', 'stop', 'resume', 'authorSteerControl', 'authorTimeLimitControl',
+    'researchAuditsControl', 'researchAuditToolbar', 'approve', 'recheck']) assert(ui[name].hidden);
+  assert.equal(ui.downloadTex.hidden, false);
+  assert.equal(ui.downloadPdf.hidden, false);
+  assert.equal(ui.traceNotice.hidden, false);
+  assert.equal(ui.traceNotice.textContent, 'Showing the most recent saved events.');
 })();
 `;
-Promise.resolve(vm.runInNewContext(setup + outcome + renderer + handlers + checks, {assert}))
+Promise.resolve(vm.runInNewContext(setup + renderer + handlers + checks, {assert}))
   .catch(error => {console.error(error); process.exitCode = 1;});
 """
         result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js")],

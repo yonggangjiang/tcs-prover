@@ -52,7 +52,7 @@ const document = {activeElement: null};
 const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
-const renderClock = () => {}, refresh = () => {}, renderResearchAudits = () => {};
+const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {}, renderResearchAudits = () => {};
 const setTimeout = () => ++polls, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 let clicked = '';
 const act = path => clicked = path;
@@ -75,7 +75,7 @@ render({...author, phase: 'paused', auditHoldingAuthor: false});
 assert.equal(ui.resume.disabled, false);
 assert.equal(ui.pause.hidden, true);
 assert.equal(ui.stop.hidden, true);
-assert.equal(polls, 3); // Observe automatic retries and resumes from another window.
+assert.equal(polls, 3); // Paused jobs poll slowly so externally resumed work appears.
 render({...author, phase: 'running', auditHoldingAuthor: false});
 assert.equal(ui.pause.hidden, false);
 assert.equal(ui.resume.hidden, true);
@@ -232,7 +232,7 @@ let state = {
     {value: 'none', label: 'None'}, {value: 'opus', label: 'Opus'},
     {value: 'gpt-6-astra', label: 'Astra'}]}}},
 };
-let currentJob = 'first', researchAuditJob = null;
+let currentJob = 'first', currentBatch = '', researchAuditJob = null;
 let researchAuditDirty = false, researchAuditSaving = false, researchAuditStarting = false, researchAuditFeedback = '';
 const document = {createElement: tag => element('', tag)};
 const clockText = value => value || '', elapsedText = () => '1s';
@@ -550,7 +550,7 @@ const checks = `
   request.resolve({...ready, phase: 'paused', auditHoldingAuthor: true});
   await starting;
   assert.equal(state, third);
-  assert.equal(researchAuditJob, 'third');
+  assert.equal(researchAuditJob, JSON.stringify(['', 'third']));
   assert.equal(researchAuditStarting, false);
   assert.equal(ui.startResearchAudit.disabled, false);
   assertCountdown('01:59:18');

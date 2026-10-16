@@ -126,9 +126,11 @@ class RunOverviewTests(unittest.TestCase):
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 class Element {
-  constructor() { this.textContent = ''; this.dataset = {}; this.children = []; }
+  constructor(tagName) { this.tagName = tagName; this.textContent = ''; this.dataset = {}; this.children = []; }
   append(...items) { this.children.push(...items); }
   replaceChildren(...items) { this.children = items; }
+  querySelectorAll(tagName) { return this.children.flatMap(child =>
+    [...(child.tagName === tagName ? [child] : []), ...child.querySelectorAll(tagName)]); }
 }
 const ui = new Proxy({}, {get(target, name) {return target[name] ||= new Element();}});
 const state = {runId: 'saved-run', phase: 'running', stage: 'solve', activeNode: 'author',
@@ -139,7 +141,7 @@ const state = {runId: 'saved-run', phase: 'running', stage: 'solve', activeNode:
   authorModel: 'gpt-6.1-sol', authorEffort: 'max', criticModel: 'gpt-6-astra', criticEffort: 'high',
   criticRounds: 2, goalThreadId: 'saved-author', output: ''};
 const context = {ui, state, assert, stateReceivedAt: Date.now(),
-  document: {createElement: () => new Element()}, show: (element, visible) => element.hidden = !visible,
+  document: {createElement: tagName => new Element(tagName)}, show: (element, visible) => element.hidden = !visible,
   clockText: () => '', describe: entry => entry.card || null};
 const checks = `
 renderRunOverview();
@@ -172,7 +174,8 @@ assert.match(ui.runNextStep.textContent, /No completed answer/);
 state.phase = 'reviewed';
 renderRunOverview(); assert.match(ui.runNextStep.textContent, /Approval is needed/);
 `;
-vm.runInNewContext(source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function renderWorkflow()')) + checks, context);
+vm.runInNewContext(source.slice(source.indexOf('function retrievalConfiguration('), source.indexOf('function renderJobs('))
+  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function renderWorkflow()')) + checks, context);
 """
         result = subprocess.run([shutil.which("node"), "-e", script, str(server.UI / "app.js")],
                                 text=True, capture_output=True, timeout=10)

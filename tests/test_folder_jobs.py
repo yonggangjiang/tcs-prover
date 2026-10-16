@@ -240,19 +240,22 @@ const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:a
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const slice = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
 const code = slice('function managesResearchFiles(', 'function selectedAuthorPrompt(')
+  + slice('function selectedRetrievalMode()', '// Keep the compact footer')
   + slice('const promptLabels =', 'function clockText(')
   + slice('async function startReview(', 'async function startLatexOnly(');
 const setup = `
-let currentJob = '', activePrompt = 'review', timer, jobsTimer, reviewPending = false;
+let currentJob = '', currentBatch = '', composingProblem = true, activePrompt = 'review', timer, jobsTimer, reviewPending = false;
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {critic: 'Shared critic.'};
 let state = {phase: 'input', workflow: {settings: {}}};
 const values = {authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
   writerModel: 'gpt-5.6-luna', authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
-  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168'};
+  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168',
+  retrievalMode: 'live', retrievalCutoffUtc: ''};
 const ui = new Proxy({fileManagement: {checked: false}}, {get(target, name) {
   return target[name] ||= {dataset: {}, value: values[name], scrollIntoView() { this.scrolled = true; }};
 }});
 const show = (element, visible) => { element.hidden = !visible; };
+const selectedProblemMode = () => 'statement';
 const clearTimeout = () => {};
 const researchAuditValues = () => ({intervalHours: 2, models: ['gpt-6-astra', 'none', 'none']});
 let questions = [], answer = true, sent = [], failure = null, rendered = null, polled = 0;
@@ -264,6 +267,9 @@ const request = async (path, body) => {
 };
 const renderJobs = jobs => { rendered = jobs; };
 const loadJobs = () => { polled += 1; };
+const renderBatchNavigation = () => {};
+const batchUrl = id => '/?batch=' + id;
+const history = {pushState() {}};
 const file = (path, content) => ({name: path.split('/').at(-1), webkitRelativePath: path,
   size: content.length, text: async () => content});
 `;
@@ -304,6 +310,7 @@ const checks = `
     criticRounds: 2, thinkingHours: 168,
     researchAudits: {intervalHours: 0, models: ['none', 'none', 'none']},
     speedMode: 'fast', reasoningSummary: 'concise',
+    retrievalMode: 'live', retrievalCutoffUtc: '',
   });
   assert.equal(ui.batchStatus.hidden, false);
   assert.equal(ui.batchStatus.textContent, 'Started 6 jobs from statements.'

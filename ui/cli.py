@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import workflow_runner as runtime
+from .current_run import CurrentRunError, select_current_dashboard
 from .review import review_worker_main
 from .server import (
     App, Server, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
@@ -537,8 +538,22 @@ def main():
         except (OSError, TypeError, ValueError) as exc:
             print(f"Cannot start headless proof: {exc}", file=sys.stderr)
             return 1
+    selected_runs = None
+    if not resume_source:
+        try:
+            selection = select_current_dashboard()
+        except CurrentRunError as exc:
+            print(f"Cannot open the current run: {exc}", file=sys.stderr)
+            return 1
+        if selection.attached:
+            print(selection.url if args.no_browser else f"TCS Prover is already running at {selection.url}")
+            if not args.no_browser:
+                webbrowser.open(selection.url)
+            return 0
+        selected_runs = selection.runs_root
     try:
-        server = Server((HOST, PORT))
+        server = (Server((HOST, PORT), runs=selected_runs) if selected_runs is not None
+                  else Server((HOST, PORT)))
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
             raise

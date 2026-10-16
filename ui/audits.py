@@ -149,6 +149,10 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
     """One fresh CLI session, with read-only tools and no delegated agents."""
     if cancelled.is_set():
         return None
+    policy = runtime.retrieval_policy(workspace)
+    if policy:
+        raise runtime.Error("Optional research audits are disabled for historical runs.")
+    live_search = runtime.retrieval_runtime.search_mode(workspace, policy=policy) == "live"
     provider = model["provider"]
     effort = model.get("effort")
     executable = resolve_executable(model)
@@ -158,21 +162,22 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
             command = [
                 executable, "-m", model["model"],
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
-                "-c", 'web_search="live"', "-c", "tools.web_search=true",
+                *runtime.retrieval_runtime.native_search_arguments(workspace, policy=policy),
                 "--disable", "multi_agent", "--enable", "shell_tool",
                 "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
                 "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
                 "-o", str(answer), "-",
             ]
         elif provider == "claude":
+            allowed_tools = "Read,Glob,Grep" + (",WebSearch,WebFetch" if live_search else "")
             command = [
                 executable, "-p", "--model", model["model"], "--output-format", "stream-json",
                 "--verbose", "--include-partial-messages",
                 *(["--effort", effort] if effort else []),
                 "--no-session-persistence", "--safe-mode", "--restricted",
                 "--permission-mode", "dontAsk", "--permission-prompts", "none",
-                "--tools", "Read,Glob,Grep,WebSearch,WebFetch",
-                "--allowedTools", "Read,Glob,Grep,WebSearch,WebFetch",
+                "--tools", allowed_tools,
+                "--allowedTools", allowed_tools,
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                 "--disable-slash-commands", "--no-chrome",
             ]
@@ -180,7 +185,7 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
             profile = Path(directory) / "research-auditor.md"
             profile.write_text("---\n" + yaml.safe_dump({
                 "name": "research-auditor", "description": "Independent research audit",
-                "tools": ["Read", "Grep", "Glob", "WebSearch", "FetchURL"], "subagents": [],
+                "tools": ["Read", "Grep", "Glob"] + (["WebSearch", "FetchURL"] if live_search else []), "subagents": [],
             }) + "---\n\n" + prompt, encoding="utf-8")
             skills = Path(directory) / "skills"
             skills.mkdir()

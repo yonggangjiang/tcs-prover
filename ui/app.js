@@ -8,6 +8,9 @@ if (location.hash) {
   history.replaceState(null, "", location.pathname + location.search);
 }
 let currentJob = new URLSearchParams(location.search).get("job") || "";
+let currentBatch = new URLSearchParams(location.search).get("batch") || "";
+let composingProblem = new URLSearchParams(location.search).get("new") === "1" && !currentJob;
+let batchCatalog = [];
 
 // Cache the small set of elements that the state renderer controls.
 const $ = (id) => document.getElementById(id);
@@ -30,6 +33,9 @@ const ui = {
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
+  retrievalSetting: $("retrievalSetting"), retrievalMode: $("retrievalMode"),
+  retrievalCutoffSetting: $("retrievalCutoffSetting"), retrievalCutoffUtc: $("retrievalCutoffUtc"),
+  retrievalSettingHelp: $("retrievalSettingHelp"), retrievalConfigurationNotice: $("retrievalConfigurationNotice"),
   skipReviewSetting: $("skipReviewSetting"),
   skipStatementReview: $("skipStatementReview"),
   reviewOnlySetting: $("reviewOnlySetting"),
@@ -50,6 +56,11 @@ const ui = {
   finalPromptTab: $("finalPromptTab"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
+  jobsHeading: $("jobsHeading"), jobsEmpty: $("jobsEmpty"),
+  batchesPanel: $("batchesPanel"), batchesList: $("batchesList"), batchesStatus: $("batchesStatus"),
+  batchNavigation: $("batchNavigation"), allBatches: $("allBatchesButton"),
+  batchProblems: $("batchProblemsButton"), selectedBatchBadge: $("selectedBatchBadge"),
+  batchReadOnlyNotice: $("batchReadOnlyNotice"), newProblem: $("newProblemButton"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   runFolder: $("runFolderButton"), runFolderHelp: $("runFolderHelp"), folderInput: $("folderInput"),
   batchStatus: $("batchStatus"),
@@ -85,10 +96,19 @@ const ui = {
   statementHeading: $("statementHeading"), runStatement: $("runStatement"),
   originalStatementDetails: $("originalStatementDetails"), runOriginalStatement: $("runOriginalStatement"),
   runMetadata: $("runMetadata"), resultPanel: $("resultPanel"), resultHeading: $("resultHeading"),
+  criticReviewHistory: $("criticReviewHistory"),
   resultDescription: $("resultDescription"), resultOutput: $("resultOutput"),
+  retrievalPanel: $("retrievalPanel"), retrievalHeading: $("retrievalHeading"),
+  retrievalStatus: $("retrievalStatus"), retrievalDescription: $("retrievalDescription"),
+  retrievalCutoffDisplay: $("retrievalCutoffDisplay"), retrievalCutoffValue: $("retrievalCutoffValue"),
+  retrievalCutoffLabel: $("retrievalCutoffLabel"),
+  retrievalPolicyNote: $("retrievalPolicyNote"), retrievalCounts: $("retrievalCounts"),
+  retrievalDetails: $("retrievalDetails"), retrievalLimitation: $("retrievalLimitation"),
+  retrievalCountNote: $("retrievalCountNote"),
+  retrievalRequestSummary: $("retrievalRequestSummary"), retrievalFailures: $("retrievalFailures"),
   globalStatus: $("globalStatus"), liveDot: $("liveDot"), elapsed: $("elapsed"),
   modelSummary: $("modelSummary"),
-  lastActivity: $("lastActivity"), timeline: $("timelineList"),
+  lastActivity: $("lastActivity"), timeline: $("timelineList"), traceNotice: $("traceNotice"),
   memoryPanel: $("memoryPanel"), memoryFilename: $("memoryFilename"),
   memoryUpdated: $("memoryUpdated"), memoryDocument: $("memoryDocument"),
   memoryMessage: $("memoryMessage"), memoryContent: $("memoryContent"),
@@ -152,6 +172,9 @@ const pinnedKinds = new Set([
 // Serialize requests so a slow poll cannot overwrite a newer action.
 function request(path, body) {
   const run = async () => {
+    if (body !== undefined && (state.readOnly || selectedBatch()?.readOnly)) {
+      throw new Error("This saved batch is read-only. Open the current batch or create a new problem from All batches.");
+    }
     const options = { headers: { "X-TCS-Prover-Token": sessionToken } };
     if (body !== undefined) {
       options.method = "POST";
@@ -168,10 +191,11 @@ function request(path, body) {
   return result;
 }
 
-// Every job action carries its run id; home actions deliberately carry none.
-function jobPath(path, values = {}) {
+// Batch identity keeps equal run names in different folders separate.
+function jobPath(path, values = {}, runId = currentJob) {
   const query = new URLSearchParams(values);
-  if (currentJob) query.set("job", currentJob);
+  if (runId) query.set("job", runId);
+  if (currentBatch) query.set("batch", currentBatch);
   const suffix = query.toString();
   return suffix ? `${path}?${suffix}` : path;
 }
@@ -182,11 +206,130 @@ function show(element, visible) {
 
 function jobUrl(runId, token = false) {
   const hash = token ? `#${sessionToken}` : "";
-  return `${location.pathname}?job=${encodeURIComponent(runId)}${hash}`;
+  return `${jobPath(location.pathname, {}, runId)}${hash}`;
+}
+
+function batchUrl(batchId) {
+  return batchId ? `${location.pathname}?batch=${encodeURIComponent(batchId)}` : location.pathname;
+}
+
+function selectedBatch() {
+  return batchCatalog.find(batch => batch.id === currentBatch);
+}
+
+function renderBatchNavigation() {
+  const batch = selectedBatch();
+  const browsing = !currentJob && !composingProblem;
+  show(ui.batchesPanel, browsing && !currentBatch);
+  show(ui.jobsPanel, browsing && Boolean(currentBatch));
+  show(ui.batchNavigation, Boolean(currentJob || currentBatch || composingProblem));
+  show(ui.batchProblems, Boolean(currentBatch));
+  ui.batchProblems.textContent = batch?.label || currentBatch;
+  ui.batchProblems.disabled = !currentJob;
+  show(ui.selectedBatchBadge, Boolean(batch?.current));
+  ui.selectedBatchBadge.textContent = "Current batch";
+  show(ui.batchReadOnlyNotice, Boolean(batch?.readOnly || state.readOnly));
+  ui.home.textContent = currentBatch ? "Back to problems" : "All batches";
+  ui.reviewHome.textContent = ui.home.textContent;
+  if (!currentJob) {
+    show(ui.input, composingProblem);
+    for (const panel of [ui.review, ui.run, ui.runOverview, ui.workflowRail, ui.activityToggle]) show(panel, false);
+    ui.globalStatus.textContent = composingProblem ? "New problem" : currentBatch ? "Batch problems" : "Problem batches";
+    ui.elapsed.textContent = "";
+    ui.liveDot.classList.toggle("active", false);
+  }
+}
+
+function renderBatches(batches) {
+  batchCatalog = batches;
+  const signature = JSON.stringify(batches);
+  if (ui.batchesList.dataset.signature === signature) {
+    renderBatchNavigation();
+    return;
+  }
+  ui.batchesList.dataset.signature = signature;
+  ui.batchesList.replaceChildren();
+  ui.batchesStatus.textContent = batches.length ? "" : "No batches yet. Create a problem to get started.";
+  show(ui.batchesStatus, !batches.length);
+  for (const batch of batches) {
+    const item = document.createElement("li"), link = document.createElement("a");
+    item.className = `batch-card${batch.current ? " current" : ""}`;
+    item.dataset.batch = batch.id;
+    link.className = "batch-card-link";
+    link.href = batchUrl(batch.id);
+    link.onclick = event => {
+      if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      selectBatch(batch.id);
+    };
+    const top = document.createElement("div"), mark = document.createElement("span");
+    top.className = "batch-card-top";
+    mark.className = "batch-folder-mark"; mark.textContent = "▤"; mark.setAttribute("aria-hidden", "true");
+    top.append(mark);
+    if (batch.current || batch.readOnly) {
+      const badge = document.createElement("span");
+      badge.className = `batch-badge${batch.current ? "" : " archive"}`;
+      badge.textContent = batch.current ? "Current batch" : "Previous batch · read-only";
+      top.append(badge);
+    }
+    const copy = document.createElement("div"), title = document.createElement("h2"), count = document.createElement("p");
+    title.textContent = batch.label || batch.id;
+    count.className = "batch-card-count";
+    const total = Number(batch.jobCount || 0);
+    count.textContent = `${total} ${total === 1 ? "problem" : "problems"}`;
+    copy.append(title, count);
+    const progress = document.createElement("p"); progress.className = "batch-progress";
+    for (const [key, label] of [["running", "running"], ["paused", "paused"], ["done", "finished"]]) {
+      const value = Number(batch.counts?.[key] || 0);
+      if (!value) continue;
+      const stat = document.createElement("span"); stat.className = key;
+      stat.textContent = `${value} ${label}`; progress.append(stat);
+    }
+    const time = document.createElement("span"), open = document.createElement("span");
+    time.className = "batch-card-time";
+    time.textContent = batch.lastActivityAt ? `Last activity ${localDateTime(batch.lastActivityAt)}`
+      : batch.startedAt ? `Started ${localDateTime(batch.startedAt)}` : "Saved research workspace";
+    open.className = "batch-card-open"; open.textContent = "Open problems →";
+    link.append(top, copy, progress, time, open); item.append(link); ui.batchesList.append(item);
+  }
+  renderBatchNavigation();
+}
+
+async function selectBatch(batchId) {
+  currentBatch = batchId;
+  currentJob = "";
+  composingProblem = false;
+  history.pushState(null, "", batchUrl(batchId));
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+  clearJobView(); show(ui.notice, false); renderBatchNavigation();
+  ui.jobsList.replaceChildren();
+  ui.jobsHeading.textContent = selectedBatch()?.label || currentBatch;
+  ui.jobsCount.textContent = "Loading…";
+  show(ui.jobsEmpty, false);
+  await loadJobs();
+}
+
+async function newProblem() {
+  currentBatch = ""; currentJob = ""; composingProblem = true;
+  history.pushState(null, "", `${location.pathname}?new=1`);
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+  clearJobView(); show(ui.notice, false); renderBatchNavigation();
+  await refresh();
+}
+
+function adoptJob(next) {
+  currentJob = next.runId;
+  currentBatch = next.batchId || next.batch?.id || "";
+  composingProblem = false;
+  history.pushState(null, "", jobUrl(currentJob));
 }
 
 function clearJobView() {
   previousPhase = "";
+  ++memoryRequest;
+  clearTimeout(memoryTimer);
+  memoryJob = null;
+  ui.memoryPanel.open = false;
   state = {
     phase: "input", problemMode: "statement", skipStatementReview: false,
     statementReviewOnly: false,
@@ -201,8 +344,11 @@ function clearJobView() {
 
 function selectJob(runId) {
   currentJob = runId;
+  composingProblem = false;
   history.pushState(null, "", jobUrl(runId));
   clearJobView();
+  clearTimeout(timer);
+  clearInterval(clock);
   clearTimeout(jobsTimer);
   refresh();
 }
@@ -212,7 +358,7 @@ async function deleteJob(job, title) {
   if (!confirm(question)) return;
   try {
     const result = await request(
-      `/delete-job?job=${encodeURIComponent(job.runId)}`, {}
+      jobPath("/delete-job", {}, job.runId), {}
     );
     if (result.deleted !== job.runId) throw new Error("Deletion was not confirmed.");
   } catch (error) {
@@ -238,10 +384,9 @@ async function resumeCritic(job, title) {
   if (!confirm(question)) return;
   try {
     const next = await request(
-      `/resume-critic?job=${encodeURIComponent(job.runId)}`, {}
+      jobPath("/resume-critic", {}, job.runId), {}
     );
-    currentJob = next.runId;
-    history.pushState(null, "", jobUrl(currentJob));
+    adoptJob(next);
     clearTimeout(jobsTimer);
     render(next);
   } catch (error) {
@@ -256,11 +401,10 @@ async function resumeCheckpoint(job, checkpoint, title) {
   if (!confirm(question)) return;
   try {
     const next = await request(
-      `/resume-checkpoint?job=${encodeURIComponent(job.runId)}`,
+      jobPath("/resume-checkpoint", {}, job.runId),
       { checkpoint: checkpoint.id },
     );
-    currentJob = next.runId;
-    history.pushState(null, "", jobUrl(currentJob));
+    adoptJob(next);
     clearTimeout(jobsTimer);
     render(next);
   } catch (error) {
@@ -279,10 +423,9 @@ async function continueStopped(job, title) {
   if (!["paused", "prepared"].includes(job.phase) && !confirm(question)) return;
   try {
     const next = await request(
-      `/continue-stopped?job=${encodeURIComponent(job.runId)}`, {}
+      jobPath("/continue-stopped", {}, job.runId), {}
     );
-    currentJob = next.runId;
-    history.pushState(null, "", jobUrl(currentJob));
+    adoptJob(next);
     clearTimeout(jobsTimer);
     render(next);
   } catch (error) {
@@ -292,19 +435,32 @@ async function continueStopped(job, title) {
 }
 
 async function goHome() {
-  currentJob = "";
-  history.pushState(null, "", location.pathname);
-  clearTimeout(timer);
-  clearInterval(clock);
-  clearJobView();
-  await refresh();
+  await selectBatch(currentBatch);
+}
+
+function retrievalConfiguration(source) {
+  // A persisted archive policy remains authoritative, including older runs.
+  const mode = source.retrievalPolicyPath ? "historical"
+    : source.retrieval?.mode || source.retrievalMode || "live";
+  return { mode, cutoff: mode === "disabled" ? "-1"
+    : source.retrieval?.cutoffExclusiveUtc || source.retrievalCutoffUtc || "" };
+}
+
+function retrievalSummary(source) {
+  const { mode, cutoff } = retrievalConfiguration(source);
+  return mode === "historical" ? `Cutoff on · historical archives before ${cutoff || "fixed cutoff"} · proof author only`
+    : mode === "live" ? "Cutoff off · unrestricted model web search"
+    : "Cutoff on · -1 · web-search tools disabled";
 }
 
 function renderJobs(jobs) {
   ui.jobsList.replaceChildren();
   ui.jobsCount.textContent = `${jobs.length} ${jobs.length === 1 ? "job" : "jobs"}`;
-  show(ui.jobsPanel, jobs.length > 0);
+  show(ui.jobsPanel, true);
+  show(ui.jobsEmpty, jobs.length === 0);
+  ui.jobsHeading.textContent = selectedBatch()?.label || "Problems and checkpoints";
   for (const job of jobs) {
+    const readOnly = Boolean(job.readOnly || selectedBatch()?.readOnly);
     const item = document.createElement("li");
     item.className = "job-card";
     item.dataset.job = job.runId;
@@ -320,7 +476,8 @@ function renderJobs(jobs) {
       running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: completedRunLabel(job),
       prepared: "Ready to start",
     };
-    status.textContent = job.manuallyStopped
+    status.textContent = job.launchHold ? "Prepared · awaiting review"
+      : job.manuallyStopped
       ? `Stopped at ${job.stoppedStage || "saved stage"}`
       : labels[job.phase] || job.phase;
     const times = document.createElement("small");
@@ -335,12 +492,18 @@ function renderJobs(jobs) {
     times.textContent = job.phase === "prepared" ? "Prepared research workspace · No model session started"
       : `Started: ${localTime(job.startedAt)} · Finished: ${finished ? localTime(finished) : "Not finished"}`;
     copy.append(title, status, times);
-    if (job.phase === "running" && job.stageLabel) status.textContent = `Running · ${job.stageLabel}`;
+    if (job.phase === "running" && job.stageLabel && !job.launchHold) status.textContent = `Running · ${job.stageLabel}`;
     if (job.error && !job.manuallyStopped) {
       const reason = document.createElement("small");
       reason.className = "job-error";
       reason.textContent = job.error;
       copy.append(reason);
+    }
+    if (job.launchHold) {
+      const hold = document.createElement("small");
+      hold.className = "job-tags";
+      hold.textContent = job.launchHold;
+      copy.append(hold);
     }
     if (job.sourceFile) {
       const tags = document.createElement("small");
@@ -348,6 +511,10 @@ function renderJobs(jobs) {
       tags.textContent = `From ${job.sourceFile}`;
       copy.append(tags);
     }
+    const retrieval = document.createElement("small");
+    retrieval.className = "job-retrieval";
+    retrieval.textContent = retrievalSummary(job);
+    copy.append(retrieval);
     const checkpoints = job.checkpoints || [];
     if (checkpoints.length) {
       const checkpointHeading = document.createElement("span");
@@ -373,7 +540,7 @@ function renderJobs(jobs) {
           checkpointLabel, checkpointMeta, checkpointDescription,
         );
         checkpointItem.append(checkpointCopy);
-        if (checkpoint.resumable) {
+        if (checkpoint.resumable && !readOnly) {
           const continueButton = document.createElement("button");
           continueButton.className = "secondary compact checkpoint-resume";
           continueButton.textContent = checkpoint.resumeLabel || "Continue";
@@ -401,18 +568,19 @@ function renderJobs(jobs) {
     const resume = document.createElement("button");
     resume.className = "secondary compact";
     resume.textContent = "Resume at critic";
-    resume.hidden = !job.canResumeCritic || checkpoints.length > 0;
+    resume.hidden = readOnly || !job.canResumeCritic || checkpoints.length > 0;
     resume.onclick = () => resumeCritic(job, title.textContent);
     const continueButton = document.createElement("button");
     continueButton.className = "secondary compact";
     continueButton.textContent = job.continueStoppedLabel
       || "Continue stopped job";
-    continueButton.hidden = !job.canContinueStopped;
+    continueButton.hidden = readOnly || !job.canContinueStopped;
     continueButton.title = job.continueStoppedDescription || "";
     continueButton.onclick = () => continueStopped(job, title.textContent);
     const remove = document.createElement("button");
     remove.className = "ghost compact job-delete";
     remove.textContent = "Delete";
+    remove.hidden = readOnly;
     remove.disabled = ["reviewing", "running", "stopping", "pausing"].includes(job.phase);
     remove.title = remove.disabled ? "Stop this job before deleting it." : "";
     remove.onclick = () => deleteJob(job, title.textContent);
@@ -424,15 +592,23 @@ function renderJobs(jobs) {
 
 async function loadJobs() {
   clearTimeout(jobsTimer);
-  if (currentJob) return;
+  if (currentJob || composingProblem) return;
+  const batch = currentBatch;
   try {
-    const result = await request("/jobs");
-    if (!currentJob) renderJobs(result.jobs || []);
+    const catalog = await request("/batches");
+    if (currentJob || composingProblem || batch !== currentBatch) return;
+    renderBatches(catalog.batches || []);
+    if (batch) {
+      if (!selectedBatch()) throw new Error("This batch is no longer available. Return to All batches.");
+      const result = await request(jobPath("/jobs"));
+      if (currentJob || composingProblem || batch !== currentBatch) return;
+      renderJobs(result.jobs || []);
+    }
   } catch (error) {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   }
-  if (!currentJob) jobsTimer = setTimeout(loadJobs, 1500);
+  if (!currentJob && !composingProblem && batch === currentBatch) jobsTimer = setTimeout(loadJobs, 2500);
 }
 
 function selectedProblemMode() {
@@ -473,6 +649,7 @@ function setProblemMode(mode) {
   show(ui.reviewOnlySetting, statement);
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
+  show(ui.retrievalSetting, true);
   show(ui.fileManagementSetting, !latexOnly && !reviewOnly);
   show(ui.researchAuditsSetting, !latexOnly && !reviewOnly && ui.fileManagement.checked);
   ui.fileManagementHelp.textContent = ui.fileManagement.checked
@@ -504,6 +681,84 @@ function setProblemMode(mode) {
     selectPrompt("final");
   }
   updateModelSummary();
+  renderRetrievalSettings();
+}
+
+function selectedRetrievalMode() {
+  if (ui.retrievalMode.value === "live") return "live";
+  return ui.retrievalMode.value === "disabled" || ui.retrievalCutoffUtc.value.trim() === "-1"
+    ? "disabled" : "historical";
+}
+
+function selectedRetrievalSettings() {
+  const mode = selectedRetrievalMode();
+  return { retrievalMode: mode, retrievalCutoffUtc: mode === "disabled" ? "-1"
+    : mode === "historical" ? ui.retrievalCutoffUtc.value.trim() : "" };
+}
+
+function restoreRetrievalSettings(source) {
+  const { mode, cutoff } = retrievalConfiguration(source);
+  ui.retrievalMode.value = mode === "live" ? "live" : "historical";
+  ui.retrievalCutoffUtc.value = mode === "live" ? "" : cutoff;
+}
+
+function renderRetrievalSettings() {
+  const mode = selectedRetrievalMode(), historical = mode === "historical";
+  const enabled = mode !== "live";
+  const capabilities = state.retrievalCapabilities || {};
+  show(ui.retrievalCutoffSetting, enabled);
+  ui.retrievalCutoffUtc.required = enabled;
+  ui.retrievalCutoffUtc.disabled = !enabled;
+  ui.retrievalSettingHelp.textContent = historical
+    ? "The proof author discovers general web sources through Codex, then reads verified archived captures before your cutoff. The critic and writer have no external retrieval tools."
+    : mode === "disabled" ? "All model web-search tools are disabled. This setting controls search tools; it does not isolate ordinary shell network access."
+    : "The model's native web search is enabled without a date restriction.";
+  const message = !historical ? ""
+    : selectedProblemMode() === "latex" || ui.statementReviewOnly.checked
+      ? "A historical cutoff requires a full proof job with Skip statement review. For this workflow, use cutoff Off or enter -1 to disable web-search tools."
+    : capabilities.historicalAvailable !== true
+    ? capabilities.reason || "Historical search setup is unavailable in this interface. Open the updated TCS Prover interface to create a historical job."
+    : !ui.skipStatementReview.checked
+      ? "Select Skip statement review below to start a historical proof job."
+      : "Use Codex models for author, critic and writer, with optional research audits set to None.";
+  ui.retrievalConfigurationNotice.textContent = message;
+  show(ui.retrievalConfigurationNotice, Boolean(message));
+}
+
+function validateRetrievalSettings({ folder = false } = {}) {
+  if (selectedRetrievalMode() !== "historical") return true;
+  let message = "", focus = ui.retrievalCutoffUtc;
+  const value = ui.retrievalCutoffUtc.value.trim();
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d{1,6})?(?:Z|\+00:00)$/.exec(value);
+  const base = match && `${match[1]}T${match[2]}Z`;
+  const parsed = base && new Date(base);
+  if (selectedProblemMode() === "latex" || ui.statementReviewOnly.checked) {
+    message = "A historical cutoff requires a full proof job with Skip statement review. For this workflow, use cutoff Off or enter -1 to disable web-search tools.";
+    focus = ui.retrievalMode;
+  } else if (state.retrievalCapabilities?.historicalAvailable !== true) {
+    message = state.retrievalCapabilities?.reason || "This interface cannot create historical jobs. Open the updated TCS Prover interface before starting this job.";
+    focus = ui.retrievalMode;
+  } else if (!match || !Number.isFinite(parsed?.getTime()) || parsed.toISOString().slice(0, 19) !== base.slice(0, 19)) {
+    message = "Enter -1 to disable web-search tools, or a valid UTC cutoff such as 2026-10-02T14:13:12Z. Include seconds and the UTC timezone.";
+  } else if (Date.parse(value) >= Date.now()) {
+    message = "Choose a historical cutoff in the past.";
+  } else if (!folder && !ui.skipStatementReview.checked) {
+    message = "Historical search currently requires Skip statement review.";
+    focus = ui.skipStatementReview;
+  } else if (["author", "critic", "writer"].some(role => ui[`${role}Model`].value === "deepseek-v4-pro")) {
+    message = "Historical proof jobs require Codex models for the author, critic and writer.";
+    focus = ui.authorModel;
+  } else if (managesResearchFiles() && researchAuditValues().models.some(model => model !== "none")) {
+    message = "Set each optional research audit to None for a historical proof job.";
+    ui.researchAuditsSetting.open = true;
+    focus = ui.researchAuditModels[0];
+  }
+  if (!message) return true;
+  ui.notice.textContent = message;
+  show(ui.notice, true);
+  ui.retrievalSetting.closest("details").open = true;
+  focus.focus();
+  return false;
 }
 
 // Keep the compact footer label synchronized with every model setting.
@@ -617,8 +872,9 @@ function selectPrompt(name) {
 
 async function currentPromptDefaults() {
   const job = currentJob;
+  const batch = currentBatch;
   const next = await request(jobPath("/state"));
-  if (job !== currentJob) return null;
+  if (job !== currentJob || batch !== currentBatch) return null;
   state.workflow = next.workflow;
   return state.workflow.settings.prompts;
 }
@@ -697,6 +953,8 @@ function nodeFromStage(stage) {
 // Preserve prompts, results, errors, and completed root-model answers.
 function importantEntry(entry) {
   if (pinnedKinds.has(entry.kind)) return true;
+  if (entry.kind === "status" && entry.label === "Critic approved"
+      && entry.root !== false && !entry.activityLabel) return true;
   if (entry.kind === "research_audit") return entry.status !== "working" || Boolean(entry.recovered);
   if (entry.kind !== "codex_event" || entry.root === false) return false;
   const event = entry.event || {};
@@ -737,12 +995,18 @@ function describe(entry) {
   }
   if (entry.kind === "critic_result") {
     const report = entry.report || {};
+    const verdict = String(report.verdict || "").toLowerCase();
+    const match = criticReviewModel().byResult.get(entry);
+    const round = match?.round || collectCriticReviewCycles([entry]).at(-1)?.rounds.at(-1);
+    const outcome = criticRoundOutcomeLabel(round || {});
     return {
-      key: `critic:${entry.round || entry.time}`, type: "agent",
-      label: `${entry.label || "Critic result"} · ${report.verdict || "returned"}`,
-      text: report.verdict === "reject"
+      key: `critic:${entry.time || entry.round}`, type: "agent",
+      label: `${match ? `Review cycle ${match.cycleNumber} · round ${match.roundNumber}` : entry.label || "Critic result"} · ${outcome}`,
+      text: verdict === "reject"
         ? (report.bugs || "Unfixable issues return to the proof author.")
-        : "The critic passed this round. An unchanged proof proceeds immediately; an edited proof repeats until the round limit.",
+        : verdict === "pass" ? outcome + (round?.outcome === "pass_edited_limit"
+          ? ". The changed proof is accepted without another critic round because the round limit was reached." : ".")
+          : "No valid critic verdict was recorded for this response.",
       time: entry.time, checks: report.checks || [], replace: true, pinned: true,
     };
   }
@@ -1250,11 +1514,12 @@ async function loadMemory() {
   clearTimeout(memoryTimer);
   if (!ui.memoryPanel.open || ui.memoryPanel.hidden || document.hidden) return;
   const job = currentJob;
+  const batch = currentBatch;
   const requestId = ++memoryRequest;
   try {
     if (memoryFile.startsWith("APPROACHES")) {
       const graph = await request(jobPath("/approach-graph"));
-      if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+      if (job !== currentJob || batch !== currentBatch || requestId !== memoryRequest || !ui.memoryPanel.open) return;
       approachGraphData = graph;
       renderApproachGraph();
       renderMemoryChoices({files: graph.files});
@@ -1269,7 +1534,7 @@ async function loadMemory() {
       }
     }
     const file = await request(jobPath("/memory", { file: memoryFile, version: memoryVersion }));
-    if (job !== currentJob || requestId !== memoryRequest || !ui.memoryPanel.open) return;
+    if (job !== currentJob || batch !== currentBatch || requestId !== memoryRequest || !ui.memoryPanel.open) return;
     renderMemoryChoices(memoryFile.startsWith("APPROACHES") ? {...file, files: approachGraphData.files} : file);
     ui.memoryFilename.textContent = file.name;
     if (file.status === "ready") {
@@ -1295,14 +1560,14 @@ async function loadMemory() {
       ui.memoryUpdated.textContent = file.status === "missing" ? "Not created yet" : "Temporarily unavailable";
     }
   } catch (error) {
-    if (job !== currentJob || requestId !== memoryRequest) return;
+    if (job !== currentJob || batch !== currentBatch || requestId !== memoryRequest) return;
     ui.memoryUpdated.textContent = "Could not refresh. Retrying…";
     if (!memoryVersion) {
       ui.memoryMessage.textContent = error.message;
       show(ui.memoryMessage, true);
     }
   } finally {
-    if (job === currentJob && requestId === memoryRequest && ui.memoryPanel.open && !ui.memoryPanel.hidden) {
+    if (job === currentJob && batch === currentBatch && requestId === memoryRequest && ui.memoryPanel.open && !ui.memoryPanel.hidden) {
       memoryTimer = setTimeout(loadMemory, 5000);
     }
   }
@@ -1358,7 +1623,8 @@ function followArchivedMemoryFile() {
 }
 
 function syncMemoryPanel() {
-  const identity = currentJob || state.runId || "";
+  const job = currentJob || state.runId || "";
+  const identity = job ? JSON.stringify([currentBatch, job]) : "";
   if (memoryJob !== identity) {
     memoryJob = identity;
     ++memoryRequest;
@@ -1573,18 +1839,23 @@ function renderRunOverview() {
   const statement = (latex ? state.latexInput : state.statement)
     || state.review?.statement || state.reviewStatement || original || "";
   const title = String(original || statement).trim().split("\n").find(line => line.trim()) || "Untitled problem";
-  ui.runProblemTitle.textContent = title.replace(/^#+\s*/, "").slice(0, 220);
+  ui.runProblemTitle.textContent = state.sourceFile
+    ? String(state.sourceFile).split(/[\\/]/).pop()
+    : title.replace(/^#+\s*/, "").slice(0, 220);
   ui.runProblemTitle.title = title;
+  const reviewCycles = criticReviewModel().cycles;
+  const latestCycle = reviewCycles.at(-1);
   ui.runStage.textContent = state.phase === "reviewed" ? "Waiting for approval"
-    : state.phase === "prepared" ? "Ready to start"
+    : state.phase === "prepared" ? (state.launchHold ? "Awaiting review" : "Ready to start")
     : state.phase === "done" ? completedRunLabel(state)
     : `${state.workflow?.nodes?.[state.activeNode]?.label || state.stage || "Starting"}`
       + (["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
-      + (state.activeNode === "critic" && state.round ? ` · round ${state.round}/${state.criticRounds}` : "");
-  const seconds = runElapsedSeconds(), limit = Number(state.thinkingHours || 168) * 3600;
+      + (state.activeNode === "critic" && latestCycle ? ` · cycle ${reviewCycles.length} · round ${latestCycle.rounds.length}` : "");
+  const seconds = runElapsedSeconds(), hours = Number(state.thinkingHours ?? 168), limit = hours * 3600;
   ui.runActiveTime.textContent = durationText(seconds);
-  ui.runBudget.textContent = `${state.thinkingHours || 168}h · ${durationText(Math.max(0, limit - seconds))} left`;
-  ui.runHealth.textContent = state.processAlive ? "Running"
+  ui.runBudget.textContent = hours === 0 ? "Unlimited" : `${hours}h · ${durationText(Math.max(0, limit - seconds))} left`;
+  ui.runHealth.textContent = state.processAlive == null && state.workerActive == null ? "Unknown · telemetry unavailable"
+    : state.processAlive ? "Running"
     : state.workerActive ? "Starting / closing"
     : state.phase === "paused" ? "Paused · saved conversation"
     : ["reviewed", "prepared"].includes(state.phase) ? "Waiting for you" : "No active process";
@@ -1597,13 +1868,16 @@ function renderRunOverview() {
   };
   ui.runNextStep.textContent = state.phase === "reviewed" ? "Statement review finished. Approval is needed before proof search can begin."
     : state.phase === "paused" ? "No final answer yet. Resume continues the saved conversation and preserves the work already done."
-    : state.phase === "prepared" ? "Start this prepared workspace to begin proof search."
+    : state.phase === "prepared" ? (state.launchHold || "Start this prepared workspace to begin proof search.")
     : state.phase === "done" ? (state.resultKind === "final" || state.canDownloadTex
       ? "The final answer is saved below. Source and PDF downloads are available for saved artifacts."
       : state.resultKind === "review" ? "The statement review is saved."
         : "No completed answer was produced. Saved partial work and checkpoints remain available; open the home page to continue from a checkpoint.")
     : state.statementReviewOnly ? "This job will save the checked statement and reviewer notes, then finish."
     : nextSteps[state.stage] || "Waiting for the next workflow update.";
+  if (latestCycle && ["latex_editor", "latex_compile", "latex_repair"].includes(state.activeNode)) {
+    ui.runNextStep.textContent = `${criticCycleOutcomeLabel(latestCycle)}. ${ui.runNextStep.textContent}`;
+  }
   const latest = [...(state.trace || [])].reverse().find(entry => !entry.heartbeat
     && !["request", "review_result", "critic_result", "author_result", "final_result", "failure_result", "partial_result"].includes(entry.kind)
     && describe(entry)?.text);
@@ -1611,6 +1885,7 @@ function renderRunOverview() {
   ui.runLatestAction.textContent = card
     ? `Latest activity · ${clockText(latest.time)} · ${card.label}: ${String(card.text).replace(/\s+/g, " ").slice(0, 260)}`
     : "Public activity appears below as the model works.";
+  renderRetrievalOverview();
   ui.statementHeading.textContent = latex ? "Original writing"
     : state.phase === "reviewing" ? "Statement being reviewed"
     : state.phase === "reviewed" ? "Reviewed statement · awaiting approval" : "Statement being solved";
@@ -1629,6 +1904,7 @@ function renderRunOverview() {
     ["LaTeX writer", `${state.writerModel} · ${state.writerEffort || state.reasoningEffort}`],
     ["Generation", state.speedMode || "standard"], ["Activity summaries", state.reasoningSummary || "concise"],
     ["Research files", state.fileManagement === false ? "Off" : "Managed"],
+    ["Web search", retrievalSummary(state)],
     ["Conversation", state.goalThreadId ? "Saved · resumes in this workspace" : "Not started"],
   ];
   const signature = JSON.stringify(metadata);
@@ -1639,6 +1915,7 @@ function renderRunOverview() {
       term.textContent = label; description.textContent = value; row.append(term, description); return row;
     }));
   }
+  renderCriticReviewHistory();
   const savedOutput = Boolean(state.output && ["done", "paused"].includes(state.phase));
   show(ui.resultPanel, savedOutput);
   const final = state.resultKind === "final" || state.canDownloadTex;
@@ -1647,16 +1924,468 @@ function renderRunOverview() {
   ui.resultDescription.textContent = final ? "The complete saved output is shown here."
     : "This is preserved work from an incomplete run; it has not completed the proof and critic workflow.";
   if (savedOutput && ui.resultOutput.textContent !== state.output) ui.resultOutput.textContent = state.output;
-  const identity = `${state.runId}:${state.resultKind || "partial"}`;
+  const identity = `${state.batchId || ""}:${state.runId}:${state.resultKind || "partial"}`;
   if (ui.resultPanel.dataset.identity !== identity) {
     ui.resultPanel.dataset.identity = identity;
     ui.resultPanel.open = final || state.resultKind === "failure";
   }
 }
 
+// Group the recorded critic calls by author submission, retaining every input.
+// A PASS verdict alone never establishes that the workflow accepted the proof.
+function collectCriticReviewCycles(trace, options = {}) {
+  const cycles = [], seen = new Set(), identities = new Map(), keyCounts = new Map();
+  let cycle = null, pending = null, visit = null, handoff = null, index = 0;
+  const isRoot = entry => !entry.activityLabel && entry.root !== false
+    && !/^Independent critic audit\s+\d+\b/i.test(entry.label || "");
+  const stamp = entry => String(entry.requestId || entry.id || entry.time || `event-${index}`);
+  const uniqueKey = base => {
+    const count = (keyCounts.get(base) || 0) + 1;
+    keyCounts.set(base, count);
+    return count === 1 ? base : `${base}:${count}`;
+  };
+  const positive = value => Number.isInteger(value) && value > 0 ? value : null;
+  const normalized = value => {
+    const lines = value.replace(/\r\n?/g, "\n").split("\n").map(line => line.replace(/\s+$/u, ""));
+    while (lines.length && !lines[0]) lines.shift();
+    while (lines.length && !lines.at(-1)) lines.pop();
+    return lines.join("\n");
+  };
+  const candidateFrom = request => {
+    if (typeof request.candidateText === "string") return request.candidateText;
+    // Only parse the known first-attempt prompt. Arbitrary prompts and recovery
+    // transcripts cannot safely identify the exact submitted candidate.
+    if (request.attempt > 1 || typeof request.text !== "string") return null;
+    let text = request.text.replace(/\r\n?/g, "\n");
+    const marker = "\n\nCANDIDATE SOLUTION:\n";
+    if (!text.startsWith("CRITIC INSTRUCTIONS:\n") || !text.includes("\n\nSTATEMENT:\n")
+        || text.split(marker).length !== 2) return null;
+    text = text.slice(text.indexOf(marker) + marker.length);
+    const suffix = "\n\nREAD-ONLY PROOF FILES:\nYour working directory contains proof.md (the exact candidate), "
+      + "statement.md (the exact task), and manifest.json (content hashes and provenance). "
+      + "Read both files completely; use successive ranges if tool output is truncated. "
+      + "Give independent subagents these same files and working directory. "
+      + "Review only this snapshot. Do not resolve links into the author's workspace. "
+      + "Return the complete proof text in solution, never a file pointer.";
+    const contract = "\n\nOUTPUT JSON CONTRACT\nReturn exactly one JSON object and no markdown fences or commentary. "
+      + "The object must match this JSON Schema exactly:\n";
+    if (text.includes(contract)) {
+      const parts = text.split(contract);
+      if (parts.length !== 2) return null;
+      try { JSON.parse(parts[1]); } catch { return null; }
+      text = parts[0];
+    }
+    if (text.endsWith(suffix)) text = text.slice(0, -suffix.length);
+    else if (text.includes("\n\nREAD-ONLY PROOF FILES:")) return null;
+    return text;
+  };
+  const closePending = () => {
+    if (pending && !pending.result) pending.interrupted = true;
+    pending = null;
+  };
+  const boundary = () => {
+    closePending();
+    if (cycle) cycle.closed = true;
+    cycle = null; visit = null; handoff = null;
+  };
+  const ensureCycle = entry => {
+    const explicitId = entry.cycleId || entry.reviewCycleId;
+    if (explicitId && cycle && cycle.id && cycle.id !== explicitId) boundary();
+    if (!cycle || cycle.closed) {
+      cycle = {key: uniqueKey(`cycle:${explicitId || stamp(entry)}`), id: explicitId || null,
+        number: cycles.length + 1, rounds: [], startTime: entry.time || null, outcome: "pending", closed: false};
+      cycles.push(cycle);
+    } else if (explicitId) cycle.id = explicitId;
+    return cycle;
+  };
+  const continuePrevious = current => {
+    if (!current || current.closed) return;
+    const previous = current.rounds.at(-1);
+    if (previous?.result && ["pass_unknown", "pass_edited_continue"].includes(previous.outcome)
+        && String(previous.result.report?.verdict || "").toLowerCase() === "pass") {
+      previous.outcome = "pass_edited_continue";
+      previous.transition = "review_again";
+      previous.outcomeEvidence = "next_review";
+    }
+  };
+  const ensureRound = entry => {
+    const current = ensureCycle(entry);
+    continuePrevious(current);
+    const round = {key: uniqueKey(`round:${stamp(entry)}`), number: current.rounds.length + 1,
+      roundNumber: positive(entry.round) || visit, requests: [], result: null,
+      outcome: "pending", outcomeEvidence: null, transition: null,
+      candidateText: null, handoff, startTime: entry.time || null, interrupted: false};
+    current.rounds.push(round);
+    pending = round;
+    return round;
+  };
+  const classify = (round, entry) => {
+    const verdict = String(entry.report?.verdict || "").toLowerCase();
+    const declared = String(entry.outcome || "").toLowerCase();
+    round.verdict = verdict;
+    round.outcomeEvidence = "verdict";
+    round.transition = entry.transition || null;
+    if (verdict === "reject" || declared === "reject") {
+      round.outcome = "reject"; round.transition = "author";
+    } else if (["pass_clean", "pass_edited_continue", "pass_edited_limit"].includes(declared)) {
+      round.outcome = declared; round.outcomeEvidence = "explicit_outcome";
+    } else if (declared === "pass") {
+      round.outcome = "pass_clean"; round.outcomeEvidence = "explicit_outcome";
+    } else if (verdict === "pass" || declared === "fixed") {
+      round.outcome = "pass_unknown";
+      if (declared === "fixed") {
+        round.proofChanged = true; round.outcomeEvidence = "explicit_outcome";
+      } else if (round.candidateText !== null && typeof entry.report?.solution === "string") {
+        round.proofChanged = normalized(round.candidateText) !== normalized(entry.report.solution);
+        round.outcomeEvidence = "candidate_comparison";
+        if (!round.proofChanged) round.outcome = "pass_clean";
+      }
+      if (["review_again", "critic", "continue"].includes(round.transition)) round.outcome = "pass_edited_continue";
+    } else round.outcome = "pass_unknown";
+    if (round.outcome === "pass_clean") round.transition = "accepted";
+    if (round.outcome === "pass_edited_limit") round.transition = "accepted_at_limit";
+    if (round.outcome === "pass_edited_continue") round.transition = "review_again";
+  };
+  for (const entry of trace || []) {
+    index += 1;
+    if (!entry || !isRoot(entry)) continue;
+    const criticRequest = entry.kind === "request" && (entry.stage === "critic" || entry.node === "critic");
+    const criticResult = entry.kind === "critic_result";
+    const approval = entry.kind === "status" && entry.label === "Critic approved";
+    const workflowStep = entry.kind === "status" && /^Workflow step:/.test(entry.label || "");
+    const handoffEvent = entry.kind === "proof_handoff";
+    if (criticRequest || criticResult || approval || handoffEvent || workflowStep) {
+      // Replayed transcript entries must not create extra rounds. Include the
+      // attempt and payload because request IDs may be shared across retries.
+      if (entry.time || entry.id || entry.requestId) {
+        const identity = JSON.stringify([entry.kind, entry.time, entry.id, entry.requestId,
+          entry.attempt, entry.round, entry.visit, entry.label, entry.text, entry.report]);
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+      }
+    }
+    if (criticRequest) {
+      const lastAttempt = pending?.requests.at(-1)?.attempt || 1;
+      const retry = pending && !pending.result && !pending.interrupted
+        && Number.isInteger(entry.attempt) && entry.attempt > lastAttempt;
+      if (!retry) {
+        if (pending && !pending.result) pending.interrupted = true;
+        ensureRound(entry);
+      }
+      pending.requests.push(entry);
+      if (pending.candidateText === null) pending.candidateText = candidateFrom(entry);
+      const requestId = entry.requestId || entry.id;
+      if (requestId) identities.set(String(requestId), {cycle, round: pending});
+    } else if (criticResult) {
+      let round = pending;
+      if (entry.requestId) {
+        const pair = identities.get(String(entry.requestId));
+        round = pair && pair.cycle === cycle && !pair.round.result ? pair.round : null;
+      }
+      if (!round || round.result || round.interrupted && !entry.requestId) round = ensureRound(entry);
+      round.result = entry;
+      round.interrupted = false;
+      round.endTime = entry.time || null;
+      round.roundNumber = positive(entry.round) || round.roundNumber;
+      classify(round, entry);
+      if (round === pending) pending = null;
+      // Out-of-order identified decisions belong to their original round.
+      if (round === cycle.rounds.at(-1) && ["reject", "pass_clean", "pass_edited_limit"].includes(round.outcome)) {
+        cycle.closed = true;
+      }
+    } else if (approval) {
+      const round = cycle?.rounds.findLast(item => item.result);
+      if (!round || String(round.result.report?.verdict || "").toLowerCase() !== "pass") continue;
+      const clean = entry.acceptanceReason === "clean_pass" || /^Round \d+ passed without edits\.$/.test(entry.text || "");
+      const limit = entry.acceptanceReason === "round_limit"
+        || /^Reached MAX \(\d+ rounds\); using the latest repaired proof\.$/.test(entry.text || "");
+      if (!clean && !limit) continue;
+      round.outcome = clean ? "pass_clean" : "pass_edited_limit";
+      round.transition = clean ? "accepted" : "accepted_at_limit";
+      round.outcomeEvidence = "approval";
+      round.approval = entry;
+      const match = (entry.text || "").match(/^Reached MAX \((\d+) rounds\)/);
+      round.roundLimit = positive(entry.roundLimit) || (match ? Number(match[1]) : null);
+      cycle.closed = true;
+    } else if (workflowStep && (entry.node === "critic" || entry.label === "Workflow step: critic")) {
+      closePending();
+      continuePrevious(cycle);
+      visit = positive(entry.visit);
+      handoff = null;
+      // A reset visit number on resume does not mean a new author submission.
+    } else if (handoffEvent) {
+      closePending();
+      continuePrevious(cycle);
+      handoff = entry;
+      visit = positive(entry.round) || positive(entry.manifest?.visit) || visit;
+    } else if (["author_result", "final_result", "failure_result"].includes(entry.kind)
+        || entry.kind === "request" && ["solve", "repair", "final"].includes(entry.stage)
+        || workflowStep && entry.node !== "critic"
+        || entry.kind === "workflow_paused" && entry.node === "author") {
+      const latest = cycle?.rounds.at(-1);
+      if (latest?.outcome === "pass_unknown" && latest.proofChanged === true
+          && (workflowStep && (entry.node === "latex_editor" || entry.label === "Workflow step: latex_editor")
+              || entry.kind === "request" && entry.stage === "final" || entry.kind === "final_result")) {
+        // In this workflow an edited PASS reaches the writer only on the
+        // repeat limit. This observes the actual transition, not today's settings.
+        latest.outcome = "pass_edited_limit";
+        latest.transition = "accepted_at_limit";
+        latest.outcomeEvidence = "final_transition";
+      }
+      boundary();
+    }
+  }
+  const active = options.phase === undefined || ["running", "paused", "pausing", "stopping"].includes(options.phase)
+    && options.activeNode === "critic";
+  for (const current of cycles) {
+    for (const round of current.rounds) {
+      if (!round.result) round.outcome = !round.interrupted && current === cycle && !current.closed && active
+        ? "pending" : "interrupted";
+    }
+    const last = current.rounds.at(-1);
+    current.outcome = last?.outcome || "pending";
+    current.endTime = last?.endTime || null;
+    current.accepted = ["pass_clean", "pass_edited_limit"].includes(current.outcome);
+  }
+  return cycles;
+}
+
+function criticRoundOutcomeLabel(round) {
+  round = round || {};
+  if (round.outcome === "reject") return "Rejected — returned to author";
+  if (round.outcome === "pass_clean") return "Clean pass — proof accepted";
+  if (round.outcome === "pass_edited_continue") return "Pass with fixes — another review";
+  if (round.outcome === "pass_edited_limit") return "Pass with changes — accepted at review limit";
+  if (round.outcome === "pending") return "Awaiting decision";
+  if (round.outcome === "interrupted") return "No recorded decision";
+  if (round.proofChanged) return "Pass with changes — next step not recorded";
+  return round.verdict === "pass" ? "Pass — edits and next step not recorded" : "Verdict unavailable";
+}
+
+function criticCycleOutcomeLabel(cycle) {
+  return criticRoundOutcomeLabel(cycle?.rounds?.at(-1) || {outcome: cycle?.outcome});
+}
+
+function criticReviewModel() {
+  const trace = state.trace || [];
+  const signature = JSON.stringify([state.batchId, state.runId, state.traceVersion,
+    trace.length, state.phase, state.activeNode, state.criticAcceptances || []]);
+  const cached = criticReviewModel.cache;
+  if (cached?.trace === trace && cached.signature === signature) return cached.value;
+  // Older controllers trim routine statuses. The dashboard can recover exact
+  // approval records separately, without disturbing incremental trace offsets.
+  const approvals = state.criticAcceptances || [];
+  const identity = entry => JSON.stringify([entry.kind, entry.time, entry.label, entry.text]);
+  const recorded = new Set(trace.map(identity));
+  const recovered = approvals.filter(entry => !recorded.has(identity(entry)));
+  const events = recovered.length ? [...trace, ...recovered].sort((a, b) =>
+    (Date.parse(a.time) || 0) - (Date.parse(b.time) || 0)) : trace;
+  const cycles = collectCriticReviewCycles(events, {phase: state.phase, activeNode: state.activeNode});
+  const rounds = cycles.flatMap(cycle => cycle.rounds);
+  const byResult = new Map();
+  for (const [cycleIndex, cycle] of cycles.entries()) {
+    for (const [roundIndex, round] of cycle.rounds.entries()) {
+      if (round.result) byResult.set(round.result, {cycle, round, cycleNumber: cycleIndex + 1, roundNumber: roundIndex + 1});
+    }
+  }
+  const value = {cycles, rounds, byResult};
+  criticReviewModel.cache = {trace, signature, value};
+  return value;
+}
+
+function renderCriticReviewHistory() {
+  const container = ui.criticReviewHistory;
+  if (!container) return;
+  const {cycles, rounds: reviews} = criticReviewModel();
+  const runIdentity = `${state.batchId || ""}:${state.runId || ""}`;
+  const signature = JSON.stringify([runIdentity, state.phase, state.activeNode, cycles]);
+  if (container.dataset.signature === signature) return;
+  const sameRun = container.dataset.runId === runIdentity;
+  const expanded = new Set(sameRun ? [...container.querySelectorAll("details")]
+    .filter(detail => detail.open).map(detail => detail.dataset.reviewKey) : []);
+  if (!sameRun) container.open = false;
+  container.dataset.runId = runIdentity;
+  container.dataset.signature = signature;
+  const heading = document.createElement("summary");
+  heading.textContent = `Critic review inputs and decisions · ${cycles.length} cycle${cycles.length === 1 ? "" : "s"} · ${reviews.length} round${reviews.length === 1 ? "" : "s"}`;
+  const explanation = document.createElement("p");
+  explanation.textContent = "Each author submission starts a review cycle. Changes can lead to another round within that cycle; rejection returns to the author. Expand a round for its exact inputs and decision.";
+  const children = [heading, explanation];
+  const details = (key, label, content, className = "critic-review-text") => {
+    const detail = document.createElement("details");
+    detail.className = className;
+    detail.dataset.reviewKey = key;
+    detail.open = expanded.has(key);
+    const summary = document.createElement("summary");
+    summary.textContent = label;
+    detail.append(summary);
+    if (content !== undefined) {
+      const copy = document.createElement("pre");
+      copy.textContent = content;
+      detail.append(copy);
+    }
+    return detail;
+  };
+  for (const [cycleIndex, cycle] of cycles.entries()) {
+    const cycleRow = details(cycle.key,
+      `Review cycle ${cycleIndex + 1} · ${criticCycleOutcomeLabel(cycle)} · ${cycle.rounds.length} round${cycle.rounds.length === 1 ? "" : "s"}`,
+      undefined, "critic-cycle");
+    cycleRow.dataset.outcome = cycle.outcome;
+    for (const [roundIndex, review] of cycle.rounds.entries()) {
+    const result = review.result;
+    const verdict = String(result?.report?.verdict || "").toLowerCase();
+    const first = review.requests[0];
+    const stamp = first?.time || result?.time;
+    const row = details(review.key,
+      `Round ${roundIndex + 1} · ${criticRoundOutcomeLabel(review)}${stamp ? ` · ${localDateTime(stamp)}` : ""}`,
+      undefined, "critic-review");
+    row.dataset.outcome = review.outcome;
+    if (review.outcome === "pass_edited_limit") {
+      const note = document.createElement("p");
+      note.textContent = "The critic changed the proof. The round limit accepts that revision without another critic round; this is not a clean pass.";
+      row.append(note);
+    }
+    if (!review.requests.length) {
+      const missing = document.createElement("p");
+      missing.textContent = "The exact critic input was not recorded for this review.";
+      row.append(missing);
+    }
+    for (const [attemptIndex, request] of review.requests.entries()) {
+      const label = `Exact critic input${review.requests.length > 1 ? ` · attempt ${request.attempt || attemptIndex + 1}` : ""}`;
+      const input = details(`${review.key}:input:${attemptIndex}`, label,
+        typeof request.text === "string" && request.text ? request.text : "The exact input text is unavailable.");
+      const metadata = document.createElement("p");
+      metadata.className = "critic-review-meta";
+      metadata.textContent = [request.time ? `Sent ${localDateTime(request.time)}` : "Time unavailable",
+        request.model, request.reasoningEffort, request.id || request.requestId]
+        .filter(Boolean).join(" · ");
+      input.append(metadata);
+      row.append(input);
+    }
+    if (result) {
+      if (verdict === "reject" || result.report?.bugs) {
+        row.append(details(`${review.key}:bugs`, "Rejection / unresolved bugs",
+          typeof result.report?.bugs === "string" && result.report.bugs
+            ? result.report.bugs : "No separate rejection text was recorded; see the full decision."));
+      }
+      const raw = typeof result.text === "string" && result.text
+        ? result.text : result.report ? JSON.stringify(result.report, null, 2) : "No decision text was recorded.";
+      const decision = details(`${review.key}:decision`, "Full critic decision", raw);
+      if (result.time) {
+        const metadata = document.createElement("p");
+        metadata.className = "critic-review-meta";
+        metadata.textContent = `Returned ${localDateTime(result.time)}`;
+        decision.append(metadata);
+      }
+      row.append(decision);
+    }
+    cycleRow.append(row);
+    }
+    children.push(cycleRow);
+  }
+  if (!reviews.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "No critic input or decision has been recorded yet.";
+    children.push(empty);
+  }
+  container.replaceChildren(...children);
+}
+
+function renderRetrievalOverview() {
+  const { mode, cutoff } = retrievalConfiguration(state);
+  const retrieval = state.retrieval || (state.retrievalPolicyPath
+    ? { mode: "historical", fixed: true, available: false }
+    : { mode });
+  const historical = mode === "historical", live = mode === "live";
+  ui.retrievalPanel.dataset.mode = mode;
+  ui.retrievalHeading.textContent = historical ? "Historical search"
+    : live ? "Unrestricted web search" : "Web-search tools disabled";
+  const counts = retrieval.counts || {};
+  const errors = Number.isFinite(counts.errors) ? counts.errors : 0;
+  const successes = Number.isFinite(counts.successes) ? counts.successes : 0;
+  const latest = retrieval.lastCompleted;
+  const toolNames = { search: "Search", open: "Open", find: "Find", unknown: "Request" };
+  const lastTool = toolNames[latest?.tool] || "Request";
+  const latestStatus = latest?.status;
+  ui.retrievalStatus.textContent = !historical ? (live ? "Cutoff off" : "Cutoff on · -1")
+    : retrieval.available === false ? "Status unavailable"
+    : latestStatus === "success" ? `Last ${lastTool.toLowerCase()} succeeded`
+    : latestStatus === "error" ? `Last ${lastTool.toLowerCase()} failed`
+    : latestStatus === "cancelled" ? "Last request cancelled"
+    : errors ? `${errors} failed request${errors === 1 ? "" : "s"} in history`
+    : retrieval.fixed ? "Cutoff fixed" : "Cutoff selected";
+  ui.retrievalStatus.dataset.tone = historical && (retrieval.available === false
+    || latestStatus === "error" || latestStatus === "cancelled" || (!latestStatus && errors)) ? "warning" : "neutral";
+  const providers = { codex_wayback: "General web discovery via Codex · Wayback archives",
+    scholarly_wayback: "arXiv and Crossref discovery · Wayback archives",
+    brave_wayback: "Brave URL discovery · Wayback archives", duckduckgo_wayback: "DuckDuckGo URL discovery · Wayback archives",
+    sealed_corpus: "Controller-pinned archive collection" };
+  ui.retrievalDescription.textContent = historical
+    ? `${providers[retrieval.provider] || "Historical archive retrieval"}. The proof author can search, page through, and find text within verified captures. The critic and writer have no external retrieval tools.`
+    : live ? "The model's native web search is enabled without a date restriction. Search activity appears in the run timeline."
+    : "All model web-search tools are disabled for this job. This controls search tools; it does not isolate ordinary shell network access.";
+  show(ui.retrievalCutoffDisplay, !live);
+  ui.retrievalCutoffLabel.textContent = historical ? "Only captures strictly before" : "Cutoff time";
+  ui.retrievalCutoffValue.textContent = cutoff || "Not recorded";
+  ui.retrievalPolicyNote.textContent = !historical ? "-1 disables web-search tools."
+    : retrieval.fixed
+    ? "Fixed for this job, including resumes. Times are UTC."
+    : "The selected cutoff will be fixed when the job starts. Times are UTC.";
+  show(ui.retrievalCounts, historical && retrieval.available !== false && Boolean(retrieval.counts));
+  const metrics = [
+    ["Search requests", counts.searches], ["Open requests", counts.opens], ["Find requests", counts.finds],
+    ["Completed successfully", counts.successes], ["Failed requests (total)", counts.errors],
+    ["No terminal event yet", counts.pending], ["Candidates verified", counts.verifiedCandidates],
+  ];
+  const signature = JSON.stringify(metrics);
+  if (ui.retrievalCounts.dataset.signature !== signature) {
+    ui.retrievalCounts.dataset.signature = signature;
+    ui.retrievalCounts.replaceChildren(...metrics.map(([label, value]) => {
+      const row = document.createElement("div"), term = document.createElement("dt"), description = document.createElement("dd");
+      term.textContent = label;
+      description.textContent = Number.isFinite(value) ? value.toLocaleString() : "—";
+      row.append(term, description); return row;
+    }));
+  }
+  const hasCounts = historical && retrieval.available !== false && Boolean(retrieval.counts);
+  show(ui.retrievalRequestSummary, hasCounts);
+  ui.retrievalRequestSummary.textContent = !hasCounts ? ""
+    : `${successes} successful and ${errors} failed retrieval request${successes + errors === 1 ? "" : "s"} over this run.`
+      + (errors ? " A failed request returned no usable source for that request; it does not by itself mean the proof run failed or the cutoff was bypassed." : "")
+      + (latest?.time ? ` Latest completed request: ${lastTool.toLowerCase()} ${latestStatus === "success" ? "succeeded" : latestStatus === "error" ? "failed" : "was cancelled"} at ${localDateTime(latest.time)}.` : "");
+  const failures = Array.isArray(retrieval.requestFailures) ? retrieval.requestFailures : [];
+  show(ui.retrievalFailures, hasCounts && failures.length > 0);
+  const failureSignature = JSON.stringify(failures);
+  if (ui.retrievalFailures.dataset.signature !== failureSignature) {
+    ui.retrievalFailures.dataset.signature = failureSignature;
+    ui.retrievalFailures.replaceChildren(...failures.map(failure => {
+      const row = document.createElement("li");
+      row.textContent = `${Number.isFinite(failure.count) ? failure.count : "—"} · ${failure.label || "Unclassified retrieval failure"}`;
+      return row;
+    }));
+  }
+  show(ui.retrievalDetails, historical);
+  ui.retrievalLimitation.textContent = retrieval.limitation
+    || "Current discovery influences which URLs are found. Archive coverage and model training knowledge differ from the historical experiment.";
+  ui.retrievalCountNote.textContent = (retrieval.countBasis || "Counts come from the retrieval service log. Pending means no terminal event was recorded, rather than confirmed running. Verified candidates can include sources never returned to the author.")
+    + " These counts are not a proof or citation audit."
+    + (retrieval.lastFailureAt ? ` Last failed request: ${localDateTime(retrieval.lastFailureAt)}.` : "")
+    + (retrieval.available === false ? ` ${retrieval.error || "Retrieval log statistics are unavailable."}` : "")
+    + (retrieval.lastEventAt ? ` Last recorded retrieval event: ${localDateTime(retrieval.lastEventAt)}.` : "");
+}
+
 // Show the author/audit cycle alongside the separate critic/repair cycle.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
+  const trace = state.trace || [];
+  const {cycles, rounds} = criticReviewModel();
+  const completed = rounds.filter(round => round.result);
+  const latestRound = completed.at(-1);
+  const latestCritic = latestRound?.result;
+  const currentCycle = cycles.at(-1);
+  const verdict = String(latestCritic?.report?.verdict || "").toLowerCase();
+  const rejectedReviews = completed.filter(round => round.outcome === "reject").length;
+  const criticHistoryOpen = ui.workflowNodes.querySelector?.(".critic-history")?.open || false;
   const latexOnly = ["latex", "final-resume"].includes(state.problemMode);
   const criticResume = state.problemMode === "critic-resume";
   const startsAtAuthor = state.problemMode === "algorithmic"
@@ -1679,6 +2408,15 @@ function renderWorkflow() {
     seen.add("statement_reviewer");
     seen.add("author");
   }
+  const approvedAfterLatestReview = trace.slice(trace.lastIndexOf(latestCritic) + 1)
+    .some(entry => entry.kind === "status" && entry.label === "Critic approved");
+  const authorRepairing = authorStage && !approvedAfterLatestReview
+    && (state.stage === "repair" || verdict === "reject");
+  const criticApproved = verdict === "pass" && state.stage !== "repair" && (
+    ["pass_clean", "pass_edited_limit"].includes(currentCycle?.outcome)
+    || state.finalInputReady || approvedAfterLatestReview
+    || ["latex_editor", "latex_compile", "latex_repair"].some(name => seen.has(name))
+  );
   const makeNode = (name, number, overrides = {}) => {
     const item = overrides.item || nodes[name];
     const row = document.createElement("li");
@@ -1687,14 +2425,19 @@ function renderWorkflow() {
     const active = ["running", "reviewing", "stopping"].includes(state.phase) && current;
     const failed = state.phase === "done" && current
       && (state.error || name === "failure_summary");
+    const settled = name === "critic"
+      ? verdict === "reject" ? "rejected" : criticApproved ? "complete"
+        : latestCritic || seen.has(name) ? "reviewed" : ""
+      : seen.has(name) ? "complete" : "";
     const status = overrides.status ?? (paused ? "paused" : active ? "active" : failed ? "failed"
-      : seen.has(name) ? "complete" : "");
+      : settled);
     row.className = `workflow-node ${status}`;
     row.dataset.node = name;
     if (status === "active") row.setAttribute("aria-current", "step");
     const dot = document.createElement("span");
     dot.className = "node-dot";
     dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ"
+      : status === "rejected" ? "×" : status === "reviewed" ? "·"
       : status === "complete" ? "✓" : status === "disabled" ? "–" : number;
     const copy = document.createElement("div");
     copy.className = "node-copy";
@@ -1703,25 +2446,62 @@ function renderWorkflow() {
     const description = document.createElement("span");
     const descriptions = {
       author: "Explore approaches and build a proof.",
-      critic: "Check the proof, fix issues, or return bugs.",
+      critic: "Review the candidate; rejected proofs return to the author.",
       latex_compile: "Compile, fix errors, and retry until a PDF is ready.",
     };
     description.textContent = descriptions[name] || item.description;
     copy.append(title, description);
-    const noteText = overrides.note || (paused ? (auditing
+    let noteText = overrides.note || (paused ? (auditing
       ? state.phase === "pausing" ? "Pausing for audits" : "Paused for audits" : "Paused")
       : current && state.phase === "prepared" ? "Ready to start" : "");
+    if (name === "author" && authorRepairing && current
+        && ["running", "pausing", "paused", "stopping"].includes(state.phase)) {
+      noteText = noteText ? `${noteText} · repairing critic objections` : "Repairing critic objections";
+    }
+    if (name === "critic" && !noteText) {
+      noteText = active ? `Reviewing candidate${currentCycle ? ` · cycle ${cycles.length}, round ${currentCycle.rounds.length}` : ""}` : failed ? "Review interrupted"
+        : criticApproved ? criticCycleOutcomeLabel(currentCycle || {})
+          : verdict === "reject" ? "Candidate needs repair"
+            : verdict === "pass" ? criticRoundOutcomeLabel(latestRound)
+              : seen.has(name) || latestCritic ? "Verdict unavailable" : "";
+    }
     if (noteText) {
       const note = document.createElement("span");
       note.className = "node-status";
       note.textContent = noteText;
       copy.append(note);
     }
-    if (name === "critic" && state.round) {
-      const round = document.createElement("span");
-      round.className = "node-round";
-      round.textContent = `Round ${state.round} of ${state.criticRounds}`;
-      copy.append(round);
+    if (name === "critic" && latestCritic) {
+      const latest = document.createElement("span");
+      latest.className = `node-verdict ${["pass", "reject"].includes(verdict) ? verdict : "unknown"}`;
+      latest.dataset.outcome = latestRound.outcome;
+      latest.textContent = `Latest completed round: ${criticRoundOutcomeLabel(latestRound)}`;
+      const passes = document.createElement("span");
+      passes.className = "node-review-count";
+      passes.textContent = currentCycle ? `Review cycle ${cycles.length} · ${currentCycle.rounds.length} round${currentCycle.rounds.length === 1 ? "" : "s"}` : "";
+      const history = document.createElement("details");
+      history.className = "critic-history";
+      history.open = criticHistoryOpen;
+      const summary = document.createElement("summary");
+      summary.textContent = `Recorded: ${cycles.length} cycle${cycles.length === 1 ? "" : "s"} · ${completed.length} completed round${completed.length === 1 ? "" : "s"}`
+        + ` · ${rejectedReviews} rejection${rejectedReviews === 1 ? "" : "s"}`;
+      const list = document.createElement("ol");
+      for (const [index, cycle] of cycles.entries()) {
+        const entry = document.createElement("li");
+        entry.className = "critic-cycle-summary";
+        const title = document.createElement("strong");
+        title.textContent = `Cycle ${index + 1} · ${criticCycleOutcomeLabel(cycle)}`;
+        const roundList = document.createElement("ol");
+        for (const [roundIndex, round] of cycle.rounds.entries()) {
+          const item = document.createElement("li");
+          item.textContent = `Round ${roundIndex + 1}: ${criticRoundOutcomeLabel(round)}`;
+          roundList.append(item);
+        }
+        entry.append(title, roundList);
+        list.append(entry);
+      }
+      history.append(summary, list);
+      copy.append(latest, passes, history);
     }
     if (criticResume && (name === "statement_reviewer"
       || (name === "author" && !seenInThisJob.has("author")))) {
@@ -1780,7 +2560,7 @@ function renderWorkflow() {
   rejectRoute.append(rejectLabel);
   const selfRoute = document.createElement("li");
   selfRoute.className = "loop-self";
-  selfRoute.textContent = "↻ Edited PASS → repeat below limit";
+  selfRoute.textContent = `↻ PASS with changes → next round (limit ${state.criticRounds || 2})`;
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
   let authorGroup = author;
   if (state.fileManagement !== false) {
@@ -1906,12 +2686,12 @@ function fillResearchAuditControls(live = false) {
 }
 
 function renderResearchAudits(canEdit) {
-  if (!managesResearchFiles()) {
+  if (state.readOnly || !managesResearchFiles() || state.retrieval?.mode === "historical" || state.retrievalPolicyPath) {
     for (const element of [ui.researchAuditsControl, ui.researchAuditToolbar,
       ui.researchAuditActivity, ui.researchAuditStatus]) show(element, false);
     return;
   }
-  const identity = currentJob || state.runId || "";
+  const identity = JSON.stringify([state.batchId || "", currentJob || state.runId || ""]);
   if (researchAuditJob !== identity) {
     researchAuditJob = identity;
     researchAuditDirty = false;
@@ -2050,17 +2830,18 @@ async function applyResearchAudits() {
     return;
   }
   const job = currentJob;
+  const batch = currentBatch;
   researchAuditFeedback = "";
   researchAuditSaving = true;
   renderResearchAudits(true);
   try {
     const next = await request(jobPath("/set-research-audits"), config);
-    if (job !== currentJob) return;
+    if (job !== currentJob || batch !== currentBatch) return;
     researchAuditDirty = JSON.stringify(researchAuditValues(true)) !== JSON.stringify(config);
     researchAuditSaving = false;
     render(next);
   } catch (error) {
-    if (job !== currentJob) return;
+    if (job !== currentJob || batch !== currentBatch) return;
     researchAuditSaving = false;
     researchAuditFeedback = error.message;
     renderResearchAudits(!ui.researchAuditsControl.hidden);
@@ -2070,16 +2851,17 @@ async function applyResearchAudits() {
 async function startResearchAudit() {
   if (ui.startResearchAudit.disabled) return;
   const job = currentJob;
+  const batch = currentBatch;
   researchAuditStarting = true;
   researchAuditFeedback = "";
   renderResearchAudits(true);
   try {
     const next = await request(jobPath("/start-research-audit"), {});
-    if (job !== currentJob) return;
+    if (job !== currentJob || batch !== currentBatch) return;
     researchAuditStarting = false;
     render(next);
   } catch (error) {
-    if (job !== currentJob) return;
+    if (job !== currentJob || batch !== currentBatch) return;
     researchAuditStarting = false;
     researchAuditFeedback = error.message === "Not found."
       ? "Pause the author and restart the web UI to enable Start audit now."
@@ -2091,6 +2873,8 @@ async function startResearchAudit() {
 // Merge incremental polling state, then update the visible phase.
 function render(next) {
   const incremental = next.traceFrom === state.traceVersion;
+  const acceptancesChanged = JSON.stringify(next.criticAcceptances || [])
+    !== JSON.stringify(state.criticAcceptances || []);
   const newEntries = next.trace || [];
   const combined = retainTrace(
     incremental ? [...(state.trace || []), ...newEntries] : newEntries
@@ -2098,6 +2882,17 @@ function render(next) {
   state = { ...next, trace: combined };
   stateReceivedAt = Date.now();
   ingest(newEntries, !incremental);
+  // Acceptance is logged after the PASS verdict. Refresh existing critic cards
+  // when later events clarify its route, keeping the timeline in place.
+  if (incremental && (acceptancesChanged || newEntries.some(entry => entry.kind === "critic_result"
+      || ["proof_handoff", "final_result"].includes(entry.kind)
+      || entry.kind === "status" && entry.label === "Critic approved"
+      || entry.kind === "status" && /^Workflow step:/.test(entry.label || "")
+      || entry.kind === "request" && ["critic", "final"].includes(entry.stage)))) {
+    for (const round of criticReviewModel().rounds) {
+      if (round.result) upsertTimeline(describe(round.result));
+    }
+  }
 
   const phase = state.phase;
   const auditHolding = Boolean(state.auditHoldingAuthor || state.researchAuditStatus?.batchActive)
@@ -2118,6 +2913,8 @@ function render(next) {
   syncMemoryPanel();
   ui.notice.textContent = state.error || "";
   show(ui.notice, Boolean(state.error));
+  ui.traceNotice.textContent = state.traceNotice || "Only the most recent saved activity is shown here.";
+  show(ui.traceNotice, Boolean(state.traceTruncated || state.traceNotice));
 
   if (phase === "input" && previousPhase !== "input") {
     const rounds = state.workflow?.settings?.critic_rounds || {};
@@ -2135,6 +2932,7 @@ function render(next) {
     ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
     ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
+    restoreRetrievalSettings(state);
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
     ui.fileManagement.checked = Boolean(state.fileManagement);
@@ -2143,8 +2941,8 @@ function render(next) {
     ui.criticRounds.value = state.criticRounds || 2;
     ui.criticRounds.min = rounds.minimum || 1;
     ui.criticRounds.max = rounds.maximum || 100;
-    ui.thinkingHours.value = state.thinkingHours || 168;
-    ui.thinkingHours.min = hours.minimum || 0.01;
+    ui.thinkingHours.value = state.thinkingHours ?? 168;
+    ui.thinkingHours.min = hours.minimum ?? 0;
     ui.thinkingHours.max = hours.maximum || 168;
     fillResearchAuditControls();
     setProblemMode(state.problemMode || "statement");
@@ -2162,6 +2960,7 @@ function render(next) {
     ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
     ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
+    restoreRetrievalSettings(state);
     syncPrompts(state);
     updateModelSummary();
     ui.proposed.value = state.review.statement;
@@ -2169,7 +2968,7 @@ function render(next) {
     appendFormattedText(ui.notes, state.review.notes);
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
-    ui.thinkingHours.value = state.thinkingHours || 168;
+    ui.thinkingHours.value = state.thinkingHours ?? 168;
     fillResearchAuditControls();
     checkEdited();
     reviewPending = false;
@@ -2208,7 +3007,7 @@ function render(next) {
         : (node.label || "Codex is working")));
   ui.runDescription.textContent = state.error
     || (auditHolding ? "The author will resume automatically in the same conversation after all audit reports are saved. Click Pause to cancel the audits and keep the author paused."
-      : phase === "prepared" ? "Review the reorganized research files, then start a fresh author session in this workspace."
+      : phase === "prepared" ? (state.launchHold || "Review the prepared statement and settings, then start a fresh author session in this workspace.")
       : phase === "paused" ? "Resume reopens the saved Codex conversation in this same run folder. You can change your Codex CLI login before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : done ? (state.resultKind === "final" || state.canDownloadTex
@@ -2221,7 +3020,7 @@ function render(next) {
   }
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = `Round ${state.round} / ${state.criticRounds}`;
-  const authorLimit = Number(state.thinkingHours || 168);
+  const authorLimit = Number(state.thinkingHours ?? 168);
   const maximumAuthorLimit = Number(
     state.workflow?.settings?.thinking_hours?.maximum || 168
   );
@@ -2236,7 +3035,7 @@ function render(next) {
   const authorLimitText = authorLimit.toLocaleString(undefined, {
     maximumFractionDigits: 2,
   });
-  ui.authorLimitSummary.textContent = `Total limit: ${authorLimitText} hours`;
+  ui.authorLimitSummary.textContent = authorLimit === 0 ? "No workflow time limit" : `Total limit: ${authorLimitText} hours`;
   ui.authorLimitHours.max = String(maximumAuthorLimit);
   if (canSetAuthorLimit && document.activeElement !== ui.authorLimitHours) {
     ui.authorLimitHours.value = String(authorLimit);
@@ -2248,8 +3047,8 @@ function render(next) {
   ui.pause.title = retryPending ? "Cancel automatic retries"
     : auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
-  ui.resume.textContent = phase === "prepared" ? "Start prepared run" : "Resume";
-  ui.resume.disabled = auditHolding;
+  ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run" : "Resume";
+  ui.resume.disabled = auditHolding || Boolean(state.launchHold);
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.downloadPdf, Boolean(state.canDownloadPdf));
   show(ui.stop, working);
@@ -2258,6 +3057,13 @@ function render(next) {
 
   renderWorkflow();
   renderClock();
+  renderBatchNavigation();
+  if (state.readOnly) {
+    for (const control of [ui.stop, ui.pause, ui.resume, ui.authorSteerControl, ui.authorTimeLimitControl,
+      ui.researchAuditsControl, ui.researchAuditToolbar, ui.researchAuditStatus, ui.approve, ui.recheck,
+      ui.reviewFeedbackControls]) show(control, false);
+    ui.proposed.readOnly = true;
+  }
   if (phase !== previousPhase) {
     const heading = reviewReady ? ui.reviewHeading
       : (phase !== "input" ? ui.runTitle : null);
@@ -2298,14 +3104,30 @@ function syncEffortChoices(role) {
 
 async function refresh() {
   const job = currentJob;
+  const batch = currentBatch;
+  if (!job && !composingProblem) {
+    renderBatchNavigation();
+    await loadJobs();
+    return;
+  }
   try {
+    if (job && (!batchCatalog.length || (batch && !selectedBatch()))) {
+      const catalog = await request("/batches");
+      if (job !== currentJob || batch !== currentBatch) return;
+      batchCatalog = catalog.batches || [];
+    }
     const next = await request(jobPath("/state", {
       after: state.traceVersion || 0,
     }));
-    if (job !== currentJob) return;
+    if (job !== currentJob || batch !== currentBatch) return;
+    if (job && !currentBatch && next.batchId) {
+      currentBatch = next.batchId;
+      history.replaceState(null, "", jobUrl(currentJob));
+    }
+    if (selectedBatch()?.readOnly) next.readOnly = true;
     render(next);
-    if (!currentJob) loadJobs();
   } catch (error) {
+    if (job !== currentJob || batch !== currentBatch) return;
     ui.notice.textContent = error.message;
     show(ui.notice, true);
     timer = setTimeout(refresh, 1200);
@@ -2328,6 +3150,7 @@ function checkEdited() {
 }
 
 async function startReview(statement, feedback = "") {
+  if (!validateRetrievalSettings()) return;
   clearTimeout(timer);
   clearTimeout(jobsTimer);
   const reviewOnly = !feedback && ui.statementReviewOnly.checked;
@@ -2335,6 +3158,7 @@ async function startReview(statement, feedback = "") {
   if (!(skipReview ? promptValues[selectedAuthorPrompt()] : promptValues.review)) syncPrompts();
   reviewPending = !skipReview;
   const job = currentJob;
+  const batch = currentBatch;
   try {
     const next = await request(jobPath(skipReview ? "/direct" : "/review"), {
       statement, feedback, reviewModel: ui.reviewModel.value,
@@ -2342,9 +3166,8 @@ async function startReview(statement, feedback = "") {
       ...proofJobSettings(),
       statementReviewOnly: reviewOnly,
     });
-    if (job !== currentJob) return;
-    currentJob = next.runId;
-    history.pushState(null, "", jobUrl(currentJob));
+    if (job !== currentJob || batch !== currentBatch) return;
+    adoptJob(next);
     render(next);
   } catch (error) {
     reviewPending = false;
@@ -2369,6 +3192,7 @@ function proofJobSettings() {
       : { intervalHours: 0, models: ["none", "none", "none"] },
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
+    ...selectedRetrievalSettings(),
   };
 }
 
@@ -2407,6 +3231,7 @@ let folderBatchBusy = false;
 async function startFolderBatch(files) {
   const chosen = [...(files || [])];
   if (!chosen.length || folderBatchBusy) return;
+  if (!validateRetrievalSettings({ folder: true })) return;
   folderBatchBusy = true;
   ui.runFolder.disabled = true;
   try {
@@ -2439,6 +3264,8 @@ async function sendFolderBatch(chosen) {
     show(ui.notice, true);
     return;
   }
+  // File reading is asynchronous; recheck the current settings before sending.
+  if (!validateRetrievalSettings({ folder: true })) return;
   const count = statements.length;
   const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
     + "Each runs the selected workflow and uses its own quota.\n\n"
@@ -2462,6 +3289,10 @@ async function sendFolderBatch(chosen) {
       + (skipped ? `\n${skipped}` : "");
     show(ui.batchStatus, true);
     if (!currentJob) {
+      composingProblem = false;
+      currentBatch = result.batchId || result.batch?.id || "__root__";
+      history.pushState(null, "", batchUrl(currentBatch));
+      renderBatchNavigation();
       renderJobs(result.jobs || []);
       ui.jobsPanel.scrollIntoView({ block: "start", behavior: "smooth" });
     }
@@ -2473,6 +3304,7 @@ async function sendFolderBatch(chosen) {
 }
 
 async function startLatexOnly() {
+  if (!validateRetrievalSettings()) return;
   if (!ui.latexInput.value.trim()) {
     ui.notice.textContent = "Enter the theorem and proof.";
     show(ui.notice, true);
@@ -2491,9 +3323,9 @@ async function startLatexOnly() {
         ? { final: promptOverrides.final } : {},
       speedMode: ui.speedMode.value,
       reasoningSummary: ui.reasoningSummary.value,
+      ...selectedRetrievalSettings(),
     });
-    currentJob = next.runId;
-    history.pushState(null, "", jobUrl(currentJob));
+    adoptJob(next);
     render(next);
   } catch (error) {
     ui.notice.textContent = error.message;
@@ -2504,9 +3336,10 @@ async function startLatexOnly() {
 async function act(path, body = {}) {
   clearTimeout(timer);
   const job = currentJob;
+  const batch = currentBatch;
   try {
     const next = await request(jobPath(path), body);
-    if (job === currentJob) render(next);
+    if (job === currentJob && batch === currentBatch) render(next);
   } catch (error) {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
@@ -2553,7 +3386,7 @@ document.onkeydown = (event) => {
 // These controls are the complete statement-approval and solve loop.
 ui.homeLink.onclick = (event) => {
   event.preventDefault();
-  goHome();
+  selectBatch("");
 };
 ui.runFolder.onclick = () => {
   ui.folderInput.value = "";
@@ -2575,6 +3408,14 @@ for (const role of ["review", "author", "critic", "writer"]) {
 }
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
+ui.retrievalMode.onchange = () => {
+  renderRetrievalSettings();
+  updateModelSummary();
+};
+ui.retrievalCutoffUtc.oninput = () => {
+  ui.retrievalCutoffUtc.setCustomValidity("");
+  renderRetrievalSettings();
+};
 ui.skipStatementReview.onchange = () => {
   if (ui.skipStatementReview.checked) ui.statementReviewOnly.checked = false;
   setProblemMode(selectedProblemMode());
@@ -2615,8 +3456,8 @@ ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
 ui.setAuthorTimeLimit.onclick = () => {
   const hours = Number(ui.authorLimitHours.value);
   const maximum = Number(ui.authorLimitHours.max || 168);
-  if (!(hours > 0 && hours <= maximum)) {
-    ui.notice.textContent = `Set the limit above 0 and at most ${maximum} hours.`;
+  if (!(Number.isFinite(hours) && hours >= 0 && hours <= maximum)) {
+    ui.notice.textContent = `Set 0 for unlimited, or at most ${maximum} hours.`;
     show(ui.notice, true);
     ui.authorLimitHours.focus();
     return;
@@ -2697,8 +3538,14 @@ ui.downloadTex.onclick = () => downloadArtifact(ui.downloadTex, "tex");
 ui.downloadPdf.onclick = () => downloadArtifact(ui.downloadPdf, "pdf");
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
+ui.allBatches.onclick = () => selectBatch("");
+ui.batchProblems.onclick = goHome;
+ui.newProblem.onclick = newProblem;
 window.onpopstate = () => {
   currentJob = new URLSearchParams(location.search).get("job") || "";
+  currentBatch = new URLSearchParams(location.search).get("batch") || "";
+  composingProblem = new URLSearchParams(location.search).get("new") === "1" && !currentJob;
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView();
   refresh();
 };

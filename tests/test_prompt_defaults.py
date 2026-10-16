@@ -116,7 +116,7 @@ const assert = require('node:assert/strict');
 const app = fs.readFileSync(process.argv[1], 'utf8');
 const functions = app.slice(app.indexOf('const promptLabels ='), app.indexOf('function clockText('));
 const setup = `
-let currentJob = '', activePrompt = 'review';
+let currentJob = '', currentBatch = '', activePrompt = 'review';
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
 const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', author_simple: 'Simple [STATEMENT]', critic: 'Critic', final: 'Final'};
 let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};

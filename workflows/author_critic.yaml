@@ -27,6 +27,7 @@ nodes:
     instructions: critic
     features: [multi_agent]
     inputs: {statement: state.statement, solution: state.solution}
+    proof_handoff: {candidate: solution, statement: statement}
     response: {verdict: [pass, reject], solution: string, bugs: string}
     require:
     - bool(strip(result.solution))
@@ -37,24 +38,33 @@ nodes:
     after:
     - set: {solution: strip(result.solution), report: result, round: visit}
     - write: {path: saved-candidate.md, text: state.solution}
-    - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', text: '{raw}'}
+    - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', outcome: '=outcome', text: '{raw}'}
     next:
       reject: author
       pass:
         to: end
         after:
         - set: {output: state.solution}
-        - emit: {kind: status, label: Critic approved, text: 'Round {visit} passed without edits.'}
+        - emit: {kind: status, label: Critic approved, acceptanceReason: clean_pass, round: '=visit', text: 'Round {visit} passed without edits.'}
       fixed:
         repeat: 2
         option: critic_rounds
         then: end
         after:
         - set: {output: state.solution}
-        - emit: {kind: status, label: Critic approved, text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
+        - emit: {kind: status, label: Critic approved, acceptanceReason: round_limit, round: '=visit', roundLimit: '=limit', text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
 prompts:
   author_simple: |-
     The following is the statement to prove. Try to prove it with a complete, rigorous argument.
+
+    On macOS or Linux, when complete, write the entire self-contained proof to
+    proof.md in your working directory and submit exactly PROOF_FILE: proof.md
+    as your final response. Include every argument needed by the critic in that
+    file. The critic receives a read-only snapshot of this file and the exact
+    statement. After a rejection, update proof.md with the revised complete
+    proof and submit it again. A complete inline proof is also accepted.
+    On Windows, return the entire self-contained proof inline in your final
+    response, including after a rejection; do not submit a file pointer.
 
     STATEMENT:
     [STATEMENT]
@@ -86,7 +96,7 @@ prompts:
 
     You, the author LLM, create, read, search, and update your research records and thinking process using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout.
 
-    Maintain these research records in the current working directory, please strictly follow the file structure and do not create new files or change the file structure:
+    Maintain these research records in the current working directory, please strictly follow the file structure and do not create new files or change the file structure, except for the proof.md submission file described below:
 
     1. INITIAL_PROMPT.md is the permanent instruction file, containing the complete initial prompt and exact statement. Follow it throughout the task. Do not rewrite, shorten, or replace it without an explicit user instruction. Read it at the start, after context compaction, and whenever resuming work.
 
@@ -130,6 +140,15 @@ prompts:
     4. AUDITS/ contains only the current batch of independent audit reports, one Markdown file per report. When an audit batch starts, the controller pauses your research and moves all previous reports from AUDITS/ to audit_history/. Auditors read this same working directory directly, without copying the research files, and leave your records unchanged. The controller saves the new reports in AUDITS/ and resumes your existing goal and conversation after the batch finishes. On resumption, read the current reports before continuing. Consider their suggestions as advisory and decide whether to use them; they do not override the statement or these instructions. Leave AUDITS/ and audit_history/ intact; the controller manages them. Older runs may also have audit.md; preserve it as historical advice. You remain responsible for organizing and updating your own research records.
 
     Return a complete, self-contained solution only when it resolves the exact statement and every necessary claim is justified. A special case, reduction to an unproved claim, or progress report is not a complete solution. A counterexample resolves the task only if the statement permits that answer and its validity is fully proved.
+
+    On macOS or Linux, when complete, write the entire self-contained proof to
+    proof.md in this working directory and submit exactly PROOF_FILE: proof.md
+    as your final response. Include every necessary argument in that file: the
+    critic receives only a read-only snapshot of it and the exact statement,
+    not your research records. After a rejection, update proof.md with the
+    revised complete proof and submit it again. A complete inline proof is also
+    accepted. On Windows, return the entire self-contained proof inline in your
+    final response, including after a rejection; do not submit a file pointer.
 
     STATEMENT:
     [STATEMENT]

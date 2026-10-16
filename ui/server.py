@@ -21,7 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import workflow_runner as runtime
-from . import audits
+from . import audits, retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -240,6 +240,13 @@ def important_record(record):
 
     if record.get("kind") in PINNED_KINDS:
         return True
+    if (record.get("kind") == "status"
+            and record.get("label") == "Critic approved"
+            and record.get("root") is not False
+            and not record.get("activityLabel")):
+        # A PASS can either trigger another review or accept the proof. Keep
+        # the controller's exact acceptance reason after routine events age out.
+        return True
     if record.get("kind") == "research_audit":
         return record.get("status") != "working" or bool(record.get("recovered"))
     if record.get("kind") != "codex_event" or record.get("root") is False:
@@ -281,7 +288,8 @@ PUBLIC_GRAPH = {
         },
         "thinking_hours": {
             "default": DEFAULT_THINKING_HOURS,
-            "minimum": 0.01,
+            "minimum": 0,
+            "zeroMeansUnlimited": True,
             "maximum": MAX_THINKING_HOURS,
         },
     },
@@ -448,6 +456,12 @@ def empty_state(trace=None, trace_version=0):
         "statementReviewOnly": False,
         "fileManagement": False,
         "preparedRun": False,
+        "launchHold": "",
+        "retrievalPolicyPath": "",
+        "retrievalMode": "live",
+        "retrievalCutoffUtc": "",
+        "retrieval": retrieval.public_retrieval_info(""),
+        "retrievalCapabilities": retrieval.capabilities(),
         "draft": "",
         "reviewStatement": "",
         "reviewFeedback": "",
@@ -631,15 +645,21 @@ class App:
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+            "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
             "sourceFile",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
-        self._save(
-            JOB_SETTINGS_FILENAME,
+        # The solver rechecks historical settings while UI events persist
+        # thread/steering state. Readers must never observe a truncated JSON.
+        # Stage outside the writable workspace so a same-UID sandboxed author
+        # cannot alter temporary contents before the controller installs them.
+        runtime._private_atomic_write(
+            self.run_dir / JOB_SETTINGS_FILENAME,
             json.dumps(
                 {key: options[key] for key in keys if key in options},
                 ensure_ascii=False, indent=2, sort_keys=True,
             ) + "\n",
+            staging_directory=self.run_dir.parent,
         )
 
     def _prepare_continuation(
@@ -656,6 +676,14 @@ class App:
         )
         if source == self.run_dir.resolve():
             raise ValueError("A continuation must use a new run directory.")
+        source_settings_path = source / JOB_SETTINGS_FILENAME
+        if source_settings_path.exists():
+            source_settings = json.loads(source_settings_path.read_text(encoding="utf-8"))
+            if source_settings.get("retrievalPolicyPath") or source_settings.get("launchHold"):
+                raise ValueError(
+                    "Historical runs cannot be cloned into an unrestricted continuation. "
+                    "Resume the same prepared workspace or prepare a new historical run with its policy."
+                )
         self._save(
             CONTINUATION_SOURCE_FILENAME,
             json.dumps({
@@ -693,6 +721,10 @@ class App:
         """Monitor optional audits separately from the workflow reader."""
 
         with self.lock:
+            if self.state.get("retrievalPolicyPath"):
+                # This experiment retains the default of no scheduled auditors.
+                # Do not start a second runner outside its role-specific policy.
+                return
             if self.research_audits is not None and self._audit_pause_engine is self.research_audits:
                 # Automatic resume keeps the same audit clock and monitor.
                 self._audit_token = token
@@ -874,6 +906,8 @@ class App:
 
     def start_research_audit_now(self):
         """Run the saved auditors now and restart their interval clock."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if not self.state.get("fileManagement", True):
@@ -1297,6 +1331,13 @@ class App:
             state["workerActive"] = self.has_active_worker()
             state["processAlive"] = bool(self.process is not None and self.process.poll() is None)
             state["activeElapsedSeconds"] = self._elapsed_seconds()
+            state["retrieval"] = retrieval.public_retrieval_info(
+                state.get("retrievalPolicyPath"), run_dir=self.run_dir,
+                mode=state.get("retrievalMode", "live"))
+            state["retrievalCapabilities"] = retrieval.capabilities()
+            if state["retrieval"]["mode"] == "historical":
+                state["retrievalMode"] = "historical"
+                state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
             try:
                 state["statement"] = saved_statement(self.run_dir) if self.run_dir else ""
             except ValueError:
@@ -1351,6 +1392,7 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         research_audits=None,
         file_management=True,
+        retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Normalize and validate settings shared by both input modes."""
 
@@ -1433,11 +1475,17 @@ class App:
             thinking_hours = float(thinking_hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total workflow time limit must be a number.") from exc
-        if not 0 < thinking_hours <= MAX_THINKING_HOURS:
+        if not math.isfinite(thinking_hours) or not 0 <= thinking_hours <= MAX_THINKING_HOURS:
             raise ValueError(
-                f"Choose more than 0 and at most {MAX_THINKING_HOURS} hours."
+                f"Choose 0 for unlimited, or at most {MAX_THINKING_HOURS} hours."
             )
+        audit_options = audits.normalize_settings(research_audits) if file_management else {
+            **audits.default_settings(), "models": ["none", "none", "none"]}
+        search_options = retrieval.validate_options(
+            retrieval_mode, retrieval_cutoff_utc, models=selected_models,
+            research_audits=audit_options)
         return {
+            **search_options,
             "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
             "authorModel": author_model,
             "criticModel": critic_model,
@@ -1460,8 +1508,7 @@ class App:
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
             "fileManagement": file_management,
-            "researchAudits": audits.normalize_settings(research_audits) if file_management else {
-                **audits.default_settings(), "models": ["none", "none", "none"]},
+            "researchAudits": audit_options,
         }
 
     def start_review(
@@ -1482,8 +1529,11 @@ class App:
         continuation_source="", stopped_stage="",
         research_audits=None,
         file_management=True,
+        retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Start the review and return immediately so the page can poll."""
+
+        self._check_input_replacement()
 
         statement = str(statement).strip()
         feedback = str(feedback or "").strip()
@@ -1522,7 +1572,16 @@ class App:
             reasoning_summary=reasoning_summary,
             research_audits=research_audits if not review_only else None,
             file_management=file_management,
+            retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
+        if options["retrievalMode"] == "historical":
+            raise ValueError("Historical search currently requires Skip statement review. Start a direct proof.")
+        if continuation_source:
+            options.update(retrieval.continuation_options(continuation_source))
+        elif self.run_dir and self.state["phase"] == "reviewed":
+            saved_search = retrieval.continuation_options(self.run_dir)
+            if any(options[key] != value for key, value in saved_search.items()):
+                raise ValueError("A statement revision keeps this run's search settings. Start a new job to change them.")
         if not statement:
             raise ValueError("Enter a problem statement.")
         with self.lock:
@@ -1617,7 +1676,8 @@ class App:
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1, cwd=ROOT,
+                errors="replace", bufsize=1, cwd=self.run_dir,
+                env=self._retrieval_child_environment(),
                 **isolated_process_options(),
             )
             with self.lock:
@@ -1732,9 +1792,21 @@ class App:
             if self.worker_token is token:
                 self.worker_token = None
 
+    def _retrieval_child_environment(self):
+        """Bind each worker, including independent reviewers, to its saved mode."""
+        child_environment = os.environ.copy()
+        # Never let one parallel job inherit another job's retrieval policy.
+        child_environment.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
+        child_environment["TCS_PROVER_RETRIEVAL_MODE"] = self.state.get("retrievalMode", "live")
+        if self.state.get("retrievalPolicyPath"):
+            child_environment["TCS_PROVER_RETRIEVAL_POLICY"] = self.state["retrievalPolicyPath"]
+        return child_environment
+
     def _launch_workflow_locked(self, workflows, source, options, stage, node, state=None):
         """Launch YAML graphs in this job, preserving worker ownership on errors."""
 
+        self._check_launch_hold()
+        child_environment = self._retrieval_child_environment()
         token = self.active_token = object()
         if state is not None:
             self._save("workflow-input.json", json.dumps(state, ensure_ascii=False))
@@ -1747,6 +1819,7 @@ class App:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", bufsize=1, cwd=self.run_dir,
+            env=child_environment,
             **isolated_process_options(),
         )
         self.worker_token = token
@@ -1865,8 +1938,9 @@ class App:
             )
         exhausted = (
             "time limit" in str(checkpoint.get("error", "")).lower()
-            or float(checkpoint.get("elapsedSeconds", 0))
-            >= float(self.state["thinkingHours"]) * 3600
+            or (float(self.state["thinkingHours"]) > 0 and
+                float(checkpoint.get("elapsedSeconds", 0))
+                >= float(self.state["thinkingHours"]) * 3600)
         )
         retry = checkpoint["pauseCause"] == "error" and not exhausted
         deadline = checkpoint.get("autoResumeAt", 0)
@@ -1974,10 +2048,22 @@ class App:
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
 
+    def _check_launch_hold(self):
+        """A held run must fail before credentials, workers or elapsed clocks."""
+        if self.state.get("launchHold"):
+            raise ValueError("Prepared run is held: " + str(self.state["launchHold"]))
+
+    def _check_input_replacement(self):
+        """A reused UI job must not erase its historical policy or hold."""
+        self._check_launch_hold()
+        if self.state.get("retrievalPolicyPath"):
+            raise ValueError("Historical run inputs and policy are fixed. Create a separate new job instead.")
+
     def start_prepared_run(self):
         """Start a curated workspace in place, with no inherited author session."""
 
         with self.lock:
+            self._check_launch_hold()
             if self.state["phase"] != "prepared" or self.has_active_worker():
                 raise ValueError("This workspace is no longer waiting to start.")
             statement = saved_statement(self.run_dir)
@@ -2009,6 +2095,8 @@ class App:
 
     def resume(self):
         """Reopen this run with a new CLI process and the saved goal/thread."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if self.state.get("auditHoldingAuthor"):
@@ -2121,8 +2209,12 @@ class App:
         research_audits=None,
         file_management=True,
         source_file=None,
+        retrieval_mode="live", retrieval_cutoff_utc="",
+        _prepare_only=False,
     ):
         """Send a statement directly to the proof author without review."""
+
+        self._check_input_replacement()
 
         source_file = source_file_name(source_file)
         statement = str(statement).strip()
@@ -2156,8 +2248,13 @@ class App:
             include_review=False,
             research_audits=research_audits,
             file_management=file_management,
+            retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         options["sourceFile"] = source_file
+        if options["retrievalMode"] == "historical" and continuation_source:
+            raise ValueError("Historical search cannot be added to an existing conversation. Start a new direct proof.")
+        if continuation_source:
+            options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
@@ -2172,6 +2269,11 @@ class App:
                 options.update(saved_goal_options(continuation_source))
             for name in ("author", "critic", "final"):
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+            if options["retrievalMode"] == "historical":
+                self._save("input.md", statement + "\n")
+                options["retrievalPolicyPath"] = retrieval.prepare_policy(
+                    self.run_dir, options["retrievalCutoffUtc"])
+                options["goalWorkspace"] = str(self.run_dir.resolve())
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
@@ -2183,6 +2285,9 @@ class App:
                 "# Statement sent directly to the proof author\n\n"
                 f"{statement}\n\n# Statement review\n\nSkipped by the user.\n",
             )
+            if options["retrievalMode"] == "historical" and not _prepare_only:
+                retrieval.preflight_policy(options["retrievalPolicyPath"])
+                retrieval.preflight_compiler(options["retrievalPolicyPath"])
             trace = self.state["trace"] if self.fixed_trace else []
             version = self.state["traceVersion"] if self.fixed_trace else 0
             self.state = {
@@ -2195,6 +2300,12 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            if _prepare_only:
+                self.state.update(phase="prepared", preparedRun=True,
+                                  stage="solve", activeNode="author", startedAt="",
+                                  launchHold="Historical batch preflight is pending; every run must pass before launch.")
+                self._save_job_settings(self.state)
+                return
             process, token = self._launch_solver_locked(statement)
         self._spawn_worker(self._read_output, (process, token), token)
 
@@ -2206,8 +2317,11 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
+        retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Polish one combined theorem-and-proof input without earlier stages."""
+
+        self._check_input_replacement()
 
         source = str(source).strip()
         if not source:
@@ -2222,7 +2336,12 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
+            retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
+        if options["retrievalMode"] == "historical":
+            raise ValueError("Historical search is available only for a new direct proof author.")
+        if continuation_source:
+            options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
@@ -2264,8 +2383,11 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="final",
         critic_model=DEFAULT_CRITIC_MODEL, critic_effort=None,
+        retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Retry normal finalization with its exact statement/proof contract."""
+
+        self._check_input_replacement()
 
         statement, solution = str(statement).strip(), str(solution).strip()
         if not statement or not solution:
@@ -2282,7 +2404,12 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
+            retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
+        if options["retrievalMode"] == "historical":
+            raise ValueError("Historical search cannot be added to a saved finalization. Resume the original run.")
+        if continuation_source:
+            options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
@@ -2340,8 +2467,11 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         audit_checkpoint="",
         recover_audit_checkpoint=True,
+        retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Create a new job that audits one complete saved candidate proof."""
+
+        self._check_input_replacement()
 
         statement, solution = str(statement).strip(), str(solution).strip()
         if not statement or not solution:
@@ -2366,7 +2496,12 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             file_management=file_management,
+            retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
+        if options["retrievalMode"] == "historical":
+            raise ValueError("Historical search cannot be added to a saved critic review. Resume the original run.")
+        if source_run:
+            options.update(retrieval.continuation_options(source_run))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Codex is already working.")
@@ -2425,6 +2560,8 @@ class App:
 
     def approve(self, edited_statement=None):
         """Solve the reviewed statement, including any direct author edit."""
+
+        self._check_launch_hold()
 
         with self.lock:
             if self.state.get("statementReviewOnly", False):
@@ -2768,9 +2905,9 @@ class App:
             hours = float(hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total time limit must be a number of hours.") from exc
-        if not 0 < hours <= MAX_THINKING_HOURS:
+        if not math.isfinite(hours) or not 0 <= hours <= MAX_THINKING_HOURS:
             raise ValueError(
-                f"Set the total time limit above 0 and at most "
+                f"Set 0 for unlimited, or a total time limit at most "
                 f"{MAX_THINKING_HOURS} hours."
             )
         with self.lock:
@@ -2792,7 +2929,7 @@ class App:
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"], "node": "author",
                 "label": "Total time limit set",
-                "text": f"The total workflow time limit is now {hours:g} hours.",
+                "text": "The workflow has no configured time limit." if hours == 0 else f"The total workflow time limit is now {hours:g} hours.",
                 "authorLimitHours": hours,
             })
             return hours
@@ -2832,6 +2969,8 @@ class App:
 
     def reset(self):
         """Return to the first screen when no child is active."""
+
+        self._check_input_replacement()
 
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
@@ -3298,9 +3437,13 @@ def restore_saved_app(app):
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
+                    if key in {"launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc"} and not isinstance(settings[key], str):
+                        state["launchHold"] = "Invalid saved historical launch controls; repair before launch."
+                        continue
                     if key in {
                         "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
                     } and not isinstance(settings[key], bool):
@@ -3638,8 +3781,11 @@ def restore_saved_app(app):
         state["error"] = state["error"] or "This run ended without a final answer. Continue from a saved checkpoint."
     elif state["resultKind"] == "failure":
         state["error"] = state["error"] or "Workflow incomplete. See the saved checkpoint and failure report."
+    if state.get("retrievalMode") == "historical" and not state.get("retrievalPolicyPath"):
+        state["launchHold"] = "Historical search policy is missing; restore the controller policy before launch."
     if state["preparedRun"] and not records and not state["output"]:
-        state.update(phase="prepared", stage="solve", activeNode="author", finishedAt="", error="")
+        state.update(phase="prepared", stage="solve", activeNode="author", startedAt="",
+                     resumedAt="", elapsedSeconds=0, finishedAt="", error="")
     state["checkpoints"] = saved_run_checkpoints(run_dir)
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
@@ -3845,6 +3991,8 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, trace_file=None, runs=RUNS):
         self.runs = Path(runs)
+        from .batches import BatchCatalog
+        self.batch_catalog = BatchCatalog(self.runs, current_root=self.runs)
         self.app = App(trace_file, self.runs)
         self.fixed_app = trace_file is not None
         self.jobs, self.jobs_lock = {}, threading.RLock()
@@ -3939,6 +4087,8 @@ class Server(ThreadingHTTPServer):
             **review_only_option,
             research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
             file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
+            retrieval_mode=body.get("retrievalMode", app.state.get("retrievalMode", "live") if run_id else "live"),
+            retrieval_cutoff_utc=body.get("retrievalCutoffUtc", app.state.get("retrievalCutoffUtc", "") if run_id else ""),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -3952,6 +4102,8 @@ class Server(ThreadingHTTPServer):
 
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         return {
+            "retrieval_mode": body.get("retrievalMode", "live"),
+            "retrieval_cutoff_utc": body.get("retrievalCutoffUtc", ""),
             "critic_rounds": body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
             "thinking_hours": body.get("thinkingHours", DEFAULT_THINKING_HOURS),
             "author_model": body.get("authorModel", DEFAULT_AUTHOR_MODEL),
@@ -4022,24 +4174,45 @@ class Server(ThreadingHTTPServer):
             {key: value for key, value in body.items() if key != "statements"}
         )
         # The jobs share these settings: reject them once, before any job starts.
-        App._workflow_options(include_review=False, **options)
+        normalized = App._workflow_options(include_review=False, **options)
+        options.update(retrieval_mode=normalized["retrievalMode"], retrieval_cutoff_utc=normalized["retrievalCutoffUtc"])
+        historical = normalized["retrievalMode"] == "historical"
+        if historical and len(statements) > 10:
+            raise ValueError("Historical search supports at most 10 statements per launch so every sandbox can be checked before work starts.")
         started = []
         try:
             for name, statement in statements:
                 app = App(runs=self.runs)
-                app.start_direct_statement(statement, source_file=name, **options)
+                app.start_direct_statement(statement, source_file=name, _prepare_only=historical, **options)
                 started.append(app)
                 with self.jobs_lock:
                     self.jobs[app.state["runId"]] = app
+            if historical:
+                # No model has started. Check every role boundary, with bounded
+                # transport timeouts and only two concurrent native probes.
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    list(pool.map(lambda app: retrieval.preflight_policy(app.state["retrievalPolicyPath"]), started))
+                retrieval.preflight_compiler(started[0].state["retrievalPolicyPath"])
+                for app in started:
+                    with app.lock:
+                        app.state["launchHold"] = ""
+                        app._save_job_settings(app.state)
+                        app.start_prepared_run()
         except Exception as exc:
             # A launch failed after validation (for example, the disk is full). Stop
             # the jobs this request started so a retry cannot duplicate them.
             for app in started:
                 try:
-                    app.stop()
+                    if app.state.get("phase") == "prepared":
+                        app.state["launchHold"] = "Historical batch launch failed. Create a new batch."
+                        app._save_job_settings(app.state)
+                    else:
+                        app.stop()
                 except (OSError, ValueError):
                     pass
-            failed = statements[len(started)][0] or f"statement {len(started) + 1}"
+            failed_index = min(len(started), len(statements) - 1)
+            failed = statements[failed_index][0] or f"statement {failed_index + 1}"
             stopped = (
                 f" The {len(started)} job{'s' if len(started) != 1 else ''} it had "
                 "already started were stopped." if started else ""
@@ -4059,6 +4232,8 @@ class Server(ThreadingHTTPServer):
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_latex_only(
             source=body.get("content", ""),
+            retrieval_mode=body.get("retrievalMode", "live"),
+            retrieval_cutoff_utc=body.get("retrievalCutoffUtc", ""),
             writer_model=body.get("writerModel", DEFAULT_WRITER_MODEL),
             reasoning_effort=legacy_effort,
             writer_effort=body.get("writerEffort", legacy_effort),
@@ -4248,6 +4423,8 @@ class Server(ThreadingHTTPServer):
         if state.get("phase") == "paused":
             return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
         if state.get("phase") == "prepared":
+            if state.get("launchHold"):
+                return None
             return {"action": "prepared", "label": "Start prepared run",
                     "description": "Start a fresh author session in this prepared research workspace."}
         stage = state.get("stoppedStage") or state.get("stage")
@@ -4523,7 +4700,8 @@ class Server(ThreadingHTTPServer):
                     "finishedAt", "lastActivityAt", "error", "problemMode",
                     "manuallyStopped", "stoppedStage",
                     "settingsWarning",
-                    "resultKind", "stage",
+                    "launchHold", "retrievalPolicyPath", "retrieval", "retrievalMode", "retrievalCutoffUtc",
+                    "resultKind", "stage", "workerActive", "processAlive", "activeElapsedSeconds",
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
@@ -4648,10 +4826,49 @@ class Handler(BaseHTTPRequestHandler):
         """Return state or one allow-listed static file."""
 
         request = urlsplit(self.path)
-        query = parse_qs(request.query)
+        query = parse_qs(request.query, keep_blank_values=True)
         run_id = (query.get("job") or [""])[0]
         if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
             return self.send({"error": "Untrusted local host."}, status=403)
+        if any(len(values) != 1 for values in query.values()):
+            return self.send({"error": "Duplicate request parameters are not allowed."}, status=400)
+        batch = (query.get("batch") or [None])[0]
+        if request.path == "/batches" or (batch is not None and request.path not in {"/", "/app.js", "/styles.css"}):
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            if request.path == "/batches":
+                cards = self.server.batch_catalog.list_batches()
+                root = next((card for card in cards if card["id"] == "__root__"), None)
+                jobs = self.server.job_list()
+                if root is None and jobs:
+                    root = {"id": "__root__", "name": "Runs", "folder": "."}
+                    cards.insert(0, root)
+                if root is not None:
+                    counts = {}
+                    for row in jobs:
+                        phase = row.get("phase") or "unknown"
+                        counts[phase] = counts.get(phase, 0) + 1
+                    root.update(jobCount=len(jobs), counts=counts, current=True, readOnly=False)
+                return self.send({"batches": cards, "currentBatch": "__root__"})
+            if batch != "__root__":
+                try:
+                    body, kind, headers = self.server.batch_catalog.response(
+                        request.path, batch, run_id,
+                        {key: values[0] for key, values in query.items()})
+                    if isinstance(body, Path):
+                        with self.server.batch_catalog.open_artifact(batch, run_id, body.name) as stream:
+                            self.send_response(200)
+                            self.send_header("Content-Type", kind)
+                            self.send_header("Content-Length", str(os.fstat(stream.fileno()).st_size))
+                            self.send_header("Cache-Control", "no-store")
+                            for name, value in headers.items():
+                                self.send_header(name, value)
+                            self.end_headers()
+                            shutil.copyfileobj(stream, self.wfile)
+                        return
+                    return self.send(body, kind, headers=headers)
+                except (ValueError, OSError):
+                    return self.send({"error": "Unknown batch, job, or saved artifact."}, status=404)
         if request.path in {"/download-tex", "/download-pdf"}:
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -4689,13 +4906,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(state)
                 values = query.get("after")
                 after = int(values[0]) if values else None
-                return self.send(self.server.get_job(run_id).snapshot(after))
+                return self.send({**self.server.get_job(run_id).snapshot(after), "batchId": "__root__"})
             except ValueError:
                 return self.send({"error": "Invalid job or transcript position."}, status=400)
         if request.path == "/jobs":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
-            return self.send({"jobs": self.server.job_list()})
+            return self.send({"jobs": [{**row, "batchId": "__root__"} for row in self.server.job_list()]})
         if request.path == "/transcript":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -4728,10 +4945,15 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             request = urlsplit(self.path)
-            query = parse_qs(request.query)
+            query = parse_qs(request.query, keep_blank_values=True)
             run_id = (query.get("job") or [""])[0]
             if not self.authorized():
                 return self.send({"error": "Unauthorized local request."}, status=403)
+            if any(len(values) != 1 for values in query.values()):
+                raise ValueError("Duplicate request parameters are not allowed.")
+            batch = (query.get("batch") or [None])[0]
+            if batch is not None and batch != "__root__":
+                return self.send({"error": "Saved batches are read-only."}, status=403)
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Expected a JSON request.")
             size = int(self.headers.get("Content-Length", "0"))
@@ -4746,6 +4968,7 @@ class Handler(BaseHTTPRequestHandler):
             if request.path == "/direct-batch":
                 started = self.server.start_direct_batch(body, run_id)
                 return self.send({
+                    "batchId": "__root__",
                     "startedJobs": [app.state["runId"] for app in started],
                     "jobs": self.server.job_list(),
                 })
@@ -4790,6 +5013,6 @@ class Handler(BaseHTTPRequestHandler):
                 "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume", "/start-research-audit",
             }:
                 return self.send({"error": "Not found."}, status=404)
-            self.send(app.snapshot())
+            self.send({**app.snapshot(), "batchId": "__root__"})
         except (OSError, TypeError, ValueError) as exc:
             self.send({"error": str(exc)}, status=400)

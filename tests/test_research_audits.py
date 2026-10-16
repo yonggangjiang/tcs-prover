@@ -1097,6 +1097,36 @@ class AuditProviderTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 audits.normalize_settings(options)
 
+    def test_every_provider_obeys_the_saved_live_or_disabled_search_mode(self):
+        for provider in ("codex", "claude", "kimi"):
+            for mode in ("live", "disabled"):
+                with self.subTest(provider=provider, mode=mode), tempfile.TemporaryDirectory() as directory:
+                    workspace = Path(directory)
+                    (workspace / "job-settings.json").write_text(json.dumps({"retrievalMode": mode}))
+                    def process(command, **kwargs):
+                        if provider == "codex":
+                            self.assertIn(f'web_search="{mode}"', command)
+                            self.assertIn("tools.web_search=" + str(mode == "live").lower(), command)
+                            Path(command[command.index("-o") + 1]).write_text("Audit")
+                        elif provider == "claude":
+                            expected = "Read,Glob,Grep" + (",WebSearch,WebFetch" if mode == "live" else "")
+                            self.assertEqual(command[command.index("--tools") + 1], expected)
+                            self.assertEqual(command[command.index("--allowedTools") + 1], expected)
+                            json.dump({"type": "result", "result": "Audit"}, kwargs["stdout"])
+                        else:
+                            agent = Path(command[command.index("--agent-file") + 1]).read_text()
+                            metadata = audits.yaml.safe_load(agent.split("---", 2)[1])
+                            expected = ["Read", "Grep", "Glob"] + (["WebSearch", "FetchURL"] if mode == "live" else [])
+                            self.assertEqual(metadata["tools"], expected)
+                            json.dump({"role": "assistant", "content": "Audit"}, kwargs["stdout"])
+                        kwargs["stdout"].flush()
+                        return Mock(stdin=io.StringIO(), returncode=0, poll=lambda: 0)
+                    with patch.object(audits, "resolve_executable", return_value=provider), \
+                            patch.object(audits.subprocess, "Popen", side_effect=process):
+                        result = audits.run_auditor({"provider": provider, "model": "selected"},
+                                                   "Review", workspace, threading.Event())
+                    self.assertEqual(result["text"], "Audit")
+
 
 if __name__ == "__main__":
     unittest.main()
