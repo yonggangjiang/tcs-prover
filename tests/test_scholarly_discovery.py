@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-import historical_search as hs
-import scholarly_discovery as sd
+from retrieval import historical_search as hs
+from retrieval import scholarly_discovery as sd
 
 CUTOFF = datetime(2026, 10, 2, 14, 13, 12, tzinfo=timezone.utc)
 ATOM = b'''<feed xmlns="http://www.w3.org/2005/Atom">

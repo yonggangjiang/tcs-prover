@@ -63,6 +63,26 @@ class FakeHandler(BaseHTTPRequestHandler):
         self.handle_request('POST')
 
 
+class _ApiModelRoutes:
+    def test_api_model_routes_reach_only_the_updated_controller(self):
+        status, value = self.request('/api-models')
+        self.assertEqual((status, value['route'], value['method']), (200, '/api-models', 'GET'))
+        self.assertNotIn('batchId', value)
+        for path in ('/api-models', '/api-models/delete', '/api-models/test'):
+            status, value = self.request(path, method='POST', body={'id': 'api:gateway'})
+            self.assertEqual((status, value['route'], value['method']), (200, path, 'POST'))
+        self.assertEqual([json.loads(body) for method, path, body in self.current.calls if path == '/api-models/test'],
+                         [{'id': 'api:gateway'}])
+        self.assertFalse([call for call in self.legacy.calls if call[1].startswith('/api-models')])
+        # The same authorization, query and body checks as every other route.
+        self.assertEqual(self.request('/api-models', authenticate=False)[0], 403)
+        self.assertEqual(self.request('/api-models/test', method='POST', body={}, authenticate=False)[0], 403)
+        self.assertEqual(self.request('/api-models?job=current')[0], 404)
+        self.assertEqual(self.request('/api-models/delete?job=current', method='POST', body={})[0], 404)
+        self.assertEqual(self.request('/api-models/test', method='POST', body={},
+                                      headers={'Content-Type': 'text/plain'})[0], 400)
+
+
 class _GatewayFixture(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -119,13 +139,22 @@ class _GatewayFixture(unittest.TestCase):
             connection.close()
 
 
-class GatewayTests(_GatewayFixture):
+class GatewayTests(_ApiModelRoutes, _GatewayFixture):
     def test_assets_are_new_and_need_no_controller_or_token(self):
         status, value = self.request('/app.js', authenticate=False)
         self.assertEqual((status, value), (200, b'new assets app.js'))
         self.assertEqual(self.legacy.calls, [])
         self.assertEqual(self.current.calls, [])
         self.assertEqual(self.request('/?job=legacy', authenticate=False)[0], 200)
+        # The page's theme preview parameter, alone or with the composer's, serves the same page.
+        for query in ('theme=light', 'new=1&theme=dark', 'job=legacy&theme=light'):
+            with self.subTest(query=query):
+                self.assertEqual(self.request('/?' + query, authenticate=False), (200, b'new assets index.html'))
+        # Other parameters, or any on the other assets, are still refused.
+        self.assertEqual(self.request('/?colour=light', authenticate=False)[0], 404)
+        self.assertEqual(self.request('/app.js?theme=light', authenticate=False)[0], 404)
+        self.assertEqual(self.legacy.calls, [])
+        self.assertEqual(self.current.calls, [])
 
     def test_host_origin_and_gateway_token_are_required(self):
         for options in ({'authenticate': False},

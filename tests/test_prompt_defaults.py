@@ -122,10 +122,11 @@ const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', author_si
 let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};
 const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATEMENT]'}),
                       setItem: () => {throw Error('Prompts must not be persisted');}};
-const ui = {promptEditor: {value: ''}, notice: {}, promptEditorLabel: {}, promptEditorHelp: {},
+const ui = {promptEditor: {value: '', focus() {this.focused = true;}}, notice: {}, promptEditorLabel: {},
+  promptEditorHelp: {}, promptError: {hidden: true},
   promptTabs: {querySelectorAll: () => []}, skipStatementReview: {checked: false},
   promptDialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}}};
-const show = () => {};
+const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
 const selectedAuthorPrompt = () => 'author_simple';
 const jobPath = path => path;
@@ -178,6 +179,46 @@ const checks = `
   assert.equal(ui.promptEditor.value, 'Custom simple [STATEMENT]');
   savePrompts();
   assert.deepEqual(promptOverrides, {author_simple: 'Custom simple [STATEMENT]', author: 'Custom managed [STATEMENT]'});
+
+  // An invalid Apply keeps the modal dialog open and explains why inside it, on the
+  // prompt to fix; the page notice behind the dialog is never used.
+  ui.notice = {};
+  await openPromptEditor();
+  assert.equal(ui.promptError.hidden, true);
+  selectPrompt('author_simple');
+  ui.promptEditor.value = 'No marker here';
+  selectPrompt('review');
+  savePrompts();
+  assert.equal(ui.promptDialog.open, true);
+  assert.equal(ui.promptError.hidden, false);
+  assert.equal(ui.promptError.textContent, 'Each author prompt must contain exactly one [STATEMENT].');
+  assert.equal(activePrompt, 'author_simple');
+  assert.equal(ui.promptEditor.focused, true);
+  assert.deepEqual(ui.notice, {});
+  // Editing clears it; an empty prompt on another tab is shown on that tab.
+  ui.promptEditor.oninput?.();
+  ui.promptEditor.value = 'Fixed [STATEMENT]';
+  selectPrompt('critic');
+  assert.equal(ui.promptError.hidden, true);
+  ui.promptEditor.value = '   ';
+  selectPrompt('review');
+  savePrompts();
+  assert.equal(activePrompt, 'critic');
+  assert.equal(ui.promptError.textContent, 'Every role prompt must contain instructions.');
+  assert.equal(ui.promptDialog.open, true);
+  // The variant the author tab does not show is named instead.
+  promptDrafts.critic = 'Critic';
+  promptDrafts.author = 'Managed without a marker';
+  activePrompt = 'review';
+  ui.promptEditor.value = 'Review';
+  savePrompts();
+  assert.equal(activePrompt, 'review');
+  assert.equal(ui.promptError.textContent,
+               'Each author prompt must contain exactly one [STATEMENT]. (the managed author prompt)');
+  promptDrafts.author = 'Managed [STATEMENT]';
+  savePrompts();
+  assert.equal(ui.promptDialog.open, false);
+  assert.deepEqual(ui.notice, {});
 })();
 `;
 Promise.resolve(vm.runInNewContext(setup + functions + checks, {assert}))

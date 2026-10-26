@@ -16,7 +16,7 @@ import tomllib
 import unittest
 from unittest.mock import Mock, patch
 
-import retrieval_runtime as retrieval
+from retrieval import runtime as retrieval
 import workflow_runner as runtime
 from ui import audits
 from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, success

@@ -37,7 +37,7 @@ class CommandTests(unittest.TestCase):
             self.assertNotIn('shell', kwargs)
             (kwargs['cwd']/'result.txt').write_text('Built result')
             return subprocess.CompletedProcess(argv, 0, 'Complete output ∀x')
-        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime.subprocess, 'run', side_effect=command):
+        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime, '_run_bounded', side_effect=command):
             runtime._apply_actions([{'command': self.config}], self.context, 'build', 0)
         self.assertEqual(self.context['state']['build']['status'], 'pass')
         self.assertIn('Complete output ∀x', (self.directory/'output/command.log').read_text())
@@ -45,13 +45,13 @@ class CommandTests(unittest.TestCase):
     def test_stale_result_does_not_make_an_empty_run_successful(self):
         (self.directory/'output').mkdir()
         (self.directory/'output/result.txt').write_text('Old result')
-        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'No new output')):
+        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime, '_run_bounded', return_value=subprocess.CompletedProcess([], 0, 'No new output')):
             result = runtime._run_command(self.config, self.context)
         self.assertEqual(result['status'], 'fail')
         self.assertIn('missing or empty', result['diagnostic'])
 
     def test_timeout_preserves_partial_output(self):
-        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime.subprocess, 'run', side_effect=subprocess.TimeoutExpired('builder', 3, output=b'partial output')):
+        with patch.object(runtime.shutil, 'which', return_value='/tools/builder'), patch.object(runtime, '_run_bounded', side_effect=subprocess.TimeoutExpired('builder', 3, output=b'partial output')):
             result = runtime._run_command(self.config, self.context)
         self.assertEqual(result['status'], 'fail')
         log = (self.directory/'output/command.log').read_text()

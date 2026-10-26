@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
-import historical_search as hs
+from retrieval import historical_search as hs
 import test_historical_search as fixtures
 
 
@@ -40,7 +40,7 @@ class CodexProviderTests(unittest.TestCase):
         module.validate_settings = self.validate
         module.preflight = self.preflight
         module.DiscoveryError = DiscoveryError
-        patcher = patch.dict(sys.modules, historical_codex_discovery=module)
+        patcher = patch.dict(sys.modules, {'retrieval.historical_codex_discovery': module})
         patcher.start()
         self.addCleanup(patcher.stop)
 

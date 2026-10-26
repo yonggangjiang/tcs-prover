@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-import validate_historical_search as validator
+from retrieval import validate_historical_search as validator
 
 
 CUTOFF = '2026-10-02T14:13:12Z'

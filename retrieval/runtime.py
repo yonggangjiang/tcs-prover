@@ -17,6 +17,7 @@ import queue
 import re
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -48,9 +49,14 @@ PUBLIC_EGRESS_CANARY = ("1.1.1.1", 443)
 WINDOWS_ADAPTER = "codex-windows-mxc-v1"
 MACOS_ADAPTER = "codex-macos-seatbelt-v1"
 SETTINGS_READ_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16)
-BROKER_MODULES = ('historical_transport.py', 'historical_rate_limit.py', 'historical_cache.py',
+BROKER_MODULES = ('__init__.py', 'historical_transport.py', 'historical_rate_limit.py', 'historical_cache.py',
                   'scholarly_discovery.py', 'historical_codex_discovery.py',
                   'historical_discovery_auth.py')
+# Before the broker moved into retrieval/, policies pinned it as
+# <checkout>/historical_search.py beside these modules, without a package.
+LEGACY_BROKER_MODULES = BROKER_MODULES[1:]
+LEGACY_BROKER_SCRIPT = Path(__file__).resolve().parents[1] / 'historical_search.py'
+CURRENT_BROKER_SCRIPT = Path(__file__).resolve().with_name('historical_search.py')
 _CRITIC_SESSIONS = {}
 
 
@@ -195,6 +201,14 @@ def load_policy(path):
             "--policy-sha256", policy_hash, "--audit-log", broker["auditLog"]]):
         raise RetrievalPolicyError("Historical broker arguments must bind the exact cutoff, policy hash and audit log.")
     script = _absolute(arguments[0], "broker script")
+    if script == LEGACY_BROKER_SCRIPT and not os.path.lexists(script):
+        # Prepared before this checkout moved the broker into retrieval/: run
+        # it from there. The policy file stays as written, so its recorded
+        # hash still matches; the saved author config is refreshed before start.
+        value["_legacyBrokerArgs0"] = arguments[0]
+        script = CURRENT_BROKER_SCRIPT
+        arguments = [str(script), *arguments[1:]]
+        value["broker"] = broker = {**broker, "args": arguments}
     _outside(script, workspace, "broker script")
     if not script.is_file():
         raise RetrievalPolicyError("Historical broker script is missing.")
@@ -202,7 +216,9 @@ def load_policy(path):
     value["_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     value["_brokerScriptSha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
     value["_brokerModuleSha256"] = {}
-    for name in BROKER_MODULES:
+    # An older checkout that still has the root layout runs its own six modules.
+    packaged = script.parent.name == "retrieval" or os.path.lexists(script.with_name("__init__.py"))
+    for name in (BROKER_MODULES if packaged else LEGACY_BROKER_MODULES):
         module = script.with_name(name)
         _outside(module, workspace, "broker module")
         if not module.is_file() or module.is_symlink():
@@ -221,8 +237,8 @@ def load_policy(path):
         raise RetrievalPolicyError("Historical broker credential environment is not in the audited allowlist.")
     value["_credentialEnv"] = credential_env
     if broker_policy.get('provider') == 'codex_wayback':
-        from historical_codex_discovery import validate_settings
-        from historical_transport import HistoricalSearchError
+        from retrieval.historical_codex_discovery import validate_settings
+        from retrieval.historical_transport import HistoricalSearchError
         try:
             discovery = validate_settings(broker_policy.get('discovery'), workspace=workspace)
         except (HistoricalSearchError, ValueError, OSError) as exc:
@@ -338,7 +354,7 @@ def role_workspace(policy, role):
 
 def _critic_paths(policy):
     """Only this controller's active context can select a critic snapshot."""
-    from historical_discovery_auth import _directory
+    from retrieval.historical_discovery_auth import _directory
 
     marker = policy.get("_criticSession")
     session = _CRITIC_SESSIONS.get(marker) if isinstance(marker, str) else None
@@ -363,7 +379,7 @@ def critic_session(policy):
     Sessions remain private on disk for audit; their capability expires on exit.
     No config, history, skills, project state or ambient credentials are copied.
     """
-    from historical_discovery_auth import _directory, _read_auth, preserve_refresh
+    from retrieval.historical_discovery_auth import _directory, _read_auth, preserve_refresh
 
     try:
         verified = load_policy(policy["_path"])
@@ -505,16 +521,45 @@ def _exact_configuration(expected, actual):
     return expected == actual
 
 
-def _validate_user_configuration(policy, role, actual, label="Isolated Codex configuration"):
+def _system_environment_policy(value):
+    """Recognize a no-inherit shell environment holding only SYSTEM_ENV names."""
+    names = {name.upper() for name in SYSTEM_ENV}
+    return (isinstance(value, dict) and set(value) == {"inherit", "set"}
+            and value["inherit"] == "none" and isinstance(value["set"], dict)
+            and all(isinstance(key, str) and isinstance(item, str) and key.upper() in names
+                    for key, item in value["set"].items()))
+
+
+def _validate_user_configuration(policy, role, actual, label="Isolated Codex configuration", *,
+                                 refresh_environment=False):
     """Accept only our exact config plus one known native bookkeeping record.
 
     The trust record is never an authorization to load project configuration.
     It is removed before process startup, and effective configuration layers
-    are independently checked before each model turn.
+    are independently checked before each model turn. Before startup only, a
+    controller restarted with a different PATH may also replace the saved
+    system-only shell environment; secrets or inherited values still fail.
+    Likewise the author's broker entry may move from the legacy root script
+    to retrieval/ (load_policy() maps exactly that path, nothing else).
     """
     expected = configuration(policy, role)
+    refreshed = False
+    if (refresh_environment and isinstance(actual, dict)
+            and _system_environment_policy(actual.get("shell_environment_policy"))
+            and not _exact_configuration(expected["shell_environment_policy"],
+                                         actual["shell_environment_policy"])):
+        actual = {**actual, "shell_environment_policy": expected["shell_environment_policy"]}
+        refreshed = True
+    legacy = policy.get("_legacyBrokerArgs0")
+    servers = actual.get("mcp_servers") if isinstance(actual, dict) else None
+    saved = servers.get(BROKER_NAME) if isinstance(servers, dict) else None
+    if refresh_environment and legacy and role == "author" and isinstance(saved, dict):
+        wanted = expected["mcp_servers"][BROKER_NAME]["args"]
+        if _exact_configuration([legacy, *wanted[1:]], saved.get("args")):
+            actual = {**actual, "mcp_servers": {**servers, BROKER_NAME: {**saved, "args": list(wanted)}}}
+            refreshed = True
     if _exact_configuration(expected, actual):
-        return False
+        return refreshed
     if isinstance(actual, dict) and "projects" in actual:
         remaining = {key: value for key, value in actual.items() if key != "projects"}
         if _exact_configuration(expected, remaining):
@@ -532,11 +577,12 @@ def _verify_saved_configuration(policy, role, config, expected):
         actual = tomllib.loads(original.decode("utf-8"))
     except (UnicodeError, ValueError) as exc:
         raise RetrievalPolicyError("Isolated Codex configuration has changed; re-prepare the run.") from exc
-    remove_native_trust = _validate_user_configuration(policy, role, actual)
-    if not remove_native_trust:
+    rewrite = _validate_user_configuration(policy, role, actual, refresh_environment=True)
+    if not rewrite:
         return
-    # Do not carry native auto-trust metadata into a fresh config load. Replace
-    # atomically, preserving all sessions/auth and refusing a concurrent edit.
+    # Do not carry native auto-trust metadata or an earlier controller PATH into
+    # a fresh config load. Replace atomically, preserving all sessions/auth and
+    # refusing a concurrent edit.
     temporary = config.with_name(f".retrieval-config-{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8") as stream:
@@ -717,10 +763,16 @@ def _sandbox_canaries(rpc, policy, role):
         inside.write_text(nonce, encoding="utf-8")
         for sentinel in (delete_canary, rename_canary):
             # Never overwrite an existing path, including a symlink planted in
-            # a previously unisolated workspace.
-            with sentinel.open("x", encoding="utf-8") as stream:
-                stream.write(nonce)
+            # a previously unisolated workspace. Only a plain file left by an
+            # interrupted controller preflight is removed first.
+            _remove_stale_sentinel(sentinel)
+            try:
+                stream = sentinel.open("x", encoding="utf-8")
+            except FileExistsError as exc:
+                raise RetrievalPolicyError(f"Historical sandbox canary path {sentinel} already exists; inspect and remove it before resuming.") from exc
             created_sentinels.append(sentinel)
+            with stream:
+                stream.write(nonce)
         listener.bind(("127.0.0.1", 0))
         listener.listen(2)
         port = listener.getsockname()[1]
@@ -781,6 +833,19 @@ def _sandbox_canaries(rpc, policy, role):
         for sentinel in created_sentinels:
             sentinel.unlink(missing_ok=True)
         renamed_canary.unlink(missing_ok=True)
+
+
+def _remove_stale_sentinel(path):
+    """Delete a canary left by a killed preflight; refuse links and other types."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())):
+        raise RetrievalPolicyError(f"Historical sandbox canary path {path} is not a stale controller file; inspect and remove it before resuming.")
+    path.unlink()
 
 
 def _macos_canary_command(nonce, inside, protected, settings, delete_canary,

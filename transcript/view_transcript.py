@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import secrets
 import sys
 import time
@@ -28,7 +29,7 @@ RESULT_KINDS = {
     "failure_result", "partial_result",
 }
 TOOL_TYPES = {
-    "collabAgentToolCall", "collab_agent_tool_call",
+    "collabAgentToolCall", "collab_agent_tool_call", "collab_tool_call",
     "subAgentActivity", "sub_agent_activity",
     "commandExecution", "command_execution",
     "fileChange", "file_change",
@@ -37,8 +38,46 @@ TOOL_TYPES = {
     "webSearch", "web_search",
 }
 COMPLETED_EVENTS = {"item/completed", "item.completed"}
+RUN_MARKERS = ("job-settings.json", "transcript.jsonl", "draft.md", "checked-statement.md")
 UI_BATCH_LIMIT = 250
 UI_SCAN_BYTES = 8 * 1024 * 1024
+UI_STALE_TAIL_SECONDS = 5
+
+
+def _visible_folders(directory):
+    """Yield real child directories; deleted jobs live in runs/.trash."""
+
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return
+    for child in children:
+        try:
+            if not child.name.startswith(".") and not child.is_symlink() and child.is_dir():
+                yield child
+        except OSError:
+            continue
+
+
+def newest_transcript(runs):
+    """Return the newest transcript of a direct job or a job in a batch folder."""
+
+    newest = None
+    for folder in _visible_folders(runs):
+        # Look one level into batch folders only. Never descend into a job,
+        # whose workspace could hold a planted decoy transcript.
+        is_run = any(os.path.lexists(folder / name) for name in RUN_MARKERS)
+        for job in [folder] if is_run else _visible_folders(folder):
+            candidate = job / "transcript.jsonl"
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                modified = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or modified > newest[0]:
+                newest = (modified, candidate)
+    return newest[1] if newest else None
 
 
 def transcript_path(value=None):
@@ -52,19 +91,10 @@ def transcript_path(value=None):
             raise ValueError(f"Transcript does not exist: {path}")
         return path.resolve()
 
-    candidates = []
-    runs = ROOT / "runs"
-    if runs.is_dir():
-        for folder in runs.iterdir():
-            try:
-                candidate = folder / "transcript.jsonl"
-                if candidate.is_file():
-                    candidates.append(candidate)
-            except OSError:
-                continue
-    if not candidates:
+    newest = newest_transcript(ROOT / "runs")
+    if newest is None:
         raise ValueError("No transcript found. Pass a transcript.jsonl or run directory.")
-    return max(candidates, key=lambda path: path.stat().st_mtime).resolve()
+    return newest.resolve()
 
 
 def plain_text(value):
@@ -92,6 +122,31 @@ def one_line(value, limit=240):
     return result
 
 
+def critic_edited(record, report):
+    """Return whether a critic passed only after changing the candidate."""
+
+    # Older critics reported `fixed`; the workflow now records outcome=fixed.
+    return bool(report.get("fixed")) or str(record.get("outcome") or "").lower() == "fixed"
+
+
+def agent_reports(event_name, item):
+    """Return the subagent reports carried by a completed codex exec wait call."""
+
+    if (
+        event_name not in COMPLETED_EVENTS or item.get("type") != "collab_tool_call"
+        or str(item.get("tool") or "").lower() != "wait"
+    ):
+        return ""
+    states = item.get("agents_states")
+    if not isinstance(states, dict):
+        return ""
+    return "\n\n".join(
+        f"{agent} ({state.get('status') or 'unknown'}): {plain_text(state.get('message'))}"
+        for agent, state in states.items()
+        if isinstance(state, dict) and plain_text(state.get("message"))
+    )
+
+
 class TranscriptViewer:
     """Incrementally convert stored protocol records into a human narrative."""
 
@@ -109,6 +164,8 @@ class TranscriptViewer:
         self.current_stage = None
         self.partials = {}
         self.seen_tools = set()
+        # Every codex exec process restarts its item ids at item_0.
+        self.exec_threads = {}
         self.goal_status = None
         self.records = 0
         self.shown = 0
@@ -166,6 +223,18 @@ class TranscriptViewer:
         if not isinstance(item, dict):
             item = {}
         return event, name, params, item
+
+    @staticmethod
+    def _exec_scope(record):
+        return str(record.get("stage") or ""), str(record.get("activityLabel") or "")
+
+    def _partial(self, key, record, params, root):
+        # Keep the origin so finish() still honors --stage and --root-only.
+        partial = self.partials.setdefault(
+            key, {"text": "", "stage": record.get("stage"), "root": root}
+        )
+        partial["text"] += str(params.get("delta") or "")
+        partial["time"] = record.get("time")
 
     def malformed_line(self, line_number, line):
         self.records += 1
@@ -227,8 +296,11 @@ class TranscriptViewer:
                     f"- [{str(check.get('verdict') or '?').upper()}] "
                     f"{check.get('focus') or 'check'}: {one_line(check.get('report'))}"
                 )
-            if report.get("fixed"):
-                lines.append("- The critic changed the candidate; another critic must recheck it.")
+            if critic_edited(record, report):
+                lines.append(
+                    "- Edited pass: the critic repaired the candidate; a fresh critic "
+                    "rechecks it unless the round limit was reached."
+                )
             if plain_text(report.get("bugs")):
                 lines.extend(["", "Unresolved bugs:", plain_text(report["bugs"])])
             self._write(
@@ -259,28 +331,29 @@ class TranscriptViewer:
         item_id = str(params.get("itemId") or item.get("id") or "")
         item_type = item.get("type") or ""
 
+        if name == "thread.started":
+            scope = self._exec_scope(record)
+            self.exec_threads[scope] = self.exec_threads.get(scope, 0) + 1
+            return
+
         if name == "item/reasoning/summaryTextDelta":
-            key = ("reasoning", item_id)
-            self.partials[key] = self.partials.get(key, "") + str(params.get("delta") or "")
+            self._partial(("reasoning", item_id), record, params, root)
             return
 
         if name == "item/agentMessage/delta":
-            key = ("agent", item_id)
-            self.partials[key] = self.partials.get(key, "") + str(params.get("delta") or "")
+            self._partial(("agent", item_id), record, params, root)
             return
 
         if name in COMPLETED_EVENTS and item_type == "reasoning":
-            key = ("reasoning", item_id)
-            value = item.get("text") or plain_text(item.get("summary")) or self.partials.get(key, "")
-            self.partials.pop(key, None)
+            partial = self.partials.pop(("reasoning", item_id), None) or {}
+            value = item.get("text") or plain_text(item.get("summary")) or partial.get("text", "")
             if plain_text(value):
                 self._write(record, "REASONING SUMMARY", value, root=root)
             return
 
         if name in COMPLETED_EVENTS and item_type in {"agentMessage", "agent_message"}:
-            key = ("agent", item_id)
-            value = item.get("text") or self.partials.get(key, "")
-            self.partials.pop(key, None)
+            partial = self.partials.pop(("agent", item_id), None) or {}
+            value = item.get("text") or partial.get("text", "")
             if plain_text(value):
                 phase = str(item.get("phase") or "").upper()
                 self._write(record, phase or "MODEL MESSAGE", value, root=root)
@@ -320,9 +393,16 @@ class TranscriptViewer:
 
         status = str(item.get("status") or "").lower()
         failed = status in {"failed", "error", "cancelled"}
-        if item_id in self.seen_tools and not failed:
+        reports = "" if failed else agent_reports(event_name, item)
+        # Scope ids by exec process: each one restarts its item ids at item_0.
+        scope = self._exec_scope(record)
+        key = (*scope, self.exec_threads.get(scope, 0), item_id, bool(reports))
+        if key in self.seen_tools and not failed:
             return
-        self.seen_tools.add(item_id)
+        self.seen_tools.add(key)
+        if reports:
+            self._write(record, "SUBAGENT REPORTS", reports, root=root)
+            return
 
         item_type = item.get("type") or "tool"
         action = item.get("tool") or item.get("name") or item.get("command")
@@ -358,14 +438,14 @@ class TranscriptViewer:
     def finish(self):
         """Flush incomplete streaming messages and print a short accounting."""
 
-        for (kind, _item_id), value in list(self.partials.items()):
-            if value:
-                record = {"stage": self.current_stage or "unknown", "time": None}
+        for (kind, _item_id), partial in list(self.partials.items()):
+            if partial["text"]:
+                record = {"stage": partial["stage"], "time": partial.get("time")}
                 self._write(
                     record,
                     "INCOMPLETE REASONING SUMMARY" if kind == "reasoning"
                     else "INCOMPLETE MODEL MESSAGE",
-                    value,
+                    partial["text"], root=partial["root"],
                 )
         self.partials.clear()
         self.output.write(
@@ -377,16 +457,23 @@ class TranscriptViewer:
 def records(path, follow=False, poll_seconds=0.5):
     """Yield decoded records and malformed source lines, optionally following."""
 
-    with path.open("r", encoding="utf-8", errors="replace") as source:
-        line_number = 0
+    with path.open("rb") as source:
+        line_number, pending = 0, b""
         while True:
-            line = source.readline()
-            if line:
+            chunk = source.readline()
+            pending += chunk
+            # A live writer may not have finished the last line yet. Buffer
+            # bytes, so a character split at the boundary still decodes.
+            if pending.endswith(b"\n") or (pending and not chunk and not follow):
+                line = pending.decode("utf-8", errors="replace")
+                pending = b""
                 line_number += 1
                 try:
                     yield line_number, json.loads(line), None
                 except json.JSONDecodeError:
                     yield line_number, None, line.rstrip("\r\n")
+                continue
+            if chunk:
                 continue
             if not follow:
                 return
@@ -425,14 +512,16 @@ def ui_entry(record, offset):
         report = record.get("report") or {}
         if not isinstance(report, dict):
             report = {}
+        edited = critic_edited(record, report)
         return entry(
             "critic", record.get("label") or "Critic result",
             report.get("bugs") or (
-                "The critic repaired the candidate; a fresh critic will recheck it."
-                if report.get("fixed") else "No unresolved bugs."
+                "Edited pass: the critic repaired the candidate; a fresh critic "
+                "rechecks it unless the round limit was reached."
+                if edited else "No unresolved bugs."
             ),
             verdict=report.get("verdict") or "",
-            fixed=bool(report.get("fixed")),
+            fixed=edited,
             checks=report.get("checks") if isinstance(report.get("checks"), list) else [],
         )
     if kind in RESULT_KINDS:
@@ -462,6 +551,9 @@ def ui_entry(record, offset):
     if item_type in TOOL_TYPES:
         status = str(item.get("status") or "").lower()
         failed = status in {"failed", "error", "cancelled"}
+        reports = "" if failed else agent_reports(name, item)
+        if reports:
+            return entry("tool", "Subagent reports", reports)
         if name in COMPLETED_EVENTS and not failed:
             return None
         if item_type in {"subAgentActivity", "sub_agent_activity"}:
@@ -507,12 +599,16 @@ def read_ui_batch(path, offset=0, limit=UI_BATCH_LIMIT):
         limit = min(UI_BATCH_LIMIT, max(1, int(limit)))
     except (TypeError, ValueError) as exc:
         raise ValueError("Invalid transcript cursor.") from exc
-    size = path.stat().st_size
+    info = path.stat()
+    size = info.st_size
+    # A writer this quiet is no longer finishing an unterminated last line.
+    tail_stale = time.time() - info.st_mtime >= UI_STALE_TAIL_SECONDS
     if offset > size:
         offset = 0
     entries = []
     scanned = 0
     malformed = 0
+    incomplete = False
     with path.open("rb") as source:
         source.seek(offset)
         while len(entries) < limit and scanned < UI_SCAN_BYTES:
@@ -520,15 +616,36 @@ def read_ui_batch(path, offset=0, limit=UI_BATCH_LIMIT):
             raw = source.readline()
             if not raw:
                 break
-            # A live writer may not have finished the last JSON line yet.
-            if not raw.endswith((b"\n", b"\r")) and source.tell() >= size:
+            try:
+                record, decoded = json.loads(raw.decode("utf-8", errors="replace")), True
+            except json.JSONDecodeError:
+                record, decoded = None, False
+            # A live writer may not have finished the last JSON line yet. Accept
+            # a complete object: a strict prefix of one never parses as one.
+            if (
+                raw.strip() and not raw.endswith((b"\n", b"\r"))
+                and source.tell() >= size and not isinstance(record, dict)
+            ):
                 source.seek(line_offset)
+                # A tail grown since the quiet stat still has an active writer.
+                if tail_stale and line_offset + len(raw) == size:
+                    incomplete = True
+                    entries.append({
+                        "id": f"{line_offset}:incomplete", "stage": "unknown",
+                        "stageLabel": "UNKNOWN", "time": "", "root": True,
+                        "category": "diagnostic", "label": "Incomplete record",
+                        "text": (
+                            f"Incomplete final record near byte {line_offset:,}; "
+                            "the transcript ends before this line was finished."
+                        ),
+                    })
                 break
             offset = source.tell()
             scanned += len(raw)
-            try:
-                record = json.loads(raw.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
+            # A newline can arrive after its record was accepted above.
+            if not raw.strip():
+                continue
+            if not decoded:
                 malformed += 1
                 entries.append({
                     "id": str(line_offset), "stage": "unknown",
@@ -545,7 +662,8 @@ def read_ui_batch(path, offset=0, limit=UI_BATCH_LIMIT):
         "entries": entries,
         "nextOffset": offset,
         "fileSize": latest_size,
-        "eof": offset >= latest_size,
+        # An abandoned partial line must not keep the browser reading forever.
+        "eof": offset >= latest_size or (incomplete and latest_size == size),
         "scannedBytes": scanned,
         "malformed": malformed,
     }
@@ -668,7 +786,8 @@ def serve_ui(path, port=0, open_browser=True):
     server = TranscriptHTTPServer(("127.0.0.1", port), path, token)
     url = f"http://127.0.0.1:{server.server_port}/#{token}"
     print(f"Transcript UI: {url}")
-    print("Press Ctrl-C to stop.")
+    # A redirected log may hold the only copy of the token URL.
+    print("Press Ctrl-C to stop.", flush=True)
     if open_browser:
         webbrowser.open(url)
     try:
@@ -690,7 +809,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "transcript", nargs="?",
-        help="transcript.jsonl or its run directory; defaults to the newest run",
+        help=(
+            "transcript.jsonl or its run directory; defaults to the newest run "
+            "under runs/, including jobs inside batch folders"
+        ),
     )
     parser.add_argument(
         "--text", action="store_true",
@@ -719,7 +841,17 @@ def parse_args(argv=None):
     return args
 
 
+def configure_standard_streams():
+    """Keep text mode working when stdout is not UTF-8, e.g. Windows pipes."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    configure_standard_streams()
     args = parse_args(argv)
     try:
         path = transcript_path(args.transcript)
@@ -737,6 +869,9 @@ def main(argv=None):
             output = sys.stdout
         try:
             output.write(f"TCS Prover transcript\nSource: {path}\n")
+            # Show live progress promptly through pipes and files.
+            if args.follow:
+                output.flush()
             viewer = TranscriptViewer(
                 output,
                 show_prompts=args.prompts,
@@ -751,6 +886,8 @@ def main(argv=None):
                         viewer.malformed_line(line_number, malformed)
                     else:
                         viewer.consume(record)
+                    if args.follow:
+                        output.flush()
             except KeyboardInterrupt:
                 output.write("\nStopped following transcript.\n")
             viewer.finish()

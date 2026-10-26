@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-import retrieval_runtime as retrieval
+from retrieval import runtime as retrieval
 import workflow_runner as runtime
 from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, success
 
@@ -85,7 +85,12 @@ class SearchModesRuntimeTests(unittest.TestCase):
                 snapshot = Path(command[command.index('-C') + 1])
                 self.addCleanup(shutil.rmtree, snapshot)
                 self.assertIn(f'web_search="{mode}"', command)
-                self.assertEqual(command[command.index('-s') + 1], 'read-only')
+                # Read-only either way; on macOS the profile also hides TCS Prover's private state.
+                if runtime.private_permissions(':read-only', runtime.MODEL) is None:
+                    self.assertEqual(command[command.index('-s') + 1], 'read-only')
+                else:
+                    self.assertNotIn('-s', command)
+                    self.assertIn(f'permissions.{runtime.PRIVATE_PERMISSIONS}.extends=":read-only"', command)
                 for name, value in files:
                     self.assertEqual((snapshot / name).read_text(), value)
                     if os.name != 'nt':

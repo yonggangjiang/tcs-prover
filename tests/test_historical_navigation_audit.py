@@ -4,8 +4,8 @@ import hashlib
 import json
 import unittest
 
-import audit_historical_trajectory as auditor
-from historical_search import canonical_json, LIMITATION
+from retrieval import audit_historical_trajectory as auditor
+from retrieval.historical_search import canonical_json, LIMITATION
 try:
     from tests import test_historical_trajectory_audit as fixtures
 except ImportError:

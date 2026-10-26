@@ -288,7 +288,7 @@ const checks = `
     statements: [{name: '02_cutquery_reachability', statement: 'Extensionless statement.'}, {name: 'A.md', statement: 'Prove A.'}, {name: 'b.md', statement: 'Prove B.'},
                  {name: 'c.MD', statement: 'Prove C.'}, {name: 'notes.txt', statement: 'Text statement.'},
                  {name: 'problem.tex', statement: 'TeX statement.'}],
-    empty: ['empty.md'],
+    empty: ['empty.md'], binary: [],
   });
 
   await startFolderBatch(folder);
@@ -316,7 +316,7 @@ const checks = `
   assert.equal(ui.batchStatus.textContent, 'Started 6 jobs from statements.'
     + '\\nSkipped 1 empty file: empty.md.');
   assert.deepEqual(rendered, [{runId: 'job-0'}]);
-  assert.equal(ui.jobsPanel.scrolled, true);
+  assert.equal(ui.batchStatus.scrolled, true); // the result above the list is brought into view
   assert.equal(polled, 1);
 
   // A second change event while a batch is being sent starts nothing more.

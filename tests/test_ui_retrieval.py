@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-import retrieval_runtime
+from retrieval import runtime as retrieval_runtime
 from ui import retrieval, server
 
 CUTOFF = '2026-10-02T14:13:12Z'
@@ -224,7 +224,7 @@ class RetrievalUITests(unittest.TestCase):
         bad = [{'retrievalMode': 'unknown'}, {'retrievalCutoffUtc': '2026-10-02'},
                {'retrievalCutoffUtc': '2026-10-02T14:13:12+01:00'},
                {'retrievalCutoffUtc': '2999-01-01T00:00:00Z'},
-               {'authorModel': server.runtime.DEEPSEEK_MODEL},
+               {'authorModel': 'claude-opus-5-5'},
                {'fileManagement': True, 'researchAudits': {'models': ['gpt-6-astra', 'none', 'none']}}]
         for options in bad:
             with self.subTest(options=options), self.assertRaises(ValueError):

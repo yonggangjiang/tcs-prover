@@ -137,9 +137,15 @@ ui.skipStatementReview.checked=false;
 assert.equal(validateRetrievalSettings(),false);
 assert(validateRetrievalSettings({folder:true}));
 ui.skipStatementReview.checked=true;
-ui.criticModel.value='deepseek-v4-pro';
-assert.equal(validateRetrievalSettings(),false);
-assert.equal(ui.criticModel.value,'deepseek-v4-pro');
+// Web cutoff timestamps need native Codex CLI models: not Claude CLI models, not API models.
+for (const model of ['claude-opus-5-5','api:lab-sol']) {
+  ui.criticModel.value=model;ui.criticModel.focused=false;
+  assert.equal(validateRetrievalSettings(),false);
+  assert.equal(ui.criticModel.value,model);
+  assert.equal(ui.notice.textContent,'Web cutoff timestamps require Codex CLI models for every proof role. '
+    +'Choose a Codex CLI model for the independent critic.');
+  assert.equal(ui.criticModel.focused,true);
+}
 ui.criticModel.value='gpt-6.1-sol';setManaged(true);setAudits(['gpt-6-astra','none','none']);
 assert.equal(validateRetrievalSettings(),false);
 setAudits(['none','none','none']);assert(validateRetrievalSettings());
@@ -149,7 +155,7 @@ setAudits(['none','none','none']);assert(validateRetrievalSettings());
         self.browser(r"""
 delete state.retrievalCapabilities;
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value=' -1 ';
-ui.skipStatementReview.checked=false;ui.criticModel.value='deepseek-v4-pro';
+ui.skipStatementReview.checked=false;ui.criticModel.value='claude-opus-5-5';
 setManaged(true);setAudits(['gpt-6-astra','none','none']);
 renderRetrievalSettings();
 assert(!ui.retrievalCutoffSetting.hidden);assert(!ui.retrievalCutoffUtc.disabled);

@@ -53,7 +53,6 @@ class BatchCatalogTests(unittest.TestCase):
         self.assertFalse(lookup['search-v4']['readOnly'])
         self.assertEqual(lookup['search-v2']['folder'], 'runs/search-v2')
         self.assertTrue(all(row['jobCount'] == 1 for row in cards))
-        self.assertEqual(self.catalog.batch_id(self.old_root), 'search-v2')
 
     def test_catalog_does_not_read_transcripts_or_instantiate_apps(self):
         for directory in (self.original, self.old, self.current):
@@ -91,6 +90,12 @@ class BatchCatalogTests(unittest.TestCase):
         self.assertEqual(state['statement'], 'A finite theorem.')
         self.assertEqual(state['activeElapsedSeconds'], 120)
         self.assertEqual(state['authorModel'], 'saved-model')
+        # A direct-proof job uses its own graph, and still carries the model catalog.
+        self.assertEqual(state['workflow']['nodes'], server.DIRECT_GRAPH['nodes'])
+        settings = state['workflow']['settings']
+        self.assertTrue(set(server.OFFERED_MODELS) <= {row['id'] for row in settings['model_catalog']})
+        self.assertIn('claude-opus-5-5', settings['model_efforts'])
+        self.assertNotIn('model_catalog', server.DIRECT_GRAPH['settings'])
         self.assertEqual(state['retrieval']['cutoffExclusiveUtc'], '2026-01-01T00:00:00Z')
         self.assertEqual(state['autoResumeAt'], 0)
         self.assertTrue(state['readOnly'])

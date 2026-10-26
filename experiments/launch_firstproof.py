@@ -12,8 +12,8 @@ from pathlib import Path
 import subprocess
 import threading
 
-import prepare_firstproof as preparation
-import retrieval_runtime as retrieval
+from experiments import prepare_firstproof as preparation
+from retrieval import runtime as retrieval
 from ui.server import HOST, Server, saved_statement
 
 
@@ -184,7 +184,7 @@ def preflight_one(plan, auth_home):
 
 
 def preflight_batch(plans, auth_home, control_root):
-    from isolated_compiler import preflight as compiler_preflight
+    from retrieval.isolated_compiler import preflight as compiler_preflight
     report = {'checkedAtUtc': datetime.now(timezone.utc).isoformat(),
               'platform': 'macOS', 'modelsStarted': 0,
               'selectedProblemIds': [plan['id'] for plan in plans], 'runs': []}

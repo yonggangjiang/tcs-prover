@@ -17,10 +17,10 @@ import re
 import sys
 from urllib.parse import unquote, urlsplit
 
-from historical_search import canonical_json, canonical_url, parse_cutoff, HistoricalSearchError, LIMITATION
+from retrieval.historical_search import canonical_json, canonical_url, parse_cutoff, HistoricalSearchError, LIMITATION
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / 'experiments' / 'firstproof-batch3' / 'manifest.json'
 FULL_DOCUMENT_NAVIGATION = 'full-document-v1'
 CODEX_DISCOVERY_PROVIDER = 'codex_wayback'
@@ -454,7 +454,11 @@ def audit_problem(problem_id, cutoff, transcript_path, broker_log_path, expected
         thread = params.get('threadId')
         if isinstance(thread, str):
             threads.add(thread)
+        # The author keeps its subagents; the controller records their events
+        # with root false and the child's thread. Their MCP replies are still
+        # reconciled against this problem's broker log below.
         if (expected_thread_id and record.get('stage') == 'solve' and record.get('node') == 'author'
+                and record.get('root') is not False
                 and thread is not None and thread != expected_thread_id):
             _issue(issues, 'thread_mismatch', 'Author event belongs to another thread.', line, record_source)
         item = params.get('item')

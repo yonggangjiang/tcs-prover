@@ -15,8 +15,21 @@ def main():
         # Keep the virtualenv path intact: resolving its Python symlink would
         # select the base interpreter and lose the installed dependencies.
         flags = ["-B"] if sys.dont_write_bytecode else []
+        command = [str(executable), *flags, str(entry), *sys.argv[1:]]
         try:
-            os.execv(str(executable), [str(executable), *flags, str(entry), *sys.argv[1:]])
+            if os.name == "nt":
+                # Windows execv joins arguments without quoting and exits 0 at
+                # once. A waited child keeps spaced arguments and its status.
+                import subprocess
+                child = subprocess.Popen(command)
+                while True:
+                    try:
+                        return child.wait()
+                    except KeyboardInterrupt:
+                        # The child shares this console, receives the same
+                        # Ctrl-C and stops its own jobs before exiting.
+                        continue
+            os.execv(str(executable), command)
         except OSError as exc:
             print(f"Cannot start the project Python environment: {exc}", file=sys.stderr)
             return 1

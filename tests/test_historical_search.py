@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit, quote
 
-import historical_search as hs
+from retrieval import historical_search as hs
 
 CUTOFF = '2026-10-02T12:00:00Z'
 SOURCE = 'https://example.org/paper'
@@ -283,7 +283,7 @@ class EngineTests(unittest.TestCase):
         for url in ('https://example.org/', 'http://web.archive.org/', 'https://web.archive.org:444/', 'https://evil@web.archive.org/'):
             with self.subTest(url=url), self.assertRaises(hs.HistoricalSearchError):
                 client.get(url)
-        with patch('historical_search.socket.getaddrinfo', return_value=[(2, 1, 6, '', ('127.0.0.1', 443))]):
+        with patch('retrieval.historical_search.socket.getaddrinfo', return_value=[(2, 1, 6, '', ('127.0.0.1', 443))]):
             with self.assertRaises(hs.HistoricalSearchError):
                 client.get('https://web.archive.org/cdx/search/cdx')
 

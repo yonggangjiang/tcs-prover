@@ -1,6 +1,8 @@
 """Manage proof jobs and serve the local browser interface."""
 
+import errno
 import getpass
+import http.client
 import json
 import math
 import os
@@ -8,19 +10,23 @@ import re
 import secrets
 import shutil
 import signal
+import socket
+import ssl
 import stat
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import workflow_runner as runtime
+from runner import claude_cli, providers
 from . import audits, retrieval
 from .review import REVIEW_PROMPT
 
@@ -48,6 +54,9 @@ DEFAULT_REVIEW_EFFORT = runtime.REVIEW_EFFORT
 REASONING_SUMMARIES = runtime.REASONING_SUMMARIES
 DEFAULT_REASONING_SUMMARY = runtime.DEFAULT_REASONING_SUMMARY
 STOP_TIMEOUT_SECONDS = 2
+# Stop interrupts a POSIX runner group this long before killing it, so the
+# runner's cleanup deletes any key-bearing Claude settings file it holds.
+STOP_GRACE_SECONDS = 3
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
 AUTHOR_STEER_FILENAME = "author-steer.json"
@@ -60,13 +69,78 @@ REVIEW_INPUT_FILENAME = "review-input.json"
 RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md"}
 APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
 AUDIT_MEMORY_FILE = re.compile(r"(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
-LEGACY_MODEL_ALIASES = {"deepseek/deepseek-v4-pro": runtime.DEEPSEEK_MODEL}
 MAX_REQUEST_BYTES = 100_000
 MAX_DOCUMENT_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_BATCH_STATEMENTS = 200
 MAX_BATCH_STATEMENT_CHARS = 100_000
 MAX_SOURCE_FILE_CHARS = 255
-AUTO_RESUME_SECONDS = 10 * 60
+# An error-paused author is resumed automatically after the same wait as
+# every other model-call retry (workflow_runner.MODEL_RETRY_SECONDS).
+AUTO_RESUME_SECONDS = runtime.MODEL_RETRY_SECONDS
+# How the runner's own messages begin when the workflow budget runs out
+# ("Workflow time limit reached." or "...; saved work remains resumable.").
+# A provider or CLI error that merely mentions a time limit is still retried.
+WORKFLOW_TIME_LIMIT_ERROR = "Workflow time limit reached"
+ROLES = ("review", "author", "critic", "writer")
+ROLE_LABELS = {
+    "review": "statement reviewer", "author": "proof author",
+    "critic": "critic", "writer": "LaTeX editor",
+}
+# Jobs whose model processes are running or about to run.
+ACTIVE_PHASES = {"reviewing", "running", "stopping", "pausing"}
+# Idle jobs that launch again with their saved models (Resume, Approve, Start).
+WAITING_PHASES = {"paused", "reviewed", "prepared"}
+# The API model Test button sends one tiny request and follows no redirect.
+API_TEST_TIMEOUT_SECONDS = 30
+API_TEST_PROMPT = "Reply with OK."
+API_TEST_MAX_TOKENS = 16
+API_TEST_MAX_RESPONSE_BYTES = 64 * 1024
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def retry_interval_text(seconds=None):
+    """The automatic retry interval in words ("1 minute")."""
+
+    seconds = AUTO_RESUME_SECONDS if seconds is None else seconds
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds:g} seconds"
+
+
+def load_pause_checkpoint(run_dir):
+    """Read pause.json for Resume; a damaged one raises ValueError before anything uses it.
+
+    The run folder is the author's writable workspace, so the file can be
+    truncated, replaced or edited. Resume needs an object with the saved
+    workflow state, node, stage and elapsed time.
+    """
+
+    try:
+        checkpoint = json.loads((Path(run_dir) / PAUSE_FILENAME).read_text(encoding="utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise ValueError(f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged: {exc}") from exc
+    elapsed = checkpoint.get("elapsedSeconds") if isinstance(checkpoint, dict) else None
+    if not (isinstance(checkpoint, dict) and isinstance(checkpoint.get("state"), dict)
+            and all(isinstance(checkpoint.get(key), str) and checkpoint[key] for key in ("node", "stage"))
+            and isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+            and math.isfinite(elapsed) and elapsed >= 0):
+        raise ValueError(f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged: it lacks the saved "
+                         "workflow state, node, stage or elapsed time")
+    return checkpoint
+
+
+def read_pause_object(run_dir):
+    """Read pause.json for display and routing; a missing or damaged file reads as {}.
+
+    Only Resume needs a valid checkpoint, and it checks one with load_pause_checkpoint.
+    """
+
+    try:
+        checkpoint = json.loads((Path(run_dir) / PAUSE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return checkpoint if isinstance(checkpoint, dict) else {}
 
 
 def goal_thread_from_record(record):
@@ -97,7 +171,14 @@ def isolated_process_options():
 
 
 def stop_process_tree(process):
-    """Force-stop one Codex wrapper and every process it launched."""
+    """Stop one Codex wrapper and every process it launched.
+
+    On POSIX the whole group is interrupted first (Ctrl-C), so the runner
+    unwinds its cleanup and deletes private settings files, then killed after
+    STOP_GRACE_SECONDS. Windows ends the tree at once, without that cleanup.
+    Either way the private settings a killed runner left behind are removed
+    once it has ended (claude_cli.sweep_stale_settings()).
+    """
 
     if process is None or process.poll() is not None:
         return
@@ -117,6 +198,12 @@ def stop_process_tree(process):
             pass
     else:
         try:
+            os.killpg(process.pid, signal.SIGINT)
+            process.wait(timeout=STOP_GRACE_SECONDS)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+        try:
+            # Also stops children that outlived an interrupted runner.
             os.killpg(process.pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
             pass
@@ -126,6 +213,7 @@ def stop_process_tree(process):
         # This fallback is only for a failed platform tree-stop operation.
         process.kill()
         process.wait()
+    claude_cli.sweep_stale_settings()
 
 
 def grant_windows_access(path, identity, permissions):
@@ -182,6 +270,107 @@ def prepare_runs_directory(path):
     grant_windows_access(path, WINDOWS_EVERYONE_SID, "(RX)")
 
 
+# The sandboxed author can write its run folder. Never follow a link, or
+# block on a FIFO, that it leaves where the controller keeps a run log.
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+BINARY = getattr(os, "O_BINARY", 0)
+# Open errors caused by the entry itself: a link (ELOOP, or EMLINK on BSD), a
+# FIFO or socket, a folder, or a log whose permissions were taken away.
+# Resource errors such as EMFILE are reported, never treated as tampering.
+UNUSABLE_LOG_ERRORS = {
+    errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EOPNOTSUPP,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP), errno.EISDIR, errno.EACCES, errno.EPERM,
+}
+# A Windows reparse point whose tag has this bit names another file: a
+# symlink, a junction, or a similar link, which ``lstat`` does not follow.
+# Other reparse points, such as cloud-sync placeholders and deduplicated
+# files, open as the ordinary files they are and are used in place.
+NAME_SURROGATE_TAG = 0x20000000
+
+
+def linked_entry(info):
+    """Whether ``lstat`` information describes a symlink, junction, or other Windows link."""
+
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        and getattr(info, "st_reparse_tag", 0) & NAME_SURROGATE_TAG
+    )
+
+
+def open_run_log(path, flags, *, private=True):
+    """Open a run log only if it is one regular file; return None otherwise.
+
+    ``private`` restores owner-only access through the open descriptor.
+    """
+
+    if not NOFOLLOW:
+        # Windows has no O_NOFOLLOW: refuse symlinks and junctions first.
+        try:
+            if linked_entry(os.lstat(path)):
+                return None
+        except FileNotFoundError:
+            pass
+    try:
+        descriptor = os.open(path, flags | NOFOLLOW | NONBLOCK | BINARY, 0o600)
+    except OSError as exc:
+        if exc.errno in UNUSABLE_LOG_ERRORS:
+            return None
+        raise
+    try:
+        info = os.fstat(descriptor)
+        # A second hard link could name a file outside the run folder.
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            if private and stat.S_IMODE(info.st_mode) != 0o600 and hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    os.close(descriptor)
+    return None
+
+
+def append_run_log(path, text):
+    """Append to a private run log, replacing anything planted in its place.
+
+    A link, FIFO, or hard link is unlinked; a folder, or a log that can no
+    longer be opened, is moved aside so no record is lost. Return whether the
+    entry had to be replaced.
+    """
+
+    path = Path(path)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    descriptor, replaced = open_run_log(path, flags), False
+    for _ in range(3):
+        if descriptor is not None:
+            break
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            keep = stat.S_ISDIR(info.st_mode) or (
+                stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not linked_entry(info))
+            if not keep:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    keep = True  # Windows removes a directory link only as a folder.
+            if keep:
+                os.replace(path, path.with_name(f".{path.name}.{secrets.token_hex(4)}.replaced"))
+        try:
+            descriptor = os.open(path, flags | os.O_EXCL | NOFOLLOW | BINARY, 0o600)
+        except FileExistsError:
+            continue
+        replaced = True
+    if descriptor is None:
+        raise OSError(f"Cannot replace the linked run log {path}.")
+    with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+        stream.write(text)
+    return replaced
+
+
 def source_file_name(value=None):
     """Validate the optional name of the file a job's input came from (display only)."""
 
@@ -194,17 +383,25 @@ def source_file_name(value=None):
     return value.strip()
 
 
+# The last prompts read successfully; job pages show them while a live YAML
+# edit cannot be parsed. Launches always read the YAML again.
+_last_default_prompts = {}
+
+
 def default_prompts():
     """Read workflow prompts at use time, including edits made while serving."""
 
+    global _last_default_prompts
     author_critic = runtime.builtin_workflow("author_critic")["prompts"]
-    return {
+    prompts = {
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
         "author_simple": author_critic["author_simple"],
         "critic": author_critic["critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
     }
+    _last_default_prompts = prompts
+    return dict(prompts)  # Callers adjust their copy.
 
 
 def web_prompt_options(body, roles, source=None):
@@ -227,7 +424,6 @@ def web_prompt_options(body, roles, source=None):
     }
 
 
-REVIEW_MODELS = MODELS
 TRACE_LIMIT = 1500
 PINNED_KINDS = {
     "request", "review_result", "critic_result", "author_result",
@@ -235,30 +431,60 @@ PINNED_KINDS = {
 }
 
 
+def readable_record(record):
+    """Accept a parsed transcript line whose routing fields, when set, are text."""
+
+    # The author can write its run folder, transcript included; one odd value
+    # must not stop a restart or a new job.
+    return isinstance(record, dict) and all(
+        isinstance(record.get(key), (str, type(None)))
+        for key in ("kind", "stage", "node", "label")
+    )
+
+
+def retry_record(record):
+    """Whether a request or diagnostic belongs to the third or a later attempt of one model call."""
+
+    attempt = record.get("attempt")
+    return isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 2
+
+
 def important_record(record):
     """Recognize prompts and other milestones that must stay visible."""
 
-    if record.get("kind") in PINNED_KINDS:
+    kind = record.get("kind")
+    if not isinstance(kind, str):
+        return False
+    if kind in {"request", "diagnostic"} and retry_record(record):
+        # A call retried every minute through a long outage would pin
+        # thousands of identical records: its first retry stays pinned,
+        # later ones remain in the recent window and the transcript.
+        return False
+    if kind in PINNED_KINDS:
         return True
-    if (record.get("kind") == "status"
+    if (kind == "status"
             and record.get("label") == "Critic approved"
             and record.get("root") is not False
             and not record.get("activityLabel")):
         # A PASS can either trigger another review or accept the proof. Keep
         # the controller's exact acceptance reason after routine events age out.
         return True
-    if record.get("kind") == "research_audit":
+    if kind == "research_audit":
         return record.get("status") != "working" or bool(record.get("recovered"))
-    if record.get("kind") != "codex_event" or record.get("root") is False:
+    if kind != "codex_event" or record.get("root") is False:
         return False
-    event = record.get("event") or {}
-    params = event.get("params") or {}
-    item = params.get("item") or event.get("item") or {}
+    event = record.get("event")
+    if not isinstance(event, dict):
+        return False
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    item = params.get("item") or event.get("item")
+    if not isinstance(item, dict):
+        return False
     return (
-        (event.get("method") or event.get("type")) in {
+        (event.get("method") or event.get("type")) in (
             "item/completed", "item.completed"
-        }
-        and item.get("type") in {"agentMessage", "agent_message"}
+        )
+        and item.get("type") in ("agentMessage", "agent_message")
     )
 
 # UI labels describe the persistent author and independent verification.
@@ -453,6 +679,8 @@ def empty_state(trace=None, trace_version=0):
         "skipStatementReview": False,
         "sourceFile": "",
         "autoResumeAt": 0,
+        # The runner's current wait before retrying a failed model call.
+        "modelRetry": None,
         "statementReviewOnly": False,
         "fileManagement": False,
         "preparedRun": False,
@@ -512,7 +740,9 @@ def empty_state(trace=None, trace_version=0):
         "settingsWarning": "",
         "runId": "",
         "checkpoints": [],
-        "workflow": {**PUBLIC_GRAPH, "settings": {**PUBLIC_GRAPH["settings"], "prompts": prompts}},
+        "workflow": {**PUBLIC_GRAPH, "settings": {
+            **PUBLIC_GRAPH["settings"], "prompts": prompts, **model_menu_settings(),
+        }},
         "trace": trace if trace is not None else [],
         "traceVersion": trace_version,
     }
@@ -521,7 +751,294 @@ def empty_state(trace=None, trace_version=0):
 def restored_model(value):
     """Map discontinued saved model routes to their supported replacement."""
 
-    return LEGACY_MODEL_ALIASES.get(value, value)
+    return providers.replacement_for_removed(value) or value
+
+
+def removed_model_warning(roles):
+    """Name the saved roles whose removed model now runs as its replacement."""
+
+    roles = set(roles)
+    names = [ROLE_LABELS[role] for role in ROLES if role in roles]
+    if not names:
+        return ""
+    listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return f"{listed[0].upper()}{listed[1:]}: {providers.REMOVED_MODEL_WARNING}"
+
+
+def model_menu_settings():
+    """Role menu data, read per request: configured API models change while serving.
+
+    The catalog holds no secrets. Efforts also cover the older ids that saved
+    jobs may still name, although the menus no longer offer them.
+    """
+
+    catalog = providers.catalog()
+    efforts = {model: list(levels) for model, levels in runtime.MODEL_EFFORTS.items()}
+    efforts.update((row["id"], list(row["efforts"])) for row in catalog)
+    return {"model_catalog": catalog, "model_efforts": efforts}
+
+
+def model_choice_error(model, role):
+    """Explain why one role's model id cannot run."""
+
+    label = ROLE_LABELS[role]
+    if providers.replacement_for_removed(model):
+        return (f"DeepSeek is no longer supported; choose another model for the {label}, "
+                f"for example {runtime.MODEL}.")
+    if providers.is_api_id(model):
+        return (f"The API model {model} chosen for the {label} is not configured. Add it under "
+                "Advanced settings → API models, or choose another model.")
+    shown = repr(model)[:80] if isinstance(model, str) and model else "(none)"
+    return (f"Unknown model {shown} for the {label}. Choose {', '.join(OFFERED_MODELS)}, "
+            "or an api:<id> model configured under Advanced settings → API models.")
+
+
+def unconfigured_job_model_error(model, role, snapshot):
+    """Why a saved job cannot launch its removed API model, and how to restore it.
+
+    A job cannot change its models, so the only remedy is adding the model
+    again: with the settings the job recorded (any display name gets this id
+    back, see Server.save_api_model) or, without such a record, the display
+    name that gives this id.
+    """
+
+    saved = saved_api_models(snapshot).get(model)
+    if saved:
+        kind = "Anthropic" if saved["format"] == providers.ANTHROPIC_FORMAT else "OpenAI"
+        how = (f"with the same settings ({saved['label']} · {kind} format · {saved['baseUrl']} · "
+               f"header {saved['headerName']} · model {saved['model']})")
+    else:
+        how = f"with the display name “{model[len(providers.API_ID_PREFIX):]}”"
+    return (f"The API model {model} chosen for the {ROLE_LABELS[role]} is not configured. Add it again "
+            f"under New problem → Advanced settings → API models {how} to continue this job.")
+
+
+def require_known_models(models):
+    """Reject an unknown, removed or unconfigured model for any role in ``models``."""
+
+    for role, model in models.items():
+        if not isinstance(model, str) or not providers.is_known(model):
+            raise ValueError(model_choice_error(model, role))
+
+
+class TransientLaunchError(ValueError):
+    """A model cannot start right now for a reason that passes by itself (its CLI is updating)."""
+
+
+def require_model_access(models):
+    """Check locally that each model can start: a saved API key, or the Claude CLI."""
+
+    try:
+        for model in dict.fromkeys(models):
+            runtime.verify_model_credentials(model)
+    except runtime.CLIUnavailable as exc:
+        raise TransientLaunchError(str(exc)) from exc
+    except runtime.Error as exc:
+        raise ValueError(str(exc)) from exc
+
+
+API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model")
+# The add/edit form's choices; which CLI runs each format is fixed in providers.
+API_MODEL_FORMATS = [
+    {"id": providers.OPENAI_FORMAT, "label": "OpenAI-compatible (Responses API)", "cli": "Codex CLI",
+     "headerName": providers.DEFAULT_HEADERS[providers.OPENAI_FORMAT]},
+    {"id": providers.ANTHROPIC_FORMAT, "label": "Anthropic (Messages API)", "cli": "Claude CLI",
+     "headerName": providers.DEFAULT_HEADERS[providers.ANTHROPIC_FORMAT]},
+]
+
+
+def api_model_snapshot(models):
+    """Non-secret settings of the configured API models a job uses, kept for history.
+
+    The runner always reads the private store itself; this copy is display data.
+    """
+
+    snapshot = {}
+    for model in dict.fromkeys(models):
+        entry = providers.api_model(model)
+        if entry is not None:
+            snapshot[model] = {key: entry[key] for key in API_SNAPSHOT_FIELDS}
+    return snapshot
+
+
+def saved_api_models(value):
+    """Keep only a well-formed saved snapshot: the author can write its run folder."""
+
+    if not isinstance(value, dict):
+        return {}
+    return {
+        model: {key: entry[key] for key in API_SNAPSHOT_FIELDS}
+        for model, entry in list(value.items())[:len(ROLES)]
+        if providers.is_api_id(model) and isinstance(entry, dict) and all(
+            isinstance(entry.get(key), str) and len(entry[key]) <= providers.MAX_BASE_URL_CHARS
+            for key in API_SNAPSHOT_FIELDS)
+    }
+
+
+def _api_test_request(entry):
+    """Path, headers and body of the one minimal request a Test sends."""
+
+    path = urlsplit(entry["baseUrl"]).path.rstrip("/")
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": "TCS-Prover-API-model-test"}
+    if entry["format"] == providers.OPENAI_FORMAT:
+        # Codex sends Responses requests to <base URL>/responses.
+        path += "/responses"
+        body = {"model": entry["model"], "input": API_TEST_PROMPT,
+                "max_output_tokens": API_TEST_MAX_TOKENS}
+    else:
+        # The Claude CLI takes the base URL without /v1 and adds /v1/messages.
+        if path.lower().endswith("/v1"):
+            path = path[:-3]
+        path += "/v1/messages"
+        body = {"model": entry["model"], "max_tokens": API_TEST_MAX_TOKENS,
+                "messages": [{"role": "user", "content": API_TEST_PROMPT}]}
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    header, key = entry["headerName"], entry["apiKey"]
+    headers = {name: value for name, value in headers.items() if name.lower() != header.lower()}
+    headers[header] = f"Bearer {key}" if header.lower() == "authorization" else key
+    return path, headers, json.dumps(body).encode("utf-8")
+
+
+def _api_test_text(text, key):
+    """One line of endpoint text without the key or any other known secret, clipped."""
+
+    text = " ".join(str(text).split())
+    # Remove the key before clipping, or a clip could leave part of it behind.
+    for secret in sorted({key, json.dumps(key)[1:-1], quote(key, safe="")} - {""}, key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    text = runtime.redact(text)
+    limit = providers.MAX_TEST_MESSAGE_CHARS
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _api_test_reply(value):
+    """The reply text of a Responses or Messages result, if any."""
+
+    if not isinstance(value, dict):
+        return ""
+    if isinstance(value.get("output_text"), str) and value["output_text"].strip():
+        return value["output_text"]
+    # Responses: output[].content[].text; Messages: content[].text.
+    items = value.get("output") if isinstance(value.get("output"), list) else []
+    blocks = [block for item in items if isinstance(item, dict) and isinstance(item.get("content"), list)
+              for block in item["content"]]
+    if isinstance(value.get("content"), list):
+        blocks += value["content"]
+    return " ".join(block["text"] for block in blocks
+                    if isinstance(block, dict) and isinstance(block.get("text"), str))
+
+
+def _api_test_error(value, text):
+    """The provider's own error message (OpenAI and Anthropic shapes), else the body."""
+
+    if isinstance(value, dict):
+        error = value.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"].strip():
+            return error["message"]
+        for candidate in (error, value.get("message"), value.get("detail")):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+    return text
+
+
+def _api_test_failure(exc, timeout):
+    """Describe a transport failure by its class; its text may quote request data."""
+
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError):
+        return f"No response within {timeout:g} seconds ({name})."
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return f"The TLS certificate could not be verified ({name})."
+    if isinstance(exc, ssl.SSLError):
+        return f"The TLS connection failed ({name})."
+    if isinstance(exc, socket.gaierror):
+        return f"The host name could not be resolved ({name})."
+    if isinstance(exc, ConnectionRefusedError):
+        return f"The connection was refused ({name})."
+    if isinstance(exc, http.client.HTTPException):
+        return f"The endpoint did not return a valid HTTP response ({name})."
+    if isinstance(exc, UnicodeError):
+        return f"The API key or header cannot be sent in an HTTP header ({name})."
+    return f"The request failed ({name})."
+
+
+def probe_api_endpoint(entry, timeout=None):
+    """Send ONE minimal model request to an API model's endpoint and describe the result.
+
+    ``entry`` holds validated settings including the key. The exchange has one
+    overall deadline, follows no redirect, and the key travels only in the
+    configured header; no returned text contains it.
+    """
+
+    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
+    parts = urlsplit(entry["baseUrl"])
+    result = {"ok": False, "status": None, "latencyMs": None, "message": "", "model": entry["model"],
+              "testedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    started = time.monotonic()
+    deadline, status, location, raw = started + timeout, None, "", b""
+    connection = (
+        http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                    context=ssl.create_default_context())
+        if parts.scheme == "https" else
+        http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+    )
+    try:
+        path, headers, body = _api_test_request(entry)
+        connection.request("POST", path or "/", body=body, headers=headers)
+        # The response keeps reading through this socket after getresponse().
+        channel = connection.sock
+
+        def bound():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("API model test deadline")
+            # http.client closes the socket itself once it has read the whole body of a
+            # response that ends the connection (HTTP/1.0 or "Connection: close"); the
+            # next read then returns b"", so there is nothing left to bound.
+            if channel.fileno() != -1:
+                channel.settimeout(left)
+
+        bound()
+        response = connection.getresponse()
+        status, location = response.status, response.getheader("Location") or ""
+        chunks, size = [], 0
+        while size < API_TEST_MAX_RESPONSE_BYTES:
+            bound()
+            chunk = response.read(min(16384, API_TEST_MAX_RESPONSE_BYTES - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    except Exception as exc:  # Network, TLS, protocol or encoding failure.
+        if status is None:
+            result.update(latencyMs=round((time.monotonic() - started) * 1000),
+                          message=_api_test_text(_api_test_failure(exc, timeout), entry["apiKey"]))
+            return result
+        # A body cut short still leaves a usable status line.
+    finally:
+        connection.close()
+    result.update(status=status, latencyMs=round((time.monotonic() - started) * 1000))
+    text = raw.decode("utf-8", "replace")
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if 200 <= status < 300:
+        reply = _api_test_reply(value)
+        reported = value.get("model") if isinstance(value, dict) else None
+        result.update(ok=True, model=reported if isinstance(reported, str) and reported.strip() else entry["model"],
+                      message=f"The model replied: {reply}" if reply.strip() else "The endpoint accepted the request.")
+    elif 300 <= status < 400:
+        result["message"] = (f"The endpoint redirected to {location or 'another URL'}; redirects are not "
+                             "followed. Enter the final API base URL.")
+    else:
+        detail = _api_test_error(value, text).strip()
+        result["message"] = detail or f"HTTP {status} without an error message."
+    result["model"] = _api_test_text(result["model"], entry["apiKey"])
+    result["message"] = _api_test_text(result["message"], entry["apiKey"])
+    return result
 
 
 def approach_metadata(name, content):
@@ -561,11 +1078,14 @@ def approach_metadata(name, content):
 class App:
     """Own one review-and-solve workflow."""
 
-    def __init__(self, trace_file=None, runs=RUNS, output_stream=None):
+    def __init__(self, trace_file=None, runs=RUNS, output_stream=None, *, load_latest=True):
         # Tests may supply one fixed log; the real app uses one folder per run.
         self.runs, self.fixed_trace = Path(runs), trace_file is not None
         self.output_stream = output_stream
-        self.trace_file = Path(trace_file) if trace_file else self._latest_trace()
+        # A new job creates its own run, so it need not parse another job's log.
+        self.trace_file = Path(trace_file) if trace_file else (
+            self._latest_trace() if load_latest else None
+        )
         self.run_dir = self.trace_file.parent if self.trace_file else None
         trace, total, self.pinned = self._load_trace()
         self.state = empty_state(trace, total)
@@ -580,6 +1100,10 @@ class App:
         self._checkpoint_cache = []
         self._checkpoint_cache_signature = None
         self._approach_cache = {}
+        # Start of the runner's current retry wait, which is not active time.
+        self._retry_wait_started = None
+        # The model calls now waiting to retry, by activity (parallel audits wait separately).
+        self._model_retries = {}
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -591,7 +1115,14 @@ class App:
             if not path.is_symlink()
             and direct_run_directory(path.parent, self.runs)
         )
-        return max(logs, key=lambda path: path.stat().st_mtime, default=None)
+
+        def changed(path):
+            try:
+                return path.stat().st_mtime
+            except OSError:  # Deleted concurrently.
+                return -math.inf
+
+        return max(logs, key=changed, default=None)
 
     def _new_run(self, statement, slug_source=None):
         """Create a private, readable folder name for one problem."""
@@ -630,10 +1161,21 @@ class App:
     def _save(self, name, content):
         """Save one private, human-readable run artifact."""
 
-        path = self.run_dir / name
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.write_text(content, encoding="utf-8")
-        path.chmod(0o600)
+        # The sandboxed author can write this folder. Never write through a
+        # subfolder it replaced with a link, and replace the file itself (a
+        # planted link is renamed over, never followed).
+        folder = self.run_dir
+        for part in Path(name).parts[:-1]:
+            folder = folder / part
+            try:
+                info = folder.lstat()
+            except FileNotFoundError:
+                break
+            if linked_entry(info) or not stat.S_ISDIR(info.st_mode):
+                raise OSError(f"Cannot save {name}: {part} is not a private run folder.")
+        runtime._private_atomic_write(
+            self.run_dir / name, content, staging_directory=self.run_dir.parent,
+        )
 
     def _save_job_settings(self, options):
         """Persist restart-safe workflow settings without prompt duplication."""
@@ -646,7 +1188,7 @@ class App:
             "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
             "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
-            "sourceFile",
+            "sourceFile", "apiModels",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
         )
         # The solver rechecks historical settings while UI events persist
@@ -969,61 +1511,42 @@ class App:
     def _write_author_limit(self, hours):
         """Atomically publish the total workflow limit to the active solver."""
 
-        path = self.run_dir / AUTHOR_LIMIT_FILENAME
-        temporary = path.with_name(f".{AUTHOR_LIMIT_FILENAME}.tmp")
-        try:
-            temporary.write_text(
-                json.dumps({"hours": hours}), encoding="utf-8"
-            )
-            temporary.chmod(0o600)
-            temporary.replace(path)
-            path.chmod(0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return path
+        self._save(AUTHOR_LIMIT_FILENAME, json.dumps({"hours": hours}))
+        return self.run_dir / AUTHOR_LIMIT_FILENAME
 
     def _write_author_steer(self, instruction):
         """Atomically publish one live instruction to the active author."""
 
-        path = self.run_dir / AUTHOR_STEER_FILENAME
-        temporary = path.with_name(f".{AUTHOR_STEER_FILENAME}.tmp")
         command_id = secrets.token_hex(12)
-        try:
-            temporary.write_text(json.dumps({
-                "id": command_id,
-                "instruction": instruction,
-                "createdAt": datetime.now(timezone.utc).isoformat(),
-            }, ensure_ascii=False), encoding="utf-8")
-            temporary.chmod(0o600)
-            temporary.replace(path)
-            path.chmod(0o600)
-        finally:
-            temporary.unlink(missing_ok=True)
+        self._save(AUTHOR_STEER_FILENAME, json.dumps({
+            "id": command_id,
+            "instruction": instruction,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False))
         return command_id
 
     def _load_trace(self):
         """Restore the append-only local transcript after a restart."""
 
-        if not self.trace_file or not self.trace_file.exists():
+        if not self.trace_file:
             return [], 0, []
         try:
+            descriptor = open_run_log(self.trace_file, os.O_RDONLY)
+            if descriptor is None:
+                return [], 0, []
             records, pinned, total = deque(maxlen=TRACE_LIMIT), [], 0
-            self.trace_file.parent.chmod(0o700)
-            self.trace_file.chmod(0o600)
-            with self.trace_file.open(
-                encoding="utf-8", errors="replace"
-            ) as stream:
+            with os.fdopen(descriptor, encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     total += 1
                     try:
                         if line.strip():
                             record = json.loads(line)
-                            if not isinstance(record, dict):
+                            if not readable_record(record):
                                 continue
                             records.append(record)
                             if important_record(record):
                                 pinned.append(record)
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
                         continue
             return list(records), total, pinned
         except OSError:
@@ -1048,12 +1571,11 @@ class App:
             # Secure the private log before writing its first sensitive byte.
             if not self.trace_file:
                 raise OSError("No problem run is active.")
+            # The run folder was made private once, when it was created.
             self.trace_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.trace_file.parent.chmod(0o700)
-            self.trace_file.touch(exist_ok=True, mode=0o600)
-            self.trace_file.chmod(0o600)
-            with self.trace_file.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            replaced = append_run_log(
+                self.trace_file, json.dumps(entry, ensure_ascii=False) + "\n",
+            )
             self.state["trace"].append(entry)
             self.state["trace"][:] = self.state["trace"][-TRACE_LIMIT:]
             if important_record(entry):
@@ -1064,6 +1586,13 @@ class App:
                 self.state["activeNode"] = record["node"]
             if isinstance(record.get("round"), int):
                 self.state["round"] = record["round"]
+            if replaced and record.get("label") != "Transcript replaced":
+                self.add_trace({
+                    "kind": "diagnostic", "stage": self.state["stage"], "label": "Transcript replaced",
+                    "text": "transcript.jsonl in the run folder had been replaced by a link "
+                            "or another unusable entry. It was not followed; a new private "
+                            "transcript continues from this record.",
+                })
 
     @staticmethod
     def parse_line(line, stage):
@@ -1328,35 +1857,37 @@ class App:
 
         with self.lock:
             state = dict(self.state)
+            run_dir = self.run_dir
             state["workerActive"] = self.has_active_worker()
             state["processAlive"] = bool(self.process is not None and self.process.poll() is None)
             state["activeElapsedSeconds"] = self._elapsed_seconds()
-            state["retrieval"] = retrieval.public_retrieval_info(
-                state.get("retrievalPolicyPath"), run_dir=self.run_dir,
-                mode=state.get("retrievalMode", "live"))
-            state["retrievalCapabilities"] = retrieval.capabilities()
-            if state["retrieval"]["mode"] == "historical":
-                state["retrievalMode"] = "historical"
-                state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
             try:
                 state["statement"] = saved_statement(self.run_dir) if self.run_dir else ""
             except ValueError:
                 state["statement"] = ""
             graph = state["workflow"]
-            state["workflow"] = {
-                **graph, "settings": {**graph["settings"], "prompts": default_prompts()},
-            }
-            include_transcript = state["phase"] not in {
-                "reviewing", "running", "stopping", "pausing",
-            }
-            signature = checkpoint_artifact_signature(
-                self.run_dir, include_transcript=include_transcript,
-            )
-            if signature != self._checkpoint_cache_signature:
-                self._checkpoint_cache = (
-                    saved_run_checkpoints(self.run_dir) if self.run_dir else []
+            # A typo in a live YAML edit must not break job pages or report a
+            # completed action as failed. Launches still read the YAML strictly.
+            try:
+                prompts = default_prompts()
+                include_transcript = state["phase"] not in {
+                    "reviewing", "running", "stopping", "pausing",
+                }
+                signature = checkpoint_artifact_signature(
+                    self.run_dir, include_transcript=include_transcript,
                 )
-                self._checkpoint_cache_signature = signature
+                if signature != self._checkpoint_cache_signature:
+                    self._checkpoint_cache = (
+                        saved_run_checkpoints(self.run_dir) if self.run_dir else []
+                    )
+                    self._checkpoint_cache_signature = signature
+                state["workflowWarning"] = ""
+            except (ValueError, KeyError) as exc:
+                prompts = dict(_last_default_prompts or graph["settings"].get("prompts", {}))
+                state["workflowWarning"] = f"The workflow YAML cannot be read: {exc}"
+            state["workflow"] = {
+                **graph, "settings": {**graph["settings"], "prompts": prompts, **model_menu_settings()},
+            }
             state["checkpoints"] = list(self._checkpoint_cache)
             state["canDownloadTex"] = bool(
                 state["phase"] == "done" and not self.has_active_worker()
@@ -1374,7 +1905,18 @@ class App:
                 state["trace"], state["traceFrom"] = list(trace[after - first:]), after
             else:
                 state["trace"], state["traceFrom"] = self.retained_trace(), first
-            return state
+        # Policy metadata can hash the pinned Codex binary: never hold the job
+        # lock (and its transcript reader) meanwhile. A policy that no longer
+        # loads still shows the cutoff saved with the job.
+        state["retrieval"] = retrieval.public_retrieval_info(
+            state.get("retrievalPolicyPath"), run_dir=run_dir,
+            mode=state.get("retrievalMode", "live"),
+            saved_cutoff=state.get("retrievalCutoffUtc", ""))
+        state["retrievalCapabilities"] = retrieval.capabilities()
+        if state["retrieval"]["mode"] == "historical":
+            state["retrievalMode"] = "historical"
+            state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
+        return state
 
     @staticmethod
     def _workflow_options(
@@ -1422,33 +1964,19 @@ class App:
             ).strip()
             for name, value in supplied_prompts.items()
         }
-        if include_review and review_model not in REVIEW_MODELS:
-            raise ValueError(
-                "Choose 6.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro "
-                "for statement review."
-            )
-        if any(
-            model not in MODELS
-            for model in (author_model, critic_model, writer_model)
-        ):
-            raise ValueError(
-                "Choose 6.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro "
-                "for every proof stage."
-            )
+        role_models = {"author": author_model, "critic": critic_model, "writer": writer_model}
+        if include_review:
+            role_models = {"review": review_model, **role_models}
+        # Built-in, older Codex, or configured API ids; the store is read now.
+        require_known_models(role_models)
         efforts = [author_effort, critic_effort, writer_effort]
         if include_review:
             efforts.append(review_effort)
         if any(effort not in EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
-        selected_models = [author_model, critic_model, writer_model]
+        selected_models = list(role_models.values())
         if include_review:
-            selected_models.append(review_model)
-        try:
-            for selected_model in set(selected_models):
-                runtime.verify_model_credentials(selected_model)
-        except runtime.Error as exc:
-            raise ValueError(str(exc)) from exc
-        review_effort = runtime.effective_effort(review_model, review_effort)
+            review_effort = runtime.effective_effort(review_model, review_effort)
         author_effort = runtime.effective_effort(author_model, author_effort)
         critic_effort = runtime.effective_effort(critic_model, critic_effort)
         writer_effort = runtime.effective_effort(writer_model, writer_effort)
@@ -1481,11 +2009,15 @@ class App:
             )
         audit_options = audits.normalize_settings(research_audits) if file_management else {
             **audits.default_settings(), "models": ["none", "none", "none"]}
+        # Web cutoff timestamps need Codex models: say so before any CLI check.
         search_options = retrieval.validate_options(
             retrieval_mode, retrieval_cutoff_utc, models=selected_models,
             research_audits=audit_options)
+        require_model_access(selected_models)
+        api_models = api_model_snapshot(selected_models)
         return {
             **search_options,
+            **({"apiModels": api_models} if api_models else {}),
             "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
             "authorModel": author_model,
             "criticModel": critic_model,
@@ -1530,8 +2062,13 @@ class App:
         research_audits=None,
         file_management=True,
         retrieval_mode="live", retrieval_cutoff_utc="",
+        revise_existing=False,
     ):
-        """Start the review and return immediately so the page can poll."""
+        """Start the review and return immediately so the page can poll.
+
+        ``revise_existing`` means the request names this job: it may only retry
+        a reviewed or failed review in place, never start another run.
+        """
 
         self._check_input_replacement()
 
@@ -1586,9 +2123,17 @@ class App:
             raise ValueError("Enter a problem statement.")
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Codex is already working.")
-            # Feedback retries stay in the same problem folder.
-            retry = self.state["phase"] == "reviewed" and self.run_dir is not None
+                raise ValueError("A model is already working on this job.")
+            # Feedback retries, and retries of a failed review, stay in the
+            # selected job's problem folder; one job keeps one run id.
+            failed_retry = revise_existing and self.state["phase"] == "input"
+            retry = self.run_dir is not None and (
+                self.state["phase"] == "reviewed" or failed_retry
+            )
+            if revise_existing and not retry:
+                raise ValueError("Start a new problem from the home screen.")
+            if failed_retry:
+                self._save("draft.md", f"# Draft problem\n\n{statement}\n")
             if not retry:
                 self._new_run(statement)
                 if not self.fixed_trace:
@@ -1660,7 +2205,7 @@ class App:
             if self.state["phase"] == "stopping":
                 self._finish_stopped_locked(
                     token,
-                    "Codex was stopped before it produced a checked statement.",
+                    "The reviewer was stopped before it produced a checked statement.",
                 )
                 return
         try:
@@ -1673,6 +2218,7 @@ class App:
                     "--speed", self.state["speedMode"],
                     "--review-prompt-file",
                     str(self.run_dir / "prompts/review.txt"),
+                    "--thinking-hours", str(self.state["thinkingHours"]),
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -1692,7 +2238,7 @@ class App:
                 with self.lock:
                     self._finish_stopped_locked(
                         token,
-                        "Codex was stopped before it produced a checked statement.",
+                        "The reviewer was stopped before it produced a checked statement.",
                     )
                 return
             process.stdin.write(statement + ("\0" + feedback if feedback else ""))
@@ -1700,6 +2246,7 @@ class App:
             for line in process.stdout:
                 record = self.parse_line(line, "review")
                 self.add_trace(record)
+                self._follow_model_retry(record)
                 failure = self.failure_text(record)
                 if failure and not failure.startswith("Reconnecting..."):
                     # Prefer the precise provider error over the controller's
@@ -1758,6 +2305,10 @@ class App:
                 return
             if self.process is process:
                 self.process = None
+            # A reviewer that ended while waiting to retry: that wait was not active time.
+            self._end_retry_wait_locked()
+            self._model_retries = {}
+            self.state["modelRetry"] = None
             stopped = self.state["phase"] == "stopping"
             if valid:
                 self._clear_manual_stop()
@@ -1783,7 +2334,7 @@ class App:
             elif stopped:
                 self._finish_stopped_locked(
                     token,
-                    "Codex was stopped before it produced a checked statement.",
+                    "The reviewer was stopped before it produced a checked statement.",
                 )
             elif problem:
                 self.state["phase"], self.state["error"] = "input", problem
@@ -1899,11 +2450,11 @@ class App:
         """Count active time across pauses without charging the paused interval."""
 
         if self.state["phase"] == "paused" and self.run_dir:
+            checkpoint = read_pause_object(self.run_dir)
             try:
-                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
                 if checkpoint.get("status") in {"paused", "pausing"}:
                     return float(checkpoint["elapsedSeconds"])
-            except (OSError, ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError):
                 pass
         try:
             started_at = datetime.fromisoformat(self.state.get("resumedAt") or self.state["startedAt"])
@@ -1915,15 +2466,80 @@ class App:
                 if end.tzinfo is None:
                     end = end.replace(tzinfo=timezone.utc)
             elapsed_seconds = max(0.0, (end - started_at).total_seconds())
+            waiting = getattr(self, "_retry_wait_started", None)
+            if waiting is not None and self.state["phase"] in ACTIVE_PHASES:
+                # A model call waiting to retry does not consume the budget.
+                elapsed_seconds = max(0.0, elapsed_seconds - max(0.0, (end - waiting).total_seconds()))
         except (KeyError, TypeError, ValueError):
             elapsed_seconds = 0.0
         return float(self.state.get("elapsedSeconds", 0)) + elapsed_seconds
 
+    def _follow_model_retry(self, record):
+        """Mirror the runner's retry waits: shown on the job page, never charged as active time.
+
+        The runner reports budgetClock "paused" when every model call in
+        progress waits to retry and "running" when one runs again; each
+        finished wait moves the start of the active segment forward.
+        """
+
+        if not isinstance(record, dict) or record.get("kind") != "status":
+            return
+        change = record.get("budgetClock")
+        label = record.get("label")
+        retrying = isinstance(label, str) and label.endswith(runtime.RETRY_LABEL)
+        if change not in {"paused", "running"} and not retrying:
+            return
+        with self.lock:
+            now = datetime.now(timezone.utc)
+            if change == "paused" and self._retry_wait_started is None:
+                self._retry_wait_started = now
+            elif change == "running":
+                self._end_retry_wait_locked(now)
+            if retrying:
+                # Parallel requests wait and retry separately: one that retries
+                # now must not hide another that still waits.
+                key = str(record.get("activityLabel") or record.get("node") or record.get("stage") or "")
+                retry_at = record.get("retryAt")
+                waits = getattr(self, "_model_retries", None)
+                if waits is None:
+                    waits = self._model_retries = {}
+                waits.pop(key, None)
+                if isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and math.isfinite(retry_at):
+                    waits[key] = {
+                        "text": str(record.get("text") or ""), "retryAt": float(retry_at),
+                        "attempt": record.get("retryAttempt") if isinstance(record.get("retryAttempt"), int) else None,
+                        "stage": record.get("stage") if isinstance(record.get("stage"), str) else "",
+                    }
+                # The latest wait that has not ended yet, if any.
+                self.state["modelRetry"] = next(reversed(waits.values()), None)
+
+    def _end_retry_wait_locked(self, now=None):
+        """Leave a finished retry wait out of the current segment's active time."""
+
+        started, self._retry_wait_started = self._retry_wait_started, None
+        if started is None:
+            return
+        waited = max(0.0, ((now or datetime.now(timezone.utc)) - started).total_seconds())
+        segment = self.state.get("resumedAt") or self.state.get("startedAt")
+        if not waited or not segment:
+            return
+        try:
+            start = datetime.fromisoformat(segment)
+        except (TypeError, ValueError):
+            return
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        self.state["resumedAt"] = (start + timedelta(seconds=waited)).isoformat()
+        if self.run_dir is not None:
+            try:
+                self._save_job_settings(self.state)
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass  # The in-memory segment still excludes the wait.
+
     def _save_pause(self, checkpoint):
         """Atomically store controller state; research notebooks belong to the LLM."""
 
-        self._save(".pause.tmp", json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
-        (self.run_dir / ".pause.tmp").replace(self.run_dir / PAUSE_FILENAME)
+        self._save(PAUSE_FILENAME, json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
 
     def _configure_auto_resume(self, checkpoint, now=None):
         """Persist the retry deadline and distinguish errors from deliberate pauses."""
@@ -1937,12 +2553,16 @@ class App:
                 and not (self.run_dir / PAUSE_REQUEST_FILENAME).exists() else "user"
             )
         exhausted = (
-            "time limit" in str(checkpoint.get("error", "")).lower()
+            str(checkpoint.get("error", "")).startswith(WORKFLOW_TIME_LIMIT_ERROR)
             or (float(self.state["thinkingHours"]) > 0 and
                 float(checkpoint.get("elapsedSeconds", 0))
                 >= float(self.state["thinkingHours"]) * 3600)
         )
-        retry = checkpoint["pauseCause"] == "error" and not exhausted
+        # A conversation the CLI no longer has cannot be resumed by a retry, and
+        # an author stopped by a safety check waits for the user.
+        retry = (checkpoint["pauseCause"] == "error" and not exhausted
+                 and checkpoint.get("sessionUnavailable") is not True
+                 and checkpoint.get("safetyStop") is not True)
         deadline = checkpoint.get("autoResumeAt", 0)
         if not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
             deadline = now + AUTO_RESUME_SECONDS
@@ -1959,7 +2579,13 @@ class App:
                     or self.has_active_worker() or self.state.get("auditHoldingAuthor")
                     or self.state.get("manuallyStopped")):
                 return False
-            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+            try:
+                checkpoint = load_pause_checkpoint(self.run_dir)
+            except (OSError, ValueError) as exc:
+                # A missing or damaged checkpoint stops neither this job's
+                # retries nor anyone else's: report it, then look again later.
+                self.defer_auto_resume(exc, now)
+                return True
             self._configure_auto_resume(checkpoint, now)
             if not self.state["autoResumeAt"]:
                 self._save_pause(checkpoint)
@@ -1972,11 +2598,38 @@ class App:
             self.add_trace({"kind": "status", "stage": self.state["stage"],
                             "label": "Automatic resume", "text": "Retrying after an error pause."})
             try:
+                self._check_launch_models_locked()
+            except TransientLaunchError:
+                pass  # For example a CLI updating itself: resume() reports it and the next try is reserved.
+            except ValueError as exc:
+                # A model that is not configured (or has no key) is a settings
+                # error, not a transient one: wait for an explicit Resume.
+                checkpoint["autoResumeAt"] = self.state["autoResumeAt"] = 0
+                self._save_pause(checkpoint)
+                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                "text": f"Automatic resume stopped: {exc} Choose Resume after fixing the settings."})
+                return True
+            try:
                 resume()
             except (OSError, ValueError, RuntimeError) as exc:
                 self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": f"Automatic resume failed: {exc}. Retrying in 10 minutes."})
+                                "text": f"Automatic resume failed: {exc}. Retrying in {retry_interval_text()}."})
             return True
+
+    def defer_auto_resume(self, problem, now=None):
+        """Report a due automatic resume that could not run; the next try follows after the usual wait."""
+
+        now = time.time() if now is None else now
+        with self.lock:
+            if self.state["phase"] != "paused" or not self.state.get("autoResumeAt"):
+                return
+            # Reserve first: the report itself can fail, for example on a full disk.
+            self.state["autoResumeAt"] = now + AUTO_RESUME_SECONDS
+            try:
+                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                "text": f"Automatic resume failed: {problem}. Retrying in {retry_interval_text()}."})
+            except OSError:
+                pass
 
     def _author_checkpoint_state(self):
         """Recover controller input if the author exits before emitting its state."""
@@ -1995,11 +2648,10 @@ class App:
 
         with self.lock:
             if not _for_audit and self.state["phase"] in {"pausing", "paused"}:
-                try:
-                    checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    pass  # Audit cancellation is also valid before a checkpoint exists.
-                else:
+                # Audit cancellation is also valid before a checkpoint exists. A damaged
+                # checkpoint is left for Resume to report, but its automatic retry stops.
+                checkpoint = read_pause_object(self.run_dir)
+                if checkpoint:
                     checkpoint.update(pauseCause="user", autoResumeAt=0)
                     self._save_pause(checkpoint)
                 self.state["autoResumeAt"] = 0
@@ -2027,7 +2679,7 @@ class App:
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
                             "label": "Paused for research audits" if _for_audit else "Pause requested",
                             "text": ("Preserving the author conversation; it will resume after the audit reports are saved."
-                                     if _for_audit else "Interrupting Codex and preserving its saved conversation for Resume.")})
+                                     if _for_audit else "Interrupting the author and preserving its saved conversation for Resume.")})
             process, token = self.process, self.active_token
 
         def finish_if_unresponsive():
@@ -2043,7 +2695,7 @@ class App:
                 if self.active_token is not token or self.state["phase"] != "pausing":
                     return
                 self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": "Codex did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
+                                "text": "The author did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
             stop_process_tree(process)
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
@@ -2052,6 +2704,26 @@ class App:
         """A held run must fail before credentials, workers or elapsed clocks."""
         if self.state.get("launchHold"):
             raise ValueError("Prepared run is held: " + str(self.state["launchHold"]))
+
+    def _check_launch_models_locked(self, roles=("author", "critic", "writer")):
+        """Recheck saved role models before a launch from an idle job.
+
+        API models, their keys and the Claude CLI can change while a job waits,
+        so fail with a clear message instead of a runner error.
+        """
+
+        models = {role: self.state[f"{role}Model"] for role in roles}
+        for role, model in models.items():
+            if providers.is_api_id(model) and not providers.is_known(model):
+                raise ValueError(unconfigured_job_model_error(model, role, self.state.get("apiModels")))
+        require_known_models(models)
+        if (self.state.get("retrievalMode") == "historical" or self.state.get("retrievalPolicyPath")) and any(
+                providers.provider_kind(model) != providers.CODEX for model in models.values()):
+            raise ValueError(runtime.HISTORICAL_CODEX_ONLY)
+        require_model_access(models.values())
+        snapshot = api_model_snapshot(models.values())
+        if snapshot:
+            self.state["apiModels"] = {**saved_api_models(self.state.get("apiModels")), **snapshot}
 
     def _check_input_replacement(self):
         """A reused UI job must not erase its historical policy or hold."""
@@ -2067,8 +2739,7 @@ class App:
             if self.state["phase"] != "prepared" or self.has_active_worker():
                 raise ValueError("This workspace is no longer waiting to start.")
             statement = saved_statement(self.run_dir)
-            for role in ("author", "critic", "writer"):
-                runtime.verify_model_credentials(self.state[f"{role}Model"])
+            self._check_launch_models_locked()
             for role in ("author", "critic", "final"):
                 self._save(f"prompts/{role}.txt", self.state[f"{role}Prompt"] + "\n")
             previous = dict(self.state)
@@ -2103,7 +2774,8 @@ class App:
                 raise ValueError("Wait for the audits to finish, or choose Pause to cancel them before resuming.")
             if self.state["phase"] != "paused" or self.has_active_worker():
                 raise ValueError("Wait until the author is paused before resuming.")
-            checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
+            self._check_launch_models_locked()
+            checkpoint = load_pause_checkpoint(self.run_dir)
             workflow_state = dict(checkpoint["state"])
             workflow_state.pop("paused", None)
             workflow_state.pop("failed", None)
@@ -2111,12 +2783,14 @@ class App:
             if checkpoint.get("goalThreadId"):
                 self.state["goalThreadId"] = checkpoint["goalThreadId"]
             self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
-                              resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="", autoResumeAt=0)
+                              resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="", autoResumeAt=0,
+                              sessionUnavailable=False, safetyStop=False)
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
             process = None
             try:
                 self._save_pause({**checkpoint, "status": "running", "error": "",
-                                  "pauseCause": "", "autoResumeAt": 0})
+                                  "pauseCause": "", "autoResumeAt": 0, "sessionUnavailable": False,
+                                  "safetyStop": False})
                 self._save_job_settings(self.state)
                 resume_options = (["--set", "goal_require_resume=true"]
                                   if self.state.get("goalThreadId") else [])
@@ -2137,7 +2811,7 @@ class App:
                 self._save_job_settings(self.state)
                 raise
             self.add_trace({"kind": "status", "stage": checkpoint["stage"], "node": checkpoint["node"],
-                            "label": "Resume requested", "text": "Reopening the saved Codex conversation in this same run folder."})
+                            "label": "Resume requested", "text": "Reopening the saved author conversation in this same run folder."})
 
     def final_tex(self):
         """Read the finished LaTeX artifact for an authenticated download."""
@@ -2257,7 +2931,7 @@ class App:
             options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Codex is already working.")
+                raise ValueError("A model is already working on this job.")
             self._new_run(statement)
             if not self.fixed_trace:
                 self.pinned = []
@@ -2344,7 +3018,7 @@ class App:
             options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Codex is already working.")
+                raise ValueError("A model is already working on this job.")
             self._new_run(source)
             if not self.fixed_trace:
                 self.pinned = []
@@ -2412,7 +3086,7 @@ class App:
             options.update(retrieval.continuation_options(continuation_source))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Codex is already working.")
+                raise ValueError("A model is already working on this job.")
             source_label = (
                 Path(continuation_source).name
                 if continuation_source else "saved-final"
@@ -2504,7 +3178,7 @@ class App:
             options.update(retrieval.continuation_options(source_run))
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Codex is already working.")
+                raise ValueError("A model is already working on this job.")
             source_label = Path(source_run).name if source_run else "saved-proof"
             self._new_run(statement, f"critic-resume-{source_label}")
             if not self.fixed_trace:
@@ -2570,6 +3244,7 @@ class App:
                 )
             if self.state["phase"] != "reviewed":
                 raise ValueError("There is no reviewed statement to approve.")
+            self._check_launch_models_locked()
             statement = self.state["review"]["statement"] if edited_statement is None else (
                 str(edited_statement).strip()
             )
@@ -2584,7 +3259,20 @@ class App:
                     f"{self.state['review']['notes'] or 'None.'}\n\n"
                     "# Author action\n\nEdited and directly approved by the author.\n",
                 )
-            process, token = self._launch_solver_locked(statement)
+            # Charge the review, not the wait for approval: start a new active
+            # segment, saved before launch as resume() and prepared runs do.
+            previous = {key: self.state[key] for key in ("elapsedSeconds", "resumedAt")
+                        if key in self.state}
+            self.state.update(elapsedSeconds=self._elapsed_seconds(),
+                              resumedAt=datetime.now(timezone.utc).isoformat())
+            try:
+                self._save_job_settings(self.state)
+                process, token = self._launch_solver_locked(statement)
+            except (OSError, ValueError, RuntimeError):
+                for key in ("elapsedSeconds", "resumedAt"):
+                    self.state.pop(key, None)
+                self.state.update(previous)
+                raise
         self._spawn_worker(self._read_output, (process, token), token)
 
     def _read_output(self, process, token=None):
@@ -2593,6 +3281,9 @@ class App:
         problem, answers, order, final, failed = "", {}, [], False, False
         latest_critic_solution = ""
         last_work_node = self.state["activeNode"]
+        # Only the first repair turn after an author submission starts a new
+        # answer; live instructions and continuation turns extend it.
+        repair_pending = False
         try:
             for line in process.stdout:
                 if self.output_stream is not None:
@@ -2605,6 +3296,7 @@ class App:
                 # Untagged errors belong to the most recently active stage.
                 record = self.parse_line(line, self.state["stage"] or "solve")
                 self.add_trace(record)
+                self._follow_model_retry(record)
                 goal_thread = goal_thread_from_record(record)
                 if goal_thread:
                     with self.lock:
@@ -2646,14 +3338,21 @@ class App:
                 elif (
                     record.get("kind") == "request"
                     and record_stage == "critic"
+                    # A retry of the same critic call is not another round.
+                    and record.get("attempt") in (None, 1)
                 ):
                     with self.lock:
                         self.state["round"] += 1
+                if record.get("kind") == "author_result":
+                    repair_pending = True
                 # A repair replaces the prior answer; the final proof replaces all.
                 if (
                     record.get("kind") == "request"
                     and record_stage == "repair"
+                    and record.get("label") == "Exact solve input"
+                    and repair_pending
                 ):
+                    repair_pending = False
                     answers.clear()
                     order.clear()
                     with self.lock:
@@ -2669,23 +3368,32 @@ class App:
                 if record.get("kind") == "workflow_paused":
                     with self.lock:
                         if self.state["phase"] != "stopping" and not self.state.get("manuallyStopped"):
-                            try:
-                                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-                            except (OSError, ValueError):
-                                checkpoint = {}
+                            checkpoint = read_pause_object(self.run_dir)
                             reason = record.get("reason", "")
                             cause = checkpoint.get("pauseCause") if self.state["phase"] == "pausing" else "error"
+                            if cause == "audit" and reason:
+                                # The author failed before it saw the audit pause (an
+                                # acknowledged pause carries no reason). No audit runs and
+                                # nothing resumes it: an error pause, retried as usual.
+                                cause = "error"
                             paused_stage = record["stage"]
                             if (record["node"] == "author"
                                     and record["state"].get("report", {}).get("verdict") == "reject"):
                                 paused_stage = "repair"
+                            # The saved conversation is gone: retrying the same
+                            # resume cannot help, so only an explicit choice continues.
+                            unavailable = record.get("sessionUnavailable") is True
+                            # A safety check stopped the author: only the user resumes it.
+                            safety = record.get("safetyStop") is True
                             self._save_pause({**checkpoint, "status": "pausing", "state": record["state"],
                                               "pauseCause": cause or "error", "autoResumeAt": 0,
                                               "node": record["node"], "error": reason,
                                               "elapsedSeconds": self._elapsed_seconds(),
                                               "goalThreadId": self.state.get("goalThreadId", ""),
-                                              "stage": paused_stage})
-                            self.state.update(phase="pausing", error=reason)
+                                              "stage": paused_stage, "sessionUnavailable": unavailable,
+                                              "safetyStop": safety})
+                            self.state.update(phase="pausing", error=reason, sessionUnavailable=unavailable,
+                                              safetyStop=safety)
                             self._update_research_audits()
                             self._save_job_settings(self.state)
                 if (
@@ -2781,6 +3489,10 @@ class App:
                 return
             stopped = self.state["phase"] == "stopping"
             paused = self.state["phase"] == "pausing"
+            # A runner that ended while waiting to retry: that wait was not active time.
+            self._end_retry_wait_locked()
+            self._model_retries = {}
+            self.state["modelRetry"] = None
             if self.process is process:
                 self.process = None
             if self.active_token is token:
@@ -2789,10 +3501,7 @@ class App:
                 self.worker_token = None
             self.state["phase"] = "done"
             self.state["finishedAt"] = datetime.now(timezone.utc).isoformat()
-            try:
-                checkpoint = json.loads((self.run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                checkpoint = {}
+            checkpoint = read_pause_object(self.run_dir)
             author_interrupted = (not stopped and last_work_node == "author" and (not final or failed))
             if (paused or author_interrupted) and (not final or failed):
                 error = checkpoint.get("error", "") if paused else (
@@ -2820,7 +3529,7 @@ class App:
             elif stopped:
                 self.state["error"] = "Stopped."
                 self.state["output"] = self.state["output"] or (
-                    "Codex was stopped before it produced an answer."
+                    "The model was stopped before it produced an answer."
                 )
             elif problem or code:
                 self.state["error"] = problem or f"The solver exited with code {code}."
@@ -2837,7 +3546,7 @@ class App:
 
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
-                raise ValueError("Wait for the current Codex request to finish.")
+                raise ValueError("Wait for the current model request to finish.")
             self.state["trace"] = []
             self.state["traceVersion"] = 0
             self.pinned = []
@@ -2845,7 +3554,7 @@ class App:
                 self.trace_file.unlink(missing_ok=True)
 
     def stop(self):
-        """Immediately stop Codex and all of its descendants."""
+        """Immediately stop the running CLI and all of its descendants."""
 
         with self.lock:
             if self.state["phase"] == "stopping" or (
@@ -2854,7 +3563,7 @@ class App:
             ):
                 return
             if self.state["phase"] not in {"reviewing", "running", "pausing"} and not self.state.get("auditHoldingAuthor"):
-                raise ValueError("Codex is not working.")
+                raise ValueError("No model request is running in this job.")
             self._audit_pause_engine = None
             self.state["auditHoldingAuthor"] = False
             self.add_trace({
@@ -2895,7 +3604,7 @@ class App:
             if self.state["phase"] == "stopping" and self.worker_token is None:
                 self._finish_stopped_locked(
                     self.active_token,
-                    "Codex was stopped before it produced an answer.",
+                    "The model was stopped before it produced an answer.",
                 )
 
     def set_author_time_limit(self, hours):
@@ -3007,16 +3716,34 @@ def _iter_run_records(run_dir):
 
     path = Path(run_dir) / "transcript.jsonl"
     try:
-        with path.open(encoding="utf-8", errors="replace") as stream:
+        # Never follow a link or open a FIFO left where the log belongs.
+        descriptor = open_run_log(path, os.O_RDONLY, private=False)
+        if descriptor is None:
+            return
+        with os.fdopen(descriptor, encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     value = json.loads(line)
-                    if isinstance(value, dict):
-                        yield value
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     continue
+                if readable_record(value):
+                    yield value
     except OSError:
         pass
+
+
+def _joins_instructions(value, instructions):
+    """Whether ``value`` is the blank-line join of consecutive saved instructions."""
+
+    for start, first in enumerate(instructions):
+        joined = first
+        for item in instructions[start + 1:]:
+            if not value.startswith(joined + "\n\n"):
+                break
+            joined += "\n\n" + item
+            if joined == value:
+                return True
+    return False
 
 
 def saved_author_instructions(run_dir):
@@ -3028,29 +3755,34 @@ def saved_author_instructions(run_dir):
     }
     records = [record for record in _iter_run_records(run_dir)
                if record.get("label") in labels]
+    restored = [record for record in records
+                if record.get("label") == "Restored live instructions queued"]
     restored_ids = {
-        str(record.get("steerId") or "").strip()
-        for record in records
-        if record.get("label") == "Restored live instructions queued"
-        and str(record.get("steerId") or "").strip()
+        str(record.get("steerId") or "").strip() for record in restored
+        if str(record.get("steerId") or "").strip()
+    }
+    # Older runners logged the delivered block without its steerId; recognize
+    # that echo by its text.
+    restored_texts = {
+        text.strip() for text in (record.get("text") for record in restored)
+        if isinstance(text, str) and text.strip()
     }
     instructions, seen = [], set()
     for record in records:
-        if record.get("label") not in labels:
-            continue
-        steer_id = str(record.get("steerId") or "").strip()
-        if (
-            record.get("label") == "Live author instruction sent"
-            and steer_id in restored_ids
-        ):
-            continue
+        if record.get("label") == "Live author instruction sent":
+            text = record.get("text")
+            if (str(record.get("steerId") or "").strip() in restored_ids
+                    or (isinstance(text, str) and text.strip() in restored_texts)):
+                continue
         values = record.get("restoredInstructions")
         values = values if isinstance(values, list) else [record.get("text")]
         for value in values:
             if not isinstance(value, str) or not value.strip() or "\0" in value:
                 continue
             key = value.strip()
-            if key in seen:
+            # Earlier continuations may have saved such a block as one more
+            # instruction; it only repeats instructions already collected.
+            if key in seen or _joins_instructions(key, instructions):
                 continue
             seen.add(key)
             instructions.append(key)
@@ -3244,11 +3976,7 @@ def valid_saved_audit_reports(run_dir, source):
         )
         model = runtime.chosen_model(model)
         effort = runtime.chosen_effort(effort)
-        audit_effort = (
-            runtime.effective_effort(model, "high")
-            if runtime.is_deepseek_model(model)
-            else runtime.effective_effort(model, effort)
-        )
+        audit_effort = runtime.effective_effort(model, effort)
         instructions = runtime.text(source["critic_prompt"])
         if runtime.CRITIC_MEMORY_PROMPT not in instructions:
             instructions = f"{instructions}\n\n{runtime.CRITIC_MEMORY_PROMPT}"
@@ -3423,6 +4151,8 @@ def restore_saved_app(app):
 
     settings_path = run_dir / JOB_SETTINGS_FILENAME
     persisted_settings = set()
+    # Roles whose saved model was removed (DeepSeek) and now runs as its replacement.
+    replaced_roles, settings_warnings = set(), []
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
@@ -3430,6 +4160,9 @@ def restore_saved_app(app):
                 state["sourceFile"] = source_file_name(settings.get("sourceFile"))
             except ValueError:
                 pass
+            api_models = saved_api_models(settings.get("apiModels"))
+            if api_models:
+                state["apiModels"] = api_models
             for key in (
                 "reviewModel", "authorModel", "criticModel", "writerModel",
                 "reasoningEffort", "reviewEffort", "authorEffort",
@@ -3461,14 +4194,16 @@ def restore_saved_app(app):
                         try:
                             state[key] = audits.normalize_settings(settings[key])
                         except ValueError:
-                            state["settingsWarning"] = "Saved research audit settings are invalid; audits are disabled."
+                            settings_warnings.append("Saved research audit settings are invalid; audits are disabled.")
                         continue
                     if key == "researchAuditProgress" and not isinstance(settings[key], dict):
                         continue
-                    state[key] = (
-                        restored_model(settings[key])
-                        if key.endswith("Model") else settings[key]
-                    )
+                    if key.endswith("Model"):
+                        state[key] = restored_model(settings[key])
+                        if state[key] != settings[key]:
+                            replaced_roles.add(key[:-len("Model")])
+                        continue
+                    state[key] = settings[key]
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
     if not state["fileManagement"]:
@@ -3593,6 +4328,10 @@ def restore_saved_app(app):
                 and model_key not in persisted_settings
             ):
                 state[f"{role}Model"] = restored_model(model)
+                if state[f"{role}Model"] != model:
+                    replaced_roles.add(role)
+                else:
+                    replaced_roles.discard(role)
             if (
                 role and isinstance(effort, str)
                 and effort_key not in persisted_settings
@@ -3647,17 +4386,22 @@ def restore_saved_app(app):
         and role not in observed_role_settings
     )
     if unknown_roles:
-        labels = {
-            "review": "statement reviewer",
-            "author": "proof author",
-            "critic": "critic",
-            "writer": "LaTeX editor",
-        }
-        names = ", ".join(labels[role] for role in unknown_roles)
-        state["settingsWarning"] = (
+        names = ", ".join(ROLE_LABELS[role] for role in unknown_roles)
+        settings_warnings.append(
             f"This older run did not record the {names} model settings. "
             "Those roles will use the current defaults if you continue."
         )
+    # Only roles this job still runs are worth a warning.
+    replaced_roles &= required_roles
+    if replaced_roles:
+        settings_warnings.insert(0, removed_model_warning(replaced_roles))
+    # An API model removed since the job ran: a settings error, never retried.
+    unconfigured_roles = [
+        role for role in ROLES if role in required_roles
+        and providers.is_api_id(state.get(f"{role}Model")) and not providers.is_known(state[f"{role}Model"])
+    ]
+    settings_warnings.extend(unconfigured_job_model_error(state[f"{role}Model"], role, state.get("apiModels"))
+                             for role in unconfigured_roles)
 
     first_time = records[0].get("time") if records else ""
     last_time = records[-1].get("time") if records else ""
@@ -3685,6 +4429,9 @@ def restore_saved_app(app):
                 break
             except (OSError, UnicodeError):
                 pass
+    if state["resultKind"] == "final":
+        # A completed answer supersedes errors that a later resume recovered from.
+        state["error"] = ""
     if state["statementReviewOnly"] and state["review"]:
         state["output"] = state["review"].get("statement", "")
         state["resultKind"] = "review"
@@ -3729,11 +4476,7 @@ def restore_saved_app(app):
             state["output"] = (
                 "This job was manually stopped. Continue it from the home page."
             )
-    checkpoint = {}
-    try:
-        checkpoint = json.loads((run_dir / PAUSE_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError, KeyError, TypeError):
-        checkpoint = {}
+    checkpoint = read_pause_object(run_dir)
     if (manual_stop is None and state["resultKind"] != "final"
             and last_work_node == "author" and not author_finished
             and checkpoint.get("status") not in {"paused", "pausing"}):
@@ -3754,16 +4497,19 @@ def restore_saved_app(app):
             except (TypeError, ValueError):
                 pass
             recovered_state = checkpoint.get("state") or {"statement": statement}
+            # The unfinished author was repairing the latest rejection, even when
+            # its new goal session logged as 'solve' or audit records followed it.
             rejection = next((record for record in reversed(records)
                               if record.get("kind") == "critic_result"), {})
-            if state["stage"] == "repair" and rejection.get("report", {}).get("verdict") == "reject":
-                recovered_state = {**recovered_state, "report": rejection["report"],
-                                   "solution": rejection["report"].get("solution", ""),
+            report = rejection.get("report")
+            if isinstance(report, dict) and report.get("verdict") == "reject":
+                recovered_state = {**recovered_state, "report": report,
+                                   "solution": report.get("solution", ""),
                                    "round": rejection.get("round", state["round"])}
             checkpoint = {
                 **checkpoint, "status": "paused", "node": "author",
                 "state": recovered_state,
-                "stage": "repair" if state["stage"] == "repair" else "solve",
+                "stage": "repair" if recovered_state.get("report") else "solve",
                 "goalThreadId": checkpoint.get("goalThreadId") or state["goalThreadId"],
                 "elapsedSeconds": elapsed,
                 "error": "The previous author process ended without a final answer. Resume continues its saved conversation.",
@@ -3774,7 +4520,9 @@ def restore_saved_app(app):
         state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
                      error=checkpoint.get("error", ""), finishedAt="",
                      elapsedSeconds=checkpoint.get("elapsedSeconds", state.get("elapsedSeconds", 0)),
-                     resumedAt=state["lastActivityAt"])
+                     resumedAt=state["lastActivityAt"],
+                     sessionUnavailable=checkpoint.get("sessionUnavailable") is True,
+                     safetyStop=checkpoint.get("safetyStop") is True)
         if checkpoint.get("goalThreadId"):
             state["goalThreadId"] = checkpoint["goalThreadId"]
     elif state["phase"] == "done" and manual_stop is None and not state["resultKind"]:
@@ -3793,7 +4541,15 @@ def restore_saved_app(app):
     if state["phase"] == "paused":
         pause_path = run_dir / PAUSE_FILENAME
         app._configure_auto_resume(checkpoint, pause_path.stat().st_mtime if pause_path.exists() else time.time())
+        if replaced_roles and checkpoint.get("autoResumeAt"):
+            # A replaced model is never started unattended: Resume is explicit.
+            checkpoint["autoResumeAt"] = state["autoResumeAt"] = 0
+            settings_warnings.insert(1, "Automatic retry is off; choose Resume to continue with the replacement.")
+        if unconfigured_roles and checkpoint.get("autoResumeAt"):
+            checkpoint["autoResumeAt"] = state["autoResumeAt"] = 0
+            settings_warnings.append("Automatic retry is off; choose Resume once the model is configured.")
         app._save_pause(checkpoint)
+    state["settingsWarning"] = " ".join(settings_warnings)
     app.fixed_trace = False
     return app
 
@@ -3802,6 +4558,9 @@ def restore_saved_jobs(runs):
     """Load every historical run as an idle job after a Web UI restart."""
 
     jobs = {}
+    # A broken shared workflow file is not a damaged run: report it before
+    # skipping individual runs could hide every job.
+    default_prompts()
     candidates = set(Path(runs).glob("*/transcript.jsonl"))
     for settings_path in Path(runs).glob("*/job-settings.json"):
         if settings_path.is_symlink():
@@ -3816,7 +4575,14 @@ def restore_saved_jobs(runs):
             transcript.parent, runs
         ):
             continue
-        app = restore_saved_app(App(transcript, runs))
+        try:
+            app = restore_saved_app(App(transcript, runs))
+        except (OSError, UnicodeError, TypeError, AttributeError, KeyError,
+                ValueError, RecursionError) as exc:
+            # One damaged run folder must not keep the Web UI from starting.
+            print(f"Skipped damaged saved run {transcript.parent.name}: {exc}",
+                  file=sys.stderr, flush=True)
+            continue
         jobs[app.state["runId"]] = app
     return jobs
 
@@ -3843,9 +4609,8 @@ def saved_statement(path):
     run_dir = source if source.is_dir() else source.parent
     if not run_dir.is_dir():
         raise ValueError(f"The saved run does not exist: {run_dir}")
-    statement = ""
     checked_path = run_dir / "checked-statement.md"
-    if not statement and checked_path.exists():
+    if checked_path.exists():
         checked = read_utf8(checked_path, "saved checked statement")
         reviewed_prefix = "# Checked statement"
         direct_prefix = "# Statement sent directly to the proof author"
@@ -3862,7 +4627,7 @@ def saved_statement(path):
             raise ValueError(
                 f"Cannot locate the checked statement in {checked_path}."
             )
-    elif not statement:
+    else:
         raise ValueError(f"No saved checked statement exists in {run_dir}.")
     if not statement:
         raise ValueError("The saved checked statement is empty.")
@@ -3971,9 +4736,13 @@ def saved_research_source(path):
             raise ValueError(f"Cannot read saved author settings: {exc}") from exc
         if not isinstance(settings, dict):
             raise ValueError("Saved author settings must be an object.")
+    replaced = []
     for role in ("author", "critic", "writer"):
         if f"{role}Model" in settings:
-            settings[f"{role}Model"] = restored_model(settings[f"{role}Model"])
+            saved = settings[f"{role}Model"]
+            settings[f"{role}Model"] = restored_model(saved)
+            if settings[f"{role}Model"] != saved:
+                replaced.append(role)
     defaults = default_prompts()
     if settings.get("fileManagement") is False:
         defaults["author"] = defaults["author_simple"]
@@ -3983,28 +4752,31 @@ def saved_research_source(path):
             read_utf8(path, f"saved {role} prompt") if path.exists()
             else defaults[role]
         )
-    return {"run_dir": source, "statement": saved_statement(source), "settings": settings}
+    return {"run_dir": source, "statement": saved_statement(source), "settings": settings,
+            "replacedRoles": replaced}
 
 
 class Server(ThreadingHTTPServer):
     """Keep independent jobs alive while browser tabs come and go."""
 
-    def __init__(self, address, trace_file=None, runs=RUNS):
+    # On Windows SO_REUSEADDR lets a second server bind a port that is already
+    # listening, so two servers would own the same jobs. Without it a second
+    # launch fails with "address in use"; POSIX keeps quick restarts.
+    allow_reuse_address = os.name != "nt"
+
+    def __init__(self, address, runs=RUNS):
         self.runs = Path(runs)
         from .batches import BatchCatalog
-        self.batch_catalog = BatchCatalog(self.runs, current_root=self.runs)
-        self.app = App(trace_file, self.runs)
-        self.fixed_app = trace_file is not None
+        # The catalog refuses a symlinked root itself; a linked runs folder
+        # (for example on another disk) still works for jobs and restores.
+        root = self.runs.resolve()
+        self.batch_catalog = BatchCatalog(root, current_root=root)
         self.jobs, self.jobs_lock = {}, threading.RLock()
         self._retry_stop = threading.Event()
         super().__init__(address, Handler)
-        if not self.fixed_app:
-            self.jobs.update(restore_saved_jobs(self.runs))
-            if self.jobs:
-                self.app = max(
-                    self.jobs.values(),
-                    key=lambda item: item.state.get("lastActivityAt", ""),
-                )
+        # Key-bearing Claude settings left by runners that were killed.
+        claude_cli.sweep_stale_settings()
+        self.jobs.update(restore_saved_jobs(self.runs))
         # Only the unguessable launch URL can create this server's session.
         self.token = secrets.token_urlsafe(32)
         self.origin = f"http://{HOST}:{self.server_port}"
@@ -4016,15 +4788,20 @@ class Server(ThreadingHTTPServer):
                     return
                 try:
                     app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
-                except (OSError, ValueError, TypeError):
-                    # A missing or damaged checkpoint must not stop other jobs.
-                    continue
+                except Exception as exc:
+                    # Nothing one job raises may stop the other jobs' retries:
+                    # report it on that job, which tries again after the usual wait.
+                    app.defer_auto_resume(exc, now)
 
     def serve_forever(self, poll_interval=0.5):
         # No browser tab or polling request is needed to retry a paused job.
         def retry_loop():
             while not self._retry_stop.wait(1):
-                self._retry_paused_jobs()
+                try:
+                    self._retry_paused_jobs()
+                except Exception:
+                    # Every paused job depends on this one thread: keep it alive.
+                    traceback.print_exc()
 
         worker = threading.Thread(target=retry_loop, daemon=True)
         worker.start()
@@ -4043,10 +4820,8 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
     def get_job(self, run_id):
-        """Return one exact job; tests may use their fixed single app."""
+        """Return one exact job."""
 
-        if not run_id and self.fixed_app:
-            return self.app
         with self.jobs_lock:
             app = self.jobs.get(run_id)
         if not app:
@@ -4056,9 +4831,7 @@ class Server(ThreadingHTTPServer):
     def start_job(self, body, run_id=""):
         """Create a new job, or revise the selected existing job."""
 
-        app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
-        )
+        app = self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False)
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         review_only_option = (
             {"review_only": body.get("statementReviewOnly")}
@@ -4089,10 +4862,11 @@ class Server(ThreadingHTTPServer):
             file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
             retrieval_mode=body.get("retrievalMode", app.state.get("retrievalMode", "live") if run_id else "live"),
             retrieval_cutoff_utc=body.get("retrievalCutoffUtc", app.state.get("retrievalCutoffUtc", "") if run_id else ""),
+            # A named job is revised in its own folder, never re-registered.
+            revise_existing=bool(run_id),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app  # Preserve the small single-app testing interface.
         return app
 
 
@@ -4123,17 +4897,14 @@ class Server(ThreadingHTTPServer):
     def start_direct_job(self, body, run_id=""):
         """Create a statement job that starts directly with the author."""
 
-        if run_id and not self.fixed_app:
+        if run_id:
             raise ValueError("Start a direct proof from the home screen.")
-        app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
-        )
+        app = App(runs=self.runs, load_latest=False)
         app.start_direct_statement(
             statement=body.get("statement", ""), **self._direct_options(body),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app
         return app
 
     def start_direct_batch(self, body, run_id=""):
@@ -4179,10 +4950,12 @@ class Server(ThreadingHTTPServer):
         historical = normalized["retrievalMode"] == "historical"
         if historical and len(statements) > 10:
             raise ValueError("Historical search supports at most 10 statements per launch so every sandbox can be checked before work starts.")
-        started = []
+        # ``current`` indexes the statement being handled; None means a step
+        # shared by the whole historical batch.
+        started, current = [], 0
         try:
-            for name, statement in statements:
-                app = App(runs=self.runs)
+            for current, (name, statement) in enumerate(statements):
+                app = App(runs=self.runs, load_latest=False)
                 app.start_direct_statement(statement, source_file=name, _prepare_only=historical, **options)
                 started.append(app)
                 with self.jobs_lock:
@@ -4192,9 +4965,17 @@ class Server(ThreadingHTTPServer):
                 # transport timeouts and only two concurrent native probes.
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    list(pool.map(lambda app: retrieval.preflight_policy(app.state["retrievalPolicyPath"]), started))
+                    checks = [pool.submit(retrieval.preflight_policy, app.state["retrievalPolicyPath"])
+                              for app in started]
+                    try:
+                        for current, check in enumerate(checks):
+                            check.result()
+                    finally:
+                        for check in checks:
+                            check.cancel()  # Like map(): skip checks not yet started.
+                current = None
                 retrieval.preflight_compiler(started[0].state["retrievalPolicyPath"])
-                for app in started:
+                for current, app in enumerate(started):
                     with app.lock:
                         app.state["launchHold"] = ""
                         app._save_job_settings(app.state)
@@ -4202,33 +4983,37 @@ class Server(ThreadingHTTPServer):
         except Exception as exc:
             # A launch failed after validation (for example, the disk is full). Stop
             # the jobs this request started so a retry cannot duplicate them.
+            stopped = held = 0
             for app in started:
+                prepared = app.state.get("phase") == "prepared"
+                held, stopped = held + prepared, stopped + (not prepared)
                 try:
-                    if app.state.get("phase") == "prepared":
+                    if prepared:
                         app.state["launchHold"] = "Historical batch launch failed. Create a new batch."
                         app._save_job_settings(app.state)
                     else:
                         app.stop()
                 except (OSError, ValueError):
                     pass
-            failed_index = min(len(started), len(statements) - 1)
-            failed = statements[failed_index][0] or f"statement {failed_index + 1}"
-            stopped = (
-                f" The {len(started)} job{'s' if len(started) != 1 else ''} it had "
-                "already started were stopped." if started else ""
+            target = "the historical batch" if current is None else (
+                "the job for " + (statements[current][0] or f"statement {current + 1}")
             )
             detail = str(exc).rstrip(".") or type(exc).__name__
-            raise ValueError(f"Could not start the job for {failed}: {detail}.{stopped}") from exc
+            message = f"Could not start {target}: {detail}."
+            if stopped:
+                message += f" The {stopped} job{'s' if stopped != 1 else ''} it had already started were stopped."
+            if held:
+                message += (f" The {held} prepared job{'s are' if held != 1 else ' is'} "
+                            "held and will not start.")
+            raise ValueError(message) from exc
         return started
 
     def start_latex_job(self, body, run_id=""):
         """Create a job that runs only the final LaTeX editor."""
 
-        if run_id and not self.fixed_app:
+        if run_id:
             raise ValueError("Start LaTeX-only editing from the home screen.")
-        app = self.get_job(run_id) if run_id else (
-            self.app if self.fixed_app else App(runs=self.runs)
-        )
+        app = App(runs=self.runs, load_latest=False)
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_latex_only(
             source=body.get("content", ""),
@@ -4245,7 +5030,6 @@ class Server(ThreadingHTTPServer):
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app
         return app
 
     def start_saved_critic_job(
@@ -4257,7 +5041,7 @@ class Server(ThreadingHTTPServer):
         source = saved_critic_source(source_run)
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
-        app = App(runs=self.runs)
+        app = App(runs=self.runs, load_latest=False)
         app.start_critic_resume(
             statement=source["statement"],
             solution=source["solution"],
@@ -4295,7 +5079,6 @@ class Server(ThreadingHTTPServer):
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app
         return app
 
     def start_saved_research_job(self, source_run, settings=None):
@@ -4305,7 +5088,7 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
         options = {**source["settings"], **(settings or {})}
-        app = App(runs=self.runs)
+        app = App(runs=self.runs, load_latest=False)
         app.start_direct_statement(
             source["statement"],
             critic_rounds=options.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
@@ -4327,10 +5110,16 @@ class Server(ThreadingHTTPServer):
             research_audits=options.get("researchAudits"),
             file_management=options.get("fileManagement", True),
         )
+        warning = removed_model_warning(
+            role for role in source.get("replacedRoles", ()) if f"{role}Model" not in (settings or {}))
+        if warning:
+            with app.lock:
+                app.state["settingsWarning"] = warning
+                app.add_trace({"kind": "status", "stage": "solve", "node": "author",
+                               "label": "Saved model replaced", "text": warning})
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app
         return app
 
     def _check_author_workspace_idle(self, source_run):
@@ -4420,13 +5209,19 @@ class Server(ThreadingHTTPServer):
             or source_app.has_active_worker()
         ):
             return None
-        if state.get("phase") == "paused":
+        if state.get("phase") == "paused" and not (
+                state.get("sessionUnavailable") and state.get("stage") in {"solve", "repair"}
+                and not state.get("retrievalPolicyPath") and state.get("retrievalMode") != "historical"):
             return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
         if state.get("phase") == "prepared":
             if state.get("launchHold"):
                 return None
             return {"action": "prepared", "label": "Start prepared run",
                     "description": "Start a fresh author session in this prepared research workspace."}
+        if state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical":
+            # Every other continuation creates a new run, which a historical
+            # run's fixed workspace and cutoff do not allow.
+            return None
         stage = state.get("stoppedStage") or state.get("stage")
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
@@ -4593,7 +5388,7 @@ class Server(ThreadingHTTPServer):
                 self._queue_saved_author_instructions(source_app, continued)
             return continued
 
-        app = App(runs=self.runs)
+        app = App(runs=self.runs, load_latest=False)
         source_run = source_app.run_dir
         common = {
             "speed_mode": source_state["speedMode"],
@@ -4683,7 +5478,6 @@ class Server(ThreadingHTTPServer):
                 )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
-        self.app = app
         return app
 
     def job_list(self):
@@ -4705,6 +5499,8 @@ class Server(ThreadingHTTPServer):
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
+            # A paused job whose auditors still hold its workspace is busy.
+            job["auditHoldingAuthor"] = bool(state.get("auditHoldingAuthor"))
             job["stageLabel"] = state["workflow"]["nodes"].get(state["activeNode"], {}).get("label", "")
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
@@ -4713,9 +5509,15 @@ class Server(ThreadingHTTPServer):
             )
             run_dir = app.run_dir
             checkpoints = state.get("checkpoints", [])
+            historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+            if historical:
+                # Critic continuations start new runs, which historical runs refuse.
+                # Copy: the snapshot shares these dicts with the job's cache.
+                checkpoints = [{**checkpoint, "resumable": False} for checkpoint in checkpoints]
             job["checkpoints"] = checkpoints
             job["canResumeCritic"] = bool(
-                state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
+                not historical
+                and state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
                 and run_dir
                 and (
                     (run_dir / "SOLUTION.md").is_file()
@@ -4742,18 +5544,23 @@ class Server(ThreadingHTTPServer):
             if not app:
                 raise ValueError("That job is not available in this TCS Prover session.")
             with app.lock:
+                engine = app.research_audits
                 if (
                     app.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
                     or app.worker_token is not None
+                    # Auditors of a paused author still read and write its folder.
+                    or app.state.get("auditHoldingAuthor") or app._audit_pause_engine is not None
+                    or (engine is not None and engine.status().get("batchActive"))
                 ):
                     raise ValueError("Stop this job before deleting it.")
                 folder = app.run_dir
                 if not folder or folder.resolve().parent != self.runs.resolve():
                     raise ValueError("The job folder is outside the runs directory.")
                 for other in self.jobs.values():
-                    if other is app or not (other.has_active_worker() or other.state["phase"] in {
-                        "reviewing", "running", "stopping", "pausing",
-                    }):
+                    if other is app or not (
+                        other.has_active_worker() or other.state.get("auditHoldingAuthor")
+                        or other.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
+                    ):
                         continue
                     workspace = other.state.get("goalWorkspace")
                     if workspace and Path(workspace).resolve() == folder.resolve():
@@ -4765,9 +5572,158 @@ class Server(ThreadingHTTPServer):
                 while target.exists():
                     target = trash / f"{folder.name}-{number}"
                     number += 1
+                if engine is not None:
+                    # An idle scheduler stays attached after Stop; detach it so no
+                    # later audit event recreates the deleted folder.
+                    engine.close()
+                    app.research_audits = app._audit_token = None
                 folder.rename(target)
                 del self.jobs[run_id]
         return {"deleted": run_id}
+
+    def api_model_listing(self):
+        """Saved API models (never their keys) and the role menus that include them."""
+
+        return {"models": providers.load_api_models(), "formats": API_MODEL_FORMATS, **model_menu_settings()}
+
+    def _api_model_jobs(self, model_id):
+        """Run ids of the jobs naming one model: (running, waiting to start or resume)."""
+
+        active, waiting = [], []
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        for app in apps:
+            with app.lock:
+                if not any(app.state.get(f"{role}Model") == model_id for role in ROLES):
+                    continue
+                if (app.state["phase"] in ACTIVE_PHASES or app.worker_token is not None
+                        or app.state.get("auditHoldingAuthor")):
+                    active.append(app.state.get("runId", ""))
+                elif app.state["phase"] in WAITING_PHASES:
+                    waiting.append(app.state.get("runId", ""))
+        return active, waiting
+
+    def _removed_api_models(self):
+        """Removed API models that saved jobs still name: {id: (formats, settings)}.
+
+        Formats come from every job naming the id; settings from a job's own
+        key-free snapshot, when it recorded one.
+        """
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        removed = {}
+        for app in apps:
+            with app.lock:
+                snapshot = saved_api_models(app.state.get("apiModels"))
+                for role in ROLES:
+                    model = app.state.get(f"{role}Model")
+                    if not providers.is_api_id(model) or providers.is_known(model):
+                        continue
+                    formats, settings = removed.setdefault(model, (set(), {}))
+                    if model in snapshot:
+                        formats.add(snapshot[model]["format"])
+                        settings.setdefault("value", snapshot[model])
+        return {model: (formats, settings.get("value")) for model, (formats, settings) in removed.items()}
+
+    def save_api_model(self, body):
+        """Create or update one API model; an empty apiKey keeps the saved key
+        while the format, base URL and header name stay the same.
+
+        A new model with exactly the settings a job recorded for a removed API
+        model gets that model's id back, whatever its display name, so the job
+        can continue. A new model never takes a removed id that jobs recorded
+        with another format: the format chooses the CLI of their sessions.
+        """
+
+        requested = body.get("id")
+        reserved = set()
+        with self.jobs_lock:
+            saved = providers.api_model(requested) if requested else None
+            if (saved is not None and body.get("format") in providers.FORMATS
+                    and body["format"] != saved["format"] and any(self._api_model_jobs(requested))):
+                # The format chooses the CLI, and a saved author session belongs to one CLI.
+                raise ValueError(
+                    "The API format decides which CLI runs this model, so it cannot change while "
+                    "jobs use it. Add a new API model for the other format."
+                )
+            if saved is None:
+                entry, _ = providers.validated_api_model(body)
+                removed = self._removed_api_models()
+                if not requested:
+                    same = sorted(model for model, (_, settings) in removed.items() if settings and all(
+                        settings[key] == entry[key] for key in ("format", "baseUrl", "model"))
+                        and settings["headerName"].lower() == entry["headerName"].lower())
+                    if same:
+                        settings = removed[same[0]][1]
+                        body = {**body, "id": same[0], "label": body.get("label") or settings["label"]}
+                reserved = {model for model, (formats, _) in removed.items() if formats - {entry["format"]}}
+                if body.get("id") in reserved:
+                    raise ValueError(
+                        f"Jobs still use {body['id']} as an API model of another format, which decides the CLI "
+                        "of their sessions. Choose the format they recorded."
+                    )
+            model = providers.save_api_model(body, reserved=reserved)
+        return {"model": model, **self.api_model_listing()}
+
+    def delete_api_model(self, body):
+        """Remove one API model unless a running job uses it."""
+
+        model_id = body.get("id")
+        if not providers.is_api_id(model_id):
+            raise ValueError("Choose a configured API model to remove.")
+        with self.jobs_lock:
+            saved = providers.api_model(model_id)
+            if saved is None:
+                raise ValueError("That API model is not configured.")
+            active, waiting = self._api_model_jobs(model_id)
+            if active:
+                raise ValueError(
+                    f"{saved['label']} is in use by a running job. Stop that job before removing "
+                    "this API model."
+                )
+            providers.delete_api_model(model_id)
+        warning = ""
+        if waiting:
+            count = len(waiting)
+            warning = (
+                f"{count} job{'s' if count != 1 else ''} waiting to start or resume still "
+                f"use{'s' if count == 1 else ''} {saved['label']}; {'it' if count == 1 else 'they'} "
+                "cannot continue until you add it again with the same format, base URL, header "
+                "name and model ID."
+            )
+        return {"deleted": model_id, "warning": warning, **self.api_model_listing()}
+
+    def probe_api_model(self, body):
+        """Test a saved API model ({id}) or unsaved form fields with one request.
+
+        Form fields with the id of a saved model fill gaps from that model; an
+        empty key is filled in only while the format, base URL and header name
+        are the saved ones, so the saved key never goes to another destination.
+        Only a test of exactly the saved settings is recorded as its last test.
+        """
+
+        requested = body.get("id") or None
+        fields = {key: body[key] for key in ("format", "baseUrl", "headerName", "model", "apiKey", "label")
+                  if key in body}
+        if requested and not fields and providers.api_model(requested) is None:
+            raise ValueError("That API model is not configured.")
+        entry, saved = providers.validated_api_model(fields, requested)
+        result = probe_api_endpoint(entry)
+        request_fields = ("format", "baseUrl", "headerName", "model", "apiKey")
+        result["recorded"] = False
+        if saved is not None and all(saved[key] == entry[key] for key in request_fields):
+            try:
+                _, current = providers.validated_api_model({}, requested)
+                if current is not None and all(current[key] == entry[key] for key in request_fields):
+                    result["apiModel"] = providers.record_api_model_test(requested, {
+                        "ok": result["ok"], "status": result["status"], "message": result["message"],
+                        "latencyMs": result["latencyMs"], "at": result["testedAt"],
+                    })
+                    result["recorded"] = True
+            except providers.ProviderError:
+                pass  # Removed or changed during the test: nothing to record.
+        return result
 
     def stop_all(self):
         """Interrupt every live child when the local server itself closes."""
@@ -4780,11 +5736,20 @@ class Server(ThreadingHTTPServer):
                 app.state["auditHoldingAuthor"] = False
                 if app.research_audits is not None:
                     app.research_audits.close()
-            if app.process:
-                try:
-                    app.process.send_signal(signal.SIGINT)
-                except OSError:
-                    pass
+                process = app.process
+            if process is None:
+                continue
+            # One job that cannot be stopped must not leave the others running.
+            try:
+                if os.name == "nt":
+                    # Windows Popen cannot send SIGINT, and runners in their own
+                    # process group never see the console's Ctrl-C.
+                    stop_process_tree(process)
+                else:
+                    # SIGINT keeps the runner's graceful goal-pause cleanup.
+                    process.send_signal(signal.SIGINT)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4900,7 +5865,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             try:
-                if not run_id and not self.server.fixed_app:
+                if not run_id:
                     state = empty_state()
                     state["traceFrom"] = 0
                     return self.send(state)
@@ -4913,6 +5878,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.send({"jobs": [{**row, "batchId": "__root__"} for row in self.server.job_list()]})
+        if request.path == "/api-models":
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            return self.send(self.server.api_model_listing())
         if request.path == "/transcript":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -4934,6 +5903,8 @@ class Handler(BaseHTTPRequestHandler):
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
+            # Linked from index.html, so the browser's own icon request finds it.
+            "/favicon.svg": ("favicon.svg", "image/svg+xml"),
         }
         if request.path not in files or (request.query and request.path != "/"):
             return self.send({"error": "Not found."}, status=404)
@@ -4963,6 +5934,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object.")
+            # API models belong to this installation, not to one job; no
+            # response ever contains a key.
+            api_model_actions = {
+                "/api-models": self.server.save_api_model,
+                "/api-models/delete": self.server.delete_api_model,
+                "/api-models/test": self.server.probe_api_model,
+            }
+            if request.path in api_model_actions:
+                return self.send(api_model_actions[request.path](body))
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
             if request.path == "/direct-batch":
@@ -5014,5 +5994,11 @@ class Handler(BaseHTTPRequestHandler):
             }:
                 return self.send({"error": "Not found."}, status=404)
             self.send({**app.snapshot(), "batchId": "__root__"})
-        except (OSError, TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            # Includes runtime.Error and RetrievalPolicyError: their messages
+            # are written for the user and reach only this authorized client.
             self.send({"error": str(exc)}, status=400)
+        except Exception as exc:
+            # Answer rather than drop the connection ("Failed to fetch").
+            traceback.print_exc()
+            self.send({"error": f"Unexpected server error: {exc}"}, status=500)

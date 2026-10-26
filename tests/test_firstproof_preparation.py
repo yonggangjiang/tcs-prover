@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import prepare_firstproof
+from experiments import prepare_firstproof
 from ui import server
 
 class PreparationTests(unittest.TestCase):

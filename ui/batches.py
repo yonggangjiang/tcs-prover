@@ -48,6 +48,36 @@ def _finite_number(value):
         return False
 
 
+def _timestamp(value):
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _active_seconds(phase, settings, pause, started, end):
+    """Mirror App._elapsed_seconds using only artifacts the catalog already read.
+
+    A paused checkpoint holds a frozen total. Every other saved job adds its
+    last running segment, which ends at its latest activity, to the time
+    recorded when that segment started.
+    """
+    if phase == 'prepared':
+        return 0
+    if phase == 'paused' and _finite_number(pause.get('elapsedSeconds')):
+        return max(0, pause['elapsedSeconds'])
+    base = settings.get('elapsedSeconds')
+    if not _finite_number(base):
+        # A leftover 'pausing' checkpoint beside a result is already a total.
+        base = pause.get('elapsedSeconds') if pause.get('status') == 'running' else 0
+    base = max(0, base) if _finite_number(base) else 0
+    if phase == 'paused':
+        return base
+    try:
+        start = _timestamp(_text(settings.get('resumedAt')) or started)
+        return base + max(0, (_timestamp(end) - start).total_seconds())
+    except (AttributeError, TypeError, ValueError):
+        return base
+
+
 class BatchCatalog:
     """Read direct jobs and one level of batch folders beneath a fixed root."""
 
@@ -129,8 +159,10 @@ class BatchCatalog:
         if not self._directory(directory):
             return []
         try:
+            # Hidden folders are never batches or runs: deleted jobs live in runs/.trash.
             return sorted((entry for entry in directory.iterdir()
-                           if _component(entry.name) and self._directory(entry)), key=lambda entry: entry.name)
+                           if _component(entry.name) and not entry.name.startswith('.')
+                           and self._directory(entry)), key=lambda entry: entry.name)
         except OSError:
             return []
 
@@ -155,12 +187,8 @@ class BatchCatalog:
         except (KeyError, TypeError):
             raise ValueError('Unknown saved batch.') from None
 
-    def batch_id(self, directory):
-        directory = Path(directory).resolve()
-        return next((key for key, path in self._batches().items() if path == directory), None)
-
     def _run(self, batch_id, run_id):
-        if not _component(run_id):
+        if not _component(run_id) or run_id.startswith('.'):
             raise ValueError('Invalid saved job.')
         path = self.batch_root(batch_id) / run_id
         if not self._directory(path) or not self._is_run(path):
@@ -185,13 +213,15 @@ class BatchCatalog:
         cutoff = _text(settings.get('retrievalCutoffUtc'))
         policy_path = _text(settings.get('retrievalPolicyPath'))
         if policy_path:
-            import retrieval_runtime
+            from retrieval import runtime as retrieval_runtime
+            from .retrieval import display_policy
             mode = 'historical'
             try:
                 path = Path(policy_path)
                 if not path.is_absolute() or path.is_symlink():
                     raise ValueError
-                policy = retrieval_runtime.load_policy(path)
+                # A full load rehashes the pinned Codex binary on every poll.
+                policy = display_policy(path)
                 if Path(policy['isolation']['workspace']).resolve() != directory:
                     raise ValueError
                 cutoff = policy['cutoffExclusiveUtc']
@@ -240,13 +270,13 @@ class BatchCatalog:
             'review': 'statement_reviewer', 'solve': 'author', 'repair': 'author',
             'critic': 'critic', 'final': 'latex_editor', 'failure': 'failure_summary',
         }.get(stage, '')
-        elapsed = pause.get('elapsedSeconds', settings.get('elapsedSeconds', 0))
-        elapsed = max(0, elapsed) if _finite_number(elapsed) else 0
+        last_activity = _iso(trace_info.st_mtime) if trace_info else ''
+        # Lists never read transcripts, so the transcript's mtime ends the segment.
+        elapsed = _active_seconds(phase, settings, pause, started, last_activity)
         retrieval = self._retrieval_settings(directory, settings)
         return {'runId': directory.name, 'phase': phase, 'draft': draft, 'title': draft.split('\n', 1)[0],
                 'sourceFile': _text(settings.get('sourceFile')), 'startedAt': started,
-                'lastActivityAt': _iso(trace_info.st_mtime) if trace_info else '',
-                'finishedAt': _iso(trace_info.st_mtime) if trace_info else '',
+                'lastActivityAt': last_activity, 'finishedAt': last_activity,
                 'stage': stage, 'activeNode': active_node, 'stageLabel': '',
                 'error': 'Stopped.' if stopped else _text(pause.get('error')),
                 'manuallyStopped': bool(stopped), 'stoppedStage': _text(stopped.get('stage')),
@@ -302,7 +332,7 @@ class BatchCatalog:
 
     def state(self, batch_id, run_id, after=None):
         from .server import (DIRECT_GRAPH, LATEX_GRAPH, REVIEW_ONLY_GRAPH,
-                             empty_state, event_node)
+                             empty_state, event_node, model_menu_settings, saved_api_models)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
@@ -311,7 +341,9 @@ class BatchCatalog:
         policy_path = _text(settings.get('retrievalPolicyPath'))
         if policy_path:
             from .retrieval import public_retrieval_info
-            state['retrieval'] = public_retrieval_info(policy_path, run_dir=directory)
+            # The saved cutoff stays visible when the policy metadata cannot load.
+            state['retrieval'] = public_retrieval_info(policy_path, run_dir=directory,
+                                                       saved_cutoff=state['retrievalCutoffUtc'])
             state['retrievalMode'] = state['retrieval']['mode']
             state['retrievalCutoffUtc'] = state['retrieval']['cutoffExclusiveUtc']
         for key in ('sourceFile', 'reviewModel', 'authorModel', 'criticModel', 'writerModel',
@@ -319,6 +351,10 @@ class BatchCatalog:
                     'speedMode', 'reasoningSummary', 'goalThreadId', 'authorSteerDelivered'):
             if isinstance(settings.get(key), str):
                 state[key] = settings[key]
+        # Saved API model settings (never a key) label models that were removed since.
+        api_models = saved_api_models(settings.get('apiModels'))
+        if api_models:
+            state['apiModels'] = api_models
         for key in ('fileManagement', 'preparedRun', 'skipStatementReview', 'statementReviewOnly'):
             if isinstance(settings.get(key), bool):
                 state[key] = settings[key]
@@ -343,6 +379,10 @@ class BatchCatalog:
             state['workflow'] = LATEX_GRAPH
         elif state['skipStatementReview']:
             state['workflow'] = DIRECT_GRAPH
+        # Every /state carries the model catalog, read per request; the shared
+        # graph constants never hold user data.
+        graph = state['workflow']
+        state['workflow'] = {**graph, 'settings': {**graph['settings'], **model_menu_settings()}}
         records, truncated, version = self._trace(directory)
         for record in records:
             kind = _text(record.get('kind'))
@@ -359,6 +399,9 @@ class BatchCatalog:
             state['lastActivityAt'] = _text(records[-1].get('time')) or state['lastActivityAt']
             if not truncated:
                 state['startedAt'] = _text(records[0].get('time')) or state['startedAt']
+        state['activeElapsedSeconds'] = _active_seconds(
+            state['phase'], settings, self._json(directory, 'pause.json'),
+            state['startedAt'], state['lastActivityAt'])
         for filename in ('final.tex', 'failure-summary.md', 'partial-output.md', 'SOLUTION.md'):
             output = self._read(directory, filename)
             if output:
@@ -371,7 +414,9 @@ class BatchCatalog:
         state['traceFrom'] = after if after == version else 0
         state['trace'] = [] if after == version else list(records)
         state['traceTruncated'] = truncated
-        state['traceNotice'] = ('Showing recent saved events. Download the transcript for the complete history.'
+        state['traceNotice'] = ("Showing recent saved events. The complete history is in this job's "
+                                'transcript.jsonl in its run folder; read it with '
+                                'python3 transcript/view_transcript.py <run folder>.'
                                 if truncated else '')
         state['processHealthSource'] = 'Saved batch (read only)'
         return state

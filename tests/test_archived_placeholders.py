@@ -4,7 +4,7 @@ from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
-import historical_search as hs
+from retrieval import historical_search as hs
 import test_historical_search as fixtures
 from test_historical_search import FakeClient, SOURCE, snapshot
 

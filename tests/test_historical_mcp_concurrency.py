@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import historical_search as hs
-import scholarly_discovery as sd
+from retrieval import historical_search as hs
+from retrieval import scholarly_discovery as sd
 
 
 def request(request_id, method='tools/call', **params):

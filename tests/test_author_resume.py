@@ -70,14 +70,20 @@ class AuthorNotebookContinuationTests(unittest.TestCase):
             return object(), object()
 
         original_read, original_write = Path.read_text, Path.write_text
+        original_atomic = server.runtime._private_atomic_write
         def guarded_read(path, *args, **kwargs):
             self.assertNotIn(path.name, self.contents, "UI must not read LLM memory")
             return original_read(path, *args, **kwargs)
         def guarded_write(path, *args, **kwargs):
             self.assertNotIn(path.name, self.contents, "UI must not write LLM memory")
             return original_write(path, *args, **kwargs)
+        def guarded_atomic(path, *args, **kwargs):
+            # Run artifacts are saved by atomic replacement, not Path.write_text.
+            self.assertNotIn(Path(path).name, self.contents, "UI must not write LLM memory")
+            return original_atomic(path, *args, **kwargs)
         with mock.patch.object(app, "_launch_solver_locked", side_effect=launch):
-            with mock.patch.object(Path, "read_text", guarded_read), mock.patch.object(Path, "write_text", guarded_write):
+            with mock.patch.object(Path, "read_text", guarded_read), mock.patch.object(Path, "write_text", guarded_write), \
+                    mock.patch.object(server.runtime, "_private_atomic_write", guarded_atomic):
                 app.start_direct_statement(self.statement, continuation_source=self.source, stopped_stage="solve")
         self.assertEqual(
             {str(path.relative_to(self.source)): path.read_bytes()

@@ -14,8 +14,8 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-import historical_transport as ht
-from historical_rate_limit import RateLimitError
+from retrieval import historical_transport as ht
+from retrieval.historical_rate_limit import RateLimitError
 
 URL = 'https://web.archive.org/cdx/search/cdx?url=SECRET_QUERY'
 PUBLIC_DNS = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))]

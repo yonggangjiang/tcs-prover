@@ -30,6 +30,11 @@ class CompilerIsolationError(RuntimeError):
     """The compiler's boundary could not be established."""
 
 
+def supported():
+    """Only the macOS Seatbelt adapter exists; every historical run compiles here."""
+    return sys.platform == "darwin"
+
+
 def _root_owned(path):
     """Reject writable toolchains, including a writable canonical parent."""
     canonical = Path(path).resolve(strict=True)
@@ -171,7 +176,7 @@ def _replace(path, data):
 
 def compile_command(policy, config, argv, directory):
     """Return the workflow command result, preserving outputs on boundary failure."""
-    if sys.platform != "darwin" or policy["isolation"]["adapter"] != ADAPTER:
+    if not supported() or policy["isolation"]["adapter"] != ADAPTER:
         raise CompilerIsolationError("An isolated compiler/command adapter has not been verified for this platform.")
     workspace = Path(policy["isolation"]["workspace"]).resolve()
     if (directory != workspace or argv != LATEX_ARGV or config.get("requires") != ["pdflatex"]
@@ -187,7 +192,14 @@ def compile_command(policy, config, argv, directory):
     with tempfile.TemporaryDirectory(prefix="tcs-isolated-tex-") as folder:
         stage = Path(folder).resolve()
         profile, env = sandbox_profile(stage, tex_root), environment(stage, binary_directory)
-        verify_sandbox(profile, stage, env)
+        try:
+            verify_sandbox(profile, stage, env)
+        except subprocess.TimeoutExpired as exc:
+            # Its command line holds the whole profile and script: keep the message short.
+            raise CompilerIsolationError(
+                f"Compiler sandbox canaries did not finish within {exc.timeout:g} seconds.") from exc
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise CompilerIsolationError(f"Compiler sandbox canaries could not run: {exc}") from exc
         (stage / "latex-source.tex").write_bytes(source)
         # Root-owned latexmk is a Perl script; invoke the system interpreter
         # explicitly and pin its engine. Disable bibliography subprocesses.

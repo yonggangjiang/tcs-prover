@@ -6,22 +6,16 @@
 !ui/**/*
 !workflows/
 !workflows/**/*
+!runner/
+!runner/**/*
+!retrieval/
+!retrieval/**/*
 !.gitignore
 !.gitattributes
 !README.md
 !web_ui.py
 !workflow_runner.py
-!proof_handoff.py
 !requirements.txt
-!retrieval_runtime.py
-!historical_search.py
-!historical_*.py
-!scholarly_discovery.py
-!validate_historical_search.py
-!audit_historical_trajectory.py
-!prepare_firstproof.py
-!launch_firstproof.py
-!isolated_compiler.py
 !experiments/
 !experiments/**/*
 !tests/
@@ -30,3 +24,5 @@
 !third_party/**/*
 **/__pycache__/
 *.pyc
+# Private controller state (API model keys, private Codex homes): never tracked.
+/.tcs-prover/

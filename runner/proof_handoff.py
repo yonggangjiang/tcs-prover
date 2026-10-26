@@ -58,13 +58,29 @@ def _json_object(pairs):
     return result
 
 
-def extract_proof_reference(final_message):
+def _undecorated_marker_value(reference):
+    # A sentence period right after a name, or inline-code backticks around a
+    # path, leave a final name without a proof suffix, so such values are always
+    # rejected; removing them never changes an acceptable path, and every path
+    # check still runs on the result. A "." or ".." component is not a period.
+    stem = reference[:-1]
+    if (reference.endswith(".") and not stem.endswith(("/", "."))
+            and (stem.endswith(("`", '"')) or Path(stem).suffix.lower() in PROOF_SUFFIXES)):
+        reference = stem
+    if len(reference) >= 2 and reference[0] == reference[-1] == "`" and "`" not in reference[1:-1]:
+        reference = reference[1:-1]
+    return reference
+
+
+def extract_proof_reference(final_message, *, code_span=True):
     """Return an explicit local file reference, or None for an inline proof.
 
     Prefer ``PROOF_FILE: proof.md`` or an exact ``{"proof_file":"proof.md"}``
     object. Compatibility accepts a short message whose opening sentence says
     that the complete proof is in a Markdown link, followed by a short synopsis.
     An incidental file link within an inline argument is never a handoff.
+    With ``code_span``, a pointer-sized message may also write its marker line
+    as one inline-code span (see resolve_author_proof()).
     """
     if not isinstance(final_message, str):
         raise ProofHandoffError("The author response must be text.")
@@ -81,13 +97,20 @@ def extract_proof_reference(final_message):
             raise ProofHandoffError("Proof reference JSON must contain only a nonempty proof_file string.")
         return value["proof_file"]
 
+    # A marker line written as one inline-code span is still that marker when
+    # it is the only pointer of a pointer-sized message. Beside a plain marker,
+    # a JSON key or a link, or inside a complete proof, it stays text, so those
+    # messages resolve exactly as they did before.
+    if (code_span and len(message) <= 1500
+            and not re.search(r'^\s*PROOF_FILE\s*:|"proof_file"\s*:|\[[^\]\n]+\]\(', unwrapped, re.M)):
+        unwrapped = re.sub(r"(?m)^([ \t]*)`(PROOF_FILE[ \t]*:[^`\n]*)`\.?[ \t\r]*$", r"\1\2", unwrapped)
     marker_lines = re.findall(r"^\s*PROOF_FILE\s*:(.*)$", unwrapped, re.M)
     if marker_lines:
         if re.search(r'"proof_file"\s*:|\[[^\]\n]+\]\(', unwrapped):
             raise ProofHandoffError("Use one proof reference format; mixed pointers are ambiguous.")
         references = []
         for raw in marker_lines:
-            reference = raw.strip()
+            reference = _undecorated_marker_value(raw.strip())
             if reference.startswith('"'):
                 try:
                     reference = json.loads(reference)
@@ -170,6 +193,14 @@ def _identity(info):
             info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def _directory_identity(info):
+    # The controller keeps writing beside the author's files, so folder times,
+    # sizes, link counts and mode bits change harmlessly. Each component is
+    # opened no-follow from a held parent descriptor, so a swapped or replaced
+    # folder still changes its device, inode or file type.
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid)
+
+
 def _require_secure_access():
     if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
             or not hasattr(os, "geteuid")
@@ -188,17 +219,18 @@ def _secure_read(workspace, parts, max_bytes, expected_root):
             return fd
 
         root_before = os.stat(workspace, follow_symlinks=False)
-        if _identity(root_before) != expected_root:
+        if _directory_identity(root_before) != expected_root:
             raise ProofHandoffError("The author workspace changed before proof handoff.")
         parent = open_at(workspace, directory=True)
-        if not stat.S_ISDIR(root_before.st_mode) or _identity(root_before) != _identity(os.fstat(parent)):
+        if (not stat.S_ISDIR(root_before.st_mode)
+                or _directory_identity(root_before) != _directory_identity(os.fstat(parent))):
             raise ProofHandoffError("The author workspace changed during proof handoff.")
         traversed = []
         for part in parts[:-1]:
             before = os.stat(part, dir_fd=parent, follow_symlinks=False)
             child = open_at(part, parent, directory=True)
             if (not stat.S_ISDIR(before.st_mode) or before.st_uid != os.geteuid()
-                    or _identity(before) != _identity(os.fstat(child))):
+                    or _directory_identity(before) != _directory_identity(os.fstat(child))):
                 raise ProofHandoffError("A proof directory changed during handoff.")
             traversed.append((parent, part, before))
             parent = child
@@ -225,20 +257,34 @@ def _secure_read(workspace, parts, max_bytes, expected_root):
                 or _identity(before) != _identity(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False))):
             raise ProofHandoffError("The proof file changed while it was read.")
         for directory, name, original in traversed:
-            if _identity(original) != _identity(os.stat(name, dir_fd=directory, follow_symlinks=False)):
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if _directory_identity(original) != _directory_identity(current):
                 raise ProofHandoffError("A proof directory changed while the file was read.")
-        if _identity(root_before) != _identity(os.stat(workspace, follow_symlinks=False)):
+        if _directory_identity(root_before) != _directory_identity(os.stat(workspace, follow_symlinks=False)):
             raise ProofHandoffError("The author workspace changed while the proof was read.")
         return b"".join(chunks)
 
 
 def resolve_author_proof(final_message, workspace, *, max_bytes=MAX_PROOF_BYTES):
-    """Snapshot an explicit proof reference, returning None for inline output."""
-    reference = extract_proof_reference(final_message)
-    if reference is None:
-        return None
+    """Snapshot an explicit proof reference, returning None for inline output.
+
+    A pointer written only as an inline-code marker line is honored when its
+    file resolves; otherwise the message is reviewed as text, as it was before
+    such pointers were recognized, instead of refusing the handoff.
+    """
     if type(max_bytes) is not int or max_bytes < 1:
         raise ProofHandoffError("The proof handoff size limit must be a positive integer.")
+    reference = extract_proof_reference(final_message, code_span=False)
+    if reference is not None:
+        return _snapshot(reference, workspace, max_bytes)
+    try:
+        reference = extract_proof_reference(final_message)
+        return None if reference is None else _snapshot(reference, workspace, max_bytes)
+    except ProofHandoffError:
+        return None
+
+
+def _snapshot(reference, workspace, max_bytes):
     _require_secure_access()
     try:
         root = Path(workspace)
@@ -249,14 +295,14 @@ def resolve_author_proof(final_message, workspace, *, max_bytes=MAX_PROOF_BYTES)
             raise ProofHandoffError("The author workspace must be a regular directory, not a symbolic link.")
         if original_root.st_uid != os.geteuid():
             raise ProofHandoffError("The author workspace must belong to the controller's local user.")
-        expected_root = _identity(original_root)
+        expected_root = _directory_identity(original_root)
         canonical_root = root.resolve(strict=True)
         if Path(reference).is_absolute() and not Path(reference).is_relative_to(root):
             parts = _relative_parts(reference, canonical_root)
         else:
             parts = _relative_parts(reference, root)
         data = _secure_read(canonical_root, parts, max_bytes, expected_root)
-        if _identity(root.lstat()) != expected_root:
+        if _directory_identity(root.lstat()) != expected_root:
             raise ProofHandoffError("The original author workspace changed during proof handoff.")
         text = data.decode("utf-8", errors="strict")
         if not text.strip() or "\x00" in text:

@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 
-from historical_rate_limit import MAX_SLEEP_SECONDS, RateLimitError, SharedHostLimiter
+from retrieval.historical_rate_limit import MAX_SLEEP_SECONDS, RateLimitError, SharedHostLimiter
 
 
 class FakeTime:

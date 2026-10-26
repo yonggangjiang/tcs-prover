@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import isolated_compiler as compiler
+from retrieval import isolated_compiler as compiler
 import workflow_runner as runtime
 
 

@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from historical_cache import CacheError, CaptureCache, MAX_BODY_BYTES, MAX_JSON_BYTES
+from retrieval.historical_cache import CacheError, CaptureCache, MAX_BODY_BYTES, MAX_JSON_BYTES
 
 
 URL = "https://papers.example/archived-paper"
@@ -267,7 +267,7 @@ class MultiProcessCacheTests(CaptureCacheFixture, unittest.TestCase):
         process = self.process(cache_lock_holder, (str(self.directory), str(self.workspace), ready, release))
         self.assertTrue(ready.wait(5))
         started = time.monotonic()
-        with patch("historical_cache.LOCK_TIMEOUT", 0.1):
+        with patch("retrieval.historical_cache.LOCK_TIMEOUT", 0.1):
             with self.assertRaises(CacheError):
                 self.cache.get(URL)
         self.assertLess(time.monotonic() - started, 1)

@@ -8,9 +8,9 @@ from pathlib import Path
 import sys
 
 from ui.server import empty_state, default_prompts
-import retrieval_runtime as retrieval
+from retrieval import runtime as retrieval
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT = ROOT / 'experiments' / 'firstproof-batch3'
 NAVIGATION_VERSION = 'full-document-v1'
 DISCOVERY_PROVIDER = 'codex_wayback'
@@ -116,7 +116,7 @@ def prepare(runs_root=None, control_root=None, problems=None):
             'cutoffExclusiveUtc': cutoff,
             'broker': {
                 'command': sys.executable,
-                'args': [str(ROOT / 'historical_search.py'), '--cutoff', cutoff,
+                'args': [str(ROOT / 'retrieval' / 'historical_search.py'), '--cutoff', cutoff,
                          '--policy-file', str(broker_policy), '--policy-sha256', sha(broker_policy),
                          '--audit-log', str(audit_log)],
                 'policyFile': str(broker_policy), 'auditLog': str(audit_log),

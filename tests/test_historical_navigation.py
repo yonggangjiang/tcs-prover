@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-import historical_search as hs
+from retrieval import historical_search as hs
 import test_historical_search as fixtures
 
 

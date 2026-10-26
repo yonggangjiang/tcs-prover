@@ -24,7 +24,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from historical_rate_limit import RateLimitError
+from retrieval.historical_rate_limit import RateLimitError
 
 ALLOWED_NETWORK_HOSTS = frozenset({
     'api.search.brave.com', 'lite.duckduckgo.com', 'web.archive.org',

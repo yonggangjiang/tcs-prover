@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-import historical_search as hs
+from retrieval import historical_search as hs
 import test_historical_search as fixtures
 from test_historical_search import FakeClient, SOURCE, snapshot
 
@@ -83,9 +83,9 @@ class ReliabilityTests(unittest.TestCase):
         })
 
     def test_scholarly_partial_discovery_integrates_callback_and_is_not_cached(self):
-        with patch('scholarly_discovery._arxiv_urls', side_effect=hs.HistoricalSearchError(
+        with patch('retrieval.scholarly_discovery._arxiv_urls', side_effect=hs.HistoricalSearchError(
                 'Unavailable.', code='http_error', status=503, operational=True)), \
-             patch('scholarly_discovery._crossref_urls', return_value=[SOURCE]):
+             patch('retrieval.scholarly_discovery._crossref_urls', return_value=[SOURCE]):
             engine = self.scholarly_engine()
             result = engine.search('graph')
         self.assertTrue(result['incomplete'])
@@ -95,9 +95,9 @@ class ReliabilityTests(unittest.TestCase):
     def test_scholarly_discovery_audit_failure_aborts_before_second_provider(self):
         client = FakeClient()
         client.audit = lambda *args, **kwargs: (_ for _ in ()).throw(OSError('private path'))
-        with patch('scholarly_discovery._arxiv_urls', side_effect=hs.HistoricalSearchError(
+        with patch('retrieval.scholarly_discovery._arxiv_urls', side_effect=hs.HistoricalSearchError(
                 'Unavailable.', code='http_error', status=503, operational=True)), \
-             patch('scholarly_discovery._crossref_urls', return_value=[SOURCE]) as other:
+             patch('retrieval.scholarly_discovery._crossref_urls', return_value=[SOURCE]) as other:
             with self.assertRaises(hs.HistoricalSearchError) as error:
                 self.scholarly_engine(client).search('graph')
         self.assertEqual(error.exception.code, 'audit_failure')

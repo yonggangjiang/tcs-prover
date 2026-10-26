@@ -3,116 +3,183 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <!-- The browser chrome follows the page; app.js sets both to the chosen theme's canvas. -->
+  <meta name="theme-color" content="#f3f5f8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0c0e11" media="(prefers-color-scheme: dark)">
   <title>TCS Prover</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body>
-  <!-- The shell stays minimal before a problem is submitted. -->
+  <a class="skip-link" href="#main">Skip to content</a>
   <div id="page" class="app-shell">
-    <header class="topbar">
-      <a id="homeLink" class="brand" href="/" aria-label="TCS Prover home">
-        <span class="brand-mark" aria-hidden="true">T</span>
-        <span>TCS Prover</span>
-      </a>
-      <div class="topbar-status">
-        <span id="liveDot" class="live-dot" aria-hidden="true"></span>
-        <span id="globalStatus">Ready</span>
-        <span id="elapsed" class="elapsed"></span>
+    <!-- Workbench sidebar: navigation, every batch with its live counts (app.js fills #navBatches
+         from /batches), and the configuration pages. Collapses to an icon rail on wide screens and
+         becomes an off-canvas drawer on phones. -->
+    <aside id="sidebar" class="sidebar" aria-label="Workbench">
+      <div class="sidebar-head">
+        <a id="homeLink" class="brand" href="/" aria-label="TCS Prover home" data-tip="TCS Prover" data-tip-meta="Research workbench · overview">
+          <span class="brand-mark" aria-hidden="true">⊢</span>
+          <span class="brand-copy">
+            <span class="brand-name">TCS Prover</span>
+            <span class="brand-sub">Research workbench</span>
+          </span>
+        </a>
+        <button id="sidebarClose" class="icon-button sidebar-close" type="button" aria-label="Close navigation"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m4 4 8 8M12 4l-8 8"/></svg></button>
       </div>
-      <button id="activityToggle" class="ghost compact"
-        aria-controls="activityPanel" aria-expanded="false">Show details</button>
-    </header>
+      <nav id="sideNav" class="side-nav" aria-label="Main">
+        <div class="nav-group">
+          <p class="nav-label" id="navWorkspaceLabel">Workspace</p>
+          <ul class="nav-list" aria-labelledby="navWorkspaceLabel">
+            <li><a class="nav-item" href="/" data-nav="home" data-tip="Overview" data-tip-meta="Every batch at a glance"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2.5" y="2.5" width="4.5" height="5.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="3.5" rx="1"/><rect x="9" y="8" width="4.5" height="5.5" rx="1"/><rect x="2.5" y="10" width="4.5" height="3.5" rx="1"/></svg><span class="nav-text">Overview</span><span id="navLiveCount" class="nav-badge nav-badge-live" hidden></span></a></li>
+            <li><a class="nav-item" href="/?new=1" data-nav="new" data-tip="New problem" data-tip-meta="A statement, or LaTeX to polish"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6Z"/><path d="M9 2v4h4M8 8.25v3.5M6.25 10h3.5"/></svg><span class="nav-text">New problem</span></a></li>
+          </ul>
+        </div>
+        <div class="nav-group nav-group-batches">
+          <p class="nav-label" id="navBatchesLabel">Batches <span id="navBatchTotal" class="nav-label-count"></span></p>
+          <ul id="navBatches" class="nav-list nav-batches" aria-labelledby="navBatchesLabel">
+            <li class="nav-empty">Reading batches…</li>
+          </ul>
+        </div>
+        <div class="nav-group">
+          <p class="nav-label" id="navConfigureLabel">Configure</p>
+          <ul class="nav-list" aria-labelledby="navConfigureLabel">
+            <li><a class="nav-item" href="/?new=1#models" data-nav="models" data-tip="Models &amp; API" data-tip-meta="Role models and your API endpoints"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/><rect x="6.5" y="6.5" width="3" height="3" rx=".5"/><path d="M6 1.75V4M10 1.75V4M6 12v2.25M10 12v2.25M1.75 6H4M1.75 10H4M12 6h2.25M12 10h2.25"/></svg><span class="nav-text">Models &amp; API</span></a></li>
+            <li><button class="nav-item" type="button" data-nav="prompts" aria-haspopup="dialog" data-tip="Prompts" data-tip-meta="Role prompts for the next problem"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.5 10a1.5 1.5 0 0 1-1.5 1.5H5.25L2.5 14V3.5A1.5 1.5 0 0 1 4 2h8a1.5 1.5 0 0 1 1.5 1.5Z"/><path d="M5.5 5.5h5M5.5 8h3.25"/></svg><span class="nav-text">Prompts</span></button></li>
+          </ul>
+        </div>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="navFootStatus" class="foot-status">Local workbench</span>
+        <kbd class="foot-key" title="Collapse or expand the sidebar">⌘B</kbd>
+      </div>
+    </aside>
+    <div id="sidebarScrim" class="sidebar-scrim" hidden></div>
+    <div id="navTooltip" class="nav-tooltip" role="tooltip" hidden><strong></strong><span></span></div>
+
+    <div class="main-column">
+      <!-- Floating header: the sidebar toggle, where you are, the open job's live status, and the
+           page tools (prompts and responses, theme). -->
+      <header class="topbar">
+        <button id="sidebarToggle" class="icon-button sidebar-toggle" type="button" aria-controls="sidebar"
+          aria-expanded="true" aria-label="Collapse sidebar"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M6.25 2.5v11"/><path class="toggle-chevron" d="m10.75 6.5-1.5 1.5 1.5 1.5"/></svg></button>
+        <div class="topbar-path">
+          <nav id="batchNavigation" class="breadcrumbs" aria-label="Breadcrumb" hidden>
+            <button id="allBatchesButton" class="crumb" type="button">Overview</button>
+            <span class="crumb-sep" aria-hidden="true">/</span>
+            <button id="batchProblemsButton" class="crumb" type="button"></button>
+            <span id="selectedBatchBadge" class="badge badge-current" hidden></span>
+          </nav>
+          <span id="topbarTitle" class="topbar-title">Overview</span>
+        </div>
+        <div class="topbar-pill">
+          <div class="topbar-status">
+            <span id="liveDot" class="live-dot" aria-hidden="true"></span>
+            <span id="globalStatus">Ready</span>
+            <span id="elapsed" class="elapsed"></span>
+          </div>
+          <button id="activityToggle" class="ghost compact" type="button" hidden
+            aria-controls="activityPanel" aria-expanded="false" aria-haspopup="dialog"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 3.5h11v9h-11z"/><path d="m5 6.5 1.75 1.5L5 9.5M8.5 9.75H11"/></svg><span class="button-label">Prompts &amp; responses</span></button>
+          <div class="theme-menu">
+            <button id="themeToggle" class="icon-button theme-button" type="button" aria-expanded="false"
+              aria-controls="themeMenu" aria-label="Appearance: Blue, System">
+              <svg class="icon theme-icon theme-icon-dark" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.25 9.6A5.5 5.5 0 0 1 6.4 2.75a5.5 5.5 0 1 0 6.85 6.85Z"/></svg>
+              <svg class="icon theme-icon theme-icon-light" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.25M8 13.25v1.25M1.5 8h1.25M13.25 8h1.25M3.4 3.4l.9.9M11.7 11.7l.9.9M3.4 12.6l.9-.9M11.7 4.3l.9-.9"/></svg>
+              <svg class="icon theme-icon theme-icon-system" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg>
+            </button>
+            <!-- Appearance: a theme (four palettes) and a mode. app.js keeps both in this browser. -->
+            <div id="themeMenu" class="theme-popover" role="group" aria-label="Appearance" hidden>
+              <p id="themeCardsLabel" class="theme-popover-label">Theme</p>
+              <div class="theme-cards" role="radiogroup" aria-labelledby="themeCardsLabel">
+                <button class="theme-card" type="button" role="radio" aria-checked="true" tabindex="0" data-theme-choice="blue" title="Blue: cool white and slate, one cobalt accent"><span class="theme-swatch" data-swatch="blue" aria-hidden="true"><i class="sw-side"></i><i class="sw-head"></i><i class="sw-card"></i><b class="sw-title">Aa</b><i class="sw-text"></i><i class="sw-button"></i></span><span class="theme-card-name">Blue</span></button>
+                <button class="theme-card" type="button" role="radio" aria-checked="false" tabindex="-1" data-theme-choice="brown" title="Brown: warm paper and charcoal, ink pills"><span class="theme-swatch" data-swatch="brown" aria-hidden="true"><i class="sw-side"></i><i class="sw-head"></i><i class="sw-card"></i><b class="sw-title">Aa</b><i class="sw-text"></i><i class="sw-button"></i></span><span class="theme-card-name">Brown</span></button>
+                <button class="theme-card" type="button" role="radio" aria-checked="false" tabindex="-1" data-theme-choice="crimson" title="Crimson: the ember palette, serif titles"><span class="theme-swatch" data-swatch="crimson" aria-hidden="true"><i class="sw-side"></i><i class="sw-head"></i><i class="sw-card"></i><b class="sw-title">Aa</b><i class="sw-text"></i><i class="sw-button"></i></span><span class="theme-card-name">Crimson</span></button>
+                <button class="theme-card" type="button" role="radio" aria-checked="false" tabindex="-1" data-theme-choice="ink" title="Ink: a monochrome notebook, set like a paper"><span class="theme-swatch" data-swatch="ink" aria-hidden="true"><i class="sw-side"></i><i class="sw-head"></i><i class="sw-card"></i><b class="sw-title">Aa</b><i class="sw-text"></i><i class="sw-button"></i></span><span class="theme-card-name">Ink</span></button>
+              </div>
+              <p id="themeModeLabel" class="theme-popover-label">Mode</p>
+              <div class="mode-switch" role="radiogroup" aria-labelledby="themeModeLabel">
+                <button class="mode-choice" type="button" role="radio" aria-checked="false" tabindex="-1" data-mode-choice="light"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.25M8 13.25v1.25M1.5 8h1.25M13.25 8h1.25M3.4 3.4l.9.9M11.7 11.7l.9.9M3.4 12.6l.9-.9M11.7 4.3l.9-.9"/></svg><span>Light</span></button>
+                <button class="mode-choice" type="button" role="radio" aria-checked="false" tabindex="-1" data-mode-choice="dark"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.25 9.6A5.5 5.5 0 0 1 6.4 2.75a5.5 5.5 0 1 0 6.85 6.85Z"/></svg><span>Dark</span></button>
+                <button class="mode-choice" type="button" role="radio" aria-checked="true" tabindex="0" data-mode-choice="system"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="2" y="2.5" width="12" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11v3"/></svg><span>System</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
 
     <div class="workspace">
-      <!-- This rail summarizes the runtime stages without cluttering the form. -->
-      <aside id="workflowRail" class="workflow-rail" hidden>
-        <p class="rail-kicker">Workflow</p>
-        <ol id="workflowNodes" class="workflow-nodes"></ol>
-      </aside>
-
-      <main class="work-pane">
+      <main id="main" class="work-pane" tabindex="-1">
+        <p id="batchReadOnlyNotice" class="readonly-note" hidden>Previous batch · You can read saved work and download results.</p>
         <p id="notice" class="notice" role="alert" hidden></p>
+        <!-- A folder run's result, on the batch list or the job page it was started from.
+             The plain wrapper keeps it in the centred content column. -->
+        <div><p id="batchStatus" class="batch-status" role="status" hidden></p></div>
 
-        <nav id="batchNavigation" class="batch-navigation" aria-label="Batch navigation" hidden>
-          <button id="allBatchesButton" class="ghost compact">← All batches</button>
-          <span class="batch-navigation-divider" aria-hidden="true">/</span>
-          <button id="batchProblemsButton" class="ghost compact"></button>
-          <span id="selectedBatchBadge" class="batch-badge" hidden></span>
-        </nav>
-        <p id="batchReadOnlyNotice" class="batch-readonly" hidden>Previous batch · You can read saved work and download results.</p>
-
-        <section id="batchesPanel" class="batches-panel" aria-labelledby="batchesHeading">
-          <div class="batches-heading">
-            <div><p class="eyebrow">RESEARCH WORKSPACE</p><h1 id="batchesHeading">Problem batches</h1>
-              <p class="section-copy">Open a batch to follow its problems, proofs, and saved work.</p></div>
-            <button id="newProblemButton" class="secondary">New problem</button>
+        <!-- Home: totals across batches, then one row per batch (the current batch first). -->
+        <section id="batchesPanel" class="page batches-panel" aria-labelledby="batchesHeading">
+          <div class="page-head">
+            <div>
+              <p class="eyebrow page-eyebrow">Research workspace</p>
+              <h1 id="batchesHeading">Overview</h1>
+              <p id="overviewMeta" class="page-meta">Reading batches…</p>
+            </div>
+            <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
+          </div>
+          <!-- Totals across every batch; app.js fills them from /batches. -->
+          <dl id="overviewStats" class="stat-strip" aria-label="Problems across all batches">
+            <div class="stat tone-running"><dt>Running</dt><dd><strong data-stat="running">–</strong><span class="stat-note">working now</span></dd></div>
+            <div class="stat tone-waiting"><dt>Needs you</dt><dd><strong data-stat="waiting">–</strong><span class="stat-note">approval or a start</span></dd></div>
+            <div class="stat tone-paused"><dt>Paused</dt><dd><strong data-stat="paused">–</strong><span class="stat-note">saved, can resume</span></dd></div>
+            <div class="stat tone-done"><dt>Finished</dt><dd><strong data-stat="done">–</strong><span class="stat-note">every outcome</span></dd></div>
+          </dl>
+          <div class="section-head">
+            <h2 class="section-title">Batches</h2>
+            <p class="section-note">Open a batch to follow its problems, proofs, and saved work.</p>
+          </div>
+          <div class="table-head batch-table-head" aria-hidden="true">
+            <span>Batch</span><span>Problems by status</span><span>Activity</span>
           </div>
           <p id="batchesStatus" class="help" role="status">Loading batches…</p>
           <ol id="batchesList" class="batches-list"></ol>
         </section>
 
-        <section id="runOverview" class="run-overview" aria-labelledby="runProblemTitle" hidden>
-          <p class="eyebrow">CURRENT PROBLEM</p>
-          <h2 id="runProblemTitle"></h2>
-          <dl class="run-facts">
-            <div><dt>Current stage</dt><dd id="runStage"></dd></div>
-            <div><dt>Active time</dt><dd id="runActiveTime"></dd></div>
-            <div><dt>Workflow limit</dt><dd id="runBudget"></dd></div>
-            <div><dt>Local process</dt><dd id="runHealth"></dd></div>
-          </dl>
-          <p id="runNextStep" class="run-next-step" role="status"></p>
-          <p id="runLatestAction" class="run-latest-action"></p>
-          <section id="retrievalPanel" class="retrieval-panel" aria-labelledby="retrievalHeading">
-            <div class="retrieval-heading">
-              <div><p class="eyebrow">RESEARCH SOURCES</p><h3 id="retrievalHeading">Web search</h3></div>
-              <span id="retrievalStatus" class="retrieval-badge"></span>
+        <!-- New problem: the statement, the workflow choices, then one primary action. -->
+        <section id="inputPanel" class="page input-view" aria-labelledby="composerHeading" hidden>
+          <!-- Models & API (?new=1#models): the same controls as Advanced settings below, shown on
+               their own; app.js switches the view without leaving the composer. -->
+          <div class="page-head models-head">
+            <div>
+              <p class="eyebrow page-eyebrow">Configure</p>
+              <h1 id="modelsHeading">Models &amp; API</h1>
+              <p id="modelsMeta" class="page-meta">Codex CLI · Claude CLI · API models</p>
+              <p class="page-lede">Role models apply to the next problem you start in this window. API models are
+                saved on this computer and appear in every role menu.</p>
             </div>
-            <p id="retrievalDescription" class="retrieval-description"></p>
-            <div id="retrievalCutoffDisplay" class="retrieval-cutoff" hidden>
-              <span id="retrievalCutoffLabel">Only captures strictly before</span>
-              <strong id="retrievalCutoffValue"></strong>
-              <span id="retrievalPolicyNote"></span>
-            </div>
-            <dl id="retrievalCounts" class="retrieval-counts" hidden></dl>
-            <p id="retrievalRequestSummary" class="retrieval-request-summary" hidden></p>
-            <ul id="retrievalFailures" class="retrieval-failures" aria-label="Failed retrieval requests by reason" hidden></ul>
-            <details id="retrievalDetails" class="retrieval-details" hidden>
-              <summary>Source checks and coverage</summary>
-              <p id="retrievalLimitation"></p>
-              <p id="retrievalCountNote"></p>
-            </details>
-          </section>
-          <details id="statementDetails" class="run-context" open>
-            <summary id="statementHeading">Statement being solved</summary>
-            <pre id="runStatement" class="statement-copy"></pre>
-          </details>
-          <details id="originalStatementDetails" class="run-context" hidden>
-            <summary>Original statement</summary>
-            <pre id="runOriginalStatement" class="statement-copy"></pre>
-          </details>
-          <details class="run-context">
-            <summary>Run settings and history</summary>
-            <dl id="runMetadata" class="run-metadata"></dl>
-            <details id="criticReviewHistory" class="critic-review-history">
-              <summary>Critic review inputs and decisions</summary>
-            </details>
-          </details>
-        </section>
-
-        <!-- The first screen intentionally contains only one obvious task. -->
-        <section id="inputPanel" class="input-view" hidden>
-          <div class="intro">
-            <p class="eyebrow">THEORY, CHECKED CAREFULLY</p>
-            <h1>What should we solve?</h1>
-            <p id="introDescription">Start with a rough TCS problem. The agent will clarify it,
-              ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
           </div>
-          <div class="composer">
+          <div class="page-head composer-head">
+            <div>
+              <p class="eyebrow page-eyebrow">Theory, checked carefully</p>
+              <h1 id="composerHeading">New problem</h1>
+              <p id="introDescription" class="page-lede">Start with a rough TCS problem. The agent will clarify it,
+                ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
+              <!-- A CSS-only preview of the stages the chosen workflow runs; it follows the options below. -->
+              <ol class="pipeline" aria-label="Stages this workflow runs">
+                <li class="pipe-step pipe-review">Statement review</li>
+                <li class="pipe-step pipe-approve">Your approval</li>
+                <li class="pipe-step pipe-author">Proof author</li>
+                <li class="pipe-step pipe-critic">Independent critic</li>
+                <li class="pipe-step pipe-latex">LaTeX editor &amp; PDF</li>
+              </ol>
+            </div>
+          </div>
+          <div class="composer card">
             <fieldset class="problem-mode">
               <legend>Problem setup</legend>
               <div class="mode-options">
                 <label class="mode-option">
                   <input type="radio" name="problemMode" value="statement" checked>
+                  <span class="mode-glyph" aria-hidden="true">∀</span>
                   <span>
                     <strong>Statement</strong>
                     <small>Review and approve a rough problem statement</small>
@@ -120,6 +187,7 @@
                 </label>
                 <label class="mode-option">
                   <input type="radio" name="problemMode" value="latex">
+                  <span class="mode-glyph mode-glyph-tex" aria-hidden="true">TeX</span>
                   <span>
                     <strong>LaTeX polish</strong>
                     <small>Polish an existing writing only</small>
@@ -127,200 +195,40 @@
                 </label>
               </div>
             </fieldset>
-            <div id="statementFields">
+            <div id="statementFields" class="field">
               <label for="problem">Problem statement</label>
-              <textarea id="problem" rows="12" required
+              <textarea id="problem" rows="8" required
                 placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
             </div>
-            <div id="latexFields" hidden>
-              <div>
-                <label for="latexInput">Writing</label>
-                <textarea id="latexInput" rows="18"
-                  placeholder="Paste an AI generated writing…"></textarea>
-              </div>
+            <div id="latexFields" class="field" hidden>
+              <label for="latexInput">Writing to polish</label>
+              <textarea id="latexInput" rows="14"
+                placeholder="Paste an AI generated writing…"></textarea>
             </div>
-            <label id="fileManagementSetting" class="file-management-setting" for="fileManagement">
-              <span>
-                <strong>Manage research files</strong>
-                <small id="fileManagementHelp">Off · Focus on proving the statement with a simple author prompt.</small>
-              </span>
-              <input id="fileManagement" type="checkbox" role="switch" aria-describedby="fileManagementHelp">
-            </label>
-            <details class="advanced">
-              <summary>Advanced</summary>
-              <section id="retrievalSetting" class="retrieval-setting" aria-labelledby="retrievalSettingHeading">
-                <div class="retrieval-setting-heading">
-                  <div><h3 id="retrievalSettingHeading">Web search cutoff</h3><p>Choose unrestricted search, a historical cutoff, or no web-search tools.</p></div>
-                  <span class="setting-badge">Optional</span>
-                </div>
-                <label for="retrievalMode">Time cutoff</label>
-                <select id="retrievalMode" aria-describedby="retrievalSettingHelp">
-                  <option value="live" selected>Off — unrestricted model web search</option>
-                  <option value="historical">On — use the cutoff below</option>
-                </select>
-                <div id="retrievalCutoffSetting" class="retrieval-cutoff-setting" hidden>
-                  <label for="retrievalCutoffUtc">Cutoff time (UTC), or -1 to disable web-search tools</label>
-                  <input id="retrievalCutoffUtc" type="text" autocomplete="off" spellcheck="false"
-                    placeholder="2026-10-02T14:13:12Z" aria-describedby="retrievalCutoffHelp">
-                  <p id="retrievalCutoffHelp" class="help">Enter -1 to disable all web-search tools, or an exact UTC timestamp including seconds and Z. Historical search returns only verified captures strictly before that time. The choice stays fixed after the job starts.</p>
-                </div>
-                <p id="retrievalSettingHelp" class="help">The model's native web search is enabled without a date restriction.</p>
-                <p id="retrievalConfigurationNotice" class="retrieval-configuration-notice" role="status" hidden></p>
-              </section>
-              <div class="model-grid">
-                <div id="reviewModelSetting" class="round-setting model-setting">
-                  <label for="reviewModel">Statement reviewer</label>
-                  <select id="reviewModel">
-                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
-                    <option value="gpt-6-astra">Astra — frontier</option>
-                    <option value="gpt-6-sol">6 Sol — previous generation</option>
-                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
-                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
-                  </select>
-                  <label class="effort-label" for="reviewEffort">Reasoning</label>
-                  <select id="reviewEffort">
-                    <option value="ultra">Ultra — Max with task delegation</option>
-                    <option value="max" selected>Max — default</option>
-                    <option value="xhigh">Extra high</option>
-                    <option value="high">High</option>
-                    <option value="medium">Medium</option>
-                    <option value="low">Low</option>
-                  </select>
-                </div>
-                <div id="authorModelSetting" class="round-setting model-setting">
-                  <label for="authorModel">Proof author</label>
-                  <select id="authorModel">
-                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
-                    <option value="gpt-6-astra">Astra — frontier</option>
-                    <option value="gpt-6-sol">6 Sol — previous generation</option>
-                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
-                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
-                  </select>
-                  <label class="effort-label" for="authorEffort">Reasoning</label>
-                  <select id="authorEffort">
-                    <option value="ultra">Ultra — Max with task delegation</option>
-                    <option value="max" selected>Max — default</option>
-                    <option value="xhigh">Extra high</option>
-                    <option value="high">High</option>
-                    <option value="medium">Medium</option>
-                    <option value="low">Low</option>
-                  </select>
-                </div>
-                <div id="criticModelSetting" class="round-setting model-setting">
-                  <label for="criticModel">Independent critic</label>
-                  <select id="criticModel">
-                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
-                    <option value="gpt-6-astra">Astra — frontier</option>
-                    <option value="gpt-6-sol">6 Sol — previous generation</option>
-                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
-                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
-                  </select>
-                  <label class="effort-label" for="criticEffort">Reasoning</label>
-                  <select id="criticEffort">
-                    <option value="ultra">Ultra — Max with task delegation</option>
-                    <option value="max" selected>Max — default</option>
-                    <option value="xhigh">Extra high</option>
-                    <option value="high">High</option>
-                    <option value="medium">Medium</option>
-                    <option value="low">Low</option>
-                  </select>
-                </div>
-                <div id="writerModelSetting" class="round-setting model-setting">
-                  <label for="writerModel">LaTeX writer</label>
-                  <select id="writerModel">
-                    <option value="gpt-6.1-sol" selected>6.1 Sol — default</option>
-                    <option value="gpt-6-astra">Astra — frontier</option>
-                    <option value="gpt-6-sol">6 Sol — previous generation</option>
-                    <option value="gpt-6-luna">6 Luna — fast, affordable</option>
-                    <option value="deepseek-v4-pro">DeepSeek V4 Pro — Official API</option>
-                  </select>
-                  <label class="effort-label" for="writerEffort">Reasoning</label>
-                  <select id="writerEffort">
-                    <option value="ultra">Ultra — Max with task delegation</option>
-                    <option value="max" selected>Max — default</option>
-                    <option value="xhigh">Extra high</option>
-                    <option value="high">High</option>
-                    <option value="medium">Medium</option>
-                    <option value="low">Low</option>
-                  </select>
-                </div>
-              </div>
-              <p id="modelHelp" class="help model-help">
-                6.1 Sol and Max are the defaults for every role. Each model offers
-                only the reasoning levels it supports. DeepSeek remains
-                available through the official API with DEEPSEEK_API_KEY and
-                always runs at standard speed.
-              </p>
-              <input id="reasoningEffort" type="hidden" value="max">
-              <div class="prompt-setting">
-                <div>
-                  <strong>Role prompts</strong>
-                  <span>Custom prompts override defaults for future jobs</span>
-                </div>
-                <button id="editPromptsButton" class="secondary compact"
-                  type="button">Edit prompts</button>
-              </div>
-              <label id="skipReviewSetting" class="advanced-toggle"
-                for="skipStatementReview">
-                <input id="skipStatementReview" type="checkbox">
-                <span>
-                  <strong>Skip statement review</strong>
-                  <small>Send the statement directly to the proof author.</small>
-                </span>
-              </label>
-              <label id="reviewOnlySetting" class="advanced-toggle"
-                for="statementReviewOnly">
-                <input id="statementReviewOnly" type="checkbox">
-                <span>
-                  <strong>Statement review only</strong>
-                  <small>Check and rewrite the statement, then stop. The proof
-                    author, critic, and LaTeX editor will not run.</small>
-                </span>
-              </label>
-              <div id="speedModeSetting" class="round-setting">
-                <label for="speedMode">Generation speed</label>
-                <select id="speedMode" aria-describedby="speedHelp">
-                  <option value="standard" selected>Standard &mdash; normal speed</option>
-                  <option value="fast">Fast &mdash; up to 2&times; speed</option>
-                </select>
-                <p id="speedHelp" class="help">
-                  Standard is the default. Fast uses credits at a higher rate.
-                  DeepSeek always runs at standard speed.
-                </p>
-              </div>
-              <div id="reasoningSummarySetting" class="round-setting">
-                <label for="reasoningSummary">Activity log detail</label>
-                <select id="reasoningSummary" aria-describedby="reasoningSummaryHelp">
-                  <option value="none">Status only</option>
-                  <option value="concise" selected>Concise summaries &mdash; recommended</option>
-                  <option value="detailed">Detailed summaries</option>
-                </select>
-                <p id="reasoningSummaryHelp" class="help">
-                  Requests model-generated public reasoning summaries for every
-                  stage. Private chain-of-thought is never displayed or saved.
-                </p>
-              </div>
-              <div id="criticRoundSetting" class="round-setting">
-                <label for="criticRounds">Maximum consecutive critic rounds</label>
-                <input id="criticRounds" type="number" min="1" max="100"
-                  step="1" value="2" aria-describedby="roundHelp">
-                <p id="roundHelp" class="help">
-                  Default 2 rounds. Each critic call uses fresh independent
-                  subagents and fixes issues. An unchanged PASS proceeds immediately;
-                  an edited PASS repeats until the limit, then proceeds.
-                  Unfixable issues return to the author and reset the count.
-                </p>
-              </div>
-              <div id="thinkingHoursSetting" class="round-setting">
-                <label for="thinkingHours">Workflow hours (0 = unlimited)</label>
-                <input id="thinkingHours" type="number" min="0" max="168"
-                  step="0.25" value="168" aria-describedby="timeHelp">
-                <p id="timeHelp" class="help">
-                  Default 168 hours for the whole workflow. The author keeps
-                  one LLM session while working. After an interruption, continue
-                  in the same workspace and saved session when available.
-                  A continued run starts with a renewed time budget.
-                </p>
+            <fieldset class="workflow-options">
+              <legend>Workflow</legend>
+              <div class="toggle-grid">
+                <label id="skipReviewSetting" class="toggle-card" for="skipStatementReview">
+                  <input id="skipStatementReview" type="checkbox">
+                  <span>
+                    <strong>Skip statement review</strong>
+                    <small>Send the statement directly to the proof author.</small>
+                  </span>
+                </label>
+                <label id="reviewOnlySetting" class="toggle-card" for="statementReviewOnly">
+                  <input id="statementReviewOnly" type="checkbox">
+                  <span>
+                    <strong>Statement review only</strong>
+                    <small>Check and rewrite the statement, then stop. No proof stages run.</small>
+                  </span>
+                </label>
+                <label id="fileManagementSetting" class="toggle-card switch-card" for="fileManagement">
+                  <span>
+                    <strong>Manage research files</strong>
+                    <small id="fileManagementHelp">Off · Focus on proving the statement with a simple author prompt.</small>
+                  </span>
+                  <input id="fileManagement" type="checkbox" role="switch" aria-describedby="fileManagementHelp">
+                </label>
               </div>
               <details id="researchAuditsSetting" class="research-audits research-audits-initial" hidden>
                 <summary>Research audits <span>Optional independent suggestions</span></summary>
@@ -335,265 +243,634 @@
                 </div>
                 <p class="help">The author pauses while selected models independently review the same workspace. Current reports appear in AUDITS/; previous reports move to audit_history/ when the next batch starts. None disables that audit.</p>
               </details>
+            </fieldset>
+            <details class="advanced">
+              <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>Advanced settings</summary>
+              <div class="advanced-body">
+                <fieldset class="settings-group models-group">
+                  <legend>Models and reasoning</legend>
+                  <div class="model-grid">
+                    <div id="reviewModelSetting" class="model-setting">
+                      <label for="reviewModel">Statement reviewer</label>
+                      <select id="reviewModel" aria-describedby="reviewModelProvider">
+                        <optgroup label="Codex CLI" data-provider="codex">
+                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6-astra">GPT 6 Astra</option>
+                          <option value="gpt-6-sol">GPT 6 Sol</option>
+                          <option value="gpt-6-luna">GPT 6 Luna</option>
+                        </optgroup>
+                        <optgroup label="Claude CLI" data-provider="claude">
+                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
+                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
+                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
+                        </optgroup>
+                      </select>
+                      <label class="effort-label" for="reviewEffort">Reasoning</label>
+                      <select id="reviewEffort">
+                        <option value="ultra">Ultra — Max with task delegation</option>
+                        <option value="max" selected>Max — default</option>
+                        <option value="xhigh">Extra high</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                      <span id="reviewModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                    </div>
+                    <div id="authorModelSetting" class="model-setting">
+                      <label for="authorModel">Proof author</label>
+                      <select id="authorModel" aria-describedby="authorModelProvider">
+                        <optgroup label="Codex CLI" data-provider="codex">
+                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6-astra">GPT 6 Astra</option>
+                          <option value="gpt-6-sol">GPT 6 Sol</option>
+                          <option value="gpt-6-luna">GPT 6 Luna</option>
+                        </optgroup>
+                        <optgroup label="Claude CLI" data-provider="claude">
+                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
+                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
+                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
+                        </optgroup>
+                      </select>
+                      <label class="effort-label" for="authorEffort">Reasoning</label>
+                      <select id="authorEffort">
+                        <option value="ultra">Ultra — Max with task delegation</option>
+                        <option value="max" selected>Max — default</option>
+                        <option value="xhigh">Extra high</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                      <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                    </div>
+                    <div id="criticModelSetting" class="model-setting">
+                      <label for="criticModel">Independent critic</label>
+                      <select id="criticModel" aria-describedby="criticModelProvider">
+                        <optgroup label="Codex CLI" data-provider="codex">
+                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6-astra">GPT 6 Astra</option>
+                          <option value="gpt-6-sol">GPT 6 Sol</option>
+                          <option value="gpt-6-luna">GPT 6 Luna</option>
+                        </optgroup>
+                        <optgroup label="Claude CLI" data-provider="claude">
+                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
+                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
+                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
+                        </optgroup>
+                      </select>
+                      <label class="effort-label" for="criticEffort">Reasoning</label>
+                      <select id="criticEffort">
+                        <option value="ultra">Ultra — Max with task delegation</option>
+                        <option value="max" selected>Max — default</option>
+                        <option value="xhigh">Extra high</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                      <span id="criticModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                    </div>
+                    <div id="writerModelSetting" class="model-setting">
+                      <label for="writerModel">LaTeX writer</label>
+                      <select id="writerModel" aria-describedby="writerModelProvider">
+                        <optgroup label="Codex CLI" data-provider="codex">
+                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6-astra">GPT 6 Astra</option>
+                          <option value="gpt-6-sol">GPT 6 Sol</option>
+                          <option value="gpt-6-luna">GPT 6 Luna</option>
+                        </optgroup>
+                        <optgroup label="Claude CLI" data-provider="claude">
+                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
+                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
+                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
+                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
+                        </optgroup>
+                      </select>
+                      <label class="effort-label" for="writerEffort">Reasoning</label>
+                      <select id="writerEffort">
+                        <option value="ultra">Ultra — Max with task delegation</option>
+                        <option value="max" selected>Max — default</option>
+                        <option value="xhigh">Extra high</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                      <span id="writerModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                    </div>
+                  </div>
+                  <p id="modelHelp" class="help">
+                    GPT 6.1 Sol at Max is the default for every role. Each menu offers only the
+                    reasoning levels the chosen model supports. Codex CLI and Claude CLI models use
+                    the logins on this computer; add your own endpoints under API models below.
+                  </p>
+                  <input id="reasoningEffort" type="hidden" value="max">
+                </fieldset>
+
+                <!-- API models: endpoints configured on this computer. app.js lists, tests, saves and removes
+                     them; the key is sent once in a request body and never displayed again. The key field
+                     says autocomplete="new-password" so that no browser fills in a saved login password,
+                     and both role="status" lines stay rendered while empty (CSS collapses them). -->
+                <fieldset id="apiModelsSetting" class="settings-group providers-group" aria-describedby="providerHelp">
+                  <legend>Model providers</legend>
+                  <p id="providerHelp" class="help provider-note">Codex CLI and Claude CLI models run with the logins on
+                    this computer. An API model uses your own endpoint and key and runs through the Codex CLI
+                    (OpenAI-compatible) or the Claude CLI (Anthropic).</p>
+                  <div id="apiModels" class="api-models" role="group" aria-labelledby="apiModelsHeading">
+                    <div class="api-models-head">
+                      <h3 id="apiModelsHeading" tabindex="-1">API models</h3>
+                      <span id="apiModelCount" class="chip">Loading…</span>
+                    </div>
+                    <p id="apiModelsStatus" class="api-models-status" role="status"></p>
+                    <ul id="apiModelList" class="api-model-list" aria-label="Saved API models" hidden></ul>
+                    <p id="apiModelEmpty" class="api-model-empty" hidden>No API models yet. A saved model appears in
+                      every role menu under API.</p>
+
+                    <div id="apiModelForm" class="api-model-form" role="group" aria-labelledby="apiModelFormHeading">
+                      <h4 id="apiModelFormHeading">Add an API model</h4>
+                      <div class="segmented" role="radiogroup" aria-label="Request format" aria-describedby="apiModelFormatHelp">
+                        <label class="segment"><input id="apiModelFormatOpenai" type="radio" name="apiModelFormat" value="openai" checked><span>OpenAI-compatible</span></label>
+                        <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
+                      </div>
+                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API
+                        (<code>&lt;base URL&gt;/responses</code>), always at standard speed.</p>
+                      <div class="api-model-fields">
+                        <div class="field api-field-wide">
+                          <label for="apiModelBaseUrl">Base URL</label>
+                          <input id="apiModelBaseUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
+                            spellcheck="false" placeholder="https://api.openai.com/v1">
+                        </div>
+                        <div class="field">
+                          <label for="apiModelHeaderName">Header name</label>
+                          <input id="apiModelHeaderName" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                            value="Authorization" aria-describedby="apiModelHeaderHelp">
+                        </div>
+                        <div class="field">
+                          <label for="apiModelKey">API key</label>
+                          <input id="apiModelKey" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"
+                            placeholder="sk-…" aria-describedby="apiModelKeyHelp" data-1p-ignore data-lpignore="true">
+                          <p id="apiModelKeyHelp" class="help api-key-help">Stored only on this computer and never shown again.</p>
+                        </div>
+                        <div class="field">
+                          <label for="apiModelId">Model ID</label>
+                          <input id="apiModelId" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                            placeholder="gpt-6.1-sol">
+                        </div>
+                        <div class="field">
+                          <label for="apiModelName">Display name <span>(optional)</span></label>
+                          <input id="apiModelName" type="text" autocomplete="off" placeholder="Model · host">
+                        </div>
+                      </div>
+                      <p id="apiModelHeaderHelp" class="help api-header-help">OpenAI-compatible endpoints usually read the key from
+                        <code>Authorization</code> (sent as <code>Bearer &lt;key&gt;</code>); Anthropic endpoints read
+                        <code>x-api-key</code>. Any other header receives the key as it is.</p>
+                      <div class="api-model-form-actions">
+                        <p id="apiModelTestResult" class="api-test-result" role="status"></p>
+                        <button id="apiModelCancelButton" class="ghost" type="button" hidden>Cancel editing</button>
+                        <button id="apiModelTestButton" class="secondary" type="button">Test connection</button>
+                        <button id="apiModelSaveButton" class="primary" type="button">Save model</button>
+                      </div>
+                    </div>
+                  </div>
+                </fieldset>
+
+                <section id="retrievalSetting" class="settings-group retrieval-setting" aria-labelledby="retrievalSettingHeading">
+                  <div class="retrieval-setting-heading">
+                    <div><h3 id="retrievalSettingHeading">Web search cutoff</h3><p>Choose unrestricted search, a historical cutoff, or no web-search tools.</p></div>
+                    <span class="badge">Optional</span>
+                  </div>
+                  <label for="retrievalMode">Time cutoff</label>
+                  <select id="retrievalMode" aria-describedby="retrievalSettingHelp">
+                    <option value="live" selected>Off — unrestricted search</option>
+                    <option value="historical">On — set a cutoff</option>
+                  </select>
+                  <div id="retrievalCutoffSetting" class="retrieval-cutoff-setting" hidden>
+                    <label for="retrievalCutoffUtc">Cutoff time (UTC), or -1 to disable web-search tools</label>
+                    <input id="retrievalCutoffUtc" type="text" autocomplete="off" spellcheck="false"
+                      placeholder="2026-10-02T14:13:12Z" aria-describedby="retrievalCutoffHelp">
+                    <p id="retrievalCutoffHelp" class="help">Enter -1 to disable all web-search tools, or an exact UTC timestamp including seconds and Z. Historical search returns only verified captures strictly before that time. The choice stays fixed after the job starts.</p>
+                  </div>
+                  <p id="retrievalSettingHelp" class="help">The model's native web search is enabled without a date restriction.</p>
+                  <p id="retrievalConfigurationNotice" class="retrieval-configuration-notice" role="status" hidden></p>
+                </section>
+                <fieldset class="settings-group limits-group">
+                  <legend>Limits and logging</legend>
+                  <div class="field-grid">
+                  <div id="criticRoundSetting" class="field">
+                    <label for="criticRounds">Maximum consecutive critic rounds</label>
+                    <input id="criticRounds" type="number" min="1" max="100"
+                      step="1" value="2" aria-describedby="roundHelp">
+                    <p id="roundHelp" class="help">
+                      Default 2. An unchanged PASS proceeds at once; an edited PASS repeats until
+                      the limit. Unfixable issues return to the author and reset the count.
+                    </p>
+                  </div>
+                  <div id="thinkingHoursSetting" class="field">
+                    <label for="thinkingHours">Time limit in hours (0 = unlimited)</label>
+                    <input id="thinkingHours" type="number" min="0" max="168"
+                      step="0.25" value="168" aria-describedby="timeHelp">
+                    <p id="timeHelp" class="help">
+                      Default 168 hours for the whole workflow. A continued run starts with a
+                      renewed time budget in the same workspace and saved session.
+                    </p>
+                  </div>
+                  <div id="speedModeSetting" class="field">
+                    <label for="speedMode">Generation speed</label>
+                    <select id="speedMode" aria-describedby="speedHelp">
+                      <option value="standard" selected>Standard &mdash; default</option>
+                      <option value="fast">Fast &mdash; up to 2&times; (Codex CLI)</option>
+                    </select>
+                    <p id="speedHelp" class="help">
+                      Fast applies to Codex CLI models only and uses credits at a higher rate. Claude CLI
+                      and API models always run at standard speed.
+                    </p>
+                  </div>
+                  <div id="reasoningSummarySetting" class="field">
+                    <label for="reasoningSummary">Activity log detail</label>
+                    <select id="reasoningSummary" aria-describedby="reasoningSummaryHelp">
+                      <option value="none">Status only</option>
+                      <option value="concise" selected>Concise summaries</option>
+                      <option value="detailed">Detailed summaries</option>
+                    </select>
+                    <p id="reasoningSummaryHelp" class="help">
+                      Public reasoning summaries for every stage (Concise is recommended);
+                      Anthropic-format API models show none. Private chain-of-thought is never
+                      displayed or saved.
+                    </p>
+                  </div>
+                  </div>
+                </fieldset>
+                <div class="settings-group prompt-setting">
+                  <div>
+                    <strong>Role prompts</strong>
+                    <span>Custom prompts override the defaults for this job</span>
+                  </div>
+                  <button id="editPromptsButton" class="secondary compact"
+                    type="button">Edit prompts</button>
+                </div>
+              </div>
             </details>
             <div class="composer-actions">
-              <span id="modelSummary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</span>
+              <p id="modelSummary" class="model-summary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</p>
               <div class="composer-buttons">
                 <button id="runFolderButton" class="secondary" type="button"
-                  aria-describedby="runFolderHelp">Run a folder…</button>
-                <button id="checkButton">Check statement</button>
+                  aria-describedby="runFolderHelp"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z"/></svg>Run a folder…</button>
+                <button id="checkButton" class="primary" type="button">Check statement</button>
               </div>
             </div>
           </div>
           <p id="runFolderHelp" class="help folder-help">
-            Run a folder starts one parallel proof job for each text file directly
-            inside the folder you choose, with the settings above. Each job skips
-            statement review. Any file extension or no extension is accepted.
-            Empty files and subfolders are skipped.
+            Run a folder starts one parallel proof job for each file directly inside the folder
+            you choose, with the settings above, and skips statement review. Any file extension
+            is accepted. Hidden files and subfolders are ignored; empty and binary files are
+            skipped and listed.
           </p>
           <input id="folderInput" type="file" webkitdirectory multiple hidden
             aria-label="Folder of statement files (any extension or none)">
-          <p id="batchStatus" class="batch-status" role="status" hidden></p>
-        </section>
-        <section id="jobsPanel" class="jobs-panel" aria-labelledby="jobsHeading" hidden>
-            <div class="jobs-heading">
-              <div>
-                <p class="eyebrow">BATCH PROBLEMS</p>
-                <h2 id="jobsHeading">Problems and checkpoints</h2>
-              </div>
-              <span id="jobsCount"></span>
-            </div>
-            <ol id="jobsList" class="jobs-list"></ol>
-            <p id="jobsEmpty" class="help" hidden>No problems have been saved in this batch yet.</p>
         </section>
 
-        <!-- The author can edit or explain a rejected statement here. -->
-        <section id="reviewPanel" class="review-view surface" hidden>
-          <p id="reviewEyebrow" class="eyebrow">REVIEW COMPLETE</p>
-          <h1 id="reviewHeading" tabindex="-1">Approve the precise statement</h1>
-          <p id="reviewDescription" class="section-copy">Edit it directly and
-            approve it, or explain what should change and ask for another
-            independent review.</p>
-          <label for="proposed">Proposed statement</label>
-          <textarea id="proposed" rows="14"></textarea>
-          <div class="review-notes">
-            <span>Reviewer notes</span>
-            <p id="notes" class="notes"></p>
-          </div>
-          <div id="reviewFeedbackControls">
-            <label for="feedback">Feedback for the next review
-              <span>(optional)</span></label>
-            <textarea id="feedback" rows="4" aria-describedby="feedbackHelp"
-              placeholder="For example: keep the original time bound and clarify the graph model."></textarea>
-            <p id="feedbackHelp" class="help">
-              Feedback is editing guidance, not part of the statement.
-            </p>
-            <p id="editHint" class="hint" hidden>
-              Your edits will be approved exactly as written.
-            </p>
-          </div>
-          <div class="actions">
-            <button id="reviewHomeButton" class="ghost">Return home</button>
-            <button id="recheckButton" class="secondary">Retry with feedback</button>
-            <button id="approveButton">Approve and start</button>
-          </div>
-        </section>
-
-        <!-- During work, readable summaries are primary and raw JSON is optional. -->
-        <section id="runPanel" class="run-view" hidden aria-busy="true">
-          <div class="run-heading">
+        <!-- Batch: every problem with its status, next action and checkpoints. -->
+        <section id="jobsPanel" class="page jobs-panel" aria-labelledby="jobsHeading" hidden>
+          <div class="page-head">
             <div>
-              <p id="runLabel" class="eyebrow">CODEX IS WORKING</p>
-              <h1 id="runTitle" tabindex="-1">Checking the statement…</h1>
-              <p id="runDescription" class="section-copy"></p>
+              <p class="eyebrow page-eyebrow">Batch</p>
+              <h1 id="jobsHeading">Problems and checkpoints</h1>
+              <p id="jobsCount" class="page-meta"></p>
             </div>
-            <span id="roundBadge" class="round-badge" hidden></span>
           </div>
-
-          <details id="resultPanel" class="run-result" hidden>
-            <summary id="resultHeading">Final answer</summary>
-            <p id="resultDescription" class="help"></p>
-            <pre id="resultOutput" class="statement-copy"></pre>
-          </details>
-
-          <details id="memoryPanel" class="memory-panel" hidden>
-            <summary>
-              <span class="memory-mark" aria-hidden="true">≡</span>
-              <span><strong>Research files</strong><small>Approach graph, proved lemmas, and independent reports</small></span>
-              <span class="memory-chevron" aria-hidden="true">⌄</span>
-            </summary>
-            <div class="memory-tabs" role="tablist" aria-label="Research memory files">
-              <button id="memoryApproachesTab" type="button" role="tab" aria-selected="true"
-                aria-controls="memoryDocument" data-memory="APPROACHES">Approach graph</button>
-              <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
-              <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Current audits</button>
-              <button id="memoryAuditHistoryTab" type="button" role="tab" aria-selected="false"
-                aria-controls="memoryDocument" tabindex="-1" data-memory="audit_history">Audit history</button>
+          <!-- Show one status at a time; app.js keeps the counts current. -->
+          <div class="jobs-toolbar">
+            <div id="jobsFilter" class="seg-filter" role="group" aria-label="Show problems">
+              <button type="button" class="seg" data-show="all" aria-pressed="true">All <span class="seg-count" data-count="all"></span></button>
+              <button type="button" class="seg" data-show="running" aria-pressed="false">Running <span class="seg-count" data-count="running"></span></button>
+              <button type="button" class="seg" data-show="waiting" aria-pressed="false">Needs you <span class="seg-count" data-count="waiting"></span></button>
+              <button type="button" class="seg" data-show="paused" aria-pressed="false">Paused <span class="seg-count" data-count="paused"></span></button>
+              <button type="button" class="seg" data-show="done" aria-pressed="false">Complete <span class="seg-count" data-count="done"></span></button>
+              <button type="button" class="seg" data-show="failed" aria-pressed="false">Incomplete <span class="seg-count" data-count="failed"></span></button>
             </div>
-            <section id="approachGraph" class="approach-graph" aria-labelledby="approachGraphHeading" hidden>
-              <div class="approach-graph-heading">
-                <div><h3 id="approachGraphHeading">How the approaches connect</h3>
-                  <p id="approachGraphSummary">Each node opens a saved approach. Arrows point from parent to child.</p></div>
-                <button id="approachIndexButton" type="button" class="ghost compact" hidden>Read index</button>
-              </div>
-              <p id="approachGraphWarning" class="help graph-warning" role="status" hidden></p>
-              <div id="approachGraphViewport" class="approach-graph-viewport" tabindex="0" aria-label="Approach diagram. Scroll to explore; tab to focus nodes and Enter to read a file.">
-                <div id="approachGraphCanvas" class="approach-graph-canvas"></div>
-              </div>
-              <div id="approachGraphInspector" class="approach-graph-inspector">Hover or focus a node for its result and dependencies. Select it to read the full record.</div>
-            </section>
-            <div id="memoryApproachPicker" class="memory-approach-picker" hidden>
-              <label for="memoryApproach">File</label>
-              <select id="memoryApproach" aria-controls="memoryDocument"></select>
-            </div>
-            <div class="memory-meta">
-              <code id="memoryFilename">APPROACHES</code>
-              <span id="memoryUpdated" role="status"></span>
-            </div>
-            <div id="memoryDocument" class="memory-document" role="tabpanel"
-              aria-labelledby="memoryApproachesTab" tabindex="0">
-              <p id="memoryMessage" class="memory-message">Open a file to read the author’s saved work.</p>
-              <div id="memoryContent" class="memory-content"></div>
-            </div>
-            <p class="memory-footer">Read-only · Refreshes automatically while open</p>
-          </details>
-
-          <div id="researchAuditToolbar" class="research-audit-toolbar" hidden>
-            <div class="research-audit-clock" title="Counts active author time. Pauses and audit time do not count.">
-              <span id="researchAuditCountdownLabel">Next audit</span>
-              <strong id="researchAuditCountdown" role="timer" aria-live="off">00:00:00</strong>
-              <span id="researchAuditTimerState" class="research-audit-timer-state">author time</span>
-            </div>
-            <button id="startResearchAuditButton" type="button" class="secondary compact" disabled>Start audit now</button>
           </div>
-          <div id="researchAuditActivity" class="research-audit-activity" aria-label="Auditor status and activity" hidden></div>
-          <details id="researchAuditsControl" class="research-audits" hidden>
-            <summary>Research audits <span id="researchAuditSummary">Disabled</span></summary>
-            <div class="research-audit-fields">
-              <div>
-                <label for="liveResearchAuditInterval">Interval (active author hours)</label>
-                <input id="liveResearchAuditInterval" type="number" min="0" step="any" value="2">
-              </div>
-              <div><label for="liveResearchAuditOne">Audit one</label><select id="liveResearchAuditOne"><option value="none">None</option></select></div>
-              <div><label for="liveResearchAuditTwo">Audit two</label><select id="liveResearchAuditTwo"><option value="none">None</option></select></div>
-              <div><label for="liveResearchAuditThree">Audit three</label><select id="liveResearchAuditThree"><option value="none">None</option></select></div>
-            </div>
-            <div class="research-audit-actions">
-              <p class="help">Apply changes without restarting the author. Auditors read the author's workspace while it is paused. Each new batch moves previous reports to audit_history/ and saves current reports in AUDITS/.</p>
-              <button id="applyResearchAuditsButton" type="button" class="secondary compact" disabled>Apply</button>
-            </div>
-          </details>
-          <p id="researchAuditStatus" class="help research-audit-status" role="status" hidden></p>
+          <div class="table-head jobs-table-head" aria-hidden="true">
+            <span>Status</span><span>Problem</span><span>Actions</span>
+          </div>
+          <ol id="jobsList" class="jobs-list"></ol>
+          <p class="jobs-filter-empty help">No problems with this status. Choose All to see every problem.</p>
+          <p id="jobsEmpty" class="help" hidden>No problems have been saved in this batch yet.</p>
+        </section>
 
-          <section class="timeline-surface" aria-labelledby="activityHeading">
-            <div class="timeline-head">
+        <!-- Job: one header, then the panel that needs the user, then context. -->
+        <section id="runOverview" class="job" aria-labelledby="runProblemTitle" hidden>
+          <header class="job-header">
+            <div class="job-meta">
+              <dl class="run-facts">
+                <div class="fact-stage"><dt class="visually-hidden">Current stage</dt><dd id="runStage" class="status-pill"></dd></div>
+                <div><dt>Active</dt><dd id="runActiveTime"></dd></div>
+                <div class="fact-budget"><dt>Time limit</dt><dd id="runBudget"></dd></div>
+                <div class="fact-process"><dt>Process</dt><dd id="runHealth"></dd></div>
+              </dl>
+              <span id="roundBadge" class="badge round-badge" hidden></span>
+              <a class="badge mode-badge mode-historical" href="#retrievalPanel">Historical search</a>
+              <a class="badge mode-badge mode-disabled" href="#retrievalPanel">Web search off</a>
+            </div>
+            <h1 id="runProblemTitle" class="job-title"></h1>
+            <p id="runNextStep" class="job-next" role="status"></p>
+            <p id="runLatestAction" class="job-latest"></p>
+            <p id="runSettingsWarning" class="job-warning" role="status" hidden></p>
+          </header>
+
+          <!-- Statement review: the decision first, the evidence beside it. -->
+          <section id="reviewPanel" class="review-view card" aria-labelledby="reviewHeading" hidden>
+            <div class="review-head">
               <div>
-                <h2 id="activityHeading">Live activity</h2>
-                <p id="lastActivity">Waiting for the first update…</p>
+                <p id="reviewEyebrow" class="eyebrow">REVIEW COMPLETE</p>
+                <h2 id="reviewHeading" tabindex="-1">Approve the precise statement</h2>
+                <p id="reviewDescription" class="section-copy">Edit it directly and
+                  approve it, or explain what should change and ask for another
+                  independent review.</p>
               </div>
-              <div id="filters" class="filters" aria-label="Activity filters">
-                <button class="filter active" data-filter="all">All</button>
-                <button class="filter" data-filter="reasoning">Reasoning</button>
-                <button class="filter" data-filter="agent">Agents</button>
-                <button class="filter" data-filter="tool">Tools</button>
-                <button class="filter" data-filter="prompt">Prompts</button>
+              <div class="review-decision">
+                <button id="approveButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m3.5 8.5 3 3 6-7"/></svg>Approve and start</button>
+                <p id="editHint" class="hint" hidden>Your edits will be approved exactly as written.</p>
               </div>
             </div>
-            <p id="traceNotice" class="help trace-notice" role="status" hidden></p>
-            <ol id="timelineList" class="timeline" role="log"
-              aria-live="off" aria-relevant="additions text"></ol>
-            <button id="jumpLatest" class="jump-latest secondary compact" hidden>
-              Jump to latest
-            </button>
+            <div class="review-grid">
+              <div class="field review-statement">
+                <label for="proposed">Proposed statement</label>
+                <textarea id="proposed" rows="14"></textarea>
+              </div>
+              <section class="review-notes" aria-labelledby="notesHeading">
+                <h3 id="notesHeading">Reviewer notes</h3>
+                <p id="notes" class="notes"></p>
+              </section>
+            </div>
+            <div id="reviewFeedbackControls" class="review-feedback">
+              <label for="feedback">Feedback for another review
+                <span>(optional)</span></label>
+              <textarea id="feedback" rows="3" aria-describedby="feedbackHelp"
+                placeholder="For example: keep the original time bound and clarify the graph model."></textarea>
+              <div class="review-feedback-row">
+                <p id="feedbackHelp" class="help">Feedback is editing guidance, not part of the statement.</p>
+                <button id="recheckButton" class="secondary" type="button">Retry with feedback</button>
+              </div>
+            </div>
+            <button id="reviewHomeButton" class="ghost" type="button" hidden>Return home</button>
           </section>
 
-          <div id="authorSteerControl" class="author-steer-control" hidden>
-            <label for="authorSteerInstruction">Guide the running proof author</label>
-            <textarea id="authorSteerInstruction" rows="3" maxlength="12000"></textarea>
-            <button id="sendAuthorSteerButton" class="secondary compact">
-              Send instruction now
-            </button>
-          </div>
-
-          <div class="run-actions">
-            <div id="authorTimeLimitControl" class="author-time-limit-control" hidden>
-              <span id="authorLimitSummary" class="author-limit-summary">
-                Total limit: 168 hours
-              </span>
-              <label for="authorLimitHours">Set hours (0 = unlimited)</label>
-              <input id="authorLimitHours" type="number" min="0"
-                max="168" step="0.5" value="168" inputmode="decimal">
-              <span>hours</span>
-              <button id="setAuthorTimeLimitButton" class="secondary compact">
-                Set limit
-              </button>
+          <!-- Run: what is happening now and the controls for it, then the work. -->
+          <section id="runPanel" class="run-view" aria-labelledby="runTitle" hidden aria-busy="true">
+            <div class="run-now card">
+              <div class="run-heading">
+                <p id="runLabel" hidden>MODEL IS WORKING</p>
+                <h2 id="runTitle" tabindex="-1" aria-describedby="runDescription">Checking the statement…</h2>
+                <p id="runDescription" class="run-description"></p>
+              </div>
+              <div class="run-actions">
+                <button id="resumeButton" class="primary" type="button" hidden>Resume</button>
+                <button id="pauseButton" class="secondary" type="button" hidden>Pause</button>
+                <button id="downloadPdfButton" class="primary" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download PDF</button>
+                <button id="downloadTexButton" class="secondary" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download .tex</button>
+                <button id="stopButton" class="danger" type="button"><svg class="icon icon-fill" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>Stop</button>
+                <details id="authorTimeLimitControl" class="limit-control" hidden>
+                  <summary><span id="authorLimitSummary" class="author-limit-summary">Time limit: 168 hours</span>
+                    <span class="limit-change" aria-hidden="true">Change</span></summary>
+                  <div class="limit-body">
+                    <label for="authorLimitHours">New limit in hours (0 = unlimited)</label>
+                    <input id="authorLimitHours" type="number" min="0"
+                      max="168" step="0.5" value="168" inputmode="decimal">
+                    <button id="setAuthorTimeLimitButton" class="secondary compact" type="button">Set limit</button>
+                  </div>
+                </details>
+              </div>
+              <div id="jobRecovery" class="job-recovery" hidden></div>
+              <div id="authorSteerControl" class="author-steer-control" hidden>
+                <label for="authorSteerInstruction">Guide the running proof author</label>
+                <textarea id="authorSteerInstruction" rows="2" maxlength="12000"
+                  placeholder="For example: try a potential-function argument before the case analysis."></textarea>
+                <button id="sendAuthorSteerButton" class="secondary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 8h10M9 4.5 12.5 8 9 11.5"/></svg>Send instruction now</button>
+              </div>
             </div>
-            <button id="pauseButton" class="secondary" hidden>Pause</button>
-            <button id="stopButton" class="danger">Stop</button>
-            <button id="resumeButton" class="primary" hidden>Resume</button>
-            <button id="downloadTexButton" class="secondary" hidden>Download source (.tex)</button>
-            <button id="downloadPdfButton" class="secondary" hidden>Download PDF</button>
-            <button id="homeButton" class="secondary">Return home</button>
+
+            <details id="statementDetails" class="statement-panel card" open>
+              <summary id="statementHeading">Statement being solved</summary>
+              <pre id="runStatement" class="statement-copy"></pre>
+            </details>
+
+            <details id="resultPanel" class="run-result card" hidden>
+              <summary id="resultHeading">Final answer</summary>
+              <p id="resultDescription" class="help"></p>
+              <pre id="resultOutput" class="statement-copy"></pre>
+            </details>
+
+            <details id="memoryPanel" class="memory-panel card" hidden>
+              <summary>
+                <span class="memory-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 16 16" focusable="false"><circle cx="3.5" cy="8" r="1.75"/><circle cx="12.5" cy="3.75" r="1.75"/><circle cx="12.5" cy="12.25" r="1.75"/><path d="M5.25 7.4 10.75 4.4M5.25 8.6l5.5 3"/></svg></span>
+                <span><strong>Research files</strong><small>Approach graph, proved lemmas, and independent reports</small></span>
+                <span class="memory-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="memory-tabs" role="tablist" aria-label="Research memory files">
+                <button id="memoryApproachesTab" type="button" role="tab" aria-selected="true"
+                  aria-controls="memoryDocument" data-memory="APPROACHES">Approach graph</button>
+                <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
+                  aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
+                <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
+                  aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Current audits</button>
+                <button id="memoryAuditHistoryTab" type="button" role="tab" aria-selected="false"
+                  aria-controls="memoryDocument" tabindex="-1" data-memory="audit_history">Audit history</button>
+              </div>
+              <section id="approachGraph" class="approach-graph" aria-labelledby="approachGraphHeading" hidden>
+                <div class="approach-graph-heading">
+                  <div><h3 id="approachGraphHeading">How the approaches connect</h3>
+                    <p id="approachGraphSummary">Each node opens a saved approach. Arrows point from parent to child.</p></div>
+                  <button id="approachIndexButton" type="button" class="ghost compact" hidden>Read index</button>
+                </div>
+                <p id="approachGraphWarning" class="help graph-warning" role="status" hidden></p>
+                <div id="approachGraphViewport" class="approach-graph-viewport" tabindex="0" aria-label="Approach diagram. Scroll to explore; tab to focus nodes and Enter to read a file.">
+                  <div id="approachGraphCanvas" class="approach-graph-canvas"></div>
+                </div>
+                <div id="approachGraphInspector" class="approach-graph-inspector">Hover or focus a node for its result and dependencies. Select it to read the full record.</div>
+              </section>
+              <div id="memoryApproachPicker" class="memory-approach-picker" hidden>
+                <label for="memoryApproach">File</label>
+                <select id="memoryApproach" aria-controls="memoryDocument"></select>
+              </div>
+              <div class="memory-meta">
+                <code id="memoryFilename">APPROACHES</code>
+                <span id="memoryUpdated"></span>
+              </div>
+              <div id="memoryDocument" class="memory-document" role="tabpanel"
+                aria-labelledby="memoryApproachesTab" tabindex="0">
+                <p id="memoryMessage" class="memory-message">Open a file to read the author’s saved work.</p>
+                <div id="memoryContent" class="memory-content"></div>
+              </div>
+              <p class="memory-footer">Read-only · Refreshes automatically while open</p>
+            </details>
+
+            <div id="researchAuditToolbar" class="research-audit-toolbar" hidden>
+              <div class="research-audit-clock" title="Counts active author time. Pauses and audit time do not count.">
+                <span id="researchAuditCountdownLabel">Next audit</span>
+                <strong id="researchAuditCountdown" role="timer" aria-live="off">00:00:00</strong>
+                <span id="researchAuditTimerState" class="research-audit-timer-state">author time</span>
+              </div>
+              <button id="startResearchAuditButton" type="button" class="secondary compact" disabled>Start audit now</button>
+            </div>
+            <div id="researchAuditActivity" class="research-audit-activity" aria-label="Auditor status and activity" hidden></div>
+            <details id="researchAuditsControl" class="research-audits" hidden>
+              <summary>Research audits <span id="researchAuditSummary">Disabled</span></summary>
+              <div class="research-audit-fields">
+                <div>
+                  <label for="liveResearchAuditInterval">Interval (active author hours)</label>
+                  <input id="liveResearchAuditInterval" type="number" min="0" step="any" value="2">
+                </div>
+                <div><label for="liveResearchAuditOne">Audit one</label><select id="liveResearchAuditOne"><option value="none">None</option></select></div>
+                <div><label for="liveResearchAuditTwo">Audit two</label><select id="liveResearchAuditTwo"><option value="none">None</option></select></div>
+                <div><label for="liveResearchAuditThree">Audit three</label><select id="liveResearchAuditThree"><option value="none">None</option></select></div>
+              </div>
+              <div class="research-audit-actions">
+                <p class="help">Apply changes without restarting the author. Auditors read the author's workspace while it is paused. Each new batch moves previous reports to audit_history/ and saves current reports in AUDITS/.</p>
+                <button id="applyResearchAuditsButton" type="button" class="secondary compact" disabled>Apply</button>
+              </div>
+            </details>
+            <p id="researchAuditStatus" class="help research-audit-status" role="status" hidden></p>
+
+            <section class="timeline-surface card" aria-labelledby="activityHeading">
+              <div class="timeline-head">
+                <div>
+                  <h2 id="activityHeading">Live activity</h2>
+                  <p id="lastActivity">Waiting for the first update…</p>
+                </div>
+                <div id="filters" class="filters" role="group" aria-label="Activity filters">
+                  <button class="filter active" type="button" data-filter="all" aria-pressed="true">All</button>
+                  <button class="filter" type="button" data-filter="reasoning" aria-pressed="false">Reasoning</button>
+                  <button class="filter" type="button" data-filter="agent" aria-pressed="false">Agents</button>
+                  <button class="filter" type="button" data-filter="tool" aria-pressed="false">Tools</button>
+                  <button class="filter" type="button" data-filter="prompt" aria-pressed="false">Prompts</button>
+                </div>
+              </div>
+              <p id="traceNotice" class="help trace-notice" role="status" hidden></p>
+              <ol id="timelineList" class="timeline" role="log"
+                aria-live="off" aria-relevant="additions text"></ol>
+              <button id="jumpLatest" class="jump-latest secondary compact" type="button" hidden>
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v9.5M4 8.5l4 4 4-4"/></svg>
+                Jump to latest
+              </button>
+            </section>
+          </section>
+
+          <!-- Reference material for every phase, below the work. -->
+          <div class="job-context">
+            <h2 class="visually-hidden">Problem and run details</h2>
+            <details id="originalStatementDetails" class="run-context" hidden>
+              <summary>Original statement</summary>
+              <pre id="runOriginalStatement" class="statement-copy"></pre>
+            </details>
+            <section id="retrievalPanel" class="retrieval-panel" aria-labelledby="retrievalHeading" tabindex="-1">
+              <div class="retrieval-heading">
+                <div><p class="eyebrow">Research sources</p><h3 id="retrievalHeading">Web search</h3></div>
+                <span id="retrievalStatus" class="badge retrieval-badge"></span>
+              </div>
+              <p id="retrievalDescription" class="retrieval-description"></p>
+              <div id="retrievalCutoffDisplay" class="retrieval-cutoff" hidden>
+                <span id="retrievalCutoffLabel">Only captures strictly before</span>
+                <strong id="retrievalCutoffValue"></strong>
+                <span id="retrievalPolicyNote"></span>
+              </div>
+              <dl id="retrievalCounts" class="retrieval-counts" hidden></dl>
+              <p id="retrievalRequestSummary" class="retrieval-request-summary" hidden></p>
+              <ul id="retrievalFailures" class="retrieval-failures" aria-label="Failed retrieval requests by reason" hidden></ul>
+              <details id="retrievalDetails" class="retrieval-details" hidden>
+                <summary>Source checks and coverage</summary>
+                <p id="retrievalLimitation"></p>
+                <p id="retrievalCountNote"></p>
+              </details>
+            </section>
+            <details id="criticReviewHistory" class="run-context critic-review-history">
+              <summary>Critic review inputs and decisions</summary>
+            </details>
+            <details class="run-context">
+              <summary>Run settings</summary>
+              <dl id="runMetadata" class="run-metadata"></dl>
+            </details>
+          </div>
+          <div class="job-footer">
+            <button id="homeButton" class="ghost" type="button">Back to problems</button>
           </div>
         </section>
       </main>
+
+      <!-- The workflow diagram: right column on wide screens, after the work on narrow ones. -->
+      <aside id="workflowRail" class="workflow-rail" aria-labelledby="workflowHeading" hidden>
+        <h2 id="workflowHeading" class="rail-kicker">Workflow</h2>
+        <ol id="workflowNodes" class="workflow-nodes"></ol>
+        <!-- A visual key for the step glyphs; every step already states its status in words. -->
+        <ul class="rail-legend" aria-hidden="true">
+          <li><span class="legend-dot complete">✓</span>Done</li>
+          <li><span class="legend-dot active"></span>Working</li>
+          <li><span class="legend-dot paused">Ⅱ</span>Paused</li>
+          <li><span class="legend-dot rejected">×</span>Rejected</li>
+          <li><span class="legend-dot failed">!</span>Needs attention</li>
+          <li><span class="legend-dot">3</span>Up next</li>
+        </ul>
+      </aside>
     </div>
+    </div><!-- .main-column -->
 
     <!-- Advanced prompt editing stays out of the main problem form. -->
-    <dialog id="promptDialog" class="prompt-dialog">
+    <dialog id="promptDialog" class="prompt-dialog" aria-labelledby="promptDialogTitle">
       <form method="dialog">
         <div class="prompt-dialog-head">
           <div>
-            <p class="eyebrow">ADVANCED</p>
-            <h2>Edit role prompts</h2>
+            <p class="eyebrow">Advanced</p>
+            <h2 id="promptDialogTitle">Edit role prompts</h2>
           </div>
           <button id="closePromptsButton" class="ghost compact"
             value="cancel">Close</button>
         </div>
         <div id="promptTabs" class="prompt-tabs" role="tablist"
           aria-label="Choose a role prompt">
-          <button id="reviewPromptTab" type="button" class="prompt-tab active"
-            data-prompt="review">Reviewer</button>
-          <button id="authorPromptTab" type="button" class="prompt-tab"
-            data-prompt="author">Author</button>
-          <button id="criticPromptTab" type="button" class="prompt-tab"
-            data-prompt="critic">Critic</button>
-          <button id="finalPromptTab" type="button" class="prompt-tab"
-            data-prompt="final">Final writer</button>
+          <button id="reviewPromptTab" type="button" role="tab" class="prompt-tab active"
+            aria-selected="true" aria-controls="promptPanel" data-prompt="review">Reviewer</button>
+          <button id="authorPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
+            aria-selected="false" aria-controls="promptPanel" data-prompt="author">Author</button>
+          <button id="criticPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
+            aria-selected="false" aria-controls="promptPanel" data-prompt="critic">Critic</button>
+          <button id="finalPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
+            aria-selected="false" aria-controls="promptPanel" data-prompt="final">Final writer</button>
         </div>
-        <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>
-        <textarea id="promptEditor" rows="18" spellcheck="false"></textarea>
-        <p id="promptEditorHelp" class="help">
-          The author prompt must contain exactly one [STATEMENT].
-        </p>
+        <div id="promptPanel" role="tabpanel" aria-labelledby="promptEditorLabel">
+          <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>
+          <textarea id="promptEditor" rows="18" spellcheck="false"></textarea>
+          <p id="promptEditorHelp" class="help">
+            The author prompt must contain exactly one [STATEMENT].
+          </p>
+          <p id="promptEditorError" class="notice" role="alert" hidden></p>
+        </div>
         <div class="prompt-dialog-actions">
           <button id="resetPromptButton" class="ghost" type="button">
             Reset to default
           </button>
-          <button id="savePromptsButton" type="button">Apply to this job</button>
+          <button id="savePromptsButton" class="primary" type="button">Apply to this job</button>
         </div>
       </form>
     </dialog>
 
-    <!-- Only the application's exact model conversation appears here. -->
+    <!-- Only the application's exact model conversation appears here. #activityPanel is a modal
+         <dialog>: open and close it only through setAudit(); never give it the hidden attribute. -->
     <div id="drawerScrim" class="drawer-scrim" hidden></div>
-    <aside id="activityPanel" class="audit-drawer"
-      aria-labelledby="auditTitle" hidden>
-      <div class="drawer-head">
-        <div>
-          <p class="eyebrow">RUN DETAILS</p>
-          <h2 id="auditTitle">Prompts and responses</h2>
+    <dialog id="activityPanel" class="audit-drawer" aria-labelledby="auditTitle">
+      <div class="drawer-inner">
+        <div class="drawer-head">
+          <div>
+            <p class="eyebrow">Run details</p>
+            <h2 id="auditTitle">Prompts and responses</h2>
+          </div>
+          <button id="activityClose" class="ghost compact" type="button">Close</button>
         </div>
-        <button id="activityClose" class="ghost compact">Close</button>
+        <p class="drawer-copy">
+          Only the exact prompt TCS Prover sends to the selected model and its text are
+          shown. Private chain-of-thought is unavailable.
+        </p>
+        <ol id="activityList" class="audit-list" aria-label="Model prompts and responses"></ol>
       </div>
-      <p class="drawer-copy">
-        Only the exact prompt TCS Prover sends to the selected model and its text are
-        shown. Private chain-of-thought is unavailable.
-      </p>
-      <ol id="activityList" class="audit-list" aria-label="Model prompts and responses"></ol>
-    </aside>
+    </dialog>
   </div>
 
   <script src="/app.js"></script>

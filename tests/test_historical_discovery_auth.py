@@ -9,7 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-import historical_discovery_auth as auth
+from retrieval import historical_discovery_auth as auth
 
 
 class DiscoveryAuthTests(unittest.TestCase):

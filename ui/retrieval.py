@@ -13,15 +13,19 @@ import threading
 import time
 import uuid
 
-import historical_search
-import retrieval_runtime
+from retrieval import historical_search
+from retrieval import isolated_compiler
+from retrieval import runtime as retrieval_runtime
 import workflow_runner as runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 LIMITATION = ('Current discovery suggests URLs; only verified archive text strictly before the cutoff is returned. '
               'Coverage is incomplete and model training knowledge is not time limited.')
+PLATFORM_REASON = ('Historical search currently requires macOS: the isolated LaTeX compiler '
+                   'has only a macOS Seatbelt adapter.')
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
+_POLICY_MEMO = {}
 MAX_AUDIT_BYTES = 32 * 1024 * 1024
 REQUEST_FAILURE_LABELS = {
     'no_capture': 'No verified pre-cutoff archive',
@@ -42,9 +46,11 @@ MCP_TERMINALS = frozenset(('mcp_response_ready', 'mcp_deadline', 'mcp_cancelled'
 
 
 def capabilities():
-    available = sys.platform == 'darwin' or os.name == 'nt'
+    # Model roles also have a Windows MXC adapter, but every historical run
+    # ends in the isolated compiler, which supports only macOS.
+    available = isolated_compiler.supported()
     return {'historicalAvailable': available, 'defaultMode': 'live', 'scope': 'author',
-            'reason': '' if available else 'Historical search requires macOS Seatbelt or Windows MXC.',
+            'reason': '' if available else PLATFORM_REASON,
             'requiresDirect': True, 'requiresCodexModels': True}
 
 
@@ -74,8 +80,10 @@ def validate_options(mode='live', cutoff='', *, models=(), research_audits=None,
         raise ValueError(capabilities()['reason'])
     if continuation_source:
         raise ValueError('Historical search cannot be added to an existing conversation. Start a new direct proof.')
+    # Claude and API models (including OpenAI-format ones run through Codex)
+    # are excluded: historical isolation exists only for native Codex models.
     if any(runtime.model_provider(model) != runtime.OPENAI_PROVIDER for model in models):
-        raise ValueError('Historical search requires Codex models for the author, critic, and writer.')
+        raise ValueError(runtime.HISTORICAL_CODEX_ONLY)
     if research_audits and any(model != 'none' for model in research_audits.get('models', [])):
         raise ValueError('Disable optional research auditors when using historical search.')
     return {'retrievalMode': mode, 'retrievalCutoffUtc': historical_search.utc_text(parsed)}
@@ -105,7 +113,10 @@ def prepare_policy(workspace, cutoff, *, controller_root=None):
     if parent == workspace or workspace in parent.parents:
         raise ValueError('Historical controller state must be outside the solver workspace.')
     adapter = retrieval_runtime.MACOS_ADAPTER if sys.platform == 'darwin' else retrieval_runtime.WINDOWS_ADAPTER
-    executable = retrieval_runtime.codex_executable({'isolation': {'workspace': str(workspace), 'adapter': adapter}})
+    try:
+        executable = retrieval_runtime.codex_executable({'isolation': {'workspace': str(workspace), 'adapter': adapter}})
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise ValueError(str(exc)) from exc
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     controller = parent / (workspace.name + '-' + uuid.uuid4().hex)
     controller.mkdir(mode=0o700)
@@ -115,7 +126,7 @@ def prepare_policy(workspace, cutoff, *, controller_root=None):
     rate_directory = Path(shared_state).expanduser() if shared_state else parent / 'retrieval-state'
     if not rate_directory.is_absolute():
         raise ValueError('The controller retrieval-state directory must be absolute.')
-    from historical_codex_discovery import build_settings
+    from retrieval.historical_codex_discovery import build_settings
     discovery = build_settings(executable, controller / 'discovery-auth',
                                controller / 'discovery-state', runtime.AUTHOR_MODEL)
     _write_json(broker_path, {
@@ -132,7 +143,7 @@ def prepare_policy(workspace, cutoff, *, controller_root=None):
         # Preserve the virtualenv launcher path: resolving its symlink selects
         # system Python and drops installed PDF/parser dependencies.
         'broker': {'command': str(Path(sys.executable).absolute()),
-                   'args': [str(ROOT / 'historical_search.py'), '--cutoff', cutoff,
+                   'args': [str(ROOT / 'retrieval' / 'historical_search.py'), '--cutoff', cutoff,
                             '--policy-file', str(broker_path), '--policy-sha256',
                             hashlib.sha256(broker_path.read_bytes()).hexdigest(),
                             '--audit-log', str(audit_path)],
@@ -192,10 +203,12 @@ def preflight_policy(policy_path, *, auth_home=None):
 
 
 def preflight_compiler(policy_path):
-    import isolated_compiler
+    if not isolated_compiler.supported():
+        raise ValueError(PLATFORM_REASON)
     try:
         isolated_compiler.preflight(retrieval_runtime.load_policy(policy_path))
-    except (isolated_compiler.CompilerIsolationError, retrieval_runtime.RetrievalPolicyError, OSError) as exc:
+    except (isolated_compiler.CompilerIsolationError, retrieval_runtime.RetrievalPolicyError, OSError,
+            subprocess.SubprocessError) as exc:
         raise ValueError('Historical compiler preflight failed; no model was started. Check the protected TeX installation and sandbox support.') from exc
 
 
@@ -275,26 +288,67 @@ def _request_metadata(records, modern):
     return result
 
 
-def public_retrieval_info(policy_path, *, run_dir=None, mode='live'):
+def _file_signature(path):
+    try:
+        info = Path(path).stat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def display_policy(path):
+    """Load a policy for dashboard display without rehashing unchanged files.
+
+    The memo is rechecked against the policy, broker files and pinned Codex
+    binary on every call. Launch, resume and the broker never use it; they
+    still run the full load_policy and discovery hash checks.
+    """
+    key = str(path)
+    with _CACHE_LOCK:
+        saved = _POLICY_MEMO.get(key)
+    if saved is not None and all(_file_signature(item) == signature for item, signature in saved[0]):
+        return copy.deepcopy(saved[1])
+    policy = retrieval_runtime.load_policy(path)
+    broker = policy['broker']
+    # The files load_policy hashed, and a legacy broker path it mapped away
+    # (which would be used again if it reappeared).
+    files = [key, broker['policyFile'], broker['command'], broker['args'][0], *policy['_brokerModuleSha256'],
+             *([policy['_legacyBrokerArgs0']] if policy.get('_legacyBrokerArgs0') else [])]
+    if policy.get('_discoverySettings'):
+        files.append(policy['_discoverySettings']['codex_path'])
+    with _CACHE_LOCK:
+        if len(_POLICY_MEMO) > 256:
+            _POLICY_MEMO.clear()
+        _POLICY_MEMO[key] = (tuple((item, _file_signature(item)) for item in files), copy.deepcopy(policy))
+    return policy
+
+
+def public_retrieval_info(policy_path, *, run_dir=None, mode='live', saved_cutoff=''):
     """Return whitelisted aggregate metadata only; never source or query content.
 
     A five-second cache bounds repeated dashboard reads. Large audit files are
     reported unavailable rather than silently presenting tail-only totals.
+    ``saved_cutoff`` is the job's recorded cutoff; it stays visible when the
+    policy metadata cannot be loaded, and a loaded policy always overrides it.
     """
     if not policy_path:
         return _empty_info(mode if mode in ('live', 'disabled') else 'disabled')
-    key = (str(policy_path), str(run_dir or ''))
+    try:
+        saved_cutoff = historical_search.utc_text(historical_search.parse_cutoff(saved_cutoff))
+    except historical_search.HistoricalSearchError:
+        saved_cutoff = ''
+    key = (str(policy_path), str(run_dir or ''), saved_cutoff)
     with _CACHE_LOCK:
         saved = _CACHE.get(key)
         if saved and time.monotonic() - saved[0] < 5:
             return copy.deepcopy(saved[1])
     info = _empty_info()
-    info.update(mode='historical', fixed=True, available=False)
+    info.update(mode='historical', fixed=True, available=False, cutoffExclusiveUtc=saved_cutoff)
     try:
         path = Path(policy_path)
         if path.is_symlink() or not path.is_absolute():
             raise ValueError('Invalid controller policy path.')
-        policy = retrieval_runtime.load_policy(path)
+        policy = display_policy(path)
         if run_dir is not None and Path(policy['isolation']['workspace']).resolve() != Path(run_dir).resolve():
             raise ValueError('Controller workspace mismatch.')
         info['cutoffExclusiveUtc'] = policy['cutoffExclusiveUtc']

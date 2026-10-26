@@ -17,11 +17,12 @@ from .server import (
     App, Server, DEFAULT_AUTHOR_MODEL, DEFAULT_CRITIC_MODEL,
     DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, EFFORTS, HOST,
-    MODELS, OFFERED_MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
+    OFFERED_MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, read_utf8,
     saved_critic_source, saved_research_source,
 )
 
-ACTIVE_PHASES = {"reviewing", "running", "stopping"}
+ACTIVE_PHASES = {"reviewing", "running", "stopping", "pausing"}
+_UNSET = object()
 
 class ConciseHeadlessOutput:
     """Print only headless workflow transitions and diagnostics."""
@@ -34,7 +35,7 @@ class ConciseHeadlessOutput:
         "final": ("final", "LaTeX editor"),
         "failure": ("failure", "Failure summary"),
     }
-    IMPORTANT_STATUSES = {"Goal paused", "Pause not confirmed"}
+    IMPORTANT_STATUSES = {"Author paused", "Author stopped for safety", runtime.RETRY_LABEL}
 
     def __init__(self, stream, lock, input_file):
         self.stream, self.lock = stream, lock
@@ -70,12 +71,18 @@ class ConciseHeadlessOutput:
                 return f"Error: {detail}"
             return f"Diagnostic: {detail}"
 
-        if kind == "status" and record.get("label") in self.IMPORTANT_STATUSES:
-            label = record["label"]
+        label = record.get("label")
+        if kind == "status" and isinstance(label, str) and (
+                label in self.IMPORTANT_STATUSES
+                # Parallel requests prefix their own name ("Independent audit 2 · ...").
+                or label.endswith(runtime.RETRY_LABEL)):
             detail = str(record.get("text", "")).strip()
             return f"{label}: {detail}" if detail else label
 
         if kind != "request":
+            return None
+        # A retry of the same model call is not a new step or critic round.
+        if isinstance(record.get("attempt"), int) and record["attempt"] > 1:
             return None
         stage = record.get("stage")
         step = self.STAGE_NODES.get(stage)
@@ -94,8 +101,10 @@ class ConciseHeadlessOutput:
         self.node = node
         if node == "author":
             self.critic_round = 0
-            if stage == "repair" and record.get("label"):
-                title = str(record["label"])
+            # Every author request is labelled "Exact solve input", so the
+            # stage, not the label, identifies a repair turn.
+            if stage == "repair":
+                title = "Proof author (repairing critic objections)"
         return f"Current step: {title}"
 
     def write(self, line):
@@ -221,24 +230,28 @@ def direct_cli_options(
     }
 
 
-def research_resume_cli_settings(args, argv):
+def research_resume_cli_settings(args, parser, argv):
     """Override saved author settings only for options explicitly supplied."""
 
-    supplied = {argument.split("=", 1)[0] for argument in argv if argument.startswith("-")}
     fields = {
-        "criticRounds": ("critic_rounds", "critic-rounds"),
-        "thinkingHours": ("thinking_hours", "thinking-hours"),
-        "reasoningEffort": ("reasoning_effort", "reasoning-effort"),
-        "speedMode": ("speed_mode", "speed-mode"),
-        "reasoningSummary": ("reasoning_summary", "reasoning-summary"),
+        "criticRounds": "critic_rounds",
+        "thinkingHours": "thinking_hours",
+        "reasoningEffort": "reasoning_effort",
+        "speedMode": "speed_mode",
+        "reasoningSummary": "reasoning_summary",
     }
     for role in ("author", "critic", "writer"):
-        fields[f"{role}Model"] = (f"{role}_model", f"{role}-model")
-        fields[f"{role}Effort"] = (f"{role}_effort", f"{role}-effort")
+        fields[f"{role}Model"] = f"{role}_model"
+        fields[f"{role}Effort"] = f"{role}_effort"
+    # Let argparse report what was supplied: it also accepts unambiguous
+    # abbreviations such as -thinking 24, which no spelling list can cover.
+    probe = parser.parse_args(
+        argv, namespace=argparse.Namespace(**dict.fromkeys(fields.values(), _UNSET)),
+    )
     options = {
         key: getattr(args, attribute)
-        for key, (attribute, kebab) in fields.items()
-        if supplied.intersection({f"-{key}", f"--{key}", f"--{kebab}"})
+        for key, attribute in fields.items()
+        if getattr(probe, attribute) is not _UNSET
     }
     if "reasoningEffort" in options:
         for role in ("author", "critic", "writer"):
@@ -266,6 +279,31 @@ def _stop_headless_apps(apps):
         thread.join()
 
 
+def _job_active(app):
+    """Read one job's phase without a snapshot, which re-reads workflow YAML.
+
+    A reader that is still saving pause.json or partial output keeps the job
+    active, so the interpreter cannot exit before those artifacts exist. A
+    job paused by an error with an automatic retry scheduled is still active:
+    the terminal resumes it like the web server does.
+    """
+
+    with app.lock:
+        return (app.state["phase"] in ACTIVE_PHASES or app.has_active_worker()
+                or (app.state["phase"] == "paused" and bool(app.state.get("autoResumeAt"))))
+
+
+def _retry_paused_job(app):
+    """Resume a job whose error pause has reached its automatic retry time (as the web server does)."""
+
+    try:
+        app.auto_resume_if_due(app.resume)
+    except Exception:
+        # Nothing one job raises may end the other jobs' retries. A damaged
+        # checkpoint is reported on its job, which tries again after the usual wait.
+        pass
+
+
 def run_headless_markdown(
     path, runs=RUNS, output_stream=None, error_stream=None,
     verbose_events=False, **settings
@@ -291,7 +329,8 @@ def run_headless_markdown(
                 job_output = ConciseHeadlessOutput(
                     output_stream, output_lock, source.name
                 )
-            app = App(runs=runs, output_stream=job_output)
+            # A new job creates its own run; never parse another job's transcript.
+            app = App(runs=runs, output_stream=job_output, load_latest=False)
             apps.append((source, app))
             app.start_direct_statement(statement=statement, **options)
             print(
@@ -307,7 +346,9 @@ def run_headless_markdown(
         raise
 
     try:
-        while any(app.snapshot()["phase"] in ACTIVE_PHASES for _, app in apps):
+        while any(_job_active(app) for _, app in apps):
+            for _, app in apps:
+                _retry_paused_job(app)
             time.sleep(0.25)
     except KeyboardInterrupt:
         _stop_headless_apps(apps)
@@ -316,8 +357,8 @@ def run_headless_markdown(
 
     failed = False
     for source, app in apps:
-        state = app.snapshot()
-        error = state.get("error", "")
+        with app.lock:
+            error = app.state.get("error", "")
         if error:
             failed = True
             print(
@@ -332,85 +373,12 @@ def run_headless_markdown(
     return 1 if failed else 0
 
 
-def run_headless_critic_resume(
-    source_run, runs=RUNS, output_stream=None, error_stream=None,
-    verbose_events=False, critic_rounds=DEFAULT_CRITIC_ROUNDS,
-    critic_model=DEFAULT_CRITIC_MODEL, writer_model=DEFAULT_WRITER_MODEL,
-    reasoning_effort=DEFAULT_REASONING_EFFORT,
-    critic_effort=None, writer_effort=None,
-    speed_mode=DEFAULT_SPEED,
-    reasoning_summary=DEFAULT_REASONING_SUMMARY,
-    critic_prompt_file=None, final_prompt_file=None,
-):
-    """Audit a complete proof saved by an earlier author job."""
-
-    output_stream = sys.stdout if output_stream is None else output_stream
-    error_stream = sys.stderr if error_stream is None else error_stream
-    source = saved_critic_source(source_run)
-    critic_prompt = (
-        read_utf8(critic_prompt_file, "critic prompt")
-        if critic_prompt_file else source["critic_prompt"]
-    )
-    final_prompt = (
-        read_utf8(final_prompt_file, "final prompt")
-        if final_prompt_file else source["final_prompt"]
-    )
-    lock = threading.Lock()
-    job_output = (
-        output_stream if verbose_events
-        else ConciseHeadlessOutput(output_stream, lock, source["run_dir"].name)
-    )
-    app = App(runs=runs, output_stream=job_output)
-    try:
-        app.start_critic_resume(
-            statement=source["statement"],
-            solution=source["solution"],
-            source_run=source["run_dir"],
-            critic_rounds=critic_rounds,
-            critic_model=critic_model,
-            writer_model=writer_model,
-            reasoning_effort=reasoning_effort,
-            critic_effort=critic_effort,
-            writer_effort=writer_effort,
-            author_prompt=source["author_prompt"],
-            critic_prompt=critic_prompt,
-            final_prompt=final_prompt,
-            speed_mode=speed_mode,
-            reasoning_summary=reasoning_summary,
-        )
-        print(
-            f"Saved-candidate audit started in {app.run_dir}",
-            file=error_stream, flush=True,
-        )
-        while app.snapshot()["phase"] in ACTIVE_PHASES:
-            time.sleep(0.25)
-    except KeyboardInterrupt:
-        try:
-            app.stop()
-        except ValueError:
-            pass
-        print("Saved-candidate audit stopped.", file=error_stream, flush=True)
-        return 130
-    state = app.snapshot()
-    if state.get("error"):
-        print(
-            f"Saved-candidate audit failed: {state['error']}",
-            file=error_stream, flush=True,
-        )
-        return 1
-    print(
-        f"Saved-candidate audit finished in {app.run_dir}",
-        file=error_stream, flush=True,
-    )
-    return 0
-
-
 def main():
     """Run Markdown proofs from the terminal or start the browser interface."""
 
     if sys.argv[1:2] == ["--review-worker"]:
         return review_worker_main(sys.argv[2:])
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=runtime.HelpFormatter)
     parser.add_argument(
         "input_path", nargs="?",
         help="UTF-8 .md statement file or folder of top-level .md files",
@@ -448,7 +416,8 @@ def main():
         "-thinkingHours", "--thinkingHours", "--thinking-hours",
         dest="thinking_hours", type=float, default=DEFAULT_THINKING_HOURS,
         metavar="HOURS",
-        help=f"total elapsed-workflow limit (default: {DEFAULT_THINKING_HOURS})",
+        help=(f"total elapsed-workflow limit in hours: 0 for unlimited, or at most "
+              f"{runtime.MAX_AUTHOR_HOURS} (default: {DEFAULT_THINKING_HOURS})"),
     )
     model_defaults = {
         "author": DEFAULT_AUTHOR_MODEL,
@@ -457,12 +426,15 @@ def main():
     }
     for role in ("author", "critic", "writer"):
         camel = f"{role}Model"
+        # Configured API models are user data, so the registry validates ids
+        # instead of a fixed choices list.
         parser.add_argument(
             f"-{camel}", f"--{camel}", f"--{role}-model",
-            dest=f"{role}_model", choices=MODELS, metavar="MODEL",
+            dest=f"{role}_model", type=runtime.model_argument, metavar="MODEL",
             default=model_defaults[role],
             help=(
-                f"{role} model: {', '.join(OFFERED_MODELS)} "
+                f"{role} model: {', '.join(OFFERED_MODELS)}, or an api:<id> "
+                "model from Advanced settings → API models "
                 f"(default: {model_defaults[role]}); the older GPT-5.6 ids "
                 "are still accepted"
             ),
@@ -486,7 +458,10 @@ def main():
     parser.add_argument(
         "-speedMode", "--speedMode", "--speed-mode",
         dest="speed_mode", choices=SPEEDS, default=DEFAULT_SPEED,
-        help=f"generation speed (default: {DEFAULT_SPEED})",
+        help=(
+            f"generation speed (default: {DEFAULT_SPEED}); fast applies to Codex "
+            "CLI models only, other models run standard"
+        ),
     )
     parser.add_argument(
         "-reasoningSummary", "--reasoningSummary", "--reasoning-summary",
@@ -566,37 +541,37 @@ def main():
     resume_app = None
     if resume_source:
         try:
-            resume_settings = {
-                "criticRounds": args.critic_rounds,
-                "thinkingHours": args.thinking_hours,
-                "authorModel": args.author_model,
-                "criticModel": args.critic_model,
-                "writerModel": args.writer_model,
-                "reasoningEffort": args.reasoning_effort,
-                "authorEffort": args.author_effort,
-                "criticEffort": args.critic_effort,
-                "writerEffort": args.writer_effort,
-                "speedMode": args.speed_mode,
-                "reasoningSummary": args.reasoning_summary,
-            }
-            if args.author_prompt_file:
-                resume_settings["authorPrompt"] = read_utf8(
-                    args.author_prompt_file, "author prompt"
-                )
-            if args.critic_prompt_file:
-                resume_settings["criticPrompt"] = read_utf8(
-                    args.critic_prompt_file, "critic prompt"
-                )
-            if args.final_prompt_file:
-                resume_settings["finalPrompt"] = read_utf8(
-                    args.final_prompt_file, "final prompt"
-                )
             if args.resume_research:
                 resume_app = server.start_saved_research_job(
                     resume_source["run_dir"],
-                    research_resume_cli_settings(args, sys.argv[1:]),
+                    research_resume_cli_settings(args, parser, sys.argv[1:]),
                 )
             else:
+                resume_settings = {
+                    "criticRounds": args.critic_rounds,
+                    "thinkingHours": args.thinking_hours,
+                    "authorModel": args.author_model,
+                    "criticModel": args.critic_model,
+                    "writerModel": args.writer_model,
+                    "reasoningEffort": args.reasoning_effort,
+                    "authorEffort": args.author_effort,
+                    "criticEffort": args.critic_effort,
+                    "writerEffort": args.writer_effort,
+                    "speedMode": args.speed_mode,
+                    "reasoningSummary": args.reasoning_summary,
+                }
+                if args.author_prompt_file:
+                    resume_settings["authorPrompt"] = read_utf8(
+                        args.author_prompt_file, "author prompt"
+                    )
+                if args.critic_prompt_file:
+                    resume_settings["criticPrompt"] = read_utf8(
+                        args.critic_prompt_file, "critic prompt"
+                    )
+                if args.final_prompt_file:
+                    resume_settings["finalPrompt"] = read_utf8(
+                        args.final_prompt_file, "final prompt"
+                    )
                 resume_app = server.start_saved_critic_job(
                     resume_source["run_dir"], resume_settings,
                 )
@@ -604,12 +579,17 @@ def main():
             server.server_close()
             print(f"Cannot resume saved job: {exc}", file=sys.stderr)
             return 1
+        if resume_app.state.get("settingsWarning"):
+            # For example, a saved DeepSeek role now runs as GPT 6.1 Sol.
+            print(f"Note: {resume_app.state['settingsWarning']}", file=sys.stderr, flush=True)
     # A URL fragment stays in the browser; JavaScript sends it as a secret header.
     job_query = (
         f"?job={quote(resume_app.state['runId'])}" if resume_app else ""
     )
     url = f"{server.origin}/{job_query}#{server.token}"
-    print(f"TCS Prover is ready at {url}\nPress Ctrl-C to stop.")
+    # Flush before blocking: with --no-browser this line may be the only copy
+    # of the session URL, and a pipe or log file would otherwise hold it back.
+    print(f"TCS Prover is ready at {url}\nPress Ctrl-C to stop.", flush=True)
     if not args.no_browser:
         webbrowser.open(url)
     try:

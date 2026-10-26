@@ -26,7 +26,7 @@ CONCURRENT_QUERIES = (
     'central limit theorem', 'linear algebra', 'graph coloring',
     'Markov chains', 'Riemannian geometry', 'convex optimization', 'finite groups',
 )
-BROKER_SOURCES = ('historical_search.py', 'historical_transport.py',
+BROKER_SOURCES = ('__init__.py', 'historical_search.py', 'historical_transport.py',
                   'historical_rate_limit.py', 'historical_cache.py', 'scholarly_discovery.py',
                   'historical_codex_discovery.py', 'historical_discovery_auth.py')
 

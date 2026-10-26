@@ -26,15 +26,21 @@ const categories = {
 const state = {
   meta: null, entries: [], ids: new Set(), offset: 0, eof: false,
   loading: false, loadingAll: false, pauseRequested: false, autoLoad: true,
+  showPause: false, lastError: null, retryMs: 2000,
   selectedStage: "", query: "", rootOnly: false,
   enabledCategories: new Set(Object.keys(categories).filter((name) => name !== "prompt")),
   timer: null,
 };
+const STALE_TOKEN_MESSAGE = "Reopen the viewer link printed in the terminal.";
 
 async function api(path) {
   const response = await fetch(path, { headers: { "X-Transcript-Token": token } });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Could not read transcript.");
+  if (!response.ok) {
+    const error = new Error(data.error || "Could not read transcript.");
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -198,16 +204,37 @@ function render() {
   ui.visibleSummary.textContent = `Showing ${visible.length.toLocaleString()} of ${state.entries.length.toLocaleString()} loaded entries`;
   ui.entryCount.textContent = state.entries.length.toLocaleString();
   ui.elapsed.textContent = currentElapsed();
-  ui.loadMore.hidden = state.eof && !state.loadingAll;
-  ui.loadMore.disabled = state.loading && !state.loadingAll;
+  syncLoadButton();
   window.scrollTo(0, scrollPosition);
+}
+
+// Derive the button entirely from state, so idle live checks leave no stale label.
+function syncLoadButton() {
+  const button = ui.loadMore;
+  if (state.loadingAll) {
+    button.hidden = !state.showPause;
+    button.disabled = state.pauseRequested;
+    button.textContent = state.pauseRequested ? "Pausing…" : "Pause full-file loading";
+  } else if (state.lastError) {
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = "Retry now";
+  } else if (!state.autoLoad) {
+    button.hidden = false;
+    button.disabled = false;
+    button.textContent = "Resume full-file loading";
+  } else {
+    button.hidden = true;
+  }
 }
 
 function updateScanProgress() {
   const size = Number(state.meta?.size || 0);
-  const percent = size ? Math.min(100, (state.offset / size) * 100) : 0;
+  // At EOF everything readable was read, even beside an abandoned partial line.
+  const read = state.eof ? size : state.offset;
+  const percent = state.eof ? 100 : size ? Math.min(100, (read / size) * 100) : 0;
   ui.scanBar.style.width = `${percent}%`;
-  ui.scanProgress.textContent = `${formatBytes(state.offset)} of ${formatBytes(size)} read · ${percent.toFixed(1)}%`;
+  ui.scanProgress.textContent = `${formatBytes(read)} of ${formatBytes(size)} read · ${percent.toFixed(1)}%`;
 }
 
 async function loadBatch(renderAfter = true) {
@@ -231,13 +258,20 @@ async function loadBatch(renderAfter = true) {
     state.meta.size = batch.fileSize;
     ui.fileSize.textContent = formatBytes(batch.fileSize);
     updateScanProgress();
+    state.lastError = null;
     ui.liveDot.className = "live-dot ready";
     if (renderAfter) render();
     return true;
   } catch (error) {
+    state.lastError = error;
     ui.liveDot.className = "live-dot error";
-    ui.loadState.textContent = error.message;
-    state.autoLoad = false;
+    if (error.status === 403) {
+      // Retrying with a stale per-launch token cannot succeed.
+      state.autoLoad = false;
+      ui.loadState.textContent = STALE_TOKEN_MESSAGE;
+    } else {
+      ui.loadState.textContent = `${error.message} · retrying…`;
+    }
     return false;
   } finally {
     state.loading = false;
@@ -248,20 +282,27 @@ async function loadEntireTranscript(liveCheck = false) {
   if (state.loadingAll) return;
   state.loadingAll = true;
   state.pauseRequested = false;
-  ui.loadMore.hidden = false;
-  ui.loadMore.disabled = false;
-  ui.loadMore.textContent = "Pause full-file loading";
+  // Routine live checks do not flash the pause button.
+  state.showPause = !liveCheck;
+  syncLoadButton();
   ui.loadState.textContent = liveCheck
     ? "Checking for new transcript activity…"
     : "Reading the complete transcript…";
   const initialEntryCount = state.entries.length;
   const initialOffset = state.offset;
   let batches = 0;
+  let failed = false;
   do {
     const previousOffset = state.offset;
     const loaded = await loadBatch(false);
+    failed = !loaded;
     if (!loaded || state.offset === previousOffset) break;
     batches += 1;
+    if (!state.eof && !state.showPause) {
+      // A real backlog found by a live check can still be paused.
+      state.showPause = true;
+      syncLoadButton();
+    }
     if (batches === 1 || batches % 8 === 0) {
       render();
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -269,7 +310,7 @@ async function loadEntireTranscript(liveCheck = false) {
   } while (!state.eof && !state.pauseRequested);
   state.loadingAll = false;
   if (
-    !liveCheck || state.pauseRequested
+    !liveCheck || failed || state.pauseRequested
     || state.entries.length !== initialEntryCount
     || state.offset !== initialOffset
   ) {
@@ -277,18 +318,26 @@ async function loadEntireTranscript(liveCheck = false) {
   }
   if (state.pauseRequested) {
     state.autoLoad = false;
-    ui.loadMore.hidden = false;
-    ui.loadMore.textContent = "Resume full-file loading";
     ui.loadState.textContent = "Full-file loading paused";
-  } else if (state.eof) {
+  } else if (state.eof && state.autoLoad && !state.lastError) {
     ui.loadState.textContent = "Complete transcript loaded · watching for updates";
+  } else if (!state.eof && !state.lastError) {
+    ui.loadState.textContent = "Waiting for the last transcript line…";
   }
+  syncLoadButton();
+}
+
+function schedulePoll() {
+  clearTimeout(state.timer);
+  // Back off while the viewer server or the transcript is unavailable.
+  state.retryMs = state.lastError ? Math.min(state.retryMs * 2, 30000) : 2000;
+  state.timer = setTimeout(pollLive, state.retryMs);
 }
 
 async function pollLive() {
   clearTimeout(state.timer);
   if (state.autoLoad && !state.loadingAll) await loadEntireTranscript(true);
-  state.timer = setTimeout(pollLive, 2000);
+  schedulePoll();
 }
 
 async function start() {
@@ -302,7 +351,7 @@ async function start() {
     pollLive();
   } catch (error) {
     ui.liveDot.className = "live-dot error";
-    ui.loadState.textContent = error.message;
+    ui.loadState.textContent = error.status === 403 ? STALE_TOKEN_MESSAGE : error.message;
   }
 }
 
@@ -310,11 +359,11 @@ ui.allStages.onclick = () => { state.selectedStage = ""; render(); };
 ui.loadMore.onclick = () => {
   if (state.loadingAll) {
     state.pauseRequested = true;
-    ui.loadMore.disabled = true;
-    ui.loadMore.textContent = "Pausing…";
+    syncLoadButton();
   } else {
     state.autoLoad = true;
-    loadEntireTranscript(false);
+    // Resume the normal live-check cadence after a manual retry or resume.
+    loadEntireTranscript(false).then(schedulePoll);
   }
 };
 ui.jumpLatest.onclick = () => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });

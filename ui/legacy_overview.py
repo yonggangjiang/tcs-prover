@@ -4,15 +4,22 @@ Never restore an App here: restoring its checkpoints could change an active run.
 The original controller remains the authority for phase and all user actions.
 """
 
+from collections import OrderedDict
 from datetime import datetime, timezone
 from functools import lru_cache
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import threading
 
 
 ACTIVE_PHASES = {"reviewing", "running", "stopping", "pausing"}
+SUMMARY_CACHE_SIZE = 128
+FINGERPRINT_BYTES = 4096
+_summaries = OrderedDict()
+_summaries_lock = threading.Lock()
 
 
 def _timestamp(value):
@@ -45,36 +52,82 @@ def _statement(directory, signature):
         return ""
 
 
-@lru_cache(maxsize=128)
+def _fold(line, result, acceptances):
+    """Apply one transcript line to the outcome and the acceptance list."""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return result
+    if not isinstance(record, dict):
+        return result
+    if record.get("kind") == "final_result" and isinstance(record.get("output"), str) and record["output"].strip():
+        result = "final"
+    elif record.get("kind") == "failure_result" and result != "final":
+        result = "failure"
+    if (record.get("kind") == "status"
+            and record.get("label") == "Critic approved"
+            and record.get("root") is not False
+            and not record.get("activityLabel")):
+        acceptances.append(record)
+    return result
+
+
+def _fingerprint(stream, offset):
+    """Hash the first bytes and the bytes before offset; rewrites keep the inode."""
+    stream.seek(0)
+    head = stream.read(min(offset, FINGERPRINT_BYTES))
+    start = max(0, offset - FINGERPRINT_BYTES)
+    stream.seek(start)
+    return hashlib.sha256(head + b"\n" + stream.read(offset - start)).digest()
+
+
 def _transcript_summary(directory, signature):
-    """Recover durable decisions in one cached, read-only transcript scan."""
+    """Recover durable decisions, scanning only lines added since the last poll.
+
+    A running job appends on nearly every poll, so its whole transcript must
+    not be parsed again each time. Replaced or rewritten files are rescanned.
+    """
     from .batches import BatchCatalog
-    result = ""
-    acceptances = []
+    with _summaries_lock:
+        saved = _summaries.get(directory)
+        if saved is not None and saved["signature"] == signature:
+            _summaries.move_to_end(directory)
+            return saved["value"]
     try:
         # Reuse the catalog's pinned-directory, no-follow regular-file reader.
         # This only opens the exact controller-owned job's transcript.
         catalog = BatchCatalog(directory.parent)
         with catalog._open(directory, "transcript.jsonl") as stream:
+            info = os.fstat(stream.fileno())
+            identity = (info.st_dev, info.st_ino)
+            offset, result, acceptances = 0, "", []
+            if (saved is not None and saved["identity"] == identity
+                    and saved["offset"] <= info.st_size
+                    and _fingerprint(stream, saved["offset"]) == saved["fingerprint"]):
+                offset, result, acceptances = saved["offset"], saved["result"], list(saved["acceptances"])
+            stream.seek(offset)
+            tail = b""
             for line in stream:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(record, dict):
-                    continue
-                if record.get("kind") == "final_result" and isinstance(record.get("output"), str) and record["output"].strip():
-                    result = "final"
-                elif record.get("kind") == "failure_result" and result != "final":
-                    result = "failure"
-                if (record.get("kind") == "status"
-                        and record.get("label") == "Critic approved"
-                        and record.get("root") is not False
-                        and not record.get("activityLabel")):
-                    acceptances.append(record)
+                if not line.endswith(b"\n"):
+                    tail = line
+                    break
+                result = _fold(line, result, acceptances)
+                offset += len(line)
+            entry = {"signature": signature, "identity": identity, "offset": offset,
+                     "fingerprint": _fingerprint(stream, offset),
+                     "result": result, "acceptances": tuple(acceptances)}
+            # A record still being appended counts now but is never committed.
+            if tail:
+                result = _fold(tail, result, acceptances)
     except (OSError, ValueError, UnicodeError):
-        pass
-    return result, tuple(acceptances)
+        return "", ()
+    entry["value"] = (result, tuple(acceptances))
+    with _summaries_lock:
+        _summaries[directory] = entry
+        _summaries.move_to_end(directory)
+        while len(_summaries) > SUMMARY_CACHE_SIZE:
+            _summaries.popitem(last=False)
+    return entry["value"]
 
 
 def _elapsed(state, directory, now):
@@ -122,7 +175,8 @@ def augment_legacy(payload, is_job_list=False, *, runs_root, status_path,
             from .retrieval import public_retrieval_info
             state["retrieval"] = public_retrieval_info(
                 state.get("retrievalPolicyPath", ""), run_dir=directory,
-                mode=state.get("retrievalMode", "live"))
+                mode=state.get("retrievalMode", "live"),
+                saved_cutoff=state.get("retrievalCutoffUtc", ""))
         else:
             state["retrieval"] = retrieval_loader(state.get("retrievalPolicyPath", ""))
         state["retrievalMode"] = state["retrieval"].get("mode", state.get("retrievalMode", "live"))

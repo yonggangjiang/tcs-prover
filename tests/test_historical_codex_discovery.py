@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import historical_codex_discovery as discovery
+from retrieval import historical_codex_discovery as discovery
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -164,7 +164,7 @@ class DiscoveryTests(unittest.TestCase):
         (auth / 'auth.json').write_text('{"tokens":{"access_token":"test"}}')
         with patch.object(discovery.sys, 'platform', 'darwin'), \
                 patch.object(discovery, '_verify', side_effect=discovery.DiscoveryError()), \
-                patch('historical_discovery_auth.preserve_refresh', return_value=False) as preserve:
+                patch('retrieval.historical_discovery_auth.preserve_refresh', return_value=False) as preserve:
             with self.assertRaises(discovery.DiscoveryError):
                 discovery.preflight(self.settings)
         self.assertEqual(preserve.call_count, 1)

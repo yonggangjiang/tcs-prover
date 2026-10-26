@@ -4,6 +4,7 @@ import contextlib
 from html.parser import HTMLParser
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -15,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import workflow_runner as runtime
+from runner import providers
 from ui import audits, cli, review, server
 
 MODEL, EFFORT = "gpt-6.1-sol", "max"
@@ -71,7 +73,8 @@ class RuntimeDefaultTests(unittest.TestCase):
     def test_current_codex_models_are_offered_and_max_reaches_codex_unchanged(self):
         self.assertEqual(
             runtime.OFFERED_MODELS,
-            ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", runtime.DEEPSEEK_MODEL),
+            ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+             "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"),
         )
         self.assertEqual(runtime.chosen_model(MODEL), MODEL)
         self.assertEqual(runtime.effective_effort(MODEL, "max"), "max")
@@ -92,8 +95,14 @@ class RuntimeDefaultTests(unittest.TestCase):
                 self.assertEqual(options["authorModel"], model)
 
     def test_unknown_models_are_rejected_with_the_current_names(self):
-        with self.assertRaisesRegex(runtime.Error, r"6\.1 Sol, Astra, 6 Sol, 6 Luna, or DeepSeek V4 Pro"):
+        with self.assertRaises(runtime.Error) as failure:
             runtime.chosen_model("gpt-9")
+        message = str(failure.exception)
+        self.assertIn("Unknown model 'gpt-9'", message)
+        self.assertIn(", ".join(runtime.OFFERED_MODELS), message)
+        self.assertIn("api:<id>", message)
+        with self.assertRaisesRegex(runtime.Error, "DeepSeek is no longer supported"):
+            runtime.chosen_model("deepseek-v4-pro")
 
     def test_effort_table_covers_every_model_and_the_default_is_valid_for_all(self):
         self.assertEqual(set(runtime.MODEL_EFFORTS), set(runtime.MODELS))
@@ -147,8 +156,10 @@ class ServerDefaultTests(unittest.TestCase):
             self.assertEqual(options["reasoningEffort"], EFFORT)
 
     def test_invalid_model_errors_name_the_current_choices(self):
-        for field in ("review_model", "author_model"):
-            with self.subTest(field=field), self.assertRaisesRegex(ValueError, r"6\.1 Sol, Astra, 6 Sol, 6 Luna"):
+        offered = re.escape(", ".join(runtime.OFFERED_MODELS))
+        for field, role in (("review_model", "statement reviewer"), ("author_model", "proof author")):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, rf"Unknown model 'gpt-9' for the {role}\. Choose {offered}, or an api:<id> model"):
                 server.App._workflow_options(**{field: "gpt-9"})
 
     def test_public_settings_describe_the_default_and_keep_audits_opt_in(self):
@@ -236,7 +247,8 @@ class CommandLineDefaultTests(unittest.TestCase):
         offered = ", ".join(runtime.OFFERED_MODELS)
         for role in ("author", "critic", "writer"):
             with self.subTest(role=role):
-                self.assertIn(f"{role} model: {offered} (default: {MODEL}); the older GPT-5.6 ids are still accepted", text)
+                self.assertIn(f"{role} model: {offered}, or an api:<id> model from Advanced settings → API models "
+                              f"(default: {MODEL}); the older GPT-5.6 ids are still accepted", text)
         self.assertIn("fallback reasoning effort for every proof role (default: max)", text)
         self.assertNotIn("gpt-5.6-terra", text)
 
@@ -290,7 +302,7 @@ class AuditMenuTests(unittest.TestCase):
         codex = [row for row in rows if row.get("provider") == "codex"]
         current = [row["model"] for row in codex if "older" not in row["label"]]
         older = [row for row in codex if "older" in row["label"]]
-        self.assertEqual(current, [m for m in runtime.OFFERED_MODELS if m != runtime.DEEPSEEK_MODEL])
+        self.assertEqual(current, [m for m in runtime.OFFERED_MODELS if providers.harness(m) == providers.CODEX])
         self.assertEqual([row["model"] for row in older], list(runtime.LEGACY_MODELS))
         # The older entries sit at the very end, after every other provider.
         self.assertEqual(rows[-len(older):], older)
@@ -337,11 +349,21 @@ def menus():
 
 class BrowserDefaultTests(unittest.TestCase):
     def test_role_menus_offer_the_current_models_and_preselect_the_default(self):
+        # The Codex CLI and Claude CLI options are static markup (only the API group comes
+        # from the /state catalog): exactly the built-in models in registry order, so a
+        # removed model such as DeepSeek can never reappear in a menu.
         page = menus()
+        builtin = [row["id"] for row in providers.BUILTIN_MODELS]
+        codex = [model for model in runtime.OFFERED_MODELS if providers.harness(model) == providers.CODEX]
         for role in ROLES:
             with self.subTest(role=role):
                 models = page.options[f"{role}Model"]
-                self.assertEqual([value for value, *_ in models], list(runtime.OFFERED_MODELS))
+                values = [value for value, *_ in models]
+                self.assertEqual(values, builtin)
+                self.assertEqual([value for value in values if value in codex], codex)
+                for value in values:
+                    self.assertTrue(providers.is_known(value), value)
+                    self.assertFalse(providers.replacement_for_removed(value), value)
                 self.assertEqual([value for value, selected, _ in models if selected], [MODEL])
                 efforts = page.options[f"{role}Effort"]
                 self.assertEqual(sorted(value for value, *_ in efforts), sorted(runtime.EFFORTS))
@@ -367,6 +389,11 @@ class BrowserDefaultTests(unittest.TestCase):
         self.assertIn(f"| `{MODEL}` |", row)
         for model in runtime.OFFERED_MODELS:
             self.assertIn(f"`{model}`", row)
+        self.assertIn("`api:<id>`", row)
+        # The removed provider's setup is gone; only its migration is described.
+        for removed in ("DEEPSEEK_API_KEY", "deepseek-v4-pro", "How to use DeepSeek", "deepseek-models.json"):
+            self.assertNotIn(removed, text)
+        self.assertIn("## Model providers", text)
         self.assertIn("| `-reasoningEffort LEVEL` | `max` |", text)
         self.assertNotIn("1.5× on", text.replace("1.5× on the other models", ""))
 
@@ -401,30 +428,53 @@ const ui = {
 const selectedProblemMode = () => 'statement';
 `;
 const checks = `
+// Each part keeps its words together (no-break spaces, a word joiner after a hyphen); a line
+// breaks only after a "·".
+const text = () => ui.modelSummary.textContent.replace(/\\u00a0/g, ' ').replace(/\\u2060/g, '');
 updateModelSummary();
-assert.equal(ui.modelSummary.textContent, 'Fast speed · Concise activity log · '
+assert.equal(text(), 'Fast speed · Concise activity log · '
   + '6.1 Sol/Max review · 6.1 Sol/Max author · 6.1 Sol/Max critic · 6.1 Sol/Max writer');
+assert.doesNotMatch(ui.modelSummary.textContent, /[^·] /);
 
 ui.reviewModel.value = 'gpt-6-luna'; ui.reviewEffort.value = 'high';
 ui.authorModel.value = 'gpt-6-sol'; ui.authorEffort.value = 'ultra';
 ui.criticModel.value = 'gpt-6-astra';
 ui.writerModel.value = 'gpt-5.6-terra';
 updateModelSummary();
-assert.match(ui.modelSummary.textContent,
+assert.match(text(),
   /6 Luna\\/High review · 6 Sol\\/Ultra author · Astra\\/Max critic · 5\\.6 Terra\\/Max writer$/);
 
-ui.writerModel.value = 'deepseek-v4-pro'; ui.writerEffort.value = 'ultra';
+// Fast is a Codex CLI service tier: a Claude CLI (or API) model in the mix runs at standard speed.
+ui.writerModel.value = 'claude-opus-5-5'; ui.writerEffort.value = 'max';
 updateModelSummary();
-assert.match(ui.modelSummary.textContent, /^Fast for ChatGPT · Standard for DeepSeek/);
-assert.match(ui.modelSummary.textContent, /DeepSeek V4 Pro\\/Max writer$/);
+assert.match(text(), /^Fast for Codex CLI · Standard for others/);
+assert.match(text(), /Opus 5\\.5\\/Max writer$/);
+// An API model goes by the short display name its menu option carries.
+ui.criticModel.value = 'api:lab-sol';
+ui.criticModel.selectedOptions = [{dataset: {short: 'Sol via lab gateway'}}];
+updateModelSummary();
+assert.match(text(), /Sol via lab gateway\\/Max critic · Opus 5\\.5\\/Max writer$/);
+// Without its option the id names it, never as a bare suffix.
+delete ui.criticModel.selectedOptions;
+updateModelSummary();
+assert.match(text(), /lab-sol\\/Max critic/);
+// No Codex CLI model at all: Fast cannot apply anywhere.
+for (const role of ['review', 'author', 'critic', 'writer']) ui[role + 'Model'].value = 'claude-haiku-5-5';
+updateModelSummary();
+assert.match(text(), /^Standard speed · Fast is Codex CLI only · /);
+ui.speedMode.value = 'standard';
+updateModelSummary();
+assert.match(text(), /^Standard speed · Concise activity log · Haiku 5\\.5\\/High review/);
+ui.speedMode.value = 'fast';
 
 // Every accepted model gets its own name, never a bare "Sol", "Luna" or "Terra".
 const ids = ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol',
-  'gpt-5.6-terra', 'gpt-5.6-luna', 'deepseek-v4-pro'];
+  'gpt-5.6-terra', 'gpt-5.6-luna', 'claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5',
+  'claude-haiku-5-5'];
 const names = ids.map((id) => {
   ui.authorModel.value = id; ui.authorEffort.value = 'max';
   updateModelSummary();
-  return ui.modelSummary.textContent.match(/([^·]+)\\/Max author/)[1].trim();
+  return text().match(/([^·]+)\\/Max author/)[1].trim();
 });
 assert.equal(new Set(names).size, ids.length, names.join(' | '));
 assert.ok(!names.some((name) => ['Sol', 'Luna', 'Terra'].includes(name)), names.join(' | '));
@@ -447,18 +497,20 @@ const app = fs.readFileSync(process.argv[1], 'utf8');
 const functions = app.slice(app.indexOf('function setChoice('), app.indexOf('async function refresh()'));
 const setup = `
 class Option {
-  constructor(text, value) { this.text = text; this.value = value; this.disabled = false; }
+  constructor(text, value) { this.text = text; this.value = value; this.disabled = false; this.dataset = {}; }
+  remove() { this.owner.options = this.owner.options.filter((option) => option !== this); }
 }
-const select = (values, value) => ({
-  options: values.map((item) => new Option(item, item)), value,
-  add(option) { this.options.push(option); },
-});
+const select = (values, value) => {
+  const menu = {options: [], value, add(option) { option.owner = this; this.options.push(option); }};
+  values.forEach((item) => menu.add(new Option(item, item)));
+  return menu;
+};
 const everyEffort = ['ultra', 'max', 'xhigh', 'high', 'medium', 'low'];
 let state = {workflow: {settings: {model_efforts: {
-  'gpt-6.1-sol': everyEffort, 'gpt-6-luna': everyEffort.slice(1), 'deepseek-v4-pro': everyEffort,
+  'gpt-6.1-sol': everyEffort, 'gpt-6-luna': everyEffort.slice(1), 'claude-opus-5-5': everyEffort.slice(1),
 }}}};
 const ui = {
-  authorModel: select(['gpt-6.1-sol', 'gpt-6-luna', 'deepseek-v4-pro'], 'gpt-6.1-sol'),
+  authorModel: select(['gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5'], 'gpt-6.1-sol'),
   authorEffort: select(everyEffort, 'ultra'),
 };
 const disabled = () => ui.authorEffort.options.filter((option) => option.disabled).map((option) => option.value);
@@ -481,10 +533,14 @@ syncEffortChoices('author');
 assert.deepEqual(disabled(), []);
 assert.equal(ui.authorEffort.value, 'max');
 
-// DeepSeek maps the shared menu itself, and unknown models are never filtered.
-ui.authorModel.value = 'deepseek-v4-pro';
+// A Claude CLI model does not list Ultra either: a chosen Ultra runs as Max, the nearest lower level.
+ui.authorEffort.value = 'ultra';
+ui.authorModel.value = 'claude-opus-5-5';
 syncEffortChoices('author');
-assert.deepEqual(disabled(), []);
+assert.deepEqual(disabled(), ['ultra']);
+assert.equal(ui.authorEffort.value, 'max');
+
+// Unknown models are never filtered.
 ui.authorModel.value = 'something-new'; ui.authorEffort.value = 'ultra';
 syncEffortChoices('author');
 assert.deepEqual(disabled(), []);
@@ -502,8 +558,11 @@ assert.equal(ui.authorModel.value, 'gpt-5.6-terra');
 assert.equal(ui.authorModel.options.at(-1).text, 'gpt-5.6-terra (older)');
 const count = ui.authorModel.options.length;
 setChoice(ui.authorModel, 'gpt-5.6-terra');
-setChoice(ui.authorModel, 'gpt-6-luna');
 assert.equal(ui.authorModel.options.length, count);
+// The next choice (another job, or a new problem) no longer offers it.
+setChoice(ui.authorModel, 'gpt-6-luna');
+assert.equal(ui.authorModel.options.length, count - 1);
+assert.ok(!ui.authorModel.options.some((option) => option.value === 'gpt-5.6-terra'));
 assert.equal(ui.authorModel.value, 'gpt-6-luna');
 
 // Elements that expose no options (like the stubs other tests use) are left alone.
@@ -521,6 +580,13 @@ vm.runInNewContext(setup + functions + checks, {assert});
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @staticmethod
+    def state_without_api_models():
+        """A new job's state from an empty API model store, whatever this checkout has saved."""
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                os.environ, {providers.STORE_ENV: str(Path(folder) / "api-models.json")}):
+            return server.empty_state()
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
     def test_render_and_the_model_menus_apply_the_model_support_rules(self):
         # Drives the real render() and the real model-menu handlers against fake selects built from index.html.
@@ -530,7 +596,7 @@ vm.runInNewContext(setup + functions + checks, {assert});
                 menu: [{"value": value, "selected": selected, "text": label.strip()} for value, selected, label in rows]
                 for menu, rows in page.options.items()
             },
-            "empty": server.empty_state(),
+            "empty": self.state_without_api_models(),
         }
         script = r"""
 const fs = require('node:fs');
@@ -540,18 +606,20 @@ const fixture = JSON.parse(fs.readFileSync(0, 'utf8'));
 const app = fs.readFileSync(process.argv[1], 'utf8');
 
 class Option {
-  constructor(text, value) { this.text = text; this.value = value === undefined ? String(text) : value; this.disabled = false; }
+  constructor(text, value) { this.text = text; this.value = value === undefined ? String(text) : value; this.disabled = false; this.dataset = {}; }
+  remove() { this.owner.options = this.owner.options.filter((option) => option !== this); }
 }
 // Like a real <select>, assigning a value it has no option for blanks it.
 function select(rows) {
   const element = {
-    options: rows.map((row) => new Option(row.text, row.value)), current: '',
+    options: [], current: '',
     dataset: {}, classList: {toggle() {}}, setAttribute() {}, focus() {},
-    add(option) { this.options.push(option); },
+    add(option) { option.owner = this; this.options.push(option); },
     querySelector(selector) { const value = selector.match(/value="([^"]+)"/)?.[1]; return this.options.find(option => option.value === value); },
     get value() { return this.current; },
     set value(value) { this.current = this.options.some((option) => option.value === value) ? value : ''; },
   };
+  rows.forEach((row) => element.add(new Option(row.text, row.value)));
   const chosen = rows.find((row) => row.selected);
   element.current = chosen ? chosen.value : (rows.length ? rows[0].value : '');
   return element;
@@ -587,16 +655,16 @@ function load() {
 
 const roles = ['review', 'author', 'critic', 'writer'];
 const disabled = (ui, role) => ui[`${role}Effort`].options.filter((option) => option.disabled).map((option) => option.value);
-const summary = (ui) => ui.modelSummary.textContent;
+const summary = (ui) => ui.modelSummary.textContent.replace(/\u00a0/g, ' ').replace(/\u2060/g, '');
 const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {statement: 'S', notes: 'n'}};
 
-// 1. A new job shows the defaults, offers five models and disables nothing.
+// 1. A new job shows the defaults, offers the eight built-in models and disables nothing.
 {
   const {ui, api} = load();
   api.render({...fixture.empty, phase: 'input'});
   for (const role of roles) {
     assert.equal(ui[`${role}Model`].value, 'gpt-6.1-sol');
-    assert.equal(ui[`${role}Model`].options.length, 5);
+    assert.equal(ui[`${role}Model`].options.length, 8);
     assert.equal(ui[`${role}Effort`].value, 'max');
     assert.deepEqual(disabled(ui, role), []);
   }
@@ -638,7 +706,7 @@ const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {sta
   // Rendering the same job again must not add a second stand-in option.
   api.setPending(true);
   api.render(job);
-  assert.equal(ui.reviewModel.options.length, 6);
+  assert.equal(ui.reviewModel.options.length, 9);
 }
 
 // 4. A state that records no model or effort falls back to the defaults.

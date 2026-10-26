@@ -390,7 +390,7 @@ def _candidate_url(value):
 
 
 def _preserve_auth(prepared, original_sha256):
-    from historical_discovery_auth import preserve_refresh
+    from retrieval.historical_discovery_auth import preserve_refresh
     settings, _, home, _, _, _ = prepared
     return preserve_refresh(Path(settings['auth_home']) / 'auth.json',
                             home / 'auth.json', original_sha256)
@@ -409,6 +409,11 @@ def _trace(path, final_path, maximum):
             if not isinstance(event, dict):
                 raise DiscoveryError()
             kind = event.get('type')
+            if (kind == 'error' and isinstance(event.get('message'), str)
+                    and event['message'].startswith('Reconnecting...')):
+                # A dropped stream is retried by Codex itself; the turn must
+                # still complete with a grounded search below.
+                continue
             if kind in ('turn.failed', 'error'):
                 raise DiscoveryError()
             if kind == 'turn.completed':

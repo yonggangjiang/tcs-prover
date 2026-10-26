@@ -57,7 +57,7 @@ class LatexCompilationTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0 if len(builds) == 3 else 1,
                                                "Built" if len(builds) == 3 else "Undefined control sequence")
 
-        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime.subprocess, "run", side_effect=command):
+        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime, "_run_bounded", side_effect=command):
             state = self.execute(model, writer_model="gpt-5.6-sol", writer_effort="high")
         self.assertEqual(builds, candidates)
         self.assertEqual(state["output"], LATEX)
@@ -91,7 +91,7 @@ class LatexCompilationTests(unittest.TestCase):
             remaining[0] = 0
             return subprocess.CompletedProcess(argv, 1, "Compilation error")
 
-        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime.subprocess, "run", side_effect=command), patch.object(runtime, "workflow_remaining", side_effect=lambda options: remaining[0]):
+        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime, "_run_bounded", side_effect=command), patch.object(runtime, "workflow_remaining", side_effect=lambda options: remaining[0]):
             with self.assertRaisesRegex(runtime.Error, "time limit"):
                 self.execute(lambda *args, **kwargs: ({"latex": BROKEN}, ""))
         self.assertFalse((self.directory / "final.pdf").exists())

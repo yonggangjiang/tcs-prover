@@ -164,7 +164,11 @@ def run_auditor(model, prompt, workspace, cancelled, on_activity=None):
                 *(["-c", f"model_reasoning_effort={json.dumps(effort)}"] if effort else []),
                 *runtime.retrieval_runtime.native_search_arguments(workspace, policy=policy),
                 "--disable", "multi_agent", "--enable", "shell_tool",
-                "-C", str(workspace), "-s", "read-only", "-a", "never", "exec",
+                # Auditors use the native login: the read-only sandbox, minus
+                # TCS Prover's private state ("-s read-only" would override it).
+                "-C", str(workspace),
+                *(runtime.private_permission_arguments(":read-only", None) or ["-s", "read-only"]),
+                "-a", "never", "exec",
                 "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
                 "-o", str(answer), "-",
             ]

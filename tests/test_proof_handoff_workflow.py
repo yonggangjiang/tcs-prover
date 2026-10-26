@@ -110,7 +110,7 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
     def test_structured_retries_keep_same_snapshot_and_log_file_instructions(self):
         files = (("proof.md", "Original"), ("statement.md", "Task"), ("manifest.json", "{}"))
         schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
-        with workspace(), patch.object(runtime, "retrieval_policy", return_value=None), patch.object(runtime, "require_model_credentials"), patch.object(runtime, "run_structured_attempt", side_effect=["", '{"ok":true}']) as attempt, patch.object(runtime, "emit") as emit:
+        with workspace(), patch.object(runtime, "retrieval_policy", return_value=None), patch.object(runtime, "require_model_credentials"), patch.object(runtime, "run_structured_attempt", side_effect=["", '{"ok":true}']) as attempt, patch.object(runtime, "emit") as emit, patch.object(runtime, "MODEL_RETRY_SECONDS", 0):
             runtime.structured("Review", schema, "critic", input_files=files)
         self.assertEqual(attempt.call_count, 2)
         for call in attempt.call_args_list:

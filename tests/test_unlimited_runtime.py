@@ -23,8 +23,14 @@ class UnlimitedRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.workflow_remaining({'thinking_hours': 1, 'elapsed_seconds': 4000}), 0)
 
     def test_no_model_request_deadline_for_unlimited_job(self):
-        settings = runtime._bounded_request_settings({'timeout': 900}, {'thinking_hours': 0})
-        self.assertIsNone(settings['timeout'])
+        # No deadline ever ends an unlimited job's model call, but each attempt
+        # still has a timeout: a hung request is stopped and retried (each
+        # consecutive timeout doubles the next attempt's).
+        options = {'thinking_hours': 0, 'elapsed_seconds': 10**12}
+        settings = runtime._bounded_request_settings({}, options)
+        self.assertEqual(settings['timeout'], runtime.STRUCTURED_TIMEOUT_SECONDS)
+        self.assertEqual(runtime._attempt_timeout(settings['timeout'], options), runtime.STRUCTURED_TIMEOUT_SECONDS)
+        self.assertEqual(runtime._attempt_timeout(runtime._grown_timeout(900, 2), options), 3600)
         finite = runtime._bounded_request_settings({'timeout': 900}, {'thinking_hours': 1})
         self.assertEqual(finite['timeout'], 900)
 

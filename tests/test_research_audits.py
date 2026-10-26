@@ -960,16 +960,30 @@ class AuditProviderTests(unittest.TestCase):
         return Mock(stdin=io.StringIO(), returncode=0, poll=lambda: 0)
 
     def test_codex_tools_and_session_are_isolated(self):
+        from runner import providers
+
         model = next(row for row in audits.load_config()["models"] if row["value"] == "gpt-6-astra")
-        with tempfile.TemporaryDirectory() as directory, patch.object(audits.shutil, "which", return_value="codex"), patch.object(audits.subprocess, "Popen", side_effect=self.fake_process):
-            result = audits.run_auditor(model, "Read and advise", Path(directory), threading.Event())
-        self.assertEqual(result["text"], "An independent report")
-        self.assertIn("read-only", self.command)
-        self.assertIn("--ephemeral", self.command)
-        self.assertIn("--ignore-user-config", self.command)
-        self.assertIn('web_search="live"', self.command)
-        self.assertEqual(self.command[self.command.index("--disable") + 1], "multi_agent")
-        self.assertNotIn("resume", self.command)
+        for platform in ("darwin", "linux"):
+            with self.subTest(platform=platform), patch.object(audits.runtime.sys, "platform", platform), tempfile.TemporaryDirectory() as directory, patch.object(audits.shutil, "which", return_value="codex"), patch.object(audits.subprocess, "Popen", side_effect=self.fake_process):
+                result = audits.run_auditor(model, "Read and advise", Path(directory), threading.Event())
+                self.assertEqual(result["text"], "An independent report")
+                pairs = list(zip(self.command, self.command[1:]))
+                overrides = [value for flag, value in pairs if flag == "-c"]
+                if platform == "darwin":
+                    # The read-only sandbox minus the API model store; "-s read-only" would override it.
+                    self.assertNotIn("-s", self.command)
+                    self.assertIn('default_permissions="tcs_prover_private"', overrides)
+                    self.assertIn('permissions.tcs_prover_private.extends=":read-only"', overrides)
+                    denied = next(value for value in overrides if value.startswith("permissions.tcs_prover_private.filesystem="))
+                    self.assertIn(json.dumps(os.path.realpath(providers.store_path())) + '="deny"', denied)
+                else:
+                    self.assertIn(("-s", "read-only"), pairs)
+                    self.assertFalse([value for value in overrides if "permissions" in value])
+                self.assertIn("--ephemeral", self.command)
+                self.assertIn("--ignore-user-config", self.command)
+                self.assertIn('web_search="live"', self.command)
+                self.assertEqual(self.command[self.command.index("--disable") + 1], "multi_agent")
+                self.assertNotIn("resume", self.command)
 
     def test_codex_uses_selected_effort_including_yaml_customization(self):
         models = [row for row in audits.load_config()["models"] if row.get("provider") == "codex"]

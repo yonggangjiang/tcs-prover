@@ -30,7 +30,8 @@ POST_TIMEOUT_SECONDS = 600
 BATCH_TIMEOUT_SECONDS = 1800
 STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
           '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
-          '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
+          '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
+          '/favicon.svg': ('favicon.svg', 'image/svg+xml')}
 GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/approach-graph': {'job'},
               '/memory': {'job', 'file', 'version'},
@@ -40,6 +41,9 @@ CONTROL_ROUTES = {'/delete-job', '/resume', '/start-research-audit', '/resume-cr
                   '/resume-checkpoint', '/continue-stopped', '/approve',
                   '/set-author-time-limit', '/set-research-audits', '/steer-author',
                   '/stop', '/pause', '/reset', '/clear-trace'}
+# API models belong to the updated controller's installation, not to a job:
+# GET lists them; the POST routes save, delete and test one.
+API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test'}
 
 
 class GatewayError(Exception):
@@ -131,6 +135,8 @@ def contains_policy_change(value):
 
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second gateway bind a port that is in use.
+    allow_reuse_address = os.name != 'nt'
 
     def __init__(self, address, *, legacy, current, augment_legacy, ui_directory=UI,
                  catalog=None, legacy_batch=None, current_batch=None, token=None):
@@ -244,6 +250,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def request_path(path, query):
         return path + ('?' + urlencode(query) if query else '')
 
+    def forward_api_models(self, method, path, body=None):
+        """Pass one API model request to the updated controller unchanged.
+
+        Its responses never contain a key; the legacy controller has no API models.
+        """
+        status, content_type, disposition, raw = self.server.current.request(method, path, body)
+        self.send(raw, status, content_type, disposition)
+
     def forward(self, upstream, method, path, query, body=None, batch=None):
         status, content_type, disposition, raw = upstream.request(
             method, self.request_path(path, query), body)
@@ -276,12 +290,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise GatewayError('Untrusted local host.', 403)
             path, query = self.parsed_request()
             if path in STATIC:
-                if query and (path != '/' or set(query) - {'job', 'batch', 'new'}):
+                # The page reads job, batch and new; theme previews a light or dark page unsaved.
+                if query and (path != '/' or set(query) - {'job', 'batch', 'new', 'theme'}):
                     raise GatewayError('Not found.', 404)
                 filename, kind = STATIC[path]
                 return self.send((self.server.ui_directory / filename).read_bytes(), content_type=kind)
             if not self.authorized():
                 raise GatewayError('Open TCS Prover from its launch URL.', 403)
+            if path == '/api-models' and not query:
+                return self.forward_api_models('GET', path)
             if path not in GET_ROUTES or set(query) - (GET_ROUTES[path] | {'batch'}):
                 raise GatewayError('Not found.', 404)
             if path == '/batches':
@@ -331,7 +348,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not self.authorized():
                 raise GatewayError('Unauthorized local request.', 403)
             path, query = self.parsed_request()
-            if path not in CREATE_ROUTES | CONTROL_ROUTES or set(query) - {'job', 'batch'}:
+            api_models = path in API_MODEL_ROUTES
+            if api_models and query:
+                raise GatewayError('Not found.', 404)
+            if not api_models and (path not in CREATE_ROUTES | CONTROL_ROUTES or set(query) - {'job', 'batch'}):
                 raise GatewayError('Not found.', 404)
             batch = query.pop('batch', None)
             batch_upstream = self.server.batch_upstream(batch)
@@ -355,6 +375,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     raise ValueError
             except (ValueError, UnicodeError):
                 raise GatewayError('Expected a JSON object.', 400) from None
+            if api_models:
+                return self.forward_api_models('POST', path, raw or b'{}')
             run_id = query.get('job', '')
             if run_id:
                 if batch_upstream:
@@ -382,6 +404,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send({'error': str(error)}, error.status)
         except (OSError, ValueError, TypeError, KeyError):
             self.send({'error': 'The local dashboard could not complete this request.'}, 502)
+
+
+def write_launch_status(path, record):
+    """Replace the launch record atomically with a private new file.
+
+    A failed write never leaves an empty record that blocks the next launch.
+    os.fchmod is unnecessary here and is missing on Windows before 3.13.
+    """
+    path = Path(path)
+    temporary = path.with_name(f'.{path.name}.{secrets.token_hex(8)}.tmp')
+    try:
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as stream:
+            stream.write(json.dumps(record, indent=2) + '\n')
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def validate_separate_runs(legacy_runs, new_runs):
@@ -437,10 +475,7 @@ def main(argv=None):
                   'updatedAtUtc': datetime.now(timezone.utc).isoformat(),
                   'legacyPort': legacy.port, 'newControllerPort': current.server_port,
                   'newRuns': str(new_runs), 'legacyRuns': str(legacy_runs)}
-        descriptor = os.open(status_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, 'w') as stream:
-            stream.write(json.dumps(record, indent=2) + '\n')
+        write_launch_status(status_path, record)
         print(f'Updated dashboard listening on {gateway.origin}', flush=True)
         gateway.serve_forever()
     finally:

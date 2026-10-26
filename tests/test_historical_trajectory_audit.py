@@ -13,7 +13,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import audit_historical_trajectory as auditor
+from retrieval import audit_historical_trajectory as auditor
 
 
 CUTOFF = '2026-10-02T14:13:12Z'

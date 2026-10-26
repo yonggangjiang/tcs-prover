@@ -66,8 +66,12 @@ import zlib
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit, unquote, parse_qs
 
-from historical_transport import (ALLOWED_NETWORK_HOSTS, MAX_BYTES, HistoricalSearchError,
-                                  HttpResponse, NoRedirect, RestrictedHttpClient)
+if __name__ == '__main__' and not __package__:
+    # Codex launches the broker by path; import its siblings from the package.
+    sys.path[0] = str(Path(__file__).resolve().parents[1])
+
+from retrieval.historical_transport import (ALLOWED_NETWORK_HOSTS, MAX_BYTES, HistoricalSearchError,
+                                            HttpResponse, NoRedirect, RestrictedHttpClient)
 
 UTC = timezone.utc
 MAX_PROTOCOL_LINE = 64 * 1024
@@ -174,6 +178,11 @@ class ArchivedText(HTMLParser):
                 self.title.append(data)
 
 
+def well_formed_text(value: str) -> str:
+    """Rejoin split surrogate pairs and replace lone surrogates with U+FFFD."""
+    return value.encode('utf-16-le', 'surrogatepass').decode('utf-16-le', 'replace')
+
+
 def pdf_supported() -> bool:
     try:
         import pypdf
@@ -211,7 +220,9 @@ def extract_pdf(body: bytes) -> tuple[str, str]:
             reader = PdfReader(io.BytesIO(body), strict=True)
             if reader.is_encrypted or len(reader.pages) > 250:
                 raise HistoricalSearchError('Encrypted or oversized PDF cannot be extracted.')
-            title = str(reader.metadata.title or '') if reader.metadata else ''
+            # pypdf can decode malformed text maps into lone surrogates, which
+            # no UTF-8 reply, digest or audit can carry. Offsets follow this text.
+            title = well_formed_text(str(reader.metadata.title or '')) if reader.metadata else ''
             pages = []
             stream_bytes = 0
             for page in reader.pages:
@@ -219,7 +230,7 @@ def extract_pdf(body: bytes) -> tuple[str, str]:
                 stream_bytes += len(contents.get_data()) if contents is not None else 0
                 if stream_bytes > MAX_BYTES * 4:
                     raise HistoricalSearchError('PDF content exceeds the extraction resource limit.')
-                pages.append(page.extract_text())
+                pages.append(well_formed_text(page.extract_text()))
                 if sum(len(item) for item in pages) > 1000000:
                     raise HistoricalSearchError('PDF text exceeds the extraction resource limit.')
             content = '\n\n'.join(pages).strip()
@@ -266,7 +277,12 @@ def extract_text(body: bytes, mime_type: str, content_encoding: str = 'identity'
     if mime_type == 'text/plain':
         return '', decoded.strip()
     parser = ArchivedText()
-    parser.feed(decoded)
+    try:
+        parser.feed(decoded)
+    except (AssertionError, ValueError):
+        # CPython's parser asserts on some malformed marked sections. Reject
+        # only this capture so older captures and other candidates still run.
+        raise HistoricalSearchError('Archived HTML could not be parsed.', code='unreadable_capture') from None
     title = ' '.join(' '.join(parser.title).split())[:500]
     content = ' '.join(' '.join(parser.text).split())
     # These observed archive records authenticate correctly but contain only
@@ -285,6 +301,28 @@ def extract_text(body: bytes, mime_type: str, content_encoding: str = 'identity'
         raise HistoricalSearchError('Verified archive contains only an access or redirect placeholder.',
                                     code='unusable_capture')
     return title, content
+
+
+def unfolded_offset(text: str, folded_offset: int) -> int:
+    """Map an offset in text.casefold() to the character of text producing it.
+
+    Case folding can lengthen characters (the ligature U+FB01 folds to 'fi'),
+    so folded offsets cannot slice the original text directly.
+    """
+    index = consumed = 0
+    while index < len(text):
+        chunk = text[index:index + 4096]
+        size = len(chunk.casefold())  # Folding is per character, without context.
+        if consumed + size <= folded_offset:
+            consumed += size
+            index += len(chunk)
+            continue
+        for character in chunk:
+            consumed += len(character.casefold())
+            if consumed > folded_offset:
+                return index
+            index += 1
+    return len(text)
 
 
 @dataclass(frozen=True)
@@ -339,9 +377,10 @@ class Snapshot:
         metadata, content = self.document(cutoff)
         if query is not None:
             words = re.findall(r'\w+', query.casefold())
-            positions = [content.casefold().find(word) for word in words if len(word) > 2]
+            folded = content.casefold()
+            positions = [folded.find(word) for word in words if len(word) > 2]
             positions = [position for position in positions if position >= 0]
-            start = max(0, min(positions) - 120) if positions else 0
+            start = max(0, unfolded_offset(content, min(positions)) - 120) if positions else 0
             content = content[start:start + min(limit, 1200)]
         else:
             content = content[:limit]
@@ -377,13 +416,28 @@ class WaybackProvider:
         self.cutoff, self.token, self.client, self.max_candidates = cutoff, token, client, max_candidates
         self.cache: OrderedDict[tuple[str, str], Snapshot] = OrderedDict()
         self.negative_cache: OrderedDict[tuple[str, str], float] = OrderedDict()
+        # Guards compound updates of the bounded in-memory caches, which calls
+        # may share. Never held during network, extraction or persistent I/O.
+        self.cache_lock = threading.Lock()
         self.persistent_cache = None
         self.audit = None
+
+    def share_memory_caches(self, source):
+        """Reuse another call's bounded in-memory caches, never its request state.
+
+        Clients, audit, deadlines, discovery status and the persistent cache
+        stay per call. Every cached snapshot is still revalidated before use.
+        """
+        if type(source) is not type(self) or source.cutoff != self.cutoff:
+            return
+        self.cache_lock, self.cache, self.negative_cache = source.cache_lock, source.cache, source.negative_cache
+        if hasattr(source, 'discovery_cache'):
+            self.discovery_cache = source.discovery_cache
 
     def _cached_capture(self, url):
         if self.persistent_cache is None:
             return None
-        from historical_cache import CacheError
+        from retrieval.historical_cache import CacheError
         try:
             record = self.persistent_cache.get(url)
             if record is None:
@@ -410,11 +464,30 @@ class WaybackProvider:
                        capture=utc_text(capture_datetime(snapshot.capture)), body_sha256=snapshot.body_sha256)
         return snapshot
 
+    def _newer_usable_capture(self, snapshot):
+        """Whether the shared entry already holds a newer readable capture.
+
+        Jobs with different cutoffs share URL-keyed entries. An earlier-cutoff
+        job must not replace a later-cutoff job's newer capture, or that job's
+        digest-pinned reads change. Any doubt leaves the entry replaceable.
+        """
+        try:
+            record = self.persistent_cache.get(snapshot.url)
+            if record is None or capture_datetime(record['capture']) <= capture_datetime(snapshot.capture):
+                return False
+            existing = Snapshot(**{**record, 'body': base64.b64decode(record['body'], validate=True)})
+            existing.validate(datetime.max.replace(tzinfo=UTC))
+            return bool(extract_text(existing.body, existing.mime_type, existing.content_encoding)[1])
+        except Exception:
+            return False
+
     def _store_capture(self, snapshot):
         if self.persistent_cache is None:
             return
-        from historical_cache import CacheError
+        from retrieval.historical_cache import CacheError
         snapshot.validate(self.cutoff)
+        if self._newer_usable_capture(snapshot):
+            return
         record = {**snapshot.__dict__, 'body': base64.b64encode(snapshot.body).decode('ascii')}
         try:
             self.persistent_cache.put(snapshot.url, record)
@@ -457,25 +530,33 @@ class WaybackProvider:
     def open(self, url: str) -> Snapshot:
         url = canonical_url(url)
         key = (utc_text(self.cutoff), url)
-        if key in self.cache:
-            snapshot = self.cache[key]
+        with self.cache_lock:
+            snapshot = self.cache.get(key)
+        if snapshot is not None:
             snapshot.validate(self.cutoff)
             try:
                 extract_text(snapshot.body, snapshot.mime_type, snapshot.content_encoding)
             except HistoricalSearchError as error:
                 if error.code != 'unusable_capture':
                     raise
-                del self.cache[key]
+                with self.cache_lock:
+                    if self.cache.get(key) is snapshot:
+                        del self.cache[key]
             else:
-                self.cache.move_to_end(key)
+                with self.cache_lock:
+                    if key in self.cache:
+                        self.cache.move_to_end(key)
                 return snapshot
         cached = self._cached_capture(url)
         if cached is not None:
-            self.cache[key] = cached
-            while len(self.cache) > 16:
-                self.cache.popitem(last=False)
+            with self.cache_lock:
+                self.cache[key] = cached
+                while len(self.cache) > 16:
+                    self.cache.popitem(last=False)
             return cached
-        if self.negative_cache.get(key, 0) > time.monotonic():
+        with self.cache_lock:
+            absent = self.negative_cache.get(key, 0) > time.monotonic()
+        if absent:
             raise HistoricalSearchError(
                 "No verifiable historical capture is available (short-lived cached absence).",
                 code="no_capture")
@@ -545,15 +626,17 @@ class WaybackProvider:
                     break
                 continue
             self._store_capture(snapshot)
-            self.cache[key] = snapshot
-            while len(self.cache) > 16:
-                self.cache.popitem(last=False)
+            with self.cache_lock:
+                self.cache[key] = snapshot
+                while len(self.cache) > 16:
+                    self.cache.popitem(last=False)
             return snapshot
         if last_operational_error is not None:
             raise last_operational_error
-        self.negative_cache[key] = time.monotonic() + 60
-        while len(self.negative_cache) > 64:
-            self.negative_cache.popitem(last=False)
+        with self.cache_lock:
+            self.negative_cache[key] = time.monotonic() + 60
+            while len(self.negative_cache) > 64:
+                self.negative_cache.popitem(last=False)
         raise HistoricalSearchError('No verifiable historical capture is available.', code='no_capture')
 
 
@@ -613,7 +696,7 @@ class DuckDuckGoWaybackProvider(WaybackProvider):
         parser = DuckDuckGoResultLinks()
         try:
             parser.feed(response.body.decode('utf-8', errors='replace'))
-        except (ValueError, UnicodeError):
+        except (AssertionError, ValueError, UnicodeError):
             raise HistoricalSearchError('Public search markup could not be validated.') from None
         if parser.challenge:
             raise HistoricalSearchError('Public search presented a challenge; retrieval stopped without bypass.')
@@ -637,13 +720,14 @@ class ScholarlyWaybackProvider(WaybackProvider):
         self.discovery_cache = OrderedDict()
 
     def candidates(self, query):
-        from scholarly_discovery import discover
+        from retrieval.scholarly_discovery import discover
         self.discovery_incomplete = False
         key = sha256(query.encode('utf-8'))
-        cached = self.discovery_cache.get(key)
-        if cached is not None and cached[0] > time.monotonic():
-            self.discovery_cache.move_to_end(key)
-            return list(cached[1])
+        with self.cache_lock:
+            cached = self.discovery_cache.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                self.discovery_cache.move_to_end(key)
+                return list(cached[1])
         def failed(fields):
             self.discovery_incomplete = True
             callback = getattr(self.client, 'audit', None)
@@ -656,10 +740,11 @@ class ScholarlyWaybackProvider(WaybackProvider):
 
         urls = discover(query, self.cutoff, self.max_candidates, self.client,
                         HistoricalSearchError, canonical_url, on_failure=failed)
-        if not self.discovery_incomplete:
-            self.discovery_cache[key] = (time.monotonic() + 300, tuple(urls))
-        while len(self.discovery_cache) > 64:
-            self.discovery_cache.popitem(last=False)
+        with self.cache_lock:
+            if not self.discovery_incomplete:
+                self.discovery_cache[key] = (time.monotonic() + 300, tuple(urls))
+            while len(self.discovery_cache) > 64:
+                self.discovery_cache.popitem(last=False)
         return urls
 
 
@@ -673,7 +758,7 @@ class CodexWaybackProvider(WaybackProvider):
         self.discovery_deadline = None
 
     def candidates(self, query):
-        from historical_codex_discovery import DiscoveryError, discover
+        from retrieval.historical_codex_discovery import DiscoveryError, discover
         try:
             urls = discover(query, self.cutoff, self.max_candidates, self.discovery_settings,
                             self.audit, deadline=self.discovery_deadline)
@@ -717,7 +802,7 @@ def codex_discovery_settings(settings, workspace):
             path = Path(value)
             if not path.is_absolute() or path != path.resolve() or path == workspace or workspace in path.parents:
                 raise ValueError
-        from historical_codex_discovery import validate_settings
+        from retrieval.historical_codex_discovery import validate_settings
         validate_settings(settings, workspace=workspace)
     except Exception:
         raise HistoricalSearchError('Codex discovery controller paths or authentication are invalid.',
@@ -853,7 +938,7 @@ class HistoricalSearchEngine:
             candidates = bounded_int(policy, 'max_candidates', 10, 1, 20)
             coordinator = None
             if provider in ('scholarly_wayback', 'codex_wayback') or 'rate_limit_directory' in policy or 'solver_workspace' in policy:
-                from historical_rate_limit import SharedHostLimiter, RateLimitError
+                from retrieval.historical_rate_limit import SharedHostLimiter, RateLimitError
                 if not all(isinstance(policy.get(key), str) for key in ('rate_limit_directory', 'solver_workspace')):
                     raise HistoricalSearchError('Shared pacing requires fixed controller and solver paths.')
                 try:
@@ -879,7 +964,7 @@ class HistoricalSearchEngine:
             else:
                 self.provider = DuckDuckGoWaybackProvider(self.cutoff, self.client, candidates)
             if coordinator is not None:
-                from historical_cache import CaptureCache, CacheError
+                from retrieval.historical_cache import CaptureCache, CacheError
                 try:
                     self.provider.persistent_cache = CaptureCache(
                         Path(policy['rate_limit_directory']) / 'captures',
@@ -1196,7 +1281,11 @@ class StdioMCPServer:
             selected_engine = self.engine if engine is None else engine
             result = (selected_engine.search(arguments['query']) if name == 'search'
                       else getattr(selected_engine, name)(**arguments))
-            output = {'content': [{'type': 'text', 'text': json.dumps(result, ensure_ascii=False)}], 'isError': False}
+            text = json.dumps(result, ensure_ascii=False)
+            # Text a UTF-8 reply cannot carry fails closed here, before the
+            # audit records the reply, instead of muting the stdio stream.
+            text.encode('utf-8')
+            output = {'content': [{'type': 'text', 'text': text}], 'isError': False}
         except HistoricalSearchError as error:
             output = {'content': [{'type': 'text', 'text': str(error)}], 'isError': True}
         except Exception:
@@ -1221,6 +1310,14 @@ class StdioMCPServer:
             output_stream.write(json.dumps(response, ensure_ascii=False) + '\n')
             output_stream.flush()
 
+    def _emit_call(self, output_stream, call, response):
+        # A text stream encodes a whole line before writing any of it, so an
+        # unencodable reply is replaced rather than closing the stream.
+        try:
+            self._emit(output_stream, response)
+        except UnicodeError:
+            self._emit(output_stream, self._tool_error(call['id'], 'Historical retrieval failed closed.'))
+
     def _deadline(self, call, output_stream):
         with self._state_lock:
             if self._closed or call['cancelled'] or call['responded']:
@@ -1232,7 +1329,7 @@ class StdioMCPServer:
                 response = self._tool_error(call['id'], 'Historical retrieval audit failed closed.')
             call['responded'] = True
             try:
-                self._emit(output_stream, response)
+                self._emit_call(output_stream, call, response)
             except (OSError, ValueError):
                 self._closed = True
             # A timed-out or cancelled worker keeps its capacity slot until it
@@ -1269,7 +1366,7 @@ class StdioMCPServer:
                         except HistoricalSearchError:
                             response = self._tool_error(call['id'], 'Historical retrieval audit failed closed.')
                         call['responded'] = True
-                        self._emit(output_stream, response)
+                        self._emit_call(output_stream, call, response)
                 except (OSError, ValueError):
                     self._closed = True
                 finally:
@@ -1391,7 +1488,7 @@ def main(argv=None) -> int:
                       'network_checked': False, 'pdf_supported': pdf_supported(), 'limitation': LIMITATION}
             if isinstance(engine.provider, CodexWaybackProvider):
                 try:
-                    from historical_codex_discovery import preflight
+                    from retrieval.historical_codex_discovery import preflight
                     preflight(engine.provider.discovery_settings)
                 except Exception:
                     raise HistoricalSearchError('Independent Codex discovery preflight failed.',
@@ -1400,7 +1497,18 @@ def main(argv=None) -> int:
             print(json.dumps(result))
         else:
             def engine_factory():
-                return HistoricalSearchEngine(args.policy_file, args.cutoff, args.audit_log, engine.policy_sha256)
+                created = HistoricalSearchEngine(args.policy_file, args.cutoff, args.audit_log, engine.policy_sha256)
+                # Per-call engines keep independent deadlines and audit state;
+                # only the bounded in-memory caches are shared across calls.
+                if isinstance(created.provider, WaybackProvider):
+                    created.provider.share_memory_caches(engine.provider)
+                return created
+            # MCP stdio is UTF-8 JSON-RPC regardless of the platform's default
+            # pipe encoding (for example cp1252 on Windows).
+            for stream, options in ((sys.stdin, {}), (sys.stdout, {'newline': '\n'})):
+                reconfigure = getattr(stream, 'reconfigure', None)
+                if reconfigure is not None:
+                    reconfigure(encoding='utf-8', errors='replace', **options)
             StdioMCPServer(engine, engine_factory=engine_factory).serve(sys.stdin, sys.stdout)
         return 0
     except HistoricalSearchError as error:

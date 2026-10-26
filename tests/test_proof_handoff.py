@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import proof_handoff as handoff
+from runner import proof_handoff as handoff
 
 
 class ProofReferenceTests(unittest.TestCase):

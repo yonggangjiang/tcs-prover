@@ -159,10 +159,16 @@ class PipelineTests(unittest.TestCase):
             model.assert_not_called()
 
     def test_bounded_calls_have_no_stale_internal_retry_budget(self):
-        settings=runtime._bounded_request_settings({'attempts':2,'timeout':900},
-                    {'thinking_hours':1,'elapsed_seconds':3599})
-        self.assertEqual(settings['attempts'],1)
-        self.assertLessEqual(settings['timeout'],1)
+        options = {'thinking_hours': 1, 'elapsed_seconds': 3599}
+        settings = runtime._bounded_request_settings({'attempts': 2, 'timeout': 900}, options)
+        # No internal attempt budget: structured() retries every failure, rechecking
+        # the shared deadline before each attempt, so none can outlive it.
+        self.assertNotIn('attempts', settings)
+        self.assertLessEqual(settings['timeout'], 1)
+        self.assertIs(settings['options'], options)
+        with patch.object(runtime, 'workflow_remaining', return_value=0):
+            with self.assertRaisesRegex(runtime.Error, 'time limit'):
+                runtime._bounded_request_settings({'timeout': 900}, options)
 
     def test_successful_cleanup_is_one_editor_call_then_compilation(self):
         for initial in ({'statement': 'Task', 'solution': PROOF}, {'source': LATEX}):

@@ -10,6 +10,9 @@ from unittest.mock import Mock, patch
 
 from ui import server
 
+# Error pauses are retried every minute, like every other model call.
+WAIT = 60
+
 
 class AutoResumeTests(unittest.TestCase):
     def setUp(self):
@@ -43,7 +46,12 @@ class AutoResumeTests(unittest.TestCase):
         with patch.object(server.time, "time", return_value=now):
             self.app._read_output(self.process, self.token)
 
-    def test_error_and_unexpected_exit_schedule_ten_minutes_after_pause(self):
+    def test_the_retry_interval_is_one_minute(self):
+        self.assertEqual(server.AUTO_RESUME_SECONDS, WAIT)
+        self.assertEqual(server.AUTO_RESUME_SECONDS, server.runtime.MODEL_RETRY_SECONDS)
+        self.assertEqual(server.retry_interval_text(), "1 minute")
+
+    def test_error_and_unexpected_exit_schedule_one_minute_after_pause(self):
         for raw in (False, True):
             with self.subTest(raw=raw):
                 self.app.state.update(phase="running", stage="solve", activeNode="author")
@@ -52,20 +60,54 @@ class AutoResumeTests(unittest.TestCase):
                 checkpoint = self.checkpoint()
                 self.assertEqual(self.app.state["phase"], "paused")
                 self.assertEqual(checkpoint["pauseCause"], "error")
-                self.assertEqual(checkpoint["autoResumeAt"], 1_600)
+                self.assertEqual(checkpoint["autoResumeAt"], 1_000 + WAIT)
                 restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
-                self.assertEqual(restored.state["autoResumeAt"], 1_600)
+                self.assertEqual(restored.state["autoResumeAt"], 1_000 + WAIT)
                 self.assertEqual(restored.state["goalThreadId"], "saved-thread")
+
+    def test_every_model_failure_cause_is_retried_after_one_minute(self):
+        causes = ("Author turn failed: Selected model is at capacity. Please try a different model.",
+                  "Claude author turn failed: API Error: 529 Overloaded.", "Author stopped: usageLimited.",
+                  "exceeded retry limit, last status: 429 Too Many Requests",
+                  "stream disconnected before completion: stream closed before response.completed",
+                  "Codex app-server stopped unexpectedly.", "Claude CLI stopped unexpectedly.",
+                  "Please run codex login: 401 Unauthorized",
+                  "Could not resume the saved Codex conversation; no replacement was started. network unavailable")
+        for reason in causes:
+            with self.subTest(reason=reason):
+                self.app.state.update(phase="running", stage="solve", activeNode="author", autoResumeAt=0)
+                self.app.active_token = self.app.worker_token = self.token
+                self.fail(reason=reason, now=5_000)
+                self.assertEqual(self.checkpoint()["pauseCause"], "error")
+                self.assertEqual(self.app.state["autoResumeAt"], 5_000 + WAIT)
+                retry = Mock()
+                self.assertFalse(self.app.auto_resume_if_due(retry, now=5_000 + WAIT - 1))
+                self.assertTrue(self.app.auto_resume_if_due(retry, now=5_000 + WAIT))
+                retry.assert_called_once_with()
+                self.assertEqual(self.app.state["autoResumeAt"], 5_000 + 2 * WAIT)
+
+    def test_user_pause_and_stop_are_never_retried(self):
+        self.fail(now=1_000)
+        self.app.pause()  # Keep paused.
+        retry = Mock()
+        self.assertFalse(self.app.auto_resume_if_due(retry, now=10**9))
+        self.app.state.update(phase="running", stage="solve", activeNode="author")
+        self.app.active_token = self.app.worker_token = self.token
+        with patch.object(server, "stop_process_tree"):
+            self.app.stop()
+        self.assertEqual(self.app.state["autoResumeAt"], 0)
+        self.assertFalse(self.app.auto_resume_if_due(retry, now=10**9))
+        retry.assert_not_called()
 
     def test_due_retry_resumes_original_conversation_once(self):
         self.fail()
         launch = Mock(stdin=io.StringIO())
         with patch.object(server.subprocess, "Popen", return_value=launch) as popen, \
                 patch.object(self.app, "_spawn_worker"):
-            self.assertFalse(self.app.auto_resume_if_due(self.app.resume, now=1_599))
+            self.assertFalse(self.app.auto_resume_if_due(self.app.resume, now=1_000 + WAIT - 1))
             popen.assert_not_called()
-            self.assertTrue(self.app.auto_resume_if_due(self.app.resume, now=1_600))
-            self.assertFalse(self.app.auto_resume_if_due(self.app.resume, now=1_601))
+            self.assertTrue(self.app.auto_resume_if_due(self.app.resume, now=1_000 + WAIT))
+            self.assertFalse(self.app.auto_resume_if_due(self.app.resume, now=1_000 + WAIT + 1))
         self.assertEqual(popen.call_count, 1)
         argv = popen.call_args.args[0]
         self.assertIn('goal_thread_id="saved-thread"', argv)
@@ -75,24 +117,30 @@ class AutoResumeTests(unittest.TestCase):
         self.assertEqual(self.app.state["autoResumeAt"], 0)
         self.assertEqual(self.checkpoint()["autoResumeAt"], 0)
 
-    def test_failed_launch_retries_every_ten_minutes_and_survives_restart(self):
+    def test_failed_launch_retries_every_minute_and_survives_restart(self):
         self.fail()
+        first = 1_000 + WAIT
         with patch.object(server.subprocess, "Popen", side_effect=OSError("offline")) as popen:
-            for now, expected in ((1_600, 1), (1_601, 1), (2_199, 1), (2_200, 2)):
+            for now, expected in ((first, 1), (first + 1, 1), (first + WAIT - 1, 1), (first + WAIT, 2)):
                 self.app.auto_resume_if_due(self.app.resume, now=now)
                 self.assertEqual(popen.call_count, expected)
         self.assertEqual(self.app.state["phase"], "paused")
-        self.assertEqual(self.app.state["autoResumeAt"], 2_800)
+        self.assertEqual(self.app.state["autoResumeAt"], first + 2 * WAIT)
+        trace = [entry.get("text", "") for entry in self.app.state["trace"]]
+        self.assertTrue(any(text.endswith("Retrying in 1 minute.") for text in trace), trace)
         restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
-        self.assertEqual(restored.state["autoResumeAt"], 2_800)
+        self.assertEqual(restored.state["autoResumeAt"], first + 2 * WAIT)
 
     def test_manual_and_audit_pauses_never_retry(self):
-        for audit in (False, True):
+        # An error that reaches a user's pause keeps it the user's; the author's
+        # acknowledgement of an audit pause carries no reason. An error during an
+        # audit pause is an error pause (tests/test_critical_interrupt_fixes.py).
+        for audit, reason in ((False, "Connection dropped while pausing"), (True, "")):
             with self.subTest(audit=audit):
                 self.app.state.update(phase="running", stage="solve", activeNode="author")
                 self.app.active_token = self.app.worker_token = self.token
                 self.app.pause(_for_audit=audit)
-                self.fail(reason="Connection dropped while pausing")
+                self.fail(reason=reason)
                 self.assertEqual(self.checkpoint()["pauseCause"], "audit" if audit else "user")
                 retry = Mock()
                 self.assertFalse(self.app.auto_resume_if_due(retry, now=10_000))
@@ -156,9 +204,83 @@ class AutoResumeTests(unittest.TestCase):
         self.addCleanup(http.server_close)
         with patch.object(http, "_check_author_workspace_idle", side_effect=ValueError("Already running")), \
                 patch.object(http.jobs[self.run.name], "resume") as launch:
-            http._retry_paused_jobs(now=1_600)
+            http._retry_paused_jobs(now=1_000 + WAIT)
             launch.assert_not_called()
-        self.assertEqual(http.jobs[self.run.name].state["autoResumeAt"], 2_200)
+        self.assertEqual(http.jobs[self.run.name].state["autoResumeAt"], 1_000 + 2 * WAIT)
+
+    def test_a_conversation_the_cli_no_longer_has_is_not_retried(self):
+        self.process.stdout = io.StringIO(json.dumps({
+            "kind": "workflow_paused", "stage": "solve", "node": "author",
+            "state": {"statement": "Exact statement", "paused": True}, "sessionUnavailable": True,
+            "reason": "Could not resume the saved Claude conversation; no replacement was started.",
+        }) + "\n")
+        with patch.object(server.time, "time", return_value=1_000):
+            self.app._read_output(self.process, self.token)
+        checkpoint = self.checkpoint()
+        self.assertEqual((self.app.state["phase"], checkpoint["pauseCause"]), ("paused", "error"))
+        self.assertEqual((checkpoint["autoResumeAt"], checkpoint["sessionUnavailable"]), (0, True))
+        never = Mock(side_effect=AssertionError("retried"))
+        self.assertFalse(self.app.auto_resume_if_due(never, now=10**9))
+        # The saved work continues in a new conversation instead of Resume.
+        plan = server.Server._stopped_continuation_plan(self.app)
+        self.assertEqual((plan["action"], plan["label"]), ("author", "Continue proof author"))
+        restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
+        self.assertEqual(restored.state["autoResumeAt"], 0)
+        self.assertEqual(server.Server._stopped_continuation_plan(restored)["action"], "author")
+        # An ordinary error pause still offers Resume.
+        restored.state["sessionUnavailable"] = False
+        self.assertEqual(server.Server._stopped_continuation_plan(restored)["action"], "resume")
+
+    def test_an_author_stopped_for_safety_is_never_resumed_automatically(self):
+        self.process.stdout = io.StringIO(json.dumps({
+            "kind": "workflow_paused", "stage": "solve", "node": "author",
+            "state": {"statement": "Exact statement", "paused": True}, "safetyStop": True,
+            "reason": "Stopped for safety: Codex returned a different thread ID; refusing to continue a replacement "
+                      "conversation. Automatic retry is off; check the setup, then choose Resume.",
+        }) + "\n")
+        with patch.object(server.time, "time", return_value=1_000):
+            self.app._read_output(self.process, self.token)
+        checkpoint = self.checkpoint()
+        self.assertEqual((self.app.state["phase"], checkpoint["pauseCause"]), ("paused", "error"))
+        self.assertEqual((checkpoint["autoResumeAt"], checkpoint["safetyStop"], self.app.state["safetyStop"]),
+                         (0, True, True))
+        never = Mock(side_effect=AssertionError("retried"))
+        self.assertFalse(self.app.auto_resume_if_due(never, now=10**9))
+        # Resume stays the user's choice, and survives a restart without retries.
+        self.assertEqual(server.Server._stopped_continuation_plan(self.app)["action"], "resume")
+        restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
+        self.assertEqual((restored.state["autoResumeAt"], restored.state["safetyStop"]), (0, True))
+
+    def test_a_cli_that_is_updating_does_not_stop_automatic_resume(self):
+        self.fail()
+        updating = server.TransientLaunchError(
+            "Claude CLI is not installed or is not on PATH; install Claude Code to use Claude models.")
+        with patch.object(server, "require_model_access", side_effect=updating), \
+                patch.object(server.subprocess, "Popen") as popen:
+            self.assertTrue(self.app.auto_resume_if_due(self.app.resume, now=1_000 + WAIT))
+        popen.assert_not_called()
+        # The next try stays scheduled one minute later.
+        self.assertEqual(self.app.state["autoResumeAt"], 1_000 + 2 * WAIT)
+        trace = [entry.get("text", "") for entry in self.app.state["trace"]]
+        self.assertTrue(any(text.startswith("Automatic resume failed: Claude CLI is not installed")
+                            and text.endswith("Retrying in 1 minute.") for text in trace), trace)
+        self.assertFalse(any(text.startswith("Automatic resume stopped") for text in trace))
+        # A missing API key is a settings error: automatic resume stops until the user fixes it.
+        self.app.state["autoResumeAt"] = 1_000 + 2 * WAIT
+        with patch.object(server, "require_model_access", side_effect=ValueError("Add an API key for Gateway.")):
+            self.app.auto_resume_if_due(self.app.resume, now=1_000 + 2 * WAIT)
+        self.assertEqual(self.app.state["autoResumeAt"], 0)
+
+    def test_runtime_reports_a_missing_cli_as_transient_and_a_missing_key_as_settings(self):
+        with patch.object(server.runtime, "verify_model_credentials",
+                          side_effect=server.runtime.CLIUnavailable("Claude CLI is not installed.")):
+            with self.assertRaises(server.TransientLaunchError):
+                server.require_model_access(["claude-opus-5-5"])
+        with patch.object(server.runtime, "verify_model_credentials",
+                          side_effect=server.runtime.ConfigurationError("Add an API key.")):
+            with self.assertRaises(ValueError) as raised:
+                server.require_model_access(["api:gateway"])
+        self.assertNotIsInstance(raised.exception, server.TransientLaunchError)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
-import launch_firstproof as launch
-import prepare_firstproof as preparation
+from experiments import launch_firstproof as launch
+from experiments import prepare_firstproof as preparation
 
 
 class LaunchTests(unittest.TestCase):
@@ -182,7 +182,7 @@ class LaunchTests(unittest.TestCase):
                 launch.retrieval.isolated_environment(plan['policy'], role, {})
             return {'id': plan['id'], 'runId': plan['runId']}
         with patch.object(launch, 'preflight_one', side_effect=preflight) as probe, \
-             patch('isolated_compiler.preflight', return_value={'status': 'pass'}):
+             patch('retrieval.isolated_compiler.preflight', return_value={'status': 'pass'}):
             report = launch.preflight_batch(plans, self.root / 'auth', controls)
         self.assertEqual({call.args[0]['id'] for call in probe.call_args_list}, {'P09', 'P10'})
         self.assertEqual(report['selectedProblemIds'], ['P09', 'P10'])

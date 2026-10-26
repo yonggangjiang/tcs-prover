@@ -24,11 +24,12 @@ their subagents can read the snapshot with shell tools, with external file
 access, networking, native search, and MCP disabled. Missing, linked, unsafe,
 non-UTF-8, empty, or larger-than-8-MiB proof files are rejected before review.
 
-In a run, expand **Run settings and history → Critic review inputs and decisions**
-to read every recorded review's exact input, full rejection reasons, and complete
-decision. Retries and repeated round numbers retain separate history. The
-workflow rail distinguishes rejection, active review, and approval; the search
-panel distinguishes the latest request from cumulative failed requests.
+In a run, expand **Critic review inputs and decisions** (beside **Run settings**;
+it appears once the critic has reviewed a submission) to read every recorded
+review's exact input, full rejection reasons, and complete decision. Retries
+and repeated round numbers retain separate history. The workflow rail
+distinguishes rejection, active review, and approval; the search panel
+distinguishes the latest request from cumulative failed requests.
 
 Critic history groups each author's submission into a **review cycle**, with
 rounds and request retries inside it. A **pass with fixes** starts another round;
@@ -37,13 +38,14 @@ the review limit** accepts the latest revision without another critic round.
 The workflow rail, timeline, and expandable metadata show these outcomes
 separately. Missing historical transition evidence is shown as unknown.
 
-The Codex CLI provides the local author session and model-call runtime. The
-author keeps the same conversation while it works; files preserve its assignment,
-attempt history, and proved results across interruptions or context compaction.
-GPT-6.1 Sol with Max reasoning and Standard generation are the defaults for every
-role. DeepSeek V4 Pro is an additional
-model option that uses the same harness pipeline through DeepSeek's official
-API.
+Every model runs through one of two local agent harnesses: the Codex CLI
+(default) or the Claude CLI. They provide the author session and the model
+calls. The author keeps the same conversation while it works; files preserve its
+assignment, attempt history, and proved results across interruptions or context
+compaction. GPT-6.1 Sol with Max reasoning and Standard generation are the
+defaults for every role. Claude models, and API models served by your own
+OpenAI- or Anthropic-format endpoint, are additional options in the same model
+menus; see [Model providers](#model-providers).
 
 
 ## Install and run
@@ -51,7 +53,8 @@ API.
 Requires Python 3.11+, the Codex CLI, and a TeX distribution with `latexmk`
 and `pdflatex` available on `PATH` (for example, TeX Live, MacTeX, or MiKTeX).
 Install Codex CLI through this
-[official website](https://learn.chatgpt.com/docs/codex/cli).
+[official website](https://learn.chatgpt.com/docs/codex/cli). The Claude CLI is
+needed only for Claude models and Anthropic-format API models.
 
 ```bash
 codex login
@@ -87,65 +90,142 @@ links so repeated problem names stay associated with the correct run. All run
 folders remain in their original locations.
 
 The Web UI opens locally with 6.1 Sol, Max, and Standard defaults for
-the reviewer, proof author, critic, and LaTeX writer. The DeepSeek setup below
-is needed only when you select DeepSeek for one or more roles.
+the reviewer, proof author, critic, and LaTeX writer. The provider setup below
+is needed only when you select Claude CLI or API models for one or more roles.
 
-## How to use DeepSeek
+## Model providers
 
-### 1. Obtain an official API key
+Each role's model menu under **Advanced settings** groups its models by the
+harness that runs them: **Codex CLI**, **Claude CLI**, and **API**. Each model
+offers only the reasoning levels it supports, and every launch or resume checks
+locally that the selected models can start: Claude models need `claude` on
+`PATH`, and API models need a saved key. `runner/providers.py` is the single
+registry of model ids, harnesses, and efforts.
 
-Create a key in your DeepSeek account. TCS Prover uses only
-`DEEPSEEK_API_KEY`; the key must belong to the official DeepSeek API account
-that will be billed for the model calls.
+### Codex CLI (default)
 
-### 2. Make the key available to TCS Prover
+`gpt-6.1-sol` (GPT 6.1 Sol, the default), `gpt-6-astra`, `gpt-6-sol`, and
+`gpt-6-luna` use your ChatGPT login (`codex login`). They offer `low` through
+`ultra`; the Luna models do not list `ultra`. **Fast** speed applies to these
+models only. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` ids are
+still accepted for saved runs and scripts.
 
-In the same Terminal window where you will start the Web UI, run:
+### Claude CLI
 
-```bash
-export DEEPSEEK_API_KEY="sk-..."
-```
+Install [Claude Code](https://code.claude.com/docs), run `claude` once, and log
+in with your Claude subscription. The menus offer `claude-fable-5-1` (Claude
+Fable 5.1), `claude-opus-5-5`, `claude-sonnet-5-5`, and `claude-haiku-5-5`, with
+the efforts `low`, `medium`, `high`, `xhigh`, and `max`; a shared `ultra` choice
+runs as `max`. Fast does not apply: Claude models always run at standard speed.
 
-This lasts for the lifetime of that shell. Editing or updating TCS Prover does
-not erase the variable, so restarting from the same Terminal does not require
-another `export`. A newly opened Terminal does require it unless you add the
-same export to your shell startup configuration.
+Every Claude process receives an explicit tool list and no MCP servers, user
+settings, skills, plugins, hooks, or `CLAUDE.md`, and it never waits for a
+permission prompt. The proof author's file tools are confined to its run folder,
+and its shell runs in the Claude sandbox without network access (macOS, or
+Linux with `bwrap` and `socat`; elsewhere the author gets file tools only). The
+sandbox can neither read nor write TCS Prover's private state in `.tcs-prover/`.
+The statement reviewer, critic, and LaTeX writer only read. Web-search tools follow
+the job's search mode. Claude has no native goals, so the harness asks the
+author to end each turn with a short structured status and continues the
+conversation until it reports the goal complete; pause, resume, live
+instructions, context compaction, and critic repairs work as with Codex.
+With **Concise** or **Detailed** reasoning summaries, the activity log shows
+Anthropic's summarized thinking; Claude has a single summary level, so both
+settings show the same summaries, and **Status only** shows none.
 
-To check the variable without printing the secret:
+Claude Code keeps a saved conversation for `cleanupPeriodDays` (30 days by
+default) after its last activity, and any Claude Code run with default settings
+deletes older ones. A Claude author paused for longer cannot resume its
+conversation: **Resume** reports this, automatic retry stays off, and **Continue
+proof author** continues the saved work in a new conversation from its research
+records. To keep conversations longer, set for example `"cleanupPeriodDays": 365`
+in `~/.claude/settings.json`.
 
-```bash
-python3 -c 'import os; print("DeepSeek key is set" if os.environ.get("DEEPSEEK_API_KEY") else "DeepSeek key is missing")'
-```
+### API models
 
-### 3. Start the Web UI
+**Advanced settings → API models** adds a model served by your own endpoint:
 
-From the repository directory:
+| Field | Meaning |
+| --- | --- |
+| Format | **OpenAI** (Responses API) or **Anthropic** (Messages API). |
+| Base URL | For example `https://api.openai.com/v1` or `https://api.anthropic.com`. HTTPS is required except for `localhost`; credentials, query strings, and fragments are rejected. So that the host shown and tested is the host the CLIs contact, the URL must be plain ASCII (an international domain name in its `xn--` form) without backslashes, a percent-encoded host, an IPv4 address other than four decimal numbers, or `.`/`..` path segments. |
+| Header name | The header that carries the key: `Authorization` (sent as `Bearer <key>`; the OpenAI default), `x-api-key` (the Anthropic default), or any other name (sent as the raw key). Letters, digits, and hyphens only. |
+| API key | Stored only on this computer and never shown again. Editing a model (or testing an edit) with an empty key keeps the saved key only while the format, base URL, and header name stay the same; changing any of them requires entering the key again. |
+| Model ID | The model name the endpoint expects. |
+| Display name | Optional menu label; the default is `<model> · <host>`. |
 
-```bash
-python3 web_ui.py
-```
+**Test connection** (the form, saved or not) and **Test** (a saved model's row)
+send one minimal request (`Reply with OK.`, at most 16 output tokens)
+to `<base URL>/responses` (OpenAI) or `<base URL without /v1>/v1/messages`
+(Anthropic, with `anthropic-version: 2023-06-01`). It has a 30-second timeout,
+follows no redirect, and shows the HTTP status, latency, and the provider's
+message with the key removed. Testing a saved model records the result beside it.
+**Edit** fills the form with a saved model's settings but never its key, and
+**Remove** deletes the model and its key; a role that used it falls back to
+GPT 6.1 Sol in the menus, and the page of a saved job that still uses it shows a
+warning under the title and marks the model *not configured* in its run settings.
+Editing a tested setting marks the form's last test result as out of date. Under
+each role menu a chip names the CLI that runs a built-in model, or an API model's
+format and host.
 
-Open **Advanced**, then select **DeepSeek V4 Pro — Official API** for any roles
-you want DeepSeek to handle. Selecting it for all four model roles means that
-the statement reviewer, author, critic, and LaTeX writer all use DeepSeek.
-A Codex/ChatGPT login is not required for roles that use DeepSeek.
+OpenAI-format models run through the Codex CLI as an isolated custom provider
+with a private Codex home under `.tcs-prover/codex-homes/`, so your ChatGPT login
+is neither used nor sent to the endpoint. A `codex` launcher that replaces
+`CODEX_HOME` cannot run them; put the native Codex binary on `PATH`. Their
+structured roles return JSON by a prompt contract with validation, retried
+until the answer is valid (see [Automatic retries](#automatic-retries)),
+and live web search uses the endpoint's hosted search tool, which some endpoints
+reject. Anthropic-format models run through the Claude CLI in bare mode, so your
+Claude login is never read; there the author has the sandboxed shell, Read, and
+Edit tools, without subagents or web tools. They show messages and tool activity
+but no reasoning summaries, because a gateway may return raw reasoning, which is
+never displayed. API models offer `low` through `max` and always run at standard
+speed. Saved models appear in every role menu, and the terminal options accept
+their `api:<id>` ids.
 
-DeepSeek exposes `high` and `max` reasoning in this harness. The shared menu is
-normalized as follows: `low`, `medium`, and `high` run as DeepSeek `high`;
-`xhigh`, `max`, and `ultra` run as DeepSeek `max`. DeepSeek always uses Standard
-speed because the Fast service tier is specific to OpenAI models.
+Keys are stored in `.tcs-prover/api-models.json` in this checkout: an
+owner-only file in an owner-only folder that Git ignores (`TCS_PROVER_API_MODELS`
+selects another path; a relative path is resolved against this checkout). The
+browser receives only a key hint such as `…abcd`. Keys never enter process
+arguments, run folders, transcripts, logs, or error messages: the runner reads
+the store itself and gives the key only to the CLI process, through its
+environment (Codex, whose model shell commands never inherit it) or an
+owner-only settings file under `.tcs-prover/claude-settings/` that is deleted
+when the process exits (Claude). **Stop** interrupts the runner before ending it
+(Windows ends it at once) and then removes any such file the runner left; one
+left by a process killed some other way is removed when the next runner or
+server starts. Every transcript record is also cleaned of the keys
+the runner knows (any value of at least 8 characters), so a gateway error or a
+command that echoes a key shows `[redacted]`.
 
-The harness passes the selected key through environment-backed authentication
-to each relevant child process, injects an isolated
-Responses-provider configuration, and loads model metadata based on DeepSeek's
-[official Codex integration](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/).
-It does not put the key in process arguments, edit `~/.codex/config.toml`, send
-the key through the UI, or save it in run artifacts.
+Model sandboxes cannot read or write this private state: the Claude Bash sandbox
+everywhere it runs and, on macOS, the Codex sandboxes of every role and of Codex
+research auditors (through a Codex permission profile derived from the usual
+read-only or workspace sandbox). The author's profile keeps the run folder's
+`.codex`, `.agents`, `.git`, and `.aws` folders read-only, as Codex's own
+workspace sandbox does, and applies the network access, extra writable roots,
+and `/tmp` exclusions of your `[sandbox_workspace_write]` Codex settings.
+Sandboxes of API models also cannot read your Codex or Claude login files. On
+Linux and Windows the Codex sandboxes keep Codex's default read access to your
+files, so a Codex role's shell there could read the key store; there, store API
+keys only if the models you run with Codex CLI may see them. Each job records
+the non-secret settings of its API models under `apiModels` in
+`job-settings.json`. A model used by a running job cannot be removed, and its
+format cannot change while jobs use it. A job cannot switch to another model, so
+a waiting job whose API model was removed continues once you add the model again
+with the settings the job shows (format, base URL, header name and model ID; any
+display name): it gets its old id back. A new model never takes such an id with
+another format.
 
-If the UI reports that `DEEPSEEK_API_KEY` is missing, stop the Web UI, export
-the key in the Terminal that will launch it, and start it again. If DeepSeek
-returns an authentication error, verify that this is an active official API
-key and that no extra quotation marks were copied into its value.
+### Web cutoff and removed models
+
+Web cutoff timestamps require Codex CLI models for every proof role, because
+their isolation is specific to the Codex sandbox; Claude and API models are
+rejected before launch. With a timestamp cutoff, the proof roles' menus disable their
+Claude CLI and API groups and flag a chosen model that cannot run. DeepSeek V4
+Pro is no longer supported: a saved run that names it restores with GPT 6.1 Sol
+in that role and a warning under the job title, and an error-paused run waits
+for an explicit **Resume** instead of retrying automatically.
 
 You can type your open problem into the text box and click “Check Statement.” The system will first revise the statement to remove ambiguities and handle corner cases, then ask you to approve or reject the revised version.
 
@@ -154,10 +234,10 @@ is found or the time limit is reached. The candidate passes through an
 independent critic loop. Accepted proofs are then formatted as readable LaTeX.
 
 Options for changing the default model, time limit, and other settings are under
-**Advanced**. GPT-6.1 Sol (`gpt-6.1-sol`) at Max reasoning is the default for
+**Advanced settings**. GPT-6.1 Sol (`gpt-6.1-sol`) at Max reasoning is the default for
 every node.
 
-Advanced includes **Web cutoff**, which is off for new jobs:
+**Advanced settings** include **Web cutoff** (labelled *Web search cutoff*), which is off for new jobs:
 
 | Web cutoff | Cutoff value | Search behavior |
 | --- | --- | --- |
@@ -165,7 +245,8 @@ Advanced includes **Web cutoff**, which is off for new jobs:
 | On | `-1` | Web-search tools disabled. |
 | On | UTC timestamp, e.g. `2026-10-02T14:13:12Z` | Author can search and read verified archives strictly before that instant. |
 
-For a timestamp cutoff, enable **Skip statement review**, use Codex models for all
+A timestamp cutoff currently requires macOS; elsewhere only Off and `-1` are
+available. For a timestamp cutoff, enable **Skip statement review**, use Codex CLI models for all
 proof roles, and disable optional research auditors. Before model work, the
 controller saves a separate policy and checks the native sandbox for both author
 and structured roles. A failed check blocks launch. The saved search mode and
@@ -203,6 +284,8 @@ assets, reads legacy metadata without restoring jobs, and forwards existing
 job actions to their original controller. A separate controller handles new
 jobs. The two run directories must not overlap. Keep the gateway running while
 using it; the original controller remains responsible for the older batch.
+**Advanced settings → API models** (listing, saving, removing, and Test) goes
+to the controller that handles new jobs.
 An older server without the new search capabilities cannot enable historical
 search through the updated frontend. Operators can set `TCS_PROVER_UI_AUTH_HOME`
 to the local Codex login directory; only its authentication file is copied.
@@ -212,13 +295,17 @@ trusted local settings and cannot be supplied by the browser.
 
 ## Run a folder from the Web UI
 
-On the home screen in Statement mode, click **Run a folder…** and choose a
-folder containing text statements. Any filename is accepted, including `.md`,
-`.txt`, `.tex`, and files without an extension. Each non-empty, top-level text file
-starts its own parallel proof job using the current author, critic, writer,
-prompt, and research-file settings. Statement review is skipped. The browser
-asks for confirmation before starting the jobs, each of which uses its own quota.
-Files are read as UTF-8 text. Subfolders are ignored; empty files are reported and skipped.
+On the home page choose **New problem**, keep **Statement** mode (with
+**Statement review only** off), click **Run a folder…**, and choose a folder
+containing text statements. Any file extension or none is accepted, including
+`.md`, `.txt`, and `.tex`. Each non-empty, top-level text file starts its own
+parallel proof job using the current author, critic, writer, prompt, and
+research-file settings. Statement review is skipped. The browser asks for
+confirmation before starting the jobs, each of which uses its own quota. Files
+are read as UTF-8 text. Hidden files (names starting with `.`), the system files
+`Thumbs.db`, `ehthumbs.db`, and `desktop.ini`, and subfolders are ignored; empty
+files and binary files (containing a NUL byte) are skipped and listed in the
+confirmation.
 The job list shows each source filename, including after a server restart.
 
 A batch accepts at most 200 statements, 100,000 characters per statement, and
@@ -259,16 +346,16 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-criticRounds N` | `2` | Maximum consecutive edited critic passes before using the latest solution; `1` to `100`. An unchanged pass accepts immediately. Rejection returns to the author and resets the count. |
-| `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit; greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
-| `-authorModel MODEL` | `gpt-6.1-sol` | Author model: `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, or official `deepseek-v4-pro`. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the Web UI no longer lists them. |
+| `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit in hours: `0` for unlimited, or greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
+| `-authorModel MODEL` | `gpt-6.1-sol` | Author model: Codex CLI `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude CLI `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or an `api:<id>` model saved under **Advanced settings → API models**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the Web UI no longer lists them. |
 | `-criticModel MODEL` | `gpt-6.1-sol` | Critic model; same choices as the author. |
 | `-writerModel MODEL` | `gpt-6.1-sol` | LaTeX writer model; same choices as the author. |
-| `-reasoningEffort LEVEL` | `max` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (Max plus automatic task delegation). The Luna models do not list `ultra`, and the Web UI offers each model only the levels it supports. |
+| `-reasoningEffort LEVEL` | `max` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (Max plus automatic task delegation). The Luna, Claude, and API models do not list `ultra` and run it as `max`; the Web UI offers each model only the levels it supports. |
 | `-authorEffort LEVEL` | shared effort | Override only the author effort. |
 | `-criticEffort LEVEL` | shared effort | Override only the critic effort. |
 | `-writerEffort LEVEL` | shared effort | Override only the LaTeX writer effort. |
-| `-speedMode MODE` | `standard` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation (up to 2× on 6.1 Sol and Astra, 1.5× on the other models; Fast can draw credits faster). DeepSeek calls always use standard service because Fast is provider-specific. |
-| `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. |
+| `-speedMode MODE` | `standard` | `standard` for normal speed or `fast` for ChatGPT's accelerated generation (up to 2× on 6.1 Sol and Astra, 1.5× on the other models; Fast can draw credits faster). Fast applies to Codex CLI models only; Claude CLI and API models always run at standard speed. |
+| `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never exposes private chain-of-thought. Claude CLI models show Anthropic's summarized thinking for both `concise` and `detailed`; Anthropic-format API models show no reasoning summaries. |
 | `-authorPromptFile PATH` | built-in prompt | Load a UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
 | `-criticPromptFile PATH` | built-in prompt | Load a UTF-8 critic prompt. |
 | `-finalPromptFile PATH` | built-in prompt | Load a UTF-8 LaTeX prompt. |
@@ -276,16 +363,94 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 Prompt-file paths are resolved from the terminal's current working directory.
 Run `python3 web_ui.py --help` to see every spelling and allowed value.
 
+## Automatic retries
+
+Every failed model call is retried automatically every minute (plus up to five
+seconds, so that many jobs do not retry in the same instant), with no attempt
+limit, so a job keeps going through provider outages without you. This covers
+the statement reviewer, the proof author, the critic, the LaTeX editor and its
+compilation repairs, and parallel independent requests. A failure is anything
+that interrupts a call: a provider error such as "model at capacity",
+overloaded, 429 or 5xx, a dropped stream, a CLI crash or non-zero exit, a CLI
+that is missing for a moment (for example while it updates itself), a call
+that exceeds its own request timeout, a login or usage-limit error, and an
+answer that cannot be used (empty, not valid JSON, the wrong shape, or failing
+a workflow `require` rule, such as a critic that returns no proof). Each
+attempt of a structured call (reviewer, critic, LaTeX editor) may run 15
+minutes, also when the total time limit is unlimited; after each consecutive
+timeout the next attempt may run twice as long (never past the time limit), so
+an answer that needs longer still arrives. The statement review's retries end
+at the job's total time limit in the same way.
+
+Failures that no retry can fix are not retried: a configuration error (for
+example a missing API key, or a Claude model in a web-cutoff run), a workflow
+rule that cannot be evaluated on a valid answer (a problem of the YAML, not of
+the model), a safety refusal (a CLI that offers unexpected tools, ignores an API
+model's private Codex home, continues a different conversation or lacks a
+required tool runtime, or a changed web-cutoff policy) and programming errors.
+A structured call ends the run with such an error, as before; the proof author
+pauses with it. An author stopped by a safety check, or whose saved
+conversation its CLI no longer has (or whose saved conversation ID is missing),
+is not resumed automatically: the job says why and waits for you (**Resume**,
+or **Continue proof author** for a vanished conversation).
+
+A retry keeps everything the failed attempts knew, without piling up notes:
+
+- Structured calls persist their CLI session (Codex without `--ephemeral`,
+  Claude with `--session-id`). Once an attempt has produced model output (for
+  example the critic read the proof or ran a subagent), the next attempt forks
+  that session (`codex exec fork <id>`, `claude --resume <id> --fork-session`,
+  with the same model, effort, sandbox, schema and settings) and adds a short
+  note; after an unusable answer the note says in plain words what was wrong,
+  for example "the solution field must not be empty", and quotes the model's
+  own explanation. A critic that rejects without listing bugs is asked to keep
+  its verdict and list them. A fork that fails before producing anything is
+  deleted, and the next retry forks the same session again, so an outage adds
+  nothing to the conversation. While no attempt has produced output, when the
+  CLI no longer has the session, when the conversation no longer fits the
+  model's context, when the critic's proof snapshot disappeared, and in
+  web-cutoff runs (which never persist sessions), the retry sends the exact
+  saved input again in a new conversation.
+- The author's retry starts a new CLI process that reopens the same thread or
+  session. An instruction the model never received is sent again; a turn that
+  the model received but answered with nothing is first removed from the
+  conversation (Codex `thread/revert`, Claude `--resume-session-at`) and its
+  instruction sent again; after a turn in which the model worked, a short note
+  asks it to continue. A retry that fails before it reopened the conversation
+  keeps the thread and the pending instruction for the next one.
+
+The structured sessions live only while their call runs: TCS Prover deletes
+them when the call ends (`codex delete --force`, which also removes the threads
+of subagents, or the Claude transcript files). Until then they are where each
+CLI keeps its sessions: Codex under `$CODEX_HOME/sessions` and its state
+database (an API model's private Codex home for OpenAI-format API models),
+marked so that Codex never builds memories from them; Claude under `projects/`
+in its configuration folder (`~/.claude` for Anthropic-format API models).
+
+During the wait the job stays running, and the run page, the activity log and
+the terminal say why, for example "Model call failed (model at capacity) —
+retrying in 1 min (attempt 7, retrying for 6 min)" with the provider's message
+(keys removed). The wait does not consume the workflow time budget, no attempt
+starts after the time limit is reached, **Stop** ends a wait at once, and
+**Pause** (offered while the proof author works) pauses the job instead of
+retrying. Only the first retries of one call stay pinned in the activity log;
+later ones stay in the recent window and in `transcript.jsonl`. Optional
+research auditors keep their own behaviour (a failed auditor is skipped with a
+warning), as research-audit holds are being decided separately.
+
 ## How to use checkpoints
 
-If a proof author pauses because of a connection loss or another unexpected
-error, TCS Prover retries the saved conversation after 10 minutes. A failed
-resume attempt is retried every 10 minutes. Retry times survive server restarts
-and do not require an open browser tab. The paused job shows its next retry time;
-**Keep paused** cancels automatic retries, and **Resume** retries immediately.
-User-requested pauses and stops, research-audit pauses, and exhausted workflow
-time limits do not trigger this error retry. Saved work and the original time
-budget are preserved.
+If a proof author still ends up paused by an error (for example when its runner
+process itself ended), TCS Prover retries the saved conversation after 1 minute,
+and a failed resume attempt is retried every minute; a terminal run does the
+same. Retry times survive server restarts and do not require an open browser
+tab. The paused job shows its next retry time; **Keep paused** cancels
+automatic retries, and **Resume** retries immediately. User-requested pauses
+and stops, research-audit pauses, exhausted workflow time limits, safety stops
+and conversations the CLI no longer has do not trigger this error retry, and
+neither does a model whose settings are incomplete (a CLI that is only missing
+for a moment is retried). Saved work and the original time budget are
+preserved.
 
 TCS Prover writes durable artifacts while a job progresses. When the Web UI is
 started again, it scans `runs/*/transcript.jsonl`, restores the historical job
@@ -304,15 +469,17 @@ find bugs and then repairs the argument itself.
 To continue from the Web UI:
 
 1. Stop the old server if it is still running, then run `python3 web_ui.py`.
-2. On the home screen, locate the historical job by its full start/finish time.
-3. Click the continuation button beside the checkpoint you want.
+2. On the home page, open the job's batch and find the job by its full start/finish time.
+3. Click the continuation button beside the checkpoint you want (the job's own
+   page also lists it under **Continue from saved work**).
 4. Confirm the action. TCS Prover creates a new job and opens it immediately.
 
 Saved run inputs and transcripts are preserved. The new job copies the selected candidate,
 role prompts, model choices, reasoning efforts, speed, critic-round maximum,
-and workflow time limit. Old saved model routes that are no longer selectable
-are migrated to the official DeepSeek model when the
-job is restored.
+and workflow time limit. A saved role that names the removed DeepSeek V4 Pro
+restores with GPT 6.1 Sol and a visible warning; an error-paused job with such a
+role waits for an explicit **Resume**. A role whose API model was removed
+reports it before any new request starts.
 
 Very old runs that predate `job-settings.json` can restore only choices visible
 in their transcript. A role that never ran has
@@ -328,9 +495,9 @@ recent checkpoint listed on the job card.
 ### Continue a manually stopped job
 
 Jobs stopped with the Web UI's **Stop** button remain visible as **Stopped at
-review**, **solve**, **repair**, **critic**, **final**, or **failure** after the
-server is restarted. On the home page, use the stage-specific continuation
-button:
+statement review**, **proof author**, **critic**, **LaTeX editor**, or **failure summary** after the
+server is restarted. On the batch list, or under **Continue from saved work** on the job's own page,
+use the stage-specific continuation button:
 
 | Stopped stage | Button | Continuation boundary |
 | --- | --- | --- |
@@ -391,7 +558,7 @@ python3 web_ui.py statements/ -criticRounds 6 -authorEffort ultra
 The lookup is case-insensitive (`.md` and `.MD` both work), deterministic, and
 non-recursive. All matching files and shared settings are validated before any
 job starts. The jobs then run concurrently, and every override applies to every
-file. Be aware that a large folder can therefore use many simultaneous Codex
+file. Be aware that a large folder can therefore use many simultaneous model
 jobs and credits.
 
 Terminal output is concise by default: it reports only the current workflow
@@ -443,13 +610,13 @@ Choose **Statement** to review or edit a rough problem before approval. Include
 the computational model, problem description, and asymptotic goal in the
 statement for algorithmic tasks. Choose **LaTeX polish** to edit an existing
 theorem and proof with a single editor call.
-**Advanced** controls each node's model, reasoning effort, prompt, public activity-log
-detail, workflow time limit, and critic-round limit. The log can show status
-only or request concise or detailed model-generated summaries. Its **Statement review only** option runs just the
+**Advanced settings** control each node's model, reasoning effort, prompt, public activity-log
+detail, time limit, and critic-round limit. The log can show status
+only or request concise or detailed model-generated summaries. Under **Workflow**, **Statement review only** runs just the
 reviewer, saves the checked statement and reviewer notes, and finishes without
 starting the proof author, critic, or LaTeX editor. This option and **Skip
-statement review** are mutually exclusive. Jobs run in parallel. **Show
-details** displays the exact application prompts and returned model text.
+statement review** are mutually exclusive. Jobs run in parallel. **Prompts &
+responses** displays the exact application prompts and returned model text.
 Private records and outputs are stored under `runs/`.
 
 New jobs read the author and critic prompts from `workflows/author_critic.yaml`
@@ -483,24 +650,30 @@ discard the memory files or restart the problem. The
 control is intentionally unavailable during statement review,
 critic review, failure summaries, and final LaTeX editing.
 
-**Pause**, beside **Stop**, interrupts the active Codex turn and pauses its goal,
-preserving the native conversation and existing research files. It does not ask
-the model to produce a final answer or spend another turn writing a summary.
-Wait for **Paused** before closing the UI or changing your Codex CLI login. Then
+**Pause**, beside **Stop**, interrupts the active author turn (Codex also pauses
+its native goal), preserving the saved conversation and existing research files.
+It does not ask the model to produce a final answer or spend another turn
+writing a summary. Wait for **Paused** before closing the UI or changing your
+Codex or Claude CLI login. Then
 click **Resume** on the inference page or job card: a fresh CLI process reopens
 the same saved thread in the same run folder and appends to its transcript.
 If that saved thread cannot be reopened, the job remains paused with an error
-and can be retried; it does not silently replace the conversation. A pause before
-Codex created any thread starts that initial thread on Resume.
+and can be retried; it does not silently replace the conversation. When Claude
+Code no longer has the saved conversation, automatic retry stays off and the job
+offers **Continue proof author**, which continues the saved work in a new
+conversation. A pause before
+the CLI created any thread or session starts that initial one on Resume.
 Paused jobs also remain resumable after restarting the UI. Paused time does not
 consume the remaining workflow time budget. Already saved conversation and file
 content are retained; an interrupted response or file write may be incomplete.
-Usage limits, network failures, and unexpected author interruptions also pause
-the job automatically, displaying the reason and keeping Resume available in
-the same folder. Resolve the interruption, then click Resume when ready.
+Usage limits, network failures, and other model-call failures do not pause the
+job: the author retries every minute in the same conversation and shows why (see
+[Automatic retries](#automatic-retries)). A job that still pauses with an error
+is resumed automatically after 1 minute; click Resume to retry at once.
 For a reached workflow time limit, increase the existing total time limit control
 while paused before clicking Resume.
-**Stop** keeps its existing immediate termination behavior.
+**Stop** ends the job at once: it interrupts the runner and its CLI processes so
+they can remove private files, and kills any that remain after three seconds.
 
 **Start audit now** is available while the author is running or paused, once at
 least one auditor is selected and its settings applied. An audit started from a
@@ -510,7 +683,7 @@ the author paused.
 Audit time does not advance the author clock, and another audit cannot start
 until the current batch finishes.
 
-When compilation succeeds, **Download source (.tex)** and **Download PDF**
+When compilation succeeds, **Download .tex** and **Download PDF**
 download that job's saved `final.tex` and `final.pdf`. Older jobs that only
 contain a source file still offer the source download.
 
@@ -518,7 +691,8 @@ Live web search is enabled for the author, statement reviewer, critic, and
 LaTeX editor, including structured retries and the configuration inherited by
 subagents. The runner explicitly sets Codex's
 [`web_search="live"`](https://learn.chatgpt.com/docs/config-file/config-reference)
-for new and resumed sessions; the models decide when to search.
+for new and resumed sessions, and Claude CLI models receive the WebSearch and
+WebFetch tools; the models decide when to search.
 
 ## Workflow
 
@@ -550,7 +724,7 @@ node; the author is marked paused while the auditors run.
 
 This node lets the user start with convenient informal language while preventing
 a model from silently solving a different problem. To use it without requesting
-a proof, open **Advanced**, enable **Statement review only**, and submit the
+a proof, enable **Statement review only** under **Workflow**, and submit the
 statement. The completed result remains available to copy from the review page
 and is saved as `checked-statement.md` in that job's run directory. Only the
 reviewer model, reviewer reasoning effort, reviewer prompt, and generation speed
@@ -656,23 +830,39 @@ repeated model repair calls.
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
 engine and model/goal transport. The author research records remain plain
-Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches the UI or Markdown proof jobs. The
-`workflows/` directory contains exactly two YAML definitions:
+Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches
+the UI or Markdown proof jobs. Everything else lives in a package:
 
 ```text
-workflow_runner.py          Graph engine, model transport, and workflow CLI
 web_ui.py                   UI and Markdown-job launcher
+workflow_runner.py          Graph engine, model transport, and workflow CLI
 workflows/
-  author_critic.yaml         Author/critic prompts, response schema, and logic
-  clean_up.yaml              LaTeX prompts, response schema, and logic
-transcript/
-  view_transcript.py         Transcript reader, CLI, and viewer server
-  transcript_ui/            Transcript viewer HTML, JavaScript, and CSS
+  author_critic.yaml        Author/critic prompts, response schema, and logic
+  clean_up.yaml             LaTeX prompts, response schema, and logic
+  research_audit.yaml       Research-audit models, schedule, and prompt
+runner/
+  proof_handoff.py          Verified capture of an author's PROOF_FILE
+  providers.py              Model registry and the private API model store
+  claude_cli.py             Claude CLI transport for structured roles and the author
 ui/
   server.py                 HTTP endpoints, job state, and process management
   review.py                 Independent statement-review procedure
   cli.py                    UI startup and Markdown file/folder runs
   index.html, app.js, styles.css
+transcript/
+  view_transcript.py        Transcript reader, CLI, and viewer server
+  transcript_ui/            Transcript viewer HTML, JavaScript, and CSS
+retrieval/
+  runtime.py                Search modes and fail-closed historical isolation
+  historical_search.py      Historical (web cutoff) MCP broker, launched by path
+  historical_*.py, scholarly_discovery.py
+                            Broker transport, pacing, cache, and URL discovery
+  isolated_compiler.py      Sandboxed LaTeX compilation for historical runs
+  validate_historical_search.py, audit_historical_trajectory.py
+                            Operator checks for historical batches
+experiments/
+  firstproof-batch3/        Pinned First Proof inputs and manifest
+  prepare_firstproof.py, launch_firstproof.py
 tests/                      Offline regression tests
 ```
 
@@ -815,7 +1005,7 @@ starting proof models, run harmless search/open validation after preparation and
 authentication provisioning:
 
 ```console
-.venv/bin/python validate_historical_search.py \
+.venv/bin/python -m retrieval.validate_historical_search \
   --policy-file .experiment-control/firstproof-batch3/P01/broker-policy.json \
   --cutoff 2026-10-02T14:13:12Z \
   --output .experiment-control/firstproof-batch3/search-validation \
@@ -867,7 +1057,7 @@ overall proof effort.
 Audit a running or completed batch without sending queries or invoking a model:
 
 ```console
-.venv/bin/python audit_historical_trajectory.py \
+.venv/bin/python -m retrieval.audit_historical_trajectory \
   --control-root .experiment-control/firstproof-batch3-search-v4 \
   --output .experiment-control/firstproof-batch3-search-v4/trajectory-source-audit.json
 ```
@@ -881,13 +1071,15 @@ archived byte. The gateway performs byte verification before returning content.
 
 ### Pinned benchmark preparation
 
-`prepare_firstproof.py` prepares the ten pinned inputs in
+`python -m experiments.prepare_firstproof` prepares the ten pinned inputs in
 `experiments/firstproof-batch3/manifest.json` without starting model work.
-`launch_firstproof.py` checks configuration, isolation and compilation;
-`launch_firstproof.py --start` releases the preparation hold and launches the jobs.
+`python -m experiments.launch_firstproof` checks configuration, isolation and
+compilation; adding `--start` releases the preparation hold and launches the jobs.
 Use fresh run and controller directories for each batch; existing work is never
 overwritten. Both scripts accept `--problems P09 P10` to select a subset.
 Regenerate policies on each host because their paths are machine-specific.
 Generated runs, controller state, credentials and virtual environments stay out
-of Git. Historical search is supported on macOS Seatbelt and Windows MXC when
-their runtime canaries pass; unavailable isolation blocks launch.
+of Git. Historical search launches currently require macOS, because the isolated
+LaTeX compiler has only a macOS Seatbelt adapter; the Windows MXC adapter covers
+the model roles only. Launch also requires the runtime canaries to pass;
+unavailable isolation blocks launch.
