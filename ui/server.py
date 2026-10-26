@@ -23,7 +23,7 @@ from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import workflow_runner as runtime
 from runner import claude_cli, providers
@@ -95,6 +95,9 @@ API_TEST_TIMEOUT_SECONDS = 30
 API_TEST_PROMPT = "Reply with OK."
 API_TEST_MAX_TOKENS = 16
 API_TEST_MAX_RESPONSE_BYTES = 64 * 1024
+API_MODELS_MAX_RESPONSE_BYTES = 1024 * 1024
+API_MODELS_MAX_PAGES = 100
+API_MODELS_MAX_COUNT = 5000
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -396,7 +399,6 @@ def default_prompts():
     prompts = {
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
-        "author_simple": author_critic["author_simple"],
         "critic": author_critic["critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
     }
@@ -409,17 +411,12 @@ def web_prompt_options(body, roles, source=None):
 
     overrides = body.get("promptOverrides", {})
     if not isinstance(overrides, dict) or any(
-        name not in {"review", "author", "author_simple", "critic", "final"}
+        name not in {"review", "author", "critic", "final"}
         or not isinstance(value, str) for name, value in overrides.items()
     ):
         raise ValueError("Prompt overrides must map role names to prompt text.")
-    managed = body.get("fileManagement", (source or {}).get("fileManagement", False))
-    if source and managed != source.get("fileManagement", True):
-        raise ValueError("Start a new job to change research file management.")
     return {
-        f"{name}_prompt": overrides.get(
-            "author_simple" if name == "author" and not managed else name,
-            (source or {}).get(f"{name}Prompt"))
+        f"{name}_prompt": overrides.get(name, (source or {}).get(f"{name}Prompt"))
         for name in roles
     }
 
@@ -682,7 +679,6 @@ def empty_state(trace=None, trace_version=0):
         # The runner's current wait before retrying a failed model call.
         "modelRetry": None,
         "statementReviewOnly": False,
-        "fileManagement": False,
         "preparedRun": False,
         "launchHold": "",
         "retrievalPolicyPath": "",
@@ -717,7 +713,7 @@ def empty_state(trace=None, trace_version=0):
         "reasoningSummary": DEFAULT_REASONING_SUMMARY,
         "speedMode": DEFAULT_SPEED,
         "reviewPrompt": prompts["review"],
-        "authorPrompt": prompts["author_simple"],
+        "authorPrompt": prompts["author"],
         "criticPrompt": prompts["critic"],
         "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
@@ -806,7 +802,7 @@ def unconfigured_job_model_error(model, role, snapshot):
     if saved:
         kind = "Anthropic" if saved["format"] == providers.ANTHROPIC_FORMAT else "OpenAI"
         how = (f"with the same settings ({saved['label']} · {kind} format · {saved['baseUrl']} · "
-               f"header {saved['headerName']} · model {saved['model']})")
+               f"model {saved['model']})")
     else:
         how = f"with the display name “{model[len(providers.API_ID_PREFIX):]}”"
     return (f"The API model {model} chosen for the {ROLE_LABELS[role]} is not configured. Add it again "
@@ -837,7 +833,7 @@ def require_model_access(models):
         raise ValueError(str(exc)) from exc
 
 
-API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model")
+API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model", "requestSource")
 # The add/edit form's choices; which CLI runs each format is fixed in providers.
 API_MODEL_FORMATS = [
     {"id": providers.OPENAI_FORMAT, "label": "OpenAI-compatible (Responses API)", "cli": "Codex CLI",
@@ -866,38 +862,57 @@ def saved_api_models(value):
 
     if not isinstance(value, dict):
         return {}
-    return {
-        model: {key: entry[key] for key in API_SNAPSHOT_FIELDS}
-        for model, entry in list(value.items())[:len(ROLES)]
-        if providers.is_api_id(model) and isinstance(entry, dict) and all(
-            isinstance(entry.get(key), str) and len(entry[key]) <= providers.MAX_BASE_URL_CHARS
-            for key in API_SNAPSHOT_FIELDS)
-    }
+    snapshots = {}
+    for model, entry in list(value.items())[:len(ROLES)]:
+        if (not providers.is_api_id(model) or not isinstance(entry, dict)
+                or entry.get("format") not in providers.FORMATS or not all(
+                    isinstance(entry.get(key), str) and len(entry[key]) <= providers.MAX_BASE_URL_CHARS
+                    for key in ("label", "format", "baseUrl", "model"))):
+            continue
+        try:
+            source = providers._request_source(entry.get("requestSource"))
+        except providers.ProviderError:
+            continue
+        snapshots[model] = {**{key: entry[key] for key in ("label", "format", "baseUrl", "model")},
+                            "headerName": providers.DEFAULT_HEADERS[entry["format"]], "requestSource": source}
+    return snapshots
+
+
+def _api_connection_headers(entry):
+    """Automatic protocol authentication and source for tests and model discovery."""
+
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": providers.request_source(entry)}
+    if entry["format"] == providers.ANTHROPIC_FORMAT:
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+    header, key = providers.DEFAULT_HEADERS[entry["format"]], entry["apiKey"]
+    headers[header] = f"Bearer {key}" if header.lower() == "authorization" else key
+    return headers
+
+
+def _api_endpoint_path(entry, endpoint):
+    path = urlsplit(entry["baseUrl"]).path.rstrip("/")
+    if entry["format"] == providers.ANTHROPIC_FORMAT:
+        if path.lower().endswith("/v1"):
+            path = path[:-3]
+        path += "/v1"
+    return path + "/" + endpoint
 
 
 def _api_test_request(entry):
     """Path, headers and body of the one minimal request a Test sends."""
 
-    path = urlsplit(entry["baseUrl"]).path.rstrip("/")
-    headers = {"Content-Type": "application/json", "Accept": "application/json",
-               "User-Agent": "TCS-Prover-API-model-test"}
     if entry["format"] == providers.OPENAI_FORMAT:
         # Codex sends Responses requests to <base URL>/responses.
-        path += "/responses"
+        path = _api_endpoint_path(entry, "responses")
         body = {"model": entry["model"], "input": API_TEST_PROMPT,
                 "max_output_tokens": API_TEST_MAX_TOKENS}
     else:
         # The Claude CLI takes the base URL without /v1 and adds /v1/messages.
-        if path.lower().endswith("/v1"):
-            path = path[:-3]
-        path += "/v1/messages"
+        path = _api_endpoint_path(entry, "messages")
         body = {"model": entry["model"], "max_tokens": API_TEST_MAX_TOKENS,
                 "messages": [{"role": "user", "content": API_TEST_PROMPT}]}
-        headers["anthropic-version"] = ANTHROPIC_VERSION
-    header, key = entry["headerName"], entry["apiKey"]
-    headers = {name: value for name, value in headers.items() if name.lower() != header.lower()}
-    headers[header] = f"Bearer {key}" if header.lower() == "authorization" else key
-    return path, headers, json.dumps(body).encode("utf-8")
+    return path, _api_connection_headers(entry), json.dumps(body).encode("utf-8")
 
 
 def _api_test_text(text, key):
@@ -968,7 +983,7 @@ def probe_api_endpoint(entry, timeout=None):
 
     ``entry`` holds validated settings including the key. The exchange has one
     overall deadline, follows no redirect, and the key travels only in the
-    configured header; no returned text contains it.
+    protocol's standard authentication header; no returned text contains it.
     """
 
     timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
@@ -1037,6 +1052,121 @@ def probe_api_endpoint(entry, timeout=None):
         detail = _api_test_error(value, text).strip()
         result["message"] = detail or f"HTTP {status} without an error message."
     result["model"] = _api_test_text(result["model"], entry["apiKey"])
+    result["message"] = _api_test_text(result["message"], entry["apiKey"])
+    return result
+
+
+def _api_models_page(entry, path, deadline):
+    """Read a bounded models page without following provider-supplied URLs or redirects."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("API model discovery deadline")
+    parts = urlsplit(entry["baseUrl"])
+    connection = (http.client.HTTPSConnection(parts.hostname, parts.port, timeout=remaining,
+                                            context=ssl.create_default_context())
+                  if parts.scheme == "https" else
+                  http.client.HTTPConnection(parts.hostname, parts.port, timeout=remaining))
+    try:
+        connection.request("GET", path, headers=_api_connection_headers(entry))
+        channel = connection.sock
+
+        def bound():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("API model discovery deadline")
+            if channel.fileno() != -1:
+                channel.settimeout(left)
+
+        bound()
+        response = connection.getresponse()
+        chunks, size = [], 0
+        while size <= API_MODELS_MAX_RESPONSE_BYTES:
+            bound()
+            chunk = response.read(min(16384, API_MODELS_MAX_RESPONSE_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > API_MODELS_MAX_RESPONSE_BYTES:
+            raise providers.ProviderError("The model list response is too large.")
+        return response.status, response.getheader("Location") or "", b"".join(chunks)
+    finally:
+        connection.close()
+
+
+def discover_api_models(entry, timeout=None):
+    """Fetch model options using the connection's key, with an overall deadline.
+
+    Anthropic pages use the returned last_id as a cursor on the original path;
+    remote pagination links are never followed. Incomplete lists are rejected so
+    a failed later page cannot silently hide valid choices.
+    """
+
+    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    result = {"ok": False, "status": None, "latencyMs": None, "message": "", "models": [],
+              "testedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    path, cursor, seen_cursors, models = _api_endpoint_path(entry, "models"), None, set(), {}
+    try:
+        for _ in range(API_MODELS_MAX_PAGES):
+            page_path = path + ("?" + urlencode({"after_id": cursor}) if cursor is not None else "")
+            status, location, raw = _api_models_page(entry, page_path, deadline)
+            result["status"] = status
+            text = raw.decode("utf-8", "replace")
+            try:
+                value = json.loads(text)
+            except ValueError:
+                value = None
+            if 300 <= status < 400:
+                result["message"] = (f"The endpoint redirected to {location or 'another URL'}; redirects are not "
+                                     "followed. Enter the final API base URL.")
+                break
+            if not 200 <= status < 300:
+                detail = _api_test_error(value, text).strip() or f"HTTP {status} without an error message."
+                result["message"] = detail
+                break
+            if not isinstance(value, dict) or not isinstance(value.get("data"), list):
+                result["message"] = "The endpoint did not return a valid model list (expected data with model IDs)."
+                break
+            for item in value["data"]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    identity = providers._model_name(item.get("id"))
+                except providers.ProviderError:
+                    continue
+                if _api_test_text(identity, entry["apiKey"]) != identity:
+                    continue
+                label = item.get("display_name")
+                label = label if isinstance(label, str) and label.strip() else identity
+                models.setdefault(identity, {"id": identity, "label": _api_test_text(label, entry["apiKey"])})
+            if len(models) > API_MODELS_MAX_COUNT:
+                result["message"] = "The endpoint returned too many models; narrow the API key's model access."
+                break
+            if not value.get("has_more"):
+                result["models"] = sorted(models.values(), key=lambda item: item["id"].casefold())
+                result["ok"] = bool(models)
+                result["message"] = (f"Found {len(models)} model{'s' if len(models) != 1 else ''}." if models else
+                                     "No models are available for this API key.")
+                break
+            if entry["format"] != providers.ANTHROPIC_FORMAT:
+                result["message"] = "The endpoint returned a paginated model list in an unsupported format."
+                break
+            cursor = value.get("last_id")
+            if (not isinstance(cursor, str) or not cursor or len(cursor) > providers.MAX_MODEL_CHARS
+                    or cursor in seen_cursors):
+                result["message"] = "The endpoint returned an invalid model list pagination cursor."
+                break
+            seen_cursors.add(cursor)
+        else:
+            result["message"] = "The endpoint returned too many model list pages."
+    except providers.ProviderError as exc:
+        result["message"] = str(exc)
+    except Exception as exc:
+        result["message"] = _api_test_failure(exc, timeout)
+    result["latencyMs"] = round((time.monotonic() - started) * 1000)
     result["message"] = _api_test_text(result["message"], entry["apiKey"])
     return result
 
@@ -1186,7 +1316,7 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "researchAudits", "researchAuditProgress",
-            "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+            "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
             "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
             "sourceFile", "apiModels",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
@@ -1272,8 +1402,7 @@ class App:
                 self._audit_token = token
                 return
             paused = paused and self.state["phase"] == "paused" and self.worker_token is None
-            if (not self.state.get("fileManagement", True)
-                    or (not paused and (token is None or self.worker_token is not token or self._audit_token is token))
+            if ((not paused and (token is None or self.worker_token is not token or self._audit_token is token))
                     or all(model == "none" for model in self.state["researchAudits"]["models"])):
                 return
             workspace = self.state.get("goalWorkspace") or self.run_dir
@@ -1425,8 +1554,6 @@ class App:
 
         settings = audits.normalize_settings(settings)
         with self.lock:
-            if not self.state.get("fileManagement", True):
-                raise ValueError("Research audits require file management for this run.")
             if (self.state["phase"] not in {"running", "paused"}
                     or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
@@ -1452,8 +1579,6 @@ class App:
         self._check_launch_hold()
 
         with self.lock:
-            if not self.state.get("fileManagement", True):
-                raise ValueError("Research audits require file management for this run.")
             paused = self.state["phase"] == "paused"
             if (self.state["phase"] not in {"running", "paused"} or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}
@@ -1933,13 +2058,10 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         research_audits=None,
-        file_management=True,
         retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Normalize and validate settings shared by both input modes."""
 
-        if not isinstance(file_management, bool):
-            raise ValueError("File management must be enabled or disabled.")
         review_model = str(review_model or "")
         author_model = str(author_model or "")
         critic_model = str(critic_model or "")
@@ -1956,8 +2078,6 @@ class App:
             "critic": critic_prompt, "final": final_prompt,
         }
         defaults = default_prompts()
-        if not file_management:
-            defaults["author"] = defaults["author_simple"]
         prompts = {
             name: str(
                 defaults[name] if value is None else value
@@ -2007,8 +2127,7 @@ class App:
             raise ValueError(
                 f"Choose 0 for unlimited, or at most {MAX_THINKING_HOURS} hours."
             )
-        audit_options = audits.normalize_settings(research_audits) if file_management else {
-            **audits.default_settings(), "models": ["none", "none", "none"]}
+        audit_options = audits.normalize_settings(research_audits)
         # Web cutoff timestamps need Codex models: say so before any CLI check.
         search_options = retrieval.validate_options(
             retrieval_mode, retrieval_cutoff_utc, models=selected_models,
@@ -2039,7 +2158,6 @@ class App:
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
-            "fileManagement": file_management,
             "researchAudits": audit_options,
         }
 
@@ -2060,7 +2178,6 @@ class App:
         review_only=False,
         continuation_source="", stopped_stage="",
         research_audits=None,
-        file_management=True,
         retrieval_mode="live", retrieval_cutoff_utc="",
         revise_existing=False,
     ):
@@ -2108,7 +2225,6 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             research_audits=research_audits if not review_only else None,
-            file_management=file_management,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         if options["retrievalMode"] == "historical":
@@ -2415,7 +2531,6 @@ class App:
             "--speed", self.state["speedMode"],
             "--author-limit-file", str(author_limit_file),
             "--author-steer-file", str(author_steer_file),
-            "--set", "file_management=" + json.dumps(self.state.get("fileManagement", True)),
         ]
         for role in ("author", "critic", "writer"):
             options.extend([
@@ -2881,7 +2996,6 @@ class App:
         continuation_source="", stopped_stage="",
         allow_external_source=False,
         research_audits=None,
-        file_management=True,
         source_file=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
@@ -2897,7 +3011,6 @@ class App:
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
         if continuation_source:
-            file_management = saved_file_management(continuation_source)
             saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
             if saved_prompt.is_file():
                 original_template = read_utf8(saved_prompt, "saved author prompt")
@@ -2921,7 +3034,6 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             research_audits=research_audits,
-            file_management=file_management,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         options["sourceFile"] = source_file
@@ -3152,7 +3264,7 @@ class App:
             raise ValueError("A saved statement and complete proof are required.")
         if "\0" in statement or "\0" in solution:
             raise ValueError("Saved critic inputs cannot contain NUL characters.")
-        file_management = saved_file_management(source_run) if source_run else True
+
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             thinking_hours=thinking_hours,
@@ -3169,7 +3281,6 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
-            file_management=file_management,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         if options["retrievalMode"] == "historical":
@@ -3814,15 +3925,6 @@ def saved_goal_thread_id(run_dir):
     return identity
 
 
-def saved_file_management(run_dir):
-    """Old runs are managed; only an explicit saved false selects simple mode."""
-    try:
-        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
-        return True
-    return not isinstance(settings, dict) or settings.get("fileManagement") is not False
-
-
 def saved_goal_options(run_dir):
     """Recover generic session/workspace settings without reading author files."""
 
@@ -3836,7 +3938,6 @@ def saved_goal_options(run_dir):
     if not workspace.is_dir():
         raise ValueError(f"The saved author workspace no longer exists: {workspace}")
     return {"goalWorkspace": str(workspace), "goalResume": True,
-            "fileManagement": not isinstance(settings, dict) or settings.get("fileManagement") is not False,
             "goalThreadId": saved_goal_thread_id(run_dir)}
 
 
@@ -4119,8 +4220,6 @@ def restore_saved_app(app):
         return app
     records = _run_records(run_dir)
     state = empty_state(app.state["trace"], app.state["traceVersion"])
-    # Historical jobs predate the opt-in switch and used managed author records.
-    state.update(fileManagement=True, authorPrompt=default_prompts()["author"])
     state["runId"] = run_dir.name
     draft_path = run_dir / "draft.md"
     try:
@@ -4169,7 +4268,7 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "researchAudits", "researchAuditProgress",
-                "problemMode", "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
                 "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
@@ -4178,7 +4277,7 @@ def restore_saved_app(app):
                         state["launchHold"] = "Invalid saved historical launch controls; repair before launch."
                         continue
                     if key in {
-                        "skipStatementReview", "statementReviewOnly", "fileManagement", "preparedRun",
+                        "skipStatementReview", "statementReviewOnly", "preparedRun",
                     } and not isinstance(settings[key], bool):
                         continue
                     if (
@@ -4206,9 +4305,6 @@ def restore_saved_app(app):
                     state[key] = settings[key]
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
-    if not state["fileManagement"]:
-        state["authorPrompt"] = default_prompts()["author_simple"]
-        state["researchAudits"] = {**audits.default_settings(), "models": ["none", "none", "none"]}
     warnings = audits.selected_warnings(state["researchAuditProgress"].get("warnings"), state["researchAudits"])
     state["researchAuditStatus"].update(warnings=warnings, lastError="\n".join(item["message"] for item in warnings))
     for name in ("review", "author", "critic", "final"):
@@ -4693,8 +4789,6 @@ def saved_critic_source(path):
     statement = saved_statement(run_dir)
     defaults = default_prompts()
     prompts = {}
-    if not saved_file_management(run_dir):
-        defaults["author"] = defaults["author_simple"]
     for name in ("author", "critic", "final"):
         prompt_path = run_dir / "prompts" / f"{name}.txt"
         prompts[name] = (
@@ -4744,8 +4838,6 @@ def saved_research_source(path):
             if settings[f"{role}Model"] != saved:
                 replaced.append(role)
     defaults = default_prompts()
-    if settings.get("fileManagement") is False:
-        defaults["author"] = defaults["author_simple"]
     for role in ("author", "critic", "final"):
         path = source / "prompts" / f"{role}.txt"
         settings[f"{role}Prompt"] = (
@@ -4859,7 +4951,6 @@ class Server(ThreadingHTTPServer):
             ),
             **review_only_option,
             research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
-            file_management=body.get("fileManagement", app.state.get("fileManagement", True) if run_id else False),
             retrieval_mode=body.get("retrievalMode", app.state.get("retrievalMode", "live") if run_id else "live"),
             retrieval_cutoff_utc=body.get("retrievalCutoffUtc", app.state.get("retrievalCutoffUtc", "") if run_id else ""),
             # A named job is revised in its own folder, never re-registered.
@@ -4889,7 +4980,6 @@ class Server(ThreadingHTTPServer):
             "writer_effort": body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("author", "critic", "final")),
             "research_audits": body.get("researchAudits"),
-            "file_management": body.get("fileManagement", False),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
         }
@@ -5108,7 +5198,6 @@ class Server(ThreadingHTTPServer):
             continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
             research_audits=options.get("researchAudits"),
-            file_management=options.get("fileManagement", True),
         )
         warning = removed_model_warning(
             role for role in source.get("replacedRoles", ()) if f"{role}Model" not in (settings or {}))
@@ -5416,7 +5505,6 @@ class Server(ThreadingHTTPServer):
                 critic_prompt=source_state["criticPrompt"],
                 final_prompt=source_state["finalPrompt"],
                 review_only=source_state["statementReviewOnly"],
-                file_management=source_state.get("fileManagement", True),
                 research_audits=source_state.get("researchAudits"),
                 **common,
             )
@@ -5435,7 +5523,6 @@ class Server(ThreadingHTTPServer):
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
                 "final_prompt": source_state["finalPrompt"],
-                "file_management": source_state.get("fileManagement", True),
                 "research_audits": source_state.get("researchAudits"),
                 **common,
             }
@@ -5628,7 +5715,7 @@ class Server(ThreadingHTTPServer):
 
     def save_api_model(self, body):
         """Create or update one API model; an empty apiKey keeps the saved key
-        while the format, base URL and header name stay the same.
+        while the format and base URL stay the same.
 
         A new model with exactly the settings a job recorded for a removed API
         model gets that model's id back, whatever its display name, so the job
@@ -5652,8 +5739,7 @@ class Server(ThreadingHTTPServer):
                 removed = self._removed_api_models()
                 if not requested:
                     same = sorted(model for model, (_, settings) in removed.items() if settings and all(
-                        settings[key] == entry[key] for key in ("format", "baseUrl", "model"))
-                        and settings["headerName"].lower() == entry["headerName"].lower())
+                        settings[key] == entry[key] for key in ("format", "baseUrl", "model")))
                     if same:
                         settings = removed[same[0]][1]
                         body = {**body, "id": same[0], "label": body.get("label") or settings["label"]}
@@ -5689,28 +5775,35 @@ class Server(ThreadingHTTPServer):
             warning = (
                 f"{count} job{'s' if count != 1 else ''} waiting to start or resume still "
                 f"use{'s' if count == 1 else ''} {saved['label']}; {'it' if count == 1 else 'they'} "
-                "cannot continue until you add it again with the same format, base URL, header "
-                "name and model ID."
+                "cannot continue until you add it again with the same format, base URL and model ID."
             )
         return {"deleted": model_id, "warning": warning, **self.api_model_listing()}
+
+    def discover_api_models(self, body):
+        """List the models a new or saved API key can access, before choosing one."""
+
+        requested = body.get("id") or None
+        fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "apiKey") if key in body}
+        entry = providers.validated_api_connection(fields, requested)
+        return discover_api_models(entry)
 
     def probe_api_model(self, body):
         """Test a saved API model ({id}) or unsaved form fields with one request.
 
         Form fields with the id of a saved model fill gaps from that model; an
-        empty key is filled in only while the format, base URL and header name
+        empty key is filled in only while the format and base URL
         are the saved ones, so the saved key never goes to another destination.
         Only a test of exactly the saved settings is recorded as its last test.
         """
 
         requested = body.get("id") or None
-        fields = {key: body[key] for key in ("format", "baseUrl", "headerName", "model", "apiKey", "label")
+        fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "label")
                   if key in body}
         if requested and not fields and providers.api_model(requested) is None:
             raise ValueError("That API model is not configured.")
         entry, saved = providers.validated_api_model(fields, requested)
         result = probe_api_endpoint(entry)
-        request_fields = ("format", "baseUrl", "headerName", "model", "apiKey")
+        request_fields = ("format", "baseUrl", "requestSource", "model", "apiKey")
         result["recorded"] = False
         if saved is not None and all(saved[key] == entry[key] for key in request_fields):
             try:
@@ -5940,6 +6033,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api-models": self.server.save_api_model,
                 "/api-models/delete": self.server.delete_api_model,
                 "/api-models/test": self.server.probe_api_model,
+                "/api-models/discover": self.server.discover_api_models,
             }
             if request.path in api_model_actions:
                 return self.send(api_model_actions[request.path](body))

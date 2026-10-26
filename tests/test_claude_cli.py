@@ -342,9 +342,9 @@ class FakeClaudeCase(unittest.TestCase):
     def texts(self):
         return [message["message"]["content"][0]["text"] for message in self.inputs()]
 
-    def api_model(self, header="x-api-key", base="https://gateway.example.com/v1"):
+    def api_model(self, header="x-api-key", base="https://gateway.example.com/v1", source=""):
         return providers.save_api_model({"format": "anthropic", "baseUrl": base, "headerName": header,
-                                         "model": "gateway-claude", "apiKey": SECRET, "label": "Gateway"})["id"]
+                                         "model": "gateway-claude", "apiKey": SECRET, "label": "Gateway", "requestSource": source})["id"]
 
     def assertPrivateFilesRemoved(self):
         settings_parent = providers.state_directory() / providers.CLAUDE_SETTINGS
@@ -541,14 +541,14 @@ class StructuredTests(FakeClaudeCase):
         self.assertEqual(self.records(), [])
 
     def test_anthropic_api_model_uses_bare_mode_and_a_private_gateway_settings_file(self):
-        for header, variable in (("x-api-key", "ANTHROPIC_API_KEY"), ("Authorization", "ANTHROPIC_AUTH_TOKEN"),
-                                 ("X-Gateway-Key", "ANTHROPIC_CUSTOM_HEADERS")):
-            with self.subTest(header=header):
+        for header, source in (("x-api-key", ""), ("Authorization", "Zephy-TCS-Prover"),
+                               ("X-Gateway-Key", "Research client")):
+            with self.subTest(header=header, source=source):
                 self.log.unlink(missing_ok=True)
                 self.events.clear()
                 for model in providers.load_api_models():
                     providers.delete_api_model(model["id"])
-                model = self.api_model(header)
+                model = self.api_model(header, source=source)
                 self.script([["init", {"structured": {"statement": "S", "notes": ""}}]])
                 with mock.patch.object(claude_cli, "sandbox_supported", return_value=True):
                     runtime.structured("Review.", SCHEMA, "review", model=model, features=("shell_tool",))
@@ -561,13 +561,10 @@ class StructuredTests(FakeClaudeCase):
                 self.assertEqual((start["settings_mode"], start["settings_dir_mode"]), ("0o600", "0o700"))
                 gateway = start["settings"]["env"]
                 self.assertEqual(gateway["ANTHROPIC_BASE_URL"], "https://gateway.example.com")
-                expected = f"{header}: {SECRET}" if variable == "ANTHROPIC_CUSTOM_HEADERS" else SECRET
-                self.assertEqual(gateway[variable], expected)
-                for other in {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"} - {variable}:
-                    if other == "ANTHROPIC_API_KEY" and variable == "ANTHROPIC_CUSTOM_HEADERS":
-                        self.assertEqual(gateway[other], claude_cli.API_KEY_PLACEHOLDER)
-                    else:
-                        self.assertNotIn(other, gateway)
+                self.assertEqual(gateway["ANTHROPIC_API_KEY"], SECRET)
+                self.assertEqual(gateway["ANTHROPIC_CUSTOM_HEADERS"], "User-Agent: " + (source or "TCS-Prover"))
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", gateway)
+                self.assertNotIn("Gateway", json.dumps(gateway))
                 for alias in ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                               "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
                     self.assertEqual(gateway[alias], "gateway-claude")
@@ -1251,6 +1248,22 @@ class PrivateSettingsTests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {providers.STORE_ENV: str(self.root / "state" / "api-models.json")})
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_gateway_environment_uses_standard_auth_and_a_separate_request_source(self):
+        for source in ("", "Zephy-TCS-Prover"):
+            with self.subTest(source=source):
+                model = providers.save_api_model({
+                    "format": "anthropic", "baseUrl": "https://gateway.example.com/v1",
+                    "model": "gateway-claude", "apiKey": SECRET,
+                    "headerName": "Zephy-TCS-Prover", "requestSource": source,
+                    "label": "Local display name",
+                })
+                environment = claude_cli.gateway_environment(model["id"], SECRET)
+                self.assertEqual(environment["ANTHROPIC_API_KEY"], SECRET)
+                self.assertEqual(environment["ANTHROPIC_CUSTOM_HEADERS"], "User-Agent: " + (source or "TCS-Prover"))
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", environment)
+                self.assertNotIn("Local display name", json.dumps(environment))
+                self.assertEqual(environment["ANTHROPIC_BASE_URL"], "https://gateway.example.com")
 
     @unittest.skipIf(os.name == "nt", "POSIX process liveness")
     def test_sweep_removes_only_the_folders_of_ended_processes(self):

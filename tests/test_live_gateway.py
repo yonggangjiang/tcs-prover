@@ -68,7 +68,7 @@ class _ApiModelRoutes:
         status, value = self.request('/api-models')
         self.assertEqual((status, value['route'], value['method']), (200, '/api-models', 'GET'))
         self.assertNotIn('batchId', value)
-        for path in ('/api-models', '/api-models/delete', '/api-models/test'):
+        for path in ('/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover'):
             status, value = self.request(path, method='POST', body={'id': 'api:gateway'})
             self.assertEqual((status, value['route'], value['method']), (200, path, 'POST'))
         self.assertEqual([json.loads(body) for method, path, body in self.current.calls if path == '/api-models/test'],
@@ -77,6 +77,8 @@ class _ApiModelRoutes:
         # The same authorization, query and body checks as every other route.
         self.assertEqual(self.request('/api-models', authenticate=False)[0], 403)
         self.assertEqual(self.request('/api-models/test', method='POST', body={}, authenticate=False)[0], 403)
+        self.assertEqual(self.request('/api-models/discover', method='POST', body={}, authenticate=False)[0], 403)
+        self.assertEqual(self.request('/api-models/discover?job=current', method='POST', body={})[0], 404)
         self.assertEqual(self.request('/api-models?job=current')[0], 404)
         self.assertEqual(self.request('/api-models/delete?job=current', method='POST', body={})[0], 404)
         self.assertEqual(self.request('/api-models/test', method='POST', body={},

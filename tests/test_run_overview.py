@@ -23,7 +23,7 @@ class RunRecoveryTests(unittest.TestCase):
         self.run = self.app.run_dir
         self.statement = "Exact approved negative-weight shortest-path statement"
         self.app._save("checked-statement.md", "# Checked statement\n\n" + self.statement)
-        self.app.state.update(fileManagement=False, skipStatementReview=True,
+        self.app.state.update(skipStatementReview=True,
                               goalThreadId="saved-author", elapsedSeconds=100,
                               resumedAt="2026-10-12T10:00:00+00:00")
         self.app._save_job_settings(self.app.state)
@@ -135,7 +135,7 @@ class Element {
 const ui = new Proxy({}, {get(target, name) {return target[name] ||= new Element();}});
 const state = {runId: 'saved-run', phase: 'running', stage: 'solve', activeNode: 'author',
   draft: 'Original negative-weight statement', statement: 'Exact approved statement <script>text</script>',
-  review: {statement: 'Earlier reviewed version'}, fileManagement: false,
+  review: {statement: 'Earlier reviewed version'},
   processAlive: true, workerActive: true, activeElapsedSeconds: 180, thinkingHours: 168,
   workflow: {nodes: {author: {label: 'Proof author'}}}, trace: [],
   authorModel: 'gpt-6.1-sol', authorEffort: 'max', criticModel: 'gpt-6-astra', criticEffort: 'high',

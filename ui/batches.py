@@ -355,7 +355,7 @@ class BatchCatalog:
         api_models = saved_api_models(settings.get('apiModels'))
         if api_models:
             state['apiModels'] = api_models
-        for key in ('fileManagement', 'preparedRun', 'skipStatementReview', 'statementReviewOnly'):
+        for key in ('preparedRun', 'skipStatementReview', 'statementReviewOnly'):
             if isinstance(settings.get(key), bool):
                 state[key] = settings[key]
         for key in ('thinkingHours', 'criticRounds'):

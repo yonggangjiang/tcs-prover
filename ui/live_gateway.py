@@ -43,7 +43,7 @@ CONTROL_ROUTES = {'/delete-job', '/resume', '/start-research-audit', '/resume-cr
                   '/stop', '/pause', '/reset', '/clear-trace'}
 # API models belong to the updated controller's installation, not to a job:
 # GET lists them; the POST routes save, delete and test one.
-API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test'}
+API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover'}
 
 
 class GatewayError(Exception):

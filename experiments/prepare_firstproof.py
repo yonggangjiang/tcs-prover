@@ -19,7 +19,7 @@ SETTING_KEYS = (
     'reviewModel', 'authorModel', 'criticModel', 'writerModel', 'reasoningEffort',
     'reviewEffort', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds',
     'thinkingHours', 'speedMode', 'reasoningSummary', 'researchAudits',
-    'problemMode', 'skipStatementReview', 'statementReviewOnly', 'fileManagement',
+    'problemMode', 'skipStatementReview', 'statementReviewOnly',
     'preparedRun', 'sourceFile', 'goalThreadId', 'goalWorkspace', 'goalResume',
     'launchHold', 'retrievalPolicyPath',
 )
@@ -139,13 +139,13 @@ def prepare(runs_root=None, control_root=None, problems=None):
         # surrounding whitespace. Preserve the original bytes in input.md.
         (folder / 'checked-statement.md').write_text('# Statement sent directly to the proof author\n\n' + statement.strip(), encoding='utf-8')
         settings = {key: defaults[key] for key in SETTING_KEYS}
-        settings.update(preparedRun=True, skipStatementReview=True, fileManagement=False,
+        settings.update(preparedRun=True, skipStatementReview=True,
                         speedMode='fast', sourceFile=item['id'] + '.md', launchHold=HOLD,
                         retrievalPolicyPath=str(policy_path), goalWorkspace=str(folder),
                         thinkingHours=manifest['executionOverrides']['thinkingHours'])
         write_json(folder / 'job-settings.json', settings)
         for role in ('review', 'author', 'critic', 'final'):
-            prompt = prompts['author_simple' if role == 'author' else role]
+            prompt = prompts[role]
             p = folder / 'prompts' / (role + '.txt')
             p.parent.mkdir(exist_ok=True)
             p.write_text(prompt, encoding='utf-8')

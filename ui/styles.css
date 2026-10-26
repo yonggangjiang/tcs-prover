@@ -3518,7 +3518,7 @@ kbd {
 .api-model-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; margin-top: var(--space-4); }
 .api-model-fields .field { margin-top: 0; }
 .api-field-wide { grid-column: 1 / -1; }
-.api-model-form input { font-family: var(--font-mono); font-size: var(--text-sm); }
+.api-model-form :is(input, select) { min-width: 0; font-family: var(--font-mono); font-size: var(--text-sm); }
 .api-key-help { font-size: var(--text-xs); }
 /* Header help: code samples keep the 12px floor (no em-relative shrink). */
 .api-header-help { margin-top: var(--space-3); }

@@ -37,16 +37,16 @@ const state = {phase:'running',stage:'solve',activeNode:'author',problemMode:'st
   workflow:{nodes:{author:{label:'Proof author'}}},
   retrievalCapabilities:{historicalAvailable:true},
   retrieval:{mode:'disabled',fixed:false,available:true}};
-let mode = 'statement', auditModels = ['none','none','none'], managed = false;
+let mode = 'statement', auditModels = ['none','none','none'];
 const sent = [];
 const context = {ui,state,assert,Date,Number,sent,document:{createElement:tag=>new Element(tag)},
   show:(element,visible)=>element.hidden=!visible,selectedProblemMode:()=>mode,
-  managesResearchFiles:()=>managed,researchAuditValues:()=>({models:auditModels}),
+  researchAuditValues:()=>({models:auditModels}),
   promptOverrides:{},stateReceivedAt:Date.now(),describe:()=>null,clockText:()=>'',
   timer:null,jobsTimer:null,clearTimeout:()=>{},promptValues:{final:'Writer prompt'},
   request:async(path,body)=>{sent.push({path,body});return {runId:'created'};},
   adoptJob:()=>{},render:()=>{},
-  setMode:value=>mode=value,setAudits:value=>auditModels=value,setManaged:value=>managed=value};
+  setMode:value=>mode=value,setAudits:value=>auditModels=value};
 const selected = source.slice(source.indexOf('function retrievalConfiguration('), source.indexOf('function renderJobs('))
   + source.slice(source.indexOf('function selectedRetrievalMode()'), source.indexOf('// Keep the compact footer'))
   + source.slice(source.indexOf('function describe(entry)'), source.indexOf('function cardIcon('))
@@ -146,7 +146,7 @@ for (const model of ['claude-opus-5-5','api:lab-sol']) {
     +'Choose a Codex CLI model for the independent critic.');
   assert.equal(ui.criticModel.focused,true);
 }
-ui.criticModel.value='gpt-6.1-sol';setManaged(true);setAudits(['gpt-6-astra','none','none']);
+ui.criticModel.value='gpt-6.1-sol';setAudits(['gpt-6-astra','none','none']);
 assert.equal(validateRetrievalSettings(),false);
 setAudits(['none','none','none']);assert(validateRetrievalSettings());
 """)
@@ -156,7 +156,7 @@ setAudits(['none','none','none']);assert(validateRetrievalSettings());
 delete state.retrievalCapabilities;
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value=' -1 ';
 ui.skipStatementReview.checked=false;ui.criticModel.value='claude-opus-5-5';
-setManaged(true);setAudits(['gpt-6-astra','none','none']);
+setAudits(['gpt-6-astra','none','none']);
 renderRetrievalSettings();
 assert(!ui.retrievalCutoffSetting.hidden);assert(!ui.retrievalCutoffUtc.disabled);
 assert.equal(proofJobSettings().retrievalMode,'disabled');
@@ -247,7 +247,7 @@ assert.equal(ui.runStatement.textContent,'A precise theorem');
 
     def test_historical_runs_do_not_offer_unsupported_optional_audits(self):
         self.browser(r"""
-setManaged(true);state.retrieval={mode:'historical'};
+state.retrieval={mode:'historical'};
 renderResearchAudits(true);
 for (const name of ['researchAuditsControl','researchAuditToolbar','researchAuditActivity','researchAuditStatus']) {
   assert(ui[name].hidden);

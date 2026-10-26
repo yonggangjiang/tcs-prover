@@ -222,13 +222,6 @@
                     <small>Check and rewrite the statement, then stop. No proof stages run.</small>
                   </span>
                 </label>
-                <label id="fileManagementSetting" class="toggle-card switch-card" for="fileManagement">
-                  <span>
-                    <strong>Manage research files</strong>
-                    <small id="fileManagementHelp">Off · Focus on proving the statement with a simple author prompt.</small>
-                  </span>
-                  <input id="fileManagement" type="checkbox" role="switch" aria-describedby="fileManagementHelp">
-                </label>
               </div>
               <details id="researchAuditsSetting" class="research-audits research-audits-initial" hidden>
                 <summary>Research audits <span>Optional independent suggestions</span></summary>
@@ -401,9 +394,10 @@
                             spellcheck="false" placeholder="https://api.openai.com/v1">
                         </div>
                         <div class="field">
-                          <label for="apiModelHeaderName">Header name</label>
-                          <input id="apiModelHeaderName" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-                            value="Authorization" aria-describedby="apiModelHeaderHelp">
+                          <label for="apiModelRequestSource">Request source <span>(optional)</span></label>
+                          <input id="apiModelRequestSource" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                            placeholder="TCS-Prover" maxlength="200" aria-describedby="apiModelSourceHelp">
+                          <p id="apiModelSourceHelp" class="help">Sent to the router as User-Agent. Leave blank for TCS-Prover.</p>
                         </div>
                         <div class="field">
                           <label for="apiModelKey">API key</label>
@@ -412,18 +406,22 @@
                           <p id="apiModelKeyHelp" class="help api-key-help">Stored only on this computer and never shown again.</p>
                         </div>
                         <div class="field">
-                          <label for="apiModelId">Model ID</label>
-                          <input id="apiModelId" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-                            placeholder="gpt-6.1-sol">
+                          <label for="apiModelId">Model</label>
+                          <select id="apiModelId" aria-describedby="apiModelOptionsHelp" disabled>
+                            <option value="">Load models from your connection</option>
+                          </select>
+                          <p id="apiModelOptionsHelp" class="help">Enter the connection details, then load its available models.</p>
+                          <button id="apiModelLoadButton" class="secondary compact" type="button">Load models</button>
                         </div>
                         <div class="field">
                           <label for="apiModelName">Display name <span>(optional)</span></label>
-                          <input id="apiModelName" type="text" autocomplete="off" placeholder="Model · host">
+                          <input id="apiModelName" type="text" autocomplete="off" placeholder="Model · host" aria-describedby="apiModelNameHelp">
+                          <p id="apiModelNameHelp" class="help">A label inside TCS Prover; it is not sent to the router.</p>
                         </div>
                       </div>
-                      <p id="apiModelHeaderHelp" class="help api-header-help">OpenAI-compatible endpoints usually read the key from
-                        <code>Authorization</code> (sent as <code>Bearer &lt;key&gt;</code>); Anthropic endpoints read
-                        <code>x-api-key</code>. Any other header receives the key as it is.</p>
+                      <p id="apiModelAuthHelp" class="help api-header-help">Authentication is automatic:
+                        <code>Authorization: Bearer &lt;key&gt;</code> for OpenAI-compatible connections,
+                        or <code>x-api-key</code> for Anthropic.</p>
                       <div class="api-model-form-actions">
                         <p id="apiModelTestResult" class="api-test-result" role="status"></p>
                         <button id="apiModelCancelButton" class="ghost" type="button" hidden>Cancel editing</button>

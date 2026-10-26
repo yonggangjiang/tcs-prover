@@ -118,7 +118,7 @@ class StoreTests(StoreCase):
         saved = json.loads(self.store.read_text())
         self.assertEqual(saved["version"], 1)
         entry = saved["models"][0]
-        self.assertEqual(set(entry), {"id", "label", "format", "baseUrl", "headerName", "model", "apiKey",
+        self.assertEqual(set(entry), {"id", "label", "format", "baseUrl", "headerName", "requestSource", "model", "apiKey",
                                       "createdAt", "updatedAt", "lastTest"})
         self.assertEqual((entry["headerName"], entry["baseUrl"]), ("Authorization", "https://api.example.com/v1"))
 
@@ -153,6 +153,30 @@ class StoreTests(StoreCase):
         self.assertEqual(providers.api_model_secret(model["id"]), "replacement-key-9876")
         self.assertEqual(len(providers.load_api_models()), 1)
 
+    def test_request_source_is_optional_saved_and_independent_of_the_display_label(self):
+        model = self.save(label="Local menu name", requestSource="  Zephy-TCS-Prover  ")
+        self.assertEqual(model["requestSource"], "Zephy-TCS-Prover")
+        providers.record_api_model_test(model["id"], {"ok": True, "status": 200, "message": "OK"})
+        updated = providers.save_api_model({"id": model["id"], "requestSource": "New source", "apiKey": ""})
+        self.assertEqual(updated["label"], "Local menu name")
+        self.assertEqual(updated["requestSource"], "New source")
+        self.assertIsNone(updated["lastTest"])
+        self.assertEqual(providers.api_model_secret(model["id"]), KEY)
+        blank = providers.save_api_model({"id": model["id"], "requestSource": ""})
+        self.assertEqual(blank["requestSource"], "")
+
+    def test_legacy_custom_auth_header_loads_with_format_authentication(self):
+        model = self.save()
+        raw = json.loads(self.store.read_text())
+        raw["models"][0]["headerName"] = "Zephy-TCS-Prover"
+        raw["models"][0].pop("requestSource", None)
+        self.store.write_text(json.dumps(raw))
+        loaded = providers.api_model(model["id"])
+        self.assertEqual((loaded["headerName"], loaded["requestSource"]), ("Authorization", ""))
+        updated = providers.save_api_model({"id": model["id"], "apiKey": ""})
+        self.assertEqual(updated["headerName"], "Authorization")
+        self.assertEqual(providers.api_model_secret(model["id"]), KEY)
+
     def test_validation_rejects_unsafe_or_malformed_settings(self):
         invalid = [
             {"format": "gemini"},
@@ -161,7 +185,8 @@ class StoreTests(StoreCase):
             {"baseUrl": "https://user:pass@api.example.com"}, {"baseUrl": "https://api.example.com/v1#x"},
             {"baseUrl": "https://api.example.com/v1?api-version=1"}, {"baseUrl": "https://api.example.com/ v1"},
             {"baseUrl": "https://" + "a" * 2050 + ".com"}, {"baseUrl": "https://api.example.com:99999"},
-            {"headerName": "X Key"}, {"headerName": "X-Key:"}, {"headerName": "x" * 65}, {"headerName": "Ünicode"},
+            {"requestSource": "line\nbreak"}, {"requestSource": "x" * 201}, {"requestSource": "Ünicode"},
+            {"requestSource": 5},
             {"model": ""}, {"model": "gpt\nx"}, {"model": "--dangerously-skip-permissions"}, {"model": "m" * 201},
             {"apiKey": ""}, {"apiKey": "Bearer "}, {"apiKey": "two words"}, {"apiKey": "line\nbreak"},
             {"apiKey": "k" * 4097}, {"label": "x" * 201}, {"label": "bad\x00label"}, {"id": "api:Upper"},
@@ -233,7 +258,7 @@ class StoreTests(StoreCase):
     def test_a_saved_key_is_reused_only_for_the_destination_it_was_saved_for(self):
         model = self.save(headerName="X-Gateway-Key")
         for change in ({"baseUrl": "https://attacker.example/v1"}, {"baseUrl": "https://api.example.com/v2"},
-                       {"baseUrl": "https://api.example.com:8443/v1"}, {"headerName": "X-Leak"},
+                       {"baseUrl": "https://api.example.com:8443/v1"},
                        {"format": "anthropic"}):
             with self.subTest(change=change):
                 for attempt in (lambda: providers.validated_api_model({**change, "apiKey": ""}, model["id"]),
@@ -243,9 +268,9 @@ class StoreTests(StoreCase):
                     self.assertIn("Enter the API key again", str(failure.exception))
                     self.assertNotIn(KEY, str(failure.exception))
         self.assertEqual(providers.api_model(model["id"])["baseUrl"], "https://api.example.com/v1")
-        # The same destination (header names are case-insensitive) keeps the key.
-        entry, _ = providers.validated_api_model({"headerName": "x-gateway-key", "model": "gpt-z"}, model["id"])
-        self.assertEqual(entry["apiKey"], KEY)
+        # Authentication is chosen from the format, even for legacy form fields.
+        entry, _ = providers.validated_api_model({"headerName": "X-Leak", "model": "gpt-z"}, model["id"])
+        self.assertEqual((entry["apiKey"], entry["headerName"]), (KEY, "Authorization"))
         entry, _ = providers.validated_api_model({"baseUrl": "https://attacker.example/v1", "apiKey": "typed-key-0123"},
                                                  model["id"])
         self.assertEqual(entry["apiKey"], "typed-key-0123")

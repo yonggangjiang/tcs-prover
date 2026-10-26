@@ -87,7 +87,6 @@ class FolderBatchTests(unittest.TestCase):
                 self.assertEqual(app.state["sourceFile"], item["name"])
                 self.assertTrue(app.state["skipStatementReview"])
                 self.assertIs(app.state["workflow"], server.DIRECT_GRAPH)
-                self.assertFalse(app.state["fileManagement"])
                 self.assertEqual((app.run_dir / "prompts/critic.txt").read_text(), "Shared critic.\n")
                 self.assertTrue((app.run_dir / "checked-statement.md").read_text().startswith(
                     "# Statement sent directly to the proof author"))
@@ -101,16 +100,13 @@ class FolderBatchTests(unittest.TestCase):
         restored = server.restore_saved_app(server.App(started[0].trace_file, self.runs))
         self.assertEqual(restored.state["sourceFile"], "a.md")
 
-    def test_file_management_and_research_audits_apply_to_every_job(self):
+    def test_independent_research_audits_apply_to_every_job(self):
         started = self.manager.start_direct_batch({
-            "statements": self.statements("a.md", "b.md"), "fileManagement": True,
+            "statements": self.statements("a.md", "b.md"),
             "researchAudits": {"models": ["gpt-6-astra", "none", "none"], "intervalHours": 1},
         })
         for app in started:
-            self.assertTrue(app.state["fileManagement"])
             self.assertEqual(app.state["researchAudits"]["models"][0], "gpt-6-astra")
-        for argv, _ in self.launches:
-            self.assertIn("file_management=true", argv)
 
     def test_everything_is_validated_before_any_job_starts(self):
         good = self.statements("a.md", "b.md")
@@ -133,10 +129,9 @@ class FolderBatchTests(unittest.TestCase):
             ({"statements": good, "criticRounds": 0}, "round"),
             ({"statements": good, "thinkingHours": -1}, "hours"),
             ({"statements": good, "speedMode": "warp"}, "speed"),
-            ({"statements": good, "fileManagement": "yes"}, "File management"),
-            ({"statements": good, "fileManagement": True,
+            ({"statements": good,
               "researchAudits": {"models": ["bogus"]}}, ""),
-            ({"statements": good, "promptOverrides": {"author_simple": "No marker."}}, "STATEMENT"),
+            ({"statements": good, "promptOverrides": {"author": "No marker."}}, "STATEMENT"),
             ({"statements": good, "promptOverrides": {"bogus": "x"}}, "Prompt overrides"),
         )
         for body, message in invalid:
@@ -239,8 +234,7 @@ class FolderBatchBrowserTests(unittest.TestCase):
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const slice = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
-const code = slice('function managesResearchFiles(', 'function selectedAuthorPrompt(')
-  + slice('function selectedRetrievalMode()', '// Keep the compact footer')
+const code = slice('function selectedRetrievalMode()', '// Keep the compact footer')
   + slice('const promptLabels =', 'function clockText(')
   + slice('async function startReview(', 'async function startLatexOnly(');
 const setup = `
@@ -251,7 +245,7 @@ const values = {authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
   writerModel: 'gpt-5.6-luna', authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
   speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168',
   retrievalMode: 'live', retrievalCutoffUtc: ''};
-const ui = new Proxy({fileManagement: {checked: false}}, {get(target, name) {
+const ui = new Proxy({}, {get(target, name) {
   return target[name] ||= {dataset: {}, value: values[name], scrollIntoView() { this.scrolled = true; }};
 }});
 const show = (element, visible) => { element.hidden = !visible; };
@@ -306,9 +300,9 @@ const checks = `
     statements: body.statements,
     authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol', writerModel: 'gpt-5.6-luna',
     authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
-    promptOverrides: {critic: 'Shared critic.'}, fileManagement: false,
+    promptOverrides: {critic: 'Shared critic.'},
     criticRounds: 2, thinkingHours: 168,
-    researchAudits: {intervalHours: 0, models: ['none', 'none', 'none']},
+    researchAudits: {intervalHours: 2, models: ['gpt-6-astra', 'none', 'none']},
     speedMode: 'fast', reasoningSummary: 'concise',
     retrievalMode: 'live', retrievalCutoffUtc: '',
   });

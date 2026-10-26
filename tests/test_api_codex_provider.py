@@ -53,9 +53,9 @@ class ApiCase(unittest.TestCase):
         self.resolver = resolver.start()
         self.addCleanup(resolver.stop)
 
-    def model(self, header="Authorization", label="Team gateway", base="https://api.example.com/v1/"):
+    def model(self, header="Authorization", label="Team gateway", base="https://api.example.com/v1/", source=""):
         return providers.save_api_model({"format": "openai", "baseUrl": base, "headerName": header,
-                                         "model": "gpt-gateway-x", "apiKey": KEY, "label": label})["id"]
+                                         "model": "gpt-gateway-x", "apiKey": KEY, "label": label, "requestSource": source})["id"]
 
     @staticmethod
     def overrides(arguments):
@@ -81,12 +81,13 @@ class ProviderArgumentTests(ApiCase):
         arguments = runtime.provider_arguments(self.model())
         self.assertEqual(arguments, [
             "-c", 'model_provider="tcs_api"',
-            "-c", 'model_providers.tcs_api.name="Team gateway"',
+            "-c", 'model_providers.tcs_api.name="TCS Prover"',
             "-c", 'model_providers.tcs_api.base_url="https://api.example.com/v1"',
             "-c", 'model_providers.tcs_api.wire_api="responses"',
             "-c", "model_providers.tcs_api.supports_websockets=false",
             "-c", "model_providers.tcs_api.requires_openai_auth=false",
             "-c", 'model_providers.tcs_api.env_key="TCS_PROVER_API_TOKEN"',
+            "-c", 'model_providers.tcs_api.http_headers={"User-Agent"="TCS-Prover"}',
             # The model's shell commands never inherit the key or the placeholder.
             "-c", "shell_environment_policy.ignore_default_excludes=false",
             "-c", 'shell_environment_policy.exclude=["TCS_PROVER_API_TOKEN","OPENAI_API_KEY"]',
@@ -97,24 +98,25 @@ class ProviderArgumentTests(ApiCase):
         self.assertNotIn("model_catalog_json", " ".join(arguments))
         self.assertNotIn(KEY, " ".join(arguments))
 
-    def test_other_headers_use_env_http_headers_case_insensitively(self):
-        self.assertIn('model_providers.tcs_api.env_key="TCS_PROVER_API_TOKEN"',
-                      runtime.provider_arguments(self.model(header="authorization")))
-        arguments = runtime.provider_arguments(self.model(header="X-Api-Key"))
-        self.assertIn('model_providers.tcs_api.env_http_headers={"X-Api-Key"="TCS_PROVER_API_TOKEN"}', arguments)
-        self.assertNotIn("env_key", " ".join(arguments))
-        self.assertIn('shell_environment_policy.exclude=["TCS_PROVER_API_TOKEN","OPENAI_API_KEY"]', arguments)
+    def test_legacy_custom_headers_still_use_automatic_bearer_authentication(self):
+        for header in ("authorization", "X-Api-Key", "Zephy-TCS-Prover"):
+            arguments = runtime.provider_arguments(self.model(header=header))
+            self.assertIn('model_providers.tcs_api.env_key="TCS_PROVER_API_TOKEN"', arguments)
+            self.assertNotIn("env_http_headers", " ".join(arguments))
+            self.assertIn('shell_environment_policy.exclude=["TCS_PROVER_API_TOKEN","OPENAI_API_KEY"]', arguments)
 
     @unittest.skipIf(tomllib is None, "tomllib is needed to parse Codex overrides")
-    def test_every_override_is_valid_toml_including_awkward_labels(self):
+    def test_request_source_is_quoted_and_local_display_label_is_not_transmitted(self):
         label = 'Quote " back\\slash ünïcode {braces} = sign'
-        arguments = runtime.provider_arguments(self.model(header="X-Gateway-Key", label=label))
+        source = 'Zephy " research\\client {test} = source'
+        arguments = runtime.provider_arguments(self.model(label=label, source=source))
         parsed = {}
         for key, value in self.overrides(arguments):
             parsed[key] = tomllib.loads(f"value = {value}")["value"]
-        self.assertEqual(parsed["model_providers.tcs_api.name"], label)
+        self.assertEqual(parsed["model_providers.tcs_api.name"], "TCS Prover")
+        self.assertNotIn(label, " ".join(arguments))
         self.assertEqual(parsed["model_providers.tcs_api.base_url"], "https://api.example.com/v1")
-        self.assertEqual(parsed["model_providers.tcs_api.env_http_headers"], {"X-Gateway-Key": "TCS_PROVER_API_TOKEN"})
+        self.assertEqual(parsed["model_providers.tcs_api.http_headers"], {"User-Agent": source})
         self.assertIs(parsed["model_providers.tcs_api.supports_websockets"], False)
         self.assertIs(parsed["shell_environment_policy.ignore_default_excludes"], False)
         self.assertEqual(parsed["shell_environment_policy.exclude"], ["TCS_PROVER_API_TOKEN", "OPENAI_API_KEY"])

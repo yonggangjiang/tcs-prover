@@ -26,7 +26,7 @@ class Element {
   querySelector(selector) {return all(this).find(node => selector.startsWith('.') && node.className.split(' ').includes(selector.slice(1)));}
 }
 const ui = {workflowNodes: new Element('ol')};
-const state = {phase: 'running', stage: 'solve', activeNode: 'author', fileManagement: true,
+const state = {phase: 'running', stage: 'solve', activeNode: 'author',
   problemMode: 'statement', skipStatementReview: true, criticRounds: 2,
   workflow: JSON.parse(process.argv[2]), trace: [{node: 'author'}],
   researchAudits: {models: ['gpt-6-astra', 'claude-opus', 'none'], intervalHours: 2},
@@ -128,13 +128,11 @@ renderWorkflow();
 assert.equal(row('research_audit').attributes['aria-current'], undefined);
 """)
 
-    def test_audits_only_appear_in_workflows_that_use_research_files(self):
+    def test_audits_appear_only_when_the_workflow_contains_an_author(self):
         self.run_sidebar(r"""
-state.fileManagement = false;
 renderWorkflow();
-assert(!row('research_audit'));
+assert(row('research_audit'));
 assert(row('author'));
-state.fileManagement = true;
 state.statementReviewOnly = true;
 renderWorkflow();
 assert(!row('research_audit'));
@@ -163,7 +161,7 @@ assert.match(text(row('author')), /Ready to start/);
 
     def test_rejected_critic_is_not_a_completed_pass_during_author_repair(self):
         self.run_sidebar(r"""
-state.fileManagement = false;
+
 state.stage = 'repair'; state.round = 1;
 state.trace.push({kind: 'critic_result', node: 'critic', round: 1, report: {verdict: 'reject'}});
 state.finalInputReady = true; // Stale approval cannot override the newest verdict.
@@ -289,7 +287,7 @@ assert.equal(row('critic').children[0].textContent, '✓');
 
     def test_edited_pass_shows_next_round_and_clean_pass_accepts_same_cycle(self):
         self.run_sidebar(r"""
-state.activeNode = 'critic'; state.stage = 'critic'; state.fileManagement = false;
+state.activeNode = 'critic'; state.stage = 'critic';
 state.trace = [
   {kind: 'request', stage: 'critic', time: 't1', attempt: 1, text: 'Original proof'},
   {kind: 'critic_result', time: 't2', round: 1, outcome: 'fixed', report: {verdict: 'pass', solution: 'Revised proof'}},

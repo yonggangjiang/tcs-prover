@@ -1,4 +1,4 @@
-# One persistent author session; the LLM maintains its research files.
+# One persistent author session for proving the exact statement.
 nodes:
   author:
     run: goal
@@ -54,7 +54,8 @@ nodes:
         - set: {output: state.solution}
         - emit: {kind: status, label: Critic approved, acceptanceReason: round_limit, round: '=visit', roundLimit: '=limit', text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
 prompts:
-  author_simple: |-
+  # EDIT AUTHOR HERE: instructions for proving the exact statement.
+  author: |-
     The following is the statement to prove. Try to prove it with a complete, rigorous argument.
 
     On macOS or Linux, when complete, write the entire self-contained proof to
@@ -68,20 +69,21 @@ prompts:
 
     STATEMENT:
     [STATEMENT]
-  goal_simple: >-
+  goal: >-
     Prove the exact statement given in the initial prompt with a complete, rigorous argument.
-  continuation_simple: >-
+  continuation: >-
     Continue trying to prove the same statement in this conversation. Return a
     complete, rigorous solution only when the exact statement is resolved.
-  compaction_simple: >-
+  compaction: >-
     Continue the same proof task using the conversation summary. Preserve the
     exact assumptions and requested conclusion.
-  resume_simple: |-
+  resume: |-
     Continue trying to prove the statement below, using any previous work in this conversation.
+    If independent reports are present in AUDITS/, consider their advice before continuing.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
-  repair_simple: |-
+  repair: |-
     Correct the unresolved errors in this candidate and continue proving the exact statement.
 
     CURRENT CANDIDATE:
@@ -90,68 +92,6 @@ prompts:
     CRITIC BUGS:
     {bugs}
 
-  # EDIT AUTHOR HERE: research freedom and all author-managed file instructions.
-  author: |-
-    Resolve the exact statement below with a complete, rigorous proof. Think deeply and consider substantially diversified approaches.
-
-    You, the author LLM, create, read, search, and update your research records and thinking process using file tools. Inspect the working directory first. For a new run, create INITIAL_PROMPT.md with this entire initial author prompt verbatim, including the exact statement and every instruction; create APPROACHES/index.md with the heading "# Attempted approaches" and PROVED.md with "# Proved lemmas". Create files only if absent. For an existing run, read and follow its saved INITIAL_PROMPT.md and memory layout.
-
-    Maintain these research records in the current working directory, please strictly follow the file structure and do not create new files or change the file structure, except for the proof.md submission file described below:
-
-    1. INITIAL_PROMPT.md is the permanent instruction file, containing the complete initial prompt and exact statement. Follow it throughout the task. Do not rewrite, shorten, or replace it without an explicit user instruction. Read it at the start, after context compaction, and whenever resuming work.
-
-    2. APPROACHES/ contains a simple directed acyclic graph (DAG) of attempted approaches. Each node is a Markdown file with a stable ID and descriptive name, for example A001-xxx.md. An edge A -> B means that approach B developed from approach A. An approach may have no parents or several parents.
-
-    APPROACHES/index.md is a short navigation table with one row per node: linked ID and title, parent IDs, children IDs, status, and a concise result or remaining question. This parent table defines the DAG. Update the table whenever a node is added or its position changes, with links to the relevant detailed records.
-
-    Each node file has this markdown structure:
-
-    # A001 — Descriptive title
-    Parents: linked IDs, or none.
-    Children: linked IDs, or none.
-    Status: ACTIVE, BLOCKED, CLOSED, or RESOLVED.
-
-    ACTIVE means currently being developed; BLOCKED means unresolved, with the obstacle recorded; CLOSED means a precisely identified construction or claim has failed; RESOLVED means that node's stated objective is achieved.
-
-    For the following sections, the writing should follow strictly the following rules: Assuming the reader only knows the original definitions and statment in INITIAL_PROMPT.md. The definitions should be self-contained, with every first appearance of a term or symbol clearly defined under the convention of the field where the original statement is from. Before finishing a node update, read its opening using only the original problem statement and the text preceding each sentence. For every imported procedure, term or sentence that can not be understood within just the context of the original statement, clearly define and explain it. A name, lemma ID, or parent link should be provided for each related explaination. 
-
-    ## Context and objective
-
-    Define the local problem. Split this part into three parts. 1. Backgrounds: Given all the definitions and context that the author should know before reading the objective, they can be definitions or procedures, prelims from other parts of this project. 2. Objective: a clearly defined objective that the reader is able to understand with only the backgrounds and general TCS knowledge under the field of the orginal statement. 3. Connection to the overall research goal: explain how this node's objective relates to the original statement and the overall research goal.
-
-    ## Detailed work
-
-    Append all mathematical work and thinking process towards the objective described above. Let above.
-
-    This part should be well-organized into subsections, where at the begining of each subsection state clearly what this subsection pursue, ideally with a lemma, and how it relates to the overall objective. This principle applies in every level of hierarchy: before doing anything, state clearly what you are targeting at and how that target relates to the general context.
-
-    ## Obstacles
-
-    This section is only required if the node is BLOCKED. State clearly what is the obstacle and why it is blocked. Record whether this approach is still pursued. If yes, refer to the child node that is being developed to overcome the obstacle. If no, explain why this approach is abandoned, what other approaches are being pursued, and when is this approach likely to be revisited. 
-
-    ## Conclusions
-
-    This section is only required if the node is RESOLVED or CLOSED. If the node is RESOLVED, state clearly what is proved; If the proof is recorded in PROVED.md, give the lemma ID and a brief description. If the node is CLOSED, state clearly what is disproved or what is the obstacle that cannot be overcome; Again, if the proof is recorded in PROVED.md, give the lemma ID and a brief description.
-
-    3. PROVED.md contains only important re-usable rigorously established lemmas and complete proofs. Use stable IDs such as L001, precise statements with all assumptions, and clear links to the approach nodes each lemma supports or rules out. Positive and negative results are both welcome. If a recorded lemma is found wrong, withdraw its proved status, preserve the erroneous argument and correction in the relevant node, and identify affected dependencies before relying on them.
-
-    Apply the same self-contained writing principle as above: every lemma and proof should be readable without assuming the reader knows the global context. The lemmas should not contain everything proved, but only those that are important and re-usable.
-
-    4. AUDITS/ contains only the current batch of independent audit reports, one Markdown file per report. When an audit batch starts, the controller pauses your research and moves all previous reports from AUDITS/ to audit_history/. Auditors read this same working directory directly, without copying the research files, and leave your records unchanged. The controller saves the new reports in AUDITS/ and resumes your existing goal and conversation after the batch finishes. On resumption, read the current reports before continuing. Consider their suggestions as advisory and decide whether to use them; they do not override the statement or these instructions. Leave AUDITS/ and audit_history/ intact; the controller manages them. Older runs may also have audit.md; preserve it as historical advice. You remain responsible for organizing and updating your own research records.
-
-    Return a complete, self-contained solution only when it resolves the exact statement and every necessary claim is justified. A special case, reduction to an unproved claim, or progress report is not a complete solution. A counterexample resolves the task only if the statement permits that answer and its validity is fully proved.
-
-    On macOS or Linux, when complete, write the entire self-contained proof to
-    proof.md in this working directory and submit exactly PROOF_FILE: proof.md
-    as your final response. Include every necessary argument in that file: the
-    critic receives only a read-only snapshot of it and the exact statement,
-    not your research records. After a rejection, update proof.md with the
-    revised complete proof and submit it again. A complete inline proof is also
-    accepted. On Windows, return the entire self-contained proof inline in your
-    final response, including after a rejection; do not submit a file pointer.
-
-    STATEMENT:
-    [STATEMENT]
   critic: |-
     Act as a rigorous proof critic. Spawn multiple fresh independent subagents to
     aggressively find bugs in the exact statement and candidate proof. Give each
@@ -174,39 +114,6 @@ prompts:
     proof in solution. If no edits are needed, copy the candidate proof verbatim.
     Return only the requested JSON.
 
-  goal: >-
-    Resolve the exact statement in INITIAL_PROMPT.md with a complete, rigorous
-    solution. Follow its instructions and maintain the research records it defines.
-  continuation: >-
-    Continue the same goal in this session. Read INITIAL_PROMPT.md and follow it;
-    recover the relevant saved context using its memory layout. Preserve and
-    update the research records. Return a complete, rigorous solution only when
-    the exact statement is resolved.
-  compaction: >-
-    Context was compacted. Read INITIAL_PROMPT.md now and follow its instructions.
-    Recover the relevant saved context using its memory layout, preserve the
-    records, and continue the same goal.
-  resume: |-
-    Resume the existing task in this working directory: {directory}
-    Use your file tools to read INITIAL_PROMPT.md first and follow its current
-    instructions and memory layout, including any explicit user-approved migration.
-    Continue the same goal.
-    If new reports are present in AUDITS/, read them and consider their advice
-    before continuing.
-
-    ORIGINAL INITIAL AUTHOR PROMPT:
-    {original_prompt}
-  repair: |-
-    The following proof contains unresolved errors. The critic rejected round
-    {round}. Read INITIAL_PROMPT.md and follow its instructions. Recover the
-    relevant saved context, record the objections and any corrections, and
-    continue the same goal toward a complete, rigorous solution.
-
-    CURRENT CANDIDATE:
-    {solution}
-
-    CRITIC BUGS:
-    {bugs}
   critic_input: |
     CRITIC INSTRUCTIONS:
     {instructions}

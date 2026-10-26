@@ -423,7 +423,7 @@ class AuditPauseErrorTests(IsolatedTestCase):
         self.app._new_run("Exact task")
         self.app._save("checked-statement.md", "# Checked statement\n\nExact task\n")
         self.app.state.update(phase="running", activeNode="author", stage="solve", runId=self.app.run_dir.name,
-                              goalWorkspace=str(self.app.run_dir), fileManagement=True,
+                              goalWorkspace=str(self.app.run_dir),
                               goalThreadId="saved-author-thread",
                               researchAudits={"intervalHours": 2, "models": ["gpt-6-astra", "none", "none"]})
         self.app._save_job_settings(self.app.state)

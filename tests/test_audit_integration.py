@@ -22,8 +22,7 @@ class AuditIntegrationTests(unittest.TestCase):
         self.app = server.App(runs=self.runs)
         self.app._new_run("Exact task")
         self.app.state.update(phase="paused", activeNode="author", stage="solve",
-                              runId=self.app.run_dir.name, goalWorkspace=str(self.app.run_dir),
-                              fileManagement=True)
+                              runId=self.app.run_dir.name, goalWorkspace=str(self.app.run_dir))
         self.app._save("checked-statement.md", "# Checked statement\n\nExact task\n")
         self.app.add_trace({"kind": "status", "stage": "solve", "node": "author"})
         self.options = {"intervalHours": 2, "models": ["gpt-6-astra", "none", "claude-opus"]}
@@ -64,16 +63,12 @@ class AuditIntegrationTests(unittest.TestCase):
         self.assertFalse((self.app.run_dir / "AUDITS").exists())
         engine.after_batch.assert_called_once_with(engine)
 
-    def test_simple_runs_reject_audits_and_never_start_scheduler(self):
-        token = self.app.worker_token = self.app.active_token = object()
-        self.app.state.update(phase="running", fileManagement=False, researchAudits=self.options)
-        with patch.object(audits, "ResearchAudits") as constructor:
-            self.app._start_research_audits(token)
-        constructor.assert_not_called()
-        for action in (lambda: self.app.set_research_audits(self.options),
-                       self.app.start_research_audit_now):
-            with self.assertRaisesRegex(ValueError, "require file management"):
-                action()
+    def test_audits_are_available_without_research_notebooks(self):
+        self.assertFalse((self.app.run_dir / "INITIAL_PROMPT.md").exists())
+        self.assertFalse((self.app.run_dir / "APPROACHES").exists())
+        self.app.set_research_audits(self.options)
+        self.assertEqual(self.app.state["researchAudits"], self.options)
+        self.assertFalse((self.app.run_dir / "INITIAL_PROMPT.md").exists())
 
     def test_live_settings_persist_without_restart_or_note_changes(self):
         self.app._save("INITIAL_PROMPT.md", "Original instructions")

@@ -39,7 +39,6 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(app.state['launchHold'])
             self.assertEqual(app.state['retrievalPolicyPath'], row['policy'])
             self.assertTrue(app.state['skipStatementReview'])
-            self.assertFalse(app.state['fileManagement'])
             self.assertEqual(app.state['speedMode'], 'fast')
             self.assertEqual(app.state['thinkingHours'], 0)
             for key in ('authorModel', 'criticModel', 'writerModel', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'reasoningSummary', 'researchAudits'):

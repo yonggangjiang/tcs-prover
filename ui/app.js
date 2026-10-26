@@ -125,8 +125,6 @@ const ui = {
   skipStatementReview: $("skipStatementReview"),
   reviewOnlySetting: $("reviewOnlySetting"),
   statementReviewOnly: $("statementReviewOnly"),
-  fileManagement: $("fileManagement"), fileManagementSetting: $("fileManagementSetting"),
-  fileManagementHelp: $("fileManagementHelp"),
   speedModeSetting: $("speedModeSetting"),
   criticRoundSetting: $("criticRoundSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
@@ -752,15 +750,6 @@ function selectedProblemMode() {
   return [...ui.problemModes].find((input) => input.checked)?.value || "statement";
 }
 
-function managesResearchFiles(source = state) {
-  // Runs saved before this option existed used the managed author by default.
-  return source.runId ? source.fileManagement !== false : ui.fileManagement.checked;
-}
-
-function selectedAuthorPrompt() {
-  return managesResearchFiles() ? "author" : "author_simple";
-}
-
 function setProblemMode(mode) {
   const latexOnly = mode === "latex";
   const statement = !latexOnly;
@@ -787,13 +776,7 @@ function setProblemMode(mode) {
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
   show(ui.retrievalSetting, true);
-  show(ui.fileManagementSetting, !latexOnly && !reviewOnly);
-  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly && ui.fileManagement.checked);
-  ui.fileManagementHelp.textContent = ui.fileManagement.checked
-    ? "On · Organize approach files, proved lemmas, and optional research audits."
-    : "Off · Focus on proving the statement with a simple author prompt.";
-  ui.authorPromptTab.dataset.prompt = selectedAuthorPrompt();
-  ui.authorPromptTab.textContent = ui.fileManagement.checked ? "Author · managed" : "Author · simple";
+  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly);
   ui.problem.required = statement;
   ui.latexInput.required = latexOnly;
   ui.check.textContent = latexOnly ? "Polish LaTeX"
@@ -812,7 +795,7 @@ function setProblemMode(mode) {
   if (reviewOnly && activePrompt !== "review" && ui.promptDialog.open) {
     selectPrompt("review");
   } else if (skipReview && activePrompt === "review" && ui.promptDialog.open) {
-    selectPrompt(selectedAuthorPrompt());
+    selectPrompt("author");
   }
   if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
     selectPrompt("final");
@@ -948,7 +931,7 @@ function validateRetrievalSettings({ folder = false } = {}) {
   } else if (cutoffBlockedRoles().length) {
     message = cutoffModelMessage();
     focus = ui[`${cutoffBlockedRoles()[0]}Model`];
-  } else if (managesResearchFiles() && researchAuditValues().models.some(model => model !== "none")) {
+  } else if (researchAuditValues().models.some(model => model !== "none")) {
     message = "Set each optional research audit to None for a historical proof job.";
     ui.researchAuditsSetting.open = true;
     focus = ui.researchAuditModels[0];
@@ -1012,14 +995,13 @@ function updateModelSummary() {
 }
 
 const promptLabels = {
-  review: "Reviewer prompt", author: "Managed author prompt", author_simple: "Simple author prompt",
+  review: "Reviewer prompt", author: "Author prompt",
   critic: "Critic prompt", final: "Final writer prompt",
 };
 
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow replaces it with your statement.",
-  author_simple: "Used when research file management is off. Keep exactly one [STATEMENT] for your statement.",
   critic: "Each critic call receives the statement and latest proof, then follows these instructions to use fresh independent subagents.",
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
@@ -1034,10 +1016,6 @@ function syncPrompts(source = state) {
 
 function savedPrompt(source, name) {
   if (!source.runId) return "";
-  if (name === "author" || name === "author_simple") {
-    const selected = source.fileManagement === false ? "author_simple" : "author";
-    return name === selected ? source.authorPrompt : "";
-  }
   return source[`${name}Prompt`];
 }
 
@@ -1086,7 +1064,7 @@ async function openPromptEditor() {
     promptDrafts = { ...promptValues };
     promptOriginals = { ...promptValues };
     activePrompt = selectedProblemMode() === "latex" ? "final"
-      : ui.skipStatementReview.checked ? selectedAuthorPrompt() : "review";
+      : ui.skipStatementReview.checked ? "author" : "review";
     selectPrompt(activePrompt);
     ui.promptDialog.showModal();
   } catch (error) {
@@ -1099,9 +1077,8 @@ async function openPromptEditor() {
 function promptProblem() {
   const empty = Object.keys(promptDrafts).find((name) => !promptDrafts[name].trim());
   if (empty) return [empty, "Every role prompt must contain instructions."];
-  const author = ["author", "author_simple"].find(
-    (name) => (promptDrafts[name]?.match(/\[STATEMENT\]/g) || []).length !== 1);
-  return author ? [author, "Each author prompt must contain exactly one [STATEMENT]."] : null;
+  return (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length === 1
+    ? null : ["author", "The author prompt must contain exactly one [STATEMENT]."];
 }
 
 // The dialog is modal, so its own errors appear inside it, next to the prompt to fix.
@@ -1115,10 +1092,8 @@ function savePrompts() {
   const problem = promptProblem();
   if (problem) {
     const [role, message] = problem;
-    // The author tab edits only the selected variant; name the other one.
-    const elsewhere = role.startsWith("author") && role !== selectedAuthorPrompt();
-    if (!elsewhere) selectPrompt(role);
-    showPromptError(elsewhere ? `${message} (the ${role === "author" ? "managed" : "simple"} author prompt)` : message);
+    selectPrompt(role);
+    showPromptError(message);
     ui.promptEditor.focus();
     return;
   }
@@ -1849,7 +1824,7 @@ function syncMemoryPanel() {
     selectMemoryFile(memoryTabs[0]);
   }
   const visible = Boolean(identity) && !ui.run.hidden
-    && state.problemMode !== "latex" && !state.statementReviewOnly && managesResearchFiles();
+    && state.problemMode !== "latex" && !state.statementReviewOnly;
   show(ui.memoryPanel, visible);
   if (visible) followArchivedMemoryFile();
   if (!visible) {
@@ -2076,7 +2051,7 @@ function unconfiguredJobModelText(model, role) {
   const saved = state.apiModels?.[model];
   const how = saved
     ? `with the same settings (${saved.label} · ${saved.format === "anthropic" ? "Anthropic" : "OpenAI"} format · `
-      + `${saved.baseUrl} · header ${saved.headerName} · model ${saved.model})`
+      + `${saved.baseUrl} · model ${saved.model})`
     : `with the display name “${model.slice("api:".length)}”`;
   return `The API model ${model} chosen for the ${labels[role]} is not configured. Add it again under `
     + `New problem → Advanced settings → API models ${how} to continue this job.`;
@@ -2195,7 +2170,6 @@ function renderRunOverview() {
     ["LaTeX writer", modelRecord(state.writerModel, state.writerEffort || state.reasoningEffort)],
     ...(settingsWarning ? [["Settings warning", settingsWarning]] : []),
     ["Generation", state.speedMode || "standard"], ["Activity summaries", state.reasoningSummary || "concise"],
-    ["Research files", state.fileManagement === false ? "Off" : "Managed"],
     ["Web search", retrievalSummary(state)],
     ["Conversation", state.goalThreadId ? "Saved · resumes in this workspace" : "Not started"],
   ];
@@ -2858,41 +2832,38 @@ function renderWorkflow() {
   selfRoute.className = "loop-self";
   selfRoute.textContent = `↻ PASS with changes → next round (limit ${state.criticRounds || 2})`;
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
-  let authorGroup = author;
-  if (state.fileManagement !== false) {
-    authorGroup = document.createElement("li");
-    authorGroup.className = "author-audit-group";
-    const group = document.createElement("ol");
-    group.className = "author-audit-nodes" + (!selectedAuditors && !auditing ? " audits-disabled" : "");
-    group.setAttribute("aria-label", "Author and research audits: pause, audit, then resume the same author");
-    const warnings = (auditStatus.warnings || []).length;
-    const problem = warnings || auditStatus.batchError || auditStatus.lastError;
-    const latest = [...(state.trace || [])].reverse().find(entry => entry.kind === "research_audit"
-      && ["completed", "cancelled"].includes(entry.status) && (auditConfig.models || []).includes(entry.model));
-    const status = auditing ? "active" : !selectedAuditors ? "disabled" : problem ? "warning"
-      : latest?.status === "completed" ? "complete" : "";
-    const note = auditing ? (state.phase === "pausing" ? "Waiting for author"
-      : state.phase === "running" && !state.auditHoldingAuthor ? "Checking auditors" : runningAuditors
-        ? `${runningAuditors} auditor${runningAuditors === 1 ? "" : "s"} active` : "Finishing batch")
-      : !selectedAuditors ? "Disabled" : problem ? "Needs attention"
-        : latest?.status === "completed" ? "Reports saved" : latest?.status === "cancelled" ? "Cancelled"
-          : authorStage ? state.phase === "paused" ? "Ready while paused" : "Scheduled" : "Waiting for author";
-    const description = auditing ? (state.auditHoldingAuthor
-      ? "Review saved work, then resume the author." : "Check availability before pausing the author.")
-      : !selectedAuditors ? "Select auditors to review the author's work."
-        : `${selectedAuditors} selected · every ${auditConfig.intervalHours ?? 2} author hours or on demand.`;
-    const audit = makeNode("research_audit", "↻", {status, note,
-      item: {label: "Research audits", description}});
-    const connection = document.createElement("li");
-    connection.className = "audit-cycle-route";
-    connection.textContent = "⇄";
-    connection.setAttribute("aria-hidden", "true");
-    const caption = document.createElement("li");
-    caption.className = "audit-cycle-caption";
-    caption.textContent = "Pause author → audit → resume author";
-    group.append(author, connection, audit, caption);
-    authorGroup.append(group);
-  }
+  const authorGroup = document.createElement("li");
+  authorGroup.className = "author-audit-group";
+  const group = document.createElement("ol");
+  group.className = "author-audit-nodes" + (!selectedAuditors && !auditing ? " audits-disabled" : "");
+  group.setAttribute("aria-label", "Author and research audits: pause, audit, then resume the same author");
+  const warnings = (auditStatus.warnings || []).length;
+  const problem = warnings || auditStatus.batchError || auditStatus.lastError;
+  const latest = [...(state.trace || [])].reverse().find(entry => entry.kind === "research_audit"
+    && ["completed", "cancelled"].includes(entry.status) && (auditConfig.models || []).includes(entry.model));
+  const status = auditing ? "active" : !selectedAuditors ? "disabled" : problem ? "warning"
+    : latest?.status === "completed" ? "complete" : "";
+  const note = auditing ? (state.phase === "pausing" ? "Waiting for author"
+    : state.phase === "running" && !state.auditHoldingAuthor ? "Checking auditors" : runningAuditors
+      ? `${runningAuditors} auditor${runningAuditors === 1 ? "" : "s"} active` : "Finishing batch")
+    : !selectedAuditors ? "Disabled" : problem ? "Needs attention"
+      : latest?.status === "completed" ? "Reports saved" : latest?.status === "cancelled" ? "Cancelled"
+        : authorStage ? state.phase === "paused" ? "Ready while paused" : "Scheduled" : "Waiting for author";
+  const description = auditing ? (state.auditHoldingAuthor
+    ? "Review saved work, then resume the author." : "Check availability before pausing the author.")
+    : !selectedAuditors ? "Select auditors to review the author's work."
+      : `${selectedAuditors} selected · every ${auditConfig.intervalHours ?? 2} author hours or on demand.`;
+  const audit = makeNode("research_audit", "↻", {status, note,
+    item: {label: "Research audits", description}});
+  const connection = document.createElement("li");
+  connection.className = "audit-cycle-route";
+  connection.textContent = "⇄";
+  connection.setAttribute("aria-hidden", "true");
+  const caption = document.createElement("li");
+  caption.className = "audit-cycle-caption";
+  caption.textContent = "Pause author → audit → resume author";
+  group.append(author, connection, audit, caption);
+  authorGroup.append(group);
   const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
   passStem.className = "critic-pass-stem";
@@ -2987,7 +2958,7 @@ function fillResearchAuditControls(live = false) {
 }
 
 function renderResearchAudits(canEdit) {
-  if (state.readOnly || !managesResearchFiles() || state.retrieval?.mode === "historical" || state.retrievalPolicyPath) {
+  if (state.readOnly || state.retrieval?.mode === "historical" || state.retrievalPolicyPath) {
     for (const element of [ui.researchAuditsControl, ui.researchAuditToolbar,
       ui.researchAuditActivity, ui.researchAuditStatus]) show(element, false);
     return;
@@ -3250,7 +3221,6 @@ function render(next) {
     restoreRetrievalSettings(state);
     ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
     ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
-    ui.fileManagement.checked = Boolean(state.fileManagement);
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 2;
@@ -3263,7 +3233,6 @@ function render(next) {
     setProblemMode(state.problemMode || "statement");
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
-    ui.fileManagement.checked = state.fileManagement !== false;
     syncModelMenus();
     setChoice(ui.reviewModel, state.reviewModel || "gpt-6.1-sol");
     setChoice(ui.authorModel, state.authorModel || "gpt-6.1-sol");
@@ -3623,7 +3592,7 @@ async function startReview(statement, feedback = "") {
   if (!reviewOnly && !validateWorkflowHours()) return;
   clearTimeout(timer);
   clearTimeout(jobsTimer);
-  if (!(skipReview ? promptValues[selectedAuthorPrompt()] : promptValues.review)) syncPrompts();
+  if (!(skipReview ? promptValues.author : promptValues.review)) syncPrompts();
   reviewPending = !skipReview;
   const job = currentJob;
   const batch = currentBatch;
@@ -3673,11 +3642,9 @@ function proofJobSettings() {
     criticEffort: ui.criticEffort.value,
     writerEffort: ui.writerEffort.value,
     promptOverrides,
-    fileManagement: managesResearchFiles(),
     criticRounds: Number(ui.criticRounds.value),
     thinkingHours: Number(ui.thinkingHours.value),
-    researchAudits: managesResearchFiles() ? researchAuditValues()
-      : { intervalHours: 0, models: ["none", "none", "none"] },
+    researchAudits: researchAuditValues(),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
     ...selectedRetrievalSettings(),
@@ -3953,12 +3920,6 @@ ui.statementReviewOnly.onchange = () => {
   if (ui.statementReviewOnly.checked) ui.skipStatementReview.checked = false;
   setProblemMode(selectedProblemMode());
 };
-ui.fileManagement.onchange = () => {
-  setProblemMode(selectedProblemMode());
-  if (ui.promptDialog.open && ["author", "author_simple"].includes(activePrompt)) {
-    selectPrompt(selectedAuthorPrompt());
-  }
-};
 for (const input of ui.problemModes) {
   input.onchange = () => setProblemMode(input.value);
 }
@@ -4126,20 +4087,21 @@ const apiUi = {
   status: $("apiModelsStatus"), list: $("apiModelList"), empty: $("apiModelEmpty"),
   form: $("apiModelForm"), formHeading: $("apiModelFormHeading"), formatHelp: $("apiModelFormatHelp"),
   formats: [$("apiModelFormatOpenai"), $("apiModelFormatAnthropic")],
-  baseUrl: $("apiModelBaseUrl"), headerName: $("apiModelHeaderName"), key: $("apiModelKey"),
+  baseUrl: $("apiModelBaseUrl"), requestSource: $("apiModelRequestSource"), key: $("apiModelKey"),
   keyHelp: $("apiModelKeyHelp"), model: $("apiModelId"), label: $("apiModelName"),
+  modelHelp: $("apiModelOptionsHelp"), discover: $("apiModelLoadButton"),
   result: $("apiModelTestResult"), cancel: $("apiModelCancelButton"),
   test: $("apiModelTestButton"), save: $("apiModelSaveButton"),
 };
-// Per format: the header the key goes in by default (the server's list refines it), the form's
-// examples, and which CLI runs the model with what limits (`help` alternates text and code).
+// Per format: the form's examples and which CLI runs the model with what limits
+// (`help` alternates text and code). The server chooses authentication automatically.
 // The Claude CLI adds /v1/messages to a base URL without its /v1, so either form works.
 const apiFormats = {
-  openai: { name: "OpenAI", headerName: "Authorization", baseUrl: "https://api.openai.com/v1",
-    model: "gpt-6.1-sol", key: "sk-…", help: ["Runs through the Codex CLI with the Responses API (",
+  openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1",
+    key: "sk-…", help: ["Runs through the Codex CLI with the Responses API (",
       "<base URL>/responses", "), always at standard speed."] },
-  anthropic: { name: "Anthropic", headerName: "x-api-key", baseUrl: "https://api.anthropic.com",
-    model: "claude-opus-5-5", key: "sk-ant-…", help: ["Runs through the Claude CLI in bare mode (",
+  anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com",
+    key: "sk-ant-…", help: ["Runs through the Claude CLI in bare mode (",
       "<base URL>/v1/messages", "; a base URL ending in ", "/v1", " works too): no subagents, no web tools "
       + "and no reasoning summaries."] },
 };
@@ -4150,10 +4112,12 @@ let apiModelEditing = null; // the saved model the form edits; null while adding
 let apiModelBusy = false;
 let apiModelsUnavailable = false; // an older server (or gateway) without the API model routes
 let apiModelsLoaded = false; // the list has been read once (the count says "Loading…" until then)
-// Edits to what a test checks (format, base URL, header name, key, model ID). A test result on
+// Edits to what a test checks (format, base URL, source, key, model). A test result on
 // screen ({head}) turns stale at the next such edit, so it never vouches for untested settings.
 let apiFormEdits = 0;
 let apiShownTest = null;
+let apiConnectionEdits = 0;
+let apiDiscoveredModels = [];
 
 async function apiModelRequest(path, body) {
   const options = { headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" };
@@ -4183,9 +4147,6 @@ function apiElement(tag, className = "", text = "") {
 // menus in place. Returns the roles whose removed model fell back to the default.
 function adoptApiModels(data) {
   if (Array.isArray(data.models)) apiModels = data.models;
-  for (const format of data.formats || []) {
-    if (apiFormats[format.id] && format.headerName) apiFormats[format.id].headerName = format.headerName;
-  }
   let replaced = [];
   if (Array.isArray(data.model_catalog)) {
     const settings = state.workflow?.settings || {};
@@ -4220,9 +4181,10 @@ async function loadApiModels() {
 function setApiBusy(busy, button = null, label = "") {
   apiModelBusy = busy;
   apiUi.group.setAttribute("aria-busy", String(busy));
-  for (const control of [apiUi.test, apiUi.save, apiUi.cancel, ...apiUi.list.querySelectorAll("button")]) {
+  for (const control of [apiUi.discover, apiUi.test, apiUi.save, apiUi.cancel, ...apiUi.list.querySelectorAll("button")]) {
     control.disabled = busy || apiModelsUnavailable;
   }
+  apiUi.model.disabled = busy || apiModelsUnavailable || !apiDiscoveredModels.length;
   if (button && label) {
     button.textContent = label;
     const model = apiModels.find((item) => item.id === button.dataset?.apiModel);
@@ -4298,6 +4260,24 @@ function noteApiFormEdit() {
   if (apiShownTest) showStaleApiTest(apiShownTest.head);
 }
 
+function setApiModelOptions(models, preferred = "") {
+  apiDiscoveredModels = models;
+  apiUi.model.replaceChildren(...(models.length
+    ? models.map((model) => new Option(model.label || model.id, model.id))
+    : [new Option("Load models from your connection", "")]));
+  apiUi.model.value = models.some((model) => model.id === preferred) ? preferred : models[0]?.id || "";
+  apiUi.model.disabled = apiModelBusy || apiModelsUnavailable || !models.length;
+  apiUi.modelHelp.textContent = models.length
+    ? "Choose a model available to this connection."
+    : "Enter the connection details, then load its available models.";
+}
+
+function noteApiConnectionEdit() {
+  apiConnectionEdits += 1;
+  noteApiFormEdit();
+  setApiModelOptions([]);
+}
+
 function apiTestTime(value) {
   const date = new Date(value);
   return Number.isFinite(date.getTime())
@@ -4357,25 +4337,17 @@ function selectedApiFormat() {
   return apiUi.formats.find((input) => input.checked)?.value || "openai";
 }
 
-// The header name follows the format until the user types a name of their own.
 function chooseApiFormat(format) {
-  const header = apiUi.headerName.value.trim().toLowerCase();
-  if (!header || Object.values(apiFormats).some((item) => item.headerName.toLowerCase() === header)) {
-    apiUi.headerName.value = apiFormats[format].headerName;
-  }
   for (const input of apiUi.formats) input.checked = input.value === format;
   renderApiForm();
 }
 
 // The server keeps a saved key for an empty field only while the destination it was saved for
-// (format, base URL, header name) is unchanged; otherwise the form asks for the key again.
+// (format and base URL) is unchanged; otherwise the form asks for the key again.
 function apiKeyRequired() {
   if (!apiModelEditing) return true;
-  const format = selectedApiFormat();
-  const header = apiUi.headerName.value.trim() || apiFormats[format].headerName;
-  return format !== apiModelEditing.format
-    || apiUi.baseUrl.value.trim().replace(/\/+$/, "") !== apiModelEditing.baseUrl
-    || header.toLowerCase() !== String(apiModelEditing.headerName || "").toLowerCase();
+  return selectedApiFormat() !== apiModelEditing.format
+    || apiUi.baseUrl.value.trim().replace(/\/+$/, "") !== apiModelEditing.baseUrl;
 }
 
 function renderApiForm() {
@@ -4383,41 +4355,41 @@ function renderApiForm() {
   apiUi.formHeading.textContent = editing ? `Edit ${editing.label}` : "Add an API model";
   apiUi.form.classList.toggle("editing", Boolean(editing));
   if (!apiModelBusy) {
+    apiUi.discover.textContent = "Load models";
     apiUi.test.textContent = "Test connection";
     apiUi.save.textContent = editing ? "Save changes" : "Save model";
   }
   show(apiUi.cancel, Boolean(editing));
   apiUi.formatHelp.replaceChildren(...format.help.map((part, index) => index % 2 ? apiElement("code", "", part) : part));
   apiUi.baseUrl.placeholder = format.baseUrl;
-  apiUi.headerName.placeholder = format.headerName;
-  apiUi.model.placeholder = format.model;
   apiUi.key.required = required;
   apiUi.key.placeholder = !editing ? format.key
     : required ? "Enter the key again" : `Saved key ${editing.keyHint || ""}`.trim();
   apiUi.keyHelp.textContent = !editing ? "Stored only on this computer and never shown again."
-    : required ? "Enter the API key again: a saved key is sent only to the format, base URL and header name it was saved with."
+    : required ? "Enter the API key again: a saved key is sent only to the format and base URL it was saved with."
     : "Leave blank to keep the saved key; a new key replaces it.";
 }
 
 function resetApiForm() {
+  apiConnectionEdits += 1;
   apiModelEditing = null;
-  for (const field of [apiUi.baseUrl, apiUi.key, apiUi.model, apiUi.label]) field.value = "";
-  apiUi.headerName.value = apiFormats[selectedApiFormat()].headerName;
+  for (const field of [apiUi.baseUrl, apiUi.key, apiUi.requestSource, apiUi.label]) field.value = "";
+  setApiModelOptions([]);
   renderApiForm();
 }
 
 // The form's settings, or null after pointing at the first missing field.
-function apiFormValues() {
+function apiFormValues(requireModel = true) {
   const values = {
     format: selectedApiFormat(), baseUrl: apiUi.baseUrl.value.trim(),
-    headerName: apiUi.headerName.value.trim(), apiKey: apiUi.key.value.trim(),
+    requestSource: apiUi.requestSource.value.trim(), apiKey: apiUi.key.value.trim(),
     model: apiUi.model.value.trim(), label: apiUi.label.value.trim(),
   };
   const missing = !values.baseUrl ? [apiUi.baseUrl, "Enter the base URL."]
     : !values.apiKey && apiKeyRequired() ? [apiUi.key, apiModelEditing
-      ? "Enter the API key again: a saved key is sent only to the format, base URL and header name it was saved with."
+      ? "Enter the API key again: a saved key is sent only to the format and base URL it was saved with."
       : "Enter the API key."]
-    : !values.model ? [apiUi.model, "Enter the model ID."] : null;
+    : requireModel && !values.model ? [apiUi.discover, "Load the available models, then choose a model."] : null;
   if (missing) {
     showApiResult("error", "", missing[1]);
     missing[0].focus();
@@ -4425,6 +4397,40 @@ function apiFormValues() {
   }
   if (apiModelEditing) values.id = apiModelEditing.id;
   return values;
+}
+
+async function discoverApiModels() {
+  if (apiModelBusy) return;
+  const values = apiFormValues(false);
+  if (!values) return;
+  delete values.model;
+  delete values.label;
+  const connectionEdits = apiConnectionEdits, preferred = apiUi.model.value;
+  setApiBusy(true, apiUi.discover, "Loading models…");
+  showApiResult("pending", "Loading available models…", "Using this connection's API key.");
+  let result = null, failure = "";
+  try {
+    result = await apiModelRequest("/api-models/discover", values);
+  } catch (error) {
+    failure = error.message;
+  }
+  const stale = connectionEdits !== apiConnectionEdits;
+  if (!stale) setApiModelOptions(result?.ok && Array.isArray(result.models) ? result.models : [], preferred);
+  setApiBusy(false);
+  renderApiForm();
+  restoreApiFocus(apiUi.discover);
+  if (stale) {
+    showApiResult("stale", "Connection details changed", "Load models again for the current connection.");
+  } else if (result?.ok && apiDiscoveredModels.length) {
+    showApiResult("ok", `Loaded ${apiDiscoveredModels.length} model${apiDiscoveredModels.length === 1 ? "" : "s"}.`,
+      "Choose a model, then test or save it.");
+  } else if (result && !result.ok) {
+    if (result.status >= 200 && result.status < 300) {
+      showApiResult("error", "No models loaded", result.message || "This connection returned no available models.");
+    } else showApiResult("error", ...apiTestParts(result));
+  } else {
+    showApiResult("error", "No models loaded", failure || "This connection returned no available models.");
+  }
 }
 
 function replaceApiModel(model) {
@@ -4505,7 +4511,7 @@ async function removeApiModel(model, button) {
   if (apiModelBusy) return;
   const question = `Remove ${model.label}?\n\nIts saved key is deleted from this computer. Jobs that `
     + "wait to start or resume with it cannot continue until you add it again with the same format, "
-    + "base URL, header name and model ID.";
+    + "base URL and selected model.";
   if (!confirm(question)) return;
   setApiBusy(true, button, "Removing…");
   let message = "", warning = false, removed = false;
@@ -4530,12 +4536,14 @@ async function removeApiModel(model, button) {
 }
 
 function editApiModel(model) {
+  apiConnectionEdits += 1;
   apiModelEditing = model;
   for (const input of apiUi.formats) input.checked = input.value === model.format;
   apiUi.baseUrl.value = model.baseUrl;
-  apiUi.headerName.value = model.headerName;
+  apiUi.requestSource.value = model.requestSource || "";
   apiUi.key.value = "";
-  apiUi.model.value = model.model;
+  setApiModelOptions([{ id: model.model, label: model.model }], model.model);
+  apiUi.modelHelp.textContent = "Saved model. Load models to refresh the available choices.";
   // A default display name ("model · host") is left empty so that it follows the settings.
   apiUi.label.value = model.label === `${model.model} · ${model.host}` ? "" : model.label;
   clearApiResult();
@@ -4546,15 +4554,18 @@ function editApiModel(model) {
 
 for (const input of apiUi.formats) {
   input.onchange = () => {
-    noteApiFormEdit();
+    noteApiConnectionEdit();
     chooseApiFormat(input.value);
   };
 }
-apiUi.baseUrl.oninput = apiUi.headerName.oninput = () => {
-  noteApiFormEdit();
+apiUi.baseUrl.oninput = () => {
+  noteApiConnectionEdit();
   renderApiForm();
 };
-apiUi.key.oninput = apiUi.model.oninput = noteApiFormEdit; // the display name is not tested
+apiUi.key.oninput = noteApiConnectionEdit;
+apiUi.requestSource.oninput = noteApiConnectionEdit;
+apiUi.model.onchange = apiUi.model.oninput = noteApiFormEdit; // the display name is not tested
+apiUi.discover.onclick = discoverApiModels;
 apiUi.test.onclick = testApiForm;
 apiUi.save.onclick = saveApiModel;
 apiUi.cancel.onclick = () => {
@@ -4573,6 +4584,7 @@ apiUi.list.onclick = (event) => {
 ui.input.querySelector("details.advanced")?.addEventListener("toggle", (event) => {
   if (event.target.open) loadApiModels();
 });
+setApiModelOptions([]);
 renderApiForm();
 
 // Appearance: the dark theme or the light one (the mode: Light, Dark, or System, which follows

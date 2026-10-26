@@ -781,7 +781,7 @@ class JobListTests(TemporaryRuns):
         self.assertFalse(self.manager.job_list()[0]["auditHoldingAuthor"])
 
     def test_deleting_detaches_an_idle_scheduler_so_late_events_write_nothing(self):
-        self.app.state.update(phase="paused", stage="solve", activeNode="author", fileManagement=True,
+        self.app.state.update(phase="paused", stage="solve", activeNode="author",
                               researchAudits={"intervalHours": 2, "models": ["auditor", "none", "none"]})
         with mock.patch.object(server.audits, "ResearchAudits", FakeEngine):
             engine = self.app._start_research_audits(None, paused=True)

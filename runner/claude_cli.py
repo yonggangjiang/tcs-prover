@@ -58,9 +58,6 @@ SUBAGENT_REFUSALS = ("limit reached", "available agents:", "denied by permission
                      "cannot launch new agents", "inputvalidationerror")
 # Pre-approved writes stay inside the working directory; Edit rules cover Write.
 WRITE_RULE = "Edit(./**)"
-# --bare needs some API credential to start; with a custom header only this
-# public placeholder reaches x-api-key.
-API_KEY_PLACEHOLDER = "tcs-prover-placeholder"
 # The user's own subscription login may be located through these; API models
 # start from an environment without any Claude or Anthropic variable.
 SUBSCRIPTION_ENVIRONMENT = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")
@@ -235,9 +232,8 @@ def sandbox_settings(hidden):
 def gateway_environment(model, key):
     """Settings-file environment that sends every request to the configured endpoint.
 
-    ANTHROPIC_BASE_URL takes no /v1. The key travels only in the configured
-    header: x-api-key (ANTHROPIC_API_KEY), Authorization: Bearer
-    (ANTHROPIC_AUTH_TOKEN) or any other header (ANTHROPIC_CUSTOM_HEADERS). All
+    ANTHROPIC_BASE_URL takes no /v1. The key travels in x-api-key via
+    ANTHROPIC_API_KEY; the optional request source travels in User-Agent. All
     model aliases point at the configured model so no background request asks
     the gateway for a model it lacks.
     """
@@ -254,15 +250,9 @@ def gateway_environment(model, key):
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": name, "ANTHROPIC_DEFAULT_SONNET_MODEL": name,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": name, "CLAUDE_CODE_SUBAGENT_MODEL": name,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "ANTHROPIC_API_KEY": key,
+        "ANTHROPIC_CUSTOM_HEADERS": f"User-Agent: {providers.request_source(entry)}",
     }
-    header = entry["headerName"]
-    if header.lower() == "x-api-key":
-        environment["ANTHROPIC_API_KEY"] = key
-    elif header.lower() == "authorization":
-        environment["ANTHROPIC_AUTH_TOKEN"] = key
-    else:
-        environment["ANTHROPIC_CUSTOM_HEADERS"] = f"{header}: {key}"
-        environment["ANTHROPIC_API_KEY"] = API_KEY_PLACEHOLDER
     return environment
 
 

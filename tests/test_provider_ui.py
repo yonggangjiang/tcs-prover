@@ -263,11 +263,17 @@ class ProviderMarkupTests(unittest.TestCase):
         self.assertEqual(parsed.elements["apiModelFormatOpenai"]["value"], "openai")
         self.assertEqual(parsed.elements["apiModelFormatAnthropic"]["value"], "anthropic")
         self.assertIn("checked", parsed.elements["apiModelFormatOpenai"])
-        self.assertEqual(parsed.elements["apiModelHeaderName"]["value"], providers.DEFAULT_HEADERS["openai"])
+        self.assertNotIn("apiModelHeaderName", parsed.elements)
+        self.assertIn("Authentication is automatic", parsed.texts["apiModelAuthHelp"])
+        self.assertIn("not sent to the router", parsed.texts["apiModelNameHelp"])
         help_text = " ".join(parsed.texts["apiModelFormatHelp"].split())
         self.assertIn("Codex CLI", help_text)
-        for identity in ("apiModelBaseUrl", "apiModelHeaderName", "apiModelId", "apiModelName", "apiModelKey"):
+        for identity in ("apiModelBaseUrl", "apiModelRequestSource", "apiModelId", "apiModelName", "apiModelKey"):
             self.assertIn(identity, [attrs.get("for") for attrs in _labels(INDEX)])
+        self.assertEqual(parsed.elements["apiModelId"]["tag"], "select")
+        self.assertIn("disabled", parsed.elements["apiModelId"])
+        self.assertNotIn("Model ID", parsed.texts["apiModelForm"])
+        self.assertEqual(parsed.elements["apiModelLoadButton"]["type"], "button")
         self.assertIn('id="runSettingsWarning"', INDEX.read_text(encoding="utf-8"))
 
     def test_slice_markers_used_by_the_ui_tests_occur_once(self):
@@ -493,7 +499,6 @@ ui.skipStatementReview.checked = true;
 ui.researchAuditModels = [new Element()];
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
-const managesResearchFiles = () => false;
 const researchAuditValues = () => ({models: ['none', 'none', 'none']});
 const chip = (role) => ui[role + 'ModelProvider'];
 const disabledGroups = (role) => ui[role + 'Model'].children.filter((group) => group.disabled).map((group) => group.label);
@@ -664,7 +669,7 @@ const catalog = [{id: 'gpt-6.1-sol', provider: 'codex'}, {id: 'claude-opus-5-5',
 // A job cannot switch models: the only remedy is adding it again with the settings it recorded.
 const missing = 'The API model api:lab-sol chosen for the critic is not configured. Add it again under '
   + 'New problem → Advanced settings → API models with the same settings (Sol via lab gateway · OpenAI format · '
-  + 'https://gateway.lab.example/v1 · header Authorization · model gpt-6.1-sol) to continue this job.';
+  + 'https://gateway.lab.example/v1 · model gpt-6.1-sol) to continue this job.';
 state = {...state, workflow: {...state.workflow, settings: {model_catalog: catalog}}};
 renderRunOverview();
 assert.equal(rows()['Independent critic'], 'api:lab-sol (not configured) · high · Sol via lab gateway · OpenAI format · '
@@ -702,14 +707,13 @@ assert.equal(ui.runSettingsWarning.textContent, 'The API model api:gone chosen f
     MANAGER = [["// API models (Advanced settings", "// Appearance: the dark theme"]]
     MANAGER_SETUP = r"""
 const elements = {};
-const $ = (id) => elements[id] ||= new Element(['apiModelList'].includes(id) ? 'ul' : 'div');
+const $ = (id) => elements[id] ||= id === 'apiModelId' ? new Select() : new Element(['apiModelList'].includes(id) ? 'ul' : 'div');
 const advanced = new Element('details');
 const ui = {input: {querySelector: (selector) => selector === 'details.advanced' ? advanced : null}};
 for (const [id, value] of [['apiModelFormatOpenai', 'openai'], ['apiModelFormatAnthropic', 'anthropic']]) {
   $(id).value = value;
 }
 $('apiModelFormatOpenai').checked = true;
-$('apiModelHeaderName').value = 'Authorization';
 const sessionToken = 'session-token';
 let state = {workflow: {nodes: {}, settings: {model_catalog: [], model_efforts: {}}}};
 const show = (element, visible) => { element.hidden = !visible; };
@@ -722,7 +726,7 @@ let pendingReplaced = [];
 let answer = true;
 const questions = [];
 const confirm = (question) => { questions.push(question); return answer; };
-document.createElement = (tag) => new Element(tag);
+document.createElement = (tag) => tag === 'select' ? new Select() : new Element(tag);
 const sent = [];
 const fetch = (path, options = {}) => new Promise((resolve) => sent.push({path, options,
   body: options.body ? JSON.parse(options.body) : undefined,
@@ -739,10 +743,13 @@ const lab = {id: 'api:lab-sol', label: 'Sol via lab gateway', format: 'openai', 
   host: 'gateway.lab.example', headerName: 'Authorization', model: 'gpt-6.1-sol', hasKey: true, keyHint: '…2223',
   lastTest: null};
 const type = (id, value) => { $(id).value = value; $(id).oninput?.(); };
+// Existing manager checks begin with model discovery already completed. The discovery checks
+// below exercise the HTTP flow and actual select behavior separately.
+const discovered = () => setApiModelOptions([{id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol'}]);
 const rowButton = (action, id) => $('apiModelList').querySelector(`button[data-api-action="${action}"]`)
   && $('apiModelList').querySelectorAll('button').find((b) => b.dataset.apiAction === action && b.dataset.apiModel === id);
 const click = (button) => $('apiModelList').onclick({target: button});
-const buttons = () => [$('apiModelTestButton'), $('apiModelSaveButton'), ...$('apiModelList').querySelectorAll('button')];
+const buttons = () => [$('apiModelLoadButton'), $('apiModelTestButton'), $('apiModelSaveButton'), ...$('apiModelList').querySelectorAll('button')];
 """
 
     def test_api_model_manager_lists_tests_saves_edits_and_removes(self):
@@ -778,12 +785,13 @@ assert.equal(document.activeElement, $('apiModelKey'));
 
 // Test the unsaved form: the key only in the POST body; every button waits; the result inline.
 type('apiModelKey', other);
+discovered();
 type('apiModelName', 'Sol via lab gateway');
 $('apiModelTestButton').onclick();
 assert.equal(sent.length, 2);
 assert.equal(sent[1].path, '/api-models/test');
 assert.equal(sent[1].options.method, 'POST');
-assert.deepEqual(sent[1].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', headerName: 'Authorization',
+assert.deepEqual(sent[1].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', requestSource: '',
   apiKey: other, model: 'gpt-6.1-sol', label: 'Sol via lab gateway'});
 assert(!sent[1].path.includes(other));
 assert.equal($('apiModelTestButton').textContent, 'Testing…');
@@ -810,6 +818,7 @@ assert.deepEqual(parts().map((part) => part[2]), ['Changed since the last test',
   'Last result: Failed · 401. Test again to check these settings.']);
 
 type('apiModelKey', key);
+discovered();
 $('apiModelTestButton').onclick();
 sent[2].reply(200, {ok: true, status: 200, latencyMs: 412.4, message: 'The model replied: OK',
   model: 'gpt-6.1-sol-2026-10', testedAt: '2026-10-22T09:45:51+00:00', recorded: false});
@@ -888,7 +897,7 @@ assert.equal($('apiModelCancelButton').hidden, false);
 assert($('apiModelList').children[0].classList.contains('editing'));
 type('apiModelName', 'Lab Sol');
 $('apiModelSaveButton').onclick();
-assert.deepEqual(sent[6].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', headerName: 'Authorization',
+assert.deepEqual(sent[6].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', requestSource: '',
   apiKey: '', model: 'gpt-6.1-sol', label: 'Lab Sol', id: 'api:lab-sol'});
 const renamed = {...tested, label: 'Lab Sol'};
 sent[6].reply(200, {model: renamed, ...listing([renamed])});
@@ -905,18 +914,18 @@ $('apiModelTestButton').onclick();
 assert.equal(sent.length, 7);
 assert.match($('apiModelTestResult').textContent, /^Enter the API key again/);
 assert.equal(document.activeElement, $('apiModelKey'));
-// The header follows the format unless it was typed by hand.
+// The optional request source is independent of the API format; authentication is automatic.
+type('apiModelRequestSource', 'Zephy-TCS-Prover');
 $('apiModelFormatAnthropic').checked = true; $('apiModelFormatOpenai').checked = false;
 $('apiModelFormatAnthropic').onchange();
-assert.equal($('apiModelHeaderName').value, 'x-api-key');
+assert.equal($('apiModelRequestSource').value, 'Zephy-TCS-Prover');
 assert.match($('apiModelFormatHelp').textContent, /Claude CLI in bare mode.*no subagents, no web tools/);
-type('apiModelHeaderName', 'api-key');
 $('apiModelFormatOpenai').checked = true; $('apiModelFormatAnthropic').checked = false;
 $('apiModelFormatOpenai').onchange();
-assert.equal($('apiModelHeaderName').value, 'api-key');
+assert.equal($('apiModelRequestSource').value, 'Zephy-TCS-Prover');
 $('apiModelCancelButton').onclick();
 assert.equal($('apiModelFormHeading').textContent, 'Add an API model');
-assert.equal($('apiModelHeaderName').value, 'Authorization');
+assert.equal($('apiModelRequestSource').value, '');
 
 // Remove asks first; a refusal leaves everything as it was.
 answer = false;
@@ -979,6 +988,7 @@ sent[0].reply(200, listing([lab]));
 await settle();
 type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
 type('apiModelKey', 'sk-test-0123456789abcdef');
+discovered();
 type('apiModelId', 'gpt-6.1-sol');
 
 // Test connection from the keyboard: focus comes back to the button, then the outcome is written.
@@ -1049,6 +1059,132 @@ await settle();
 assert.equal(document.activeElement, $('apiModelsHeading'));
 assert.deepEqual(written, [['status', 'false', $('apiModelsHeading')]]);
 assert.equal($('apiModelsStatus').textContent, 'Removed Other.');
+""")
+
+    def test_api_model_discovery_populates_a_picker_without_typing_a_model_id(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+assert.equal($('apiModelId').tagName, 'SELECT');
+assert.equal($('apiModelId').disabled, true);
+$('apiModelLoadButton').onclick();
+assert.equal(sent.length, 0);
+assert.equal($('apiModelTestResult').textContent, 'Enter the base URL.');
+type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
+type('apiModelKey', 'sk-discovery-secret');
+$('apiModelSaveButton').onclick();
+assert.equal(sent.length, 0);
+assert.equal($('apiModelTestResult').textContent, 'Load the available models, then choose a model.');
+assert.equal(document.activeElement, $('apiModelLoadButton'));
+$('apiModelLoadButton').onclick();
+assert.equal(sent[0].path, '/api-models/discover');
+assert.equal(sent[0].options.method, 'POST');
+assert.deepEqual(sent[0].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1',
+  requestSource: '', apiKey: 'sk-discovery-secret'});
+assert.equal($('apiModelLoadButton').textContent, 'Loading models…');
+assert(buttons().every((button) => button.disabled));
+sent[0].reply(200, {ok: true, status: 200, models: [{id: 'model-one', label: 'First model'},
+  {id: 'model-two', label: '<script>plain text</script>'}]});
+await settle();
+assert.equal($('apiModelId').disabled, false);
+assert.equal($('apiModelId').value, 'model-one');
+assert.deepEqual($('apiModelId').options.map((option) => [option.value, option.textContent]),
+  [['model-one', 'First model'], ['model-two', '<script>plain text</script>']]);
+assert.equal($('apiModelTestResult').children[0].textContent, 'Loaded 2 models.');
+$('apiModelId').value = 'model-two';
+$('apiModelId').onchange();
+$('apiModelTestButton').onclick();
+assert.equal(sent[1].path, '/api-models/test');
+assert.equal(sent[1].body.model, 'model-two');
+sent[1].reply(200, {ok: true, status: 200, model: 'model-two', message: 'The model replied: OK'});
+await settle();
+type('apiModelName', 'My model');
+assert.match($('apiModelTestResult').className, /\bok\b/);
+type('apiModelRequestSource', 'Zephy-TCS-Prover');
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelId').disabled, true);
+assert.match($('apiModelTestResult').className, /\bstale\b/);
+type('apiModelBaseUrl', 'https://other.example/v1');
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelId').disabled, true);
+assert.match($('apiModelTestResult').className, /\bstale\b/);
+""")
+
+    def test_api_model_discovery_ignores_results_for_edited_credentials_and_clears_failures(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
+type('apiModelKey', 'sk-discovery-secret');
+$('apiModelLoadButton').onclick();
+type('apiModelKey', 'sk-another-secret');
+sent[0].reply(200, {ok: true, status: 200, models: [{id: 'wrong-account-model', label: 'Old model'}]});
+await settle();
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelId').disabled, true);
+assert.equal($('apiModelTestResult').children[0].textContent, 'Connection details changed');
+$('apiModelLoadButton').onclick();
+sent[1].reply(200, {ok: true, status: 200, models: [{id: 'new-model', label: 'New model'}]});
+await settle();
+assert.equal($('apiModelId').value, 'new-model');
+$('apiModelLoadButton').onclick();
+sent[2].reply(200, {ok: false, status: 401, message: 'Missing API key', models: []});
+await settle();
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelId').disabled, true);
+assert.deepEqual($('apiModelTestResult').children.map((part) => part.textContent), ['Failed · 401', 'Missing API key']);
+$('apiModelLoadButton').onclick();
+sent[3].reply(200, {ok: false, status: 200, models: [], message: 'No models are available for this API key.'});
+await settle();
+assert.equal($('apiModelTestResult').children[0].textContent, 'No models loaded');
+assert.equal($('apiModelTestResult').children[1].textContent, 'No models are available for this API key.');
+$('apiModelLoadButton').onclick();
+sent[4].reply(400, {error: 'The base URL is invalid.'});
+await settle();
+assert.equal($('apiModelTestResult').children[1].textContent, 'The base URL is invalid.');
+assert.equal($('apiModels').getAttribute('aria-busy'), 'false');
+$('apiModelLoadButton').onclick();
+type('apiModelRequestSource', 'Another router source');
+sent[5].reply(200, {ok: true, status: 200, models: [{id: 'old-source-model', label: 'Old source'}]});
+await settle();
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelTestResult').children[0].textContent, 'Connection details changed');
+""")
+
+    def test_api_model_discovery_refreshes_saved_choices_without_exposing_the_saved_key(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+advanced.open = true;
+advanced.listeners.toggle({target: advanced});
+sent[0].reply(200, listing([lab]));
+await settle();
+click(rowButton('edit', lab.id));
+assert.equal($('apiModelId').value, lab.model);
+assert.equal($('apiModelId').disabled, false);
+type('apiModelRequestSource', 'Proof lab');
+assert.equal($('apiModelKey').required, false);
+assert.equal($('apiModelId').value, '');
+$('apiModelLoadButton').onclick();
+assert.deepEqual(sent[1].body, {id: lab.id, format: 'openai', baseUrl: lab.baseUrl,
+  requestSource: 'Proof lab', apiKey: ''});
+sent[1].reply(200, {ok: true, status: 200, models: [{id: lab.model, label: 'Sol'},
+  {id: 'other-model', label: 'Other'}]});
+await settle();
+assert.equal($('apiModelId').value, lab.model);
+assert.equal($('apiModelKey').value, '');
+$('apiModelSaveButton').onclick();
+assert.equal(sent[2].path, '/api-models');
+assert.equal(sent[2].body.requestSource, 'Proof lab');
+assert.equal(sent[2].body.apiKey, '');
+assert.equal(sent[2].body.headerName, undefined);
+const sourced = {...lab, requestSource: 'Proof lab'};
+sent[2].reply(200, {model: sourced, ...listing([sourced])});
+await settle();
+assert.equal($('apiModelRequestSource').value, '');
+click(rowButton('edit', lab.id));
+assert.equal($('apiModelRequestSource').value, 'Proof lab');
+type('apiModelBaseUrl', 'https://other.example/v1');
+$('apiModelLoadButton').onclick();
+assert.equal(sent.length, 3);
+assert.match($('apiModelTestResult').textContent, /^Enter the API key again/);
+$('apiModelCancelButton').onclick();
+assert.equal($('apiModelId').value, '');
+assert.equal($('apiModelId').disabled, true);
 """)
 
     def test_api_model_manager_explains_an_older_server(self):

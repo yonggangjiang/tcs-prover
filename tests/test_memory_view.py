@@ -422,7 +422,6 @@ const context = vm.createContext({ ui, memoryTabs: tabs, currentJob: '', current
   approachGraphData: {nodes: [], files: [], indexFile: ''}, approachGraphSignature: '',
   document: { hidden: false, createElement: () => ({ children: [], append(child) { this.children.push(child); } }) },
   show: (element, visible) => { element.hidden = !visible; },
-  managesResearchFiles: () => true,
   clearTimeout() {}, setTimeout: callback => { timers.push(callback); return timers.length; },
   jobPath: (path, values) => ({ path, ...values }),
   request: path => new Promise(resolve => pending.push({ path, resolve })),

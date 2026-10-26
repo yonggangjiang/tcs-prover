@@ -91,7 +91,7 @@ COMPOSER = [
 COMPOSER_SETUP = r"""
 let currentJob = '', currentBatch = '', timer = 0, jobsTimer = 0, reviewPending = false;
 let state = {phase: 'input'};
-let promptValues = {review: 'Review.', author: 'Author.', author_simple: 'Author.', final: 'Final.'};
+let promptValues = {review: 'Review.', author: 'Author.', final: 'Final.'};
 let promptOverrides = {};
 const ui = new Proxy({}, {get: (target, name) => target[name] ||= new Element()});
 const advanced = new Element('details');
@@ -102,8 +102,7 @@ ui.latexInput.value = 'An existing theorem and proof.';
 ui.check.textContent = 'Check statement';
 const show = (element, visible) => { element.hidden = !visible; };
 const validateRetrievalSettings = () => true;
-const selectedAuthorPrompt = () => 'author_simple', syncPrompts = () => {};
-const managesResearchFiles = () => false;
+const syncPrompts = () => {};
 const researchAuditValues = () => ({intervalHours: 2, models: ['none', 'none', 'none']});
 const selectedRetrievalSettings = () => ({retrievalMode: 'live', retrievalCutoffUtc: ''});
 const jobPath = (path, values = {}, runId = currentJob) => path + (runId ? '?job=' + runId : '');
@@ -601,7 +600,7 @@ const critic = (time, bugs) => [
   {kind: 'request', stage: 'repair', node: 'author', time: time + ':repair'},
 ];
 const state = {runId: 'r', phase: 'running', stage: 'critic', activeNode: 'critic', skipStatementReview: true,
-  fileManagement: false, criticRounds: 2, traceVersion: 9,
+  criticRounds: 2, traceVersion: 9,
   workflow: {nodes: {author: node('Proof author'), critic: node('Independent critic'),
     latex_editor: node('LaTeX editor'), latex_compile: node('Compile PDF'), failure_summary: node('Saved progress')}},
   trace: [...critic('t1', 'Gap one.'), ...critic('t2', 'Gap two.'), ...critic('t3', 'Gap three.')]};

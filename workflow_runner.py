@@ -639,9 +639,8 @@ def environment(model=None):
         key = providers.api_model_secret(model)
         if key:
             register_secret(key)
-            # The custom provider reads this environment value (as a Bearer
-            # token or in the configured header). The key never appears in
-            # process arguments.
+            # The custom provider reads this environment value as a Bearer
+            # token. The key never appears in process arguments.
             env[API_TOKEN_ENV] = key
             # Some Codex versions require a nonempty OPENAI_API_KEY before they
             # initialize a custom provider. This public placeholder is never a
@@ -1130,35 +1129,28 @@ def inherited_openai_base_url_arguments(overrides=None, environment=None):
 def provider_arguments(model):
     """Define an isolated custom provider for an OpenAI-format API model.
 
-    The endpoint and header come from the API model store; the key stays in
+    The endpoint and request source come from the API model store; the key stays in
     the child environment (environment()). Built-in models need no flags.
     """
 
     if model_provider(model) != API_PROVIDER or providers.harness(model) != providers.CODEX:
         return []
     entry = providers.api_model(model)
-    header = entry["headerName"]
-    if not providers.HEADER_NAME.match(header):
-        raise ConfigurationError("The API model's header name is invalid.")
-    authentication = (
-        # Codex sends this variable as "Authorization: Bearer <key>".
-        f'model_providers.{API_PROVIDER}.env_key="{API_TOKEN_ENV}"'
-        if header.lower() == "authorization" else
-        f'model_providers.{API_PROVIDER}.env_http_headers={{{toml_string(header)}="{API_TOKEN_ENV}"}}'
-    )
     # No forced_login_method: Codex enforces it by deleting a stored ChatGPT
     # login, which a launcher that resets CODEX_HOME would expose (verified
-    # with Codex 0.160). The provider authenticates only with the variable or
-    # header below; requires_openai_auth=false keeps any OpenAI login out of
+    # with Codex 0.160). The provider authenticates only with the variable
+    # below; requires_openai_auth=false keeps any OpenAI login out of
     # its requests.
     return [
         "-c", f'model_provider="{API_PROVIDER}"',
-        "-c", f"model_providers.{API_PROVIDER}.name={toml_string(entry['label'])}",
+        "-c", f'model_providers.{API_PROVIDER}.name="TCS Prover"',
         "-c", f"model_providers.{API_PROVIDER}.base_url={toml_string(entry['baseUrl'].rstrip('/'))}",
         "-c", f'model_providers.{API_PROVIDER}.wire_api="responses"',
         "-c", f"model_providers.{API_PROVIDER}.supports_websockets=false",
         "-c", f"model_providers.{API_PROVIDER}.requires_openai_auth=false",
-        "-c", authentication,
+        # Codex sends this variable as "Authorization: Bearer <key>".
+        "-c", f'model_providers.{API_PROVIDER}.env_key="{API_TOKEN_ENV}"',
+        "-c", f'model_providers.{API_PROVIDER}.http_headers={{"User-Agent"={toml_string(providers.request_source(entry))}}}',
         # The model's shell commands never inherit the key: by default Codex
         # 0.160 passes *KEY*/*TOKEN* variables to them (verified with a mock
         # endpoint). Both settings drop it; either alone suffices.
@@ -3704,11 +3696,6 @@ def prepare(workflow, options):
     """Resolve prompt overrides and validate every node before starting any model."""
 
     prompts = dict(workflow["prompts"])
-    # Built-in author prompts have a simple variant for every lifecycle event.
-    # Other workflows without these variants retain their original behavior.
-    if options.get("file_management") is False:
-        prompts.update({name: prompts[f"{name}_simple"] for name in tuple(prompts)
-                        if f"{name}_simple" in prompts})
     prompts.update(options.get("prompts", {}))
     if not all(isinstance(value, str) and value.strip() for value in prompts.values()):
         raise ValueError("Prompt overrides must be nonempty strings.")

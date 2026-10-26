@@ -2189,7 +2189,6 @@ const ui = new Proxy({}, {get(target, name) {return target[name] ||= {
 };}});
 const document = {activeElement: null, body: {append() {}}, createElement() {return {click() {}, remove() {}};}};
 const show = (element, visible) => element.hidden = !visible;
-const managesResearchFiles = () => true;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};

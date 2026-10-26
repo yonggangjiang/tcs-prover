@@ -57,8 +57,8 @@ REMOVED_MODEL_WARNING = "DeepSeek is no longer supported; this role now uses GPT
 
 API_ID_PREFIX = "api:"
 API_SLUG = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
-HEADER_NAME = re.compile(r"[A-Za-z0-9-]{1,64}\Z")
 DEFAULT_HEADERS = {OPENAI_FORMAT: "Authorization", ANTHROPIC_FORMAT: "x-api-key"}
+DEFAULT_REQUEST_SOURCE = "TCS-Prover"
 # Plain HTTP would expose the key on the network; only loopback may use it.
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # Host names every URL parser reads alike (see _base_url()).
@@ -66,6 +66,7 @@ HOST_NAME = re.compile(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?\Z")
 MAX_BASE_URL_CHARS = 2048
 MAX_MODEL_CHARS = 200
 MAX_LABEL_CHARS = 200
+MAX_REQUEST_SOURCE_CHARS = 200
 MAX_KEY_CHARS = 4096
 MAX_TEST_MESSAGE_CHARS = 300
 
@@ -230,13 +231,17 @@ def _check_host(netloc, host):
             raise ProviderError("Write an IPv4 address as four decimal numbers, for example 127.0.0.1.")
 
 
-def _header_name(value, api_format):
-    value = (value or "").strip() if isinstance(value, str) else value
-    if value in (None, ""):
-        return DEFAULT_HEADERS[api_format]
-    if not isinstance(value, str) or not HEADER_NAME.match(value):
-        raise ProviderError("Header names may use only letters, digits and hyphens (at most 64 characters).")
+def _request_source(value):
+    value = _clean_text(value, "request source", MAX_REQUEST_SOURCE_CHARS, required=False)
+    if not value.isascii():
+        raise ProviderError("The request source must use printable ASCII characters.")
     return value
+
+
+def request_source(entry):
+    """The non-secret source identifier sent as User-Agent on API requests."""
+
+    return entry.get("requestSource") or DEFAULT_REQUEST_SOURCE
 
 
 def _api_key(value):
@@ -278,8 +283,8 @@ def _slug(text):
     return (slug or "model")[:48].rstrip("-._") or "model"
 
 
-def _validated(values, existing=None, *, require_key=True):
-    """Return a complete stored entry from submitted fields (and a saved entry)."""
+def _validated_connection(values, existing=None, *, require_key=True):
+    """Validate connection fields without needing a model from the endpoint yet."""
 
     if not isinstance(values, dict):
         raise ProviderError("API model settings must be an object.")
@@ -287,30 +292,37 @@ def _validated(values, existing=None, *, require_key=True):
     api_format = values.get("format", existing.get("format"))
     if api_format not in FORMATS:
         raise ProviderError("Choose the OpenAI or Anthropic API format.")
-    base_url, host = _base_url(values.get("baseUrl", existing.get("baseUrl")))
-    header = _header_name(values.get("headerName", existing.get("headerName")), api_format)
-    model = _model_name(values.get("model", existing.get("model")))
-    label = _clean_text(values.get("label", existing.get("label")), "label", MAX_LABEL_CHARS, required=False)
+    base_url, _ = _base_url(values.get("baseUrl", existing.get("baseUrl")))
+    # Authentication is fixed by the protocol. Normalize older custom header
+    # settings while retaining their saved id and key at the same destination.
+    header = DEFAULT_HEADERS[api_format]
+    source = _request_source(values.get("requestSource", existing.get("requestSource")))
     supplied_key = values.get("apiKey")
     blank = supplied_key is None or (isinstance(supplied_key, str) and not supplied_key.strip())
     if existing and blank:
         # An empty field keeps the saved key, but only for the destination it
         # was saved for: otherwise anyone who can call the controller could
         # send a key they never saw to a host and header of their choice.
-        if (api_format != existing.get("format") or base_url != existing.get("baseUrl")
-                or header.lower() != str(existing.get("headerName") or "").lower()):
-            raise ProviderError("Enter the API key again: a saved key is sent only to the format, base URL and "
-                                "header name it was saved with.")
+        if api_format != existing.get("format") or base_url != existing.get("baseUrl"):
+            raise ProviderError("Enter the API key again: a saved key is sent only to the format and base URL "
+                                "it was saved with.")
         key = existing.get("apiKey", "")
     elif blank and not require_key:
         key = ""
     else:
         key = _api_key(supplied_key)
-    return {
-        "label": label or f"{model} · {host}",
-        "format": api_format, "baseUrl": base_url, "headerName": header,
-        "model": model, "apiKey": key,
-    }
+    return {"format": api_format, "baseUrl": base_url, "headerName": header, "requestSource": source, "apiKey": key}
+
+
+def _validated(values, existing=None, *, require_key=True):
+    """Return a complete stored entry from submitted fields (and a saved entry)."""
+
+    connection = _validated_connection(values, existing, require_key=require_key)
+    existing = existing or {}
+    model = _model_name(values.get("model", existing.get("model")))
+    label = _clean_text(values.get("label", existing.get("label")), "label", MAX_LABEL_CHARS, required=False)
+    host = (urlsplit(connection["baseUrl"]).hostname or "").lower()
+    return {**connection, "label": label or f"{model} · {host}", "model": model}
 
 
 def _stored(entry):
@@ -323,7 +335,11 @@ def _stored(entry):
     for field in ("createdAt", "updatedAt"):
         result[field] = entry.get(field) if isinstance(entry.get(field), str) else ""
     test = entry.get("lastTest")
-    result["lastTest"] = _last_test(test) if isinstance(test, dict) else None
+    old_header = entry.get("headerName", result["headerName"])
+    same_auth = isinstance(old_header, str) and old_header.lower() == result["headerName"].lower()
+    # A historical custom-header test describes a different authentication
+    # scheme; it cannot vouch for the automatic one used after migration.
+    result["lastTest"] = _last_test(test) if same_auth and isinstance(test, dict) else None
     return result
 
 
@@ -424,7 +440,8 @@ def public_api_model(entry):
     return {
         "id": entry["id"], "label": entry["label"], "format": entry["format"],
         "baseUrl": entry["baseUrl"], "host": (urlsplit(entry["baseUrl"]).hostname or "").lower(),
-        "headerName": entry["headerName"], "model": entry["model"], "hasKey": bool(key),
+        "headerName": entry["headerName"], "requestSource": entry["requestSource"],
+        "model": entry["model"], "hasKey": bool(key),
         "keyHint": ("…" + key[-4:]) if len(key) >= 12 else ("…" if key else ""),
         "lastTest": entry.get("lastTest"), "createdAt": entry.get("createdAt", ""),
         "updatedAt": entry.get("updatedAt", ""),
@@ -463,8 +480,7 @@ def save_api_model(values, reserved=()):
 
     Without an id a new `api:<slug>` id is chosen, never one in `reserved`;
     an unknown explicit id is created as given. On update an empty or absent
-    apiKey keeps the saved key while the format, base URL and header name
-    stay the same.
+    apiKey keeps the saved key while the format and base URL stay the same.
     """
 
     if not isinstance(values, dict):
@@ -478,7 +494,8 @@ def save_api_model(values, reserved=()):
         entry = _validated(values, existing)
         now = _now()
         if existing:
-            changed = any(existing[key] != entry[key] for key in ("format", "baseUrl", "headerName", "model", "apiKey"))
+            changed = any(existing[key] != entry[key]
+                          for key in ("format", "baseUrl", "requestSource", "model", "apiKey"))
             entry.update(id=existing["id"], createdAt=existing.get("createdAt") or now, updatedAt=now,
                          lastTest=None if changed else existing.get("lastTest"))
             entries = [entry if item["id"] == existing["id"] else item for item in entries]
@@ -506,8 +523,8 @@ def validated_api_model(values, model_id=None):
     """Check settings exactly as save_api_model() would, without saving them.
 
     With the id of a saved model, absent fields come from that model, and an
-    empty apiKey too while the destination (format, base URL, header name)
-    is unchanged. Returns (entry, saved): the complete settings and the saved
+    empty apiKey too while the destination (format and base URL) is unchanged.
+    Returns (entry, saved): the complete settings and the saved
     entry (None when unsaved). Both include the key: keep them on the server.
     """
 
@@ -516,6 +533,22 @@ def validated_api_model(values, model_id=None):
     with _STORE_LOCK:
         saved = next((entry for entry in _read_store() if model_id and entry["id"] == model_id), None)
     return _validated(values, saved), saved
+
+
+def validated_api_connection(values, model_id=None):
+    """Validate discovery settings, reusing a saved key only for its saved destination.
+
+    No model is required before fetching the provider's available model list.
+    The result contains the key and must stay on the server.
+    """
+
+    if model_id not in (None, "") and not is_api_id(model_id):
+        raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
+    with _STORE_LOCK:
+        saved = next((entry for entry in _read_store() if model_id and entry["id"] == model_id), None)
+    if model_id and saved is None:
+        raise ProviderError("That API model is not configured.")
+    return _validated_connection(values, saved)
 
 
 def delete_api_model(model_id):

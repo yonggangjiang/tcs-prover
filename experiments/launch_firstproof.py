@@ -95,13 +95,13 @@ def batch_plan(runs_root, control_root, problems=None):
             'authorModel', 'criticModel', 'writerModel', 'authorEffort',
             'criticEffort', 'writerEffort', 'criticRounds', 'researchAudits',
         )}
-        required.update(thinkingHours=0, speedMode='fast', fileManagement=False,
+        required.update(thinkingHours=0, speedMode='fast',
                         skipStatementReview=True, preparedRun=True)
         if any(settings.get(key) != value for key, value in required.items()):
             raise ValueError(f'{run_id}: prepared run settings changed or run already started.')
         prompts = preparation.default_prompts()
         for role in ('review', 'author', 'critic', 'final'):
-            expected = prompts['author_simple' if role == 'author' else role]
+            expected = prompts[role]
             if (folder / 'prompts' / (role + '.txt')).read_text().rstrip() != expected.rstrip():
                 raise ValueError(f'{run_id}: prepared {role} prompt changed.')
         if settings.get('goalThreadId') or (folder / 'transcript.jsonl').exists():

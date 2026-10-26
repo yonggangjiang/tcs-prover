@@ -196,7 +196,7 @@ class SavedRunCompatibilityTests(unittest.TestCase):
         )
         (directory / "draft.md").write_text("# Draft problem\n\n" + statement)
         (directory / "INITIAL_PROMPT.md").write_text("Preserved curated instructions")
-        options = server.App._workflow_options(file_management=True, include_review=False)
+        options = server.App._workflow_options(include_review=False)
         options.update(preparedRun=True, skipStatementReview=True, **settings)
         (directory / "job-settings.json").write_text(json.dumps(options))
 

@@ -5,9 +5,9 @@ only to servers on 127.0.0.1 that log every request before parsing it and never
 record credential values: the test key is matched, other credentials are only
 classified. These pin the provider plumbing against CLI upgrades:
 - Anthropic-format API models: --bare plus a private settings file send every
-  request to the configured base URL with the key only in the configured header
+  request to the configured base URL with the key only in x-api-key
   and no subscription credential;
-- OpenAI-format API models: Codex sends the key only in the configured header,
+- OpenAI-format API models: Codex sends the key only as Bearer authorization,
   runs with the private CODEX_HOME and leaves the user's Codex home alone.
 """
 
@@ -154,42 +154,43 @@ class LiveCliTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("claude"), "Claude CLI is not installed")
     def test_anthropic_gateway_receives_every_request_with_the_key_only_in_its_header(self):
-        for header, expected in (("x-api-key", "<KEY>"), ("Authorization", "Bearer <KEY>"), ("X-Live-Key", "<KEY>")):
+        for header in ("x-api-key", "Authorization", "X-Live-Key"):
             with self.subTest(header=header):
                 endpoint = self.endpoint("anthropic")
                 model = providers.save_api_model({"format": "anthropic", "baseUrl": f"http://127.0.0.1:{endpoint.port}/v1",
-                                                  "headerName": header, "model": "live-gateway-model", "apiKey": KEY})["id"]
+                                                  "headerName": header, "requestSource": "Zephy-TCS-Prover",
+                                                  "model": "live-gateway-model", "apiKey": KEY})["id"]
                 result, _ = runtime.structured("Return ok.", self.SCHEMA, "review", model=model, effort="low")
                 self.assertEqual(result, {"ok": True})
                 for request in self.assertNoLeaks(endpoint):
                     self.assertTrue(request["line"].startswith("POST /v1/messages"), request["line"])
-                    self.assertEqual(request["headers"].get(header.lower()), expected)
-                    if header.lower() != "authorization":
-                        self.assertNotIn("authorization", request["headers"])
-                    if header == "X-Live-Key":
-                        self.assertEqual(request["headers"]["x-api-key"], "<other>")  # The public placeholder.
+                    self.assertEqual(request["headers"]["x-api-key"], "<KEY>")
+                    self.assertEqual(request["headers"]["user-agent"], "Zephy-TCS-Prover")
+                    self.assertNotIn("authorization", request["headers"])
+                    self.assertNotIn("x-live-key", request["headers"])
                 # The key-bearing settings folder lived in the private state folder and is gone.
                 settings = providers.state_directory() / providers.CLAUDE_SETTINGS
                 self.assertEqual(list(settings.iterdir()) if settings.exists() else [], [])
                 self.assertEqual(list(Path(tempfile.gettempdir()).glob("tcs-claude-*")), [])
 
     @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
-    def test_openai_gateway_uses_the_configured_header_and_a_private_codex_home(self):
+    def test_openai_gateway_uses_bearer_auth_request_source_and_a_private_codex_home(self):
         user_home = Path.home() / ".codex"
         sessions_before = set(user_home.glob("sessions/**/*.jsonl"))
         runtime._ISOLATED_CODEX.clear()
-        for header, expected in (("Authorization", "Bearer <KEY>"), ("X-Live-Key", "<KEY>")):
+        for header in ("Authorization", "X-Live-Key"):
             with self.subTest(header=header):
                 endpoint = self.endpoint("openai")
                 model = providers.save_api_model({"format": "openai", "baseUrl": f"http://127.0.0.1:{endpoint.port}/v1",
-                                                  "headerName": header, "model": "live-gateway-model", "apiKey": KEY})["id"]
+                                                  "headerName": header, "requestSource": "Zephy-TCS-Prover",
+                                                  "model": "live-gateway-model", "apiKey": KEY})["id"]
                 result, _ = runtime.structured("Return ok.", self.SCHEMA, "review", model=model, effort="low")
                 self.assertEqual(result, {"ok": True})
                 for request in self.assertNoLeaks(endpoint):
-                    self.assertEqual(request["headers"].get(header.lower()), expected)
+                    self.assertEqual(request["headers"]["authorization"], "Bearer <KEY>")
+                    self.assertEqual(request["headers"]["user-agent"], "Zephy-TCS-Prover")
                     self.assertNotIn("chatgpt-account-id", request["headers"])
-                    if header != "Authorization":
-                        self.assertNotIn("authorization", request["headers"])
+                    self.assertNotIn("x-live-key", request["headers"])
         # The user's own Codex may be busy; only a rollout of this test would be a leak.
         added = set(user_home.glob("sessions/**/*.jsonl")) - sessions_before
         self.assertEqual([path for path in added if "live-gateway-model" in path.read_text(errors="replace")], [])

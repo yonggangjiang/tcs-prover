@@ -36,13 +36,13 @@ class PromptDefaultsTests(unittest.TestCase):
         self.manager.fixed_app = False
 
     def edit_yaml(self, version):
-        for filename, names in (("author_critic.yaml", ("author", "author_simple", "critic")),
+        for filename, names in (("author_critic.yaml", ("author", "critic")),
                                 ("clean_up.yaml", ("final",))):
             path = self.workflows / filename
             workflow = yaml.safe_load(path.read_text())
             for name in names:
                 workflow["prompts"][name] = f"{version} {name} policy." + (
-                    "\n\n[STATEMENT]" if name in {"author", "author_simple"} else ""
+                    "\n\n[STATEMENT]" if name == "author" else ""
                 )
             path.write_text(yaml.safe_dump(workflow, sort_keys=False))
 
@@ -54,7 +54,7 @@ class PromptDefaultsTests(unittest.TestCase):
         latest = server.empty_state()
         self.assertTrue(original["authorPrompt"].startswith("First"))
         for name in ("author", "critic", "final"):
-            expected = server.default_prompts()["author_simple" if name == "author" else name]
+            expected = server.default_prompts()[name]
             self.assertEqual(latest[f"{name}Prompt"], expected)
             self.assertEqual(latest["workflow"]["settings"]["prompts"][name], server.default_prompts()[name])
             self.assertEqual(app.snapshot()["workflow"]["settings"]["prompts"][name], server.default_prompts()[name])
@@ -70,13 +70,13 @@ class PromptDefaultsTests(unittest.TestCase):
             with self.subTest(launch=launch.__name__):
                 app = launch(body)
                 for name in roles:
-                    expected = server.default_prompts()["author_simple" if name == "author" else name]
+                    expected = server.default_prompts()[name]
                     self.assertEqual(app.state[f"{name}Prompt"], expected)
                     self.assertEqual((app.run_dir / "prompts" / f"{name}.txt").read_text(), expected + "\n")
                 if "author" in roles:
                     options = app._proof_options_locked()
                     path = Path(options[options.index("--author-prompt-file") + 1])
-                    self.assertEqual(path.read_text().strip(), server.default_prompts()["author_simple"])
+                    self.assertEqual(path.read_text().strip(), server.default_prompts()["author"])
                 for name in server.RESEARCH_MEMORY_FILES:
                     self.assertFalse((app.run_dir / name).exists(), "Only the LLM creates memory")
 
@@ -84,11 +84,11 @@ class PromptDefaultsTests(unittest.TestCase):
         self.edit_yaml("Current")
         custom = "Deliberate per-job instructions. [STATEMENT]"
         edited = self.manager.start_direct_job({
-            "statement": "First task", "promptOverrides": {"author_simple": custom},
+            "statement": "First task", "promptOverrides": {"author": custom},
         })
         fresh = self.manager.start_direct_job({"statement": "Next task"})
         self.assertEqual(edited.state["authorPrompt"], custom)
-        self.assertEqual(fresh.state["authorPrompt"], server.default_prompts()["author_simple"])
+        self.assertEqual(fresh.state["authorPrompt"], server.default_prompts()["author"])
         self.assertEqual(edited.state["criticPrompt"], fresh.state["criticPrompt"])
 
     def test_review_retry_and_run_history_keep_the_job_prompt(self):
@@ -118,7 +118,7 @@ const functions = app.slice(app.indexOf('const promptLabels ='), app.indexOf('fu
 const setup = `
 let currentJob = '', currentBatch = '', activePrompt = 'review';
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
-const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', author_simple: 'Simple [STATEMENT]', critic: 'Critic', final: 'Final'};
+const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', critic: 'Critic', final: 'Final'};
 let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};
 const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATEMENT]'}),
                       setItem: () => {throw Error('Prompts must not be persisted');}};
@@ -128,7 +128,6 @@ const ui = {promptEditor: {value: '', focus() {this.focused = true;}}, notice: {
   promptDialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}}};
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
-const selectedAuthorPrompt = () => 'author_simple';
 const jobPath = path => path;
 let diskPrompts = defaults;
 const request = async () => ({workflow: {settings: {prompts: diskPrompts}}});
@@ -164,35 +163,31 @@ const checks = `
   // Historical jobs still display their actual prompt, rather than rewriting history.
   syncPrompts({...state, runId: 'old-job', authorPrompt: 'Actual saved author [STATEMENT]'});
   assert.equal(promptValues.author, 'Actual saved author [STATEMENT]');
-  syncPrompts({...state, runId: 'simple-job', fileManagement: false, authorPrompt: 'Saved simple [STATEMENT]'});
-  assert.equal(promptValues.author_simple, 'Saved simple [STATEMENT]');
-  assert.equal(promptValues.author, diskPrompts.author);
 
-  // Switching between author editors preserves an independent custom value for each mode.
+  // Moving between roles preserves the deliberate author edit.
   syncPrompts();
   await openPromptEditor();
-  selectPrompt('author_simple');
-  ui.promptEditor.value = 'Custom simple [STATEMENT]';
   selectPrompt('author');
-  ui.promptEditor.value = 'Custom managed [STATEMENT]';
-  selectPrompt('author_simple');
-  assert.equal(ui.promptEditor.value, 'Custom simple [STATEMENT]');
+  ui.promptEditor.value = 'Custom author [STATEMENT]';
+  selectPrompt('review');
+  selectPrompt('author');
+  assert.equal(ui.promptEditor.value, 'Custom author [STATEMENT]');
   savePrompts();
-  assert.deepEqual(promptOverrides, {author_simple: 'Custom simple [STATEMENT]', author: 'Custom managed [STATEMENT]'});
+  assert.deepEqual(promptOverrides, {author: 'Custom author [STATEMENT]'});
 
   // An invalid Apply keeps the modal dialog open and explains why inside it, on the
   // prompt to fix; the page notice behind the dialog is never used.
   ui.notice = {};
   await openPromptEditor();
   assert.equal(ui.promptError.hidden, true);
-  selectPrompt('author_simple');
+  selectPrompt('author');
   ui.promptEditor.value = 'No marker here';
   selectPrompt('review');
   savePrompts();
   assert.equal(ui.promptDialog.open, true);
   assert.equal(ui.promptError.hidden, false);
-  assert.equal(ui.promptError.textContent, 'Each author prompt must contain exactly one [STATEMENT].');
-  assert.equal(activePrompt, 'author_simple');
+  assert.equal(ui.promptError.textContent, 'The author prompt must contain exactly one [STATEMENT].');
+  assert.equal(activePrompt, 'author');
   assert.equal(ui.promptEditor.focused, true);
   assert.deepEqual(ui.notice, {});
   // Editing clears it; an empty prompt on another tab is shown on that tab.
@@ -206,16 +201,8 @@ const checks = `
   assert.equal(activePrompt, 'critic');
   assert.equal(ui.promptError.textContent, 'Every role prompt must contain instructions.');
   assert.equal(ui.promptDialog.open, true);
-  // The variant the author tab does not show is named instead.
   promptDrafts.critic = 'Critic';
-  promptDrafts.author = 'Managed without a marker';
-  activePrompt = 'review';
-  ui.promptEditor.value = 'Review';
-  savePrompts();
-  assert.equal(activePrompt, 'review');
-  assert.equal(ui.promptError.textContent,
-               'Each author prompt must contain exactly one [STATEMENT]. (the managed author prompt)');
-  promptDrafts.author = 'Managed [STATEMENT]';
+  ui.promptEditor.value = 'Critic';
   savePrompts();
   assert.equal(ui.promptDialog.open, false);
   assert.deepEqual(ui.notice, {});

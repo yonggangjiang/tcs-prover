@@ -6,12 +6,11 @@ through a critic loop, and
 produces a complete LaTeX document and compiled PDF.
 Algorithmic tasks can be entered as statements too.
 
-The complete author instructions live directly in
-[`workflows/author_critic.yaml`](workflows/author_critic.yaml). The LLM creates,
-reads, searches, and updates its initial instructions, approach files, and proved
-lemmas when **Manage research files** is enabled. This switch is off by default
-on the home screen: `author_simple` asks only for a rigorous proof, and the UI
-hides research records and scheduled audits. The critic and LaTeX writer still run.
+The author instructions live directly in
+[`workflows/author_critic.yaml`](workflows/author_critic.yaml). The author and
+its goal, continuation, compaction, resume, and repair prompts focus on proving
+the exact statement, without requiring research notebooks or a file layout.
+Optional independent audits, the critic, and the LaTeX writer remain available.
 
 On macOS and Linux, authors can submit `PROOF_FILE: proof.md` after writing a
 complete proof in their working directory. Windows authors submit the complete
@@ -137,8 +136,7 @@ Claude Code keeps a saved conversation for `cleanupPeriodDays` (30 days by
 default) after its last activity, and any Claude Code run with default settings
 deletes older ones. A Claude author paused for longer cannot resume its
 conversation: **Resume** reports this, automatic retry stays off, and **Continue
-proof author** continues the saved work in a new conversation from its research
-records. To keep conversations longer, set for example `"cleanupPeriodDays": 365`
+proof author** continues the saved work in a new conversation from its saved public input. To keep conversations longer, set for example `"cleanupPeriodDays": 365`
 in `~/.claude/settings.json`.
 
 ### API models
@@ -149,10 +147,24 @@ in `~/.claude/settings.json`.
 | --- | --- |
 | Format | **OpenAI** (Responses API) or **Anthropic** (Messages API). |
 | Base URL | For example `https://api.openai.com/v1` or `https://api.anthropic.com`. HTTPS is required except for `localhost`; credentials, query strings, and fragments are rejected. So that the host shown and tested is the host the CLIs contact, the URL must be plain ASCII (an international domain name in its `xn--` form) without backslashes, a percent-encoded host, an IPv4 address other than four decimal numbers, or `.`/`..` path segments. |
-| Header name | The header that carries the key: `Authorization` (sent as `Bearer <key>`; the OpenAI default), `x-api-key` (the Anthropic default), or any other name (sent as the raw key). Letters, digits, and hyphens only. |
-| API key | Stored only on this computer and never shown again. Editing a model (or testing an edit) with an empty key keeps the saved key only while the format, base URL, and header name stay the same; changing any of them requires entering the key again. |
-| Model ID | The model name the endpoint expects. |
-| Display name | Optional menu label; the default is `<model> · <host>`. |
+| API key | Stored only on this computer and never shown again. Editing a model (or testing an edit) with an empty key keeps the saved key only while the format and base URL stay the same; changing either requires entering the key again. |
+| Model | Click **Load models** to fetch the choices available to this API key, then select one. No model ID needs to be typed. |
+| Request source | Optional client name sent as the `User-Agent` header, so routers that log it can identify your requests. Use up to 200 printable ASCII characters; the default is `TCS-Prover`. |
+| Display name | Optional local menu label; the default is `<model> · <host>`. It is not sent to the API or used as the request source. |
+
+**Load models** requests the endpoint's model catalog with the same API key and
+authentication used for inference. Changing the format, base URL, request source, or key
+clears the choices so they can be refreshed for the new connection. Editing a
+saved model keeps its current selection until you refresh it.
+
+Authentication is selected automatically: OpenAI-compatible endpoints receive
+`Authorization: Bearer <key>`, and Anthropic endpoints receive `x-api-key: <key>`.
+Existing saved custom authentication headers are replaced with the format's
+standard header while retaining the key for the same endpoint. If an endpoint
+reports **401 · Missing API key**, check that the format, endpoint, and key match
+the service's requirements. The request source labels the client independently
+of authentication, and applies to model discovery, connection tests, and model
+requests.
 
 **Test connection** (the form, saved or not) and **Test** (a saved model's row)
 send one minimal request (`Reply with OK.`, at most 16 output tokens)
@@ -213,7 +225,7 @@ the non-secret settings of its API models under `apiModels` in
 `job-settings.json`. A model used by a running job cannot be removed, and its
 format cannot change while jobs use it. A job cannot switch to another model, so
 a waiting job whose API model was removed continues once you add the model again
-with the settings the job shows (format, base URL, header name and model ID; any
+with the settings the job shows (format, base URL and model ID; any
 display name): it gets its old id back. A new model never takes such an id with
 another format.
 
@@ -457,7 +469,7 @@ started again, it scans `runs/*/transcript.jsonl`, restores the historical job
 cards, and lists every resumable critic checkpoint found in those run folders.
 It also discovers prepared workspaces with `preparedRun: true` in
 `job-settings.json`. **Start prepared run** opens a fresh author session in that
-exact folder, using its saved prompts and research records; no earlier session
+exact folder, using its saved prompts and workspace; no earlier session
 or elapsed budget is inherited.
 You do not need to keep the old browser tab open.
 
@@ -502,22 +514,22 @@ use the stage-specific continuation button:
 | Stopped stage | Button | Continuation boundary |
 | --- | --- | --- |
 | Statement review | **Retry statement review** | Starts a new review request from `review-input.json`, including the current statement and feedback, plus the saved prompt and role settings. Older runs without this artifact warn that only their original draft and no feedback can be recovered. |
-| Proof author, repair, or interrupted failure summary | **Continue proof author** | Uses `INITIAL_PROMPT.md`, the approach index and route files, and `PROVED.md`, plus saved user instructions. It resumes the author conversation when available; otherwise a new conversation reads the active work before continuing. Unmigrated older runs retain their `APPROACHES.md` layout. Visible partial text is not treated as a complete proof. |
+| Proof author, repair, or interrupted failure summary | **Continue proof author** | Reuses the saved prompt, workspace, and user instructions. It resumes the author conversation when available and otherwise restarts from its saved public input. Visible partial text is not treated as a complete proof. |
 | Critic | **Continue critic** | Starts a fresh critic round from the latest saved candidate. The critic requests new independent bug-finding reports. |
 | LaTeX editor | **Retry LaTeX editor** | Retries the single editor call with the saved accepted solution or standalone LaTeX source. Older jobs without an exact final input fall back to their latest critic checkpoint. |
 
 These continuation actions create a new run folder while preserving the source
-job's saved inputs and transcripts. Author continuation updates the existing shared
-research records. An in-flight request or inaccessible private reasoning cannot be
+job's saved inputs and transcripts. Author continuation reuses its existing
+workspace. An in-flight request or inaccessible private reasoning cannot be
 recovered as a completed answer. Review and final requests retry from their
 exact saved public input. The author resumes its existing conversation when
-available, or reads its research records in a fresh conversation. Historical runs created before
+available, or starts a fresh conversation from its saved public input. Historical runs created before
 `manual-stop.json` are recognized from their existing `Stop requested`
 transcript entry.
 
 ### Command-line fallback
 
-Continue a stopped author with its saved notebooks and a new time budget:
+Continue a stopped author in its saved workspace with a new time budget:
 
 ```bash
 python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN
@@ -633,8 +645,7 @@ Every job card shows its full local start and finish date and time, including
 seconds. Active jobs show that they have not finished yet, so repeated problem
 titles remain distinguishable.
 
-Every run shows its workflow sidebar, including when research-file management
-is off. The run overview displays the exact checked statement, the original
+Every run shows its workflow sidebar. The run overview displays the exact checked statement, the original
 wording when it differs, current stage, active time and remaining workflow
 budget, local process status, recent public activity, and saved model settings.
 Completed answers and preserved partial work have separate labels and a readable
@@ -736,58 +747,29 @@ the target impossible. The review step states the intended convention and writes
 it as `(m+n) log² n` instead of letting that mismatch
 derail the proof search.
 
-### 2. One persistent author, with optional research files
+### 2. One persistent author
 
-Home-screen jobs default to **Manage research files: Off**. The `author_simple`
-prompt in `workflows/author_critic.yaml` asks the author to prove the supplied
-statement. Its goal, continuation, compaction, resume, and repair prompts also
-avoid requiring a file layout. The mode is saved with the job and retained on
-continuation. Existing runs without the setting retain managed mode. Direct
-CLI jobs retain managed mode for compatibility; the generic runner also accepts
-`--set file_management=false` to use the simple prompt family.
+The `author` prompt in `workflows/author_critic.yaml` asks for a complete,
+rigorous proof of the supplied statement. The same author conversation continues
+across interruptions, context compaction, critic rejections, and resumption.
+The runner retains the conversation and operational checkpoints.
+`--resume-research` continues saved author work with a fresh budget. Existing
+jobs retain their saved per-job prompt and workspace when continued.
 
-Turn **Manage research files** on before starting a job to enable the full
-research workspace and scheduled advisers. The managed author explores diverse
-approaches, using these records:
+Optional research audits pause the author and independently review the exact
+statement, available candidates, and public conversation records in its working
+directory. Auditors suggest promising directions, identify mathematical gaps,
+and recommend clearer arguments. They do not edit the author's work or require
+research notebooks. Before a batch, the controller moves existing `AUDITS/`
+reports to `audit_history/`, preserving colliding filenames with a suffix. New
+reports are saved in `AUDITS/`, then the same author conversation resumes and
+considers their advice. Provider failures leave earlier reports safely in history.
 
-| File | Contents |
-| --- | --- |
-| `INITIAL_PROMPT.md` | The permanent complete initial author prompt and exact statement. |
-| `APPROACHES/index.md` | A short navigation table of linked node IDs and titles, parents, children, status, and result or remaining question. Optional for displaying the graph. |
-| `APPROACHES/A001-short-title.md` | One approach with linked Parents and Children, Status, **Context and objective**, and organized **Detailed work**. Each argument defines its terms and explains its relation to the task. |
-| `PROVED.md` | Important reusable, rigorously proved lemmas with stable IDs, full assumptions and proofs, and links to supported or ruled-out approaches. |
-| `AUDITS/` | Independent reports from the current audit batch only. |
-| `audit_history/` | Previous audit reports, moved here by the controller when the next batch starts. |
-
-The **Research files** panel presents the approach DAG as clickable nodes. Hover
-or focus a node to see its status, relationships, and result or open question;
-click it to read the corresponding file. The graph reads each approach file's
-title, `Parents`, `Status`, and summary directly, and derives children from the
-parent links. It works without an index and refreshes when node files change.
-Missing parents, incomplete metadata, duplicate IDs, and cycles are reported.
-The optional index, node selector, collapsible sections, and Markdown links
-provide additional navigation. Older `INDEX.md` and `APPROACHES.md` documents
-remain readable.
-
-Statuses have precise scope: **ACTIVE** means under development; **BLOCKED** means
-unresolved with its obstacle recorded; **CLOSED** means an identified claim or
-construction failed; **RESOLVED** means that node's stated objective was achieved.
-Unfinished work stays in approach files. Only established reusable results belong
-in `PROVED.md`, and a disproved lemma must lose its proved status with its
-correction and affected dependencies recorded.
-
-Scheduled audits pause the author and read its actual working directory directly.
-They do not copy the workspace or edit the author's research records. Before
-launching the available auditors, the controller moves existing `AUDITS/` files
-to `audit_history/`, preserving colliding filenames with a suffix. New reports
-are saved in `AUDITS/`, then the same author conversation resumes and considers
-their advice. Provider failures leave earlier reports safely in history. Legacy
-`audit.md` remains available under audit history.
-
-The author creates and maintains its mathematical records. On managed-mode
-compaction or resumption it reads `INITIAL_PROMPT.md` and recovers the relevant
-work from that layout. The runner retains the conversation and operational
-checkpoints. `--resume-research` continues saved author work with a fresh budget.
+The read-only **Research files** panel preserves access to existing workspace
+records and current and historical audit reports. Older `APPROACHES/index.md`,
+`APPROACHES/A001-short-title.md`, `APPROACHES.md`, and `PROVED.md` files remain
+readable. When approach files exist, the graph derives navigation from their
+titles, parent links, status, and summaries, without changing the saved files.
 
 ### 3. Critic loop
 
@@ -798,9 +780,8 @@ instructed not to communicate with one another and to report back to the critic.
 The critic considers those reports and repairs the complete argument itself.
 
 If it cannot fix every issue, it returns the latest safely repaired candidate
-and exact unresolved bugs to the author. The author continues the proof task; in managed mode it also records the
-objections and rechecks affected lemmas in its research files. This
-rejection resets the consecutive critic-round count.
+and exact unresolved bugs to the author. The author continues the proof task,
+and the rejection resets the consecutive critic-round count.
 
 An unchanged pass accepts immediately. An edited pass sends the latest solution
 to another fresh critic round while below the configured maximum (default 2).
@@ -829,8 +810,8 @@ repeated model repair calls.
 ## Project structure
 
 The root has two Python entry points. `workflow_runner.py` provides the graph
-engine and model/goal transport. The author research records remain plain
-Markdown files managed by the LLM under the YAML prompt. `web_ui.py` launches
+engine and model/goal transport. Workflow prompts live in YAML, and each job's
+inputs, transcripts, and outputs are saved in its run folder. `web_ui.py` launches
 the UI or Markdown proof jobs. Everything else lives in a package:
 
 ```text

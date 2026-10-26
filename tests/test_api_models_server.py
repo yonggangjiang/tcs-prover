@@ -214,8 +214,8 @@ class ApiModelEndpointTests(HttpCase):
              "plain http is allowed only for localhost"),
             ({"format": "openai", "baseUrl": f"https://user:{KEY}@gateway.example.com", "model": "m"},
              "Remove credentials from the base URL"),
-            ({"format": "openai", "baseUrl": "https://gateway.example.com", "model": "m", "headerName": "X Key"},
-             "Header names may use only letters"),
+            ({"format": "openai", "baseUrl": "https://gateway.example.com", "model": "m", "requestSource": "bad\nsource"},
+             "request source"),
             ({"format": "gemini", "baseUrl": "https://gateway.example.com", "model": "m"}, "OpenAI or Anthropic"),
             ({"format": "openai", "baseUrl": "https://gateway.example.com", "model": "m", "apiKey": ""},
              "Enter the API key."),
@@ -248,8 +248,7 @@ class ApiModelEndpointTests(HttpCase):
         status, value = self.call("/api-models/delete", {"id": model["id"]})
         self.assertEqual(status, 200)
         self.assertEqual(value["warning"], "1 job waiting to start or resume still uses Gateway; it cannot "
-                                           "continue until you add it again with the same format, base URL, "
-                                           "header name and model ID.")
+                                           "continue until you add it again with the same format, base URL and model ID.")
         self.assertFalse(providers.is_known(model["id"]))
 
     def test_format_change_is_refused_while_jobs_use_the_model(self):
@@ -269,7 +268,7 @@ class ApiModelEndpointTests(HttpCase):
         self.assertEqual(status, 400)
         self.assertIn("Enter the API key again", value["error"])
         status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic", "apiKey": KEY})
-        self.assertEqual((status, value["model"]["format"], value["model"]["headerName"]), (200, "anthropic", "Authorization"))
+        self.assertEqual((status, value["model"]["format"], value["model"]["headerName"]), (200, "anthropic", "x-api-key"))
 
     def removed_model_job(self, label="Lab Sol", phase="paused"):
         """A waiting job whose critic used an API model that is then removed."""
@@ -292,7 +291,7 @@ class ApiModelEndpointTests(HttpCase):
                 self.assertEqual(str(failure.exception),
                                  f"The API model {model} chosen for the critic is not configured. Add it again under "
                                  "New problem → Advanced settings → API models with the same settings (Lab Sol · "
-                                 "OpenAI format · https://gateway.example.com/v1 · header Authorization · model "
+                                 "OpenAI format · https://gateway.example.com/v1 · model "
                                  "gpt-gateway) to continue this job.")
                 status, value = self.call("/api-models", {**endpoint, "label": label})
                 self.assertEqual((status, value["model"]["id"], value["model"]["label"]), (200, model, expected))
@@ -415,7 +414,7 @@ class ProbeTests(HttpCase):
         self.assertEqual((last["ok"], last["status"], last["latencyMs"]), (True, 200, result["latencyMs"]))
         self.assertEqual(result["apiModel"]["lastTest"], last)
 
-    def test_anthropic_success_uses_the_messages_path_and_the_configured_header(self):
+    def test_anthropic_success_uses_the_messages_path_and_automatic_key_header(self):
         for base in ("", "/v1"):
             with self.subTest(base=base):
                 self.endpoint.requests.clear()
@@ -431,13 +430,25 @@ class ProbeTests(HttpCase):
                 self.assertEqual(request["body"], {"model": "claude-gw", "max_tokens": 16,
                                                    "messages": [{"role": "user", "content": "Reply with OK."}]})
 
-    def test_a_custom_header_carries_the_raw_key(self):
-        model = self.saved(headerName="X-Gateway-Key")
+    def test_request_source_reaches_the_router_without_changing_authentication(self):
+        model = self.saved(headerName="Zephy-TCS-Prover", requestSource="Zephy-TCS-Prover", label="Local menu only")
         status, result = self.call("/api-models/test", {"id": model["id"]})
         self.assertEqual((status, result["ok"]), (200, True))
-        headers = self.endpoint.requests[0]["headers"]
-        self.assertEqual(headers["x-gateway-key"], KEY)
-        self.assertNotIn("authorization", headers)
+        request = self.endpoint.requests[0]
+        self.assertEqual(request["headers"]["authorization"], f"Bearer {KEY}")
+        self.assertEqual(request["headers"]["user-agent"], "Zephy-TCS-Prover")
+        self.assertNotIn("zephy-tcs-prover", request["headers"])
+        self.assertNotIn("Local menu only", json.dumps(request))
+
+    def test_default_request_source_and_edited_source_keep_the_saved_key(self):
+        model = self.saved()
+        self.call("/api-models/test", {"id": model["id"]})
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["user-agent"], "TCS-Prover")
+        status, result = self.call("/api-models/test", {"id": model["id"], "requestSource": "Router-visible client"})
+        self.assertEqual((status, result["ok"], result["recorded"]), (200, True, False))
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["user-agent"], "Router-visible client")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["authorization"], f"Bearer {KEY}")
+        self.assertEqual(providers.api_model(model["id"])["requestSource"], "")
 
     def test_rejected_keys_report_the_provider_message_with_the_key_redacted(self):
         model = self.saved()
@@ -494,7 +505,7 @@ class ProbeTests(HttpCase):
         self.addCleanup(attacker.close)
         model = self.saved()
         for change in ({"baseUrl": attacker.base + "/v1", "headerName": "X-Leak"},
-                       {"baseUrl": attacker.base + "/v1"}, {"headerName": "X-Leak"}, {"format": "anthropic"}):
+                       {"baseUrl": attacker.base + "/v1"}, {"format": "anthropic"}):
             with self.subTest(change=change):
                 status, value = self.call("/api-models/test", {"id": model["id"], **change})
                 self.assertEqual(status, 400)
@@ -556,13 +567,14 @@ class ProbeHelperTests(StoreCase):
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-inherited-secret-55555"}):
             self.assertEqual(server._api_test_text("a sk-inherited-secret-55555 b", key), "a [redacted] b")
 
-    def test_configured_header_replaces_a_default_of_the_same_name(self):
+    def test_legacy_header_cannot_replace_content_type_or_format_authentication(self):
         path, headers, body = server._api_test_request({
             "format": "anthropic", "baseUrl": "https://gw.example.com/proxy/V1/", "headerName": "content-type",
             "model": "c", "apiKey": KEY})
         self.assertEqual(path, "/proxy/v1/messages")
-        self.assertEqual([name for name in headers if name.lower() == "content-type"], ["content-type"])
-        self.assertEqual(headers["content-type"], KEY)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(headers["x-api-key"], KEY)
+        self.assertNotIn("content-type", headers)
         self.assertEqual(json.loads(body)["max_tokens"], 16)
 
 
@@ -646,7 +658,7 @@ class LaunchValidationTests(StoreCase):
                 model = self.openai_model()
 
     def test_api_model_jobs_record_a_snapshot_and_never_pass_the_key(self):
-        model = self.openai_model()
+        model = self.openai_model(requestSource="Zephy-TCS-Prover")
         app = server.App(runs=self.runs, load_latest=False)
         launched = {}
 
@@ -661,7 +673,7 @@ class LaunchValidationTests(StoreCase):
         self.assertEqual(settings["authorModel"], model["id"])
         self.assertEqual(settings["apiModels"], {model["id"]: {
             "label": "Gateway", "format": "openai", "baseUrl": "https://gateway.example.com/v1",
-            "headerName": "Authorization", "model": "gpt-gateway"}})
+            "headerName": "Authorization", "requestSource": "Zephy-TCS-Prover", "model": "gpt-gateway"}})
         self.assertNotIn(KEY, text)
         command = launched["command"]
         self.assertEqual(command[command.index("--author-model") + 1], model["id"])
@@ -681,7 +693,7 @@ class LaunchValidationTests(StoreCase):
         restored = server.restore_saved_jobs(self.runs)[app.run_dir.name]
         self.assertEqual(restored.state["apiModels"], {"api:gateway": {
             "label": "Gateway", "format": "openai", "baseUrl": "https://g.example.com/v1",
-            "headerName": "Authorization", "model": "m"}})
+            "headerName": "Authorization", "requestSource": "", "model": "m"}})
         catalog = batches.BatchCatalog(self.runs.resolve(), current_root=self.runs.resolve())
         self.assertEqual(catalog.state("__root__", app.run_dir.name)["apiModels"], restored.state["apiModels"])
 
@@ -791,8 +803,7 @@ class RemovedModelRestoreTests(StoreCase):
                                  "Choose Resume after fixing the settings."])
 
     def test_a_cli_author_continuation_reports_the_replacement(self):
-        source = self.saved_run("source", {"authorModel": "deepseek-v4-pro", "criticModel": "deepseek-v4-pro",
-                                           "fileManagement": False})
+        source = self.saved_run("source", {"authorModel": "deepseek-v4-pro", "criticModel": "deepseek-v4-pro"})
         self.assertEqual(server.saved_research_source(source)["replacedRoles"], ["author", "critic"])
         manager = object.__new__(server.Server)
         manager.runs, manager.jobs, manager.jobs_lock = self.runs, {}, threading.RLock()

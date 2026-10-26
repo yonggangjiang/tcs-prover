@@ -40,8 +40,7 @@ assert.notEqual(launch.key, card.key);
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const renderer = source.slice(source.indexOf('function managesResearchFiles('), source.indexOf('function selectedAuthorPrompt('))
-  + source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
+const renderer = source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
 const handlers = source.slice(source.indexOf('ui.stop.onclick ='), source.indexOf('ui.home.onclick ='));
 const setup = `
 let state = {}, previousPhase = 'running', currentJob = 'same-job', timer, clock, polls = 0;
@@ -58,7 +57,7 @@ let clicked = '';
 const act = path => clicked = path;
 `;
 const checks = `
-const author = {runId: 'audit-test', fileManagement: true, phase: 'pausing', stage: 'solve', activeNode: 'author', auditHoldingAuthor: true};
+const author = {runId: 'audit-test', phase: 'pausing', stage: 'solve', activeNode: 'author', auditHoldingAuthor: true};
 render(author);
 assert.equal(ui.pause.hidden, false);
 assert.equal(ui.stop.hidden, false);
@@ -198,8 +197,7 @@ vm.runInNewContext(setup + linkFormatter + selected + checks, {assert});
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const controls = source.slice(source.indexOf('function managesResearchFiles('), source.indexOf('function selectedAuthorPrompt('))
-  + source.slice(source.indexOf('function researchAuditValues('),
+const controls = source.slice(source.indexOf('function researchAuditValues('),
   source.indexOf('// Merge incremental polling state'));
 const setup = `
 function element(value = '', tagName = '') {
@@ -215,7 +213,6 @@ function element(value = '', tagName = '') {
     }, focus() {}};
 }
 const ui = {
-  fileManagement: {checked: true},
   researchAuditInterval: element(), researchAuditModels: Array.from({length: 3}, () => element()),
   liveResearchAuditInterval: element(), liveResearchAuditModels: Array.from({length: 3}, () => element()),
   researchAuditsControl: element(), applyResearchAudits: element(),
@@ -225,7 +222,7 @@ const ui = {
   researchAuditActivity: element(), memoryPanel: element(),
 };
 let state = {
-  runId: 'first', fileManagement: true,
+  runId: 'first',
   researchAudits: {intervalHours: 2, models: ['none', 'none', 'none']},
   researchAuditStatus: {runningSlots: [], lastError: ''},
   workflow: {settings: {research_audits: {choices: [
