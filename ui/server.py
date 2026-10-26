@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import workflow_runner as runtime
 from runner import claude_cli, providers
-from . import audits, retrieval
+from . import retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -466,8 +466,6 @@ def important_record(record):
         # A PASS can either trigger another review or accept the proof. Keep
         # the controller's exact acceptance reason after routine events age out.
         return True
-    if kind == "research_audit":
-        return record.get("status") != "working" or bool(record.get("recovered"))
     if kind != "codex_event" or record.get("root") is False:
         return False
     event = record.get("event")
@@ -500,7 +498,6 @@ PUBLIC_GRAPH = {
         "model_efforts": {
             model: list(efforts) for model, efforts in runtime.MODEL_EFFORTS.items()
         },
-        "research_audits": {**audits.default_settings(), "choices": audits.model_choices()},
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "model_summary": "6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer",
@@ -718,10 +715,6 @@ def empty_state(trace=None, trace_version=0):
         "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
         "thinkingHours": DEFAULT_THINKING_HOURS,
-        "researchAudits": audits.default_settings(),
-        "researchAuditProgress": {},
-        "researchAuditStatus": {"runningSlots": [], "lastError": "", "warnings": []},
-        "auditHoldingAuthor": False,
         "stage": "",
         "activeNode": "",
         "round": 0,
@@ -771,7 +764,7 @@ def model_menu_settings():
     catalog = providers.catalog()
     efforts = {model: list(levels) for model, levels in runtime.MODEL_EFFORTS.items()}
     efforts.update((row["id"], list(row["efforts"])) for row in catalog)
-    return {"model_catalog": catalog, "model_efforts": efforts}
+    return {"model_catalog": catalog, "model_efforts": efforts, "model_sources": providers.source_catalog()}
 
 
 def model_choice_error(model, role):
@@ -783,10 +776,10 @@ def model_choice_error(model, role):
                 f"for example {runtime.MODEL}.")
     if providers.is_api_id(model):
         return (f"The API model {model} chosen for the {label} is not configured. Add it under "
-                "Advanced settings → API models, or choose another model.")
+                "Advanced settings → API connections, or choose another model.")
     shown = repr(model)[:80] if isinstance(model, str) and model else "(none)"
     return (f"Unknown model {shown} for the {label}. Choose {', '.join(OFFERED_MODELS)}, "
-            "or an api:<id> model configured under Advanced settings → API models.")
+            "or an api:<id> model configured under Advanced settings → API connections.")
 
 
 def unconfigured_job_model_error(model, role, snapshot):
@@ -806,7 +799,7 @@ def unconfigured_job_model_error(model, role, snapshot):
     else:
         how = f"with the display name “{model[len(providers.API_ID_PREFIX):]}”"
     return (f"The API model {model} chosen for the {ROLE_LABELS[role]} is not configured. Add it again "
-            f"under New problem → Advanced settings → API models {how} to continue this job.")
+            f"under New problem → Advanced settings → API connections {how} to continue this job.")
 
 
 def require_known_models(models):
@@ -833,7 +826,7 @@ def require_model_access(models):
         raise ValueError(str(exc)) from exc
 
 
-API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model", "requestSource")
+API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model", "requestSource", "sourceId", "sourceLabel")
 # The add/edit form's choices; which CLI runs each format is fixed in providers.
 API_MODEL_FORMATS = [
     {"id": providers.OPENAI_FORMAT, "label": "OpenAI-compatible (Responses API)", "cli": "Codex CLI",
@@ -874,7 +867,10 @@ def saved_api_models(value):
         except providers.ProviderError:
             continue
         snapshots[model] = {**{key: entry[key] for key in ("label", "format", "baseUrl", "model")},
-                            "headerName": providers.DEFAULT_HEADERS[entry["format"]], "requestSource": source}
+                            "headerName": providers.DEFAULT_HEADERS[entry["format"]], "requestSource": source,
+                            "sourceId": entry.get("sourceId") if providers.is_api_id(entry.get("sourceId")) else model,
+                            "sourceLabel": entry.get("sourceLabel") if isinstance(entry.get("sourceLabel"), str)
+                            and len(entry["sourceLabel"]) <= providers.MAX_LABEL_CHARS else entry["label"]}
     return snapshots
 
 
@@ -1224,9 +1220,6 @@ class App:
         self.active_token = None
         self.worker_token = None
         self.lock = threading.RLock()
-        self.research_audits = None
-        self._audit_token = None
-        self._audit_pause_engine = None
         self._checkpoint_cache = []
         self._checkpoint_cache_signature = None
         self._approach_cache = {}
@@ -1257,12 +1250,6 @@ class App:
     def _new_run(self, statement, slug_source=None):
         """Create a private, readable folder name for one problem."""
 
-        if self.research_audits is not None:
-            self.research_audits.close()
-            self.research_audits = None
-            self._audit_token = None
-        self._audit_pause_engine = None
-        self.state["auditHoldingAuthor"] = False
         if self.fixed_trace:
             self.run_dir = self.trace_file.parent
         else:
@@ -1315,7 +1302,6 @@ class App:
             "reasoningEffort", "reviewEffort", "authorEffort",
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
-            "researchAudits", "researchAuditProgress",
             "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
             "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
             "sourceFile", "apiModels",
@@ -1386,231 +1372,8 @@ class App:
                 if self.worker_token is token:
                     self.worker_token = None
             raise
-        self._start_research_audits(token)
+
         return worker
-
-    def _start_research_audits(self, token, *, paused=False):
-        """Monitor optional audits separately from the workflow reader."""
-
-        with self.lock:
-            if self.state.get("retrievalPolicyPath"):
-                # This experiment retains the default of no scheduled auditors.
-                # Do not start a second runner outside its role-specific policy.
-                return
-            if self.research_audits is not None and self._audit_pause_engine is self.research_audits:
-                # Automatic resume keeps the same audit clock and monitor.
-                self._audit_token = token
-                return
-            paused = paused and self.state["phase"] == "paused" and self.worker_token is None
-            if ((not paused and (token is None or self.worker_token is not token or self._audit_token is token))
-                    or all(model == "none" for model in self.state["researchAudits"]["models"])):
-                return
-            workspace = self.state.get("goalWorkspace") or self.run_dir
-
-            def record(event):
-                with self.lock:
-                    if self.research_audits is engine:
-                        self.add_trace(event)
-                        self.state["researchAuditProgress"] = engine.checkpoint()
-                        self.state["researchAuditStatus"] = engine.status()
-                        if event.get("status") in {"warning", "completed", "retrying"} or event.get("recovered"):
-                            self._save_job_settings(self.state)
-
-            try:
-                engine = audits.ResearchAudits(workspace, on_event=record,
-                                               progress=self.state["researchAuditProgress"],
-                                               before_batch=self._pause_for_research_audit,
-                                               after_batch=self._resume_after_research_audit)
-            except Exception as exc:
-                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
-                return
-            if self.research_audits is not None:
-                self.research_audits.close()
-            self.research_audits = engine
-            self._audit_token = token
-
-        def monitor():
-            checkpoint_at = 0
-            tick = threading.Event()
-            try:
-                while True:
-                    with self.lock:
-                        if (engine.closed or self.research_audits is not engine
-                                or (self.worker_token is not self._audit_token
-                                    and self._audit_pause_engine is not engine)):
-                            break
-                        self._update_research_audits()
-                        elapsed = self.state["researchAuditProgress"].get("elapsedSeconds", 0)
-                        if elapsed - checkpoint_at >= 60:
-                            self._save_job_settings(self.state)
-                            checkpoint_at = elapsed
-                    tick.wait(1)
-            except (OSError, ValueError) as exc:
-                record({"kind": "research_audit", "stage": "audit", "status": "error", "text": str(exc)})
-            finally:
-                engine.close()
-                with self.lock:
-                    if self.research_audits is engine:
-                        self.state["researchAuditProgress"] = engine.checkpoint()
-                        status = engine.status()
-                        if (self.state["researchAuditStatus"].get("lastError")
-                                and not self.state["researchAuditStatus"].get("warnings")):
-                            status["lastError"] = self.state["researchAuditStatus"]["lastError"]
-                        self.state["researchAuditStatus"] = status
-                        # An audit batch releases its own pause after its cancelled
-                        # workers finish, even when this monitor has failed.
-                        if self._audit_pause_engine is not engine:
-                            self.research_audits = None
-                            self._audit_token = None
-                            self.state["auditHoldingAuthor"] = False
-                        if self.run_dir:
-                            self._save_job_settings(self.state)
-
-        try:
-            threading.Thread(target=monitor, daemon=True).start()
-            return engine
-        except Exception as exc:
-            engine.close()
-            with self.lock:
-                self.research_audits = None
-                self._audit_token = None
-                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
-
-    def _update_research_audits(self):
-        """Tick author time; keep audits alive during their own temporary pause."""
-
-        if self.research_audits is not None:
-            if self.research_audits.closed:
-                return
-            active = (self.state["phase"] == "running" and self.state["activeNode"] == "author"
-                      and self.state["stage"] in {"solve", "repair"})
-            try:
-                self.research_audits.update(
-                    self.state["researchAudits"], active=active,
-                    paused_for_audit=self._audit_pause_engine is self.research_audits,
-                )
-                self.state["researchAuditProgress"] = self.research_audits.checkpoint()
-                self.state["researchAuditStatus"] = self.research_audits.status()
-            except Exception as exc:
-                self.research_audits.close()
-                if self._audit_pause_engine is not self.research_audits:
-                    self.research_audits = None
-                    self._audit_token = None
-                    self.state["auditHoldingAuthor"] = False
-                self.state["researchAuditStatus"] = {"runningSlots": [], "lastError": str(exc)}
-
-    def _pause_for_research_audit(self, engine):
-        """Wait for the author reader to settle before any audit reads its files."""
-
-        with self.lock:
-            if (self.research_audits is not engine or self.state["phase"] not in {"running", "paused"}
-                    or self.state["activeNode"] != "author" or self.state["stage"] not in {"solve", "repair"}):
-                return False
-            if self.state["phase"] == "paused":
-                return self.worker_token is None and self._audit_pause_engine is engine
-            self._audit_pause_engine = engine
-            self.state["auditHoldingAuthor"] = True
-            self.pause(_for_audit=True)
-        tick = threading.Event()
-        while True:
-            with self.lock:
-                if self.research_audits is not engine or self._audit_pause_engine is not engine:
-                    return False
-                if self.state["phase"] == "paused" and self.worker_token is None:
-                    if self.state["activeNode"] != "author" or self.state["stage"] not in {"solve", "repair"}:
-                        return False
-                    if not self.state.get("goalThreadId"):
-                        self.state["error"] = "No saved author conversation is available. Resume manually before auditing."
-                    return not bool(self.state["error"])
-                if self.state["phase"] != "pausing":
-                    return False
-            tick.wait(0.1)
-
-    def _resume_after_research_audit(self, engine):
-        """Resume only our own pause, after all audit reports have been published."""
-
-        with self.lock:
-            if self.research_audits is not engine or self._audit_pause_engine is not engine:
-                return
-            self.state["auditHoldingAuthor"] = False
-            if engine.closed:
-                self.state["researchAuditProgress"] = engine.checkpoint()
-                self.research_audits = None
-                self._audit_token = self._audit_pause_engine = None
-            try:
-                if (self.state["phase"] == "paused" and self.worker_token is None
-                        and not self.state["error"]):
-                    self.resume()
-            except Exception as exc:
-                self.state["error"] = f"Audits finished, but the author could not resume: {exc}"
-                self.add_trace({"kind": "research_audit", "stage": "audit", "status": "error",
-                                "text": self.state["error"]})
-            finally:
-                self._audit_pause_engine = None
-                self._save_job_settings(self.state)
-
-    def set_research_audits(self, settings):
-        """Apply the three optional auditor choices without restarting research."""
-
-        settings = audits.normalize_settings(settings)
-        with self.lock:
-            if (self.state["phase"] not in {"running", "paused"}
-                    or self.state["activeNode"] != "author"
-                    or self.state["stage"] not in {"solve", "repair"}):
-                raise ValueError("Research audits can be changed while the author is running or paused.")
-            if (self.research_audits is None
-                    and all(model == "none" for model in self.state["researchAudits"]["models"])):
-                self.state["researchAuditProgress"] = {}
-            self.state["researchAudits"] = settings
-            self._update_research_audits()
-            if self.research_audits is None:
-                warnings = audits.selected_warnings(self.state["researchAuditProgress"].get("warnings"), settings)
-                self.state["researchAuditProgress"]["warnings"] = warnings
-                self.state["researchAuditStatus"] = {
-                    "runningSlots": [], "warnings": warnings,
-                    "lastError": "\n".join(item["message"] for item in warnings),
-                }
-            self._save_job_settings(self.state)
-            self._start_research_audits(self.worker_token)
-
-    def start_research_audit_now(self):
-        """Run the saved auditors now and restart their interval clock."""
-
-        self._check_launch_hold()
-
-        with self.lock:
-            paused = self.state["phase"] == "paused"
-            if (self.state["phase"] not in {"running", "paused"} or self.state["activeNode"] != "author"
-                    or self.state["stage"] not in {"solve", "repair"}
-                    or (self.worker_token is not None if paused else self.worker_token is None)
-                    or self.state["manuallyStopped"] or self._audit_pause_engine is not None
-                    or self.state["auditHoldingAuthor"]):
-                raise ValueError("Start an audit while the author is running or fully paused.")
-            settings = self.state["researchAudits"]
-            if all(model == "none" for model in settings["models"]):
-                raise ValueError("Select and save at least one auditor first.")
-            if self.research_audits is not None and self.research_audits.status().get("batchActive"):
-                raise ValueError("A research audit batch is already in progress.")
-            if paused or self.research_audits is None:
-                if self._start_research_audits(self.worker_token, paused=paused) is None:
-                    raise ValueError("The research audit scheduler is unavailable.")
-            if self.research_audits is None or self.research_audits.closed:
-                raise ValueError("The research audit scheduler is unavailable.")
-            previous_error = self.state["error"]
-            if paused:
-                # Reserve the paused workspace during preflight as well as the audit.
-                self._audit_pause_engine = self.research_audits
-                self.state.update(auditHoldingAuthor=True, error="")
-            try:
-                self.research_audits.update(settings, active=not paused, paused_for_audit=paused, start_now=True)
-            except Exception:
-                if paused:
-                    self._audit_pause_engine = None
-                    self.state.update(auditHoldingAuthor=False, error=previous_error)
-                raise
-            self.state["researchAuditProgress"] = self.research_audits.checkpoint()
-            self.state["researchAuditStatus"] = self.research_audits.status()
-            self._save_job_settings(self.state)
 
     def has_active_worker(self):
         """Return whether a model reader can still mutate this run."""
@@ -2057,7 +1820,6 @@ class App:
         review_prompt=None, include_review=True,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
-        research_audits=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
     ):
         """Normalize and validate settings shared by both input modes."""
@@ -2127,11 +1889,9 @@ class App:
             raise ValueError(
                 f"Choose 0 for unlimited, or at most {MAX_THINKING_HOURS} hours."
             )
-        audit_options = audits.normalize_settings(research_audits)
         # Web cutoff timestamps need Codex models: say so before any CLI check.
         search_options = retrieval.validate_options(
-            retrieval_mode, retrieval_cutoff_utc, models=selected_models,
-            research_audits=audit_options)
+            retrieval_mode, retrieval_cutoff_utc, models=selected_models)
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
         return {
@@ -2158,7 +1918,6 @@ class App:
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
-            "researchAudits": audit_options,
         }
 
     def start_review(
@@ -2177,7 +1936,6 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         review_only=False,
         continuation_source="", stopped_stage="",
-        research_audits=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
         revise_existing=False,
     ):
@@ -2224,7 +1982,6 @@ class App:
             review_prompt=review_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
-            research_audits=research_audits if not review_only else None,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         if options["retrievalMode"] == "historical":
@@ -2652,7 +2409,7 @@ class App:
                 pass  # The in-memory segment still excludes the wait.
 
     def _save_pause(self, checkpoint):
-        """Atomically store controller state; research notebooks belong to the LLM."""
+        """Atomically store the author's controller checkpoint."""
 
         self._save(PAUSE_FILENAME, json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
 
@@ -2691,7 +2448,7 @@ class App:
         with self.lock:
             deadline = self.state.get("autoResumeAt", 0)
             if (self.state["phase"] != "paused" or not deadline or now < deadline
-                    or self.has_active_worker() or self.state.get("auditHoldingAuthor")
+                    or self.has_active_worker()
                     or self.state.get("manuallyStopped")):
                 return False
             try:
@@ -2758,25 +2515,18 @@ class App:
                                     round=report_record.get("round", self.state["round"]))
         return checkpoint_state
 
-    def pause(self, *, _for_audit=False):
+    def pause(self):
         """Interrupt the author while retaining its native session for resume."""
 
         with self.lock:
-            if not _for_audit and self.state["phase"] in {"pausing", "paused"}:
-                # Audit cancellation is also valid before a checkpoint exists. A damaged
-                # checkpoint is left for Resume to report, but its automatic retry stops.
+            if self.state["phase"] in {"pausing", "paused"}:
+                # A damaged checkpoint is left for Resume to report, but its
+                # automatic retry stops.
                 checkpoint = read_pause_object(self.run_dir)
                 if checkpoint:
                     checkpoint.update(pauseCause="user", autoResumeAt=0)
                     self._save_pause(checkpoint)
                 self.state["autoResumeAt"] = 0
-            if not _for_audit and self._audit_pause_engine is not None:
-                # A human pause cancels the audits and their automatic resume.
-                self._audit_pause_engine = None
-                self.state["auditHoldingAuthor"] = False
-                self._update_research_audits()
-                if self.state["phase"] in {"pausing", "paused"}:
-                    return
             if self.state["phase"] in {"pausing", "paused"}:
                 return
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
@@ -2784,17 +2534,15 @@ class App:
                 raise ValueError("Pause is available while the proof author is working.")
             checkpoint_state = self._author_checkpoint_state()
             self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
-                              "pauseCause": "audit" if _for_audit else "user", "autoResumeAt": 0,
+                              "pauseCause": "user", "autoResumeAt": 0,
                               "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
                               "goalThreadId": self.state.get("goalThreadId", "")})
             self._save(PAUSE_REQUEST_FILENAME, "{}\n")
             self.state.update(phase="pausing", error="", autoResumeAt=0)
-            self._update_research_audits()
             self._save_job_settings(self.state)
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
-                            "label": "Paused for research audits" if _for_audit else "Pause requested",
-                            "text": ("Preserving the author conversation; it will resume after the audit reports are saved."
-                                     if _for_audit else "Interrupting the author and preserving its saved conversation for Resume.")})
+                            "label": "Pause requested",
+                            "text": "Interrupting the author and preserving its saved conversation for Resume."})
             process, token = self.process, self.active_token
 
         def finish_if_unresponsive():
@@ -2862,7 +2610,7 @@ class App:
             self.state.update(preparedRun=False, goalResume=False, goalThreadId="",
                               goalWorkspace=str(self.run_dir.resolve()), authorSteerDelivered="",
                               elapsedSeconds=0, startedAt=now, resumedAt=now, finishedAt="",
-                              researchAuditProgress={}, error="")
+                              error="")
             process = None
             try:
                 self._save_job_settings(self.state)
@@ -2885,8 +2633,6 @@ class App:
         self._check_launch_hold()
 
         with self.lock:
-            if self.state.get("auditHoldingAuthor"):
-                raise ValueError("Wait for the audits to finish, or choose Pause to cancel them before resuming.")
             if self.state["phase"] != "paused" or self.has_active_worker():
                 raise ValueError("Wait until the author is paused before resuming.")
             self._check_launch_models_locked()
@@ -2995,7 +2741,6 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
         allow_external_source=False,
-        research_audits=None,
         source_file=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
@@ -3033,7 +2778,6 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             include_review=False,
-            research_audits=research_audits,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
         )
         options["sourceFile"] = source_file
@@ -3438,11 +3182,8 @@ class App:
                 }
                 if record_stage in stages:
                     with self.lock:
-                        previous_stage = (self.state["stage"], self.state["activeNode"])
                         self.state["stage"] = record_stage
                         self.state["activeNode"] = event_node(record, self.state["activeNode"])
-                        if previous_stage != (self.state["stage"], self.state["activeNode"]):
-                            self._update_research_audits()
                 if isinstance(record.get("round"), int):
                     with self.lock:
                         self.state["round"] = record["round"]
@@ -3482,11 +3223,8 @@ class App:
                             checkpoint = read_pause_object(self.run_dir)
                             reason = record.get("reason", "")
                             cause = checkpoint.get("pauseCause") if self.state["phase"] == "pausing" else "error"
-                            if cause == "audit" and reason:
-                                # The author failed before it saw the audit pause (an
-                                # acknowledged pause carries no reason). No audit runs and
-                                # nothing resumes it: an error pause, retried as usual.
-                                cause = "error"
+                            if cause not in {"user", "error"}:
+                                cause = "error" if reason else "user"
                             paused_stage = record["stage"]
                             if (record["node"] == "author"
                                     and record["state"].get("report", {}).get("verdict") == "reject"):
@@ -3505,7 +3243,6 @@ class App:
                                               "safetyStop": safety})
                             self.state.update(phase="pausing", error=reason, sessionUnavailable=unavailable,
                                               safetyStop=safety)
-                            self._update_research_audits()
                             self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "status"
@@ -3648,9 +3385,7 @@ class App:
                 self.state["error"] = "The workflow exited without a final answer. Continue from a saved checkpoint."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
-            self._update_research_audits()
-            if self.research_audits is not None:
-                self._save_job_settings(self.state)
+
 
     def clear_trace(self):
         """Clear the saved transcript only when no request is active."""
@@ -3673,10 +3408,8 @@ class App:
                 and self.state["error"] == "Stopped."
             ):
                 return
-            if self.state["phase"] not in {"reviewing", "running", "pausing"} and not self.state.get("auditHoldingAuthor"):
+            if self.state["phase"] not in {"reviewing", "running", "pausing"}:
                 raise ValueError("No model request is running in this job.")
-            self._audit_pause_engine = None
-            self.state["auditHoldingAuthor"] = False
             self.add_trace({
                 "kind": "status", "stage": self.state["stage"],
                 "node": self.state["activeNode"],
@@ -3706,7 +3439,6 @@ class App:
             (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
             (self.run_dir / PAUSE_FILENAME).unlink(missing_ok=True)
             process, self.state["phase"] = self.process, "stopping"
-            self._update_research_audits()
             self._save_job_settings(self.state)
         stop_process_tree(process)
         with self.lock:
@@ -3795,11 +3527,6 @@ class App:
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Stop the current work first.")
-            if self.research_audits is not None:
-                self.research_audits.close()
-                self.research_audits = None
-                self._audit_token = None
-            self._audit_pause_engine = None
             trace, version = self.state["trace"], self.state["traceVersion"]
             self.state = empty_state(trace, version)
             self.state["runId"] = self.run_dir.name if self.run_dir else ""
@@ -4267,7 +3994,6 @@ def restore_saved_app(app):
                 "reasoningEffort", "reviewEffort", "authorEffort",
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
-                "researchAudits", "researchAuditProgress",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
                 "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
@@ -4289,14 +4015,6 @@ def restore_saved_app(app):
                     ):
                         continue
                     persisted_settings.add(key)
-                    if key == "researchAudits":
-                        try:
-                            state[key] = audits.normalize_settings(settings[key])
-                        except ValueError:
-                            settings_warnings.append("Saved research audit settings are invalid; audits are disabled.")
-                        continue
-                    if key == "researchAuditProgress" and not isinstance(settings[key], dict):
-                        continue
                     if key.endswith("Model"):
                         state[key] = restored_model(settings[key])
                         if state[key] != settings[key]:
@@ -4305,8 +4023,6 @@ def restore_saved_app(app):
                     state[key] = settings[key]
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
-    warnings = audits.selected_warnings(state["researchAuditProgress"].get("warnings"), state["researchAudits"])
-    state["researchAuditStatus"].update(warnings=warnings, lastError="\n".join(item["message"] for item in warnings))
     for name in ("review", "author", "critic", "final"):
         prompt_path = run_dir / "prompts" / f"{name}.txt"
         try:
@@ -4950,7 +4666,6 @@ class Server(ThreadingHTTPServer):
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
             ),
             **review_only_option,
-            research_audits=body.get("researchAudits", app.state.get("researchAudits") if run_id else None),
             retrieval_mode=body.get("retrievalMode", app.state.get("retrievalMode", "live") if run_id else "live"),
             retrieval_cutoff_utc=body.get("retrievalCutoffUtc", app.state.get("retrievalCutoffUtc", "") if run_id else ""),
             # A named job is revised in its own folder, never re-registered.
@@ -4979,7 +4694,6 @@ class Server(ThreadingHTTPServer):
             "critic_effort": body.get("criticEffort", legacy_effort),
             "writer_effort": body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("author", "critic", "final")),
-            "research_audits": body.get("researchAudits"),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
         }
@@ -5197,7 +4911,6 @@ class Server(ThreadingHTTPServer):
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
-            research_audits=options.get("researchAudits"),
         )
         warning = removed_model_warning(
             role for role in source.get("replacedRoles", ()) if f"{role}Model" not in (settings or {}))
@@ -5218,7 +4931,6 @@ class Server(ThreadingHTTPServer):
         for previous in self.jobs.values():
             if not previous.run_dir or not (
                 previous.has_active_worker()
-                or previous.state.get("auditHoldingAuthor")
                 or previous.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
             ):
                 continue
@@ -5233,16 +4945,6 @@ class Server(ThreadingHTTPServer):
             app = self.get_job(run_id)
             self._check_author_workspace_idle(app.run_dir)
             app.resume()
-        return app
-
-    def start_research_audit_job(self, run_id):
-        """Reserve a paused workspace before launching its auditors."""
-
-        with self.jobs_lock:
-            app = self.get_job(run_id)
-            if app.state["phase"] == "paused":
-                self._check_author_workspace_idle(app.run_dir)
-            app.start_research_audit_now()
         return app
 
     def resume_critic_job(self, run_id, include_audit_checkpoint=True):
@@ -5505,7 +5207,6 @@ class Server(ThreadingHTTPServer):
                 critic_prompt=source_state["criticPrompt"],
                 final_prompt=source_state["finalPrompt"],
                 review_only=source_state["statementReviewOnly"],
-                research_audits=source_state.get("researchAudits"),
                 **common,
             )
         elif plan["action"] == "author":
@@ -5523,7 +5224,6 @@ class Server(ThreadingHTTPServer):
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
                 "final_prompt": source_state["finalPrompt"],
-                "research_audits": source_state.get("researchAudits"),
                 **common,
             }
             app.start_direct_statement(
@@ -5586,8 +5286,6 @@ class Server(ThreadingHTTPServer):
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
-            # A paused job whose auditors still hold its workspace is busy.
-            job["auditHoldingAuthor"] = bool(state.get("auditHoldingAuthor"))
             job["stageLabel"] = state["workflow"]["nodes"].get(state["activeNode"], {}).get("label", "")
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
@@ -5631,13 +5329,9 @@ class Server(ThreadingHTTPServer):
             if not app:
                 raise ValueError("That job is not available in this TCS Prover session.")
             with app.lock:
-                engine = app.research_audits
                 if (
                     app.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
                     or app.worker_token is not None
-                    # Auditors of a paused author still read and write its folder.
-                    or app.state.get("auditHoldingAuthor") or app._audit_pause_engine is not None
-                    or (engine is not None and engine.status().get("batchActive"))
                 ):
                     raise ValueError("Stop this job before deleting it.")
                 folder = app.run_dir
@@ -5645,7 +5339,7 @@ class Server(ThreadingHTTPServer):
                     raise ValueError("The job folder is outside the runs directory.")
                 for other in self.jobs.values():
                     if other is app or not (
-                        other.has_active_worker() or other.state.get("auditHoldingAuthor")
+                        other.has_active_worker()
                         or other.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
                     ):
                         continue
@@ -5659,19 +5353,15 @@ class Server(ThreadingHTTPServer):
                 while target.exists():
                     target = trash / f"{folder.name}-{number}"
                     number += 1
-                if engine is not None:
-                    # An idle scheduler stays attached after Stop; detach it so no
-                    # later audit event recreates the deleted folder.
-                    engine.close()
-                    app.research_audits = app._audit_token = None
                 folder.rename(target)
                 del self.jobs[run_id]
         return {"deleted": run_id}
 
     def api_model_listing(self):
-        """Saved API models (never their keys) and the role menus that include them."""
+        """Saved key connections and the role menus for their discovered models."""
 
-        return {"models": providers.load_api_models(), "formats": API_MODEL_FORMATS, **model_menu_settings()}
+        connections = providers.load_api_connections()
+        return {"connections": connections, "models": connections, "formats": API_MODEL_FORMATS, **model_menu_settings()}
 
     def _api_model_jobs(self, model_id):
         """Run ids of the jobs naming one model: (running, waiting to start or resume)."""
@@ -5681,10 +5371,13 @@ class Server(ThreadingHTTPServer):
             apps = list(self.jobs.values())
         for app in apps:
             with app.lock:
-                if not any(app.state.get(f"{role}Model") == model_id for role in ROLES):
+                choices = [app.state.get(f"{role}Model") for role in ROLES]
+                snapshots = saved_api_models(app.state.get("apiModels"))
+                if not any(choice == model_id or
+                           (providers.api_model(choice) or snapshots.get(choice) or {}).get("sourceId") == model_id
+                           for choice in choices):
                     continue
-                if (app.state["phase"] in ACTIVE_PHASES or app.worker_token is not None
-                        or app.state.get("auditHoldingAuthor")):
+                if app.state["phase"] in ACTIVE_PHASES or app.worker_token is not None:
                     active.append(app.state.get("runId", ""))
                 elif app.state["phase"] in WAITING_PHASES:
                     waiting.append(app.state.get("runId", ""))
@@ -5723,6 +5416,8 @@ class Server(ThreadingHTTPServer):
         with another format: the format chooses the CLI of their sessions.
         """
 
+        if not body.get("model"):
+            return self.save_api_connection(body)
         requested = body.get("id")
         reserved = set()
         with self.jobs_lock:
@@ -5752,6 +5447,49 @@ class Server(ThreadingHTTPServer):
             model = providers.save_api_model(body, reserved=reserved)
         return {"model": model, **self.api_model_listing()}
 
+    def save_api_connection(self, body):
+        """Discover and save one key once; role menus select its models later."""
+
+        requested = body.get("id") or None
+        saved = providers.api_connection(requested) if requested else None
+        expected = ({**providers.validated_api_connection({}, requested),
+                     "label": saved["label"], "updatedAt": saved["updatedAt"]} if saved else None)
+        with self.jobs_lock:
+            if (saved and body.get("format") in providers.FORMATS and body["format"] != saved["format"]
+                    and any(self._api_model_jobs(requested))):
+                raise ValueError("The API format decides which CLI runs these models, so it cannot change while "
+                                 "jobs use this connection. Add a new API connection for the other format.")
+        entry = providers.validated_api_connection(body, requested if saved else None)
+        discovery = discover_api_models(entry)
+        if not discovery["ok"]:
+            raise ValueError(discovery["message"] or "No models are available for this API key.")
+        with self.jobs_lock:
+            # Recheck after the network request: jobs can start while it loads.
+            current = providers.api_connection(requested) if requested else None
+            if (current and entry["format"] != current["format"] and any(self._api_model_jobs(requested))):
+                raise ValueError("The API format cannot change while jobs use this connection.")
+            removed = self._removed_api_models()
+            reserved, candidates = set(), []
+            offered = {row["id"] for row in discovery["models"]}
+            for model_id, (formats, snapshot) in removed.items():
+                source_id = (snapshot or {}).get("sourceId", model_id)
+                if formats - {entry["format"]}:
+                    reserved.add(source_id)
+                elif (snapshot and snapshot["format"] == entry["format"] and snapshot["baseUrl"] == entry["baseUrl"]
+                      and snapshot["model"] in offered and providers.api_connection(source_id) is None):
+                    candidates.append((source_id, snapshot, model_id == source_id))
+            values = {**body, **entry}
+            legacy_model = None
+            if not requested and candidates:
+                identity, snapshot, legacy = sorted(candidates, key=lambda item: item[0])[0]
+                values.update(id=identity, label=body.get("label") or snapshot.get("sourceLabel") or snapshot["label"])
+                legacy_model = snapshot["model"] if legacy else None
+            if values.get("id") in reserved:
+                raise ValueError("Saved jobs still use this API connection with another format. Choose their saved format.")
+            connection = providers.save_api_connection(values, discovery["models"], reserved=reserved,
+                                                       legacy_model=legacy_model, expected=expected)
+        return {"connection": connection, "model": connection, **self.api_model_listing()}
+
     def delete_api_model(self, body):
         """Remove one API model unless a running job uses it."""
 
@@ -5759,7 +5497,7 @@ class Server(ThreadingHTTPServer):
         if not providers.is_api_id(model_id):
             raise ValueError("Choose a configured API model to remove.")
         with self.jobs_lock:
-            saved = providers.api_model(model_id)
+            saved = providers.api_connection(model_id)
             if saved is None:
                 raise ValueError("That API model is not configured.")
             active, waiting = self._api_model_jobs(model_id)
@@ -5785,7 +5523,15 @@ class Server(ThreadingHTTPServer):
         requested = body.get("id") or None
         fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "apiKey") if key in body}
         entry = providers.validated_api_connection(fields, requested)
-        return discover_api_models(entry)
+        result = discover_api_models(entry)
+        if requested and result["ok"]:
+            current = providers.validated_api_connection({}, requested)
+            if all(current[key] == entry[key] for key in ("format", "baseUrl", "requestSource", "apiKey")):
+                result["connection"] = providers.refresh_api_connection(requested, entry, result["models"])
+                listing = self.api_model_listing()
+                listing.pop("models", None)  # models here remains the discovery result's wire choices.
+                result.update(listing)
+        return result
 
     def probe_api_model(self, body):
         """Test a saved API model ({id}) or unsaved form fields with one request.
@@ -5797,6 +5543,19 @@ class Server(ThreadingHTTPServer):
         """
 
         requested = body.get("id") or None
+        if not body.get("model"):
+            fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "apiKey") if key in body}
+            entry = providers.validated_api_connection(fields, requested)
+            result = discover_api_models(entry)
+            result["recorded"] = False
+            if requested:
+                current = providers.validated_api_connection({}, requested)
+                if all(current[key] == entry[key] for key in ("format", "baseUrl", "requestSource", "apiKey")):
+                    connection = providers.record_api_model_test(requested, {
+                        "ok": result["ok"], "status": result["status"], "message": result["message"],
+                        "latencyMs": result["latencyMs"], "at": result["testedAt"]})
+                    result.update(recorded=True, connection=providers.api_connection(connection["id"]), apiModel=connection)
+            return result
         fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "label")
                   if key in body}
         if requested and not fields and providers.api_model(requested) is None:
@@ -5825,10 +5584,6 @@ class Server(ThreadingHTTPServer):
             apps = list({id(app): app for app in self.jobs.values()}.values())
         for app in apps:
             with app.lock:
-                app._audit_pause_engine = None
-                app.state["auditHoldingAuthor"] = False
-                if app.research_audits is not None:
-                    app.research_audits.close()
                 process = app.process
             if process is None:
                 continue
@@ -6048,8 +5803,6 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if request.path == "/resume":
                 app = self.server.resume_paused_job(run_id)
-            elif request.path == "/start-research-audit":
-                app = self.server.start_research_audit_job(run_id)
             elif request.path == "/resume-critic":
                 app = self.server.resume_critic_job(run_id)
             elif request.path == "/resume-checkpoint":
@@ -6070,8 +5823,6 @@ class Handler(BaseHTTPRequestHandler):
                 app.approve(body.get("statement"))
             elif request.path == "/set-author-time-limit":
                 app.set_author_time_limit(body.get("hours"))
-            elif request.path == "/set-research-audits":
-                app.set_research_audits(body)
             elif request.path == "/steer-author":
                 app.steer_author(body.get("instruction"))
             elif request.path == "/stop":
@@ -6084,7 +5835,7 @@ class Handler(BaseHTTPRequestHandler):
                 app.clear_trace()
             elif request.path not in {
                 "/review", "/direct", "/finalize",
-                "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume", "/start-research-audit",
+                "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
             }:
                 return self.send({"error": "Not found."}, status=404)
             self.send({**app.snapshot(), "batchId": "__root__"})

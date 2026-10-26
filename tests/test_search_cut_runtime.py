@@ -18,7 +18,6 @@ from unittest.mock import Mock, patch
 
 from retrieval import runtime as retrieval
 import workflow_runner as runtime
-from ui import audits
 from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, success
 
 
@@ -432,7 +431,7 @@ class HistoricalPolicyTests(unittest.TestCase):
         self.assertIn('web_search="live"', arguments)
         self.assertIn("tools.web_search=true", arguments)
 
-    def test_historical_invalid_policy_never_spawns_author_structured_or_auditor(self):
+    def test_historical_invalid_policy_never_spawns_author_or_structured(self):
         self.value.pop("cutoffExclusiveUtc")
         self.save()
         with patch.dict(os.environ, {retrieval.POLICY_ENV: str(self.path)}), patch.object(runtime.subprocess, "Popen") as process:
@@ -442,9 +441,6 @@ class HistoricalPolicyTests(unittest.TestCase):
                                            options={"goal_cwd": str(self.workspace)})
             with self.assertRaises(runtime.Error):
                 next(session)
-            for provider in ("codex", "claude", "kimi"):
-                with self.assertRaises(runtime.Error):
-                    audits.run_auditor({"provider": provider}, "Task", self.workspace, threading.Event())
             process.assert_not_called()
 
     def test_historical_structured_attempts_use_isolated_no_broker_configuration(self):

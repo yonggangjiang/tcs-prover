@@ -188,9 +188,9 @@ class GatewayTests(_ApiModelRoutes, _GatewayFixture):
         self.assertFalse(any(path == '/state?job=legacy' for _, path, _ in self.current.calls))
 
     def test_existing_control_actions_use_upstream_own_security(self):
-        routes = ('pause', 'resume', 'stop', 'set-author-time-limit', 'set-research-audits',
+        routes = ('pause', 'resume', 'stop', 'set-author-time-limit',
                   'steer-author', 'clear-trace', 'resume-checkpoint', 'continue-stopped',
-                  'start-research-audit', 'resume-critic')
+                  'resume-critic')
         for route in routes:
             status, value = self.request('/' + route + '?job=legacy', method='POST', body={'instruction': 'continue'})
             self.assertEqual(status, 200)

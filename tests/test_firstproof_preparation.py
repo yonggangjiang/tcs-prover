@@ -41,7 +41,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(app.state['skipStatementReview'])
             self.assertEqual(app.state['speedMode'], 'fast')
             self.assertEqual(app.state['thinkingHours'], 0)
-            for key in ('authorModel', 'criticModel', 'writerModel', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'reasoningSummary', 'researchAudits'):
+            for key in ('authorModel', 'criticModel', 'writerModel', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'reasoningSummary'):
                 self.assertEqual(app.state[key], default[key])
             expected = (prepare_firstproof.EXPERIMENT / 'inputs' / (row['id'] + '.md')).read_bytes()
             self.assertEqual((app.run_dir / 'input.md').read_bytes(), expected)
@@ -175,7 +175,6 @@ class PreparationTests(unittest.TestCase):
             ('start_final_resume', ('statement', 'candidate')),
             ('start_critic_resume', ('statement', 'candidate')),
             ('reset', ()), ('resume', ()), ('approve', ()),
-            ('start_research_audit_now', ()),
         ]
         before = dict(app.state)
         with patch.object(app, '_workflow_options', side_effect=AssertionError('Reached credential/settings preparation')), \

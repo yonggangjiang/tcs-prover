@@ -103,7 +103,6 @@ ui.check.textContent = 'Check statement';
 const show = (element, visible) => { element.hidden = !visible; };
 const validateRetrievalSettings = () => true;
 const syncPrompts = () => {};
-const researchAuditValues = () => ({intervalHours: 2, models: ['none', 'none', 'none']});
 const selectedRetrievalSettings = () => ({retrievalMode: 'live', retrievalCutoffUtc: ''});
 const jobPath = (path, values = {}, runId = currentJob) => path + (runId ? '?job=' + runId : '');
 const sent = [], adopted = [], rendered = [], timers = [], questions = [];
@@ -259,7 +258,7 @@ assert.equal(ui.notice.scrolled, true);
 assert.notEqual(ui.notice.focused, true, 'an alert is announced, not focused');
 ui.notice.scrolled = false;
 const polish = startLatexOnly();
-sent[1].reject(new Error('Add an API key for Gateway in Advanced settings → API models.'));
+sent[1].reject(new Error('Add an API key for Gateway in Advanced settings → API connections.'));
 await polish;
 assert.equal(ui.notice.scrolled, true);
 ui.notice.scrolled = false;
@@ -624,7 +623,7 @@ assert.equal(ui.workflowNodes.querySelector('.critic-history > ol').scrollTop, 0
 
     # stale-live-activity-subtitle
     def test_live_activity_subtitle_resets_for_a_job_without_activity(self):
-        self.run_app([["function renderClock()", "function researchAuditValues("]], r"""
+        self.run_app([["function renderClock()", "// Merge incremental polling state"]], r"""
 const ui = new Proxy({}, {get: (target, name) => target[name] ||= new Element()});
 let state = {phase: 'running', startedAt: 's', processAlive: true, traceVersion: 523,
   lastActivityAt: new Date(Date.now() - 60000).toISOString()};
@@ -638,22 +637,6 @@ renderClock();
 assert.equal(ui.lastActivity.textContent, 'Waiting for the first update…');
 """)
 
-    # delete-job-during-paused-audit (job list part; the server must send auditHoldingAuthor)
-    def test_job_paused_for_research_audits_offers_no_delete_or_resume(self):
-        self.run_app(BATCHES, BATCHES_SETUP, r"""
-currentBatch = '__root__'; batchCatalog = [{id: '__root__', label: 'Runs', current: true}];
-const paused = {runId: 'r1', title: 'P1', phase: 'paused', canContinueStopped: true, continueStoppedLabel: 'Resume'};
-const buttons = () => ui.jobsList.children[0].children[1].children;
-const button = label => buttons().find(item => item.textContent === label);
-renderJobs([{...paused, auditHoldingAuthor: true}]);
-assert.equal(ui.jobsList.children[0].children[0].children[1].textContent, 'Paused · auditing');
-assert.equal(button('Delete').hidden, true);
-assert.equal(button('Resume').disabled, true);
-renderJobs([paused]);
-assert.equal(ui.jobsList.children[0].children[0].children[1].textContent, 'Paused');
-assert.equal(button('Delete').hidden, false);
-assert.equal(button('Resume').disabled, false);
-""")
 
     # trash-listed-as-batch (list part; the catalog must also hide runs/.trash)
     def test_deleting_the_last_problem_returns_to_all_batches(self):

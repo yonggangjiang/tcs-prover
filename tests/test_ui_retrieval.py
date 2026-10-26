@@ -224,8 +224,7 @@ class RetrievalUITests(unittest.TestCase):
         bad = [{'retrievalMode': 'unknown'}, {'retrievalCutoffUtc': '2026-10-02'},
                {'retrievalCutoffUtc': '2026-10-02T14:13:12+01:00'},
                {'retrievalCutoffUtc': '2999-01-01T00:00:00Z'},
-               {'authorModel': 'claude-opus-5-5'},
-               {'researchAudits': {'models': ['gpt-6-astra', 'none', 'none']}}]
+               {'authorModel': 'claude-opus-5-5'}]
         for options in bad:
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.manager.start_direct_job(self.body(**options))

@@ -400,7 +400,7 @@ def chosen_model(value):
     shown = repr(value)[:80] if isinstance(value, str) else type(value).__name__
     raise Error(
         f"Unknown model {shown}. Choose {', '.join(OFFERED_MODELS)}, or an api:<id> model "
-        "configured in Advanced settings → API models."
+        "configured in Advanced settings → API connections."
     )
 
 
@@ -1165,7 +1165,7 @@ def private_permissions(base, model, workspace_write=None):
     Codex's read-only and workspace sandboxes let commands read every file the
     user can, including the API model store. This profile keeps the built-in
     sandbox and denies the private paths, and for API models also the user's
-    CLI logins (`model` None is a native model, as research auditors use).
+    CLI logins (`model` None is treated as a native model).
     Verified with Codex 0.160's macOS Seatbelt sandbox: other
     platforms return None and keep the legacy sandbox modes (see README).
 
@@ -1229,7 +1229,7 @@ def require_model_credentials(model):
 
     model = chosen_model(model)
     if providers.provider_kind(model) == providers.API and not providers.api_model_secret(model):
-        raise ConfigurationError(f"Add an API key for {providers.model_label(model)} in Advanced settings → API models.")
+        raise ConfigurationError(f"Add an API key for {providers.model_label(model)} in Advanced settings → API connections.")
     if providers.harness(model) == providers.CLAUDE and not shutil.which("claude"):
         # Missing for a moment while Claude Code updates itself: a model call retries it.
         raise CLIUnavailable("Claude CLI is not installed or is not on PATH; install Claude Code to use Claude models.")
@@ -3761,7 +3761,7 @@ def _structured_options(node, options):
 
 
 def workflow_remaining(options):
-    """One elapsed-time budget across research, audits, and final editing.
+    """One elapsed-time budget across proof search, verification, and final editing.
 
     Waits before a model-call retry are not elapsed work (see RetryClock).
     """
@@ -4432,7 +4432,7 @@ def main(argv=None):
     claude_cli.sweep_stale_settings()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     parser.add_argument("workflows", nargs="+", help="YAML files, executed in order")
-    models = (f"{', '.join(OFFERED_MODELS)}, or an api:<id> model from Advanced settings → API models "
+    models = (f"{', '.join(OFFERED_MODELS)}, or an api:<id> model from Advanced settings → API connections "
               "(the older GPT-5.6 ids are still accepted)")
     parser.add_argument("--model", type=model_argument, default=MODEL, metavar="MODEL",
                         help=f"fallback model: {models}")

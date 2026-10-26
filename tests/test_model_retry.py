@@ -2192,7 +2192,6 @@ const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};
-const renderResearchAudits = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 `;
 const checks = `

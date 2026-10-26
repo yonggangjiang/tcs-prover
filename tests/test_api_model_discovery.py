@@ -79,11 +79,14 @@ class ModelDiscoveryTests(HttpCase):
     def test_saved_key_reuse_keeps_the_model_and_last_test_unchanged(self):
         saved = self.saved()
         providers.record_api_model_test(saved["id"], {"ok": True, "message": "prior", "status": 200})
-        before = self.store.read_text(encoding="utf-8")
+        before = providers.api_model(saved["id"])
         status, result = self.discover({"id": saved["id"], "apiKey": "", "headerName": "authorization"})
         self.assertEqual((status, result["ok"]), (200, True))
         self.assertEqual(self.endpoint.requests[0]["headers"]["authorization"], f"Bearer {KEY}")
-        self.assertEqual(self.store.read_text(encoding="utf-8"), before)
+        after = providers.api_model(saved["id"])
+        self.assertEqual((after["id"], after["model"], after["lastTest"]),
+                         (before["id"], before["model"], before["lastTest"]))
+        self.assertEqual([row["id"] for row in providers.api_connection(saved["id"])["models"]], ["gpt-a", "gpt-z"])
 
     def test_saved_key_cannot_be_sent_to_an_edited_destination(self):
         saved = self.saved()

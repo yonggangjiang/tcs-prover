@@ -93,7 +93,7 @@ def batch_plan(runs_root, control_root, problems=None):
         defaults = preparation.empty_state()
         required = {key: defaults[key] for key in (
             'authorModel', 'criticModel', 'writerModel', 'authorEffort',
-            'criticEffort', 'writerEffort', 'criticRounds', 'researchAudits',
+            'criticEffort', 'writerEffort', 'criticRounds',
         )}
         required.update(thinkingHours=0, speedMode='fast',
                         skipStatementReview=True, preparedRun=True)

@@ -413,8 +413,8 @@ class CompilerCanaryTests(IsolatedTestCase):
                 self.assertEqual(self.output.read_bytes(), b"existing output")
 
 
-class AuditPauseErrorTests(IsolatedTestCase):
-    """I-076: an author error that reaches an audit pause is an error pause with the usual retry."""
+class UserPauseErrorTests(IsolatedTestCase):
+    """An author error that reaches a user pause still waits for the user."""
 
     def setUp(self):
         super().setUp()
@@ -424,64 +424,11 @@ class AuditPauseErrorTests(IsolatedTestCase):
         self.app._save("checked-statement.md", "# Checked statement\n\nExact task\n")
         self.app.state.update(phase="running", activeNode="author", stage="solve", runId=self.app.run_dir.name,
                               goalWorkspace=str(self.app.run_dir),
-                              goalThreadId="saved-author-thread",
-                              researchAudits={"intervalHours": 2, "models": ["gpt-6-astra", "none", "none"]})
+                              goalThreadId="saved-author-thread")
         self.app._save_job_settings(self.app.state)
 
-    def settle_audit_pause(self, reason):
-        """Request the audit pause, then deliver the runner's pause record carrying `reason`."""
 
-        app = self.app
-        engine = app.research_audits = Mock()
-        engine.closed = False
-        engine.checkpoint.return_value = {"elapsedSeconds": 7200, "lastStartedSeconds": 7200}
-        engine.status.return_value = {"runningSlots": [], "lastError": ""}
-        process = app.process = Mock(stdout=io.StringIO(""))
-        process.wait.return_value = 1
-        token = app.worker_token = app.active_token = app._audit_token = object()
-        result = []
-        worker = threading.Thread(target=lambda: result.append(app._pause_for_research_audit(engine)))
-        worker.start()
-        deadline = time.monotonic() + 2
-        while app.state["phase"] != "pausing" and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(app.state["phase"], "pausing")
-        state = self.checkpoint(app)["state"]
-        process.stdout = io.StringIO(json.dumps({"kind": "workflow_paused", "stage": "solve", "node": "author",
-                                                 "state": state, "reason": reason}) + "\n")
-        with patch.object(server.time, "time", return_value=1_000):
-            app._read_output(process, token)
-        worker.join(timeout=2)
-        self.assertFalse(worker.is_alive())
-        return engine, result
 
-    def test_an_author_error_during_an_audit_pause_is_retried_after_the_usual_wait(self):
-        reason = "stream disconnected before completion: stream closed before response.completed"
-        engine, result = self.settle_audit_pause(reason)
-        self.assertEqual(result, [False])  # No audit reads the workspace of a failed author.
-        with patch.object(self.app, "resume") as resume:
-            self.app._resume_after_research_audit(engine)
-        resume.assert_not_called()
-        checkpoint = self.checkpoint(self.app)
-        self.assertEqual((self.app.state["phase"], checkpoint["pauseCause"], checkpoint["error"]),
-                         ("paused", "error", reason))
-        self.assertEqual((checkpoint["autoResumeAt"], self.app.state["autoResumeAt"]), (1_000 + WAIT, 1_000 + WAIT))
-        self.assertFalse(self.app.state["auditHoldingAuthor"])
-        restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
-        self.assertEqual(restored.state["autoResumeAt"], 1_000 + WAIT)
-        retry = Mock()
-        self.assertFalse(self.app.auto_resume_if_due(retry, now=1_000 + WAIT - 1))
-        self.assertTrue(self.app.auto_resume_if_due(retry, now=1_000 + WAIT))
-        retry.assert_called_once_with()
-
-    def test_an_acknowledged_audit_pause_still_waits_for_the_audits(self):
-        engine, result = self.settle_audit_pause("")
-        self.assertEqual(result, [True])
-        checkpoint = self.checkpoint(self.app)
-        self.assertEqual((checkpoint["pauseCause"], checkpoint["autoResumeAt"]), ("audit", 0))
-        retry = Mock()
-        self.assertFalse(self.app.auto_resume_if_due(retry, now=10**9))
-        retry.assert_not_called()
 
     def test_an_error_during_a_users_pause_still_waits_for_the_user(self):
         app = self.app

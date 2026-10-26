@@ -258,16 +258,17 @@ class ApiModelEndpointTests(HttpCase):
         app.state.update(phase="paused", authorModel=model["id"])
         status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic"})
         self.assertEqual(status, 400)
-        self.assertIn("cannot change while jobs use it", value["error"])
+        self.assertIn("cannot change while jobs use this connection", value["error"])
         self.assertEqual(providers.api_model(model["id"])["format"], "openai")
         # Other edits stay possible, and a finished job no longer pins the format.
-        self.assertEqual(self.call("/api-models", {"id": model["id"], "label": "Edited"})[0], 200)
+        self.assertEqual(self.call("/api-models", {"id": model["id"], "label": "Edited", "model": "gpt-gateway"})[0], 200)
         app.state["phase"] = "done"
         status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic"})
         # A new format is a new destination: the saved key is not reused for it.
         self.assertEqual(status, 400)
         self.assertIn("Enter the API key again", value["error"])
-        status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic", "apiKey": KEY})
+        status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic", "apiKey": KEY,
+                                                  "model": "gpt-gateway"})
         self.assertEqual((status, value["model"]["format"], value["model"]["headerName"]), (200, "anthropic", "x-api-key"))
 
     def removed_model_job(self, label="Lab Sol", phase="paused"):
@@ -290,7 +291,7 @@ class ApiModelEndpointTests(HttpCase):
                     app._check_launch_models_locked()
                 self.assertEqual(str(failure.exception),
                                  f"The API model {model} chosen for the critic is not configured. Add it again under "
-                                 "New problem → Advanced settings → API models with the same settings (Lab Sol · "
+                                 "New problem → Advanced settings → API connections with the same settings (Lab Sol · "
                                  "OpenAI format · https://gateway.example.com/v1 · model "
                                  "gpt-gateway) to continue this job.")
                 status, value = self.call("/api-models", {**endpoint, "label": label})
@@ -362,7 +363,7 @@ class CatalogTests(HttpCase):
                          ("Claude CLI", False))
         self.assertEqual({key: rows[model["id"]][key] for key in ("provider", "format", "host", "hasKey", "label")},
                          {"provider": "api", "format": "openai", "host": "gateway.example.com", "hasKey": True,
-                          "label": "Gateway"})
+                          "label": "gpt-gateway"})
         self.assertEqual(rows[anthropic["id"]]["efforts"], list(providers.CLAUDE_EFFORTS))
         efforts = settings["model_efforts"]
         self.assertTrue(set(rows) | set(runtime.LEGACY_MODELS) <= set(efforts))
@@ -389,6 +390,15 @@ class CatalogTests(HttpCase):
 
 
 class ProbeTests(HttpCase):
+    def call(self, path, body=None, **kwargs):
+        # These cases exercise minimal generation requests. Testing a source without an
+        # explicit model now exercises discovery instead (covered in test_api_connections).
+        if path == "/api-models/test" and isinstance(body, dict) and "model" not in body:
+            saved = providers.api_model(body.get("id"))
+            if saved is not None:
+                body = {"model": saved["model"], **body}
+        return super().call(path, body, **kwargs)
+
     def setUp(self):
         super().setUp()
         self.endpoint = MockEndpoint()
@@ -586,11 +596,11 @@ class LaunchValidationTests(StoreCase):
         offered = ", ".join(runtime.OFFERED_MODELS)
         for model, message in (
             ("gpt-9", f"Unknown model 'gpt-9' for the critic. Choose {offered}, or an api:<id> model configured "
-                      "under Advanced settings → API models."),
+                      "under Advanced settings → API connections."),
             ("deepseek-v4-pro", "DeepSeek is no longer supported; choose another model for the critic, for "
                                 "example gpt-6.1-sol."),
             ("api:gone", "The API model api:gone chosen for the critic is not configured. Add it under Advanced "
-                         "settings → API models, or choose another model."),
+                         "settings → API connections, or choose another model."),
         ):
             with self.subTest(model=model), self.assertRaises(ValueError) as failure:
                 self.options(critic_model=model)
@@ -603,7 +613,7 @@ class LaunchValidationTests(StoreCase):
             "headerName": "Authorization", "model": "m", "apiKey": ""}]}), encoding="utf-8")
         with self.assertRaises(ValueError) as failure:
             self.options(author_model="api:keyless")
-        self.assertEqual(str(failure.exception), "Add an API key for Keyless in Advanced settings → API models.")
+        self.assertEqual(str(failure.exception), "Add an API key for Keyless in Advanced settings → API connections.")
 
     def test_claude_models_need_the_claude_cli(self):
         which = shutil.which
@@ -673,7 +683,8 @@ class LaunchValidationTests(StoreCase):
         self.assertEqual(settings["authorModel"], model["id"])
         self.assertEqual(settings["apiModels"], {model["id"]: {
             "label": "Gateway", "format": "openai", "baseUrl": "https://gateway.example.com/v1",
-            "headerName": "Authorization", "requestSource": "Zephy-TCS-Prover", "model": "gpt-gateway"}})
+            "headerName": "Authorization", "requestSource": "Zephy-TCS-Prover", "model": "gpt-gateway",
+            "sourceId": model["id"], "sourceLabel": "Gateway"}})
         self.assertNotIn(KEY, text)
         command = launched["command"]
         self.assertEqual(command[command.index("--author-model") + 1], model["id"])
@@ -693,7 +704,8 @@ class LaunchValidationTests(StoreCase):
         restored = server.restore_saved_jobs(self.runs)[app.run_dir.name]
         self.assertEqual(restored.state["apiModels"], {"api:gateway": {
             "label": "Gateway", "format": "openai", "baseUrl": "https://g.example.com/v1",
-            "headerName": "Authorization", "requestSource": "", "model": "m"}})
+            "headerName": "Authorization", "requestSource": "", "model": "m",
+            "sourceId": "api:gateway", "sourceLabel": "Gateway"}})
         catalog = batches.BatchCatalog(self.runs.resolve(), current_root=self.runs.resolve())
         self.assertEqual(catalog.state("__root__", app.run_dir.name)["apiModels"], restored.state["apiModels"])
 
@@ -774,7 +786,7 @@ class RemovedModelRestoreTests(StoreCase):
         self.assertEqual((app.state["phase"], app.state["autoResumeAt"]), ("paused", 0))
         self.assertEqual(app.state["settingsWarning"],
                          "The API model api:gone chosen for the proof author is not configured. Add it again under "
-                         "New problem → Advanced settings → API models with the display name “gone” to continue "
+                         "New problem → Advanced settings → API connections with the display name “gone” to continue "
                          "this job. Automatic retry is off; choose Resume once the model is configured.")
         self.assertEqual(json.loads((self.runs / "gone" / server.PAUSE_FILENAME).read_text())["autoResumeAt"], 0)
         self.assertFalse(app.auto_resume_if_due(lambda: self.fail("resumed"), now=10**12))
@@ -798,7 +810,7 @@ class RemovedModelRestoreTests(StoreCase):
         self.assertFalse(app.auto_resume_if_due(lambda: attempts.append(1), now=10**12))
         notes = [record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic"]
         self.assertEqual(notes, [f"Automatic resume stopped: The API model {model} chosen for the proof author is not "
-                                 "configured. Add it again under New problem → Advanced settings → API models with "
+                                 "configured. Add it again under New problem → Advanced settings → API connections with "
                                  f"the display name “{model[4:]}” to continue this job. "
                                  "Choose Resume after fixing the settings."])
 
@@ -958,7 +970,7 @@ class CommandLineModelTests(StoreCase):
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit):
             self.web_ui(["--help"])
         text = " ".join(output.getvalue().split())
-        self.assertIn("claude-haiku-5-5, or an api:<id> model from Advanced settings → API models", text)
+        self.assertIn("claude-haiku-5-5, or an api:<id> model from Advanced settings → API connections", text)
         self.assertIn("fast applies to Codex CLI models only, other models run standard", text)
 
     def test_a_relative_store_override_reaches_the_runner_child(self):

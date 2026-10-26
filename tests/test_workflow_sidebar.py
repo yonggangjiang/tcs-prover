@@ -1,4 +1,4 @@
-"""The workflow rail follows author and audit activity without model requests."""
+"""The workflow rail follows author and critic activity without model requests."""
 
 import json
 import shutil
@@ -28,9 +28,7 @@ class Element {
 const ui = {workflowNodes: new Element('ol')};
 const state = {phase: 'running', stage: 'solve', activeNode: 'author',
   problemMode: 'statement', skipStatementReview: true, criticRounds: 2,
-  workflow: JSON.parse(process.argv[2]), trace: [{node: 'author'}],
-  researchAudits: {models: ['gpt-6-astra', 'claude-opus', 'none'], intervalHours: 2},
-  researchAuditStatus: {runningSlots: [], warnings: [], batchActive: false}};
+  workflow: JSON.parse(process.argv[2]), trace: [{node: 'author'}]};
 const all = node => [node, ...node.children.flatMap(all)];
 const row = name => all(ui.workflowNodes).find(node => node.dataset.node === name);
 const text = node => [node.textContent, ...node.children.map(text)].join(' ');
@@ -47,19 +45,11 @@ vm.runInNewContext(source.slice(source.indexOf('// Group the recorded critic cal
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_author_and_audit_form_a_loop_separate_from_candidate_verification(self):
+    def test_author_and_critic_form_the_candidate_verification_loop(self):
         self.run_sidebar(r"""
 renderWorkflow();
-const audit = row('research_audit'), author = row('author');
-assert(audit);
-const pair = all(ui.workflowNodes).find(node => node.children.includes(author) && node.children.includes(audit));
-assert(pair);
-assert.match(text(pair), /Pause author → audit → resume author/);
-assert.match(text(audit), /2 selected · every 2 author hours or on demand/);
-assert.match(text(audit), /Scheduled/);
-assert.equal(author.attributes['aria-current'], 'step');
-assert.equal(audit.attributes['aria-current'], undefined);
-assert(!pair.children.includes(row('critic')));
+assert.equal(row('author').attributes['aria-current'], 'step');
+assert(row('critic'));
 assert(all(ui.workflowNodes).some(node => node.className === 'loop-back'));
 assert(all(ui.workflowNodes).some(node => node.className === 'loop-self'));
 assert(all(ui.workflowNodes).indexOf(row('failure_summary')) > all(ui.workflowNodes).indexOf(row('latex_compile')));
@@ -67,81 +57,22 @@ assert(!row('statement_reviewer'));
 state.skipStatementReview = false;
 renderWorkflow();
 assert(row('statement_reviewer'));
-assert(row('research_audit'));
 """)
 
-    def test_highlight_moves_to_audit_while_author_is_paused_and_back_after_reports(self):
+    def test_stage_visibility_follows_the_selected_workflow(self):
         self.run_sidebar(r"""
-state.researchAuditStatus = {batchActive: true, runningSlots: [1, 2]};
 renderWorkflow();
-assert.match(text(row('research_audit')), /Checking auditors/);
-assert.equal(row('author').attributes['aria-current'], 'step');
-state.auditHoldingAuthor = true;
-state.phase = 'pausing';
-renderWorkflow();
-assert.match(text(row('author')), /Pausing for audits/);
-assert.match(text(row('research_audit')), /Waiting for author/);
-state.phase = 'paused';
-renderWorkflow();
-assert.match(row('author').className, /paused/);
-assert.equal(row('author').attributes['aria-current'], undefined);
-assert.equal(row('research_audit').attributes['aria-current'], 'step');
-assert.match(text(row('author')), /Paused for audits/);
-assert.match(text(row('research_audit')), /2 auditors active/);
-assert.equal(state.activeNode, 'author'); // Rendering must not change the controller's node.
-state.phase = 'running'; state.auditHoldingAuthor = false;
-state.researchAuditStatus = {runningSlots: [], batchActive: false};
-state.trace.push({kind: 'research_audit', model: 'gpt-6-astra', status: 'completed'});
-renderWorkflow();
-assert.equal(row('author').attributes['aria-current'], 'step');
-assert.match(row('research_audit').className, /complete/);
-assert.match(text(row('research_audit')), /Reports saved/);
-state.phase = 'paused';
-renderWorkflow();
-assert.match(row('author').className, /paused/);
-assert(!text(row('author')).includes('Paused for audits'));
-assert.equal(row('research_audit').attributes['aria-current'], undefined);
-""")
 
-    def test_disabled_unavailable_and_cancelled_audits_have_distinct_states(self):
-        self.run_sidebar(r"""
-state.researchAudits.models = ['none', 'none', 'none'];
-renderWorkflow();
-assert.match(row('research_audit').className, /disabled/);
-assert.match(text(row('research_audit')), /No auditors|Select auditors/);
-assert.match(text(row('research_audit')), /Disabled/);
-state.researchAudits.models[0] = 'gpt-6-astra';
-state.researchAuditStatus.warnings = [{slot: 1, model: 'gpt-6-astra', message: 'Unavailable'}];
-renderWorkflow();
-assert.match(row('research_audit').className, /warning/);
-assert.match(text(row('research_audit')), /Needs attention/);
-assert.equal(row('author').attributes['aria-current'], 'step');
-state.researchAuditStatus = {runningSlots: [], batchActive: false};
-state.trace.push({kind: 'research_audit', model: 'gpt-6-astra', status: 'cancelled'});
-state.phase = 'paused';
-renderWorkflow();
-assert.match(text(row('research_audit')), /Cancelled/);
-assert.equal(row('research_audit').attributes['aria-current'], undefined);
-state.phase = 'done'; state.error = 'Stopped.';
-state.researchAuditStatus.batchActive = true; // A stale status must not mark finished jobs active.
-renderWorkflow();
-assert.equal(row('research_audit').attributes['aria-current'], undefined);
-""")
-
-    def test_audits_appear_only_when_the_workflow_contains_an_author(self):
-        self.run_sidebar(r"""
-renderWorkflow();
-assert(row('research_audit'));
 assert(row('author'));
 state.statementReviewOnly = true;
 renderWorkflow();
-assert(!row('research_audit'));
+
 assert(row('statement_reviewer'));
 state.statementReviewOnly = false;
 for (const mode of ['latex', 'final-resume']) {
   state.problemMode = mode;
   renderWorkflow();
-  assert(!row('research_audit'));
+
   assert(row('latex_editor'));
   assert(row('latex_compile'));
 }
@@ -149,9 +80,8 @@ state.problemMode = 'critic-resume';
 state.trace = [];
 state.stage = 'critic'; state.activeNode = 'critic';
 renderWorkflow();
-assert(row('research_audit'));
+
 assert.match(text(row('author')), /Loaded from the source job/);
-assert.equal(row('research_audit').attributes['aria-current'], undefined);
 state.problemMode = 'statement'; state.phase = 'prepared';
 state.activeNode = 'author'; state.stage = 'solve';
 renderWorkflow();

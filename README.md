@@ -10,7 +10,7 @@ The author instructions live directly in
 [`workflows/author_critic.yaml`](workflows/author_critic.yaml). The author and
 its goal, continuation, compaction, resume, and repair prompts focus on proving
 the exact statement, without requiring research notebooks or a file layout.
-Optional independent audits, the critic, and the LaTeX writer remain available.
+The independent proof critic and LaTeX writer verify and present the result.
 
 On macOS and Linux, authors can submit `PROOF_FILE: proof.md` after writing a
 complete proof in their working directory. Windows authors submit the complete
@@ -94,9 +94,10 @@ is needed only when you select Claude CLI or API models for one or more roles.
 
 ## Model providers
 
-Each role's model menu under **Advanced settings** groups its models by the
-harness that runs them: **Codex CLI**, **Claude CLI**, and **API**. Each model
-offers only the reasoning levels it supports, and every launch or resume checks
+Each role under **Advanced settings** selects a **Source**, then a **Model**,
+then its reasoning effort and other settings. Sources include **Codex CLI**,
+**Claude CLI**, and each saved API-key connection. The model menu shows only
+that source's models. Each model offers the reasoning levels it supports, and every launch or resume checks
 locally that the selected models can start: Claude models need `claude` on
 `PATH`, and API models need a saved key. `runner/providers.py` is the single
 registry of model ids, harnesses, and efforts.
@@ -139,23 +140,28 @@ conversation: **Resume** reports this, automatic retry stays off, and **Continue
 proof author** continues the saved work in a new conversation from its saved public input. To keep conversations longer, set for example `"cleanupPeriodDays": 365`
 in `~/.claude/settings.json`.
 
-### API models
+### API connections
 
-**Advanced settings → API models** adds a model served by your own endpoint:
+**Advanced settings → API connections** saves an endpoint and API key once,
+then discovers every model available through that key. Start with the base URL
+and key; a request source and display name can be added later. Saving a
+connection does not ask you to choose or type a model ID.
 
 | Field | Meaning |
 | --- | --- |
 | Format | **OpenAI** (Responses API) or **Anthropic** (Messages API). |
 | Base URL | For example `https://api.openai.com/v1` or `https://api.anthropic.com`. HTTPS is required except for `localhost`; credentials, query strings, and fragments are rejected. So that the host shown and tested is the host the CLIs contact, the URL must be plain ASCII (an international domain name in its `xn--` form) without backslashes, a percent-encoded host, an IPv4 address other than four decimal numbers, or `.`/`..` path segments. |
-| API key | Stored only on this computer and never shown again. Editing a model (or testing an edit) with an empty key keeps the saved key only while the format and base URL stay the same; changing either requires entering the key again. |
-| Model | Click **Load models** to fetch the choices available to this API key, then select one. No model ID needs to be typed. |
+| API key | Stored only on this computer and never shown again. Editing a connection with an empty key keeps the saved key while the format and base URL stay the same; changing either requires entering the key again. |
 | Request source | Optional client name sent as the `User-Agent` header, so routers that log it can identify your requests. Use up to 200 printable ASCII characters; the default is `TCS-Prover`. |
-| Display name | Optional local menu label; the default is `<model> · <host>`. It is not sent to the API or used as the request source. |
+| Display name | Optional local source label; the default is the endpoint's host. It is not sent to the API or used as the request source. |
 
-**Load models** requests the endpoint's model catalog with the same API key and
-authentication used for inference. Changing the format, base URL, request source, or key
-clears the choices so they can be refreshed for the new connection. Editing a
-saved model keeps its current selection until you refresh it.
+**Save connection** loads the endpoint's model catalog before saving. A failed
+connection or empty catalog leaves the previous saved settings intact. Each
+role can then select that saved key under **Source**, select one of its models,
+and choose the supported effort and other settings. Roles can share one key
+while using different models. **Load models** on a saved connection refreshes
+its choices. Renaming a connection or reordering its catalog preserves selected
+model identities; two saved keys for the same URL remain distinct sources.
 
 Authentication is selected automatically: OpenAI-compatible endpoints receive
 `Authorization: Bearer <key>`, and Anthropic endpoints receive `x-api-key: <key>`.
@@ -166,19 +172,18 @@ the service's requirements. The request source labels the client independently
 of authentication, and applies to model discovery, connection tests, and model
 requests.
 
-**Test connection** (the form, saved or not) and **Test** (a saved model's row)
-send one minimal request (`Reply with OK.`, at most 16 output tokens)
-to `<base URL>/responses` (OpenAI) or `<base URL without /v1>/v1/messages`
-(Anthropic, with `anthropic-version: 2023-06-01`). It has a 30-second timeout,
-follows no redirect, and shows the HTTP status, latency, and the provider's
-message with the key removed. Testing a saved model records the result beside it.
-**Edit** fills the form with a saved model's settings but never its key, and
-**Remove** deletes the model and its key; a role that used it falls back to
-GPT 6.1 Sol in the menus, and the page of a saved job that still uses it shows a
-warning under the title and marks the model *not configured* in its run settings.
-Editing a tested setting marks the form's last test result as out of date. Under
-each role menu a chip names the CLI that runs a built-in model, or an API model's
-format and host.
+**Test connection** loads the model catalog without generating an answer. It
+uses `<base URL>/models` (OpenAI) or `<base URL without /v1>/v1/models`
+(Anthropic, with `anthropic-version: 2023-06-01` and pagination). Discovery has
+one 30-second deadline, follows no redirect, and shows the HTTP status, latency,
+and the provider's message with the key removed. Testing unchanged saved
+settings records the result on that connection. **Edit** fills the form with
+its saved settings but never its key. **Remove** deletes the connection, key,
+and model choices; new role menus return to the default model, while saved jobs
+retain their selected IDs and show a warning until the connection is restored.
+Removing a connection or changing its format is blocked while a running job
+uses one of its models. Editing a tested setting marks the displayed result as
+out of date. Under each role menu a chip names its CLI or API format and host.
 
 OpenAI-format models run through the Codex CLI as an isolated custom provider
 with a private Codex home under `.tcs-prover/codex-homes/`, so your ChatGPT login
@@ -192,8 +197,16 @@ Claude login is never read; there the author has the sandboxed shell, Read, and
 Edit tools, without subagents or web tools. They show messages and tool activity
 but no reasoning summaries, because a gateway may return raw reasoning, which is
 never displayed. API models offer `low` through `max` and always run at standard
-speed. Saved models appear in every role menu, and the terminal options accept
-their `api:<id>` ids.
+speed. Terminal options accept each discovered model's stable `api:<id>`
+selection ID. A connection ID identifies the saved key rather than selecting a
+model. Older configurations keep their original `api:<id>` model selection as
+an alias, so existing jobs can continue.
+
+The controller returns `model_sources` for source menus and `model_catalog` for
+model menus; each model row carries its `sourceId`, `sourceLabel`, and wire model
+name. `/api-models` lists `connections`, each with `models` containing the wire
+`id`, display `label`, and stable selection `modelId`. Saving without a model
+fetches the catalog on the server; client-supplied model lists are ignored.
 
 Keys are stored in `.tcs-prover/api-models.json` in this checkout: an
 owner-only file in an owner-only folder that Git ignores (`TCS_PROVER_API_MODELS`
@@ -211,9 +224,8 @@ the runner knows (any value of at least 8 characters), so a gateway error or a
 command that echoes a key shows `[redacted]`.
 
 Model sandboxes cannot read or write this private state: the Claude Bash sandbox
-everywhere it runs and, on macOS, the Codex sandboxes of every role and of Codex
-research auditors (through a Codex permission profile derived from the usual
-read-only or workspace sandbox). The author's profile keeps the run folder's
+everywhere it runs and, on macOS, the Codex sandboxes of every role (through a
+Codex permission profile derived from the usual read-only or workspace sandbox). The author's profile keeps the run folder's
 `.codex`, `.agents`, `.git`, and `.aws` folders read-only, as Codex's own
 workspace sandbox does, and applies the network access, extra writable roots,
 and `/tmp` exclusions of your `[sandbox_workspace_write]` Codex settings.
@@ -222,12 +234,12 @@ Linux and Windows the Codex sandboxes keep Codex's default read access to your
 files, so a Codex role's shell there could read the key store; there, store API
 keys only if the models you run with Codex CLI may see them. Each job records
 the non-secret settings of its API models under `apiModels` in
-`job-settings.json`. A model used by a running job cannot be removed, and its
-format cannot change while jobs use it. A job cannot switch to another model, so
-a waiting job whose API model was removed continues once you add the model again
-with the settings the job shows (format, base URL and model ID; any
-display name): it gets its old id back. A new model never takes such an id with
-another format.
+`job-settings.json`. A connection used by a running job cannot be removed, and
+its format cannot change while jobs use it. A saved job keeps its selected model.
+After removing a connection, add its endpoint and key again with the same format
+and base URL, exposing the job's saved model in the discovered catalog; the
+controller restores its previous source and selection IDs. Its display name
+may differ. A new connection never takes a saved job's source ID with another format.
 
 ### Web cutoff and removed models
 
@@ -259,7 +271,7 @@ every node.
 
 A timestamp cutoff currently requires macOS; elsewhere only Off and `-1` are
 available. For a timestamp cutoff, enable **Skip statement review**, use Codex CLI models for all
-proof roles, and disable optional research auditors. Before model work, the
+proof roles. Before model work, the
 controller saves a separate policy and checks the native sandbox for both author
 and structured roles. A failed check blocks launch. The saved search mode and
 cutoff are retained on resume; changing the defaults does not change existing
@@ -296,7 +308,8 @@ assets, reads legacy metadata without restoring jobs, and forwards existing
 job actions to their original controller. A separate controller handles new
 jobs. The two run directories must not overlap. Keep the gateway running while
 using it; the original controller remains responsible for the older batch.
-**Advanced settings → API models** (listing, saving, removing, and Test) goes
+**Advanced settings → API connections** (listing, saving, removing, testing,
+and refreshing model choices) goes
 to the controller that handles new jobs.
 An older server without the new search capabilities cannot enable historical
 search through the updated frontend. Operators can set `TCS_PROVER_UI_AUTH_HOME`
@@ -359,7 +372,7 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | --- | --- | --- |
 | `-criticRounds N` | `2` | Maximum consecutive edited critic passes before using the latest solution; `1` to `100`. An unchanged pass accepts immediately. Rejection returns to the author and resets the count. |
 | `-thinkingHours HOURS` | `168` | Total elapsed-workflow limit in hours: `0` for unlimited, or greater than `0` and at most `168`. Bounds author, critic, and final model calls. Recorded work is retained when time runs out. |
-| `-authorModel MODEL` | `gpt-6.1-sol` | Author model: Codex CLI `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude CLI `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or an `api:<id>` model saved under **Advanced settings → API models**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the Web UI no longer lists them. |
+| `-authorModel MODEL` | `gpt-6.1-sol` | Author model: Codex CLI `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude CLI `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or a discovered model's `api:<id>` selection from **Advanced settings → API connections**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the Web UI no longer lists them. |
 | `-criticModel MODEL` | `gpt-6.1-sol` | Critic model; same choices as the author. |
 | `-writerModel MODEL` | `gpt-6.1-sol` | LaTeX writer model; same choices as the author. |
 | `-reasoningEffort LEVEL` | `max` | Fallback effort for all three roles: `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (Max plus automatic task delegation). The Luna, Claude, and API models do not list `ultra` and run it as `max`; the Web UI offers each model only the levels it supports. |
@@ -446,9 +459,7 @@ retrying in 1 min (attempt 7, retrying for 6 min)" with the provider's message
 starts after the time limit is reached, **Stop** ends a wait at once, and
 **Pause** (offered while the proof author works) pauses the job instead of
 retrying. Only the first retries of one call stay pinned in the activity log;
-later ones stay in the recent window and in `transcript.jsonl`. Optional
-research auditors keep their own behaviour (a failed auditor is skipped with a
-warning), as research-audit holds are being decided separately.
+later ones stay in the recent window and in `transcript.jsonl`.
 
 ## How to use checkpoints
 
@@ -458,7 +469,7 @@ and a failed resume attempt is retried every minute; a terminal run does the
 same. Retry times survive server restarts and do not require an open browser
 tab. The paused job shows its next retry time; **Keep paused** cancels
 automatic retries, and **Resume** retries immediately. User-requested pauses
-and stops, research-audit pauses, exhausted workflow time limits, safety stops
+and stops, exhausted workflow time limits, safety stops
 and conversations the CLI no longer has do not trigger this error retry, and
 neither does a model whose settings are incomplete (a CLI that is only missing
 for a moment is retried). Saved work and the original time budget are
@@ -686,14 +697,6 @@ while paused before clicking Resume.
 **Stop** ends the job at once: it interrupts the runner and its CLI processes so
 they can remove private files, and kills any that remain after three seconds.
 
-**Start audit now** is available while the author is running or paused, once at
-least one auditor is selected and its settings applied. An audit started from a
-paused job audits the saved workspace first, then resumes the author automatically
-in the same conversation. Click **Pause** during the audit to cancel it and keep
-the author paused.
-Audit time does not advance the author clock, and another audit cannot start
-until the current batch finishes.
-
 When compilation succeeds, **Download .tex** and **Download PDF**
 download that job's saved `final.tex` and `final.pdf`. Older jobs that only
 contain a source file still offer the source download.
@@ -710,10 +713,7 @@ WebFetch tools; the models decide when to search.
 ```mermaid
 flowchart TD
     S["Optional statement review"] --> A["Persistent root author"]
-    A <--> M["INITIAL_PROMPT.md · APPROACHES/ · PROVED.md"]
     A -- "continue research" --> A
-    A -- "scheduled or manual pause" --> R["Research audits"]
-    R -- "save reports and resume" --> A
     A -- "complete candidate" --> C["One root critic request"]
     C <--> B["Fresh independent bug-finding subagents"]
     C -- "reject: exact bugs and reset rounds" --> A
@@ -726,10 +726,7 @@ flowchart TD
     A -. "time limit or interruption" .-> P["Preserve files and continue later"]
 ```
 
-The workflow sidebar shows the author and research audits together, with the
-pause-and-resume route separate from the critic's repair loop. Audit activity,
-saved reports, disabled auditors, and availability warnings appear on the audit
-node; the author is marked paused while the auditors run.
+The workflow sidebar shows the active proof stage and the critic repair loop.
 
 ### 1. Statement reviewer
 
@@ -756,17 +753,8 @@ The runner retains the conversation and operational checkpoints.
 `--resume-research` continues saved author work with a fresh budget. Existing
 jobs retain their saved per-job prompt and workspace when continued.
 
-Optional research audits pause the author and independently review the exact
-statement, available candidates, and public conversation records in its working
-directory. Auditors suggest promising directions, identify mathematical gaps,
-and recommend clearer arguments. They do not edit the author's work or require
-research notebooks. Before a batch, the controller moves existing `AUDITS/`
-reports to `audit_history/`, preserving colliding filenames with a suffix. New
-reports are saved in `AUDITS/`, then the same author conversation resumes and
-considers their advice. Provider failures leave earlier reports safely in history.
-
 The read-only **Research files** panel preserves access to existing workspace
-records and current and historical audit reports. Older `APPROACHES/index.md`,
+records and previously saved audit reports. Older `APPROACHES/index.md`,
 `APPROACHES/A001-short-title.md`, `APPROACHES.md`, and `PROVED.md` files remain
 readable. When approach files exist, the graph derives navigation from their
 titles, parent links, status, and summaries, without changing the saved files.
@@ -820,7 +808,6 @@ workflow_runner.py          Graph engine, model transport, and workflow CLI
 workflows/
   author_critic.yaml        Author/critic prompts, response schema, and logic
   clean_up.yaml             LaTeX prompts, response schema, and logic
-  research_audit.yaml       Research-audit models, schedule, and prompt
 runner/
   proof_handoff.py          Verified capture of an author's PROOF_FILE
   providers.py              Model registry and the private API model store

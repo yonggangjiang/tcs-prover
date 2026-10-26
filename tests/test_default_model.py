@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import workflow_runner as runtime
 from runner import providers
-from ui import audits, cli, review, server
+from ui import cli, review, server
 
 MODEL, EFFORT = "gpt-6.1-sol", "max"
 ROLES = ("review", "author", "critic", "writer")
@@ -162,7 +162,7 @@ class ServerDefaultTests(unittest.TestCase):
                     ValueError, rf"Unknown model 'gpt-9' for the {role}\. Choose {offered}, or an api:<id> model"):
                 server.App._workflow_options(**{field: "gpt-9"})
 
-    def test_public_settings_describe_the_default_and_keep_audits_opt_in(self):
+    def test_public_settings_describe_the_default(self):
         settings = server.PUBLIC_GRAPH["settings"]
         self.assertEqual((settings["model"], settings["review_model"]), (MODEL, MODEL))
         self.assertEqual(settings["reasoning_effort"], EFFORT)
@@ -172,11 +172,6 @@ class ServerDefaultTests(unittest.TestCase):
             settings["model_efforts"], {m: list(e) for m, e in runtime.MODEL_EFFORTS.items()},
         )
         self.assertEqual(settings["model_summary"], "6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer")
-        # Adding the model to the audit menu must not switch paid audits on.
-        self.assertEqual(settings["research_audits"]["models"], ["none"] * 3)
-        self.assertIn(
-            {"value": MODEL, "label": "GPT 6.1 Sol (Max)"}, settings["research_audits"]["choices"],
-        )
 
 
 class SavedRunCompatibilityTests(unittest.TestCase):
@@ -225,11 +220,6 @@ class SavedRunCompatibilityTests(unittest.TestCase):
                 self.assertEqual(jobs[model].state["writerModel"], model)
                 self.assertEqual(jobs[model].state["authorEffort"], "max")
 
-    def test_audit_choices_saved_with_older_models_stay_valid(self):
-        self.prepared_run("audited", researchAudits={"intervalHours": 2, "models": list(runtime.LEGACY_MODELS)})
-        app = server.restore_saved_jobs(self.runs)["audited"]
-        self.assertEqual(app.state["researchAudits"]["models"], list(runtime.LEGACY_MODELS))
-        self.assertEqual(app.state["settingsWarning"], "")
 
 
 class CommandLineDefaultTests(unittest.TestCase):
@@ -247,7 +237,7 @@ class CommandLineDefaultTests(unittest.TestCase):
         offered = ", ".join(runtime.OFFERED_MODELS)
         for role in ("author", "critic", "writer"):
             with self.subTest(role=role):
-                self.assertIn(f"{role} model: {offered}, or an api:<id> model from Advanced settings → API models "
+                self.assertIn(f"{role} model: {offered}, or an api:<id> model from Advanced settings → API connections "
                               f"(default: {MODEL}); the older GPT-5.6 ids are still accepted", text)
         self.assertIn("fallback reasoning effort for every proof role (default: max)", text)
         self.assertNotIn("gpt-5.6-terra", text)
@@ -283,33 +273,6 @@ class CommandLineDefaultTests(unittest.TestCase):
         self.assertIn(MODEL, output.getvalue())
 
 
-class AuditMenuTests(unittest.TestCase):
-    def test_audit_menu_runs_codex_with_6_1_sol_at_max(self):
-        row = next(row for row in audits.load_config()["models"] if row["value"] == MODEL)
-        self.assertEqual((row["provider"], row["model"], row["effort"]), ("codex", MODEL, "max"))
-
-        def launch():
-            with patch.object(audits, "resolve_executable", return_value="codex"):
-                audits.run_auditor(row, "Prompt", ".", threading.Event())
-
-        command = captured_command(launch)
-        self.assertEqual(option_after(command, "-m"), MODEL)
-        self.assertIn('model_reasoning_effort="max"', command)
-        self.assertEqual(audits.normalize_settings({"models": [MODEL, "none", "none"]})["models"], [MODEL, "none", "none"])
-
-    def test_current_codex_models_lead_and_older_ones_trail_but_stay_valid(self):
-        rows = audits.load_config()["models"]
-        codex = [row for row in rows if row.get("provider") == "codex"]
-        current = [row["model"] for row in codex if "older" not in row["label"]]
-        older = [row for row in codex if "older" in row["label"]]
-        self.assertEqual(current, [m for m in runtime.OFFERED_MODELS if providers.harness(m) == providers.CODEX])
-        self.assertEqual([row["model"] for row in older], list(runtime.LEGACY_MODELS))
-        # The older entries sit at the very end, after every other provider.
-        self.assertEqual(rows[-len(older):], older)
-        for row in codex:
-            with self.subTest(model=row["model"]):
-                self.assertIn(row["effort"], runtime.MODEL_EFFORTS[row["model"]])
-                self.assertEqual(audits.normalize_settings({"models": [row["value"], "none", "none"]})["models"][0], row["value"])
 
 
 class Menus(HTMLParser):
@@ -349,18 +312,18 @@ def menus():
 
 class BrowserDefaultTests(unittest.TestCase):
     def test_role_menus_offer_the_current_models_and_preselect_the_default(self):
-        # The Codex CLI and Claude CLI options are static markup (only the API group comes
-        # from the /state catalog): exactly the built-in models in registry order, so a
-        # removed model such as DeepSeek can never reappear in a menu.
+        # Codex is the initial source. Each role offers the current Codex models;
+        # choosing another source loads that source's models from the catalog.
         page = menus()
-        builtin = [row["id"] for row in providers.BUILTIN_MODELS]
         codex = [model for model in runtime.OFFERED_MODELS if providers.harness(model) == providers.CODEX]
         for role in ROLES:
             with self.subTest(role=role):
                 models = page.options[f"{role}Model"]
                 values = [value for value, *_ in models]
-                self.assertEqual(values, builtin)
-                self.assertEqual([value for value in values if value in codex], codex)
+                self.assertEqual(values, codex)
+                sources = page.options[f"{role}Source"]
+                self.assertEqual([value for value, *_ in sources], ["codex", "claude"])
+                self.assertEqual([value for value, selected, _ in sources if selected], ["codex"])
                 for value in values:
                     self.assertTrue(providers.is_known(value), value)
                     self.assertFalse(providers.replacement_for_removed(value), value)
@@ -607,6 +570,7 @@ const app = fs.readFileSync(process.argv[1], 'utf8');
 
 class Option {
   constructor(text, value) { this.text = text; this.value = value === undefined ? String(text) : value; this.disabled = false; this.dataset = {}; }
+  get textContent() { return this.text; }
   remove() { this.owner.options = this.owner.options.filter((option) => option !== this); }
 }
 // Like a real <select>, assigning a value it has no option for blanks it.
@@ -615,6 +579,8 @@ function select(rows) {
     options: [], current: '',
     dataset: {}, classList: {toggle() {}}, setAttribute() {}, focus() {},
     add(option) { option.owner = this; this.options.push(option); },
+    append(...options) { options.forEach((option) => this.add(option)); },
+    replaceChildren(...options) { this.options = []; this.append(...options); this.current = this.options[0]?.value || ''; },
     querySelector(selector) { const value = selector.match(/value="([^"]+)"/)?.[1]; return this.options.find(option => option.value === value); },
     get value() { return this.current; },
     set value(value) { this.current = this.options.some((option) => option.value === value) ? value : ''; },
@@ -642,7 +608,7 @@ function load() {
     const show = (element, visible) => element.hidden = !visible;
     const retainTrace = (entries) => entries;
     const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {}, renderBatchNavigation = () => {};
-    const renderResearchAudits = () => {}, fillResearchAuditControls = () => {}, appendFormattedText = () => {};
+    const appendFormattedText = () => {};
     const syncPrompts = () => {}, checkEdited = () => {}, refresh = () => {};
     const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
   `;
@@ -658,13 +624,14 @@ const disabled = (ui, role) => ui[`${role}Effort`].options.filter((option) => op
 const summary = (ui) => ui.modelSummary.textContent.replace(/\u00a0/g, ' ').replace(/\u2060/g, '');
 const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {statement: 'S', notes: 'n'}};
 
-// 1. A new job shows the defaults, offers the eight built-in models and disables nothing.
+// 1. A new job shows the defaults and offers only the chosen source's four Codex models.
 {
   const {ui, api} = load();
   api.render({...fixture.empty, phase: 'input'});
   for (const role of roles) {
     assert.equal(ui[`${role}Model`].value, 'gpt-6.1-sol');
-    assert.equal(ui[`${role}Model`].options.length, 8);
+    assert.equal(ui[`${role}Source`].value, 'codex');
+    assert.equal(ui[`${role}Model`].options.length, 4);
     assert.equal(ui[`${role}Effort`].value, 'max');
     assert.deepEqual(disabled(ui, role), []);
   }
@@ -706,7 +673,7 @@ const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {sta
   // Rendering the same job again must not add a second stand-in option.
   api.setPending(true);
   api.render(job);
-  assert.equal(ui.reviewModel.options.length, 9);
+  assert.equal(ui.reviewModel.options.length, 5);
 }
 
 // 4. A state that records no model or effort falls back to the defaults.

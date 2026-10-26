@@ -27,17 +27,14 @@ class AuthorPromptTests(unittest.TestCase):
             change.start()
             self.addCleanup(change.stop)
 
-    def test_single_author_prompt_and_independent_audits_survive_restart(self):
+    def test_single_author_prompt_survives_restart(self):
         app = self.manager.start_direct_job({
             "statement": "Exact statement",
             "promptOverrides": {"author": "Custom [STATEMENT]"},
-            "researchAudits": {"models": ["gpt-6-astra", "none", "none"], "intervalHours": 1},
         })
         self.assertEqual(app.state["authorPrompt"], "Custom [STATEMENT]")
-        self.assertEqual(app.state["researchAudits"]["models"][0], "gpt-6-astra")
         restored = server.restore_saved_app(server.App(app.trace_file, self.runs))
         self.assertEqual(restored.state["authorPrompt"], app.state["authorPrompt"])
-        self.assertEqual(restored.state["researchAudits"], app.state["researchAudits"])
 
     def test_every_author_lifecycle_uses_the_same_proof_prompt_family(self):
         workflow = runtime.builtin_workflow("author_critic")
@@ -53,6 +50,25 @@ class AuthorPromptTests(unittest.TestCase):
             custom = runtime.prepare(workflow, {"prompts": {"author": "Custom [STATEMENT]"}})
         self.assertEqual(custom["author"], "Custom [STATEMENT]")
         self.assertEqual(custom["resume"], prompts["resume"])
+
+    def test_restoring_legacy_settings_preserves_reports_without_restarting_audits(self):
+        app = self.manager.start_direct_job({"statement": "Exact statement"})
+        settings_path = app.run_dir / server.JOB_SETTINGS_FILENAME
+        settings = json.loads(settings_path.read_text())
+        legacy = {
+            "researchAudits": {"models": ["gpt-6-astra", "none", "none"], "intervalHours": 1},
+            "researchAuditProgress": {"elapsedSeconds": 3600},
+            "auditHoldingAuthor": True,
+        }
+        settings_path.write_text(json.dumps({**settings, **legacy}))
+        report = app.run_dir / "AUDITS" / "saved.md"
+        report.parent.mkdir()
+        report.write_text("Previously saved advice")
+        restored = server.restore_saved_app(server.App(app.trace_file, self.runs))
+        self.assertTrue(all(key not in restored.state for key in legacy))
+        restored._save_job_settings(restored.state)
+        self.assertTrue(all(key not in json.loads(settings_path.read_text()) for key in legacy))
+        self.assertEqual(report.read_text(), "Previously saved advice")
 
     def test_new_run_and_saved_continuation_use_the_same_default(self):
         app = self.manager.start_direct_job({"statement": "Exact statement"})

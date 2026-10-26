@@ -33,24 +33,6 @@ class Clock(datetime):
         return cls.current if tz else cls.current.replace(tzinfo=None)
 
 
-class FakeEngine:
-    """The research-audit scheduler surface the controller uses."""
-
-    def __init__(self, workspace=None, on_event=None, progress=None, before_batch=None,
-                 after_batch=None, *, active=False):
-        self.on_event, self.active, self.closed = on_event, active, False
-
-    def close(self):
-        self.closed = True
-
-    def checkpoint(self):
-        return {"elapsedSeconds": 0}
-
-    def status(self):
-        return {"runningSlots": [], "batchActive": self.active, "warnings": [], "lastError": ""}
-
-    def update(self, *args, **kwargs):
-        return False
 
 
 def socketless_server(runs):
@@ -614,6 +596,15 @@ class HttpErrorTests(TemporaryRuns):
         status, value = self.request("/state")
         self.assertEqual((status, value["phase"], value["traceFrom"]), (200, "input", 0))
 
+    def test_removed_research_audit_routes_are_unavailable(self):
+        app = self.new_app()
+        identity = app.state["runId"]
+        self.http.jobs[identity] = app
+        for route in ("/start-research-audit", "/set-research-audits"):
+            with self.subTest(route=route):
+                self.assertEqual(self.request(f"{route}?job={identity}", {}),
+                                 (404, {"error": "Not found."}))
+
     def test_prepared_run_credential_error_is_a_user_error(self):
         app = self.new_app()
         app.state.update(phase="prepared", preparedRun=True)
@@ -665,13 +656,13 @@ class CrashRecoveryTests(TemporaryRuns):
                     message("Working on the repair", "item-1", stage="solve"))
         self.assert_repair_checkpoint(*self.restore())
 
-    def test_trailing_audit_record_does_not_hide_the_rejection(self):
+    def test_trailing_status_record_does_not_hide_the_rejection(self):
         self.events({"kind": "request", "stage": "solve", "node": "author", "label": "Exact solve input"},
                     {"kind": "author_result", "stage": "solve", "node": "author", "text": "Proof"},
                     *self.rejection(),
                     {"kind": "request", "stage": "repair", "node": "author", "label": "Exact solve input"},
                     message("Repairing", "item-2"),
-                    {"kind": "research_audit", "stage": "audit", "status": "completed", "text": "Saved."})
+                    {"kind": "status", "stage": "solve", "label": "Saved progress", "text": "Saved."})
         self.assert_repair_checkpoint(*self.restore())
 
     def test_newer_rejection_wins_over_a_stale_running_checkpoint(self):
@@ -764,34 +755,7 @@ class JobListTests(TemporaryRuns):
         self.manager.jobs[self.run_id] = self.app
         retrieval._CACHE.clear()
 
-    def test_paused_job_held_by_auditors_cannot_be_deleted(self):
-        self.app.state.update(phase="paused", stage="solve", activeNode="author", auditHoldingAuthor=True)
-        self.assertTrue(self.manager.job_list()[0]["auditHoldingAuthor"])
-        for change in ({"auditHoldingAuthor": True}, {"pause_engine": object()},
-                       {"engine": FakeEngine(active=True)}):
-            with self.subTest(change=sorted(change)):
-                self.app.state["auditHoldingAuthor"] = change.get("auditHoldingAuthor", False)
-                self.app._audit_pause_engine = change.get("pause_engine")
-                self.app.research_audits = change.get("engine")
-                with self.assertRaisesRegex(ValueError, "Stop this job"):
-                    self.manager.delete_job(self.run_id)
-                self.assertTrue(self.app.run_dir.is_dir())
-        self.app.research_audits = None
-        self.app.state["auditHoldingAuthor"] = False
-        self.assertFalse(self.manager.job_list()[0]["auditHoldingAuthor"])
 
-    def test_deleting_detaches_an_idle_scheduler_so_late_events_write_nothing(self):
-        self.app.state.update(phase="paused", stage="solve", activeNode="author",
-                              researchAudits={"intervalHours": 2, "models": ["auditor", "none", "none"]})
-        with mock.patch.object(server.audits, "ResearchAudits", FakeEngine):
-            engine = self.app._start_research_audits(None, paused=True)
-        self.assertIs(self.app.research_audits, engine)
-        self.manager.delete_job(self.run_id)
-        self.assertTrue(engine.closed)
-        self.assertIsNone(self.app.research_audits)
-        engine.on_event({"kind": "research_audit", "stage": "audit", "status": "completed", "text": "Late."})
-        self.assertFalse((self.runs / self.run_id).exists())
-        self.assertEqual(self.manager.jobs, {})
 
     def historical(self, **state):
         self.app.state.update(retrievalPolicyPath=str(self.root / "controller" / "retrieval-policy.json"),
@@ -827,7 +791,7 @@ class ServerLifecycleTests(TemporaryRuns):
         apps = []
         for index in range(count):
             app = server.App(runs=self.runs, load_latest=False)
-            app.process, app.research_audits = mock.Mock(), FakeEngine()
+            app.process = mock.Mock()
             app.process.send_signal.side_effect = ValueError("Unsupported signal: 2")
             manager.jobs[f"job-{index}"] = app
             apps.append(app)
@@ -849,7 +813,6 @@ class ServerLifecycleTests(TemporaryRuns):
             manager.stop_all()
         self.assertEqual(stopped, [app.process for app in apps])
         for app in apps:
-            self.assertTrue(app.research_audits.closed)
             app.process.send_signal.assert_not_called()
 
     @unittest.skipIf(os.name == "nt", "POSIX runners receive SIGINT")
@@ -861,7 +824,6 @@ class ServerLifecycleTests(TemporaryRuns):
         manager.stop_all()
         for app in (apps[0], apps[2]):
             app.process.send_signal.assert_called_once_with(signal.SIGINT)
-            self.assertTrue(app.research_audits.closed)
 
     def test_server_starts_with_a_symlinked_runs_folder(self):
         real = self.root / "data-disk" / "runs"

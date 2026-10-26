@@ -106,6 +106,8 @@ const ui = {
   feedback: $("feedback"), notes: $("notes"), editHint: $("editHint"),
   reviewModel: $("reviewModel"), authorModel: $("authorModel"),
   criticModel: $("criticModel"), writerModel: $("writerModel"),
+  reviewSource: $("reviewSource"), authorSource: $("authorSource"),
+  criticSource: $("criticSource"), writerSource: $("writerSource"),
   reviewModelSetting: $("reviewModelSetting"),
   authorModelSetting: $("authorModelSetting"),
   criticModelSetting: $("criticModelSetting"),
@@ -157,20 +159,6 @@ const ui = {
   authorSteerControl: $("authorSteerControl"),
   authorSteerInstruction: $("authorSteerInstruction"),
   sendAuthorSteer: $("sendAuthorSteerButton"),
-  researchAuditsSetting: $("researchAuditsSetting"),
-  researchAuditInterval: $("researchAuditInterval"),
-  researchAuditModels: [$("researchAuditOne"), $("researchAuditTwo"), $("researchAuditThree")],
-  researchAuditsControl: $("researchAuditsControl"),
-  liveResearchAuditInterval: $("liveResearchAuditInterval"),
-  liveResearchAuditModels: [$("liveResearchAuditOne"), $("liveResearchAuditTwo"), $("liveResearchAuditThree")],
-  researchAuditSummary: $("researchAuditSummary"), researchAuditStatus: $("researchAuditStatus"),
-  researchAuditCountdown: $("researchAuditCountdown"),
-  researchAuditToolbar: $("researchAuditToolbar"),
-  researchAuditActivity: $("researchAuditActivity"),
-  researchAuditCountdownLabel: $("researchAuditCountdownLabel"),
-  researchAuditTimerState: $("researchAuditTimerState"),
-  startResearchAudit: $("startResearchAuditButton"),
-  applyResearchAudits: $("applyResearchAuditsButton"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
   runOverview: $("runOverview"), runProblemTitle: $("runProblemTitle"),
@@ -244,11 +232,6 @@ let memoryTimer;
 let memoryRequest = 0;
 let approachGraphData = { nodes: [], files: [], indexFile: "" };
 let approachGraphSignature = "";
-let researchAuditJob = null;
-let researchAuditDirty = false;
-let researchAuditSaving = false;
-let researchAuditStarting = false;
-let researchAuditFeedback = "";
 const pinnedKinds = new Set([
   "request", "review_result", "critic_result", "author_result",
   "final_result", "failure_result", "partial_result", "diagnostic", "error",
@@ -582,8 +565,6 @@ function renderJobs(jobs) {
   for (const job of jobs) {
     const readOnly = Boolean(job.readOnly || selectedBatch()?.readOnly);
     const active = ["reviewing", "running", "stopping", "pausing"].includes(job.phase);
-    // A paused author can be held for research audits that still work in its folder.
-    const auditing = Boolean(job.auditHoldingAuthor);
     const outcome = job.phase === "done" ? completedRunLabel(job) : "";
     const tone = job.manuallyStopped ? "stopped" : active ? "running"
       : job.phase === "paused" ? "paused" : ["reviewed", "prepared"].includes(job.phase) ? "waiting"
@@ -606,7 +587,6 @@ function renderJobs(jobs) {
     status.textContent = job.launchHold ? "Prepared · awaiting review"
       : job.manuallyStopped
       ? `Stopped at ${stoppedStages[job.stoppedStage] || "saved stage"}`
-      : auditing && job.phase === "paused" ? "Paused · auditing"
       : labels[job.phase] || job.phase;
     const times = document.createElement("small");
     times.className = "job-times";
@@ -704,14 +684,13 @@ function renderJobs(jobs) {
     continueButton.textContent = job.continueStoppedLabel
       || "Continue stopped job";
     continueButton.hidden = readOnly || !job.canContinueStopped;
-    continueButton.disabled = auditing; // the author resumes by itself after the audits
     continueButton.title = job.continueStoppedDescription || "";
     continueButton.onclick = () => continueStopped(job, title.textContent);
-    // Delete is offered only when it can work; a running or auditing job must be stopped first.
+    // Running jobs must be stopped before they can be deleted.
     const remove = document.createElement("button");
     remove.className = "ghost compact job-delete";
     remove.textContent = "Delete";
-    remove.hidden = readOnly || active || auditing;
+    remove.hidden = readOnly || active;
     remove.onclick = () => deleteJob(job, title.textContent);
     actions.append(open, separate, continueButton, resume, remove);
     item.append(copy, actions);
@@ -776,7 +755,6 @@ function setProblemMode(mode) {
   show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
   show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
   show(ui.retrievalSetting, true);
-  show(ui.researchAuditsSetting, !latexOnly && !reviewOnly);
   ui.problem.required = statement;
   ui.latexInput.required = latexOnly;
   ui.check.textContent = latexOnly ? "Polish LaTeX"
@@ -859,6 +837,10 @@ function renderModelChoices() {
     const model = select.value || "", provider = modelProvider(model);
     const row = (catalog || []).find((item) => item.id === model);
     const restricted = cutoff && role !== "review";
+    const source = ui[`${role}Source`];
+    for (const option of source?.options || []) {
+      option.disabled = restricted && option.value !== "codex";
+    }
     for (const group of select.querySelectorAll?.("optgroup") || []) {
       group.disabled = restricted && group.dataset.provider !== "codex";
     }
@@ -902,7 +884,7 @@ function renderRetrievalSettings() {
     ? capabilities.reason || "Historical search setup is unavailable in this interface. Open the updated TCS Prover interface to create a historical job."
     : !ui.skipStatementReview.checked
       ? `Select Skip statement review under Workflow to start a historical proof job. ${cutoffModelMessage()}`
-      : `${cutoffModelMessage()} Set optional research audits to None.`;
+      : cutoffModelMessage();
   ui.retrievalConfigurationNotice.textContent = message;
   show(ui.retrievalConfigurationNotice, Boolean(message));
   renderModelChoices();
@@ -931,10 +913,7 @@ function validateRetrievalSettings({ folder = false } = {}) {
   } else if (cutoffBlockedRoles().length) {
     message = cutoffModelMessage();
     focus = ui[`${cutoffBlockedRoles()[0]}Model`];
-  } else if (researchAuditValues().models.some(model => model !== "none")) {
-    message = "Set each optional research audit to None for a historical proof job.";
-    ui.researchAuditsSetting.open = true;
-    focus = ui.researchAuditModels[0];
+
   }
   if (!message) return true;
   ui.notice.textContent = message;
@@ -1144,7 +1123,6 @@ function importantEntry(entry) {
   if (pinnedKinds.has(entry.kind)) return true;
   if (entry.kind === "status" && entry.label === "Critic approved"
       && entry.root !== false && !entry.activityLabel) return true;
-  if (entry.kind === "research_audit") return entry.status !== "working" || Boolean(entry.recovered);
   if (entry.kind !== "codex_event" || entry.root === false) return false;
   const event = entry.event || {};
   const item = event.params?.item || event.item || {};
@@ -1212,10 +1190,6 @@ function describe(entry) {
         ? entry.output : text,
       time: entry.time, replace: true, pinned: true,
     };
-  }
-  if (entry.kind === "research_audit") {
-    return {key: `audit:${entry.slot}:${entry.time}:${entry.status}`, type: entry.status === "warning" ? "error" : "status",
-      label: entry.label || `Audit ${entry.slot}`, text, time: entry.time, replace: true};
   }
   if (entry.kind === "status") {
     return {
@@ -1740,9 +1714,9 @@ async function loadMemory() {
       ui.memoryContent.replaceChildren();
       ui.memoryMessage.textContent = file.status === "missing"
         ? (memoryFile === "audit_history" || memoryFile.startsWith("audit_history/") || memoryFile === "audit.md"
-          ? "No previous audit reports yet. Current reports move here when the next audit batch starts."
+          ? "No historical audit reports are saved here."
           : memoryFile === "AUDITS" || memoryFile.startsWith("AUDITS/")
-          ? "No audit report has been saved here yet. Reports will appear after an audit completes."
+          ? "No saved audit reports are available."
           : "The author has not created this file yet. It will appear here when saved.")
         : "This file is unavailable right now. Trying again shortly…";
       show(ui.memoryMessage, true);
@@ -1767,19 +1741,7 @@ function selectMemoryFile(tab) {
   selectMemoryDocument(tab.dataset.memory);
 }
 
-function resolveArchivedMemoryFile(name, entries = state.trace || []) {
-  if (!/^AUDITS\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(name)) return name;
-  for (const entry of [...entries].reverse()) {
-    if (entry.kind !== "research_audit" || entry.status !== "archived") continue;
-    const paths = entry.archivedPaths;
-    const archived = paths && Object.hasOwn(paths, name) ? paths[name] : "";
-    if (typeof archived === "string" && /^audit_history\/[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/.test(archived)) return archived;
-  }
-  return name;
-}
-
 function selectMemoryDocument(name, anchor = "") {
-  name = resolveArchivedMemoryFile(name);
   const category = name.startsWith("APPROACHES") ? "APPROACHES"
     : name === "audit_history" || name.startsWith("audit_history/") || name === "audit.md" ? "audit_history"
     : name === "AUDITS" || name.startsWith("AUDITS/") ? "AUDITS" : name;
@@ -1804,13 +1766,6 @@ function selectMemoryDocument(name, anchor = "") {
   loadMemory();
 }
 
-function followArchivedMemoryFile() {
-  if (!ui.memoryPanel.open || ui.memoryPanel.hidden) return;
-  const name = memoryFile === "AUDITS" ? ui.memoryFilename.textContent : memoryFile;
-  const archived = resolveArchivedMemoryFile(name);
-  if (archived !== name) selectMemoryDocument(archived, memoryAnchor);
-}
-
 function syncMemoryPanel() {
   const job = currentJob || state.runId || "";
   const identity = job ? JSON.stringify([currentBatch, job]) : "";
@@ -1826,7 +1781,6 @@ function syncMemoryPanel() {
   const visible = Boolean(identity) && !ui.run.hidden
     && state.problemMode !== "latex" && !state.statementReviewOnly;
   show(ui.memoryPanel, visible);
-  if (visible) followArchivedMemoryFile();
   if (!visible) {
     ui.memoryPanel.open = false;
     clearTimeout(memoryTimer);
@@ -1922,7 +1876,7 @@ function detailCard(entry) {
   if (entry.kind === "request" && entry.text) {
     return {
       key: `detail-prompt:${entry.time}`,
-      label: entry.stage === "audit" ? entry.label || "Audit prompt to model" : "Prompt to model",
+      label: "Prompt to model",
       text: entry.text,
     };
   }
@@ -2054,7 +2008,7 @@ function unconfiguredJobModelText(model, role) {
       + `${saved.baseUrl} · model ${saved.model})`
     : `with the display name “${model.slice("api:".length)}”`;
   return `The API model ${model} chosen for the ${labels[role]} is not configured. Add it again under `
-    + `New problem → Advanced settings → API models ${how} to continue this job.`;
+    + `New problem → Advanced settings → API connections ${how} to continue this job.`;
 }
 
 // The settings warning under the job title: the server's, then any API model this job still
@@ -2640,7 +2594,7 @@ function renderRetrievalOverview() {
     + (retrieval.lastEventAt ? ` Last recorded retrieval event: ${localDateTime(retrieval.lastEventAt)}.` : "");
 }
 
-// Show the author/audit cycle alongside the separate critic/repair cycle.
+// Show the author and critic/repair cycle.
 function renderWorkflow() {
   const nodes = state.workflow?.nodes || {};
   const trace = state.trace || [];
@@ -2663,14 +2617,7 @@ function renderWorkflow() {
     (entry) => entry.node || nodeFromStage(entry.stage)
   ));
   const seen = new Set(seenInThisJob);
-  const auditConfig = state.researchAudits || state.workflow?.settings?.research_audits || {};
-  const auditStatus = state.researchAuditStatus || {};
-  const selectedAuditors = (auditConfig.models || []).filter(model => model !== "none").length;
-  const runningAuditors = Array.isArray(auditStatus.runningSlots)
-    ? auditStatus.runningSlots.length : Number(auditStatus.runningSlots || 0);
   const authorStage = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
-  const auditing = authorStage && ["running", "pausing", "paused"].includes(state.phase)
-    && Boolean(state.auditHoldingAuthor || auditStatus.batchActive || runningAuditors);
   const compiling = ["latex_compile", "latex_repair"].includes(state.activeNode);
   if (seen.has("latex_repair")) seen.add("latex_compile");
   if (criticResume) {
@@ -2720,8 +2667,7 @@ function renderWorkflow() {
     };
     description.textContent = descriptions[name] || item.description;
     copy.append(title, description);
-    let noteText = overrides.note || (paused ? (auditing
-      ? state.phase === "pausing" ? "Pausing for audits" : "Paused for audits" : "Paused")
+    let noteText = overrides.note || (paused ? "Paused"
       : current && state.phase === "prepared" ? "Ready to start" : "");
     if (name === "author" && authorRepairing && current
         && ["running", "pausing", "paused", "stopping"].includes(state.phase)) {
@@ -2832,44 +2778,12 @@ function renderWorkflow() {
   selfRoute.className = "loop-self";
   selfRoute.textContent = `↻ PASS with changes → next round (limit ${state.criticRounds || 2})`;
   const author = makeNode("author", startsAtAuthor ? "1" : "2");
-  const authorGroup = document.createElement("li");
-  authorGroup.className = "author-audit-group";
-  const group = document.createElement("ol");
-  group.className = "author-audit-nodes" + (!selectedAuditors && !auditing ? " audits-disabled" : "");
-  group.setAttribute("aria-label", "Author and research audits: pause, audit, then resume the same author");
-  const warnings = (auditStatus.warnings || []).length;
-  const problem = warnings || auditStatus.batchError || auditStatus.lastError;
-  const latest = [...(state.trace || [])].reverse().find(entry => entry.kind === "research_audit"
-    && ["completed", "cancelled"].includes(entry.status) && (auditConfig.models || []).includes(entry.model));
-  const status = auditing ? "active" : !selectedAuditors ? "disabled" : problem ? "warning"
-    : latest?.status === "completed" ? "complete" : "";
-  const note = auditing ? (state.phase === "pausing" ? "Waiting for author"
-    : state.phase === "running" && !state.auditHoldingAuthor ? "Checking auditors" : runningAuditors
-      ? `${runningAuditors} auditor${runningAuditors === 1 ? "" : "s"} active` : "Finishing batch")
-    : !selectedAuditors ? "Disabled" : problem ? "Needs attention"
-      : latest?.status === "completed" ? "Reports saved" : latest?.status === "cancelled" ? "Cancelled"
-        : authorStage ? state.phase === "paused" ? "Ready while paused" : "Scheduled" : "Waiting for author";
-  const description = auditing ? (state.auditHoldingAuthor
-    ? "Review saved work, then resume the author." : "Check availability before pausing the author.")
-    : !selectedAuditors ? "Select auditors to review the author's work."
-      : `${selectedAuditors} selected · every ${auditConfig.intervalHours ?? 2} author hours or on demand.`;
-  const audit = makeNode("research_audit", "↻", {status, note,
-    item: {label: "Research audits", description}});
-  const connection = document.createElement("li");
-  connection.className = "audit-cycle-route";
-  connection.textContent = "⇄";
-  connection.setAttribute("aria-hidden", "true");
-  const caption = document.createElement("li");
-  caption.className = "audit-cycle-caption";
-  caption.textContent = "Pause author → audit → resume author";
-  group.append(author, connection, audit, caption);
-  authorGroup.append(group);
   const critic = makeNode("critic", startsAtAuthor ? "2" : "3");
   const passStem = document.createElement("li");
   passStem.className = "critic-pass-stem";
   passStem.setAttribute("aria-hidden", "true");
   loopNodes.append(
-    authorGroup, candidateRoute, critic, selfRoute, passStem, rejectRoute,
+    author, candidateRoute, critic, selfRoute, passStem, rejectRoute,
   );
   loop.append(loopTitle, loopNodes);
 
@@ -2926,223 +2840,6 @@ function renderClock() {
   }
 }
 
-function researchAuditValues(live = false) {
-  return {
-    intervalHours: Number((live ? ui.liveResearchAuditInterval : ui.researchAuditInterval).value),
-    models: (live ? ui.liveResearchAuditModels : ui.researchAuditModels).map((select) => select.value),
-  };
-}
-
-function fillResearchAuditControls(live = false) {
-  const catalog = state.workflow?.settings?.research_audits || {};
-  const config = state.researchAudits || catalog;
-  const choices = catalog.choices || [{ value: "none", label: "None" }];
-  const interval = live ? ui.liveResearchAuditInterval : ui.researchAuditInterval;
-  const models = live ? ui.liveResearchAuditModels : ui.researchAuditModels;
-  const hours = String(config.intervalHours ?? catalog.intervalHours ?? 2);
-  if (interval.value !== hours) interval.value = hours;
-  models.forEach((select, index) => {
-    const signature = JSON.stringify(choices);
-    if (select.dataset.choices !== signature) {
-      select.replaceChildren(...choices.map((choice) => {
-        const option = document.createElement("option");
-        option.value = choice.value;
-        option.textContent = choice.label;
-        return option;
-      }));
-      select.dataset.choices = signature;
-    }
-    const selected = config.models?.[index] || "none";
-    if (select.value !== selected) select.value = selected;
-  });
-}
-
-function renderResearchAudits(canEdit) {
-  if (state.readOnly || state.retrieval?.mode === "historical" || state.retrievalPolicyPath) {
-    for (const element of [ui.researchAuditsControl, ui.researchAuditToolbar,
-      ui.researchAuditActivity, ui.researchAuditStatus]) show(element, false);
-    return;
-  }
-  const identity = JSON.stringify([state.batchId || "", currentJob || state.runId || ""]);
-  if (researchAuditJob !== identity) {
-    researchAuditJob = identity;
-    researchAuditDirty = false;
-    researchAuditSaving = false;
-    researchAuditStarting = false;
-    researchAuditFeedback = "";
-    ui.researchAuditsControl.open = false;
-  }
-  show(ui.researchAuditsControl, canEdit);
-  if (!researchAuditDirty && !researchAuditSaving) fillResearchAuditControls(true);
-  for (const input of [ui.liveResearchAuditInterval, ...ui.liveResearchAuditModels]) input.disabled = !canEdit;
-  ui.applyResearchAudits.disabled = !canEdit || researchAuditSaving || researchAuditStarting || !researchAuditDirty;
-  ui.applyResearchAudits.textContent = researchAuditSaving ? "Applying…" : "Apply";
-  const config = state.researchAudits || {};
-  const status = state.researchAuditStatus || {};
-  const enabled = (config.models || []).filter((model) => model !== "none").length;
-  const running = Array.isArray(status.runningSlots) ? status.runningSlots.length : Number(status.runningSlots || 0);
-  ui.researchAuditSummary.textContent = enabled
-    ? `${enabled} selected · every ${config.intervalHours ?? 2} active author hours` : "Disabled";
-  const progress = state.researchAuditProgress || {};
-  const remaining = Math.max(0, Math.ceil((config.intervalHours ?? 2) * 3600
-    - Math.max(0, (progress.elapsedSeconds || 0) - (progress.lastStartedSeconds || 0))));
-  const countdown = [Math.floor(remaining / 3600), Math.floor(remaining / 60) % 60, remaining % 60]
-    .map((part) => String(part).padStart(2, "0")).join(":");
-  const auditing = Boolean(state.auditHoldingAuthor || status.batchActive)
-    || running > 0;
-  const author = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
-  ui.researchAuditCountdownLabel.textContent = auditing ? "Research audits" : "Next audit";
-  ui.researchAuditCountdown.textContent = auditing
-    ? (state.phase === "pausing" ? "Preparing…" : "In progress") : countdown;
-  ui.researchAuditTimerState.textContent = auditing && state.phase !== "running" ? "author paused"
-    : state.phase === "running" ? "author time" : "paused";
-  show(ui.researchAuditToolbar, Boolean((enabled || auditing) && author
-    && ["running", "pausing", "paused"].includes(state.phase)));
-  ui.startResearchAudit.disabled = !author || !["running", "paused"].includes(state.phase)
-    || state.manuallyStopped || !enabled || auditing || Boolean(status.batchActive)
-    || researchAuditDirty || researchAuditSaving || researchAuditStarting;
-  ui.startResearchAudit.textContent = researchAuditStarting ? "Starting…" : "Start audit now";
-  ui.startResearchAudit.title = researchAuditDirty ? "Apply your audit settings first."
-    : state.phase === "paused" ? "Run the selected auditors now, then resume the author automatically."
-    : "Run the selected auditors now and reset the audit interval.";
-  renderResearchAuditActivity();
-  const modelWarnings = Array.isArray(status.warnings) ? status.warnings : [];
-  let batchError = String(status.batchError || status.lastError || "");
-  for (const warning of modelWarnings) batchError = batchError.replace(String(warning.message || ""), "");
-  const warnings = batchError.trim() ? [batchError.trim()] : [];
-  const auditMessage = [
-    ...warnings,
-    researchAuditDirty ? "Changes have not been applied." : "",
-    researchAuditFeedback,
-  ].filter(Boolean).join("\n");
-  if (ui.researchAuditStatus.textContent !== auditMessage) ui.researchAuditStatus.textContent = auditMessage;
-  ui.researchAuditStatus.className = "help research-audit-status"
-    + (warnings.length || researchAuditFeedback ? " warning" : "");
-  show(ui.researchAuditStatus, Boolean(ui.researchAuditStatus.textContent));
-}
-
-function renderResearchAuditActivity() {
-  const config = state.researchAudits || {};
-  const status = state.researchAuditStatus || {};
-  const choices = state.workflow?.settings?.research_audits?.choices || [];
-  const warnings = Array.isArray(status.warnings) ? status.warnings : [];
-  const running = Array.isArray(status.runningSlots) ? status.runningSlots : [];
-  const live = Boolean(state.auditHoldingAuthor || (["running", "paused"].includes(state.phase) && status.batchActive));
-  const events = (state.trace || []).filter((entry) => entry.kind === "research_audit");
-  const rows = (config.models || []).flatMap((model, index) => {
-    if (model === "none") return [];
-    const slot = index + 1;
-    const log = events.filter((entry) => entry.slot === slot && entry.model === model).slice(-30);
-    const last = log[log.length - 1];
-    const warning = warnings.find((item) => item.slot === slot && item.model === model);
-    const busy = running.includes(slot) && (live || state.phase === "running");
-    let phase = last?.status || (warning ? "warning" : "idle");
-    if (busy && ["warning", "completed", "cancelled", "idle"].includes(phase)) phase = "starting";
-    if (!busy && ["checking", "waiting", "starting", "running", "working", "retrying"].includes(phase)) {
-      phase = warning ? "warning" : "idle";
-    }
-    const labels = {checking: "Checking", waiting: "Waiting for author", starting: "Connecting",
-      running: "Connecting", working: "Working", retrying: "Retrying", completed: "Completed",
-      cancelled: "Cancelled", warning: "Unavailable", idle: "Waiting"};
-    let text = phase === "warning" ? warning?.message || last?.text : last?.text;
-    if (phase === "idle") text = "Waiting for the next audit.";
-    if (phase === "starting" && last?.status !== "starting") text = "Waiting for a model response.";
-    text = String(text || "Waiting for a model response.")
-      .replace(/^Warning: Audit-\d+ — .*? skipped: /, "").replace(/\. No report saved\.$/, "");
-    return [{slot, model, name: choices.find((item) => item.value === model)?.label || model,
-      phase, label: labels[phase] || phase, text, log, time: last?.time, report: last?.report}];
-  });
-  show(ui.researchAuditActivity, rows.length > 0 && !["input", "reviewed", "reviewing"].includes(state.phase));
-  const signature = JSON.stringify([currentJob, rows]);
-  if (ui.researchAuditActivity.dataset.signature !== signature) {
-    const open = new Set([...ui.researchAuditActivity.querySelectorAll("details[open]")].map((item) => item.dataset.slot));
-    const cards = rows.map((row) => {
-      const card = document.createElement("section");
-      card.className = "research-auditor" + (["warning", "retrying"].includes(row.phase) ? " unavailable" : "");
-      const head = document.createElement("div"); head.className = "research-auditor-head";
-      const name = document.createElement("strong"); name.textContent = `Audit ${row.slot} · ${row.name}`;
-      const badge = document.createElement("span"); badge.className = "research-auditor-badge"; badge.textContent = row.label;
-      head.append(name, badge);
-      const message = document.createElement("p"); message.textContent = row.text;
-      const time = document.createElement("small");
-      if (row.time) time.dataset.auditTime = row.time;
-      card.append(head, message, time);
-      if (row.report && /^AUDITS\/[a-zA-Z0-9_.+-]+\.md$/.test(row.report)) {
-        const link = document.createElement("button"); link.className = "memory-link"; link.textContent = "Read report";
-        link.onclick = () => { ui.memoryPanel.open = true; selectMemoryDocument(row.report); };
-        card.append(link);
-      }
-      if (row.log.length) {
-        const details = document.createElement("details"); details.dataset.slot = String(row.slot);
-        details.open = open.has(String(row.slot));
-        const summary = document.createElement("summary"); summary.textContent = `Activity · ${row.log.length} recent events`;
-        const log = document.createElement("ol");
-        for (const entry of row.log) {
-          const line = document.createElement("li");
-          line.textContent = `${clockText(entry.time)} · ${entry.status}: ${entry.text || ""}`;
-          log.append(line);
-        }
-        details.append(summary, log); card.append(details);
-      }
-      return card;
-    });
-    ui.researchAuditActivity.replaceChildren(...cards);
-    ui.researchAuditActivity.dataset.signature = signature;
-  }
-  for (const time of ui.researchAuditActivity.querySelectorAll("[data-audit-time]")) {
-    time.textContent = `Last activity ${clockText(time.dataset.auditTime)} · ${elapsedText(time.dataset.auditTime)} ago`;
-  }
-}
-
-async function applyResearchAudits() {
-  const config = researchAuditValues(true);
-  if (!(Number.isFinite(config.intervalHours) && config.intervalHours > 0)) {
-    researchAuditFeedback = "Set an interval greater than zero hours.";
-    renderResearchAudits(!ui.researchAuditsControl.hidden);
-    ui.liveResearchAuditInterval.focus();
-    return;
-  }
-  const job = currentJob;
-  const batch = currentBatch;
-  researchAuditFeedback = "";
-  researchAuditSaving = true;
-  renderResearchAudits(true);
-  try {
-    const next = await request(jobPath("/set-research-audits"), config);
-    if (job !== currentJob || batch !== currentBatch) return;
-    researchAuditDirty = JSON.stringify(researchAuditValues(true)) !== JSON.stringify(config);
-    researchAuditSaving = false;
-    render(next);
-  } catch (error) {
-    if (job !== currentJob || batch !== currentBatch) return;
-    researchAuditSaving = false;
-    researchAuditFeedback = error.message;
-    renderResearchAudits(!ui.researchAuditsControl.hidden);
-  }
-}
-
-async function startResearchAudit() {
-  if (ui.startResearchAudit.disabled) return;
-  const job = currentJob;
-  const batch = currentBatch;
-  researchAuditStarting = true;
-  researchAuditFeedback = "";
-  renderResearchAudits(true);
-  try {
-    const next = await request(jobPath("/start-research-audit"), {});
-    if (job !== currentJob || batch !== currentBatch) return;
-    researchAuditStarting = false;
-    render(next);
-  } catch (error) {
-    if (job !== currentJob || batch !== currentBatch) return;
-    researchAuditStarting = false;
-    researchAuditFeedback = error.message === "Not found."
-      ? "Pause the author and restart the web UI to enable Start audit now."
-      : error.message;
-    renderResearchAudits(!ui.researchAuditsControl.hidden);
-  }
-}
-
 // Merge incremental polling state, then update the visible phase.
 function render(next) {
   // A control's reply is a full snapshot (no `after`). When it continues the run on screen,
@@ -3175,9 +2872,7 @@ function render(next) {
   }
 
   const phase = state.phase;
-  const auditHolding = Boolean(state.auditHoldingAuthor || state.researchAuditStatus?.batchActive)
-    && ["pausing", "paused"].includes(phase);
-  const working = ["reviewing", "running", "stopping", "pausing"].includes(phase) || auditHolding;
+  const working = ["reviewing", "running", "stopping", "pausing"].includes(phase);
   const reviewOnlyResult = phase === "done"
     && state.statementReviewOnly && Boolean(state.review);
   const reviewReady = phase === "reviewed" || reviewOnlyResult;
@@ -3229,7 +2924,7 @@ function render(next) {
     ui.thinkingHours.value = state.thinkingHours ?? 168;
     ui.thinkingHours.min = hours.minimum ?? 0;
     ui.thinkingHours.max = hours.maximum || 168;
-    fillResearchAuditControls();
+
     setProblemMode(state.problemMode || "statement");
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
@@ -3254,7 +2949,7 @@ function render(next) {
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
     ui.thinkingHours.value = state.thinkingHours ?? 168;
-    fillResearchAuditControls();
+
     checkEdited();
     reviewPending = false;
   }
@@ -3276,24 +2971,20 @@ function render(next) {
   const done = phase === "done";
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
-    : auditHolding ? "Research audits"
     : phase === "prepared" ? "Ready to start" : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? completedRunLabel(state) : (node.label || "Model is working");
-  ui.runLabel.textContent = auditHolding ? "RESEARCH AUDITS"
-    : phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED"
+  ui.runLabel.textContent = phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED"
     : done ? (state.resultKind === "final" || state.canDownloadTex ? "ANSWER READY" : "RUN INCOMPLETE") : (node.short_label || "MODEL");
   // A short status title; the error, when there is one, is the description below it.
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
-    : auditHolding ? (phase === "pausing" ? "Pausing author for research audits…" : "Author paused for research audits")
     : phase === "prepared" ? "Prepared research workspace" : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing…"
     : phase === "stopping" ? "Stopping safely…"
       : done ? completedRunLabel(state) : (node.label || "Working…");
   // The header already says what happens next; the now-card adds only the error or what its buttons need.
   ui.runDescription.textContent = (done && state.manuallyStopped ? "You stopped this job." : state.error)
-    || (auditHolding ? "The author will resume automatically in the same conversation after all audit reports are saved. Click Pause to cancel the audits and keep the author paused."
-      : phase === "prepared" ? (state.launchHold || "Review the prepared statement and settings, then start a fresh author session in this workspace.")
+    || (phase === "prepared" ? (state.launchHold || "Review the prepared statement and settings, then start a fresh author session in this workspace.")
       : phase === "paused" ? "Resume reopens the saved author conversation in this same run folder. You can update your CLI login or API model settings before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : "");
@@ -3317,7 +3008,7 @@ function render(next) {
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author";
   const canSetAuthorLimit = authorRunning || (phase === "paused"
     && ["solve", "repair"].includes(state.stage) && state.activeNode === "author");
-  renderResearchAudits(canSetAuthorLimit);
+
   show(ui.authorSteerControl, authorRunning);
   ui.sendAuthorSteer.disabled = !authorRunning;
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
@@ -3331,13 +3022,13 @@ function render(next) {
   }
   ui.setAuthorTimeLimit.disabled = !canSetAuthorLimit;
   const retryPending = phase === "paused" && Boolean(state.autoResumeAt);
-  show(ui.pause, authorRunning || auditHolding || retryPending);
+  show(ui.pause, authorRunning || retryPending);
   ui.pause.textContent = retryPending ? "Keep paused" : "Pause";
   ui.pause.title = retryPending ? "Cancel automatic retries"
-    : auditHolding ? "Cancel the audits and keep the author paused" : "Pause the author";
+    : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
   ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run" : "Resume";
-  ui.resume.disabled = auditHolding || Boolean(state.launchHold);
+  ui.resume.disabled = Boolean(state.launchHold);
   show(ui.downloadTex, Boolean(state.canDownloadTex));
   show(ui.downloadPdf, Boolean(state.canDownloadPdf));
   show(ui.stop, working);
@@ -3349,7 +3040,7 @@ function render(next) {
   renderBatchNavigation();
   if (state.readOnly) {
     for (const control of [ui.stop, ui.pause, ui.resume, ui.authorSteerControl, ui.authorTimeLimitControl,
-      ui.researchAuditsControl, ui.researchAuditToolbar, ui.researchAuditStatus, ui.approve, ui.recheck,
+      ui.approve, ui.recheck,
       ui.reviewFeedbackControls]) show(control, false);
     ui.proposed.readOnly = true;
     // Saved batches cannot resume; do not promise an action that is not offered.
@@ -3379,6 +3070,13 @@ function render(next) {
 // A saved job may name a model the menus no longer offer (an older GPT-5.6, say,
 // or an API model removed since). Keep that choice visible instead of leaving the menu blank.
 function setChoice(select, value) {
+  const role = ["review", "author", "critic", "writer"].find((name) => ui[`${name}Model`] === select);
+  if (role && ui[`${role}Source`]?.options) {
+    const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === value);
+    const source = row ? modelSourceId(row) : modelProvider(value);
+    syncRoleModelMenu(role, source, value);
+    return;
+  }
   // A stand-in belongs to the job that needed it: never offer it to the next
   // job or to a new problem (a retired or removed model would be selectable).
   for (const option of Array.from(select.options || [])) {
@@ -3427,48 +3125,93 @@ function shortModelName(label) {
   return `${cut.length >= 10 ? cut : name.slice(0, 23).trimEnd()}…`;
 }
 
-// Fill each role menu's API group from the server's catalog (the Codex CLI and Claude CLI
-// groups are static markup). A role keeps its choice while that model is still offered; a
-// role whose API model was removed falls back to the default, and its role name is returned.
-function syncModelMenus() {
+function modelSourceId(row) {
+  return row.sourceId || (row.provider === "api" ? row.id : row.provider);
+}
+
+function roleModelCatalog() {
   const catalog = state.workflow?.settings?.model_catalog;
-  if (!Array.isArray(catalog)) return []; // An older server: the built-in menus stay as they are.
-  const rows = catalog.filter((row) => row.provider === "api");
+  if (Array.isArray(catalog)) return catalog;
+  // Until /state arrives, the default Codex models are available from the markup.
+  return [...ui.authorModel.options].map((option) => ({ id: option.value,
+    label: option.textContent, provider: modelProvider(option.value) }));
+}
+
+function modelSourceChoices(catalog) {
+  const saved = state.workflow?.settings?.model_sources;
+  if (Array.isArray(saved)) return [...saved];
+  const sources = [{ id: "codex", label: "Codex CLI" }, { id: "claude", label: "Claude CLI" }];
+  for (const row of catalog.filter((item) => item.provider === "api")) {
+    const id = modelSourceId(row);
+    if (!sources.some((source) => source.id === id)) {
+      sources.push({ id, label: row.sourceLabel || row.label, provider: "api" });
+    }
+  }
+  return sources;
+}
+
+function modelSourceLabel(source, sources) {
+  if (source.provider !== "api" && !source.id.startsWith("api:")) return source.label;
+  const duplicate = sources.filter((item) => item.label === source.label).length > 1;
+  return `API key · ${source.label}${duplicate && source.keyHint ? ` · ${source.keyHint}` : ""}`;
+}
+
+function syncRoleModelMenu(role, sourceId, preferred = "") {
+  const select = ui[`${role}Model`], source = ui[`${role}Source`];
+  if (!source) return;
+  const catalog = roleModelCatalog(), sources = modelSourceChoices(catalog);
+  if (!sources.some((item) => item.id === sourceId)) {
+    if (preferred && preferred.startsWith("api:")) {
+      sources.push({ id: sourceId || preferred, label: "API connection · not configured" });
+      sourceId ||= preferred;
+    } else sourceId = "codex";
+  }
+  const sourceSignature = JSON.stringify(sources.map((item) => [item.id, modelSourceLabel(item, sources)]));
+  if (source.dataset.catalog !== sourceSignature) {
+    source.replaceChildren(...sources.map((item) => new Option(modelSourceLabel(item, sources), item.id)));
+    source.dataset.catalog = sourceSignature;
+  }
+  source.value = sourceId;
+  const rows = catalog.filter((row) => modelSourceId(row) === sourceId);
   const signature = JSON.stringify(rows.map((row) => [row.id, row.label]));
+  if (select.dataset.catalog !== signature) {
+    select.replaceChildren(...rows.map((row) => {
+      const option = new Option(row.label, row.id);
+      option.dataset.short = shortModelName(row.label);
+      return option;
+    }));
+    select.dataset.catalog = signature;
+  }
+  if (preferred && !rows.some((row) => row.id === preferred)) {
+    for (const option of [...select.options]) if (option.dataset.standIn) option.remove();
+    const option = new Option(`${preferred} (${preferred.startsWith("api:") ? "not configured" : "older"})`, preferred);
+    option.dataset.standIn = "1";
+    select.append(option);
+  }
+  if (!rows.length && !preferred) {
+    select.replaceChildren(new Option("No models loaded — refresh this API connection", ""));
+  }
+  select.disabled = !rows.length && !preferred;
+  select.value = preferred || rows[0]?.id || "";
+  ui[`${role}Effort`].disabled = !select.value;
+}
+
+// Each role first picks a source, then sees only that source's models. Refreshing
+// a catalog preserves valid choices; removed models fall back to the default.
+function syncModelMenus() {
+  if (!Array.isArray(state.workflow?.settings?.model_catalog)) return [];
+  const catalog = roleModelCatalog();
   const replaced = [], roles = ["review", "author", "critic", "writer"];
   for (const role of roles) {
     const select = ui[`${role}Model`];
-    // Unchanged (also before any API model exists): leave the menu and its focus alone.
-    if ((select.dataset?.apiModels || "[]") === signature) continue;
-    const value = select.value;
-    let group = select.querySelector('optgroup[data-provider="api"]');
-    if (!rows.length) group?.remove();
-    else {
-      if (!group) {
-        group = document.createElement("optgroup");
-        group.label = "API";
-        group.dataset.provider = "api";
-        // After the built-in groups, ahead of any stand-in option for a saved job's model.
-        const builtIn = select.querySelector('optgroup[data-provider="claude"]');
-        if (builtIn) builtIn.after(group);
-        else select.append(group);
-      }
-      group.replaceChildren(...rows.map((row) => {
-        const option = new Option(row.label, row.id);
-        option.dataset.short = shortModelName(row.label);
-        return option;
-      }));
-    }
-    // A stand-in that setChoice added for a model now configured again would duplicate it.
-    for (const option of [...select.options]) {
-      if (option.parentElement !== group && rows.some((row) => row.id === option.value)) option.remove();
-    }
-    select.dataset.apiModels = signature;
-    if ([...select.options].some((option) => option.value === value)) select.value = value;
-    else if (value.startsWith("api:")) {
-      select.value = "gpt-6.1-sol";
+    let value = select.value || "gpt-6.1-sol";
+    let row = catalog.find((item) => item.id === value);
+    if (!row && value.startsWith("api:")) {
+      value = "gpt-6.1-sol";
+      row = catalog.find((item) => item.id === value);
       replaced.push(role);
     }
+    syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(value), value);
   }
   return replaced;
 }
@@ -3644,7 +3387,6 @@ function proofJobSettings() {
     promptOverrides,
     criticRounds: Number(ui.criticRounds.value),
     thinkingHours: Number(ui.thinkingHours.value),
-    researchAudits: researchAuditValues(),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
     ...selectedRetrievalSettings(),
@@ -3895,6 +3637,12 @@ ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
 for (const role of ["review", "author", "critic", "writer"]) {
+  ui[`${role}Source`].onchange = () => {
+    syncRoleModelMenu(role, ui[`${role}Source`].value);
+    syncEffortChoices(role);
+    renderRetrievalSettings();
+    updateModelSummary();
+  };
   ui[`${role}Model`].onchange = () => {
     syncEffortChoices(role);
     renderRetrievalSettings(); // the provider chips and the web cutoff notice follow the model
@@ -3979,15 +3727,6 @@ ui.sendAuthorSteer.onclick = () => {
   }
   act("/steer-author", { instruction });
 };
-ui.applyResearchAudits.onclick = applyResearchAudits;
-ui.startResearchAudit.onclick = startResearchAudit;
-for (const input of [ui.liveResearchAuditInterval, ...ui.liveResearchAuditModels]) {
-  input.addEventListener("input", () => {
-    researchAuditDirty = true;
-    researchAuditFeedback = "";
-    renderResearchAudits(true);
-  });
-}
 ui.memoryPanel.addEventListener("toggle", () => {
   ++memoryRequest;
   clearTimeout(memoryTimer);
@@ -4077,47 +3816,27 @@ if (composerFooter && "ResizeObserver" in window) {
     "--composer-footer-h", `${Math.ceil(composerFooter.getBoundingClientRect().height)}px`)).observe(composerFooter);
 }
 
-// API models (Advanced settings → Model providers): endpoints configured on this computer.
-// They belong to the installation, not to a job, so these calls use plain paths (no job or
-// batch query, which the live gateway refuses) and stay out of the job request queue (a Test
-// may wait 30 s while polling goes on). A key travels only in a POST body: the server never
-// returns it, only a hint such as "…abcd", and nothing here logs it or puts it in a URL.
+// API models (Advanced settings → API connections): one saved key exposes its model catalog.
+// Keys travel only in POST bodies and are never returned by the controller.
 const apiUi = {
   group: $("apiModels"), heading: $("apiModelsHeading"), count: $("apiModelCount"),
   status: $("apiModelsStatus"), list: $("apiModelList"), empty: $("apiModelEmpty"),
   form: $("apiModelForm"), formHeading: $("apiModelFormHeading"), formatHelp: $("apiModelFormatHelp"),
   formats: [$("apiModelFormatOpenai"), $("apiModelFormatAnthropic")],
   baseUrl: $("apiModelBaseUrl"), requestSource: $("apiModelRequestSource"), key: $("apiModelKey"),
-  keyHelp: $("apiModelKeyHelp"), model: $("apiModelId"), label: $("apiModelName"),
-  modelHelp: $("apiModelOptionsHelp"), discover: $("apiModelLoadButton"),
-  result: $("apiModelTestResult"), cancel: $("apiModelCancelButton"),
-  test: $("apiModelTestButton"), save: $("apiModelSaveButton"),
+  keyHelp: $("apiModelKeyHelp"), label: $("apiModelName"), result: $("apiModelTestResult"),
+  cancel: $("apiModelCancelButton"), test: $("apiModelTestButton"), save: $("apiModelSaveButton"),
 };
-// Per format: the form's examples and which CLI runs the model with what limits
-// (`help` alternates text and code). The server chooses authentication automatically.
-// The Claude CLI adds /v1/messages to a base URL without its /v1, so either form works.
 const apiFormats = {
-  openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1",
-    key: "sk-…", help: ["Runs through the Codex CLI with the Responses API (",
-      "<base URL>/responses", "), always at standard speed."] },
-  anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com",
-    key: "sk-ant-…", help: ["Runs through the Claude CLI in bare mode (",
-      "<base URL>/v1/messages", "; a base URL ending in ", "/v1", " works too): no subagents, no web tools "
-      + "and no reasoning summaries."] },
+  openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1", key: "sk-…",
+    help: "Runs through the Codex CLI with the Responses API. Models load automatically when you save." },
+  anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com", key: "sk-ant-…",
+    help: "Runs through the Claude CLI in bare mode. Models load automatically when you save." },
 };
-const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic",
-  writer: "LaTeX writer" };
-let apiModels = [];
-let apiModelEditing = null; // the saved model the form edits; null while adding one
-let apiModelBusy = false;
-let apiModelsUnavailable = false; // an older server (or gateway) without the API model routes
-let apiModelsLoaded = false; // the list has been read once (the count says "Loading…" until then)
-// Edits to what a test checks (format, base URL, source, key, model). A test result on
-// screen ({head}) turns stale at the next such edit, so it never vouches for untested settings.
-let apiFormEdits = 0;
-let apiShownTest = null;
-let apiConnectionEdits = 0;
-let apiDiscoveredModels = [];
+const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic", writer: "LaTeX writer" };
+let apiModels = [], apiModelEditing = null, apiModelBusy = false;
+let apiModelsUnavailable = false, apiModelsLoaded = false;
+let apiFormEdits = 0, apiSaveEdits = 0, apiShownTest = null;
 
 async function apiModelRequest(path, body) {
   const options = { headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" };
@@ -4130,7 +3849,7 @@ async function apiModelRequest(path, body) {
   const data = await response.json().catch(() => ({}));
   if (response.status === 404) {
     apiModelsUnavailable = true;
-    throw new Error("This TCS Prover server cannot manage API models. Restart TCS Prover to update it.");
+    throw new Error("This TCS Prover server cannot manage API connections. Restart TCS Prover to update it.");
   }
   if (!response.ok) throw new Error(data.error || `The request failed (HTTP ${response.status}).`);
   return data;
@@ -4143,15 +3862,13 @@ function apiElement(tag, className = "", text = "") {
   return element;
 }
 
-// Every API model response carries the whole list and the role menus' catalog: refresh the
-// menus in place. Returns the roles whose removed model fell back to the default.
 function adoptApiModels(data) {
-  if (Array.isArray(data.models)) apiModels = data.models;
+  if (Array.isArray(data.connections || data.models)) apiModels = data.connections || data.models;
   let replaced = [];
   if (Array.isArray(data.model_catalog)) {
     const settings = state.workflow?.settings || {};
     state.workflow = { ...state.workflow, settings: { ...settings, model_catalog: data.model_catalog,
-      model_efforts: { ...settings.model_efforts, ...data.model_efforts } } };
+      model_sources: data.model_sources, model_efforts: data.model_efforts || {} } };
     replaced = syncModelMenus();
     for (const role of Object.keys(roleNames)) syncEffortChoices(role);
     renderRetrievalSettings();
@@ -4167,424 +3884,222 @@ async function loadApiModels() {
   try {
     adoptApiModels(await apiModelRequest("/api-models"));
     apiModelsLoaded = true;
-    if (apiUi.status.classList.contains("warning")) showApiStatus("");
+    showApiStatus("");
   } catch (error) {
     if (!apiModelsLoaded) apiUi.count.textContent = "Unavailable";
     showApiStatus(error.message, true);
-  } finally {
-    setApiBusy(false);
-  }
+  } finally { setApiBusy(false); }
 }
 
-// One API model request at a time: every manager button waits and the clicked one says why
-// (a row button's accessible name too: "Testing Lab Sol…"; the rebuilt row restores it).
 function setApiBusy(busy, button = null, label = "") {
   apiModelBusy = busy;
   apiUi.group.setAttribute("aria-busy", String(busy));
-  for (const control of [apiUi.discover, apiUi.test, apiUi.save, apiUi.cancel, ...apiUi.list.querySelectorAll("button")]) {
+  for (const control of [apiUi.test, apiUi.save, apiUi.cancel, ...apiUi.list.querySelectorAll("button")]) {
     control.disabled = busy || apiModelsUnavailable;
   }
-  apiUi.model.disabled = busy || apiModelsUnavailable || !apiDiscoveredModels.length;
-  if (button && label) {
-    button.textContent = label;
-    const model = apiModels.find((item) => item.id === button.dataset?.apiModel);
-    if (model) button.setAttribute("aria-label", `${label.replace(/…$/, "")} ${model.label}…`);
-  }
+  if (button && label) button.textContent = label;
 }
 
-// Disabling the button that started a request moves keyboard focus to the page. Once the
-// request is over, focus goes back to `target`, unless the user has moved on meanwhile.
-function apiFocusLost() {
-  return !document.activeElement || document.activeElement === document.body;
-}
-
-function restoreApiFocus(target) {
-  if (apiFocusLost()) target?.focus();
-}
-
-// Both result lines stay rendered while empty (CSS collapses them), so that a screen reader
-// already knows the live region when its first message arrives.
+function apiFocusLost() { return !document.activeElement || document.activeElement === document.body; }
+function restoreApiFocus(target) { if (apiFocusLost()) target?.focus(); }
 function showApiStatus(text, warning = false) {
   apiUi.status.className = `api-models-status${warning && text ? " warning" : ""}`;
   apiUi.status.textContent = text;
 }
-
-// tone: "ok" or "error" (a status glyph), "pending" or "stale" (a ring), or "" (plain text).
-// `text` is the outcome in brief (bold), `detail` the explanation or the provider's own words;
-// a message without a brief outcome (a missing field) is the detail alone.
 function showApiResult(tone, text, detail = "") {
   apiShownTest = null;
   apiUi.result.className = `api-test-result${tone ? ` ${tone}` : ""}`;
   apiUi.result.replaceChildren(...(text ? [apiElement("strong", "", text)] : []),
     ...(detail ? [apiElement("span", "api-test-detail", detail)] : []));
 }
-
-function clearApiResult() {
-  showApiResult("", "");
-}
-
-// "Connected · 412 ms"; "401 · <the provider's message>"; or the network error alone.
+function clearApiResult() { showApiResult("", ""); }
 function apiTestText(result) {
-  if (result.ok) {
-    return `Connected${Number.isFinite(result.latencyMs) ? ` · ${Math.round(result.latencyMs)} ms` : ""}`;
-  }
-  return result.status ? `${result.status} · ${result.message || "The endpoint refused the request."}`
-    : result.message || "No response.";
+  return result.ok ? `Connected${Number.isFinite(result.latencyMs) ? ` · ${Math.round(result.latencyMs)} ms` : ""}`
+    : `${result.status && result.status >= 300 ? `${result.status} · ` : ""}${result.message || "Connection failed."}`;
 }
-
-// The form's test result: the outcome in brief ("Connected · 412 ms", "Failed · 401" or
-// "Connection failed"), then the reply or the provider's message in plain text.
-function apiTestParts(result) {
-  if (result.ok) {
-    return [apiTestText(result), [result.message, result.model && `model ${result.model}`].filter(Boolean).join(" · ")];
-  }
-  return result.status ? [`Failed · ${result.status}`, result.message || "The endpoint refused the request."]
-    : ["Connection failed", result.message || "No response."];
-}
-
-// A test of settings that have changed since: say so instead of showing its outcome as current.
-function showStaleApiTest(head) {
-  showApiResult("stale", "Changed since the last test", `Last result: ${head}. Test again to check these settings.`);
-}
-
-function showApiTest(result, edits) {
-  const [head, detail] = apiTestParts(result);
-  if (edits !== apiFormEdits) return showStaleApiTest(head); // edited while the test ran
-  showApiResult(result.ok ? "ok" : "error", head, detail);
-  apiShownTest = { head };
-}
-
-// An edit to a tested setting; a save confirmation, an error or a running test stays as it is.
 function noteApiFormEdit() {
   apiFormEdits += 1;
-  if (apiShownTest) showStaleApiTest(apiShownTest.head);
+  apiSaveEdits += 1;
+  if (apiShownTest) showApiResult("stale", "Connection details changed", "Test this connection again.");
 }
-
-function setApiModelOptions(models, preferred = "") {
-  apiDiscoveredModels = models;
-  apiUi.model.replaceChildren(...(models.length
-    ? models.map((model) => new Option(model.label || model.id, model.id))
-    : [new Option("Load models from your connection", "")]));
-  apiUi.model.value = models.some((model) => model.id === preferred) ? preferred : models[0]?.id || "";
-  apiUi.model.disabled = apiModelBusy || apiModelsUnavailable || !models.length;
-  apiUi.modelHelp.textContent = models.length
-    ? "Choose a model available to this connection."
-    : "Enter the connection details, then load its available models.";
-}
-
-function noteApiConnectionEdit() {
-  apiConnectionEdits += 1;
-  noteApiFormEdit();
-  setApiModelOptions([]);
-}
-
 function apiTestTime(value) {
   const date = new Date(value);
   return Number.isFinite(date.getTime())
     ? date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
 }
 
-function renderApiModels(focus = null) {
-  const active = document.activeElement;
-  focus ||= active?.dataset?.apiAction
-    ? { id: active.dataset.apiModel, action: active.dataset.apiAction } : null;
+function renderApiModels() {
   apiUi.count.textContent = apiModels.length ? `${apiModels.length} saved` : "None saved";
   show(apiUi.list, apiModels.length > 0);
   show(apiUi.empty, apiModels.length === 0);
   apiUi.list.replaceChildren(...apiModels.map(apiModelRow));
   setApiBusy(apiModelBusy);
-  // Rows are rebuilt: give focus back to the same button of the same model.
-  if (focus) {
-    [...apiUi.list.querySelectorAll("button")].find((button) => button.dataset.apiModel === focus.id
-      && button.dataset.apiAction === focus.action)?.focus();
-  }
 }
-
-function apiModelRow(model) {
-  const item = apiElement("li", "api-model-row"), anthropic = model.format === "anthropic";
-  if (apiModelEditing?.id === model.id) item.classList.add("editing");
-  const glyph = apiElement("span", `api-model-glyph ${model.format}`, anthropic ? "AN" : "OA");
+function apiModelRow(connection) {
+  const item = apiElement("li", "api-model-row");
+  if (apiModelEditing?.id === connection.id) item.classList.add("editing");
+  const glyph = apiElement("span", `api-model-glyph ${connection.format}`, connection.format === "anthropic" ? "AN" : "OA");
   glyph.setAttribute("aria-hidden", "true");
-  const copy = apiElement("div", "api-model-copy"), test = model.lastTest;
-  // The endpoint (model id, host), then the key hint and when it was last tested.
-  const endpoint = apiElement("span", "api-model-meta"), record = apiElement("span", "api-model-meta");
-  endpoint.append(apiElement("code", "", model.model), apiElement("span", "", model.host));
-  record.append(apiElement("span", "", model.hasKey ? `key ${model.keyHint || "saved"}` : "no key saved"),
-    apiElement("span", "", test ? `tested ${apiTestTime(test.at)}` : "not tested yet"));
-  copy.append(apiElement("strong", "", model.label), endpoint, record);
-  const format = apiElement("span", `format-chip ${model.format}`, apiFormats[model.format]?.name || model.format);
+  const copy = apiElement("div", "api-model-copy");
+  const models = connection.models || [];
+  const meta = [connection.host, models.length ? `${models.length} model${models.length === 1 ? "" : "s"}` : "Load models to use this key",
+    connection.hasKey ? `key ${connection.keyHint || "saved"}` : "no key saved"];
+  copy.append(apiElement("strong", "", connection.label), apiElement("span", "api-model-meta", meta.join(" · ")));
+  const format = apiElement("span", `format-chip ${connection.format}`, apiFormats[connection.format]?.name || connection.format);
+  const test = connection.lastTest;
   const status = apiElement("span", `status-chip ${!test ? "idle" : test.ok ? "ok" : "error"}`,
-    !test ? "Not tested" : test.ok ? apiTestText(test) : `Failed${test.status ? ` · ${test.status}` : ""}`);
+    !test ? "Not tested" : test.ok ? "Connected" : "Connection failed");
   const actions = apiElement("div", "api-model-actions");
-  for (const [action, label] of [["edit", "Edit"], ["test", "Test"], ["remove", "Remove"]]) {
+  for (const [action, label] of [["edit", "Edit"], ["refresh", "Load models"], ["remove", "Remove"]]) {
     const button = apiElement("button", `ghost compact api-model-${action}`, label);
     button.type = "button";
     button.dataset.apiAction = action;
-    button.dataset.apiModel = model.id;
-    button.setAttribute("aria-label", `${label} ${model.label}`);
+    button.dataset.apiModel = connection.id;
+    button.setAttribute("aria-label", `${label} ${connection.label}`);
     actions.append(button);
   }
   item.append(glyph, copy, format, status, actions);
-  if (test && !test.ok) {
-    const failure = apiElement("p", "api-test-result error");
-    failure.append(apiElement("span", "", apiTestText(test)));
-    item.append(failure);
-  }
+  if (test && !test.ok) item.append(apiElement("p", "api-test-result error", apiTestText(test)));
   return item;
 }
 
-function selectedApiFormat() {
-  return apiUi.formats.find((input) => input.checked)?.value || "openai";
-}
-
-function chooseApiFormat(format) {
-  for (const input of apiUi.formats) input.checked = input.value === format;
-  renderApiForm();
-}
-
-// The server keeps a saved key for an empty field only while the destination it was saved for
-// (format and base URL) is unchanged; otherwise the form asks for the key again.
+function selectedApiFormat() { return apiUi.formats.find((input) => input.checked)?.value || "openai"; }
 function apiKeyRequired() {
-  if (!apiModelEditing) return true;
-  return selectedApiFormat() !== apiModelEditing.format
+  return !apiModelEditing || selectedApiFormat() !== apiModelEditing.format
     || apiUi.baseUrl.value.trim().replace(/\/+$/, "") !== apiModelEditing.baseUrl;
 }
-
 function renderApiForm() {
   const format = apiFormats[selectedApiFormat()], editing = apiModelEditing, required = apiKeyRequired();
-  apiUi.formHeading.textContent = editing ? `Edit ${editing.label}` : "Add an API model";
+  apiUi.formHeading.textContent = editing ? `Edit ${editing.label}` : "Add an API connection";
   apiUi.form.classList.toggle("editing", Boolean(editing));
   if (!apiModelBusy) {
-    apiUi.discover.textContent = "Load models";
     apiUi.test.textContent = "Test connection";
-    apiUi.save.textContent = editing ? "Save changes" : "Save model";
+    apiUi.save.textContent = editing ? "Save changes" : "Save connection";
   }
   show(apiUi.cancel, Boolean(editing));
-  apiUi.formatHelp.replaceChildren(...format.help.map((part, index) => index % 2 ? apiElement("code", "", part) : part));
+  apiUi.formatHelp.textContent = format.help;
   apiUi.baseUrl.placeholder = format.baseUrl;
   apiUi.key.required = required;
-  apiUi.key.placeholder = !editing ? format.key
-    : required ? "Enter the key again" : `Saved key ${editing.keyHint || ""}`.trim();
+  apiUi.key.placeholder = !editing ? format.key : required ? "Enter the key again" : `Saved key ${editing.keyHint || ""}`.trim();
   apiUi.keyHelp.textContent = !editing ? "Stored only on this computer and never shown again."
     : required ? "Enter the API key again: a saved key is sent only to the format and base URL it was saved with."
     : "Leave blank to keep the saved key; a new key replaces it.";
 }
-
 function resetApiForm() {
-  apiConnectionEdits += 1;
+  apiFormEdits += 1;
+  apiSaveEdits += 1;
   apiModelEditing = null;
   for (const field of [apiUi.baseUrl, apiUi.key, apiUi.requestSource, apiUi.label]) field.value = "";
-  setApiModelOptions([]);
   renderApiForm();
 }
-
-// The form's settings, or null after pointing at the first missing field.
-function apiFormValues(requireModel = true) {
-  const values = {
-    format: selectedApiFormat(), baseUrl: apiUi.baseUrl.value.trim(),
-    requestSource: apiUi.requestSource.value.trim(), apiKey: apiUi.key.value.trim(),
-    model: apiUi.model.value.trim(), label: apiUi.label.value.trim(),
-  };
+function apiFormValues() {
+  const values = { format: selectedApiFormat(), baseUrl: apiUi.baseUrl.value.trim(), apiKey: apiUi.key.value.trim(),
+    requestSource: apiUi.requestSource.value.trim(), label: apiUi.label.value.trim() };
   const missing = !values.baseUrl ? [apiUi.baseUrl, "Enter the base URL."]
-    : !values.apiKey && apiKeyRequired() ? [apiUi.key, apiModelEditing
-      ? "Enter the API key again: a saved key is sent only to the format and base URL it was saved with."
-      : "Enter the API key."]
-    : requireModel && !values.model ? [apiUi.discover, "Load the available models, then choose a model."] : null;
+    : !values.apiKey && apiKeyRequired() ? [apiUi.key, apiModelEditing ? "Enter the API key again for the new connection." : "Enter the API key."] : null;
   if (missing) {
-    showApiResult("error", "", missing[1]);
-    missing[0].focus();
-    return null;
+    showApiResult("error", "", missing[1]); missing[0].focus(); return null;
   }
   if (apiModelEditing) values.id = apiModelEditing.id;
   return values;
 }
 
-async function discoverApiModels() {
-  if (apiModelBusy) return;
-  const values = apiFormValues(false);
-  if (!values) return;
-  delete values.model;
-  delete values.label;
-  const connectionEdits = apiConnectionEdits, preferred = apiUi.model.value;
-  setApiBusy(true, apiUi.discover, "Loading models…");
-  showApiResult("pending", "Loading available models…", "Using this connection's API key.");
-  let result = null, failure = "";
-  try {
-    result = await apiModelRequest("/api-models/discover", values);
-  } catch (error) {
-    failure = error.message;
-  }
-  const stale = connectionEdits !== apiConnectionEdits;
-  if (!stale) setApiModelOptions(result?.ok && Array.isArray(result.models) ? result.models : [], preferred);
-  setApiBusy(false);
-  renderApiForm();
-  restoreApiFocus(apiUi.discover);
-  if (stale) {
-    showApiResult("stale", "Connection details changed", "Load models again for the current connection.");
-  } else if (result?.ok && apiDiscoveredModels.length) {
-    showApiResult("ok", `Loaded ${apiDiscoveredModels.length} model${apiDiscoveredModels.length === 1 ? "" : "s"}.`,
-      "Choose a model, then test or save it.");
-  } else if (result && !result.ok) {
-    if (result.status >= 200 && result.status < 300) {
-      showApiResult("error", "No models loaded", result.message || "This connection returned no available models.");
-    } else showApiResult("error", ...apiTestParts(result));
-  } else {
-    showApiResult("error", "No models loaded", failure || "This connection returned no available models.");
-  }
-}
-
-function replaceApiModel(model) {
-  apiModels = apiModels.map((item) => item.id === model.id ? model : item);
-}
-
-// Each request below ends in the same order: ready again (aria-busy cleared, buttons enabled),
-// focus restored, and only then the outcome written, so that a screen reader announces it.
-
-// Test the form as it is, saved or not; with an edited model's id an empty key uses the saved key.
 async function testApiForm() {
   if (apiModelBusy) return;
   const values = apiFormValues();
   if (!values) return;
   const edits = apiFormEdits;
   setApiBusy(true, apiUi.test, "Testing…");
-  showApiResult("pending", "Sending one short request…", "The test waits at most 30 seconds.");
-  let result = null, failure = "";
+  showApiResult("pending", "Checking connection…", "Loading the models available to this key.");
+  let result, failure = "";
   try {
     result = await apiModelRequest("/api-models/test", values);
-    if (result.apiModel) replaceApiModel(result.apiModel);
-  } catch (error) {
-    failure = error.message;
+    if (result.connection) apiModels = apiModels.map((item) => item.id === result.connection.id ? result.connection : item);
   }
-  setApiBusy(false);
-  renderApiForm();
-  renderApiModels();
-  restoreApiFocus(apiUi.test);
-  if (result) showApiTest(result, edits);
-  else showApiResult("error", "Not tested", failure);
+  catch (error) { failure = error.message; }
+  setApiBusy(false); renderApiForm(); renderApiModels(); restoreApiFocus(apiUi.test);
+  if (edits !== apiFormEdits) return showApiResult("stale", "Connection details changed", "Test this connection again.");
+  showApiResult(result?.ok ? "ok" : "error", result ? apiTestText(result) : "Connection failed",
+    result?.ok ? result.message : failure);
+  apiShownTest = { ok: result?.ok };
 }
-
 async function saveApiModel() {
   if (apiModelBusy) return;
   const values = apiFormValues();
   if (!values) return;
-  const editing = Boolean(apiModelEditing);
-  setApiBusy(true, apiUi.save, "Saving…");
-  let saved = null, failure = "";
+  const editing = Boolean(apiModelEditing), edits = apiSaveEdits;
+  setApiBusy(true, apiUi.save, "Loading models and saving…");
+  showApiResult("pending", "Loading models and saving…");
+  let saved, failure = "";
   try {
     const data = await apiModelRequest("/api-models", values);
-    resetApiForm(); // also clears the key field: a saved key is never shown again
+    saved = data.connection || data.model;
+    if (edits === apiSaveEdits) resetApiForm();
     adoptApiModels(data);
-    saved = data.model;
-  } catch (error) {
-    failure = error.message;
-  }
-  setApiBusy(false);
-  renderApiForm();
-  // The Save button stays where the user is (the result is beside it), also once the form is reset.
-  restoreApiFocus(apiUi.save);
-  if (saved) {
-    showApiResult("ok", editing ? `Saved changes to ${saved.label}.` : `Saved ${saved.label}.`,
-      "It is offered in every role menu under API.");
-  } else showApiResult("error", "Not saved", failure);
+  } catch (error) { failure = error.message; }
+  setApiBusy(false); renderApiForm(); restoreApiFocus(apiUi.save);
+  showApiResult(saved ? "ok" : "error", saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
+    saved ? "Choose this key under Source in any role, then choose a model." : failure);
 }
-
-async function testSavedApiModel(model, button) {
+async function refreshApiConnection(connection, button) {
   if (apiModelBusy) return;
-  setApiBusy(true, button, "Testing…");
+  setApiBusy(true, button, "Loading…");
   let message = "", warning = false;
   try {
-    const result = await apiModelRequest("/api-models/test", { id: model.id });
-    replaceApiModel(result.apiModel || { ...model, lastTest: { ok: result.ok, at: result.testedAt,
-      status: result.status, message: result.message, latencyMs: result.latencyMs } });
-    message = `${model.label}: ${apiTestText(result)}`;
-  } catch (error) {
-    message = `${model.label}: ${error.message}`;
-    warning = true;
-  }
-  setApiBusy(false);
-  // The row is rebuilt with the result: focus returns to its Test button.
-  renderApiModels(apiFocusLost() ? { id: model.id, action: "test" } : null);
+    const result = await apiModelRequest("/api-models/discover", { id: connection.id });
+    const replaced = result.model_catalog || result.connections ? adoptApiModels(result) : [];
+    warning = !result.ok;
+    message = `${connection.label}: ${result.message || apiTestText(result)}`;
+    if (replaced.length) message += ` ${replaced.map((role) => roleNames[role]).join(", ")} now use the default model because their selected model is no longer available.`;
+  } catch (error) { message = error.message; warning = true; }
+  setApiBusy(false); renderApiModels();
+  if (apiFocusLost()) [...apiUi.list.querySelectorAll("button")].find((item) => item.dataset.apiModel === connection.id
+    && item.dataset.apiAction === "refresh")?.focus();
   showApiStatus(message, warning);
 }
-
-async function removeApiModel(model, button) {
-  if (apiModelBusy) return;
-  const question = `Remove ${model.label}?\n\nIts saved key is deleted from this computer. Jobs that `
-    + "wait to start or resume with it cannot continue until you add it again with the same format, "
-    + "base URL and selected model.";
-  if (!confirm(question)) return;
+async function removeApiModel(connection, button) {
+  if (apiModelBusy || !confirm(`Remove ${connection.label}?\n\nIts saved key and model choices will be removed. Jobs using this connection will need it restored to continue.`)) return;
   setApiBusy(true, button, "Removing…");
-  let message = "", warning = false, removed = false;
+  let removed = false, message = "", warning = false;
   try {
-    const data = await apiModelRequest("/api-models/delete", { id: model.id });
-    if (apiModelEditing?.id === model.id) resetApiForm();
-    const replaced = adoptApiModels(data).map((role) => roleNames[role]);
-    const listed = replaced.length > 1 ? `${replaced.slice(0, -1).join(", ")} and ${replaced.at(-1)}` : replaced[0];
-    message = [`Removed ${model.label}.`, data.warning,
-      listed ? `The ${listed} now ${replaced.length > 1 ? "use" : "uses"} GPT 6.1 Sol.` : ""].filter(Boolean).join(" ");
-    removed = true;
-  } catch (error) {
-    message = error.message;
-    warning = true;
-  }
-  setApiBusy(false);
-  // A refusal keeps the row: focus returns to its Remove button. A removed row is gone, so the
-  // list heading takes focus.
-  renderApiModels(!removed && apiFocusLost() ? { id: model.id, action: "remove" } : null);
+    const data = await apiModelRequest("/api-models/delete", { id: connection.id });
+    if (apiModelEditing?.id === connection.id) resetApiForm();
+    const replaced = adoptApiModels(data); removed = true;
+    message = [`Removed ${connection.label}.`, data.warning].filter(Boolean).join(" ");
+    if (replaced.length) message += ` ${replaced.map((role) => roleNames[role]).join(", ")} now use the default model.`;
+    warning = Boolean(data.warning);
+  } catch (error) { message = error.message; warning = true; }
+  setApiBusy(false); renderApiForm(); renderApiModels();
   if (removed) apiUi.heading.focus();
   showApiStatus(message, warning);
 }
-
-function editApiModel(model) {
-  apiConnectionEdits += 1;
-  apiModelEditing = model;
-  for (const input of apiUi.formats) input.checked = input.value === model.format;
-  apiUi.baseUrl.value = model.baseUrl;
-  apiUi.requestSource.value = model.requestSource || "";
+function editApiModel(connection) {
+  apiFormEdits += 1;
+  apiSaveEdits += 1;
+  apiModelEditing = connection;
+  for (const input of apiUi.formats) input.checked = input.value === connection.format;
+  apiUi.baseUrl.value = connection.baseUrl;
   apiUi.key.value = "";
-  setApiModelOptions([{ id: model.model, label: model.model }], model.model);
-  apiUi.modelHelp.textContent = "Saved model. Load models to refresh the available choices.";
-  // A default display name ("model · host") is left empty so that it follows the settings.
-  apiUi.label.value = model.label === `${model.model} · ${model.host}` ? "" : model.label;
-  clearApiResult();
-  renderApiForm();
-  renderApiModels();
-  apiUi.baseUrl.focus();
+  apiUi.requestSource.value = connection.requestSource || "";
+  apiUi.label.value = connection.label === connection.host ? "" : connection.label;
+  clearApiResult(); renderApiForm(); renderApiModels(); apiUi.baseUrl.focus();
 }
-
-for (const input of apiUi.formats) {
-  input.onchange = () => {
-    noteApiConnectionEdit();
-    chooseApiFormat(input.value);
-  };
-}
-apiUi.baseUrl.oninput = () => {
-  noteApiConnectionEdit();
-  renderApiForm();
-};
-apiUi.key.oninput = noteApiConnectionEdit;
-apiUi.requestSource.oninput = noteApiConnectionEdit;
-apiUi.model.onchange = apiUi.model.oninput = noteApiFormEdit; // the display name is not tested
-apiUi.discover.onclick = discoverApiModels;
+for (const input of apiUi.formats) input.onchange = () => { noteApiFormEdit(); renderApiForm(); };
+apiUi.baseUrl.oninput = () => { noteApiFormEdit(); renderApiForm(); };
+apiUi.key.oninput = apiUi.requestSource.oninput = noteApiFormEdit;
+apiUi.label.oninput = () => { apiSaveEdits += 1; };
 apiUi.test.onclick = testApiForm;
 apiUi.save.onclick = saveApiModel;
-apiUi.cancel.onclick = () => {
-  resetApiForm();
-  clearApiResult();
-  renderApiModels();
-  apiUi.baseUrl.focus();
-};
+apiUi.cancel.onclick = () => { resetApiForm(); clearApiResult(); renderApiModels(); apiUi.baseUrl.focus(); };
 apiUi.list.onclick = (event) => {
   const button = event.target.closest("button[data-api-action]");
-  const model = apiModels.find((item) => item.id === button?.dataset.apiModel);
-  if (!model || button.disabled) return;
-  ({ edit: editApiModel, test: testSavedApiModel, remove: removeApiModel })[button.dataset.apiAction](model, button);
+  const connection = apiModels.find((item) => item.id === button?.dataset.apiModel);
+  if (!connection || button.disabled) return;
+  ({ edit: editApiModel, refresh: refreshApiConnection, remove: removeApiModel })[button.dataset.apiAction](connection, button);
 };
-// The list is read when Advanced settings opens, so it is current whenever it is on screen.
 ui.input.querySelector("details.advanced")?.addEventListener("toggle", (event) => {
   if (event.target.open) loadApiModels();
 });
-setApiModelOptions([]);
 renderApiForm();
 
 // Appearance: the dark theme or the light one (the mode: Light, Dark, or System, which follows
@@ -5066,10 +4581,10 @@ renderApiForm();
 
   function renderModelsMeta() {
     if (route() !== "models") return;
-    const groups = [...ui.authorModel.querySelectorAll("optgroup")];
-    const size = (provider) => groups.find((group) => group.dataset.provider === provider)?.children.length || 0;
+    const catalog = roleModelCatalog();
+    const size = (provider) => catalog.filter((model) => model.provider === provider).length;
     const parts = [`${size("codex")} Codex CLI`, `${size("claude")} Claude CLI`,
-      apiModelsLoaded ? `${apiModels.length} API ${apiModels.length === 1 ? "model" : "models"}` : "API models"];
+      apiModelsLoaded ? `${apiModels.length} API ${apiModels.length === 1 ? "key" : "keys"}` : "API keys"];
     const text = parts.join(" · ");
     setText(shell.modelsMeta, text);
   }

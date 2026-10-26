@@ -1105,8 +1105,6 @@ def preflight(policy, role, executable, inherited):
     """Return the isolated child env only after real host enforcement passes."""
     if policy is None:
         return inherited
-    if role == "auditor":
-        raise RetrievalPolicyError("Optional research audits are disabled for historical runs.")
     adapter = policy["isolation"]["adapter"]
     if adapter == WINDOWS_ADAPTER and os.name != "nt":
         raise RetrievalPolicyError("Historical isolation adapter requires Windows MXC; no fallback is allowed.")

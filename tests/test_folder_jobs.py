@@ -100,13 +100,6 @@ class FolderBatchTests(unittest.TestCase):
         restored = server.restore_saved_app(server.App(started[0].trace_file, self.runs))
         self.assertEqual(restored.state["sourceFile"], "a.md")
 
-    def test_independent_research_audits_apply_to_every_job(self):
-        started = self.manager.start_direct_batch({
-            "statements": self.statements("a.md", "b.md"),
-            "researchAudits": {"models": ["gpt-6-astra", "none", "none"], "intervalHours": 1},
-        })
-        for app in started:
-            self.assertEqual(app.state["researchAudits"]["models"][0], "gpt-6-astra")
 
     def test_everything_is_validated_before_any_job_starts(self):
         good = self.statements("a.md", "b.md")
@@ -129,8 +122,6 @@ class FolderBatchTests(unittest.TestCase):
             ({"statements": good, "criticRounds": 0}, "round"),
             ({"statements": good, "thinkingHours": -1}, "hours"),
             ({"statements": good, "speedMode": "warp"}, "speed"),
-            ({"statements": good,
-              "researchAudits": {"models": ["bogus"]}}, ""),
             ({"statements": good, "promptOverrides": {"author": "No marker."}}, "STATEMENT"),
             ({"statements": good, "promptOverrides": {"bogus": "x"}}, "Prompt overrides"),
         )
@@ -251,7 +242,6 @@ const ui = new Proxy({}, {get(target, name) {
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
 const clearTimeout = () => {};
-const researchAuditValues = () => ({intervalHours: 2, models: ['gpt-6-astra', 'none', 'none']});
 let questions = [], answer = true, sent = [], failure = null, rendered = null, polled = 0;
 const confirm = question => { questions.push(question); return answer; };
 const request = async (path, body) => {
@@ -302,7 +292,6 @@ const checks = `
     authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
     promptOverrides: {critic: 'Shared critic.'},
     criticRounds: 2, thinkingHours: 168,
-    researchAudits: {intervalHours: 2, models: ['gpt-6-astra', 'none', 'none']},
     speedMode: 'fast', reasoningSummary: 'concise',
     retrievalMode: 'live', retrievalCutoffUtc: '',
   });

@@ -434,7 +434,7 @@ def main():
             default=model_defaults[role],
             help=(
                 f"{role} model: {', '.join(OFFERED_MODELS)}, or an api:<id> "
-                "model from Advanced settings → API models "
+                "model from Advanced settings → API connections "
                 f"(default: {model_defaults[role]}); the older GPT-5.6 ids "
                 "are still accepted"
             ),

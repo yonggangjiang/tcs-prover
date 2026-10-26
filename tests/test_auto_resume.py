@@ -131,17 +131,14 @@ class AutoResumeTests(unittest.TestCase):
         restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
         self.assertEqual(restored.state["autoResumeAt"], first + 2 * WAIT)
 
-    def test_manual_and_audit_pauses_never_retry(self):
-        # An error that reaches a user's pause keeps it the user's; the author's
-        # acknowledgement of an audit pause carries no reason. An error during an
-        # audit pause is an error pause (tests/test_critical_interrupt_fixes.py).
-        for audit, reason in ((False, "Connection dropped while pausing"), (True, "")):
-            with self.subTest(audit=audit):
+    def test_manual_pauses_never_retry(self):
+        for reason in ("Connection dropped while pausing", ""):
+            with self.subTest(reason=reason):
                 self.app.state.update(phase="running", stage="solve", activeNode="author")
                 self.app.active_token = self.app.worker_token = self.token
-                self.app.pause(_for_audit=audit)
+                self.app.pause()
                 self.fail(reason=reason)
-                self.assertEqual(self.checkpoint()["pauseCause"], "audit" if audit else "user")
+                self.assertEqual(self.checkpoint()["pauseCause"], "user")
                 retry = Mock()
                 self.assertFalse(self.app.auto_resume_if_due(retry, now=10_000))
                 retry.assert_not_called()

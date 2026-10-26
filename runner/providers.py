@@ -11,6 +11,7 @@ api_model_secret(); every other view is safe to send to the browser or to log.
 """
 
 from datetime import datetime, timezone
+import hashlib
 import ipaddress
 import json
 import os
@@ -73,7 +74,7 @@ MAX_TEST_MESSAGE_CHARS = 300
 ROOT = Path(__file__).resolve().parents[1]
 STORE_ENV = "TCS_PROVER_API_MODELS"
 DEFAULT_STORE = ROOT / ".tcs-prover" / "api-models.json"
-STORE_VERSION = 1
+STORE_VERSION = 2
 # Private folders beside the store: atomic-write staging, the Codex homes of
 # OpenAI-format API models, and the Claude --settings files that carry a key.
 STORE_STAGING = ".api-models-staging"
@@ -332,6 +333,11 @@ def _stored(entry):
         raise ProviderError("Invalid API model entry.")
     result = _validated(entry, require_key=False)
     result["id"] = entry["id"]
+    # Version-one entries represented one model per key. Preserve their exact
+    # selected id while exposing that key as an independent connection source.
+    result["legacyModelId"] = entry.get("legacyModelId", True) is not False
+    result["availableModels"] = _available_models(entry.get("availableModels", [
+        {"id": result["model"], "label": result["model"]}]))
     for field in ("createdAt", "updatedAt"):
         result[field] = entry.get(field) if isinstance(entry.get(field), str) else ""
     test = entry.get("lastTest")
@@ -341,6 +347,43 @@ def _stored(entry):
     # scheme; it cannot vouch for the automatic one used after migration.
     result["lastTest"] = _last_test(test) if same_auth and isinstance(test, dict) else None
     return result
+
+
+def _available_models(values):
+    """Validate a provider's model choices before they enter the private store."""
+
+    if not isinstance(values, list) or not values or len(values) > 5000:
+        raise ProviderError("The API key must provide at least one available model (at most 5000).")
+    models = {}
+    for item in values:
+        if not isinstance(item, dict):
+            raise ProviderError("The available API models must contain model IDs.")
+        identity = _model_name(item.get("id"))
+        label = _clean_text(item.get("label", identity), "model label", MAX_LABEL_CHARS, required=False) or identity
+        models.setdefault(identity, {"id": identity, "label": label})
+    return list(models.values())
+
+
+def api_model_id(connection_id, wire_model):
+    """Stable role-selection id for one wire model under a saved API key."""
+
+    digest = hashlib.sha256((connection_id + "\0" + wire_model).encode("utf-8")).hexdigest()[:16]
+    return API_ID_PREFIX + connection_id[len(API_ID_PREFIX):][:40] + "--m-" + digest
+
+
+def _connection_models(entry):
+    return [{**row, "modelId": entry["id"] if entry.get("legacyModelId", True) and row["id"] == entry["model"]
+             else api_model_id(entry["id"], row["id"])} for row in entry["availableModels"]]
+
+
+def _resolve_api_model(entries, model_id):
+    for entry in entries:
+        if entry.get("legacyModelId", True) and entry["id"] == model_id:
+            return {**entry, "sourceId": entry["id"], "id": model_id}
+        for row in _connection_models(entry):
+            if row["modelId"] == model_id:
+                return {**entry, "sourceId": entry["id"], "id": model_id, "model": row["id"]}
+    return None
 
 
 def _last_test(value):
@@ -445,7 +488,14 @@ def public_api_model(entry):
         "keyHint": ("…" + key[-4:]) if len(key) >= 12 else ("…" if key else ""),
         "lastTest": entry.get("lastTest"), "createdAt": entry.get("createdAt", ""),
         "updatedAt": entry.get("updatedAt", ""),
+        "sourceId": entry.get("sourceId", entry["id"]), "sourceLabel": entry["label"],
     }
+
+
+def public_api_connection(entry):
+    """A saved API key's source and discovered model choices, never its secret."""
+
+    return {**public_api_model(entry), "models": _connection_models(entry)}
 
 
 def load_api_models():
@@ -455,13 +505,24 @@ def load_api_models():
         return [public_api_model(entry) for entry in _read_store()]
 
 
+def load_api_connections():
+    with _STORE_LOCK:
+        return [public_api_connection(entry) for entry in _read_store()]
+
+
+def api_connection(connection_id):
+    with _STORE_LOCK:
+        entry = next((entry for entry in _read_store() if entry["id"] == connection_id), None)
+    return public_api_connection(entry) if entry else None
+
+
 def api_model(model_id):
     """One configured API model without its key, or None."""
 
     if not is_api_id(model_id):
         return None
     with _STORE_LOCK:
-        entry = next((entry for entry in _read_store() if entry["id"] == model_id), None)
+        entry = _resolve_api_model(_read_store(), model_id)
     return public_api_model(entry) if entry else None
 
 
@@ -471,7 +532,7 @@ def api_model_secret(model_id):
     if not is_api_id(model_id):
         return ""
     with _STORE_LOCK:
-        entry = next((entry for entry in _read_store() if entry["id"] == model_id), None)
+        entry = _resolve_api_model(_read_store(), model_id)
     return entry.get("apiKey", "") if entry else ""
 
 
@@ -492,6 +553,7 @@ def save_api_model(values, reserved=()):
         entries = _read_store(strict=True)
         existing = next((entry for entry in entries if requested and entry["id"] == requested), None)
         entry = _validated(values, existing)
+        entry.update(legacyModelId=True, availableModels=[{"id": entry["model"], "label": entry["model"]}])
         now = _now()
         if existing:
             changed = any(existing[key] != entry[key]
@@ -503,6 +565,7 @@ def save_api_model(values, reserved=()):
             identity = requested
             if not identity:
                 taken = {item["id"] for item in entries} | set(reserved)
+                taken.update(row["modelId"] for item in entries for row in _connection_models(item))
                 base = new_api_id(values.get("label"), entry["model"])
                 identity, number = base, 2
                 while identity in taken:
@@ -511,6 +574,64 @@ def save_api_model(values, reserved=()):
             entries.append(entry)
         _write_store(entries)
         return public_api_model(entry)
+
+
+def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=None, expected=None):
+    """Save one API key and its catalog without asking the user to select a model."""
+
+    if not isinstance(values, dict):
+        raise ProviderError("API connection settings must be an object.")
+    requested = values.get("id") or None
+    if requested and not is_api_id(requested):
+        raise ProviderError("Choose a saved API connection to edit.")
+    choices = _available_models(discovered_models)
+    legacy_model = _model_name(legacy_model) if legacy_model is not None else None
+    with _STORE_LOCK:
+        entries = _read_store(strict=True)
+        existing = next((entry for entry in entries if entry["id"] == requested), None)
+        if expected is not None and (existing is None or any(
+                existing.get(key) != expected.get(key)
+                for key in ("format", "baseUrl", "requestSource", "apiKey", "label", "updatedAt"))):
+            raise ProviderError("The API connection changed while loading models. Save it again with the current settings.")
+        connection = _validated_connection(values, existing)
+        label = _clean_text(values.get("label", (existing or {}).get("label")), "label", MAX_LABEL_CHARS,
+                            required=False) or (urlsplit(connection["baseUrl"]).hostname or "API key")
+        now = _now()
+        if existing:
+            identity = existing["id"]
+        else:
+            taken = {entry["id"] for entry in entries} | set(reserved)
+            taken.update(row["modelId"] for entry in entries for row in _connection_models(entry))
+            base = requested or API_ID_PREFIX + _slug(label)
+            identity, number = base, 2
+            while identity in taken:
+                if requested:
+                    raise ProviderError("That API connection id is already in use.")
+                identity, number = f"{base}-{number}", number + 1
+        entry = {**connection, "id": identity, "label": label, "availableModels": choices,
+                 "legacyModelId": existing.get("legacyModelId", True) if existing else legacy_model is not None,
+                 "model": existing["model"] if existing else legacy_model or choices[0]["id"],
+                 "createdAt": (existing or {}).get("createdAt") or now, "updatedAt": now,
+                 "lastTest": None}
+        entries = [entry if row["id"] == identity else row for row in entries] if existing else [*entries, entry]
+        _write_store(entries)
+        return public_api_connection(entry)
+
+
+def refresh_api_connection(connection_id, expected, discovered_models):
+    """Publish a fetched catalog only if its saved connection remained unchanged."""
+
+    choices = _available_models(discovered_models)
+    with _STORE_LOCK:
+        entries = _read_store(strict=True)
+        entry = next((entry for entry in entries if entry["id"] == connection_id), None)
+        fields = ("format", "baseUrl", "requestSource", "apiKey")
+        if entry is None or any(entry[key] != expected[key] for key in fields):
+            raise ProviderError("The API connection changed while loading models. Load its models again.")
+        entry["availableModels"] = choices
+        entry["updatedAt"] = _now()
+        _write_store(entries)
+        return public_api_connection(entry)
 
 
 def new_api_id(label, model):
@@ -531,7 +652,7 @@ def validated_api_model(values, model_id=None):
     if model_id not in (None, "") and not is_api_id(model_id):
         raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
     with _STORE_LOCK:
-        saved = next((entry for entry in _read_store() if model_id and entry["id"] == model_id), None)
+        saved = _resolve_api_model(_read_store(), model_id) if model_id else None
     return _validated(values, saved), saved
 
 
@@ -570,7 +691,8 @@ def record_api_model_test(model_id, result):
         raise ProviderError("A test result must be an object.")
     with _STORE_LOCK:
         entries = _read_store(strict=True)
-        entry = next((entry for entry in entries if entry["id"] == model_id), None)
+        resolved = _resolve_api_model(entries, model_id)
+        entry = next((entry for entry in entries if entry["id"] == (resolved or {}).get("sourceId", model_id)), None)
         if entry is None:
             raise ProviderError("Unknown API model.")
         entry["lastTest"] = _last_test({**result, "at": result.get("at") or _now()})
@@ -583,13 +705,16 @@ def _builtin_row(row):
         "id": row["id"], "label": row["label"], "provider": row["provider"],
         "providerLabel": PROVIDER_LABELS[row["provider"]], "efforts": list(row["efforts"]),
         "defaultEffort": DEFAULT_EFFORT, "supportsFast": row["provider"] == CODEX,
+        "sourceId": row["provider"], "sourceLabel": PROVIDER_LABELS[row["provider"]],
         **({"legacy": True} if row["id"] in LEGACY_CODEX_MODELS else {}),
     }
 
 
-def _api_row(model):
+def _api_row(model, choice=None):
+    choice = choice or {"id": model["model"], "label": model["model"], "modelId": model["id"]}
     return {
-        "id": model["id"], "label": model["label"], "provider": API, "providerLabel": PROVIDER_LABELS[API],
+        "id": choice["modelId"], "label": choice["label"], "provider": API, "providerLabel": PROVIDER_LABELS[API],
+        "sourceId": model.get("sourceId", model["id"]), "sourceLabel": model["label"], "wireModel": choice["id"],
         "efforts": list(API_EFFORTS[model["format"]]), "defaultEffort": DEFAULT_EFFORT,
         "supportsFast": False, "format": model["format"], "host": model["host"], "hasKey": model["hasKey"],
     }
@@ -601,7 +726,25 @@ def catalog(include_legacy=False):
     rows = [_builtin_row(row) for row in BUILTIN_MODELS]
     if include_legacy:
         rows += [_builtin_row(row) for row in _LEGACY_MODELS]
-    return rows + [_api_row(model) for model in load_api_models()]
+    with _STORE_LOCK:
+        entries = _read_store()
+    for entry in entries:
+        model = public_api_model(entry)
+        choices = _connection_models(entry)
+        rows += [_api_row(model, choice) for choice in choices]
+        if include_legacy and entry.get("legacyModelId") and not any(choice["modelId"] == entry["id"] for choice in choices):
+            rows.append({**_api_row(model), "legacy": True})
+    return rows
+
+
+def source_catalog():
+    """Every selectable CLI or saved API-key source, without credentials."""
+
+    return [{"id": CODEX, "label": PROVIDER_LABELS[CODEX], "provider": CODEX},
+            {"id": CLAUDE, "label": PROVIDER_LABELS[CLAUDE], "provider": CLAUDE},
+            *[{"id": entry["id"], "label": entry["label"], "provider": API,
+               "format": entry["format"], "host": entry["host"], "hasKey": entry["hasKey"], "keyHint": entry["keyHint"]}
+              for entry in load_api_connections()]]
 
 
 def lookup(model_id):
@@ -609,8 +752,15 @@ def lookup(model_id):
 
     if isinstance(model_id, str) and model_id in _BUILTIN:
         return _builtin_row(_BUILTIN[model_id])
-    model = api_model(model_id)
-    return _api_row(model) if model else None
+    if not is_api_id(model_id):
+        return None
+    with _STORE_LOCK:
+        entry = _resolve_api_model(_read_store(), model_id)
+    if entry is None:
+        return None
+    choice = next((row for row in entry["availableModels"] if row["id"] == entry["model"]),
+                  {"id": entry["model"], "label": entry["model"]})
+    return _api_row(public_api_model(entry), {**choice, "modelId": model_id})
 
 
 def is_known(model_id):

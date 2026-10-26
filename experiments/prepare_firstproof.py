@@ -18,7 +18,7 @@ HOLD = 'Prepared for user launch on MacBook; compatible isolation and compiler a
 SETTING_KEYS = (
     'reviewModel', 'authorModel', 'criticModel', 'writerModel', 'reasoningEffort',
     'reviewEffort', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds',
-    'thinkingHours', 'speedMode', 'reasoningSummary', 'researchAudits',
+    'thinkingHours', 'speedMode', 'reasoningSummary',
     'problemMode', 'skipStatementReview', 'statementReviewOnly',
     'preparedRun', 'sourceFile', 'goalThreadId', 'goalWorkspace', 'goalResume',
     'launchHold', 'retrievalPolicyPath',

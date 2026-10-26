@@ -419,7 +419,6 @@ const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};
-const renderResearchAudits = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 const jobPath = path => path + '?job=same-job', sessionToken = 'secret';
 let clicked = '', requested = '', download = '';
@@ -475,7 +474,7 @@ const checks = `
   render({...running, readOnly: true, traceTruncated: true, traceNotice: 'Showing the most recent saved events.',
     canDownloadTex: true, canDownloadPdf: true});
   for (const name of ['pause', 'stop', 'resume', 'authorSteerControl', 'authorTimeLimitControl',
-    'researchAuditsControl', 'researchAuditToolbar', 'approve', 'recheck']) assert(ui[name].hidden);
+    'approve', 'recheck']) assert(ui[name].hidden);
   assert.equal(ui.downloadTex.hidden, false);
   assert.equal(ui.downloadPdf.hidden, false);
   assert.equal(ui.traceNotice.hidden, false);

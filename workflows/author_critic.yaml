@@ -79,7 +79,6 @@ prompts:
     exact assumptions and requested conclusion.
   resume: |-
     Continue trying to prove the statement below, using any previous work in this conversation.
-    If independent reports are present in AUDITS/, consider their advice before continuing.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}

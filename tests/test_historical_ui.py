@@ -28,7 +28,6 @@ class Element {
   focus() { this.focused = true; }
 }
 const elements = {}, ui = new Proxy(elements, {get:(target,key) => target[key] ||= new Element()});
-ui.researchAuditModels = [new Element(),new Element(),new Element()];
 ui.retrievalMode.value = 'live'; ui.skipStatementReview.checked = true;
 for (const role of ['author','critic','writer']) ui[role+'Model'].value = 'gpt-6.1-sol';
 const state = {phase:'running',stage:'solve',activeNode:'author',problemMode:'statement',
@@ -37,21 +36,19 @@ const state = {phase:'running',stage:'solve',activeNode:'author',problemMode:'st
   workflow:{nodes:{author:{label:'Proof author'}}},
   retrievalCapabilities:{historicalAvailable:true},
   retrieval:{mode:'disabled',fixed:false,available:true}};
-let mode = 'statement', auditModels = ['none','none','none'];
+let mode = 'statement';
 const sent = [];
 const context = {ui,state,assert,Date,Number,sent,document:{createElement:tag=>new Element(tag)},
   show:(element,visible)=>element.hidden=!visible,selectedProblemMode:()=>mode,
-  researchAuditValues:()=>({models:auditModels}),
   promptOverrides:{},stateReceivedAt:Date.now(),describe:()=>null,clockText:()=>'',
   timer:null,jobsTimer:null,clearTimeout:()=>{},promptValues:{final:'Writer prompt'},
   request:async(path,body)=>{sent.push({path,body});return {runId:'created'};},
   adoptJob:()=>{},render:()=>{},
-  setMode:value=>mode=value,setAudits:value=>auditModels=value};
+  setMode:value=>mode=value};
 const selected = source.slice(source.indexOf('function retrievalConfiguration('), source.indexOf('function renderJobs('))
   + source.slice(source.indexOf('function selectedRetrievalMode()'), source.indexOf('// Keep the compact footer'))
   + source.slice(source.indexOf('function describe(entry)'), source.indexOf('function cardIcon('))
-  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('// Show the author/audit cycle'))
-  + source.slice(source.indexOf('function renderResearchAudits('), source.indexOf('function renderResearchAuditActivity('))
+  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('// Show the author and critic/repair cycle.'))
   + source.slice(source.indexOf('function proofJobSettings()'), source.indexOf('// Read files directly'))
   + source.slice(source.indexOf('async function startLatexOnly()'), source.indexOf('async function act('));
 Promise.resolve(vm.runInNewContext(selected + '\n(async()=>{' + process.argv[2] + '})()', context))
@@ -146,9 +143,7 @@ for (const model of ['claude-opus-5-5','api:lab-sol']) {
     +'Choose a Codex CLI model for the independent critic.');
   assert.equal(ui.criticModel.focused,true);
 }
-ui.criticModel.value='gpt-6.1-sol';setAudits(['gpt-6-astra','none','none']);
-assert.equal(validateRetrievalSettings(),false);
-setAudits(['none','none','none']);assert(validateRetrievalSettings());
+ui.criticModel.value='gpt-6.1-sol';assert(validateRetrievalSettings());
 """)
 
     def test_disabled_cutoff_is_available_without_archive_support_and_preserves_all_modes(self):
@@ -156,7 +151,6 @@ setAudits(['none','none','none']);assert(validateRetrievalSettings());
 delete state.retrievalCapabilities;
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value=' -1 ';
 ui.skipStatementReview.checked=false;ui.criticModel.value='claude-opus-5-5';
-setAudits(['gpt-6-astra','none','none']);
 renderRetrievalSettings();
 assert(!ui.retrievalCutoffSetting.hidden);assert(!ui.retrievalCutoffUtc.disabled);
 assert.equal(proofJobSettings().retrievalMode,'disabled');
@@ -245,20 +239,6 @@ assert.equal(ui.runProblemTitle.textContent,'P10.md');
 assert.equal(ui.runStatement.textContent,'A precise theorem');
 """)
 
-    def test_historical_runs_do_not_offer_unsupported_optional_audits(self):
-        self.browser(r"""
-state.retrieval={mode:'historical'};
-renderResearchAudits(true);
-for (const name of ['researchAuditsControl','researchAuditToolbar','researchAuditActivity','researchAuditStatus']) {
-  assert(ui[name].hidden);
-  ui[name].hidden=false;
-}
-delete state.retrieval;state.retrievalPolicyPath='/controller/policy.json';
-renderResearchAudits(true);
-for (const name of ['researchAuditsControl','researchAuditToolbar','researchAuditActivity','researchAuditStatus']) {
-  assert(ui[name].hidden);
-}
-""")
 
     def test_prepared_hold_and_incomplete_output_are_never_presented_as_a_finished_answer(self):
         self.browser(r"""

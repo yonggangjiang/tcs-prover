@@ -37,9 +37,9 @@ GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/memory': {'job', 'file', 'version'},
               '/download-tex': {'job'}, '/download-pdf': {'job'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize'}
-CONTROL_ROUTES = {'/delete-job', '/resume', '/start-research-audit', '/resume-critic',
+CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve',
-                  '/set-author-time-limit', '/set-research-audits', '/steer-author',
+                  '/set-author-time-limit', '/steer-author',
                   '/stop', '/pause', '/reset', '/clear-trace'}
 # API models belong to the updated controller's installation, not to a job:
 # GET lists them; the POST routes save, delete and test one.

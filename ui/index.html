@@ -223,19 +223,6 @@
                   </span>
                 </label>
               </div>
-              <details id="researchAuditsSetting" class="research-audits research-audits-initial" hidden>
-                <summary>Research audits <span>Optional independent suggestions</span></summary>
-                <div class="research-audit-fields">
-                  <div>
-                    <label for="researchAuditInterval">Interval (active author hours)</label>
-                    <input id="researchAuditInterval" type="number" min="0" step="any" value="2">
-                  </div>
-                  <div><label for="researchAuditOne">Audit one</label><select id="researchAuditOne"><option value="none">None</option></select></div>
-                  <div><label for="researchAuditTwo">Audit two</label><select id="researchAuditTwo"><option value="none">None</option></select></div>
-                  <div><label for="researchAuditThree">Audit three</label><select id="researchAuditThree"><option value="none">None</option></select></div>
-                </div>
-                <p class="help">The author pauses while selected models independently review the same workspace. Current reports appear in AUDITS/; previous reports move to audit_history/ when the next batch starts. None disables that audit.</p>
-              </details>
             </fieldset>
             <details class="advanced">
               <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>Advanced settings</summary>
@@ -244,7 +231,13 @@
                   <legend>Models and reasoning</legend>
                   <div class="model-grid">
                     <div id="reviewModelSetting" class="model-setting">
-                      <label for="reviewModel">Statement reviewer</label>
+                      <h3 class="model-role-title">Statement reviewer</h3>
+                      <label for="reviewSource">1 · Source</label>
+                      <select id="reviewSource" aria-label="Statement reviewer source">
+                        <option value="codex" selected>Codex CLI</option>
+                        <option value="claude">Claude CLI</option>
+                      </select>
+                      <label for="reviewModel">2 · Model</label>
                       <select id="reviewModel" aria-describedby="reviewModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
                           <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
@@ -252,14 +245,8 @@
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
                         </optgroup>
-                        <optgroup label="Claude CLI" data-provider="claude">
-                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
-                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
-                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
-                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
-                        </optgroup>
                       </select>
-                      <label class="effort-label" for="reviewEffort">Reasoning</label>
+                      <label class="effort-label" for="reviewEffort">3 · Reasoning</label>
                       <select id="reviewEffort">
                         <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
@@ -271,7 +258,13 @@
                       <span id="reviewModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                     </div>
                     <div id="authorModelSetting" class="model-setting">
-                      <label for="authorModel">Proof author</label>
+                      <h3 class="model-role-title">Proof author</h3>
+                      <label for="authorSource">1 · Source</label>
+                      <select id="authorSource" aria-label="Proof author source">
+                        <option value="codex" selected>Codex CLI</option>
+                        <option value="claude">Claude CLI</option>
+                      </select>
+                      <label for="authorModel">2 · Model</label>
                       <select id="authorModel" aria-describedby="authorModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
                           <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
@@ -279,14 +272,8 @@
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
                         </optgroup>
-                        <optgroup label="Claude CLI" data-provider="claude">
-                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
-                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
-                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
-                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
-                        </optgroup>
                       </select>
-                      <label class="effort-label" for="authorEffort">Reasoning</label>
+                      <label class="effort-label" for="authorEffort">3 · Reasoning</label>
                       <select id="authorEffort">
                         <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
@@ -298,7 +285,13 @@
                       <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
-                      <label for="criticModel">Independent critic</label>
+                      <h3 class="model-role-title">Independent critic</h3>
+                      <label for="criticSource">1 · Source</label>
+                      <select id="criticSource" aria-label="Independent critic source">
+                        <option value="codex" selected>Codex CLI</option>
+                        <option value="claude">Claude CLI</option>
+                      </select>
+                      <label for="criticModel">2 · Model</label>
                       <select id="criticModel" aria-describedby="criticModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
                           <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
@@ -306,14 +299,8 @@
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
                         </optgroup>
-                        <optgroup label="Claude CLI" data-provider="claude">
-                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
-                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
-                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
-                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
-                        </optgroup>
                       </select>
-                      <label class="effort-label" for="criticEffort">Reasoning</label>
+                      <label class="effort-label" for="criticEffort">3 · Reasoning</label>
                       <select id="criticEffort">
                         <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
@@ -325,7 +312,13 @@
                       <span id="criticModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                     </div>
                     <div id="writerModelSetting" class="model-setting">
-                      <label for="writerModel">LaTeX writer</label>
+                      <h3 class="model-role-title">LaTeX writer</h3>
+                      <label for="writerSource">1 · Source</label>
+                      <select id="writerSource" aria-label="LaTeX writer source">
+                        <option value="codex" selected>Codex CLI</option>
+                        <option value="claude">Claude CLI</option>
+                      </select>
+                      <label for="writerModel">2 · Model</label>
                       <select id="writerModel" aria-describedby="writerModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
                           <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
@@ -333,14 +326,8 @@
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
                         </optgroup>
-                        <optgroup label="Claude CLI" data-provider="claude">
-                          <option value="claude-fable-5-1">Claude Fable 5.1</option>
-                          <option value="claude-opus-5-5">Claude Opus 5.5</option>
-                          <option value="claude-sonnet-5-5">Claude Sonnet 5.5</option>
-                          <option value="claude-haiku-5-5">Claude Haiku 5.5</option>
-                        </optgroup>
                       </select>
-                      <label class="effort-label" for="writerEffort">Reasoning</label>
+                      <label class="effort-label" for="writerEffort">3 · Reasoning</label>
                       <select id="writerEffort">
                         <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
@@ -365,60 +352,52 @@
                      says autocomplete="new-password" so that no browser fills in a saved login password,
                      and both role="status" lines stay rendered while empty (CSS collapses them). -->
                 <fieldset id="apiModelsSetting" class="settings-group providers-group" aria-describedby="providerHelp">
-                  <legend>Model providers</legend>
-                  <p id="providerHelp" class="help provider-note">Codex CLI and Claude CLI models run with the logins on
-                    this computer. An API model uses your own endpoint and key and runs through the Codex CLI
-                    (OpenAI-compatible) or the Claude CLI (Anthropic).</p>
+                  <legend>API connections</legend>
+                  <p id="providerHelp" class="help">Save a URL and API key once. Each role can then choose this connection and one of its available models.</p>
                   <div id="apiModels" class="api-models" role="group" aria-labelledby="apiModelsHeading">
                     <div class="api-models-head">
-                      <h3 id="apiModelsHeading" tabindex="-1">API models</h3>
+                      <h3 id="apiModelsHeading" tabindex="-1">Saved API keys</h3>
                       <span id="apiModelCount" class="chip">Loading…</span>
                     </div>
                     <p id="apiModelsStatus" class="api-models-status" role="status"></p>
-                    <ul id="apiModelList" class="api-model-list" aria-label="Saved API models" hidden></ul>
-                    <p id="apiModelEmpty" class="api-model-empty" hidden>No API models yet. A saved model appears in
-                      every role menu under API.</p>
-
+                    <ul id="apiModelList" class="api-model-list" aria-label="Saved API connections" hidden></ul>
+                    <p id="apiModelEmpty" class="api-model-empty" hidden>No API connections yet.</p>
                     <div id="apiModelForm" class="api-model-form" role="group" aria-labelledby="apiModelFormHeading">
-                      <h4 id="apiModelFormHeading">Add an API model</h4>
-                      <div class="segmented" role="radiogroup" aria-label="Request format" aria-describedby="apiModelFormatHelp">
-                        <label class="segment"><input id="apiModelFormatOpenai" type="radio" name="apiModelFormat" value="openai" checked><span>OpenAI-compatible</span></label>
-                        <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
-                      </div>
-                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API
-                        (<code>&lt;base URL&gt;/responses</code>), always at standard speed.</p>
+                      <h4 id="apiModelFormHeading">Add an API connection</h4>
                       <div class="api-model-fields">
                         <div class="field api-field-wide">
                           <label for="apiModelBaseUrl">Base URL</label>
                           <input id="apiModelBaseUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
                             spellcheck="false" placeholder="https://api.openai.com/v1">
                         </div>
-                        <div class="field">
-                          <label for="apiModelRequestSource">Request source <span>(optional)</span></label>
-                          <input id="apiModelRequestSource" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-                            placeholder="TCS-Prover" maxlength="200" aria-describedby="apiModelSourceHelp">
-                          <p id="apiModelSourceHelp" class="help">Sent to the router as User-Agent. Leave blank for TCS-Prover.</p>
-                        </div>
-                        <div class="field">
+                        <div class="field api-field-wide">
                           <label for="apiModelKey">API key</label>
                           <input id="apiModelKey" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"
                             placeholder="sk-…" aria-describedby="apiModelKeyHelp" data-1p-ignore data-lpignore="true">
                           <p id="apiModelKeyHelp" class="help api-key-help">Stored only on this computer and never shown again.</p>
                         </div>
-                        <div class="field">
-                          <label for="apiModelId">Model</label>
-                          <select id="apiModelId" aria-describedby="apiModelOptionsHelp" disabled>
-                            <option value="">Load models from your connection</option>
-                          </select>
-                          <p id="apiModelOptionsHelp" class="help">Enter the connection details, then load its available models.</p>
-                          <button id="apiModelLoadButton" class="secondary compact" type="button">Load models</button>
-                        </div>
-                        <div class="field">
-                          <label for="apiModelName">Display name <span>(optional)</span></label>
-                          <input id="apiModelName" type="text" autocomplete="off" placeholder="Model · host" aria-describedby="apiModelNameHelp">
-                          <p id="apiModelNameHelp" class="help">A label inside TCS Prover; it is not sent to the router.</p>
-                        </div>
                       </div>
+                      <div class="segmented" role="radiogroup" aria-label="Request format" aria-describedby="apiModelFormatHelp">
+                        <label class="segment"><input id="apiModelFormatOpenai" type="radio" name="apiModelFormat" value="openai" checked><span>OpenAI-compatible</span></label>
+                        <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
+                      </div>
+                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. Models load automatically when you save.</p>
+                      <details class="api-optional-settings">
+                        <summary>Optional source and name</summary>
+                        <div class="api-model-fields">
+                          <div class="field">
+                            <label for="apiModelRequestSource">Request source <span>(optional)</span></label>
+                            <input id="apiModelRequestSource" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                              placeholder="TCS-Prover" maxlength="200" aria-describedby="apiModelSourceHelp">
+                            <p id="apiModelSourceHelp" class="help">Sent to the router as User-Agent. Leave blank for TCS-Prover.</p>
+                          </div>
+                          <div class="field">
+                            <label for="apiModelName">Display name <span>(optional)</span></label>
+                            <input id="apiModelName" type="text" autocomplete="off" placeholder="API host" aria-describedby="apiModelNameHelp">
+                            <p id="apiModelNameHelp" class="help">A label inside TCS Prover; it is not sent to the router.</p>
+                          </div>
+                        </div>
+                      </details>
                       <p id="apiModelAuthHelp" class="help api-header-help">Authentication is automatic:
                         <code>Authorization: Bearer &lt;key&gt;</code> for OpenAI-compatible connections,
                         or <code>x-api-key</code> for Anthropic.</p>
@@ -426,7 +405,7 @@
                         <p id="apiModelTestResult" class="api-test-result" role="status"></p>
                         <button id="apiModelCancelButton" class="ghost" type="button" hidden>Cancel editing</button>
                         <button id="apiModelTestButton" class="secondary" type="button">Test connection</button>
-                        <button id="apiModelSaveButton" class="primary" type="button">Save model</button>
+                        <button id="apiModelSaveButton" class="primary" type="button">Save connection</button>
                       </div>
                     </div>
                   </div>
@@ -670,7 +649,7 @@
                 <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
                   aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
                 <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
-                  aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Current audits</button>
+                  aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Saved audits</button>
                 <button id="memoryAuditHistoryTab" type="button" role="tab" aria-selected="false"
                   aria-controls="memoryDocument" tabindex="-1" data-memory="audit_history">Audit history</button>
               </div>
@@ -701,33 +680,6 @@
               </div>
               <p class="memory-footer">Read-only · Refreshes automatically while open</p>
             </details>
-
-            <div id="researchAuditToolbar" class="research-audit-toolbar" hidden>
-              <div class="research-audit-clock" title="Counts active author time. Pauses and audit time do not count.">
-                <span id="researchAuditCountdownLabel">Next audit</span>
-                <strong id="researchAuditCountdown" role="timer" aria-live="off">00:00:00</strong>
-                <span id="researchAuditTimerState" class="research-audit-timer-state">author time</span>
-              </div>
-              <button id="startResearchAuditButton" type="button" class="secondary compact" disabled>Start audit now</button>
-            </div>
-            <div id="researchAuditActivity" class="research-audit-activity" aria-label="Auditor status and activity" hidden></div>
-            <details id="researchAuditsControl" class="research-audits" hidden>
-              <summary>Research audits <span id="researchAuditSummary">Disabled</span></summary>
-              <div class="research-audit-fields">
-                <div>
-                  <label for="liveResearchAuditInterval">Interval (active author hours)</label>
-                  <input id="liveResearchAuditInterval" type="number" min="0" step="any" value="2">
-                </div>
-                <div><label for="liveResearchAuditOne">Audit one</label><select id="liveResearchAuditOne"><option value="none">None</option></select></div>
-                <div><label for="liveResearchAuditTwo">Audit two</label><select id="liveResearchAuditTwo"><option value="none">None</option></select></div>
-                <div><label for="liveResearchAuditThree">Audit three</label><select id="liveResearchAuditThree"><option value="none">None</option></select></div>
-              </div>
-              <div class="research-audit-actions">
-                <p class="help">Apply changes without restarting the author. Auditors read the author's workspace while it is paused. Each new batch moves previous reports to audit_history/ and saves current reports in AUDITS/.</p>
-                <button id="applyResearchAuditsButton" type="button" class="secondary compact" disabled>Apply</button>
-              </div>
-            </details>
-            <p id="researchAuditStatus" class="help research-audit-status" role="status" hidden></p>
 
             <section class="timeline-surface card" aria-labelledby="activityHeading">
               <div class="timeline-head">

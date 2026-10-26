@@ -207,7 +207,8 @@ def page():
 
 def menu_fixture():
     """The static role menu of index.html, for the fake selects."""
-    groups = page().menus["authorModel"]
+    groups = [[providers.PROVIDER_LABELS[kind], kind, [[row['id'], row['id'] == runtime.MODEL, row['label']]
+             for row in providers.BUILTIN_MODELS if row['provider'] == kind]] for kind in ('codex', 'claude')]
     return [[label, provider, [[value, text.strip()] for value, _, text in options]]
             for label, provider, options in groups]
 
@@ -222,7 +223,7 @@ class ProviderMarkupTests(unittest.TestCase):
     def test_role_menus_group_the_built_in_models_by_cli_in_registry_order(self):
         parsed = page()
         expected = []
-        for provider, label in (("codex", "Codex CLI"), ("claude", "Claude CLI")):
+        for provider, label in (("codex", "Codex CLI"),):
             rows = [row for row in providers.BUILTIN_MODELS if row["provider"] == provider]
             expected.append([label, provider, [
                 [row["id"], row["id"] == runtime.MODEL,
@@ -232,6 +233,8 @@ class ProviderMarkupTests(unittest.TestCase):
                 groups = [[label, provider, [[value, selected, text.strip()] for value, selected, text in options]]
                           for label, provider, options in parsed.menus[f"{role}Model"]]
                 self.assertEqual(groups, expected)
+                source_options = parsed.menus[f"{role}Source"]
+                self.assertEqual([option[0] for option in source_options], ['codex', 'claude'])
                 chip = parsed.elements[f"{role}Model"].get("aria-describedby")
                 self.assertEqual(chip, f"{role}ModelProvider")
                 self.assertEqual(parsed.elements[chip]["class"], "provider-chip")
@@ -268,12 +271,14 @@ class ProviderMarkupTests(unittest.TestCase):
         self.assertIn("not sent to the router", parsed.texts["apiModelNameHelp"])
         help_text = " ".join(parsed.texts["apiModelFormatHelp"].split())
         self.assertIn("Codex CLI", help_text)
-        for identity in ("apiModelBaseUrl", "apiModelRequestSource", "apiModelId", "apiModelName", "apiModelKey"):
+        for identity in ("apiModelBaseUrl", "apiModelRequestSource", "apiModelName", "apiModelKey"):
             self.assertIn(identity, [attrs.get("for") for attrs in _labels(INDEX)])
-        self.assertEqual(parsed.elements["apiModelId"]["tag"], "select")
-        self.assertIn("disabled", parsed.elements["apiModelId"])
+        self.assertNotIn("apiModelId", parsed.elements)
         self.assertNotIn("Model ID", parsed.texts["apiModelForm"])
-        self.assertEqual(parsed.elements["apiModelLoadButton"]["type"], "button")
+        markup = INDEX.read_text(encoding="utf-8")
+        self.assertLess(markup.index('id="apiModelBaseUrl"'), markup.index('id="apiModelKey"'))
+        self.assertLess(markup.index('id="apiModelKey"'), markup.index('id="apiModelRequestSource"'))
+        self.assertIn('class="api-optional-settings"', markup)
         self.assertIn('id="runSettingsWarning"', INDEX.read_text(encoding="utf-8"))
 
     def test_slice_markers_used_by_the_ui_tests_occur_once(self):
@@ -321,127 +326,67 @@ class ProviderBrowserTests(unittest.TestCase):
                 + r"""
 let state = {workflow: {settings: {model_catalog: fixture.catalog, model_efforts: {}}}};
 const ui = {};
-for (const role of ['review', 'author', 'critic', 'writer']) ui[role + 'Model'] = roleMenu(fixture.menu);
-const apiValues = (select) => (select.querySelector('optgroup[data-provider="api"]')?.children || []).map((o) => o.value);
-""")
-
-    def test_api_group_follows_the_catalog_and_keeps_valid_choices(self):
-        rows = [{"id": "api:lab-sol", "label": "Sol via lab gateway", "format": "openai", "host": "gateway.lab.example"},
-                {"id": "api:opus-direct", "label": "Opus 5.5 · direct", "format": "anthropic", "host": "api.anthropic.com"}]
-        self.run_app(self.MENUS, self.menus_setup(rows), r"""
-// No API model yet: the built-in menus are left alone (no DOM work at all).
-const saved = state.workflow.settings.model_catalog;
-state.workflow.settings.model_catalog = saved.filter((row) => row.provider !== 'api');
-assert.deepEqual(syncModelMenus(), []);
-assert.equal(ui.authorModel.children.length, 2);
-assert.equal(ui.authorModel.dataset.apiModels, undefined);
-
-// Two API models: one "API" group after the built-in groups, in every role menu.
-state.workflow.settings.model_catalog = saved;
-ui.criticModel.value = 'claude-opus-5-5';
-assert.deepEqual(syncModelMenus(), []);
 for (const role of ['review', 'author', 'critic', 'writer']) {
-  const select = ui[role + 'Model'];
-  assert.deepEqual(select.children.map((group) => group.label), ['Codex CLI', 'Claude CLI', 'API']);
-  assert.deepEqual(apiValues(select), ['api:lab-sol', 'api:opus-direct']);
+  ui[role + 'Model'] = roleMenu(fixture.menu);
+  ui[role + 'Source'] = new Select([new Option('Codex CLI', 'codex'), new Option('Claude CLI', 'claude')]);
+  ui[role + 'Effort'] = new Select([new Option('Max', 'max')]);
 }
-const option = ui.authorModel.querySelector('optgroup[data-provider="api"]').children[1];
-assert.equal(option.textContent, 'Opus 5.5 · direct');
-// The footer's short name drops the "·" that separates the footer's own parts.
-assert.equal(option.dataset.short, 'Opus 5.5 direct');
-// A name over 24 characters is cut where a word ends (or after a "-", "." or "/" inside one),
-// never mid-word unless that would leave too little of it.
-for (const [label, short] of [
-  ['Sol via lab gateway preview', 'Sol via lab gateway…'],
-  ['Sol extended-context preview', 'Sol extended-context…'],
-  ['Sol via lab gateway and more', 'Sol via lab gateway and…'],
-  ['gpt-6-astra · llm-proxy.example.org', 'gpt-6-astra llm-proxy…'],
-  ['supercalifragilisticexpialidocious', 'supercalifragilisticexp…'],
-  ['Exactly twenty-four char', 'Exactly twenty-four char'],
-]) assert.equal(shortModelName(label), short, label);
-assert.equal(ui.criticModel.value, 'claude-opus-5-5');
-assert.equal(ui.reviewModel.value, 'gpt-6.1-sol');
-
-// A role on an API model keeps it through a rename; an unchanged catalog changes nothing.
-ui.writerModel.value = 'api:lab-sol';
-state.workflow.settings.model_catalog = saved.map((row) => row.id === 'api:lab-sol' ? {...row, label: 'Lab Sol'} : row);
-assert.deepEqual(syncModelMenus(), []);
-assert.equal(ui.writerModel.value, 'api:lab-sol');
-assert.equal(ui.writerModel.selectedOptions[0].textContent, 'Lab Sol');
-const group = ui.writerModel.querySelector('optgroup[data-provider="api"]');
-syncModelMenus();
-assert.equal(ui.writerModel.querySelector('optgroup[data-provider="api"]'), group);
-
-// Removing the writer's model: the writer falls back to the default, and the caller is told.
-ui.authorModel.value = 'api:opus-direct';
-state.workflow.settings.model_catalog = saved.filter((row) => row.id !== 'api:lab-sol');
-assert.deepEqual(syncModelMenus(), ['writer']);
-assert.equal(ui.writerModel.value, 'gpt-6.1-sol');
-assert.equal(ui.authorModel.value, 'api:opus-direct');
-assert.deepEqual(apiValues(ui.writerModel), ['api:opus-direct']);
-
-// The fallback is the default model itself, not whichever option happens to come first.
-ui.reviewModel = roleMenu([...fixture.menu].reverse());
-state.workflow.settings.model_catalog = saved;
-syncModelMenus();
-ui.reviewModel.value = 'api:opus-direct';
-state.workflow.settings.model_catalog = saved.filter((row) => row.id !== 'api:opus-direct');
-assert.deepEqual(syncModelMenus(), ['review', 'author']);
-assert.equal(ui.reviewModel.value, 'gpt-6.1-sol');
-assert.equal(ui.authorModel.value, 'gpt-6.1-sol');
-
-// The last one removed: the API group goes away.
-ui.authorModel.value = 'api:lab-sol';
-state.workflow.settings.model_catalog = saved.filter((row) => row.provider !== 'api');
-assert.deepEqual(syncModelMenus(), ['author']);
-assert.equal(ui.authorModel.querySelector('optgroup[data-provider="api"]'), null);
-
-// A saved job naming a removed API model keeps it visible, named for what it is; once the
-// model is configured again the stand-in gives way to the real option.
-setChoice(ui.criticModel, 'api:lab-sol');
-assert.equal(ui.criticModel.value, 'api:lab-sol');
-assert.equal(ui.criticModel.options.at(-1).textContent, 'api:lab-sol (not configured)');
-setChoice(ui.reviewModel, 'gpt-5.6-terra');
-assert.equal(ui.reviewModel.options.at(-1).textContent, 'gpt-5.6-terra (older)');
-state.workflow.settings.model_catalog = saved;
-syncModelMenus();
-assert.equal(ui.criticModel.options.filter((o) => o.value === 'api:lab-sol').length, 1);
-assert.equal(ui.criticModel.value, 'api:lab-sol');
-assert.equal(ui.criticModel.selectedOptions[0].parentElement.label, 'API');
-
-// An older server publishes no catalog: the static menus stay as they are.
-state = {workflow: {settings: {}}};
-assert.deepEqual(syncModelMenus(), []);
+const modelProvider = (id) => fixture.catalog.find((row) => row.id === id)?.provider
+  || (id.startsWith('api:') ? 'api' : id.startsWith('claude-') ? 'claude' : 'codex');
 """)
 
-    def test_a_viewed_jobs_stand_in_models_never_reach_the_next_choice(self):
-        rows = [{"id": "api:lab-sol", "label": "Sol via lab gateway", "format": "openai", "host": "gateway.lab.example"}]
+    def test_source_model_picker_filters_and_preserves_independent_role_choices(self):
+        rows = [{"id": "api:key-a-model-one", "sourceId": "api:key-a", "sourceLabel": "Key A", "label": "Model one"},
+                {"id": "api:key-a-model-two", "sourceId": "api:key-a", "sourceLabel": "Key A", "label": "Model two"},
+                {"id": "api:key-b-model-one", "sourceId": "api:key-b", "sourceLabel": "Key B", "label": "Model one"}]
         self.run_app(self.MENUS, self.menus_setup(rows), r"""
 syncModelMenus();
-// A reviewed job whose author's API model was removed, and whose critic is a retired model.
-setChoice(ui.authorModel, 'api:lab-claude');
+assert.deepEqual(ui.authorSource.options.map((o) => o.value), ['codex', 'claude', 'api:key-a', 'api:key-b']);
+assert(ui.authorModel.options.every((o) => o.value.startsWith('gpt-')));
+syncRoleModelMenu('author', 'api:key-a');
+assert.equal(ui.authorSource.value, 'api:key-a');
+assert.deepEqual(ui.authorModel.options.map((o) => o.value), ['api:key-a-model-one', 'api:key-a-model-two']);
+ui.authorModel.value = 'api:key-a-model-two';
+syncRoleModelMenu('critic', 'api:key-b');
+assert.equal(ui.criticModel.value, 'api:key-b-model-one');
+assert.equal(ui.writerSource.value, 'codex');
+syncModelMenus();
+assert.equal(ui.authorModel.value, 'api:key-a-model-two');
+assert.equal(ui.criticModel.value, 'api:key-b-model-one');
+state.workflow.settings.model_catalog = state.workflow.settings.model_catalog.map((row) =>
+  row.id === 'api:key-a-model-two' ? {...row, label: 'Renamed'} : row);
+syncModelMenus();
+assert.equal(ui.authorModel.selectedOptions[0].textContent, 'Renamed');
+state.workflow.settings.model_catalog = state.workflow.settings.model_catalog.filter((row) => row.sourceId !== 'api:key-a');
+assert.deepEqual(syncModelMenus(), ['author']);
+assert.equal(ui.authorSource.value, 'codex');
+assert.equal(ui.authorModel.value, 'gpt-6.1-sol');
+assert.equal(ui.criticModel.value, 'api:key-b-model-one');
+syncRoleModelMenu('writer', 'claude');
+assert(ui.writerModel.options.every((o) => o.value.startsWith('claude-')));
+assert.equal(ui.writerModel.value, 'claude-fable-5-1');
+""")
+
+    def test_saved_stand_ins_are_removed_when_selecting_a_new_source_or_job(self):
+        self.run_app(self.MENUS, self.menus_setup([]), r"""
+syncModelMenus();
+setChoice(ui.authorModel, 'api:gone');
+setChoice(ui.authorModel, 'api:gone');
+assert.equal(ui.authorModel.options.filter((o) => o.value === 'api:gone').length, 1);
+assert.equal(ui.authorModel.value, 'api:gone');
+assert.equal(ui.authorModel.selectedOptions[0].textContent, 'api:gone (not configured)');
 setChoice(ui.criticModel, 'gpt-5.6-sol');
-assert.equal(ui.authorModel.selectedOptions[0].textContent, 'api:lab-claude (not configured)');
 assert.equal(ui.criticModel.selectedOptions[0].textContent, 'gpt-5.6-sol (older)');
-// Choosing again for the same job keeps exactly one stand-in.
-setChoice(ui.authorModel, 'api:lab-claude');
-assert.equal(ui.authorModel.options.filter((option) => option.value === 'api:lab-claude').length, 1);
-// New problem resets every role to the default: no stand-in remains to be chosen.
-for (const role of ['author', 'critic']) {
-  const select = ui[role + 'Model'];
-  setChoice(select, 'gpt-6.1-sol');
-  assert.equal(select.value, 'gpt-6.1-sol');
-  assert.deepEqual(select.options.filter((option) => option.dataset.standIn).map((option) => option.value), []);
-}
-assert.ok(!ui.authorModel.options.some((option) => option.value === 'api:lab-claude'));
-assert.ok(!ui.criticModel.options.some((option) => option.value === 'gpt-5.6-sol'));
-// Another job's stand-in replaces this one's rather than adding to it.
-setChoice(ui.authorModel, 'api:gone-1');
-setChoice(ui.authorModel, 'api:gone-2');
-assert.deepEqual(ui.authorModel.options.filter((option) => option.dataset.standIn).map((option) => option.value),
-                 ['api:gone-2']);
-// Real options are never removed.
-assert.deepEqual(apiValues(ui.authorModel), ['api:lab-sol']);
+setChoice(ui.authorModel, 'gpt-6.1-sol');
+assert.equal(ui.authorSource.value, 'codex');
+assert(!ui.authorModel.options.some((o) => o.dataset.standIn));
+state.workflow.settings.model_sources = [{id:'codex',label:'Codex CLI'}, {id:'api:empty',label:'Empty key'}];
+setChoice(ui.authorModel, 'api:missing-source');
+assert.equal(state.workflow.settings.model_sources.length,2);
+syncRoleModelMenu('writer', 'api:empty');
+assert.equal(ui.writerModel.value, '');
+assert.equal(ui.writerModel.disabled, true);
+assert.equal(ui.writerEffort.disabled, true);
 """)
 
     def test_efforts_offer_exactly_the_models_levels_and_round_down(self):
@@ -496,10 +441,8 @@ ui.retrievalMode.value = 'live';
 ui.retrievalSetting = new Element('section');
 new Element('details').append(ui.retrievalSetting);
 ui.skipStatementReview.checked = true;
-ui.researchAuditModels = [new Element()];
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
-const researchAuditValues = () => ({models: ['none', 'none', 'none']});
 const chip = (role) => ui[role + 'ModelProvider'];
 const disabledGroups = (role) => ui[role + 'Model'].children.filter((group) => group.disabled).map((group) => group.label);
 """)
@@ -558,7 +501,7 @@ assert.equal(chip('critic').textContent, 'Codex CLI');
 assert.equal(chip('review').textContent, 'Claude CLI');
 assert.equal(ui.authorModel.value, 'claude-opus-5-5');
 const notice = ui.retrievalConfigurationNotice.textContent;
-assert.equal(notice, `${rule} Choose a Codex CLI model for the proof author and LaTeX writer. Set optional research audits to None.`);
+assert.equal(notice, `${rule} Choose a Codex CLI model for the proof author and LaTeX writer.`);
 assert.equal(ui.retrievalConfigurationNotice.hidden, false);
 
 // Starting is refused with the server's own words, and the first such menu takes focus.
@@ -571,7 +514,7 @@ assert.equal(ui.retrievalSetting.parentElement.open, true);
 ui.authorModel.value = 'gpt-6-astra';
 ui.writerModel.value = 'gpt-6.1-sol';
 renderRetrievalSettings();
-assert.equal(ui.retrievalConfigurationNotice.textContent, `${rule} Set optional research audits to None.`);
+assert.equal(ui.retrievalConfigurationNotice.textContent, `${rule}`);
 assert.equal(chip('author').dataset.state, '');
 assert.equal(validateRetrievalSettings(), true);
 
@@ -668,7 +611,7 @@ assert.equal(rows()['Settings warning'], undefined);
 const catalog = [{id: 'gpt-6.1-sol', provider: 'codex'}, {id: 'claude-opus-5-5', provider: 'claude'}];
 // A job cannot switch models: the only remedy is adding it again with the settings it recorded.
 const missing = 'The API model api:lab-sol chosen for the critic is not configured. Add it again under '
-  + 'New problem → Advanced settings → API models with the same settings (Sol via lab gateway · OpenAI format · '
+  + 'New problem → Advanced settings → API connections with the same settings (Sol via lab gateway · OpenAI format · '
   + 'https://gateway.lab.example/v1 · model gpt-6.1-sol) to continue this job.';
 state = {...state, workflow: {...state.workflow, settings: {model_catalog: catalog}}};
 renderRunOverview();
@@ -700,502 +643,196 @@ state = {...state, skipStatementReview: false};
 renderRunOverview();
 // Without a recorded snapshot, the display name that gives the same id.
 assert.equal(ui.runSettingsWarning.textContent, 'The API model api:gone chosen for the statement reviewer is not '
-  + 'configured. Add it again under New problem → Advanced settings → API models with the display name “gone” '
+  + 'configured. Add it again under New problem → Advanced settings → API connections with the display name “gone” '
   + 'to continue this job.');
 """)
 
     MANAGER = [["// API models (Advanced settings", "// Appearance: the dark theme"]]
     MANAGER_SETUP = r"""
 const elements = {};
-const $ = (id) => elements[id] ||= id === 'apiModelId' ? new Select() : new Element(['apiModelList'].includes(id) ? 'ul' : 'div');
+const $ = (id) => elements[id] ||= new Element(id === 'apiModelList' ? 'ul' : 'div');
 const advanced = new Element('details');
-const ui = {input: {querySelector: (selector) => selector === 'details.advanced' ? advanced : null}};
-for (const [id, value] of [['apiModelFormatOpenai', 'openai'], ['apiModelFormatAnthropic', 'anthropic']]) {
-  $(id).value = value;
-}
-$('apiModelFormatOpenai').checked = true;
+const ui = {input: {querySelector: () => advanced}};
+$('apiModelFormatOpenai').value = 'openai'; $('apiModelFormatOpenai').checked = true;
+$('apiModelFormatAnthropic').value = 'anthropic';
 const sessionToken = 'session-token';
-let state = {workflow: {nodes: {}, settings: {model_catalog: [], model_efforts: {}}}};
+let state = {workflow: {settings: {model_catalog: [], model_efforts: {}}}};
 const show = (element, visible) => { element.hidden = !visible; };
-const calls = [];
-const syncModelMenus = () => { calls.push('menus'); return pendingReplaced.splice(0); };
-const syncEffortChoices = (role) => calls.push('efforts:' + role);
-const renderRetrievalSettings = () => calls.push('retrieval');
-const updateModelSummary = () => calls.push('summary');
-let pendingReplaced = [];
+const syncModelMenus = () => [], syncEffortChoices = () => {}, renderRetrievalSettings = () => {}, updateModelSummary = () => {};
 let answer = true;
-const questions = [];
-const confirm = (question) => { questions.push(question); return answer; };
-document.createElement = (tag) => tag === 'select' ? new Select() : new Element(tag);
+const confirm = () => answer;
 const sent = [];
 const fetch = (path, options = {}) => new Promise((resolve) => sent.push({path, options,
   body: options.body ? JSON.parse(options.body) : undefined,
   reply: (status, value) => resolve({ok: status < 400, status, json: async () => value})}));
-const tick = () => new Promise((resolve) => setImmediate(resolve));
-const settle = async () => { for (let i = 0; i < 20; i += 1) await tick(); };
-const listing = (models) => ({models, formats: [
-  {id: 'openai', label: 'OpenAI-compatible (Responses API)', cli: 'Codex CLI', headerName: 'Authorization'},
-  {id: 'anthropic', label: 'Anthropic (Messages API)', cli: 'Claude CLI', headerName: 'x-api-key'}],
-  model_catalog: models.map((model) => ({id: model.id, label: model.label, provider: 'api', format: model.format,
-    host: model.host, hasKey: model.hasKey})),
-  model_efforts: Object.fromEntries(models.map((model) => [model.id, ['low', 'medium', 'high', 'xhigh', 'max']]))});
-const lab = {id: 'api:lab-sol', label: 'Sol via lab gateway', format: 'openai', baseUrl: 'https://gateway.lab.example/v1',
-  host: 'gateway.lab.example', headerName: 'Authorization', model: 'gpt-6.1-sol', hasKey: true, keyHint: '…2223',
-  lastTest: null};
+const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+const connection = {id: 'api:lab', label: 'Lab key', format: 'openai', baseUrl: 'https://lab.example/v1',
+  host:'lab.example', requestSource:'', hasKey:true, keyHint:'…abcd', models:[
+    {id:'model-a',label:'Model A',modelId:'api:lab-a'}, {id:'model-b',label:'Model B',modelId:'api:lab-b'}]};
+const listing = (connections) => ({connections, models:connections, model_sources:connections.map((c) => ({id:c.id,label:c.label})),
+  model_catalog:connections.flatMap((c) => c.models.map((m) => ({id:m.modelId,label:m.label,provider:'api',sourceId:c.id}))),
+  model_efforts:{}});
 const type = (id, value) => { $(id).value = value; $(id).oninput?.(); };
-// Existing manager checks begin with model discovery already completed. The discovery checks
-// below exercise the HTTP flow and actual select behavior separately.
-const discovered = () => setApiModelOptions([{id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol'}]);
-const rowButton = (action, id) => $('apiModelList').querySelector(`button[data-api-action="${action}"]`)
-  && $('apiModelList').querySelectorAll('button').find((b) => b.dataset.apiAction === action && b.dataset.apiModel === id);
-const click = (button) => $('apiModelList').onclick({target: button});
-const buttons = () => [$('apiModelLoadButton'), $('apiModelTestButton'), $('apiModelSaveButton'), ...$('apiModelList').querySelectorAll('button')];
+const rowButton = (action) => $('apiModelList').querySelectorAll('button').find((b) => b.dataset.apiAction === action);
+const click = (button) => $('apiModelList').onclick({target:button});
 """
 
-    def test_api_model_manager_lists_tests_saves_edits_and_removes(self):
-        key, other = "sk-test-0123456789abcdef", "sk-other-fedcba9876543210"
-        self.run_app(self.MANAGER, self.MANAGER_SETUP, f"const key = {json.dumps(key)}, other = {json.dumps(other)};\n"
-                     + r"""
-// The list is read when Advanced settings opens: a plain GET with the session token.
-assert.equal($('apiModelFormHeading').textContent, 'Add an API model');
-advanced.open = true;
-advanced.listeners.toggle({target: advanced});
-assert.equal(sent.length, 1);
-assert.equal(sent[0].path, '/api-models');
-assert.equal(sent[0].options.method, undefined);
-assert.equal(sent[0].options.headers['X-TCS-Prover-Token'], 'session-token');
-assert(buttons().every((button) => button.disabled));
-sent[0].reply(200, listing([]));
-await settle();
-assert.equal($('apiModelCount').textContent, 'None saved');
-assert.equal($('apiModelEmpty').hidden, false);
-assert.equal($('apiModelList').hidden, true);
-assert(!$('apiModelTestButton').disabled && !$('apiModelSaveButton').disabled);
-
-// Missing fields are pointed at before anything is sent.
+    def test_save_connection_requires_only_url_and_key_and_loads_all_model_choices(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
 $('apiModelSaveButton').onclick();
-assert.equal(sent.length, 1);
+assert.equal(sent.length, 0);
 assert.equal($('apiModelTestResult').textContent, 'Enter the base URL.');
-assert.equal(document.activeElement, $('apiModelBaseUrl'));
-type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
-type('apiModelId', 'gpt-6.1-sol');
-$('apiModelTestButton').onclick();
-assert.equal($('apiModelTestResult').textContent, 'Enter the API key.');
-assert.equal(document.activeElement, $('apiModelKey'));
-
-// Test the unsaved form: the key only in the POST body; every button waits; the result inline.
-type('apiModelKey', other);
-discovered();
-type('apiModelName', 'Sol via lab gateway');
-$('apiModelTestButton').onclick();
-assert.equal(sent.length, 2);
-assert.equal(sent[1].path, '/api-models/test');
-assert.equal(sent[1].options.method, 'POST');
-assert.deepEqual(sent[1].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', requestSource: '',
-  apiKey: other, model: 'gpt-6.1-sol', label: 'Sol via lab gateway'});
-assert(!sent[1].path.includes(other));
-assert.equal($('apiModelTestButton').textContent, 'Testing…');
-assert(buttons().every((button) => button.disabled));
-assert.equal($('apiModels').getAttribute('aria-busy'), 'true');
-sent[1].reply(200, {ok: false, status: 401, latencyMs: 188, message: 'Incorrect API key provided: [redacted].',
-  model: 'gpt-6.1-sol', testedAt: '2026-10-22T09:44:51+00:00', recorded: false});
-await settle();
-const parts = () => $('apiModelTestResult').children.map((part) => [part.tagName, part.className, part.textContent]);
-assert.deepEqual(parts(), [['STRONG', '', 'Failed · 401'],
-  ['SPAN', 'api-test-detail', 'Incorrect API key provided: [redacted].']]);
-assert.match($('apiModelTestResult').className, /\berror\b/);
-assert.equal($('apiModelTestButton').textContent, 'Test connection');
-assert(!$('apiModelTestButton').disabled);
-// The outcome is written once the manager is no longer busy, so that it is announced.
-assert.equal($('apiModels').getAttribute('aria-busy'), 'false');
-
-// Editing what was tested makes the shown result stale (here: a new key); the display name does not.
-type('apiModelName', 'Sol via lab gateway');
-assert.match($('apiModelTestResult').className, /\berror\b/);
-type('apiModelKey', 'sk-typing');
-assert.match($('apiModelTestResult').className, /\bstale\b/);
-assert.deepEqual(parts().map((part) => part[2]), ['Changed since the last test',
-  'Last result: Failed · 401. Test again to check these settings.']);
-
-type('apiModelKey', key);
-discovered();
-$('apiModelTestButton').onclick();
-sent[2].reply(200, {ok: true, status: 200, latencyMs: 412.4, message: 'The model replied: OK',
-  model: 'gpt-6.1-sol-2026-10', testedAt: '2026-10-22T09:45:51+00:00', recorded: false});
-await settle();
-assert.equal($('apiModelTestResult').children[0].textContent, 'Connected · 412 ms');
-assert.equal($('apiModelTestResult').children[1].textContent, 'The model replied: OK · model gpt-6.1-sol-2026-10');
-assert.equal($('apiModelKey').value, key);
-
-// A network failure has no status: its message stands alone.
-$('apiModelTestButton').onclick();
-sent[3].reply(200, {ok: false, status: null, latencyMs: 30000, message: 'No response within 30 seconds (TimeoutError).',
-  model: 'gpt-6.1-sol', testedAt: '2026-10-22T09:46:51+00:00', recorded: false});
-await settle();
-assert.deepEqual(parts().map((part) => part[2]), ['Connection failed', 'No response within 30 seconds (TimeoutError).']);
-
-// A field edited while a test runs: its result arrives already marked stale.
-$('apiModelTestButton').onclick();
-type('apiModelId', 'gpt-6.1-sol');
-sent[4].reply(200, {ok: true, status: 200, latencyMs: 90, message: 'The model replied: OK', model: 'gpt-6.1-sol',
-  testedAt: '2026-10-22T09:47:51+00:00', recorded: false});
-await settle();
-assert.deepEqual(parts().map((part) => part[2]), ['Changed since the last test',
-  'Last result: Connected · 90 ms. Test again to check these settings.']);
-sent.splice(4, 1);
-
-// Save: the key goes once, the field is cleared, the list and every role menu refresh.
+type('apiModelBaseUrl', connection.baseUrl);
 $('apiModelSaveButton').onclick();
-assert.equal(sent[4].path, '/api-models');
-assert.equal(sent[4].body.apiKey, key);
-assert.equal(sent[4].body.id, undefined);
-assert.equal($('apiModelSaveButton').textContent, 'Saving…');
-calls.length = 0;
-sent[4].reply(200, {model: lab, ...listing([lab])});
+assert.equal($('apiModelTestResult').textContent, 'Enter the API key.');
+type('apiModelKey', 'secret-api-key');
+$('apiModelSaveButton').onclick();
+assert.equal(sent[0].path, '/api-models');
+assert.deepEqual(sent[0].body, {format:'openai',baseUrl:connection.baseUrl,apiKey:'secret-api-key',requestSource:'',label:''});
+assert.equal(sent[0].body.model, undefined);
+assert.equal(sent[0].body.headerName, undefined);
+assert.equal($('apiModels').getAttribute('aria-busy'), 'true');
+sent[0].reply(200, {connection,...listing([connection])});
 await settle();
 assert.equal($('apiModelKey').value, '');
 assert.equal($('apiModelBaseUrl').value, '');
-assert.equal($('apiModelSaveButton').textContent, 'Save model');
-assert.equal($('apiModelTestResult').children[0].textContent, 'Saved Sol via lab gateway.');
-type('apiModelBaseUrl', 'h');
-assert.equal($('apiModelTestResult').children[0].textContent, 'Saved Sol via lab gateway.');
-type('apiModelBaseUrl', '');
-assert.deepEqual(calls, ['menus', 'efforts:review', 'efforts:author', 'efforts:critic', 'efforts:writer', 'retrieval', 'summary']);
-assert.deepEqual(state.workflow.settings.model_catalog.map((row) => row.id), ['api:lab-sol']);
-assert.deepEqual(state.workflow.settings.model_efforts['api:lab-sol'], ['low', 'medium', 'high', 'xhigh', 'max']);
-assert.deepEqual(state.workflow.nodes, {});
+assert.equal($('apiModels').getAttribute('aria-busy'), 'false');
 assert.equal($('apiModelCount').textContent, '1 saved');
-const row = $('apiModelList').children[0];
-assert.equal(row.querySelector('strong').textContent, 'Sol via lab gateway');
-assert.match(row.textContent, /gpt-6\.1-sol.*gateway\.lab\.example.*key …2223.*not tested yet/);
-assert.equal(row.querySelector('span.format-chip').textContent, 'OpenAI');
-assert.equal(row.querySelector('span.status-chip').textContent, 'Not tested');
-assert.equal(rowButton('remove', 'api:lab-sol').getAttribute('aria-label'), 'Remove Sol via lab gateway');
+assert.match($('apiModelList').textContent, /Lab key.*2 models/);
+assert.equal(state.workflow.settings.model_catalog.length, 2);
+assert.equal(state.workflow.settings.model_sources[0].id, connection.id);
+assert.match($('apiModelTestResult').textContent, /Choose this key under Source/);
+assert(!Object.keys(elements).includes('apiModelId'));
+""")
 
-// Test a saved model by its id: the recorded result replaces the row; focus returns to its Test.
-rowButton('test', 'api:lab-sol').focus();
-click(rowButton('test', 'api:lab-sol'));
-assert.deepEqual(sent[5].body, {id: 'api:lab-sol'});
-const tested = {...lab, lastTest: {ok: false, at: '2026-10-22T09:50:00+00:00', status: 401, message: 'invalid key', latencyMs: 90}};
-sent[5].reply(200, {ok: false, status: 401, latencyMs: 90, message: 'invalid key', model: 'gpt-6.1-sol',
-  testedAt: '2026-10-22T09:50:00+00:00', recorded: true, apiModel: tested});
-await settle();
-assert.equal($('apiModelList').children[0].querySelector('span.status-chip').textContent, 'Failed · 401');
-assert.equal($('apiModelList').children[0].querySelector('p.api-test-result').textContent, '401 · invalid key');
-assert.equal($('apiModelsStatus').textContent, 'Sol via lab gateway: 401 · invalid key');
-assert.equal(document.activeElement, rowButton('test', 'api:lab-sol'));
-
-// Edit: the saved settings fill the form, never the key; a blank key keeps the saved one.
-click(rowButton('edit', 'api:lab-sol'));
-assert.equal($('apiModelFormHeading').textContent, 'Edit Sol via lab gateway');
-assert.equal($('apiModelBaseUrl').value, 'https://gateway.lab.example/v1');
-assert.equal($('apiModelKey').value, '');
-assert.equal($('apiModelKey').placeholder, 'Saved key …2223');
-assert.equal($('apiModelKeyHelp').textContent, 'Leave blank to keep the saved key; a new key replaces it.');
-assert.equal($('apiModelSaveButton').textContent, 'Save changes');
-assert.equal($('apiModelCancelButton').hidden, false);
-assert($('apiModelList').children[0].classList.contains('editing'));
-type('apiModelName', 'Lab Sol');
-$('apiModelSaveButton').onclick();
-assert.deepEqual(sent[6].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1', requestSource: '',
-  apiKey: '', model: 'gpt-6.1-sol', label: 'Lab Sol', id: 'api:lab-sol'});
-const renamed = {...tested, label: 'Lab Sol'};
-sent[6].reply(200, {model: renamed, ...listing([renamed])});
-await settle();
-assert.equal($('apiModelTestResult').children[0].textContent, 'Saved changes to Lab Sol.');
-assert.equal($('apiModelFormHeading').textContent, 'Add an API model');
-
-// Another destination needs the key again (the server would refuse to reuse it).
-click(rowButton('edit', 'api:lab-sol'));
-type('apiModelBaseUrl', 'https://other.example/v1');
-assert.match($('apiModelKeyHelp').textContent, /^Enter the API key again/);
-assert.equal($('apiModelKey').required, true);
+    def test_test_connection_has_no_model_and_marks_results_stale_after_edits(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+type('apiModelBaseUrl', connection.baseUrl);
+type('apiModelKey', 'secret-api-key');
+type('apiModelRequestSource', 'Proof lab');
 $('apiModelTestButton').onclick();
-assert.equal(sent.length, 7);
-assert.match($('apiModelTestResult').textContent, /^Enter the API key again/);
-assert.equal(document.activeElement, $('apiModelKey'));
-// The optional request source is independent of the API format; authentication is automatic.
-type('apiModelRequestSource', 'Zephy-TCS-Prover');
-$('apiModelFormatAnthropic').checked = true; $('apiModelFormatOpenai').checked = false;
-$('apiModelFormatAnthropic').onchange();
-assert.equal($('apiModelRequestSource').value, 'Zephy-TCS-Prover');
-assert.match($('apiModelFormatHelp').textContent, /Claude CLI in bare mode.*no subagents, no web tools/);
-$('apiModelFormatOpenai').checked = true; $('apiModelFormatAnthropic').checked = false;
-$('apiModelFormatOpenai').onchange();
-assert.equal($('apiModelRequestSource').value, 'Zephy-TCS-Prover');
-$('apiModelCancelButton').onclick();
-assert.equal($('apiModelFormHeading').textContent, 'Add an API model');
-assert.equal($('apiModelRequestSource').value, '');
-
-// Remove asks first; a refusal leaves everything as it was.
-answer = false;
-click(rowButton('remove', 'api:lab-sol'));
-assert.equal(sent.length, 7);
-assert.match(questions[0], /^Remove Lab Sol\?/);
-answer = true;
-pendingReplaced = ['author', 'critic'];
-click(rowButton('remove', 'api:lab-sol'));
-assert.deepEqual(sent[7].body, {id: 'api:lab-sol'});
-assert.equal(sent[7].path, '/api-models/delete');
-sent[7].reply(200, {deleted: 'api:lab-sol', warning: '1 job waiting to start or resume still uses Lab Sol; it cannot continue until that API model is configured again.', ...listing([])});
+assert.equal(sent[0].path, '/api-models/test');
+assert.equal(sent[0].body.model, undefined);
+assert.equal(sent[0].body.requestSource, 'Proof lab');
+type('apiModelKey', 'new-key');
+sent[0].reply(200, {ok:true,status:200,message:'Found 2 models.',latencyMs:12});
 await settle();
-assert.equal($('apiModelsStatus').textContent, 'Removed Lab Sol. 1 job waiting to start or resume still uses Lab Sol; '
-  + 'it cannot continue until that API model is configured again. The proof author and independent critic now use GPT 6.1 Sol.');
+assert.equal($('apiModelTestResult').children[0].textContent, 'Connection details changed');
+$('apiModelTestButton').onclick();
+sent[1].reply(200, {ok:false,status:401,message:'Invalid API key'});
+await settle();
+assert.match($('apiModelTestResult').textContent, /401.*Invalid API key/);
+type('apiModelName', 'Local label');
+assert.match($('apiModelTestResult').className, /error/);
+type('apiModelRequestSource', 'New source');
+assert.match($('apiModelTestResult').className, /stale/);
+""")
+
+    def test_saved_key_edit_refresh_remove_and_secret_binding(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+advanced.open = true; advanced.listeners.toggle({target:advanced});
+assert.equal(sent[0].options.headers['X-TCS-Prover-Token'], sessionToken);
+sent[0].reply(200, listing([connection]));
+await settle();
+click(rowButton('edit'));
+assert.equal($('apiModelKey').value, '');
+assert.equal($('apiModelKey').required, false);
+$('apiModelTestButton').onclick();
+sent[1].reply(200,{ok:true,status:200,message:'Found 2 models.',recorded:true,
+  connection:{...connection,lastTest:{ok:true,at:'2026-10-26',message:'Found 2 models.'}}});
+await settle();
+assert.match($('apiModelList').textContent,/Connected/);
+sent.splice(1,1);
+type('apiModelName', 'New local label');
+$('apiModelSaveButton').onclick();
+assert.equal(sent[1].body.apiKey, '');
+assert.equal(sent[1].body.id, connection.id);
+const renamed = {...connection,label:'New local label'};
+sent[1].reply(200, {connection:renamed,...listing([renamed])});
+await settle();
+click(rowButton('edit'));
+type('apiModelBaseUrl', 'https://other.example/v1');
+$('apiModelSaveButton').onclick();
+assert.equal(sent.length, 2);
+assert.match($('apiModelTestResult').textContent, /Enter the API key again/);
+$('apiModelCancelButton').onclick();
+click(rowButton('refresh'));
+assert.equal(sent[2].path, '/api-models/discover');
+assert.deepEqual(sent[2].body, {id:connection.id});
+const refreshed = {...renamed,models:[connection.models[0]]};
+sent[2].reply(200, {ok:true,message:'Found 1 model.',...listing([refreshed])});
+await settle();
+assert.equal(state.workflow.settings.model_catalog.length, 1);
+answer = false; click(rowButton('remove')); assert.equal(sent.length, 3);
+answer = true; click(rowButton('remove'));
+assert.equal(sent[3].path, '/api-models/delete');
+sent[3].reply(200, {deleted:connection.id,...listing([])});
+await settle();
 assert.equal($('apiModelCount').textContent, 'None saved');
 assert.equal(document.activeElement, $('apiModelsHeading'));
-
-// The server's refusal (a running job uses it) is shown as it is.
-pendingReplaced = [];
-const listed = {...lab, id: 'api:busy', label: 'Busy'};
-sent.length = 0;
-advanced.listeners.toggle({target: advanced});
-sent[0].reply(200, listing([listed]));
-await settle();
-click(rowButton('remove', 'api:busy'));
-sent[1].reply(400, {error: 'Busy is in use by a running job. Stop that job before removing this API model.'});
-await settle();
-assert.equal($('apiModelsStatus').textContent, 'Busy is in use by a running job. Stop that job before removing this API model.');
-assert.match($('apiModelsStatus').className, /\bwarning\b/);
-assert.equal($('apiModelCount').textContent, '1 saved');
-
-// Nothing the page shows or sends in a URL carries a key.
-const shown = Object.values(elements).map((element) => element.textContent + element.placeholder).join('\n');
-assert(!shown.includes(key) && !shown.includes(other));
-assert(sent.every((request) => !request.path.includes('sk-')));
+assert(sent.every((request) => !request.path.includes('secret')));
 """)
 
-    def test_api_model_manager_gives_focus_back_and_writes_outcomes_once_ready(self):
+    def test_connection_save_errors_keep_the_key_and_newer_form_edits(self):
         self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
-// A browser moves focus to the page when the focused button is disabled; this fake does it by hand.
-document.body = new Element('body');
-const dropFocus = () => { document.activeElement = document.body; };
-// Record whether the manager was still busy when each outcome was written (a busy live region's
-// news may go unannounced) and where focus was by then.
-const written = [];
-const proto = Object.getOwnPropertyDescriptor(Element.prototype, 'textContent');
-Object.defineProperty($('apiModelsStatus'), 'textContent', {get() { return proto.get.call(this); }, set(value) {
-  if (value) written.push(['status', $('apiModels').getAttribute('aria-busy'), document.activeElement]);
-  proto.set.call(this, value);
-}});
-const replace = $('apiModelTestResult').replaceChildren;
-$('apiModelTestResult').replaceChildren = function (...items) {
-  if (items.length) written.push(['result', $('apiModels').getAttribute('aria-busy'), document.activeElement]);
-  return replace.apply(this, items);
-};
-advanced.open = true;
-advanced.listeners.toggle({target: advanced});
-sent[0].reply(200, listing([lab]));
-await settle();
-type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
-type('apiModelKey', 'sk-test-0123456789abcdef');
-discovered();
-type('apiModelId', 'gpt-6.1-sol');
-
-// Test connection from the keyboard: focus comes back to the button, then the outcome is written.
-$('apiModelTestButton').focus();
-$('apiModelTestButton').onclick();
-dropFocus();
-written.length = 0;
-sent[1].reply(200, {ok: true, status: 200, latencyMs: 12, message: 'The model replied: OK', model: 'gpt-6.1-sol',
-  testedAt: '2026-10-22T10:00:00+00:00', recorded: false});
-await settle();
-assert.equal(document.activeElement, $('apiModelTestButton'));
-assert.deepEqual(written, [['result', 'false', $('apiModelTestButton')]]);
-
-// Focus the user moved elsewhere meanwhile is left alone.
-$('apiModelTestButton').onclick();
-$('apiModelName').focus();
-sent[2].reply(200, {ok: true, status: 200, latencyMs: 12, message: 'The model replied: OK', model: 'gpt-6.1-sol',
-  testedAt: '2026-10-22T10:01:00+00:00', recorded: false});
-await settle();
-assert.equal(document.activeElement, $('apiModelName'));
-
-// Save: refused, then saved; focus returns to Save both times.
-$('apiModelSaveButton').focus();
+type('apiModelBaseUrl', connection.baseUrl); type('apiModelKey','secret-api-key');
 $('apiModelSaveButton').onclick();
-dropFocus();
-sent[3].reply(400, {error: 'The API format decides which CLI runs this model, so it cannot change while jobs use it.'});
+sent[0].reply(400,{error:'The endpoint returned no model choices.'});
 await settle();
-assert.equal(document.activeElement, $('apiModelSaveButton'));
-assert.deepEqual($('apiModelTestResult').children.map((part) => part.textContent),
-  ['Not saved', 'The API format decides which CLI runs this model, so it cannot change while jobs use it.']);
+assert.equal($('apiModelKey').value,'secret-api-key');
+assert.match($('apiModelTestResult').textContent,/no model choices/);
 $('apiModelSaveButton').onclick();
-dropFocus();
-written.length = 0;
-const other = {...lab, id: 'api:other', label: 'Other'};
-sent[4].reply(200, {model: other, ...listing([lab, other])});
+type('apiModelKey','a-newer-key');
+sent[1].reply(200,{connection,...listing([connection])});
 await settle();
-assert.equal(document.activeElement, $('apiModelSaveButton'));
-assert.deepEqual(written, [['result', 'false', $('apiModelSaveButton')]]);
-
-// A row's Test: while it runs its name says so; then focus moves to the rebuilt row's Test.
-const test = rowButton('test', 'api:lab-sol');
-test.focus();
-click(test);
-assert.equal(test.textContent, 'Testing…');
-assert.equal(test.getAttribute('aria-label'), 'Testing Sol via lab gateway…');
-dropFocus();
-written.length = 0;
-sent[5].reply(200, {ok: true, status: 200, latencyMs: 30, message: 'The model replied: OK', model: 'gpt-6.1-sol',
-  testedAt: '2026-10-22T10:02:00+00:00', recorded: true, apiModel: {...lab, lastTest: {ok: true,
-  at: '2026-10-22T10:02:00+00:00', status: 200, message: 'The model replied: OK', latencyMs: 30}}});
-await settle();
-assert.notEqual(rowButton('test', 'api:lab-sol'), test);
-assert.equal(document.activeElement, rowButton('test', 'api:lab-sol'));
-assert.equal(rowButton('test', 'api:lab-sol').getAttribute('aria-label'), 'Test Sol via lab gateway');
-assert.deepEqual(written, [['status', 'false', rowButton('test', 'api:lab-sol')]]);
-
-// Remove, refused: focus returns to the row's Remove. Removed: the list heading takes it first.
-click(rowButton('remove', 'api:other'));
-dropFocus();
-sent[6].reply(400, {error: 'Other is in use by a running job. Stop that job before removing this API model.'});
-await settle();
-assert.equal(document.activeElement, rowButton('remove', 'api:other'));
-click(rowButton('remove', 'api:other'));
-dropFocus();
-written.length = 0;
-sent[7].reply(200, {deleted: 'api:other', warning: '', ...listing([lab])});
-await settle();
-assert.equal(document.activeElement, $('apiModelsHeading'));
-assert.deepEqual(written, [['status', 'false', $('apiModelsHeading')]]);
-assert.equal($('apiModelsStatus').textContent, 'Removed Other.');
-""")
-
-    def test_api_model_discovery_populates_a_picker_without_typing_a_model_id(self):
-        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
-assert.equal($('apiModelId').tagName, 'SELECT');
-assert.equal($('apiModelId').disabled, true);
-$('apiModelLoadButton').onclick();
-assert.equal(sent.length, 0);
-assert.equal($('apiModelTestResult').textContent, 'Enter the base URL.');
-type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
-type('apiModelKey', 'sk-discovery-secret');
+assert.equal($('apiModelKey').value,'a-newer-key');
+assert.equal($('apiModelBaseUrl').value,connection.baseUrl);
 $('apiModelSaveButton').onclick();
-assert.equal(sent.length, 0);
-assert.equal($('apiModelTestResult').textContent, 'Load the available models, then choose a model.');
-assert.equal(document.activeElement, $('apiModelLoadButton'));
-$('apiModelLoadButton').onclick();
-assert.equal(sent[0].path, '/api-models/discover');
-assert.equal(sent[0].options.method, 'POST');
-assert.deepEqual(sent[0].body, {format: 'openai', baseUrl: 'https://gateway.lab.example/v1',
-  requestSource: '', apiKey: 'sk-discovery-secret'});
-assert.equal($('apiModelLoadButton').textContent, 'Loading models…');
-assert(buttons().every((button) => button.disabled));
-sent[0].reply(200, {ok: true, status: 200, models: [{id: 'model-one', label: 'First model'},
-  {id: 'model-two', label: '<script>plain text</script>'}]});
+type('apiModelName','A newer local name');
+sent[2].reply(200,{connection,...listing([connection])});
 await settle();
-assert.equal($('apiModelId').disabled, false);
-assert.equal($('apiModelId').value, 'model-one');
-assert.deepEqual($('apiModelId').options.map((option) => [option.value, option.textContent]),
-  [['model-one', 'First model'], ['model-two', '<script>plain text</script>']]);
-assert.equal($('apiModelTestResult').children[0].textContent, 'Loaded 2 models.');
-$('apiModelId').value = 'model-two';
-$('apiModelId').onchange();
-$('apiModelTestButton').onclick();
-assert.equal(sent[1].path, '/api-models/test');
-assert.equal(sent[1].body.model, 'model-two');
-sent[1].reply(200, {ok: true, status: 200, model: 'model-two', message: 'The model replied: OK'});
-await settle();
-type('apiModelName', 'My model');
-assert.match($('apiModelTestResult').className, /\bok\b/);
-type('apiModelRequestSource', 'Zephy-TCS-Prover');
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelId').disabled, true);
-assert.match($('apiModelTestResult').className, /\bstale\b/);
-type('apiModelBaseUrl', 'https://other.example/v1');
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelId').disabled, true);
-assert.match($('apiModelTestResult').className, /\bstale\b/);
+assert.equal($('apiModelName').value,'A newer local name');
+assert.equal($('apiModelKey').value,'a-newer-key');
 """)
 
-    def test_api_model_discovery_ignores_results_for_edited_credentials_and_clears_failures(self):
+    def test_older_server_disables_connection_controls(self):
         self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
-type('apiModelBaseUrl', 'https://gateway.lab.example/v1');
-type('apiModelKey', 'sk-discovery-secret');
-$('apiModelLoadButton').onclick();
-type('apiModelKey', 'sk-another-secret');
-sent[0].reply(200, {ok: true, status: 200, models: [{id: 'wrong-account-model', label: 'Old model'}]});
-await settle();
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelId').disabled, true);
-assert.equal($('apiModelTestResult').children[0].textContent, 'Connection details changed');
-$('apiModelLoadButton').onclick();
-sent[1].reply(200, {ok: true, status: 200, models: [{id: 'new-model', label: 'New model'}]});
-await settle();
-assert.equal($('apiModelId').value, 'new-model');
-$('apiModelLoadButton').onclick();
-sent[2].reply(200, {ok: false, status: 401, message: 'Missing API key', models: []});
-await settle();
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelId').disabled, true);
-assert.deepEqual($('apiModelTestResult').children.map((part) => part.textContent), ['Failed · 401', 'Missing API key']);
-$('apiModelLoadButton').onclick();
-sent[3].reply(200, {ok: false, status: 200, models: [], message: 'No models are available for this API key.'});
-await settle();
-assert.equal($('apiModelTestResult').children[0].textContent, 'No models loaded');
-assert.equal($('apiModelTestResult').children[1].textContent, 'No models are available for this API key.');
-$('apiModelLoadButton').onclick();
-sent[4].reply(400, {error: 'The base URL is invalid.'});
-await settle();
-assert.equal($('apiModelTestResult').children[1].textContent, 'The base URL is invalid.');
-assert.equal($('apiModels').getAttribute('aria-busy'), 'false');
-$('apiModelLoadButton').onclick();
-type('apiModelRequestSource', 'Another router source');
-sent[5].reply(200, {ok: true, status: 200, models: [{id: 'old-source-model', label: 'Old source'}]});
-await settle();
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelTestResult').children[0].textContent, 'Connection details changed');
-""")
-
-    def test_api_model_discovery_refreshes_saved_choices_without_exposing_the_saved_key(self):
-        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
-advanced.open = true;
-advanced.listeners.toggle({target: advanced});
-sent[0].reply(200, listing([lab]));
-await settle();
-click(rowButton('edit', lab.id));
-assert.equal($('apiModelId').value, lab.model);
-assert.equal($('apiModelId').disabled, false);
-type('apiModelRequestSource', 'Proof lab');
-assert.equal($('apiModelKey').required, false);
-assert.equal($('apiModelId').value, '');
-$('apiModelLoadButton').onclick();
-assert.deepEqual(sent[1].body, {id: lab.id, format: 'openai', baseUrl: lab.baseUrl,
-  requestSource: 'Proof lab', apiKey: ''});
-sent[1].reply(200, {ok: true, status: 200, models: [{id: lab.model, label: 'Sol'},
-  {id: 'other-model', label: 'Other'}]});
-await settle();
-assert.equal($('apiModelId').value, lab.model);
-assert.equal($('apiModelKey').value, '');
-$('apiModelSaveButton').onclick();
-assert.equal(sent[2].path, '/api-models');
-assert.equal(sent[2].body.requestSource, 'Proof lab');
-assert.equal(sent[2].body.apiKey, '');
-assert.equal(sent[2].body.headerName, undefined);
-const sourced = {...lab, requestSource: 'Proof lab'};
-sent[2].reply(200, {model: sourced, ...listing([sourced])});
-await settle();
-assert.equal($('apiModelRequestSource').value, '');
-click(rowButton('edit', lab.id));
-assert.equal($('apiModelRequestSource').value, 'Proof lab');
-type('apiModelBaseUrl', 'https://other.example/v1');
-$('apiModelLoadButton').onclick();
-assert.equal(sent.length, 3);
-assert.match($('apiModelTestResult').textContent, /^Enter the API key again/);
-$('apiModelCancelButton').onclick();
-assert.equal($('apiModelId').value, '');
-assert.equal($('apiModelId').disabled, true);
-""")
-
-    def test_api_model_manager_explains_an_older_server(self):
-        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
-advanced.open = true;
-advanced.listeners.toggle({target: advanced});
-sent[0].reply(404, {error: 'Not found.'});
-await settle();
-assert.equal($('apiModelsStatus').textContent, 'This TCS Prover server cannot manage API models. Restart TCS Prover to update it.');
-assert.equal($('apiModelCount').textContent, 'Unavailable');
+advanced.open=true; advanced.listeners.toggle({target:advanced});
+sent[0].reply(404,{error:'Not found'}); await settle();
+assert.match($('apiModelsStatus').textContent,/Restart TCS Prover/);
 assert($('apiModelTestButton').disabled && $('apiModelSaveButton').disabled);
+""")
+
+    def test_saved_connection_populates_real_role_source_model_and_effort_controls(self):
+        setup = self.MANAGER_SETUP.replace(
+            "const syncModelMenus = () => [], syncEffortChoices = () => {}, renderRetrievalSettings = () => {}, updateModelSummary = () => {};",
+            r"""
+const renderRetrievalSettings = () => {}, updateModelSummary = () => {};
+const modelProvider = (id) => state.workflow.settings.model_catalog.find((row) => row.id === id)?.provider || 'codex';
+for (const role of ['review','author','critic','writer']) {
+  ui[role+'Source'] = new Select([new Option('Codex CLI','codex')]);
+  ui[role+'Model'] = new Select([new Option('GPT 6.1 Sol','gpt-6.1-sol')]);
+  ui[role+'Effort'] = new Select(['ultra','max','high','low'].map((value) => new Option(value,value)));
+}
+""")
+        self.run_app(self.MENUS + self.MANAGER, setup, r"""
+type('apiModelBaseUrl',connection.baseUrl); type('apiModelKey','secret-api-key');
+$('apiModelSaveButton').onclick();
+const data = listing([connection]);
+data.model_sources.unshift({id:'codex',label:'Codex CLI'}, {id:'claude',label:'Claude CLI'});
+data.model_catalog.unshift({id:'gpt-6.1-sol',label:'GPT 6.1 Sol',provider:'codex',sourceId:'codex'});
+data.model_efforts = {'gpt-6.1-sol':['low','high','max','ultra'], 'api:lab-a':['low','high'], 'api:lab-b':['high','max']};
+sent[0].reply(200,{connection,...data}); await settle();
+assert.deepEqual(ui.authorSource.options.map((o) => o.value), ['codex','claude','api:lab']);
+syncRoleModelMenu('author','api:lab'); syncEffortChoices('author');
+assert.deepEqual(ui.authorModel.options.map((o) => o.value), ['api:lab-a','api:lab-b']);
+assert.equal(ui.authorModel.value,'api:lab-a');
+assert.equal(ui.authorEffort.value,'high');
+assert(ui.authorEffort.options.find((o) => o.value === 'ultra').hidden);
+assert.equal(ui.criticSource.value,'codex');
+ui.authorModel.value='api:lab-b'; syncEffortChoices('author');
+assert.equal(ui.authorEffort.value,'high');
+syncModelMenus(); assert.equal(ui.authorModel.value,'api:lab-b');
 """)
 
 

@@ -54,7 +54,7 @@ def capabilities():
             'requiresDirect': True, 'requiresCodexModels': True}
 
 
-def validate_options(mode='live', cutoff='', *, models=(), research_audits=None,
+def validate_options(mode='live', cutoff='', *, models=(),
                      continuation_source=''):
     """Validate before creating a workspace or starting any model work."""
     if mode not in ('live', 'disabled', 'historical'):
@@ -84,8 +84,6 @@ def validate_options(mode='live', cutoff='', *, models=(), research_audits=None,
     # are excluded: historical isolation exists only for native Codex models.
     if any(runtime.model_provider(model) != runtime.OPENAI_PROVIDER for model in models):
         raise ValueError(runtime.HISTORICAL_CODEX_ONLY)
-    if research_audits and any(model != 'none' for model in research_audits.get('models', [])):
-        raise ValueError('Disable optional research auditors when using historical search.')
     return {'retrievalMode': mode, 'retrievalCutoffUtc': historical_search.utc_text(parsed)}
 
 

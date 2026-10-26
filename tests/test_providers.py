@@ -37,7 +37,8 @@ class RegistryTests(StoreCase):
         first = rows[0]
         self.assertEqual(first, {"id": "gpt-6.1-sol", "label": "GPT 6.1 Sol", "provider": "codex",
                                  "providerLabel": "Codex CLI", "efforts": list(providers.CODEX_EFFORTS),
-                                 "defaultEffort": "max", "supportsFast": True})
+                                 "defaultEffort": "max", "supportsFast": True,
+                                 "sourceId": "codex", "sourceLabel": "Codex CLI"})
         luna = next(row for row in rows if row["id"] == "gpt-6-luna")
         self.assertNotIn("ultra", luna["efforts"])
         for row in rows[4:]:
@@ -53,7 +54,8 @@ class RegistryTests(StoreCase):
         rows = providers.catalog()
         self.assertEqual([row["id"] for row in rows[8:]], [openai["id"], anthropic["id"]])
         row = rows[8]
-        self.assertEqual(row, {"id": openai["id"], "label": "Gateway", "provider": "api", "providerLabel": "API",
+        self.assertEqual(row, {"id": openai["id"], "label": "gpt-x", "provider": "api", "providerLabel": "API",
+                               "sourceId": openai["id"], "sourceLabel": "Gateway", "wireModel": "gpt-x",
                                "efforts": ["low", "medium", "high", "xhigh", "max"], "defaultEffort": "max",
                                "supportsFast": False, "format": "openai", "host": "api.example.com", "hasKey": True})
         self.assertEqual(rows[9]["efforts"], list(providers.CLAUDE_EFFORTS))
@@ -116,10 +118,10 @@ class StoreTests(StoreCase):
             self.assertEqual(stat.S_IMODE(self.store.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(self.store.parent.stat().st_mode), 0o700)
         saved = json.loads(self.store.read_text())
-        self.assertEqual(saved["version"], 1)
+        self.assertEqual(saved["version"], 2)
         entry = saved["models"][0]
         self.assertEqual(set(entry), {"id", "label", "format", "baseUrl", "headerName", "requestSource", "model", "apiKey",
-                                      "createdAt", "updatedAt", "lastTest"})
+                                      "createdAt", "updatedAt", "lastTest", "legacyModelId", "availableModels"})
         self.assertEqual((entry["headerName"], entry["baseUrl"]), ("Authorization", "https://api.example.com/v1"))
 
     def test_defaults_ids_and_bearer_prefix(self):
