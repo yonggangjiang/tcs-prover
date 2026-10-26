@@ -64,6 +64,8 @@ class PromptDefaultsTests(unittest.TestCase):
         old_page = server.empty_state()
         self.edit_yaml("Current")
         body = {**old_page, "statement": "Exact statement", "content": "A proof"}
+        # These legacy entry routes derive their own equivalent stage choices.
+        body.pop("workflowStages", None)
         for launch, roles in ((self.manager.start_job, ("author", "critic", "final")),
                               (self.manager.start_direct_job, ("author", "critic", "final")),
                               (self.manager.start_latex_job, ("final",))):
@@ -124,10 +126,12 @@ const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATE
                       setItem: () => {throw Error('Prompts must not be persisted');}};
 const ui = {promptEditor: {value: '', focus() {this.focused = true;}}, notice: {}, promptEditorLabel: {},
   promptEditorHelp: {}, promptError: {hidden: true},
-  promptTabs: {querySelectorAll: () => []}, skipStatementReview: {checked: false},
+  promptTabs: {querySelectorAll: () => []},
   promptDialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}}};
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
+let workflowStages = {review: true, author: true, critic: true, writing: true};
+const selectedWorkflowStages = () => workflowStages;
 const jobPath = path => path;
 let diskPrompts = defaults;
 const request = async () => ({workflow: {settings: {prompts: diskPrompts}}});
@@ -206,6 +210,22 @@ const checks = `
   savePrompts();
   assert.equal(ui.promptDialog.open, false);
   assert.deepEqual(ui.notice, {});
+
+  // Disabled roles cannot block editing the enabled stage's prompt.
+  workflowStages = {review: true, author: false, critic: false, writing: false};
+  await openPromptEditor();
+  assert.equal(activePrompt, 'review');
+  promptDrafts.author = 'No statement marker';
+  promptDrafts.critic = '';
+  promptDrafts.final = '';
+  ui.promptEditor.value = 'Review enabled stage';
+  savePrompts();
+  assert.equal(ui.promptDialog.open, false);
+  assert.equal(promptValues.review, 'Review enabled stage');
+
+  workflowStages = {review: false, author: false, critic: false, writing: true};
+  await openPromptEditor();
+  assert.equal(activePrompt, 'final');
 })();
 `;
 Promise.resolve(vm.runInNewContext(setup + functions + checks, {assert}))

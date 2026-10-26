@@ -440,9 +440,10 @@ for (const role of ['review', 'author', 'critic', 'writer']) ui[role + 'Model'] 
 ui.retrievalMode.value = 'live';
 ui.retrievalSetting = new Element('section');
 new Element('details').append(ui.retrievalSetting);
-ui.skipStatementReview.checked = true;
+ui.workflowReview.checked = false;
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
+const selectedWorkflowStages = () => ({review:ui.workflowReview.checked,author:true,critic:true,writing:true});
 const chip = (role) => ui[role + 'ModelProvider'];
 const disabledGroups = (role) => ui[role + 'Model'].children.filter((group) => group.disabled).map((group) => group.label);
 """)
@@ -519,10 +520,10 @@ assert.equal(chip('author').dataset.state, '');
 assert.equal(validateRetrievalSettings(), true);
 
 // Without Skip statement review the notice asks for it and still states the rule.
-ui.skipStatementReview.checked = false;
+ui.workflowReview.checked = true;
 renderRetrievalSettings();
 assert.equal(ui.retrievalConfigurationNotice.textContent,
-  `Select Skip statement review under Workflow to start a historical proof job. ${rule}`);
+  `Turn Statement review off to start a historical proof job. ${rule}`);
 """)
 
     FOOTER = [["function updateModelSummary()", "const promptLabels ="]]
@@ -540,6 +541,8 @@ const ui = {
 ui.criticModel.selectedOptions = [{dataset: {short: 'Sol via lab gateway'}}];
 let mode = 'statement';
 const selectedProblemMode = () => mode;
+let stages = {review:true,author:true,critic:true,writing:true};
+const selectedWorkflowStages = () => stages;
 // The words of the summary; each part is held together by no-break spaces and word joiners.
 const text = () => ui.modelSummary.textContent.replace(/\u00a0/g, ' ').replace(/\u2060/g, '');
 """, r"""
@@ -560,12 +563,13 @@ updateModelSummary();
 assert.match(text(), /^Fast for Codex CLI · Standard for others · /);
 assert.match(ui.modelSummary.textContent, /^Fast\u00a0for\u00a0Codex\u00a0CLI\u00a0· Standard/);
 // Fast reaches every role only when all of them run native Codex CLI models.
-ui.skipStatementReview.checked = true;
+stages.review = false;
 for (const role of ['author', 'critic', 'writer']) ui[role + 'Model'] = field('gpt-6-luna');
 updateModelSummary();
 assert.match(text(), /^Fast speed · /);
 // LaTeX polish runs the writer only.
 mode = 'latex';
+stages = {review:false,author:false,critic:false,writing:true};
 ui.writerModel = field('claude-haiku-5-5');
 updateModelSummary();
 assert.equal(text(), 'Standard speed · Fast is Codex CLI only · Detailed activity log · Haiku 5.5/Low writer');

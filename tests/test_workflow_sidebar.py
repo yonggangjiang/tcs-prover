@@ -89,6 +89,38 @@ assert.equal(row('author').attributes['aria-current'], undefined);
 assert.match(text(row('author')), /Ready to start/);
 """)
 
+    def test_each_selected_combination_displays_only_its_stages(self):
+        self.run_sidebar(r"""
+state.trace = []; state.phase = 'prepared'; state.activeNode = ''; state.stage = '';
+for (let mask = 1; mask < 16; mask++) {
+  const stages = Object.fromEntries(['review', 'author', 'critic', 'writing'].map(
+    (name, index) => [name, Boolean(mask & (1 << index))]));
+  state.workflowStages = stages;
+  state.skipStatementReview = !stages.review;
+  renderWorkflow();
+  for (const [stage, node] of Object.entries({review: 'statement_reviewer', author: 'author',
+      critic: 'critic', writing: 'latex_editor'})) {
+    assert.equal(Boolean(row(node)), stages[stage], `${mask}: ${stage}`);
+  }
+  assert.equal(Boolean(row('latex_compile')), stages.writing, `${mask}: compile`);
+  if (!stages.author) assert(!text(ui.workflowNodes).includes('return to Author'));
+}
+""")
+
+    def test_critic_only_rejection_does_not_claim_an_author_handoff(self):
+        self.run_sidebar(r"""
+state.workflowStages = {review: false, author: false, critic: true, writing: false};
+state.activeNode = 'critic'; state.stage = 'critic'; state.phase = 'done';
+state.resultKind = 'needs-revision'; state.error = 'Proof needs revision.';
+state.trace = [{kind: 'critic_result', node: 'critic', outcome: 'needs_revision',
+  report: {verdict: 'reject', bugs: 'Missing argument'}}];
+renderWorkflow();
+assert(row('critic'));
+assert(!row('author'));
+assert.match(text(row('critic')), /Rejected — needs revision/);
+assert(!text(row('critic')).includes('returned to author'));
+""")
+
     def test_rejected_critic_is_not_a_completed_pass_during_author_repair(self):
         self.run_sidebar(r"""
 

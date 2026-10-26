@@ -385,10 +385,10 @@ const ui = {
   reviewEffort: {value: 'max'}, authorEffort: {value: 'max'},
   criticEffort: {value: 'max'}, writerEffort: {value: 'max'},
   speedMode: {value: 'fast'}, reasoningSummary: {value: 'concise'},
-  skipStatementReview: {checked: false}, statementReviewOnly: {checked: false},
   modelSummary: {textContent: ''},
 };
 const selectedProblemMode = () => 'statement';
+const selectedWorkflowStages = () => ({review: true, author: true, critic: true, writing: true});
 `;
 const checks = `
 // Each part keeps its words together (no-break spaces, a word joiner after a hyphen); a line
@@ -595,11 +595,13 @@ const stub = () => ({classList: {toggle() {}}, setAttribute() {}, focus() {}, re
 
 function load() {
   const elements = Object.fromEntries(Object.entries(fixture.selects).map(([id, rows]) => [id, select(rows)]));
-  elements.problemModes = [{value: 'statement', checked: true}, {value: 'latex', checked: false}];
+  for (const id of ['workflowReview', 'workflowAuthor', 'workflowCritic', 'workflowWriting']) {
+    (elements[id] ||= stub()).checked = true;
+  }
   const ui = new Proxy(elements, {get(target, name) { return target[name] ??= stub(); }});
   const slice = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
   const code = slice('function retrievalConfiguration(', 'function renderJobs(')
-    + slice('function selectedProblemMode(', 'const promptLabels =')
+    + slice('function selectedWorkflowStages(', 'const promptLabels =')
     + slice('function render(next)', 'async function refresh()');
   const handlers = slice('for (const role of ["review", "author", "critic", "writer"]) {', 'ui.speedMode.onchange');
   const setup = `

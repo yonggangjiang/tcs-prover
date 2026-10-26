@@ -28,7 +28,8 @@ class Element {
   focus() { this.focused = true; }
 }
 const elements = {}, ui = new Proxy(elements, {get:(target,key) => target[key] ||= new Element()});
-ui.retrievalMode.value = 'live'; ui.skipStatementReview.checked = true;
+ui.retrievalMode.value = 'live'; ui.workflowReview.checked = false;
+ui.workflowAuthor.checked = ui.workflowCritic.checked = ui.workflowWriting.checked = true;
 for (const role of ['author','critic','writer']) ui[role+'Model'].value = 'gpt-6.1-sol';
 const state = {phase:'running',stage:'solve',activeNode:'author',problemMode:'statement',
   runId:'fixture-run',draft:'# A theorem',statement:'A precise theorem',thinkingHours:0,
@@ -40,17 +41,23 @@ let mode = 'statement';
 const sent = [];
 const context = {ui,state,assert,Date,Number,sent,document:{createElement:tag=>new Element(tag)},
   show:(element,visible)=>element.hidden=!visible,selectedProblemMode:()=>mode,
+  selectedWorkflowStages:()=>({review:ui.workflowReview.checked,author:ui.workflowAuthor.checked,
+    critic:ui.workflowCritic.checked,writing:ui.workflowWriting.checked}),
+  workflowStagesFor:()=>({review:ui.workflowReview.checked,author:ui.workflowAuthor.checked,
+    critic:ui.workflowCritic.checked,writing:ui.workflowWriting.checked}),
+  currentJob:'',currentBatch:'',reviewPending:false,jobPath:path=>path,
   promptOverrides:{},stateReceivedAt:Date.now(),describe:()=>null,clockText:()=>'',
   timer:null,jobsTimer:null,clearTimeout:()=>{},promptValues:{final:'Writer prompt'},
   request:async(path,body)=>{sent.push({path,body});return {runId:'created'};},
   adoptJob:()=>{},render:()=>{},
-  setMode:value=>mode=value};
+  setMode:value=>{mode=value;ui.workflowReview.checked=false;
+    ui.workflowAuthor.checked=ui.workflowCritic.checked=value!=='latex';ui.workflowWriting.checked=true;}};
 const selected = source.slice(source.indexOf('function retrievalConfiguration('), source.indexOf('function renderJobs('))
   + source.slice(source.indexOf('function selectedRetrievalMode()'), source.indexOf('// Keep the compact footer'))
   + source.slice(source.indexOf('function describe(entry)'), source.indexOf('function cardIcon('))
   + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('// Show the author and critic/repair cycle.'))
   + source.slice(source.indexOf('function proofJobSettings()'), source.indexOf('// Read files directly'))
-  + source.slice(source.indexOf('async function startLatexOnly()'), source.indexOf('async function act('));
+  + source.slice(source.indexOf('async function startReview('), source.indexOf('// Create errors follow'));
 Promise.resolve(vm.runInNewContext(selected + '\n(async()=>{' + process.argv[2] + '})()', context))
   .catch(error=>{console.error(error);process.exitCode=1;});
 """
@@ -130,10 +137,10 @@ for (const value of ['', '2020-01-01','2020-01-01T00:00:00','2020-02-30T00:00:00
     def test_direct_codex_only_validation_does_not_silently_change_selected_models(self):
         self.browser(r"""
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value='2020-01-01T00:00:00Z';
-ui.skipStatementReview.checked=false;
+ui.workflowReview.checked=true;
 assert.equal(validateRetrievalSettings(),false);
-assert(validateRetrievalSettings({folder:true}));
-ui.skipStatementReview.checked=true;
+assert.equal(validateRetrievalSettings({folder:true}),false);
+ui.workflowReview.checked=false;
 // Web cutoff timestamps need native Codex CLI models: not Claude CLI models, not API models.
 for (const model of ['claude-opus-5-5','api:lab-sol']) {
   ui.criticModel.value=model;ui.criticModel.focused=false;
@@ -150,7 +157,7 @@ ui.criticModel.value='gpt-6.1-sol';assert(validateRetrievalSettings());
         self.browser(r"""
 delete state.retrievalCapabilities;
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value=' -1 ';
-ui.skipStatementReview.checked=false;ui.criticModel.value='claude-opus-5-5';
+ui.workflowReview.checked=true;ui.criticModel.value='claude-opus-5-5';
 renderRetrievalSettings();
 assert(!ui.retrievalCutoffSetting.hidden);assert(!ui.retrievalCutoffUtc.disabled);
 assert.equal(proofJobSettings().retrievalMode,'disabled');
@@ -162,7 +169,7 @@ for (const mode of ['statement','latex']) {
   assert.equal(proofJobSettings().retrievalCutoffUtc,'-1');
   assert(validateRetrievalSettings());
 }
-setMode('statement');ui.statementReviewOnly.checked=true;
+setMode('statement');ui.workflowReview.checked=true;ui.workflowAuthor.checked=ui.workflowCritic.checked=ui.workflowWriting.checked=false;
 assert.equal(proofJobSettings().retrievalMode,'disabled');
 assert(validateRetrievalSettings());
 ui.retrievalMode.value='live';
@@ -177,11 +184,11 @@ ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value='2020-01-01T00:0
 setMode('latex');assert.equal(proofJobSettings().retrievalMode,'historical');
 assert.equal(proofJobSettings().retrievalCutoffUtc,'2020-01-01T00:00:00Z');
 assert.equal(validateRetrievalSettings(),false);
-assert.match(ui.notice.textContent,/full proof job/);
-setMode('statement');ui.statementReviewOnly.checked=true;
+assert.match(ui.notice.textContent,/Author stage/);
+setMode('statement');ui.workflowReview.checked=true;ui.workflowAuthor.checked=ui.workflowCritic.checked=ui.workflowWriting.checked=false;
 assert.equal(proofJobSettings().retrievalMode,'historical');
 assert.equal(validateRetrievalSettings(),false);
-assert.match(ui.notice.textContent,/full proof job/);
+assert.match(ui.notice.textContent,/Author stage/);
 """)
 
     def test_new_jobs_default_live_but_saved_modes_restore_without_changing_search_access(self):
@@ -211,19 +218,19 @@ assert.equal(selectedRetrievalMode(),'historical');
 
     def test_latex_start_sends_search_choice_and_blocks_unsupported_historical_dates(self):
         self.browser(r"""
-setMode('latex');ui.latexInput.value='An existing theorem and proof.';
-await startLatexOnly();
-assert.equal(sent.at(-1).path,'/finalize');
+setMode('latex');state.phase='input';ui.problem.value='An existing theorem and proof.';
+await startReview(ui.problem.value);
+assert.equal(sent.at(-1).path,'/start-workflow');
 assert.equal(sent.at(-1).body.retrievalMode,'live');
 assert.equal(sent.at(-1).body.retrievalCutoffUtc,'');
 ui.retrievalMode.value='historical';ui.retrievalCutoffUtc.value='-1';
-await startLatexOnly();
+await startReview(ui.problem.value);
 assert.equal(sent.length,2);
 assert.equal(sent.at(-1).body.retrievalMode,'disabled');
 assert.equal(sent.at(-1).body.retrievalCutoffUtc,'-1');
 ui.retrievalCutoffUtc.value='2020-01-01T00:00:00Z';
-await startLatexOnly();
-assert.equal(sent.length,2);assert.match(ui.notice.textContent,/full proof job/);
+await startReview(ui.problem.value);
+assert.equal(sent.length,2);assert.match(ui.notice.textContent,/Author stage/);
 """)
 
     def test_overview_preserves_zero_unlimited_and_unknown_process_telemetry(self):

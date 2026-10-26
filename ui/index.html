@@ -163,66 +163,35 @@
               <h1 id="composerHeading">New problem</h1>
               <p id="introDescription" class="page-lede">Start with a rough TCS problem. The agent will clarify it,
                 ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
-              <!-- A CSS-only preview of the stages the chosen workflow runs; it follows the options below. -->
-              <ol class="pipeline" aria-label="Stages this workflow runs">
-                <li class="pipe-step pipe-review">Statement review</li>
-                <li class="pipe-step pipe-approve">Your approval</li>
-                <li class="pipe-step pipe-author">Proof author</li>
-                <li class="pipe-step pipe-critic">Independent critic</li>
-                <li class="pipe-step pipe-latex">LaTeX editor &amp; PDF</li>
-              </ol>
             </div>
           </div>
           <div class="composer card">
-            <fieldset class="problem-mode">
-              <legend>Problem setup</legend>
-              <div class="mode-options">
-                <label class="mode-option">
-                  <input type="radio" name="problemMode" value="statement" checked>
-                  <span class="mode-glyph" aria-hidden="true">∀</span>
-                  <span>
-                    <strong>Statement</strong>
-                    <small>Review and approve a rough problem statement</small>
-                  </span>
-                </label>
-                <label class="mode-option">
-                  <input type="radio" name="problemMode" value="latex">
-                  <span class="mode-glyph mode-glyph-tex" aria-hidden="true">TeX</span>
-                  <span>
-                    <strong>LaTeX polish</strong>
-                    <small>Polish an existing writing only</small>
-                  </span>
-                </label>
-              </div>
-            </fieldset>
             <div id="statementFields" class="field">
-              <label for="problem">Problem statement</label>
+              <label id="problemLabel" for="problem">Problem statement</label>
               <textarea id="problem" rows="8" required
                 placeholder="Paste a theorem, conjecture, lower bound, or algorithmic task…"></textarea>
             </div>
-            <div id="latexFields" class="field" hidden>
-              <label for="latexInput">Writing to polish</label>
-              <textarea id="latexInput" rows="14"
-                placeholder="Paste an AI generated writing…"></textarea>
-            </div>
-            <fieldset class="workflow-options">
+            <fieldset class="workflow-options" aria-describedby="workflowStageHelp">
               <legend>Workflow</legend>
-              <div class="toggle-grid">
-                <label id="skipReviewSetting" class="toggle-card" for="skipStatementReview">
-                  <input id="skipStatementReview" type="checkbox">
-                  <span>
-                    <strong>Skip statement review</strong>
-                    <small>Send the statement directly to the proof author.</small>
-                  </span>
+              <div class="workflow-stage-list">
+                <label class="workflow-stage" for="workflowReview">
+                  <input id="workflowReview" type="checkbox" checked>
+                  <span>Statement review</span>
                 </label>
-                <label id="reviewOnlySetting" class="toggle-card" for="statementReviewOnly">
-                  <input id="statementReviewOnly" type="checkbox">
-                  <span>
-                    <strong>Statement review only</strong>
-                    <small>Check and rewrite the statement, then stop. No proof stages run.</small>
-                  </span>
+                <label class="workflow-stage" for="workflowAuthor">
+                  <input id="workflowAuthor" type="checkbox" checked>
+                  <span>Author</span>
+                </label>
+                <label class="workflow-stage" for="workflowCritic">
+                  <input id="workflowCritic" type="checkbox" checked>
+                  <span>Critic</span>
+                </label>
+                <label class="workflow-stage" for="workflowWriting">
+                  <input id="workflowWriting" type="checkbox" checked>
+                  <span>Writing &amp; polishing</span>
                 </label>
               </div>
+              <p id="workflowStageHelp" class="help">Click any stage to turn it on or off. Selected stages run from left to right.</p>
             </fieldset>
             <details class="advanced">
               <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>Advanced settings</summary>
@@ -492,13 +461,13 @@
               <div class="composer-buttons">
                 <button id="runFolderButton" class="secondary" type="button"
                   aria-describedby="runFolderHelp"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z"/></svg>Run a folder…</button>
-                <button id="checkButton" class="primary" type="button">Check statement</button>
+                <button id="checkButton" class="primary" type="button">Start workflow</button>
               </div>
             </div>
           </div>
           <p id="runFolderHelp" class="help folder-help">
-            Run a folder starts one parallel proof job for each file directly inside the folder
-            you choose, with the settings above, and skips statement review. Any file extension
+            Run a folder starts one parallel job for each file directly inside the folder
+            you choose, using the selected stages and settings above. Any file extension
             is accepted. Hidden files and subfolders are ignored; empty and binary files are
             skipped and listed.
           </p>

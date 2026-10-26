@@ -36,9 +36,9 @@ GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/approach-graph': {'job'},
               '/memory': {'job', 'file', 'version'},
               '/download-tex': {'job'}, '/download-pdf': {'job'}}
-CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize'}
+CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
-                  '/resume-checkpoint', '/continue-stopped', '/approve',
+                  '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',
                   '/set-author-time-limit', '/steer-author',
                   '/stop', '/pause', '/reset', '/clear-trace'}
 # API models belong to the updated controller's installation, not to a job:

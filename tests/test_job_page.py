@@ -31,7 +31,7 @@ const retainTrace = entries => entries;
 const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {};
 const renderBatchNavigation = () => {}, refresh = () => {};
 const restoreRetrievalSettings = () => {}, syncPrompts = () => {}, updateModelSummary = () => {};
-const setProblemMode = () => {}, appendFormattedText = () => {};
+const setProblemMode = () => {}, restoreWorkflowStages = () => {}, appendFormattedText = () => {};
 const checkEdited = () => {};
 const setTimeout = () => ++polls, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 `;

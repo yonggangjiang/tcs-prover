@@ -3536,7 +3536,8 @@ def load_workflow(path):
     ):
         raise ValueError("A workflow needs named nodes; 'end' is reserved.")
     targets = set(nodes) | {"end"}
-    shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after"}
+    shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after",
+              "workflow_stage", "skip"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff"},
         "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features"},
@@ -3549,6 +3550,10 @@ def load_workflow(path):
         kind = node["run"]
         if not isinstance(kind, str) or kind not in specific or set(node) - (shared | specific[kind]):
             raise ValueError(f"Unsupported operation or fields in node {name}.")
+        if "workflow_stage" in node or "skip" in node:
+            if (node.get("workflow_stage") not in WORKFLOW_STAGES
+                    or not isinstance(node.get("skip"), str) or node["skip"] not in targets):
+                raise ValueError(f"Node {name} needs a valid workflow_stage and skip target.")
         reference = node.get("prompt")
         references = [] if kind == "command" else [reference]
         if isinstance(reference, dict):
@@ -3692,14 +3697,71 @@ def _settings(node, options):
     }
 
 
+WORKFLOW_STAGES = ("review", "author", "critic", "writing")
+
+
+def normalize_workflow_stages(value=None):
+    """The four application stages are enabled unless explicitly deselected."""
+
+    if value is None:
+        return dict.fromkeys(WORKFLOW_STAGES, True)
+    if not isinstance(value, dict) or any(
+        name not in WORKFLOW_STAGES or type(enabled) is not bool
+        for name, enabled in value.items()
+    ):
+        raise ValueError("Workflow stages must map review, author, critic and writing to enabled or disabled.")
+    stages = {**dict.fromkeys(WORKFLOW_STAGES, True), **value}
+    if not any(stages.values()):
+        raise ValueError("Enable at least one workflow stage.")
+    return stages
+
+
+def _stage_enabled(node, options):
+    name = node.get("workflow_stage")
+    return name is None or normalize_workflow_stages(options.get("workflow_stages"))[name]
+
+
+def _selected_entry(nodes, current, options):
+    """Follow declared skip edges without executing disabled nodes or their actions."""
+
+    skipped = set()
+    while current != "end" and not _stage_enabled(nodes[current], options):
+        if current in skipped:
+            raise ValueError("Disabled workflow stages form a cycle without an enabled step.")
+        skipped.add(current)
+        current = nodes[current]["skip"]
+    return current
+
+
+def _node_prompt_names(node):
+    reference = node.get("prompt")
+    names = {reference} if isinstance(reference, str) else {
+        reference[key] for key in ("then", "else")
+    } if isinstance(reference, dict) else set()
+    instructions = node.get("instructions", [])
+    names.update([instructions] if isinstance(instructions, str) else instructions)
+    lifecycle = node.get("lifecycle", {})
+    names.update(lifecycle if isinstance(lifecycle, list) else lifecycle.values())
+    if node.get("recovery"):
+        names.add(node["recovery"]["prompt"])
+    if node.get("parallel"):
+        names.update(_node_prompt_names(node["parallel"]))
+    return names
+
+
 def prepare(workflow, options):
     """Resolve prompt overrides and validate every node before starting any model."""
 
+    normalize_workflow_stages(options.get("workflow_stages"))
+    enabled = [node for node in workflow["nodes"].values() if _stage_enabled(node, options)]
+    active_prompts = set().union(*(_node_prompt_names(node) for node in enabled))
+    inactive_prompts = set().union(*(_node_prompt_names(node) for node in workflow["nodes"].values())) - active_prompts
     prompts = dict(workflow["prompts"])
-    prompts.update(options.get("prompts", {}))
+    prompts.update({name: value for name, value in options.get("prompts", {}).items()
+                    if name in prompts and name not in inactive_prompts})
     if not all(isinstance(value, str) and value.strip() for value in prompts.values()):
         raise ValueError("Prompt overrides must be nonempty strings.")
-    for node in workflow["nodes"].values():
+    for node in enabled:
         if node["run"] == "command":
             continue
         settings = _settings(node, options)
@@ -4156,8 +4218,9 @@ def _apply_actions(actions, context, stage, revision):
             emit(fields.pop("kind"), fields.pop("stage", stage), **fields)
 
 
-def _complete_node(node, state, result, raw, visit, revision):
-    context = {"state": state, "result": result, "raw": raw, "visit": visit}
+def _complete_node(node, state, result, raw, visit, revision, options=None):
+    context = {"state": state, "result": result, "raw": raw, "visit": visit,
+               "stages": normalize_workflow_stages((options or {}).get("workflow_stages"))}
     try:
         for condition in node.get("require", []):
             if not evaluate(condition, context):
@@ -4266,6 +4329,9 @@ def _execute(workflow, state, options, prompts):
     current, visits, revision = options.get("start_node", next(iter(nodes))), 0, 0
     if current not in nodes:
         raise ValueError(f"Unknown workflow entry node: {current!r}.")
+    current = _selected_entry(nodes, current, options)
+    if current == "end":
+        return state
     sessions, revisions, launchers = {}, {}, {}
     options.setdefault("_workflow_started", _now())
     retry_clock(options)
@@ -4279,6 +4345,14 @@ def _execute(workflow, state, options, prompts):
             visits += 1
             emit("status", node.get("stage", current), label=f"Workflow step: {current}",
                  node=current, visit=visits)
+            if (node.get("workflow_stage") == "writing" and node["run"] == "structured"
+                    and "solution" in node.get("inputs", {})):
+                candidate = evaluate(node["inputs"]["solution"], {"state": state, "visit": visits})
+                statement = state.get("statement")
+                if isinstance(statement, str) and statement.strip() and isinstance(candidate, str) and candidate.strip():
+                    save_final_input(statement, candidate)
+                    emit("final_input", node.get("stage", current), node=current,
+                         label="Exact writing input saved")
             input_files = _prepare_node_files(node, state, visits, options.get("goal_cwd"),
                                               resolve_reference=visits == 1)
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
@@ -4334,7 +4408,7 @@ def _execute(workflow, state, options, prompts):
                     result = _goal_step(sessions, current, launch, instruction, options,
                                         lambda session: session.send(feedback), node.get("stage", current))
                 raw = ""
-            context = _complete_node(node, state, result, raw, visits, revision)
+            context = _complete_node(node, state, result, raw, visits, revision, options)
             branch = node["next"][context["outcome"]]
             target = branch
             if isinstance(branch, dict):
@@ -4349,7 +4423,7 @@ def _execute(workflow, state, options, prompts):
                     _apply_actions(branch.get("after", []), context, node.get("stage", current), revision)
             if target != current:
                 visits = 0
-            current = target
+            current = _selected_entry(nodes, target, options)
         return state
     except Exception as exc:
         if not isinstance(exc, WorkflowPaused) and node["run"] != "goal":
@@ -4371,19 +4445,57 @@ def _execute(workflow, state, options, prompts):
 def execute(path, state=None, *, options=None):
     """Execute any graph in the documented format; no node-name dispatch."""
 
-    workflow = load_workflow(path)
-    options = {} if options is None else options
-    state = {} if state is None else state
-    prompts = prepare(workflow, options)
-    state.pop("paused", None)
-    state.pop("failed", None)
-    return _execute(workflow, state, options, prompts)
+    return execute_workflows([path], {} if state is None else state, options)
+
+
+def _capture_unreviewed_proof(workflow, state, options):
+    """A skipped critic must still pass complete author text to later stages."""
+
+    stages = normalize_workflow_stages(options.get("workflow_stages"))
+    if stages["critic"] or not any(node.get("workflow_stage") == "author" and _stage_enabled(node, options)
+                                    for node in workflow["nodes"].values()):
+        return
+    for node in workflow["nodes"].values():
+        handoff = node.get("proof_handoff")
+        if not handoff or _stage_enabled(node, options):
+            continue
+        candidate = state.get(handoff["candidate"])
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise Error("The proof author returned no complete proof.")
+        try:
+            snapshot = proof_handoff.resolve_author_proof(candidate, options.get("goal_cwd") or Path.cwd())
+        except proof_handoff.ProofHandoffError as exc:
+            raise Error(f"Cannot read the author's submitted proof: {exc}") from exc
+        if snapshot is not None:
+            candidate = snapshot.text
+        state[handoff["candidate"]] = state["output"] = candidate
+
+
+def _emit_selected_proof_result(prepared, state, options):
+    stages = normalize_workflow_stages(options.get("workflow_stages"))
+    proof_stages = {node.get("workflow_stage") for workflow, _, _ in prepared
+                    for node in workflow["nodes"].values() if _stage_enabled(node, options)} & {"author", "critic"}
+    if (stages["writing"] or not proof_stages or state.get("failed") or state.get("paused")):
+        return
+    output = state.get("output") or state.get("solution", "")
+    if not isinstance(output, str) or not output.strip():
+        raise Error("The selected proof stages returned no complete output.")
+    state["output"] = output
+    state["resultKind"] = "proof"
+    emit("final_result", "critic" if "critic" in proof_stages else "solve",
+         label="Proof result", resultKind="proof", text=output, output=output)
 
 
 def execute_workflows(paths, state, options=None):
     """Validate once, then feed state through the graphs until one reports failure."""
 
     options = {} if options is None else dict(options)
+    normalize_workflow_stages(options.get("workflow_stages"))
+    if "input_solution" in options:
+        candidate = options["input_solution"]
+        if not isinstance(candidate, str) or not candidate.strip() or "\0" in candidate:
+            raise ValueError("The supplied candidate must be nonempty text without NUL characters.")
+        state["solution"] = candidate
     options.setdefault("_workflow_started", _now())
     # Every graph of the chain shares one budget, retry waits included.
     retry_clock(options)
@@ -4400,10 +4512,13 @@ def execute_workflows(paths, state, options=None):
     # describe the earlier run and must not end this one after its first graph.
     state.pop("paused", None)
     state.pop("failed", None)
+    state.pop("revisionRequired", None)
     for workflow, prompts, local_options in prepared:
         _execute(workflow, state, local_options, prompts)
         if state.get("failed") or state.get("paused"):
             break
+        _capture_unreviewed_proof(workflow, state, local_options)
+    _emit_selected_proof_result(prepared, state, options)
     return state
 
 
@@ -4416,7 +4531,7 @@ def _builtin_node(workflow_name, node_name, state, options, visit=1, prompts=Non
     input_files = _prepare_node_files(node, state, visit, options.get("goal_cwd"))
     _apply_actions(node.get("before", []), {"state": state, "visit": visit}, node.get("stage", "model"), 0)
     result, raw = _model_call(node, resolved, state, options, visit, input_files=input_files)
-    _complete_node(node, state, result, raw, visit, 0)
+    _complete_node(node, state, result, raw, visit, 0, options)
     return result
 
 

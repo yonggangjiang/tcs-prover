@@ -565,7 +565,7 @@ textarea {
   resize: vertical;
   font: var(--text-base)/1.6 var(--font-sans);
 }
-#latexInput, #promptEditor { font: var(--text-sm)/1.7 var(--font-mono); }
+#promptEditor { font: var(--text-sm)/1.7 var(--font-mono); }
 /* Editable statements: a calm sans with room between lines; ASCII math stays exact while editing. */
 #problem, #proposed { font: 400 var(--text-md)/1.72 var(--font-sans); letter-spacing: 0.002em; }
 select {
@@ -1825,8 +1825,8 @@ kbd {
 /* New problem composer. */
 .models-head { display: none; }
 .composer { padding: var(--space-6); }
-.problem-mode, .workflow-options, .settings-group { min-width: 0; margin: 0; padding: 0; border: 0; }
-.problem-mode legend, .workflow-options legend {
+.workflow-options, .settings-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.workflow-options legend {
   margin-bottom: 8px;
   padding: 0;
   color: var(--ink-3);
@@ -1835,78 +1835,20 @@ kbd {
   letter-spacing: var(--label-tracking);
   text-transform: var(--label-transform);
 }
-.mode-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-.toggle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.mode-option, .toggle-card {
-  position: relative;
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  margin: 0;
-  padding: 12px 40px 12px 14px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-lg);
-  background: var(--tint);
-  font-weight: 400;
-  cursor: pointer;
-  transition: border-color var(--fast), background-color var(--fast);
-}
-.mode-option:hover, .toggle-card:hover { border-color: var(--field-line); background-color: var(--tint-2); }
-/* Selected: the theme's selection hairline around the card (the control inside carries the fill). */
-.mode-option:has(input:checked), .toggle-card:has(input:checked) { border-color: var(--selected-line); background: var(--selected-bg); }
-.mode-option:has(input:focus-visible), .toggle-card:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
-.mode-option input:focus-visible, .toggle-card input:focus-visible { outline: none; }
-.mode-option > input, .toggle-card > input:not([role="switch"]) { position: absolute; top: 13px; right: 13px; margin: 0; }
-.mode-option span, .toggle-card span { display: block; color: var(--ink); font-weight: inherit; }
-.mode-option strong, .toggle-card strong { display: block; font-size: var(--text-sm); font-weight: 650; }
-.mode-option small, .toggle-card small { display: block; margin-top: 2px; color: var(--ink-2); font-size: var(--text-xs); line-height: 1.45; }
-.mode-option { align-items: center; }
-.mode-option .mode-glyph {
-  display: grid;
-  flex: none;
-  width: 36px;
-  height: 36px;
-  place-items: center;
-  border: 1px solid var(--line-strong);
-  border-radius: 9px;
-  color: var(--ink-2);
-  background: var(--tint-2);
-  font: 500 19px/1 var(--font-math);
-  transition: background-color var(--fast), color var(--fast), border-color var(--fast);
-}
-.mode-option .mode-glyph-tex { font-size: 13px; font-weight: 600; letter-spacing: -0.03em; }
-.mode-option:has(input:checked) .mode-glyph { border-color: var(--field-line); color: var(--ink); background: var(--tint-3); }
-.switch-card { justify-content: space-between; padding-right: 14px; }
-.switch-card input[role="switch"] {
-  position: relative;
-  flex: 0 0 38px;
-  width: 38px;
-  height: 22px;
-  margin: 0;
-  border: 1px solid var(--field-line);
-  border-radius: var(--radius-pill);
-  background: var(--tint-2);
-  cursor: pointer;
-  appearance: none;
-  transition: background-color var(--fast), border-color var(--fast);
-}
-.switch-card input[role="switch"]::before {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--ink-3);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.2);
-  content: "";
-  transition: transform var(--medium) var(--ease), background-color var(--fast);
-}
-.switch-card input[role="switch"]:checked { border-color: var(--control-fill); background: var(--control-fill); }
-.switch-card input[role="switch"]:checked::before { background: var(--on-control); transform: translateX(16px); }
 .field { margin-top: var(--space-5); }
 .workflow-options { margin-top: var(--space-5); }
-.workflow-options:not(:has(.toggle-card:not([hidden]))) { display: none; }
+.workflow-stage-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; }
+.workflow-stage { position: relative; display: flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 52px; margin: 0; padding: 10px; border: 1px dashed var(--line-strong); border-radius: var(--radius-md);
+  color: var(--ink-2); background: var(--surface-sunken); font-size: var(--text-sm); cursor: pointer; }
+.workflow-stage:has(input:checked) { color: var(--ink); border: 1px solid var(--selected-line); background: var(--selected-bg); }
+.workflow-stage:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.workflow-stage input { flex: none; margin: 0; accent-color: var(--control-fill); }
+.workflow-stage:not(:last-child)::after { position: absolute; right: -17px; color: var(--ink-3); content: "→"; pointer-events: none; }
+@media (max-width: 700px) {
+  .workflow-stage-list { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .workflow-stage::after { display: none; }
+}
 .run-context > summary, .statement-panel > summary, .run-result > summary,
 .advanced > summary, .memory-section > summary, .retrieval-details > summary {
   display: flex;
@@ -2074,71 +2016,10 @@ kbd {
   html:has(#inputPanel:not([hidden])) { scroll-padding-bottom: calc(var(--composer-footer-h, 80px) + var(--space-3)); }
 }
 
-/* The stages the chosen workflow will run, numbered by CSS and following the options below. */
-.pipeline {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 0;
-  margin: var(--space-4) 0 0;
-  padding: 0;
-  counter-reset: stage;
-  list-style: none;
-}
-.pipe-step {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 28px;
-  padding: 3px 12px 3px 4px;
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-pill);
-  color: var(--ink);
-  background: var(--surface);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  counter-increment: stage;
-  white-space: nowrap;
-}
-.pipe-step::before {
-  display: grid;
-  min-width: 22px;
-  height: 20px;
-  padding: 0 4px;
-  place-items: center;
-  border-radius: var(--radius-pill);
-  color: var(--ink-2);
-  background: var(--tint-2);
-  content: counter(stage, decimal-leading-zero);
-  font: 600 var(--text-xs)/1 var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
-.pipe-step + .pipe-step { margin-left: 24px; }
-.pipe-step + .pipe-step::after {
-  position: absolute;
-  top: calc(50% - 0.5px);
-  left: -21px;
-  width: 18px;
-  height: 1px;
-  background: var(--line-strong);
-  content: "";
-}
-/* The human step is set apart by a dashed outline, not by colour. */
-.pipe-approve { border-style: dashed; border-color: var(--field-line); }
-.input-view:has(input[name="problemMode"][value="statement"]:checked):has(#skipStatementReview:checked) :is(.pipe-review, .pipe-approve),
-.input-view:has(input[name="problemMode"][value="statement"]:checked):has(#statementReviewOnly:checked) :is(.pipe-approve, .pipe-author, .pipe-critic, .pipe-latex),
-.input-view:has(input[name="problemMode"][value="latex"]:checked) :is(.pipe-review, .pipe-approve, .pipe-author, .pipe-critic) { display: none; }
-/* Whichever step comes first once the others are dropped carries no connector. */
-.input-view:has(input[name="problemMode"][value="statement"]:checked):has(#skipStatementReview:checked) .pipe-author,
-.input-view:has(input[name="problemMode"][value="latex"]:checked) .pipe-latex { margin-left: 0; }
-.input-view:has(input[name="problemMode"][value="statement"]:checked):has(#skipStatementReview:checked) .pipe-author::after,
-.input-view:has(input[name="problemMode"][value="latex"]:checked) .pipe-latex::after { display: none; }
-
-/* Models & API (?new=1#models): the composer's model, provider and prompt settings on their own page. */
+/* Models & API settings use the composer's source and model controls on their own page. */
 [data-view="models"] .models-head { display: flex; }
 [data-view="models"] :is(.composer-head, #runFolderHelp),
-[data-view="models"] .composer > :is(.problem-mode, #statementFields, #latexFields, .workflow-options, .composer-actions),
+[data-view="models"] .composer > :is(#statementFields, .workflow-options, .composer-actions),
 [data-view="models"] .advanced > summary,
 [data-view="models"] .advanced-body > :is(#retrievalSetting, .limits-group) { display: none !important; }
 [data-view="models"] .composer { padding: 0; border: 0; background: none; }
@@ -3557,7 +3438,6 @@ kbd {
 }
 @media (max-width: 899px) {
   .review-grid { grid-template-columns: minmax(0, 1fr); }
-  .toggle-grid { grid-template-columns: minmax(0, 1fr); }
   .review-notes { max-height: none; }
 }
 /* Phones and narrow tablets: the sidebar is an off-canvas drawer over a backdrop. */
@@ -3596,7 +3476,7 @@ kbd {
   }
   /* 16px fields: iOS does not zoom the page when one takes focus. */
   html body :is(input:is([type="text"], [type="number"], [type="url"], [type="password"], [type="search"]), select, textarea),
-  #latexInput, #promptEditor, #problem, #proposed { font-size: var(--text-edit); }
+  #promptEditor, #problem, #proposed { font-size: var(--text-edit); }
   .work-pane { padding-top: var(--space-2); padding-bottom: var(--space-12); }
   .page-head { flex-direction: column; align-items: stretch; gap: var(--space-4); margin-bottom: var(--space-5); }
   .page-head > button { align-self: flex-start; }
@@ -3610,11 +3490,6 @@ kbd {
   /* The batch filter: its six segments in two rows of three, all in view. */
   .seg-filter { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
   .seg { justify-content: center; min-width: 0; padding-inline: 6px; white-space: nowrap; }
-  .pipeline { gap: 6px; margin-top: var(--space-4); }
-  .pipe-step { min-height: 26px; padding: 2px 10px 2px 3px; }
-  .pipe-step::before { min-width: 20px; height: 19px; }
-  .pipe-step + .pipe-step { margin-left: 0; }
-  .pipe-step + .pipe-step::after { display: none; }
   .advanced > summary::before { display: none; }
   .composer, .run-now, .review-view { padding: var(--space-4); }
   .model-grid, .field-grid, .api-model-fields { grid-template-columns: minmax(0, 1fr); }
@@ -3632,7 +3507,6 @@ kbd {
   .model-setting { grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); grid-template-rows: none; row-gap: 0; }
   .model-setting > label { margin-top: 12px; margin-bottom: 4px; }
   .model-setting .provider-chip { margin-top: 8px; }
-  .mode-options { grid-template-columns: minmax(0, 1fr); }
   #problem { height: 10rem; }
   .composer-actions { flex-direction: column; align-items: stretch; }
   .composer-buttons { flex-direction: column-reverse; }
@@ -3859,9 +3733,8 @@ kbd {
 @media (forced-colors: active) {
   .page-head h1, .job-title, .loop-title { color: CanvasText; }
   .status-pill, .badge, .chip, .job-status, .batch-progress span, .approach-status, .provider-chip, .format-chip,
-  .status-chip, .pipe-step, .nav-badge { border: 1px solid CanvasText; }
+  .status-chip, .workflow-stage, .nav-badge { border: 1px solid CanvasText; }
   input[type="checkbox"]:not([role="switch"]), input[type="radio"] { appearance: auto; }
-  .switch-card input[role="switch"] { border: 1px solid CanvasText; }
   .segment input:checked + span, .seg[aria-pressed="true"], .theme-card[aria-checked="true"],
   .mode-choice[aria-checked="true"], .filter.active { outline: 2px solid Highlight; }
   .nav-item[aria-current] { outline: 2px solid Highlight; }

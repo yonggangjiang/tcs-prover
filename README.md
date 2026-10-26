@@ -270,7 +270,7 @@ every node.
 | On | UTC timestamp, e.g. `2026-10-02T14:13:12Z` | Author can search and read verified archives strictly before that instant. |
 
 A timestamp cutoff currently requires macOS; elsewhere only Off and `-1` are
-available. For a timestamp cutoff, enable **Skip statement review**, use Codex CLI models for all
+available. For a timestamp cutoff, turn off **Statement review** and use Codex CLI models for all
 proof roles. Before model work, the
 controller saves a separate policy and checks the native sandbox for both author
 and structured roles. A failed check blocks launch. The saved search mode and
@@ -320,12 +320,12 @@ trusted local settings and cannot be supplied by the browser.
 
 ## Run a folder from the Web UI
 
-On the home page choose **New problem**, keep **Statement** mode (with
-**Statement review only** off), click **Run a folder…**, and choose a folder
+On the home page choose **New problem**, select the proof stages you need,
+click **Run a folder…**, and choose a folder
 containing text statements. Any file extension or none is accepted, including
 `.md`, `.txt`, and `.tex`. Each non-empty, top-level text file starts its own
-parallel proof job using the current author, critic, writer, prompt, and
-research-file settings. Statement review is skipped. The browser asks for
+parallel proof job using the selected author, critic, and writing stages and
+their current model and prompt settings. Statement review is skipped. The browser asks for
 confirmation before starting the jobs, each of which uses its own quota. Files
 are read as UTF-8 text. Hidden files (names starting with `.`), the system files
 `Thumbs.db`, `ehthumbs.db`, and `desktop.ini`, and subfolders are ignored; empty
@@ -349,8 +349,8 @@ copied into the file without escaping. Then pass the file directly to
 python3 web_ui.py statement.md
 ```
 
-This sends the entire file directly to the proof author, exactly like enabling
-**Skip statement review** in Statement mode. It does not start an HTTP server or
+This sends the entire file directly to the proof author, exactly like turning
+off **Statement review** and keeping the other three stages on. It does not start an HTTP server or
 open a browser. With no command-line overrides, it uses the same defaults as the
 web UI: a maximum of 2 consecutive edited critic passes, a 168-hour total workflow
 limit, 6.1 Sol and Max for all proof
@@ -629,16 +629,22 @@ public reasoning summaries retained by TCS Prover, not private chain-of-thought.
 They read incrementally, so even very large transcripts do not need to fit in
 memory.
 
-Choose **Statement** to review or edit a rough problem before approval. Include
-the computational model, problem description, and asymptotic goal in the
-statement for algorithmic tasks. Choose **LaTeX polish** to edit an existing
-theorem and proof with a single editor call.
+The new-problem form has four independent stages: **Statement review**,
+**Author**, **Critic**, and **Writing & polishing**. All are on by default;
+click a stage to turn it off or on, keeping at least one selected. Selected
+stages run in that order. Include the computational model, problem description,
+and asymptotic goal in the statement for algorithmic tasks. With **Author** off,
+include the complete candidate proof in your input for the critic or writer.
+
+Select only **Statement review** to check a problem without proving it, only
+**Author** to obtain a candidate proof, only **Critic** to check and repair an
+existing proof, or only **Writing & polishing** to polish and compile an existing
+theorem and proof. Author followed by writing also works with the critic off.
+Disabled stages make no model requests and require no model settings or credentials.
+
 **Advanced settings** control each node's model, reasoning effort, prompt, public activity-log
 detail, time limit, and critic-round limit. The log can show status
-only or request concise or detailed model-generated summaries. Under **Workflow**, **Statement review only** runs just the
-reviewer, saves the checked statement and reviewer notes, and finishes without
-starting the proof author, critic, or LaTeX editor. This option and **Skip
-statement review** are mutually exclusive. Jobs run in parallel. **Prompts &
+only or request concise or detailed model-generated summaries. Jobs run in parallel. **Prompts &
 responses** displays the exact application prompts and returned model text.
 Private records and outputs are stored under `runs/`.
 
@@ -710,6 +716,10 @@ WebFetch tools; the models decide when to search.
 
 ## Workflow
 
+The default selection runs the full workflow below. Turning stages off skips
+them, including their model requests and output steps. A proof run without
+writing returns its complete proof as text rather than a LaTeX document.
+
 ```mermaid
 flowchart TD
     S["Optional statement review"] --> A["Persistent root author"]
@@ -732,7 +742,7 @@ The workflow sidebar shows the active proof stage and the critic repair loop.
 
 This node lets the user start with convenient informal language while preventing
 a model from silently solving a different problem. To use it without requesting
-a proof, enable **Statement review only** under **Workflow**, and submit the
+a proof, select only **Statement review** and submit the
 statement. The completed result remains available to copy from the review page
 and is saved as `checked-statement.md` in that job's run directory. Only the
 reviewer model, reviewer reasoning effort, reviewer prompt, and generation speed
@@ -768,20 +778,22 @@ instructed not to communicate with one another and to report back to the critic.
 The critic considers those reports and repairs the complete argument itself.
 
 If it cannot fix every issue, it returns the latest safely repaired candidate
-and exact unresolved bugs to the author. The author continues the proof task,
-and the rejection resets the consecutive critic-round count.
+and exact unresolved bugs to the author when that stage is enabled. The author
+continues the proof task, and the rejection resets the consecutive critic-round
+count. With the author off, a rejection ends as **Proof needs revision**, preserving
+the candidate and unresolved objections. Writing does not start from a rejected proof.
 
 An unchanged pass accepts immediately. An edited pass sends the latest solution
 to another fresh critic round while below the configured maximum (default 2).
 At that maximum, an edited pass accepts the latest solution and proceeds to
-LaTeX formatting. The setting is a maximum for consecutive edited passes, not
+writing if selected, or returns the proof as text. The setting is a maximum for consecutive edited passes, not
 a requirement to obtain a fixed number of passes. Model review is not formal
 proof verification.
 
 ### 4. LaTeX editing
 
-The editor makes one LLM call with the editing prompt and accepted solution,
-or the supplied `.tex` contents in standalone mode. It returns a JSON object
+The editor makes one LLM call with the editing prompt and the latest proof,
+or the supplied theorem and proof when the author and critic are off. It returns a JSON object
 whose `latex` field contains the complete document. A final compilation node
 runs `latexmk` with `pdflatex`, repeating TeX passes as needed to stabilize
 references. Compiler errors go back to the writer for minor compilation fixes,
@@ -849,8 +861,14 @@ its `command` mapping specifies `argv`, `timeout`, and a `result` state key,
 with optional `cwd`, `env`, `requires` executables, `produces` files, and `log`.
 Transitions can inspect `result.status` (`pass`, `fail`, or `unavailable`) and
 repairs can use `result.output` (the last 24,000 characters of command output).
-Memory-file instructions are plain prompt text. The YAML defines inputs, result checks, state updates, and transitions, including the
+The YAML defines inputs, result checks, state updates, and transitions, including the
 critic's repeat limit.
+
+Bundled nodes declare `workflow_stage: author`, `critic`, or `writing`, plus a
+`skip` target. The `workflow_stages` option skips disabled nodes and their
+actions, prompts, and credential checks. These annotations are optional;
+custom graphs without them execute as defined regardless of stage selection.
+Statement review runs in the UI before these graphs.
 
 A complete custom workflow can be as small as this `summarize.yaml`:
 
@@ -890,6 +908,20 @@ and prompt overrides. `--model` sets the fallback model for any workflow;
 `--set NAME=VALUE` supplies arbitrary named options and accepts JSON values.
 Node `role` settings can use options such as `editor_model` and `editor_effort`.
 
+To run only the author from the bundled graphs:
+
+```bash
+python3 workflow_runner.py workflows/author_critic.yaml workflows/clean_up.yaml \
+  --set 'workflow_stages={"review":false,"author":true,"critic":false,"writing":false}' < statement.md
+```
+
+Omitted stage flags default to enabled. A critic-only run needs the exact
+statement in `state.statement` and the complete candidate in `state.solution`,
+supplied through `--state-file` or the Python API. The `input_solution` option
+can also set that candidate. A rejected critic-only run emits `failure_result`
+with `resultKind: needs-revision` and exits unsuccessfully; a successful proof
+without writing emits `final_result` with `resultKind: proof`.
+
 The CLI initializes `state.input`, `state.statement`, and `state.source` with the
 same input after trimming surrounding whitespace. Chained graphs share state,
 and `state.failed` stops the chain. An optional `goal_pause_file` control path
@@ -897,7 +929,7 @@ also pauses execution when the file exists. Goal sessions pause their native
 goal and interrupt the active turn without an additional model prompt. Pausing emits
 `workflow_paused` with the current node and workflow state, sets `state.paused`,
 and stops the chain without returning a completed proof. The UI persists this
-controller checkpoint separately from the LLM-managed research notebooks.
+controller checkpoint separately from the saved author workspace.
 Output is JSONL events, ending with
 `workflow_result` on success and its
 `output` field from `state.output`. The Python API is

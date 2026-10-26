@@ -2,6 +2,8 @@
 nodes:
   author:
     run: goal
+    workflow_stage: author
+    skip: critic
     role: author
     stage: solve
     prompt: author
@@ -21,6 +23,8 @@ nodes:
 
   critic:
     run: structured
+    workflow_stage: critic
+    skip: end
     role: critic
     stage: critic
     prompt: critic_input
@@ -32,7 +36,7 @@ nodes:
     require:
     - bool(strip(result.solution))
     - "not strip(result.bugs) if result.verdict == 'pass' else bool(strip(result.bugs))"
-    outcome: "'reject' if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
+    outcome: "('reject' if stages.author else 'needs_revision') if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
     before:
     - write: {path: saved-candidate.md, text: state.solution}
     after:
@@ -41,6 +45,11 @@ nodes:
     - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', outcome: '=outcome', text: '{raw}'}
     next:
       reject: author
+      needs_revision:
+        to: end
+        after:
+        - set: {failed: 'True', revisionRequired: 'True', output: state.solution}
+        - emit: {kind: failure_result, label: Proof needs revision, resultKind: needs-revision, text: '=result.bugs', output: '=state.solution', bugs: '=result.bugs'}
       pass:
         to: end
         after:

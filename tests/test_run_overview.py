@@ -172,7 +172,7 @@ state.resultKind = ''; state.output = '';
 renderRunOverview(); assert.equal(completedRunLabel(state), 'Incomplete');
 assert.match(ui.runNextStep.textContent, /No completed answer/);
 state.phase = 'reviewed';
-renderRunOverview(); assert.match(ui.runNextStep.textContent, /Approval is needed/);
+renderRunOverview(); assert.match(ui.runNextStep.textContent, /Approve the statement to continue/);
 `;
 vm.runInNewContext(source.slice(source.indexOf('function retrievalConfiguration('), source.indexOf('function renderJobs('))
   + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function renderWorkflow()')) + checks, context);

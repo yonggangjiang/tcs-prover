@@ -86,7 +86,7 @@ class FolderBatchTests(unittest.TestCase):
                 self.assertEqual(app.state["draft"], item["statement"].strip())
                 self.assertEqual(app.state["sourceFile"], item["name"])
                 self.assertTrue(app.state["skipStatementReview"])
-                self.assertIs(app.state["workflow"], server.DIRECT_GRAPH)
+                self.assertEqual(app.state["workflow"]["nodes"], server.DIRECT_GRAPH["nodes"])
                 self.assertEqual((app.run_dir / "prompts/critic.txt").read_text(), "Shared critic.\n")
                 self.assertTrue((app.run_dir / "checked-statement.md").read_text().startswith(
                     "# Statement sent directly to the proof author"))
@@ -227,12 +227,12 @@ const source = fs.readFileSync(process.argv[1], 'utf8');
 const slice = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
 const code = slice('function selectedRetrievalMode()', '// Keep the compact footer')
   + slice('const promptLabels =', 'function clockText(')
-  + slice('async function startReview(', 'async function startLatexOnly(');
+  + slice('async function startReview(', 'async function act(');
 const setup = `
 let currentJob = '', currentBatch = '', composingProblem = true, activePrompt = 'review', timer, jobsTimer, reviewPending = false;
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {critic: 'Shared critic.'};
 let state = {phase: 'input', workflow: {settings: {}}};
-const values = {authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
+const values = {reviewModel:'gpt-6.1-sol',reviewEffort:'max',authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
   writerModel: 'gpt-5.6-luna', authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
   speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168',
   retrievalMode: 'live', retrievalCutoffUtc: ''};
@@ -241,6 +241,7 @@ const ui = new Proxy({}, {get(target, name) {
 }});
 const show = (element, visible) => { element.hidden = !visible; };
 const selectedProblemMode = () => 'statement';
+const selectedWorkflowStages = () => ({review:false,author:true,critic:true,writing:true});
 const clearTimeout = () => {};
 let questions = [], answer = true, sent = [], failure = null, rendered = null, polled = 0;
 const confirm = question => { questions.push(question); return answer; };
@@ -279,7 +280,7 @@ const checks = `
   assert.equal(questions.length, 1);
   assert.match(questions[0], /^Start 6 parallel jobs\\? Each runs the selected workflow and uses its own quota\\./);
   assert.match(questions[0], /Folder: statements\\n/);
-  assert.match(questions[0], /statement review is skipped/);
+  assert.match(questions[0], /selected stages/);
   assert.match(questions[0], /Skipped 1 empty file: empty\\.md\\./);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].path, '/direct-batch');
@@ -288,6 +289,7 @@ const checks = `
   assert.equal(body.statements[0].statement, 'Extensionless statement.');
   assert.deepEqual(body, {
     statements: body.statements,
+    workflowStages:{review:false,author:true,critic:true,writing:true}, reviewModel:'gpt-6.1-sol',reviewEffort:'max',
     authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol', writerModel: 'gpt-5.6-luna',
     authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
     promptOverrides: {critic: 'Shared critic.'},

@@ -102,7 +102,6 @@ const ui = {
   notice: $("notice"), problem: $("problem"), proposed: $("proposed"),
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
-  latexFields: $("latexFields"), latexInput: $("latexInput"),
   feedback: $("feedback"), notes: $("notes"), editHint: $("editHint"),
   reviewModel: $("reviewModel"), authorModel: $("authorModel"),
   criticModel: $("criticModel"), writerModel: $("writerModel"),
@@ -123,10 +122,9 @@ const ui = {
   retrievalSetting: $("retrievalSetting"), retrievalMode: $("retrievalMode"),
   retrievalCutoffSetting: $("retrievalCutoffSetting"), retrievalCutoffUtc: $("retrievalCutoffUtc"),
   retrievalSettingHelp: $("retrievalSettingHelp"), retrievalConfigurationNotice: $("retrievalConfigurationNotice"),
-  skipReviewSetting: $("skipReviewSetting"),
-  skipStatementReview: $("skipStatementReview"),
-  reviewOnlySetting: $("reviewOnlySetting"),
-  statementReviewOnly: $("statementReviewOnly"),
+  workflowReview: $("workflowReview"), workflowAuthor: $("workflowAuthor"),
+  workflowCritic: $("workflowCritic"), workflowWriting: $("workflowWriting"),
+  workflowStageHelp: $("workflowStageHelp"), problemLabel: $("problemLabel"),
   speedModeSetting: $("speedModeSetting"),
   criticRoundSetting: $("criticRoundSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
@@ -198,9 +196,9 @@ const ui = {
   reviewFeedbackControls: $("reviewFeedbackControls"),
   jobRecovery: $("jobRecovery"),
 };
-ui.problemModes = document.querySelectorAll('input[name="problemMode"]');
 
 let state = {
+  workflowStages: { review: true, author: true, critic: true, writing: true },
   phase: "input", problemMode: "statement", skipStatementReview: false,
   statementReviewOnly: false,
   trace: [], traceVersion: 0,
@@ -407,6 +405,7 @@ function clearJobView() {
   memoryJob = null;
   ui.memoryPanel.open = false;
   state = {
+    workflowStages: { review: true, author: true, critic: true, writing: true },
     phase: "input", problemMode: "statement", skipStatementReview: false,
     statementReviewOnly: false,
     trace: [], traceVersion: 0,
@@ -725,59 +724,65 @@ async function loadJobs() {
   if (!currentJob && !composingProblem && batch === currentBatch) jobsTimer = setTimeout(loadJobs, 2500);
 }
 
+function selectedWorkflowStages() {
+  return { review: ui.workflowReview.checked, author: ui.workflowAuthor.checked,
+    critic: ui.workflowCritic.checked, writing: ui.workflowWriting.checked };
+}
+
+function workflowStagesFor(source = state) {
+  if (source.workflowStages) return source.workflowStages;
+  if (source.statementReviewOnly) return { review: true, author: false, critic: false, writing: false };
+  if (["latex", "final-resume"].includes(source.problemMode)) {
+    return { review: false, author: false, critic: false, writing: true };
+  }
+  return { review: !source.skipStatementReview && !["algorithmic", "critic-resume"].includes(source.problemMode),
+    author: true, critic: true, writing: true };
+}
+
+// Read historical mode names when displaying an older saved job.
 function selectedProblemMode() {
-  return [...ui.problemModes].find((input) => input.checked)?.value || "statement";
+  const stages = selectedWorkflowStages();
+  return stages.writing && !stages.review && !stages.author && !stages.critic ? "latex" : "statement";
+}
+
+function restoreWorkflowStages(source = state) {
+  setWorkflowStages(workflowStagesFor(source));
 }
 
 function setProblemMode(mode) {
-  const latexOnly = mode === "latex";
-  const statement = !latexOnly;
-  mode = latexOnly ? "latex" : "statement";
-  const reviewOnly = statement && ui.statementReviewOnly.checked;
-  if (reviewOnly) ui.skipStatementReview.checked = false;
-  const skipReview = statement && !reviewOnly
-    && ui.skipStatementReview.checked;
-  for (const input of ui.problemModes) input.checked = input.value === mode;
-  show(ui.runFolder, statement && !reviewOnly);
-  show(ui.runFolderHelp, statement && !reviewOnly);
-  show(ui.statementFields, statement);
-  show(ui.latexFields, latexOnly);
-  show(ui.reviewModelSetting, statement && !skipReview);
-  show(ui.authorModelSetting, !latexOnly && !reviewOnly);
-  show(ui.criticModelSetting, !latexOnly && !reviewOnly);
-  show(ui.writerModelSetting, !reviewOnly);
-  show(ui.reviewPromptTab, statement && !skipReview);
-  show(ui.authorPromptTab, !latexOnly && !reviewOnly);
-  show(ui.criticPromptTab, !latexOnly && !reviewOnly);
-  show(ui.finalPromptTab, !reviewOnly);
-  show(ui.skipReviewSetting, statement);
-  show(ui.reviewOnlySetting, statement);
-  show(ui.criticRoundSetting, !latexOnly && !reviewOnly);
-  show(ui.thinkingHoursSetting, !latexOnly && !reviewOnly);
+  setWorkflowStages(mode === "latex" ? { review: false, author: false, critic: false, writing: true }
+    : workflowStagesFor(state));
+}
+
+function setWorkflowStages(stages = selectedWorkflowStages()) {
+  for (const [stage, control] of Object.entries({ review: ui.workflowReview, author: ui.workflowAuthor,
+    critic: ui.workflowCritic, writing: ui.workflowWriting })) control.checked = stages[stage] === true;
+  const roles = { review: stages.review, author: stages.author, critic: stages.critic, writer: stages.writing };
+  const prompts = { review: "review", author: "author", critic: "critic", writer: "final" };
+  for (const [role, enabled] of Object.entries(roles)) {
+    show(ui[`${role}ModelSetting`], enabled);
+    show(ui[`${prompts[role]}PromptTab`], enabled);
+  }
+  show(ui.criticRoundSetting, stages.critic);
+  show(ui.thinkingHoursSetting, stages.author);
+  show(ui.runFolder, Object.values(stages).some(Boolean));
+  show(ui.runFolderHelp, Object.values(stages).some(Boolean));
   show(ui.retrievalSetting, true);
-  ui.problem.required = statement;
-  ui.latexInput.required = latexOnly;
-  ui.check.textContent = latexOnly ? "Polish LaTeX"
-    : reviewOnly ? "Review statement only"
-    : skipReview ? "Start proof author" : "Check statement";
-  ui.introDescription.textContent = latexOnly
-    ? "Provide an existing writing. Only the final LaTeX editor will run."
-    : reviewOnly
-      ? "Check and rewrite the statement, save the result and reviewer notes, then "
-        + "stop without starting the proof author."
-    : skipReview
-      ? "Enter the exact statement to send directly to the proof author, followed "
-        + "by independent proof verification and LaTeX editing."
-      : "Start with a rough TCS problem. The agent will clarify it, ask for approval, "
-        + "solve it, verify the proof, and produce clean LaTeX.";
-  if (reviewOnly && activePrompt !== "review" && ui.promptDialog.open) {
-    selectPrompt("review");
-  } else if (skipReview && activePrompt === "review" && ui.promptDialog.open) {
-    selectPrompt("author");
-  }
-  if (latexOnly && activePrompt !== "final" && ui.promptDialog.open) {
-    selectPrompt("final");
-  }
+  const enabled = Object.values(stages).some(Boolean);
+  const creating = ui.check.dataset.creating === "1";
+  ui.check.disabled = !enabled || creating;
+  if (!creating) ui.check.textContent = "Start workflow";
+  ui.problem.required = true;
+  const existingWork = !stages.author && (stages.critic || stages.writing);
+  ui.problemLabel.textContent = existingWork ? "Statement and existing work" : "Problem statement";
+  ui.problem.placeholder = existingWork ? "Paste the statement and the proof, draft, or writing to work on…"
+    : "Paste a theorem, conjecture, lower bound, or algorithmic task…";
+  ui.workflowStageHelp.textContent = !enabled ? "Select at least one stage to start."
+    : existingWork ? "Selected stages use the existing work above. Click any stage to turn it on or off."
+    : "Click any stage to turn it on or off. Selected stages run from left to right.";
+  ui.introDescription.textContent = "Choose the stages for your problem. Review the statement, develop a proof, check it, and polish the writing.";
+  const first = Object.keys(roles).find((role) => roles[role]);
+  if (ui.promptDialog.open && first && !roles[activePrompt === "final" ? "writer" : activePrompt]) selectPrompt(prompts[first]);
   updateModelSummary();
   renderRetrievalSettings();
 }
@@ -813,7 +818,9 @@ function modelProvider(model) {
 // Web cutoff timestamps run only on native Codex CLI models: not on Claude CLI models and not
 // on API models, even OpenAI-format ones that the Codex CLI runs.
 function cutoffBlockedRoles() {
-  return ["author", "critic", "writer"].filter((role) => modelProvider(ui[`${role}Model`].value) !== "codex");
+  const stages = selectedWorkflowStages();
+  return ["author", "critic", "writer"].filter((role) => stages[role === "writer" ? "writing" : role]
+    && modelProvider(ui[`${role}Model`].value) !== "codex");
 }
 
 // The server's rule word for word, then the roles that still need a Codex CLI model.
@@ -877,13 +884,14 @@ function renderRetrievalSettings() {
     ? "The proof author discovers general web sources through the Codex CLI, then reads verified archived captures before your cutoff. The critic and writer have no external retrieval tools."
     : mode === "disabled" ? "All model web-search tools are disabled. This setting controls search tools; it does not isolate ordinary shell network access."
     : "The model's native web search is enabled without a date restriction.";
+  const stages = selectedWorkflowStages();
   const message = !historical ? ""
-    : selectedProblemMode() === "latex" || ui.statementReviewOnly.checked
-      ? "A historical cutoff requires a full proof job with Skip statement review. For this workflow, use cutoff Off or enter -1 to disable web-search tools."
+    : !stages.author
+      ? "A historical cutoff requires the Author stage. Use cutoff Off or enter -1 to disable web-search tools."
     : capabilities.historicalAvailable !== true
     ? capabilities.reason || "Historical search setup is unavailable in this interface. Open the updated TCS Prover interface to create a historical job."
-    : !ui.skipStatementReview.checked
-      ? `Select Skip statement review under Workflow to start a historical proof job. ${cutoffModelMessage()}`
+    : stages.review
+      ? `Turn Statement review off to start a historical proof job. ${cutoffModelMessage()}`
       : cutoffModelMessage();
   ui.retrievalConfigurationNotice.textContent = message;
   show(ui.retrievalConfigurationNotice, Boolean(message));
@@ -897,8 +905,9 @@ function validateRetrievalSettings({ folder = false } = {}) {
   const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d{1,6})?(?:Z|\+00:00)$/.exec(value);
   const base = match && `${match[1]}T${match[2]}Z`;
   const parsed = base && new Date(base);
-  if (selectedProblemMode() === "latex" || ui.statementReviewOnly.checked) {
-    message = "A historical cutoff requires a full proof job with Skip statement review. For this workflow, use cutoff Off or enter -1 to disable web-search tools.";
+  const stages = selectedWorkflowStages();
+  if (!stages.author) {
+    message = "A historical cutoff requires the Author stage. Use cutoff Off or enter -1 to disable web-search tools.";
     focus = ui.retrievalMode;
   } else if (state.retrievalCapabilities?.historicalAvailable !== true) {
     message = state.retrievalCapabilities?.reason || "This interface cannot create historical jobs. Open the updated TCS Prover interface before starting this job.";
@@ -907,9 +916,9 @@ function validateRetrievalSettings({ folder = false } = {}) {
     message = "Enter -1 to disable web-search tools, or a valid UTC cutoff such as 2026-10-02T14:13:12Z. Include seconds and the UTC timezone.";
   } else if (Date.parse(value) >= Date.now()) {
     message = "Choose a historical cutoff in the past.";
-  } else if (!folder && !ui.skipStatementReview.checked) {
-    message = "Historical search currently requires Skip statement review.";
-    focus = ui.skipStatementReview;
+  } else if (stages.review) {
+    message = "Turn Statement review off to start a historical proof job.";
+    focus = ui.workflowReview;
   } else if (cutoffBlockedRoles().length) {
     message = cutoffModelMessage();
     focus = ui[`${cutoffBlockedRoles()[0]}Model`];
@@ -943,14 +952,9 @@ function updateModelSummary() {
     ultra: "Ultra", max: "Max", xhigh: "Extra high", high: "High", medium: "Medium", low: "Low",
   };
   const role = (select, effort) => `${name(select)}/${efforts[effort.value] || effort.value}`;
-  const mode = selectedProblemMode();
-  const reviewOnly = mode === "statement" && ui.statementReviewOnly.checked;
-  let selectedModels = reviewOnly ? [ui.reviewModel.value]
-    : mode === "latex" ? [ui.writerModel.value]
-    : [ui.authorModel.value, ui.criticModel.value, ui.writerModel.value];
-  if (mode === "statement" && !reviewOnly && !ui.skipStatementReview.checked) {
-    selectedModels.push(ui.reviewModel.value);
-  }
+  const stages = selectedWorkflowStages();
+  const selectedRoles = ["review", "author", "critic", "writer"].filter((role) => stages[role === "writer" ? "writing" : role]);
+  const selectedModels = selectedRoles.map((role) => ui[`${role}Model`].value);
   // Fast is a ChatGPT service tier: only native Codex CLI models (gpt-… ids) run it.
   const fast = selectedModels.filter((model) => /^gpt-/.test(model)).length;
   const speed = ui.speedMode.value === "standard" ? ["Standard speed"]
@@ -961,11 +965,7 @@ function updateModelSummary() {
     concise: "Concise activity log",
     detailed: "Detailed activity log",
   }[ui.reasoningSummary.value] || "Concise activity log";
-  const roles = reviewOnly ? [`${role(ui.reviewModel, ui.reviewEffort)} review only`]
-    : mode === "latex" ? [`${role(ui.writerModel, ui.writerEffort)} writer`]
-    : [...(ui.skipStatementReview.checked ? [] : [`${role(ui.reviewModel, ui.reviewEffort)} review`]),
-      `${role(ui.authorModel, ui.authorEffort)} author`, `${role(ui.criticModel, ui.criticEffort)} critic`,
-      `${role(ui.writerModel, ui.writerEffort)} writer`];
+  const roles = selectedRoles.map((name) => `${role(ui[`${name}Model`], ui[`${name}Effort`])} ${name}`);
   // No-break spaces (and a word joiner after each hyphen of an API model's name) keep each part
   // ("6.1 Sol/Max review") on one line: a wrapped summary breaks only after a "·", so no line
   // starts with one and no model name is split. A part longer than a line still wraps (CSS).
@@ -1042,8 +1042,9 @@ async function openPromptEditor() {
     else if (!promptValues.review) syncPrompts();
     promptDrafts = { ...promptValues };
     promptOriginals = { ...promptValues };
-    activePrompt = selectedProblemMode() === "latex" ? "final"
-      : ui.skipStatementReview.checked ? "author" : "review";
+    const stages = selectedWorkflowStages();
+    activePrompt = ["review", "author", "critic", "writing"].find((name) => stages[name]) || "review";
+    if (activePrompt === "writing") activePrompt = "final";
     selectPrompt(activePrompt);
     ui.promptDialog.showModal();
   } catch (error) {
@@ -1054,9 +1055,11 @@ async function openPromptEditor() {
 
 // The first draft that cannot be applied, as [role, explanation].
 function promptProblem() {
-  const empty = Object.keys(promptDrafts).find((name) => !promptDrafts[name].trim());
+  const stages = selectedWorkflowStages();
+  const enabled = ["review", "author", "critic", "final"].filter((name) => stages[name === "final" ? "writing" : name]);
+  const empty = enabled.find((name) => !promptDrafts[name]?.trim());
   if (empty) return [empty, "Every role prompt must contain instructions."];
-  return (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length === 1
+  return !stages.author || (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length === 1
     ? null : ["author", "The author prompt must contain exactly one [STATEMENT]."];
 }
 
@@ -1950,7 +1953,9 @@ function ingest(entries, reset = false) {
 function completedRunLabel(job) {
   if (job.manuallyStopped) return "Stopped";
   if (job.resultKind === "review" || job.statementReviewOnly) return "Review complete";
+  if (job.resultKind === "needs-revision" || job.revisionRequired) return "Needs revision";
   if (job.resultKind === "failure" || job.error) return "Incomplete";
+  if (job.resultKind === "proof") return "Workflow complete";
   return job.resultKind === "final" || job.canDownloadTex ? "Answer ready" : "Incomplete";
 }
 
@@ -2017,7 +2022,8 @@ function unconfiguredJobModelText(model, role) {
 function jobSettingsWarning() {
   const warning = String(state.settingsWarning || "");
   if (state.readOnly) return warning;
-  const roles = state.statementReviewOnly ? ["review"]
+  const roles = state.workflowStages ? ["review", "author", "critic", "writer"].filter((role) => state.workflowStages[role === "writer" ? "writing" : role])
+    : state.statementReviewOnly ? ["review"]
     : ["latex", "final-resume"].includes(state.problemMode) ? ["writer"]
     : [...(state.skipStatementReview || ["algorithmic", "critic-resume"].includes(state.problemMode) ? [] : ["review"]),
       "author", "critic", "writer"];
@@ -2037,9 +2043,11 @@ function renderRunOverview() {
     : state.phase === "paused" ? "paused"
     : ["reviewed", "prepared"].includes(state.phase) ? "waiting"
     : outcome === "Stopped" ? "stopped"
-    : ["Answer ready", "Review complete"].includes(outcome) ? "done" : "failed";
+    : ["Answer ready", "Review complete", "Workflow complete"].includes(outcome) ? "done" : "failed";
   ui.runOverview.dataset.retrieval = retrievalConfiguration(state).mode;
   const latex = state.problemMode === "latex";
+  const stages = state.workflowStages || {review: !state.skipStatementReview, author: !latex && !state.statementReviewOnly,
+    critic: !latex && !state.statementReviewOnly, writing: !state.statementReviewOnly};
   const original = latex ? state.latexInput : state.draft;
   const statement = (latex ? state.latexInput : state.statement)
     || state.review?.statement || state.reviewStatement || original || "";
@@ -2065,19 +2073,24 @@ function renderRunOverview() {
     : state.phase === "paused" ? "Paused · saved conversation"
     : ["reviewed", "prepared"].includes(state.phase) ? "Waiting for you" : "No active process";
   const nextSteps = {
-    review: "After review, approve the checked statement to start the proof author.",
-    solve: "The author is searching for a complete proof. Its candidate then goes to the independent critic.",
+    review: "After review, approve the checked statement to continue the selected stages.",
+    solve: stages.critic ? "The author is searching for a complete proof. Its candidate then goes to the independent critic."
+      : stages.writing ? "The author is searching for a complete proof. The writing stage will polish its result."
+      : "The author is searching for a complete proof. This workflow finishes with its result.",
     repair: "The author is addressing critic objections. A revised candidate returns to independent review.",
-    critic: "The critic checks the candidate. Rejected proofs return to the author; accepted proofs go to the LaTeX editor.",
+    critic: stages.author ? "The critic checks the candidate. Rejected proofs return to the author."
+      : "The critic checks the supplied work and reports any unresolved errors. The Author stage is off.",
     final: "The accepted proof is being formatted and compiled. Source and PDF downloads appear when compilation succeeds.",
   };
-  let nextStep = state.phase === "reviewed" ? "Statement review finished. Approval is needed before proof search can begin."
+  let nextStep = state.phase === "reviewed" ? "Statement review finished. Approve the statement to continue the selected stages."
     : state.phase === "paused" ? (state.readOnly ? "No final answer yet. This saved job is read-only."
       : "No final answer yet. The work so far is saved.")
     : state.phase === "prepared" ? (state.launchHold || "Start this prepared workspace to begin proof search.")
     : state.phase === "done" ? (state.resultKind === "final" || state.canDownloadTex
       ? "The final answer is saved below. Source and PDF downloads are available for saved artifacts."
       : state.resultKind === "review" ? "The statement review is saved."
+        : state.revisionRequired ? "The supplied work needs revision. The candidate and critic feedback are saved below."
+        : state.output && !state.error && !["failure", "needs-revision"].includes(state.resultKind) ? "The selected workflow stages finished. Their result is saved below."
         : "No completed answer was produced. Saved partial work and checkpoints remain available.")
     : state.statementReviewOnly ? "This job will save the checked statement and reviewer notes, then finish."
     : nextSteps[state.stage] || "Waiting for the next workflow update.";
@@ -2118,10 +2131,10 @@ function renderRunOverview() {
     ["Last event", localDateTime(state.lastActivityAt)],
     ["Finished", state.phase === "done" ? localDateTime(state.finishedAt) : "Not finished"],
     ...(state.sourceFile ? [["Input file", state.sourceFile]] : []),
-    ["Statement reviewer", state.skipStatementReview ? "Skipped" : modelRecord(state.reviewModel, state.reviewEffort || state.reasoningEffort)],
-    ["Proof author", modelRecord(state.authorModel, state.authorEffort || state.reasoningEffort)],
-    ["Independent critic", `${modelRecord(state.criticModel, state.criticEffort || state.reasoningEffort)} · max ${state.criticRounds} consecutive rounds`],
-    ["LaTeX writer", modelRecord(state.writerModel, state.writerEffort || state.reasoningEffort)],
+    ["Statement reviewer", stages.review ? modelRecord(state.reviewModel, state.reviewEffort || state.reasoningEffort) : "Off"],
+    ["Proof author", stages.author ? modelRecord(state.authorModel, state.authorEffort || state.reasoningEffort) : "Off"],
+    ["Independent critic", stages.critic ? `${modelRecord(state.criticModel, state.criticEffort || state.reasoningEffort)} · max ${state.criticRounds} consecutive rounds` : "Off"],
+    ["LaTeX writer", stages.writing ? modelRecord(state.writerModel, state.writerEffort || state.reasoningEffort) : "Off"],
     ...(settingsWarning ? [["Settings warning", settingsWarning]] : []),
     ["Generation", state.speedMode || "standard"], ["Activity summaries", state.reasoningSummary || "concise"],
     ["Web search", retrievalSummary(state)],
@@ -2140,14 +2153,18 @@ function renderRunOverview() {
   show(ui.resultPanel, savedOutput);
   const final = state.resultKind === "final" || state.canDownloadTex;
   ui.resultHeading.textContent = final ? (state.canDownloadTex ? "Final answer · LaTeX source" : "Final answer")
+    : state.resultKind === "proof" ? "Workflow result"
+    : state.revisionRequired ? "Candidate and critic feedback"
     : state.resultKind === "failure" ? "Failure report" : "Saved partial work";
   ui.resultDescription.textContent = final ? "The complete saved output is shown here."
+    : state.resultKind === "proof" ? "The selected stages finished. The complete saved output is shown here."
+    : state.revisionRequired ? "The critic found unresolved errors in this candidate."
     : "This is preserved work from an incomplete run; it has not completed the proof and critic workflow.";
   if (savedOutput && ui.resultOutput.textContent !== state.output) ui.resultOutput.textContent = state.output;
   const identity = `${state.batchId || ""}:${state.runId}:${state.resultKind || "partial"}`;
   if (ui.resultPanel.dataset.identity !== identity) {
     ui.resultPanel.dataset.identity = identity;
-    ui.resultPanel.open = final || state.resultKind === "failure";
+    ui.resultPanel.open = final || ["proof", "needs-revision", "failure"].includes(state.resultKind);
   }
 }
 
@@ -2246,7 +2263,8 @@ function collectCriticReviewCycles(trace, options = {}) {
     round.outcomeEvidence = "verdict";
     round.transition = entry.transition || null;
     if (verdict === "reject" || declared === "reject") {
-      round.outcome = "reject"; round.transition = "author";
+      round.outcome = "reject";
+      round.transition = declared === "needs_revision" ? "needs_revision" : "author";
     } else if (["pass_clean", "pass_edited_continue", "pass_edited_limit"].includes(declared)) {
       round.outcome = declared; round.outcomeEvidence = "explicit_outcome";
     } else if (declared === "pass") {
@@ -2372,7 +2390,8 @@ function collectCriticReviewCycles(trace, options = {}) {
 
 function criticRoundOutcomeLabel(round) {
   round = round || {};
-  if (round.outcome === "reject") return "Rejected — returned to author";
+  if (round.outcome === "reject") return round.transition === "needs_revision"
+    ? "Rejected — needs revision" : "Rejected — returned to author";
   if (round.outcome === "pass_clean") return "Clean pass — proof accepted";
   if (round.outcome === "pass_edited_continue") return "Pass with fixes — another review";
   if (round.outcome === "pass_edited_limit") return "Pass with changes — accepted at review limit";
@@ -2662,7 +2681,8 @@ function renderWorkflow() {
     const description = document.createElement("span");
     const descriptions = {
       author: "Explore approaches and build a proof.",
-      critic: "Review the candidate; rejected proofs return to the author.",
+      critic: state.workflowStages?.author === false ? "Review the supplied work and report unresolved errors."
+        : "Review the candidate; rejected proofs return to the author.",
       latex_compile: "Compile, fix errors, and retry until a PDF is ready.",
     };
     description.textContent = descriptions[name] || item.description;
@@ -2739,6 +2759,21 @@ function renderWorkflow() {
     row.textContent = `${text} ↓`;
     return row;
   };
+  if (state.workflowStages && (!state.workflowStages.author || !state.workflowStages.critic || !state.workflowStages.writing)) {
+    const stages = state.workflowStages;
+    const names = [["review", "statement_reviewer"], ["author", "author"], ["critic", "critic"], ["writing", "latex_editor"]]
+      .filter(([stage, name]) => stages[stage] && nodes[name]).map(([, name]) => name);
+    const rows = [];
+    for (const [index, name] of names.entries()) {
+      if (index) rows.push(arrow(names[index - 1] === "statement_reviewer" ? "Approved" : "Next stage"));
+      rows.push(makeNode(name, String(index + 1)));
+    }
+    if (stages.writing && nodes.latex_compile) rows.push(arrow("Compile and check"), makeNode("latex_compile", String(names.length + 1)));
+    if (stages.author && stages.critic) rows.push(arrow("On rejection, return to Author"));
+    ui.workflowNodes.replaceChildren(...rows);
+    if (criticHistoryList) criticHistoryList.scrollTop = criticHistoryScroll;
+    return;
+  }
   if (latexOnly) {
     ui.workflowNodes.replaceChildren(makeNode("latex_editor", "1"));
     if (nodes.latex_compile) {
@@ -2899,8 +2934,7 @@ function render(next) {
   if (phase === "input" && previousPhase !== "input") {
     const rounds = state.workflow?.settings?.critic_rounds || {};
     const hours = state.workflow?.settings?.thinking_hours || {};
-    ui.problem.value = state.draft || "";
-    ui.latexInput.value = state.latexInput || "";
+    ui.problem.value = state.originalContent || state.draft || state.latexInput || "";
     syncModelMenus();
     setChoice(ui.reviewModel, state.reviewModel || "gpt-6.1-sol");
     setChoice(ui.authorModel, state.authorModel || "gpt-6.1-sol");
@@ -2914,8 +2948,6 @@ function render(next) {
     ui.speedMode.value = state.speedMode || "standard";
     ui.reasoningSummary.value = state.reasoningSummary || "concise";
     restoreRetrievalSettings(state);
-    ui.skipStatementReview.checked = Boolean(state.skipStatementReview);
-    ui.statementReviewOnly.checked = Boolean(state.statementReviewOnly);
     syncPrompts(state);
     updateModelSummary();
     ui.criticRounds.value = state.criticRounds || 2;
@@ -2925,7 +2957,7 @@ function render(next) {
     ui.thinkingHours.min = hours.minimum ?? 0;
     ui.thinkingHours.max = hours.maximum || 168;
 
-    setProblemMode(state.problemMode || "statement");
+    restoreWorkflowStages(state);
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
     syncModelMenus();
@@ -2949,7 +2981,7 @@ function render(next) {
     ui.feedback.value = "";
     ui.criticRounds.value = state.criticRounds || 2;
     ui.thinkingHours.value = state.thinkingHours ?? 168;
-
+    restoreWorkflowStages(state);
     checkEdited();
     reviewPending = false;
   }
@@ -2976,7 +3008,8 @@ function render(next) {
       : phase === "stopping" ? "Stopping"
         : done ? completedRunLabel(state) : (node.label || "Model is working");
   ui.runLabel.textContent = phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED"
-    : done ? (state.resultKind === "final" || state.canDownloadTex ? "ANSWER READY" : "RUN INCOMPLETE") : (node.short_label || "MODEL");
+    : done ? (state.resultKind === "final" || state.canDownloadTex ? "ANSWER READY"
+      : state.resultKind === "proof" ? "WORKFLOW COMPLETE" : state.revisionRequired ? "NEEDS REVISION" : "RUN INCOMPLETE") : (node.short_label || "MODEL");
   // A short status title; the error, when there is one, is the description below it.
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
     : phase === "prepared" ? "Prepared research workspace" : phase === "paused" ? "Ready to resume" : phase === "pausing" ? "Pausing…"
@@ -3328,26 +3361,27 @@ async function startReview(statement, feedback = "") {
   // One create request at a time: a second click must not start a second paid job.
   if (ui.check.disabled) return;
   if (!validateRetrievalSettings()) return;
-  // The mode toggles belong to the composer; Retry keeps the reviewed job's own workflow.
+  // Retry preserves the reviewed job's selected stages.
   const fromComposer = state.phase === "input";
-  const reviewOnly = fromComposer && !feedback && ui.statementReviewOnly.checked;
-  const skipReview = fromComposer && !reviewOnly && !feedback && ui.skipStatementReview.checked;
-  if (!reviewOnly && !validateWorkflowHours()) return;
+  const stages = fromComposer ? selectedWorkflowStages() : workflowStagesFor(state);
+  if (!Object.values(stages).some(Boolean)) return showCreateError("Select at least one workflow stage.");
+  if (!statement.trim()) return showCreateError("Enter the text for this workflow.");
+  if (stages.author && !validateWorkflowHours()) return;
   clearTimeout(timer);
   clearTimeout(jobsTimer);
-  if (!(skipReview ? promptValues.author : promptValues.review)) syncPrompts();
-  reviewPending = !skipReview;
+  if (!Object.keys(promptValues).length) syncPrompts();
+  reviewPending = stages.review;
   const job = currentJob;
   const batch = currentBatch;
   const label = ui.check.textContent;
+  ui.check.dataset.creating = "1";
   ui.check.disabled = ui.runFolder.disabled = true;
   ui.check.textContent = "Starting…";
   try {
-    const next = await request(jobPath(skipReview ? "/direct" : "/review"), {
-      statement, feedback, reviewModel: ui.reviewModel.value,
-      reviewEffort: ui.reviewEffort.value,
+    const next = await request(jobPath("/start-workflow"), {
+      content: statement, feedback,
       ...proofJobSettings(),
-      statementReviewOnly: reviewOnly,
+      workflowStages: stages,
     });
     if (job !== currentJob || batch !== currentBatch) return;
     adoptJob(next);
@@ -3361,7 +3395,9 @@ async function startReview(statement, feedback = "") {
       timer = setTimeout(refresh, 700);
     }
   } finally {
-    ui.check.disabled = ui.runFolder.disabled = false;
+    delete ui.check.dataset.creating;
+    ui.check.disabled = !Object.values(selectedWorkflowStages()).some(Boolean);
+    ui.runFolder.disabled = false;
     // The selected mode may have relabelled the button meanwhile.
     if (ui.check.textContent === "Starting…") ui.check.textContent = label;
   }
@@ -3378,6 +3414,9 @@ function showCreateError(message) {
 
 function proofJobSettings() {
   return {
+    workflowStages: selectedWorkflowStages(),
+    reviewModel: ui.reviewModel.value,
+    reviewEffort: ui.reviewEffort.value,
     authorModel: ui.authorModel.value,
     criticModel: ui.criticModel.value,
     writerModel: ui.writerModel.value,
@@ -3444,14 +3483,17 @@ async function startFolderBatch(files) {
   const chosen = [...(files || [])];
   // A single job being created also blocks the folder run (and the reverse).
   if (!chosen.length || folderBatchBusy || ui.check.disabled) return;
-  if (!validateRetrievalSettings({ folder: true }) || !validateWorkflowHours()) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
   folderBatchBusy = true;
+  ui.check.dataset.creating = "1";
   ui.runFolder.disabled = ui.check.disabled = true;
   try {
     await sendFolderBatch(chosen);
   } finally {
     folderBatchBusy = false;
-    ui.runFolder.disabled = ui.check.disabled = false;
+    delete ui.check.dataset.creating;
+    ui.runFolder.disabled = false;
+    ui.check.disabled = !Object.values(selectedWorkflowStages()).some(Boolean);
   }
 }
 
@@ -3478,13 +3520,14 @@ async function sendFolderBatch(chosen) {
     return;
   }
   // File reading is asynchronous; recheck the current settings before sending.
-  if (!validateRetrievalSettings({ folder: true }) || !validateWorkflowHours()) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
   const count = statements.length;
   const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
     + "Each runs the selected workflow and uses its own quota.\n\n"
     + `Folder: ${folder}\n`
-    + "Each job sends its statement directly to the proof author "
-    + "(statement review is skipped)." + (skipped ? `\n\n${skipped}` : "");
+    + "Each job uses the selected stages."
+    + (selectedWorkflowStages().review ? " Statement review will pause each job for your approval." : "")
+    + (skipped ? `\n\n${skipped}` : "");
   if (!confirm(question)) return;
   const body = { statements, ...proofJobSettings() };
   const size = new TextEncoder().encode(JSON.stringify(body)).length;
@@ -3513,43 +3556,6 @@ async function sendFolderBatch(chosen) {
     showCreateError(error.message);
   }
   if (!currentJob) loadJobs();
-}
-
-async function startLatexOnly() {
-  // One create request at a time: a second click must not start a second paid job.
-  if (ui.check.disabled) return;
-  if (!validateRetrievalSettings()) return;
-  if (!ui.latexInput.value.trim()) {
-    ui.notice.textContent = "Enter the theorem and proof.";
-    show(ui.notice, true);
-    ui.latexInput.focus();
-    return;
-  }
-  clearTimeout(timer);
-  clearTimeout(jobsTimer);
-  if (!promptValues.final) syncPrompts();
-  const label = ui.check.textContent;
-  ui.check.disabled = ui.runFolder.disabled = true;
-  ui.check.textContent = "Starting…";
-  try {
-    const next = await request("/finalize", {
-      content: ui.latexInput.value,
-      writerModel: ui.writerModel.value,
-      writerEffort: ui.writerEffort.value,
-      promptOverrides: Object.hasOwn(promptOverrides, "final")
-        ? { final: promptOverrides.final } : {},
-      speedMode: ui.speedMode.value,
-      reasoningSummary: ui.reasoningSummary.value,
-      ...selectedRetrievalSettings(),
-    });
-    adoptJob(next);
-    render(next);
-  } catch (error) {
-    showCreateError(error.message);
-  } finally {
-    ui.check.disabled = ui.runFolder.disabled = false;
-    if (ui.check.textContent === "Starting…") ui.check.textContent = label;
-  }
 }
 
 async function act(path, body = {}) {
@@ -3631,8 +3637,7 @@ ui.runFolder.onclick = () => {
 };
 ui.folderInput.onchange = () => startFolderBatch(ui.folderInput.files);
 
-ui.check.onclick = () => selectedProblemMode() === "latex"
-  ? startLatexOnly() : startReview(ui.problem.value);
+ui.check.onclick = () => startReview(ui.problem.value);
 ui.recheck.onclick = () => startReview(ui.proposed.value, ui.feedback.value);
 ui.proposed.oninput = checkEdited;
 ui.feedback.oninput = checkEdited;
@@ -3660,16 +3665,8 @@ ui.retrievalCutoffUtc.oninput = () => {
   ui.retrievalCutoffUtc.setCustomValidity("");
   renderRetrievalSettings();
 };
-ui.skipStatementReview.onchange = () => {
-  if (ui.skipStatementReview.checked) ui.statementReviewOnly.checked = false;
-  setProblemMode(selectedProblemMode());
-};
-ui.statementReviewOnly.onchange = () => {
-  if (ui.statementReviewOnly.checked) ui.skipStatementReview.checked = false;
-  setProblemMode(selectedProblemMode());
-};
-for (const input of ui.problemModes) {
-  input.onchange = () => setProblemMode(input.value);
+for (const control of [ui.workflowReview, ui.workflowAuthor, ui.workflowCritic, ui.workflowWriting]) {
+  control.onchange = () => setWorkflowStages();
 }
 ui.editPrompts.onclick = openPromptEditor;
 ui.promptTabs.onclick = (event) => {

@@ -84,8 +84,8 @@ Promise.resolve(vm.runInNewContext(`${setup}\n${code}\n(async () => {\n${checks}
 
 # The composer and job controls: create requests, folder runs and act().
 COMPOSER = [
-    ["async function startReview(", "async function startLatexOnly("],
-    ["async function startLatexOnly()", "async function act("],
+    ["function selectedWorkflowStages(", "// Read historical mode names"],
+    ["async function startReview(", "async function act("],
     ["async function act(", "// The drawer is a modal <dialog>"],
 ]
 COMPOSER_SETUP = r"""
@@ -98,8 +98,13 @@ const advanced = new Element('details');
 advanced.append(ui.thinkingHours);
 Object.assign(ui.thinkingHours, {value: '168', max: '168'});
 ui.criticRounds.value = '2';
-ui.latexInput.value = 'An existing theorem and proof.';
-ui.check.textContent = 'Check statement';
+ui.problem.value = 'An existing theorem and proof.';
+ui.check.textContent = 'Start workflow';
+const chooseStages = (values = {}) => {
+  for (const [stage, control] of Object.entries({review: ui.workflowReview, author: ui.workflowAuthor,
+    critic: ui.workflowCritic, writing: ui.workflowWriting})) control.checked = values[stage] ?? true;
+};
+chooseStages();
 const show = (element, visible) => { element.hidden = !visible; };
 const validateRetrievalSettings = () => true;
 const syncPrompts = () => {};
@@ -169,7 +174,7 @@ class FrontendAuditFixTests(unittest.TestCase):
         self.run_app(COMPOSER, COMPOSER_SETUP, r"""
 const first = startReview('Prove P.'), second = startReview('Prove P.');
 assert.equal(sent.length, 1, 'the second click in the same tick sends nothing');
-assert.equal(sent[0].path, '/review');
+assert.equal(sent[0].path, '/start-workflow');
 assert.equal(ui.check.disabled, true);
 assert.equal(ui.runFolder.disabled, true);
 assert.equal(ui.check.textContent, 'Starting…');
@@ -180,21 +185,24 @@ await Promise.all([first, second]);
 assert.deepEqual(adopted, ['job-1']);
 assert.equal(ui.check.disabled, false);
 assert.equal(ui.runFolder.disabled, false);
-assert.equal(ui.check.textContent, 'Check statement');
+assert.equal(ui.check.textContent, 'Start workflow');
 
-// Polish LaTeX: one request, and a label the selected mode changed meanwhile is kept.
+// Writing only: one request, and a label changed meanwhile is kept.
 state = {phase: 'input'}; currentJob = '';
-const polish = startLatexOnly(), again = startLatexOnly();
+chooseStages({review: false, author: false, critic: false, writing: true});
+const polish = startReview(ui.problem.value), again = startReview(ui.problem.value);
 assert.equal(sent.length, 2);
-assert.equal(sent[1].path, '/finalize');
-ui.check.textContent = 'Polish LaTeX';
+assert.equal(sent[1].path, '/start-workflow');
+assert.deepEqual(sent[1].body.workflowStages, {review: false, author: false, critic: false, writing: true});
+ui.check.textContent = 'Start selected stages';
 sent[1].reject(new Error('Writer unavailable.'));
 await Promise.all([polish, again]);
 assert.equal(ui.notice.textContent, 'Writer unavailable.');
 assert.equal(ui.check.disabled, false);
-assert.equal(ui.check.textContent, 'Polish LaTeX');
+assert.equal(ui.check.textContent, 'Start selected stages');
 
 // While a folder run is being prepared, Check statement sends nothing either.
+chooseStages();
 let release;
 const slow = {name: 'a.md', webkitRelativePath: 'statements/a.md', size: 8,
   text: () => new Promise(resolve => { release = () => resolve('Prove A.'); })};
@@ -257,10 +265,12 @@ assert.equal(ui.notice.textContent, 'Claude CLI is not installed or is not on PA
 assert.equal(ui.notice.scrolled, true);
 assert.notEqual(ui.notice.focused, true, 'an alert is announced, not focused');
 ui.notice.scrolled = false;
-const polish = startLatexOnly();
+chooseStages({review: false, author: false, critic: false, writing: true});
+const polish = startReview(ui.problem.value);
 sent[1].reject(new Error('Add an API key for Gateway in Advanced settings → API connections.'));
 await polish;
 assert.equal(ui.notice.scrolled, true);
+chooseStages();
 ui.notice.scrolled = false;
 await startFolderBatch([file('photos/cat.png', '\x89PNG\x00')]);
 assert.match(ui.notice.textContent, /^No statements were found directly inside photos\./);
@@ -354,27 +364,29 @@ assert.equal(timers.length, 2);
     def test_retry_with_feedback_keeps_the_reviewed_jobs_workflow(self):
         self.run_app(COMPOSER, COMPOSER_SETUP, r"""
 // Choices left in the hidden composer from an earlier job.
-ui.statementReviewOnly.checked = true; ui.skipStatementReview.checked = true;
-state = {phase: 'reviewed', runId: 'job-2'}; currentJob = 'job-2';
+chooseStages({review: false, author: false, critic: false, writing: true});
+state = {phase: 'reviewed', runId: 'job-2', workflowStages: {review: true, author: true, critic: false, writing: true}};
+currentJob = 'job-2';
 const retry = startReview('Proposed statement.', '');
 assert.equal(sent.length, 1);
-assert.equal(sent[0].path, '/review?job=job-2');
-assert.equal(sent[0].body.statementReviewOnly, false);
+assert.equal(sent[0].path, '/start-workflow?job=job-2');
+assert.deepEqual(sent[0].body.workflowStages, state.workflowStages);
 sent[0].resolve({runId: 'job-2', phase: 'reviewing'});
 await retry;
 
-// On the composer the same toggles still choose the workflow.
+// On the composer the toggles choose the workflow.
 state = {phase: 'input'}; currentJob = '';
-ui.skipStatementReview.checked = false;
+chooseStages({review: true, author: false, critic: false, writing: false});
 const reviewOnly = startReview('Prove Q.');
-assert.equal(sent[1].path, '/review');
-assert.equal(sent[1].body.statementReviewOnly, true);
+assert.equal(sent[1].path, '/start-workflow');
+assert.deepEqual(sent[1].body.workflowStages, {review: true, author: false, critic: false, writing: false});
 sent[1].resolve({runId: 'job-3', phase: 'reviewing'});
 await reviewOnly;
 state = {phase: 'input'}; currentJob = '';
-ui.statementReviewOnly.checked = false; ui.skipStatementReview.checked = true;
+chooseStages({review: false});
 const direct = startReview('Prove R.');
-assert.equal(sent[2].path, '/direct');
+assert.equal(sent[2].path, '/start-workflow');
+assert.deepEqual(sent[2].body.workflowStages, {review: false, author: true, critic: true, writing: true});
 sent[2].resolve({runId: 'job-4', phase: 'running'});
 await direct;
 """)
@@ -395,8 +407,8 @@ await startFolderBatch([{...file('statements/a.md', 'Prove A.'), text: async () 
 assert.equal(read, 0);
 assert.equal(sent.length, 0);
 
-// Statement review only never uses the hidden field.
-ui.statementReviewOnly.checked = true;
+// A workflow without an author never uses the hidden hours field.
+chooseStages({review: true, author: false, critic: false, writing: false});
 const reviewOnly = startReview('Prove U.');
 assert.equal(sent.length, 1);
 sent[0].resolve({runId: 'job-1', phase: 'reviewing'});
@@ -404,7 +416,7 @@ await reviewOnly;
 
 // An explicit 0 still means unlimited.
 state = {phase: 'input'}; currentJob = '';
-ui.statementReviewOnly.checked = false; ui.thinkingHours.value = '0';
+chooseStages(); ui.thinkingHours.value = '0';
 const unlimited = startReview('Prove V.');
 assert.equal(sent[1].body.thinkingHours, 0);
 sent[1].resolve({runId: 'job-2', phase: 'reviewing'});

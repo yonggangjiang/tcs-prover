@@ -410,9 +410,12 @@ def web_prompt_options(body, roles, source=None):
     """Accept only deliberate per-job edits; old browser defaults are ignored."""
 
     overrides = body.get("promptOverrides", {})
+    selected = normalize_workflow_stages(body.get("workflowStages")) if "workflowStages" in body else (
+        saved_workflow_stages(source) if source else normalize_workflow_stages())
     if not isinstance(overrides, dict) or any(
         name not in {"review", "author", "critic", "final"}
-        or not isinstance(value, str) for name, value in overrides.items()
+        or (selected[ROLE_STAGES[PROMPT_ROLES[name]]] and not isinstance(value, str))
+        for name, value in overrides.items()
     ):
         raise ValueError("Prompt overrides must map role names to prompt text.")
     return {
@@ -625,6 +628,65 @@ REVIEW_ONLY_GRAPH = {
     "edges": [],
 }
 
+WORKFLOW_STAGES = ("review", "author", "critic", "writing")
+STAGE_ROLES = {"review": "review", "author": "author", "critic": "critic", "writing": "writer"}
+ROLE_STAGES = {role: stage for stage, role in STAGE_ROLES.items()}
+PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "final": "writer"}
+
+
+def normalize_workflow_stages(value=None):
+    """Validate the four ordered stage switches; omitted switches default on."""
+
+    if value is None:
+        return dict.fromkeys(WORKFLOW_STAGES, True)
+    if (not isinstance(value, dict) or set(value) - set(WORKFLOW_STAGES)
+            or any(not isinstance(enabled, bool) for enabled in value.values())):
+        raise ValueError("Workflow stages must map review, author, critic and writing to enabled or disabled.")
+    result = {stage: value.get(stage, True) for stage in WORKFLOW_STAGES}
+    if not any(result.values()):
+        raise ValueError("Select at least one workflow stage.")
+    return result
+
+
+def saved_workflow_stages(state):
+    """Read explicit stage choices or recover the equivalent older workflow."""
+
+    if "workflowStages" in state:
+        return normalize_workflow_stages(state["workflowStages"])
+    if state.get("problemMode") in {"latex", "final-resume"}:
+        return {"review": False, "author": False, "critic": False, "writing": True}
+    if state.get("statementReviewOnly"):
+        return {"review": True, "author": False, "critic": False, "writing": False}
+    return {"review": not state.get("skipStatementReview", False) and state.get("problemMode") not in {
+        "algorithmic", "critic-resume"}, "author": True, "critic": True, "writing": True}
+
+
+def workflow_graph(stages):
+    """Only selected model stages and their meaningful transitions appear in the UI."""
+
+    stages = normalize_workflow_stages(stages)
+    if all(stages.values()):
+        return PUBLIC_GRAPH
+    enabled = []
+    if stages["review"]:
+        enabled.append("statement_reviewer")
+    if stages["author"]:
+        enabled.append("author")
+    if stages["critic"]:
+        enabled.append("critic")
+    if stages["writing"]:
+        enabled.extend(("latex_editor", "latex_compile", "latex_repair"))
+    nodes = {name: PUBLIC_GRAPH["nodes"][name] for name in enabled}
+    if stages["author"] or stages["critic"]:
+        nodes["failure_summary"] = PUBLIC_GRAPH["nodes"]["failure_summary"]
+    edges = [edge for edge in PUBLIC_GRAPH["edges"] if edge["from"] in nodes and edge["to"] in nodes]
+    sequence = [name for name in ("statement_reviewer", "author", "critic", "latex_editor") if name in nodes]
+    for previous, following in zip(sequence, sequence[1:]):
+        if not any(edge["from"] == previous and edge["to"] == following for edge in edges):
+            edges.append({"from": previous, "to": following,
+                          "label": "Approve statement" if previous == "statement_reviewer" else "Continue"})
+    return {"settings": PUBLIC_GRAPH["settings"], "nodes": nodes, "edges": edges}
+
 
 def event_node(record, current=""):
     """Keep explicit node context across node-less events in a shared stage."""
@@ -676,6 +738,8 @@ def empty_state(trace=None, trace_version=0):
         # The runner's current wait before retrying a failed model call.
         "modelRetry": None,
         "statementReviewOnly": False,
+        "workflowStages": normalize_workflow_stages(),
+        "originalContent": "",
         "preparedRun": False,
         "launchHold": "",
         "retrievalPolicyPath": "",
@@ -1303,6 +1367,8 @@ class App:
             "criticEffort", "writerEffort", "criticRounds",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
+            "workflowStages", "originalContent",
+            "resultKind", "revisionRequired",
             "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
             "sourceFile", "apiModels",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
@@ -1776,7 +1842,8 @@ class App:
             state["workflow"] = {
                 **graph, "settings": {**graph["settings"], "prompts": prompts, **model_menu_settings()},
             }
-            state["checkpoints"] = list(self._checkpoint_cache)
+            state["checkpoints"] = [dict(item, resumable=False) if not saved_workflow_stages(state)["critic"]
+                                    else item for item in self._checkpoint_cache]
             state["canDownloadTex"] = bool(
                 state["phase"] == "done" and not self.has_active_worker()
                 and self.run_dir and (self.run_dir / "final.tex").is_file()
@@ -1821,9 +1888,12 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
+        workflow_stages=None,
     ):
         """Normalize and validate settings shared by both input modes."""
 
+        stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
+            "review": include_review, "author": True, "critic": True, "writing": True}
         review_model = str(review_model or "")
         author_model = str(author_model or "")
         critic_model = str(critic_model or "")
@@ -1846,42 +1916,48 @@ class App:
             ).strip()
             for name, value in supplied_prompts.items()
         }
-        role_models = {"author": author_model, "critic": critic_model, "writer": writer_model}
-        if include_review:
-            role_models = {"review": review_model, **role_models}
+        all_models = {"review": review_model, "author": author_model, "critic": critic_model, "writer": writer_model}
+        role_models = {role: all_models[role] for stage, role in STAGE_ROLES.items() if stages[stage]}
         # Built-in, older Codex, or configured API ids; the store is read now.
         require_known_models(role_models)
-        efforts = [author_effort, critic_effort, writer_effort]
-        if include_review:
-            efforts.append(review_effort)
+        all_efforts = {"review": review_effort, "author": author_effort, "critic": critic_effort, "writer": writer_effort}
+        efforts = [all_efforts[role] for role in role_models]
         if any(effort not in EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
         selected_models = list(role_models.values())
-        if include_review:
-            review_effort = runtime.effective_effort(review_model, review_effort)
-        author_effort = runtime.effective_effort(author_model, author_effort)
-        critic_effort = runtime.effective_effort(critic_model, critic_effort)
-        writer_effort = runtime.effective_effort(writer_model, writer_effort)
+        defaults_models = {"review": DEFAULT_REVIEW_MODEL, "author": DEFAULT_AUTHOR_MODEL,
+                           "critic": DEFAULT_CRITIC_MODEL, "writer": DEFAULT_WRITER_MODEL}
+        for role in all_models:
+            if role in role_models:
+                all_efforts[role] = runtime.effective_effort(all_models[role], all_efforts[role])
+            else:
+                all_models[role] = defaults_models[role]
+                all_efforts[role] = DEFAULT_REVIEW_EFFORT if role == "review" else DEFAULT_REASONING_EFFORT
+        review_model, author_model, critic_model, writer_model = (all_models[role] for role in ROLES)
+        review_effort, author_effort, critic_effort, writer_effort = (all_efforts[role] for role in ROLES)
         if speed_mode not in SPEEDS:
             raise ValueError("Choose Standard or Fast speed.")
         if reasoning_summary not in REASONING_SUMMARIES:
             raise ValueError(
                 "Choose Status only, Concise summaries, or Detailed summaries."
             )
-        required_prompts = [prompts[name] for name in ("author", "critic", "final")]
-        if include_review:
-            required_prompts.append(prompts["review"])
+        required_prompts = [prompts[name] for name, role in PROMPT_ROLES.items() if role in role_models]
+        for name, role in PROMPT_ROLES.items():
+            if role not in role_models:
+                prompts[name] = defaults[name]
         if any(not prompt for prompt in required_prompts):
             raise ValueError("Every role prompt must contain instructions.")
-        if prompts["author"].count(runtime.MARKER) != 1:
+        if stages["author"] and prompts["author"].count(runtime.MARKER) != 1:
             raise ValueError(
                 f"The author prompt must contain exactly one {runtime.MARKER}."
             )
         try:
-            critic_rounds = runtime.critic_limit(critic_rounds)
+            critic_rounds = runtime.critic_limit(critic_rounds) if stages["critic"] else DEFAULT_CRITIC_ROUNDS
         except runtime.Error as exc:
             raise ValueError(str(exc)) from exc
         try:
+            if workflow_stages is not None and not stages["author"]:
+                thinking_hours = DEFAULT_THINKING_HOURS
             thinking_hours = float(thinking_hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total workflow time limit must be a number.") from exc
@@ -1892,24 +1968,27 @@ class App:
         # Web cutoff timestamps need Codex models: say so before any CLI check.
         search_options = retrieval.validate_options(
             retrieval_mode, retrieval_cutoff_utc, models=selected_models)
+        if search_options["retrievalMode"] == "historical" and (not stages["author"] or stages["review"]):
+            raise ValueError("Historical search requires Proof author enabled and Statement review disabled.")
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
         return {
             **search_options,
             **({"apiModels": api_models} if api_models else {}),
-            "reviewModel": review_model if include_review else DEFAULT_REVIEW_MODEL,
+            "workflowStages": stages,
+            "reviewModel": review_model,
             "authorModel": author_model,
             "criticModel": critic_model,
             "writerModel": writer_model,
             "reasoningEffort": author_effort,
             "reviewEffort": (
-                review_effort if include_review else DEFAULT_REVIEW_EFFORT
+                review_effort
             ),
             "authorEffort": author_effort,
             "criticEffort": critic_effort,
             "writerEffort": writer_effort,
             "reviewPrompt": (
-                prompts["review"] if include_review else defaults["review"]
+                prompts["review"]
             ),
             "authorPrompt": prompts["author"],
             "criticPrompt": prompts["critic"],
@@ -1938,6 +2017,7 @@ class App:
         continuation_source="", stopped_stage="",
         retrieval_mode="live", retrieval_cutoff_utc="",
         revise_existing=False,
+        workflow_stages=None, original_content=None, source_file=None,
     ):
         """Start the review and return immediately so the page can poll.
 
@@ -1953,6 +2033,12 @@ class App:
             raise ValueError("Statement review input cannot contain NUL characters.")
         if not isinstance(review_only, bool):
             raise ValueError("Statement review only must be enabled or disabled.")
+        stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else (
+            {"review": True, "author": False, "critic": False, "writing": False} if review_only else
+            normalize_workflow_stages())
+        if not stages["review"]:
+            raise ValueError("Enable statement review before starting a review request.")
+        review_only = not any(stages[name] for name in ("author", "critic", "writing"))
         if review_only:
             # Proof-stage settings are irrelevant to this terminal workflow.
             author_model = DEFAULT_AUTHOR_MODEL
@@ -1983,7 +2069,11 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
+            workflow_stages=stages,
         )
+        options["originalContent"] = str(original_content if original_content is not None else (
+            self.state.get("originalContent") or statement if revise_existing else statement))
+        options["sourceFile"] = source_file_name(source_file)
         if options["retrievalMode"] == "historical":
             raise ValueError("Historical search currently requires Skip statement review. Start a direct proof.")
         if continuation_source:
@@ -2022,9 +2112,7 @@ class App:
                     "feedback": feedback,
                 }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             )
-            prompt_names = ("review",) if review_only else (
-                "review", "author", "critic", "final"
-            )
+            prompt_names = [name for name, role in PROMPT_ROLES.items() if stages[ROLE_STAGES[role]]]
             for name in prompt_names:
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
@@ -2044,7 +2132,7 @@ class App:
                 "reviewInputRecorded": True,
                 "statementReviewOnly": review_only,
                 **options,
-                "workflow": REVIEW_ONLY_GRAPH if review_only else PUBLIC_GRAPH,
+                "workflow": workflow_graph(stages),
                 "activeNode": "statement_reviewer",
                 "stage": "review",
                 "startedAt": datetime.now(timezone.utc).isoformat(),
@@ -2215,6 +2303,8 @@ class App:
                 self.active_token = None
             if self.worker_token is token:
                 self.worker_token = None
+            if valid:
+                self._save_job_settings(self.state)
 
     def _retrieval_child_environment(self):
         """Bind each worker, including independent reviewers, to its saved mode."""
@@ -2276,7 +2366,8 @@ class App:
     def _proof_options_locked(self):
         """Resolve the same proof settings for new and recovered candidates."""
 
-        author_limit_file = self._write_author_limit(self.state["thinkingHours"])
+        stages = saved_workflow_stages(self.state)
+        author_limit_file = self._write_author_limit(self.state["thinkingHours"]) if stages["author"] else None
         author_steer_file = self.run_dir / AUTHOR_STEER_FILENAME
         if not self.state.get("goalResume"):
             author_steer_file.unlink(missing_ok=True)
@@ -2286,15 +2377,20 @@ class App:
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
             "--speed", self.state["speedMode"],
-            "--author-limit-file", str(author_limit_file),
-            "--author-steer-file", str(author_steer_file),
         ]
+        if stages["author"]:
+            options.extend(["--author-limit-file", str(author_limit_file), "--author-steer-file", str(author_steer_file)])
+        options.extend(["--set", "workflow_stages=" + json.dumps(stages)])
         for role in ("author", "critic", "writer"):
+            if not stages[ROLE_STAGES[role]]:
+                continue
             options.extend([
                 f"--{role}-model", self.state[f"{role}Model"],
                 f"--{role}-effort", self.state[f"{role}Effort"],
             ])
         for role in ("author", "critic", "final"):
+            if not stages[ROLE_STAGES[PROMPT_ROLES[role]]]:
+                continue
             options.extend([
                 f"--{role}-prompt-file", str(self.run_dir / f"prompts/{role}.txt"),
             ])
@@ -2312,10 +2408,15 @@ class App:
     def _launch_solver_locked(self, statement):
         """Start the author/critic graph followed by final cleanup."""
 
+        stages = saved_workflow_stages(self.state)
+        stage, node = ("solve", "author") if stages["author"] else (
+            ("critic", "critic") if stages["critic"] else ("final", "latex_editor"))
+        initial = None if stages["author"] else {
+            "statement": statement, "solution": self.state.get("originalContent") or self.state.get("draft") or statement}
         return self._launch_workflow_locked(
             ["author_critic.yaml", "clean_up.yaml"], statement,
             [*self._proof_options_locked(), "--elapsed-seconds", str(self._elapsed_seconds())],
-            "solve", "author",
+            stage, node, state=initial,
         )
 
     def _elapsed_seconds(self):
@@ -2575,7 +2676,8 @@ class App:
         so fail with a clear message instead of a runner error.
         """
 
-        models = {role: self.state[f"{role}Model"] for role in roles}
+        stages = saved_workflow_stages(self.state)
+        models = {role: self.state[f"{role}Model"] for role in roles if stages[ROLE_STAGES[role]]}
         for role, model in models.items():
             if providers.is_api_id(model) and not providers.is_known(model):
                 raise ValueError(unconfigured_job_model_error(model, role, self.state.get("apiModels")))
@@ -2604,6 +2706,8 @@ class App:
             statement = saved_statement(self.run_dir)
             self._check_launch_models_locked()
             for role in ("author", "critic", "final"):
+                if not saved_workflow_stages(self.state)[ROLE_STAGES[PROMPT_ROLES[role]]]:
+                    continue
                 self._save(f"prompts/{role}.txt", self.state[f"{role}Prompt"] + "\n")
             previous = dict(self.state)
             now = datetime.now(timezone.utc).isoformat()
@@ -2693,13 +2797,12 @@ class App:
     def _final_options(self):
         return [
             "--writer-model", self.state["writerModel"],
-            "--critic-model", self.state["criticModel"],
             "--reasoning-effort", self.state["reasoningEffort"],
             "--writer-effort", self.state["writerEffort"],
-            "--critic-effort", self.state["criticEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
             "--speed", self.state["speedMode"],
             "--final-prompt-file", str(self.run_dir / "prompts/final.txt"),
+            "--set", "workflow_stages=" + json.dumps({"review": False, "author": False, "critic": False, "writing": True}),
         ]
 
     def _launch_final_locked(self, source):
@@ -2744,6 +2847,7 @@ class App:
         source_file=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
+        workflow_stages=None, original_content=None,
     ):
         """Send a statement directly to the proof author without review."""
 
@@ -2755,6 +2859,10 @@ class App:
             raise ValueError("Enter a problem statement.")
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
+        stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
+            "review": False, "author": True, "critic": True, "writing": True}
+        if stages["review"]:
+            raise ValueError("Start the selected statement review before later workflow stages.")
         if continuation_source:
             saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
             if saved_prompt.is_file():
@@ -2779,8 +2887,10 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
+            workflow_stages=stages,
         )
         options["sourceFile"] = source_file
+        options["originalContent"] = str(original_content if original_content is not None else statement)
         if options["retrievalMode"] == "historical" and continuation_source:
             raise ValueError("Historical search cannot be added to an existing conversation. Start a new direct proof.")
         if continuation_source:
@@ -2798,6 +2908,8 @@ class App:
             if continuation_source:
                 options.update(saved_goal_options(continuation_source))
             for name in ("author", "critic", "final"):
+                if not stages[ROLE_STAGES[PROMPT_ROLES[name]]]:
+                    continue
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             if options["retrievalMode"] == "historical":
                 self._save("input.md", statement + "\n")
@@ -2817,7 +2929,8 @@ class App:
             )
             if options["retrievalMode"] == "historical" and not _prepare_only:
                 retrieval.preflight_policy(options["retrievalPolicyPath"])
-                retrieval.preflight_compiler(options["retrievalPolicyPath"])
+                if stages["writing"]:
+                    retrieval.preflight_compiler(options["retrievalPolicyPath"])
             trace = self.state["trace"] if self.fixed_trace else []
             version = self.state["traceVersion"] if self.fixed_trace else 0
             self.state = {
@@ -2826,7 +2939,7 @@ class App:
                 "skipStatementReview": True,
                 "draft": statement,
                 **options,
-                "workflow": DIRECT_GRAPH,
+                "workflow": workflow_graph(stages),
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
@@ -2867,7 +2980,9 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
+            workflow_stages={"review": False, "author": False, "critic": False, "writing": True},
         )
+        options["originalContent"] = source
         if options["retrievalMode"] == "historical":
             raise ValueError("Historical search is available only for a new direct proof author.")
         if continuation_source:
@@ -2935,7 +3050,9 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
+            workflow_stages={"review": False, "author": False, "critic": False, "writing": True},
         )
+        options["originalContent"] = solution
         if options["retrievalMode"] == "historical":
             raise ValueError("Historical search cannot be added to a saved finalization. Resume the original run.")
         if continuation_source:
@@ -2998,6 +3115,7 @@ class App:
         audit_checkpoint="",
         recover_audit_checkpoint=True,
         retrieval_mode="live", retrieval_cutoff_utc="",
+        workflow_stages=None, original_content=None,
     ):
         """Create a new job that audits one complete saved candidate proof."""
 
@@ -3026,7 +3144,9 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
+            workflow_stages=workflow_stages,
         )
+        options["originalContent"] = original_content if original_content is not None else solution
         if options["retrievalMode"] == "historical":
             raise ValueError("Historical search cannot be added to a saved critic review. Resume the original run.")
         if source_run:
@@ -3044,6 +3164,8 @@ class App:
             if source_run:
                 options.update(saved_goal_options(source_run))
             for name in ("author", "critic", "final"):
+                if not options["workflowStages"][ROLE_STAGES[PROMPT_ROLES[name]]]:
+                    continue
                 self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
             self._save_job_settings({
                 **options,
@@ -3078,7 +3200,7 @@ class App:
                 "draft": statement,
                 "sourceRun": str(source_run),
                 **options,
-                "workflow": PUBLIC_GRAPH,
+                "workflow": workflow_graph(options["workflowStages"]),
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
@@ -3197,6 +3319,9 @@ class App:
                         self.state["round"] += 1
                 if record.get("kind") == "author_result":
                     repair_pending = True
+                if record.get("kind") == "final_input":
+                    with self.lock:
+                        self.state["finalInputReady"] = True
                 # A repair replaces the prior answer; the final proof replaces all.
                 if (
                     record.get("kind") == "request"
@@ -3265,9 +3390,10 @@ class App:
                         continue
                     with self.lock:
                         self.state["output"] = record.get("output", "")
-                        self.state["resultKind"] = "final"
+                        proof = record.get("resultKind") == "proof" or not saved_workflow_stages(self.state)["writing"]
+                        self.state["resultKind"] = "proof" if proof else "final"
                         final = True
-                        self._save("final.tex", self.state["output"])
+                        self._save("proof-output.md" if proof else "final.tex", self.state["output"])
                         if self.state.get("manuallyStopped"):
                             self._clear_manual_stop()
                             self.state.update(
@@ -3278,11 +3404,18 @@ class App:
                 if record.get("kind") == "failure_result":
                     failed = True
                     with self.lock:
-                        self.state["resultKind"] = "failure"
+                        revision = record.get("resultKind") == "needs-revision"
+                        self.state["resultKind"] = "needs-revision" if revision else "failure"
+                        self.state["revisionRequired"] = revision
+                        self.state["criticBugs"] = record.get("bugs", "") if revision else ""
                         self.state["output"] = (
                             record.get("output") or record.get("summary")
                             or record.get("text", "")
                         )
+                        if revision and record.get("bugs"):
+                            bugs = record["bugs"]
+                            feedback = "\n".join(map(str, bugs)) if isinstance(bugs, list) else str(bugs)
+                            self.state["output"] += "\n\n## Critic feedback\n\n" + feedback
                         final = True
                         self._save("failure-summary.md", self.state["output"])
                         if self.state.get("manuallyStopped"):
@@ -3371,7 +3504,8 @@ class App:
                 # killed the child before it closed stdout cleanly.
                 self._clear_manual_stop()
                 self.state["error"] = (
-                    "Workflow incomplete. See the saved checkpoint and failure report."
+                    ("Proof needs revision. See the critic feedback." if self.state.get("revisionRequired") else
+                     "Workflow incomplete. See the saved checkpoint and failure report.")
                     if failed else ""
                 )
             elif stopped:
@@ -3385,6 +3519,7 @@ class App:
                 self.state["error"] = "The workflow exited without a final answer. Continue from a saved checkpoint."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
+            self._save_job_settings(self.state)
 
 
     def clear_trace(self):
@@ -3947,6 +4082,7 @@ def restore_saved_app(app):
         return app
     records = _run_records(run_dir)
     state = empty_state(app.state["trace"], app.state["traceVersion"])
+    state.pop("workflowStages", None)  # Older jobs derive stages from their saved workflow mode.
     state["runId"] = run_dir.name
     draft_path = run_dir / "draft.md"
     try:
@@ -3995,10 +4131,21 @@ def restore_saved_app(app):
                 "criticEffort", "writerEffort", "criticRounds",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
+                "workflowStages", "originalContent",
                 "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             ):
                 if key in settings:
+                    if key == "workflowStages":
+                        try:
+                            state[key] = normalize_workflow_stages(settings[key])
+                            persisted_settings.add(key)
+                        except ValueError:
+                            state["launchHold"] = "Invalid saved workflow stages; repair before launch."
+                            settings_warnings.append("Saved workflow stages are invalid; this run is held.")
+                        continue
+                    if key == "originalContent" and not isinstance(settings[key], str):
+                        continue
                     if key in {"launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc"} and not isinstance(settings[key], str):
                         state["launchHold"] = "Invalid saved historical launch controls; repair before launch."
                         continue
@@ -4085,6 +4232,13 @@ def restore_saved_app(app):
     elif state["skipStatementReview"]:
         state["workflow"] = DIRECT_GRAPH
 
+    state["workflowStages"] = saved_workflow_stages(state)
+    state["skipStatementReview"] = not state["workflowStages"]["review"]
+    state["statementReviewOnly"] = state["workflowStages"]["review"] and not any(
+        state["workflowStages"][name] for name in ("author", "critic", "writing"))
+    state["originalContent"] = state.get("originalContent") or state.get("draft", "")
+    state["workflow"] = workflow_graph(state["workflowStages"])
+
     transcript_speed = None
     observed_role_settings = set()
     post_review_request = False
@@ -4109,12 +4263,16 @@ def restore_saved_app(app):
         if record.get("kind") == "author_result":
             author_finished = True
         if record.get("kind") == "failure_result":
-            state["resultKind"] = "failure"
+            state["resultKind"] = "needs-revision" if record.get("resultKind") == "needs-revision" else "failure"
+            state["revisionRequired"] = state["resultKind"] == "needs-revision"
+            state["criticBugs"] = record.get("bugs", "")
             state["output"] = record.get("output") or record.get("summary") or record.get("text", "")
         elif (record.get("kind") in {"final_result", "workflow_result"}
                 and isinstance(record.get("output"), str) and record["output"].strip()):
-            state["resultKind"] = "final"
-            state["output"] = record["output"]
+            if record.get("kind") != "workflow_result" or state["resultKind"] not in {"needs-revision", "failure"}:
+                state["resultKind"] = "proof" if (record.get("resultKind") == "proof"
+                    or not state["workflowStages"]["writing"]) else "final"
+                state["output"] = record["output"]
         if isinstance(record.get("round"), int):
             state["round"] = record["round"]
         if record.get("kind") == "request":
@@ -4182,16 +4340,7 @@ def restore_saved_app(app):
     if transcript_speed is not None:
         state["speedMode"] = transcript_speed
 
-    if state["statementReviewOnly"]:
-        required_roles = {"review"}
-    elif state["problemMode"] in {"latex", "final-resume"}:
-        required_roles = {"writer"}
-    elif state["problemMode"] in {"algorithmic", "critic-resume"}:
-        required_roles = {"author", "critic", "writer"}
-    else:
-        required_roles = {"author", "critic", "writer"}
-        if not state["skipStatementReview"]:
-            required_roles.add("review")
+    required_roles = {role for stage, role in STAGE_ROLES.items() if state["workflowStages"][stage]}
     unknown_roles = sorted(
         role for role in required_roles
         if f"{role}Model" not in persisted_settings
@@ -4224,7 +4373,7 @@ def restore_saved_app(app):
     state["lastActivityAt"] = last_time if isinstance(last_time, str) else ""
     state["finishedAt"] = state["lastActivityAt"]
     state["phase"] = "done"
-    for filename in ("final.tex", "failure-summary.md", "partial-output.md"):
+    for filename in ("final.tex", "proof-output.md", "failure-summary.md", "partial-output.md"):
         if state["resultKind"] == "final" and filename != "final.tex":
             continue
         path = run_dir / filename
@@ -4236,12 +4385,14 @@ def restore_saved_app(app):
                 state["output"] = output
                 if filename == "final.tex" and state["output"].strip():
                     state["resultKind"] = "final"
+                elif filename == "proof-output.md":
+                    state["resultKind"] = "proof"
                 elif filename == "failure-summary.md":
-                    state["resultKind"] = "failure"
+                    state["resultKind"] = "needs-revision" if state.get("revisionRequired") else "failure"
                 break
             except (OSError, UnicodeError):
                 pass
-    if state["resultKind"] == "final":
+    if state["resultKind"] in {"final", "proof"}:
         # A completed answer supersedes errors that a later resume recovered from.
         state["error"] = ""
     if state["statementReviewOnly"] and state["review"]:
@@ -4257,7 +4408,7 @@ def restore_saved_app(app):
             phase="reviewed", stage="review",
             activeNode="statement_reviewer", finishedAt="", error="",
         )
-    if state["problemMode"] != "latex":
+    if state["problemMode"] != "latex" and state["workflowStages"]["writing"]:
         try:
             saved_final_input(run_dir, records=records)
             state["finalInputReady"] = True
@@ -4289,7 +4440,7 @@ def restore_saved_app(app):
                 "This job was manually stopped. Continue it from the home page."
             )
     checkpoint = read_pause_object(run_dir)
-    if (manual_stop is None and state["resultKind"] != "final"
+    if (manual_stop is None and state["resultKind"] not in {"final", "proof", "review"}
             and last_work_node == "author" and not author_finished
             and checkpoint.get("status") not in {"paused", "pausing"}):
         # A server/process crash leaves the last resume checkpoint marked running.
@@ -4328,7 +4479,7 @@ def restore_saved_app(app):
                 "pauseCause": "interrupted", "autoResumeAt": 0,
             }
     if (checkpoint.get("status") in {"paused", "pausing"}
-            and state["resultKind"] != "final" and manual_stop is None):
+            and state["resultKind"] not in {"final", "proof", "review"} and manual_stop is None):
         state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
                      error=checkpoint.get("error", ""), finishedAt="",
                      elapsedSeconds=checkpoint.get("elapsedSeconds", state.get("elapsedSeconds", 0)),
@@ -4341,6 +4492,8 @@ def restore_saved_app(app):
         state["error"] = state["error"] or "This run ended without a final answer. Continue from a saved checkpoint."
     elif state["resultKind"] == "failure":
         state["error"] = state["error"] or "Workflow incomplete. See the saved checkpoint and failure report."
+    elif state["resultKind"] == "needs-revision":
+        state["error"] = state["error"] or "Proof needs revision. See the critic feedback."
     if state.get("retrievalMode") == "historical" and not state.get("retrievalPolicyPath"):
         state["launchHold"] = "Historical search policy is missing; restore the controller policy before launch."
     if state["preparedRun"] and not records and not state["output"]:
@@ -4675,6 +4828,42 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
+    def start_workflow(self, body, run_id=""):
+        """Run the selected ordered stages on one input, preserving review approval."""
+
+        app = self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False)
+        stages = normalize_workflow_stages(body.get("workflowStages", app.state.get("workflowStages") if run_id else None))
+        content = body.get("content", body.get("statement", ""))
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Enter the statement or existing work to process.")
+        if "\0" in content:
+            raise ValueError("Workflow input cannot contain NUL characters.")
+        effective_body = {**body, "workflowStages": stages}
+        if run_id:
+            defaults = {key: app.state[key] for key in (
+                "authorModel", "criticModel", "writerModel", "reasoningEffort", "authorEffort", "criticEffort", "writerEffort",
+                "criticRounds", "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc")}
+            effective_body = {**defaults, **effective_body}
+        options = self._direct_options(effective_body)
+        options.update(web_prompt_options(effective_body, ("author", "critic", "final"), app.state if run_id else None))
+        options["workflow_stages"] = stages
+        options["original_content"] = app.state.get("originalContent") or content if run_id else content
+        options["source_file"] = body.get("sourceFile", app.state.get("sourceFile") if run_id else None)
+        if stages["review"]:
+            legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+            review_prompts = web_prompt_options(effective_body, ("review",), app.state if run_id else None)
+            app.start_review(content, feedback=body.get("feedback", ""),
+                             review_model=body.get("reviewModel", app.state["reviewModel"] if run_id else DEFAULT_REVIEW_MODEL),
+                             review_effort=body.get("reviewEffort", legacy_effort),
+                             **review_prompts, **options, revise_existing=bool(run_id))
+        else:
+            if run_id:
+                raise ValueError("Start a workflow without statement review from the home screen.")
+            app.start_direct_statement(content, **options)
+        with self.jobs_lock:
+            self.jobs[app.state["runId"]] = app
+        return app
+
 
     @staticmethod
     def _direct_options(body):
@@ -4696,6 +4885,7 @@ class Server(ThreadingHTTPServer):
             **web_prompt_options(body, ("author", "critic", "final")),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
+            **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
         }
 
     def start_direct_job(self, body, run_id=""):
@@ -4749,7 +4939,12 @@ class Server(ThreadingHTTPServer):
             {key: value for key, value in body.items() if key != "statements"}
         )
         # The jobs share these settings: reject them once, before any job starts.
-        normalized = App._workflow_options(include_review=False, **options)
+        validation_options = dict(options)
+        if "workflowStages" in body:
+            validation_options.update(review_model=body.get("reviewModel", DEFAULT_REVIEW_MODEL),
+                                      review_effort=body.get("reviewEffort", DEFAULT_REVIEW_EFFORT),
+                                      **web_prompt_options(body, ("review",)))
+        normalized = App._workflow_options(include_review=False, **validation_options)
         options.update(retrieval_mode=normalized["retrievalMode"], retrieval_cutoff_utc=normalized["retrievalCutoffUtc"])
         historical = normalized["retrievalMode"] == "historical"
         if historical and len(statements) > 10:
@@ -4759,8 +4954,13 @@ class Server(ThreadingHTTPServer):
         started, current = [], 0
         try:
             for current, (name, statement) in enumerate(statements):
-                app = App(runs=self.runs, load_latest=False)
-                app.start_direct_statement(statement, source_file=name, _prepare_only=historical, **options)
+                if "workflowStages" in body and normalized["workflowStages"]["review"]:
+                    if historical:
+                        raise ValueError("Historical search requires the statement review stage to be disabled.")
+                    app = self.start_workflow({**body, "content": statement, "sourceFile": name})
+                else:
+                    app = App(runs=self.runs, load_latest=False)
+                    app.start_direct_statement(statement, source_file=name, _prepare_only=historical, **options)
                 started.append(app)
                 with self.jobs_lock:
                     self.jobs[app.state["runId"]] = app
@@ -4778,7 +4978,8 @@ class Server(ThreadingHTTPServer):
                         for check in checks:
                             check.cancel()  # Like map(): skip checks not yet started.
                 current = None
-                retrieval.preflight_compiler(started[0].state["retrievalPolicyPath"])
+                if normalized["workflowStages"]["writing"]:
+                    retrieval.preflight_compiler(started[0].state["retrievalPolicyPath"])
                 for current, app in enumerate(started):
                     with app.lock:
                         app.state["launchHold"] = ""
@@ -4841,7 +5042,10 @@ class Server(ThreadingHTTPServer):
     ):
         """Create a browser-visible job from one saved complete proof."""
 
-        settings = dict(settings or {})
+        settings = {**saved_research_source(source_run)["settings"], **(settings or {})}
+        stages = {**saved_workflow_stages(settings), "review": False}
+        if not stages["critic"]:
+            raise ValueError("The critic stage is disabled for this saved workflow.")
         source = saved_critic_source(source_run)
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
@@ -4880,6 +5084,7 @@ class Server(ThreadingHTTPServer):
                 source["audit_checkpoint"] if include_audit_checkpoint else ""
             ),
             recover_audit_checkpoint=include_audit_checkpoint,
+            workflow_stages=stages, original_content=settings.get("originalContent"),
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
@@ -4911,6 +5116,8 @@ class Server(ThreadingHTTPServer):
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             continuation_source=source["run_dir"], stopped_stage="solve",
             allow_external_source=True,
+            workflow_stages={**saved_workflow_stages(options), "review": False},
+            original_content=options.get("originalContent"),
         )
         warning = removed_model_warning(
             role for role in source.get("replacedRoles", ()) if f"{role}Model" not in (settings or {}))
@@ -4962,6 +5169,7 @@ class Server(ThreadingHTTPServer):
                 "criticModel", "writerModel", "reasoningEffort",
                 "authorEffort", "criticEffort", "writerEffort",
                 "speedMode", "reasoningSummary", "authorPrompt",
+                "workflowStages", "originalContent",
             )
         }
         return self.start_saved_critic_job(
@@ -4995,6 +5203,9 @@ class Server(ThreadingHTTPServer):
         """Describe a durable restart for manual stops, exhaustion, or errors."""
 
         state = source_app.snapshot() if state is None else state
+        if (state.get("resultKind") in {"final", "proof", "review"}
+                and not state.get("manuallyStopped") and not state.get("error")):
+            return None
         if (
             state.get("phase") in {"reviewing", "running", "stopping", "pausing"}
             or source_app.has_active_worker()
@@ -5014,6 +5225,9 @@ class Server(ThreadingHTTPServer):
             # run's fixed workspace and cutoff do not allow.
             return None
         stage = state.get("stoppedStage") or state.get("stage")
+        if stage == "final" and state.get("error") and state.get("finalInputReady"):
+            return {"action": "final", "label": "Retry LaTeX editor",
+                    "description": "Retry only the writing stage from its exact saved statement and existing work."}
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
             and not (source_app.run_dir / "final.tex").is_file()
@@ -5128,6 +5342,8 @@ class Server(ThreadingHTTPServer):
     def _queue_saved_author_instructions(source_app, target_app):
         """Replay prior user steering into a newly created author process."""
 
+        if not saved_workflow_stages(target_app.state)["author"]:
+            return
         source_directory = source_app.run_dir if isinstance(source_app, App) else source_app
         instructions = saved_author_instructions(source_directory)
         if not instructions:
@@ -5207,6 +5423,8 @@ class Server(ThreadingHTTPServer):
                 critic_prompt=source_state["criticPrompt"],
                 final_prompt=source_state["finalPrompt"],
                 review_only=source_state["statementReviewOnly"],
+                workflow_stages=source_state["workflowStages"],
+                original_content=source_state.get("originalContent"),
                 **common,
             )
         elif plan["action"] == "author":
@@ -5224,6 +5442,8 @@ class Server(ThreadingHTTPServer):
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
                 "final_prompt": source_state["finalPrompt"],
+                "workflow_stages": {**source_state["workflowStages"], "review": False},
+                "original_content": source_state.get("originalContent"),
                 **common,
             }
             app.start_direct_statement(
@@ -5283,6 +5503,7 @@ class Server(ThreadingHTTPServer):
                     "settingsWarning",
                     "launchHold", "retrievalPolicyPath", "retrieval", "retrievalMode", "retrievalCutoffUtc",
                     "resultKind", "stage", "workerActive", "processAlive", "activeElapsedSeconds",
+                    "workflowStages",
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
@@ -5302,6 +5523,7 @@ class Server(ThreadingHTTPServer):
             job["checkpoints"] = checkpoints
             job["canResumeCritic"] = bool(
                 not historical
+                and saved_workflow_stages(state)["critic"]
                 and state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
                 and run_dir
                 and (
@@ -5813,13 +6035,15 @@ class Handler(BaseHTTPRequestHandler):
                 app = self.server.continue_stopped_job(run_id)
             elif request.path == "/review":
                 app = self.server.start_job(body, run_id)
+            elif request.path == "/start-workflow":
+                app = self.server.start_workflow(body, run_id)
             elif request.path == "/direct":
                 app = self.server.start_direct_job(body, run_id)
             elif request.path == "/finalize":
                 app = self.server.start_latex_job(body, run_id)
             else:
                 app = self.server.get_job(run_id)
-            if request.path == "/approve":
+            if request.path in {"/approve", "/solve"}:
                 app.approve(body.get("statement"))
             elif request.path == "/set-author-time-limit":
                 app.set_author_time_limit(body.get("hours"))
@@ -5834,7 +6058,7 @@ class Handler(BaseHTTPRequestHandler):
             elif request.path == "/clear-trace":
                 app.clear_trace()
             elif request.path not in {
-                "/review", "/direct", "/finalize",
+                "/review", "/direct", "/finalize", "/start-workflow",
                 "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
             }:
                 return self.send({"error": "Not found."}, status=404)

@@ -175,7 +175,8 @@ class PipelineTests(unittest.TestCase):
             source = initial.get('solution', initial.get('source'))
             def model(prompt, schema, stage, **settings):
                 self.assertEqual(stage, 'final')
-                self.assertEqual(prompt, runtime.FINAL_PROMPT.strip() + '\n\nSOLUTION:\n' + source)
+                self.assertEqual(prompt, runtime.FINAL_PROMPT.strip() + '\n\nEXACT STATEMENT (when supplied):\n'
+                                 + initial.get('statement', '') + '\n\nSOLUTION:\n' + source)
                 self.assertEqual(settings['features'], [])
                 return {'latex': LATEX}, json.dumps({'latex': LATEX})
             with self.subTest(initial=initial), workspace() as directory, patch.object(runtime, 'structured', side_effect=model) as editor, patch.object(runtime, '_run_command', return_value={'status': 'pass', 'output': ''}) as command, patch.object(runtime, 'emit') as emit:

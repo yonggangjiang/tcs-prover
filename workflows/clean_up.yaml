@@ -1,11 +1,15 @@
 nodes:
   latex_editor:
     run: structured
+    workflow_stage: writing
+    skip: end
     role: writer
     stage: final
     prompt: solution_input
     instructions: final
-    inputs: {solution: "get(state, 'solution', get(state, 'source', ''))"}
+    inputs:
+      statement: "get(state, 'statement', '')"
+      solution: "get(state, 'solution', get(state, 'source', ''))"
     response: {latex: string}
     require: ["strip(result.latex) != ''"]
     after:
@@ -14,6 +18,8 @@ nodes:
 
   latex_compile:
     run: command
+    workflow_stage: writing
+    skip: end
     stage: final
     before:
       - write: {path: latex-source.tex, text: state.output}
@@ -41,6 +47,8 @@ nodes:
 
   latex_repair:
     run: structured
+    workflow_stage: writing
+    skip: end
     role: writer
     stage: final
     prompt: compilation_repair
@@ -414,6 +422,9 @@ prompts:
       Return only the complete revised manuscript in LaTeX.
   solution_input: |-
     {instructions}
+
+    EXACT STATEMENT (when supplied):
+    {statement}
 
     SOLUTION:
     {solution}

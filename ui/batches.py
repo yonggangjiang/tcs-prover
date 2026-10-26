@@ -250,7 +250,13 @@ class BatchCatalog:
         return sorted(cards, key=lambda card: (not card['current'], card['id'] != ORIGINAL_BATCH, card['label']))
 
     def _summary(self, directory):
+        from .server import saved_workflow_stages
+
         settings = self._json(directory, 'job-settings.json')
+        try:
+            selected = saved_workflow_stages(settings)
+        except ValueError:
+            selected = saved_workflow_stages({key: value for key, value in settings.items() if key != 'workflowStages'})
         pause = self._json(directory, 'pause.json')
         stopped = self._json(directory, 'manual-stop.json')
         draft = self._read(directory, 'draft.md').strip()
@@ -259,11 +265,12 @@ class BatchCatalog:
         started = self._started_at(directory, settings)
         trace_info = self._info(directory, 'transcript.jsonl')
         final = self._info(directory, 'final.tex')
+        proof = self._info(directory, 'proof-output.md')
         failed = self._info(directory, 'failure-summary.md')
         phase = 'paused' if _text(pause.get('status')) in {'paused', 'pausing'} else 'done'
-        if final and final.st_size:
+        if (final and final.st_size) or (proof and proof.st_size):
             phase = 'done'
-        if settings.get('preparedRun') is True and (trace_info is None or not trace_info.st_size) and not final and not failed:
+        if settings.get('preparedRun') is True and (trace_info is None or not trace_info.st_size) and not final and not proof and not failed:
             phase, started = 'prepared', ''
         stage = _text(stopped.get('stage') or pause.get('stage'))
         active_node = _text(pause.get('node')) or {
@@ -281,7 +288,12 @@ class BatchCatalog:
                 'error': 'Stopped.' if stopped else _text(pause.get('error')),
                 'manuallyStopped': bool(stopped), 'stoppedStage': _text(stopped.get('stage')),
                 'problemMode': _text(settings.get('problemMode')) or 'statement',
-                'resultKind': 'final' if final and final.st_size else 'failure' if failed and failed.st_size else '',
+                'workflowStages': selected, 'revisionRequired': settings.get('revisionRequired') is True,
+                'originalContent': _text(settings.get('originalContent')) or draft,
+                'resultKind': ('final' if final and final.st_size else 'proof' if proof and proof.st_size
+                               else 'needs-revision' if failed and settings.get('revisionRequired') is True
+                               else 'failure' if failed and failed.st_size else
+                               'review' if settings.get('resultKind') == 'review' else ''),
                 'settingsWarning': '', 'launchHold': _text(settings.get('launchHold')),
                 'retrieval': retrieval, 'retrievalMode': retrieval['mode'],
                 'retrievalCutoffUtc': retrieval['cutoffExclusiveUtc'], 'retrievalPolicyPath': '',
@@ -331,8 +343,7 @@ class BatchCatalog:
             return [], False, 0
 
     def state(self, batch_id, run_id, after=None):
-        from .server import (DIRECT_GRAPH, LATEX_GRAPH, REVIEW_ONLY_GRAPH,
-                             empty_state, event_node, model_menu_settings, saved_api_models)
+        from .server import (empty_state, event_node, model_menu_settings, saved_api_models, workflow_graph)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
@@ -365,7 +376,7 @@ class BatchCatalog:
             prompt = self._read(directory, f'prompts/{role}.txt')
             if prompt:
                 state[role + 'Prompt'] = prompt
-        checked = self._read(directory, 'checked-statement.md').lstrip()
+        checked = self._read(directory, 'checked-statement.md').replace('\r\n', '\n').lstrip()
         for heading in ('# Checked statement', '# Statement sent directly to the proof author'):
             if checked.startswith(heading):
                 checked = checked[len(heading):].lstrip('\r\n')
@@ -373,12 +384,10 @@ class BatchCatalog:
         state['statement'] = checked.split('\n# Reviewer notes', 1)[0].rsplit(
             '\n# Statement review\n\nSkipped by the user.', 1)[0].strip() or state['draft']
         state['reviewStatement'] = state['statement']
-        if state['statementReviewOnly']:
-            state['workflow'] = REVIEW_ONLY_GRAPH
-        elif state['problemMode'] in {'latex', 'final-resume'}:
-            state['workflow'] = LATEX_GRAPH
-        elif state['skipStatementReview']:
-            state['workflow'] = DIRECT_GRAPH
+        state['workflow'] = workflow_graph(state['workflowStages'])
+        state['skipStatementReview'] = not state['workflowStages']['review']
+        state['statementReviewOnly'] = state['workflowStages']['review'] and not any(
+            state['workflowStages'][name] for name in ('author', 'critic', 'writing'))
         # Every /state carries the model catalog, read per request; the shared
         # graph constants never hold user data.
         graph = state['workflow']
@@ -394,7 +403,12 @@ class BatchCatalog:
             if kind == 'review_result' and isinstance(record.get('review'), dict):
                 state['review'] = record['review']
             if kind in {'final_result', 'failure_result'}:
-                state['resultKind'] = 'final' if kind == 'final_result' else 'failure'
+                state['resultKind'] = ('proof' if record.get('resultKind') == 'proof' else 'final') if kind == 'final_result' else (
+                    'needs-revision' if record.get('resultKind') == 'needs-revision' else 'failure')
+                state['revisionRequired'] = state['resultKind'] == 'needs-revision'
+                if state['revisionRequired']:
+                    state['criticBugs'] = record.get('bugs', '')
+                    state['error'] = 'Proof needs revision. See the critic feedback.'
         if records:
             state['lastActivityAt'] = _text(records[-1].get('time')) or state['lastActivityAt']
             if not truncated:
@@ -402,7 +416,7 @@ class BatchCatalog:
         state['activeElapsedSeconds'] = _active_seconds(
             state['phase'], settings, self._json(directory, 'pause.json'),
             state['startedAt'], state['lastActivityAt'])
-        for filename in ('final.tex', 'failure-summary.md', 'partial-output.md', 'SOLUTION.md'):
+        for filename in ('final.tex', 'proof-output.md', 'failure-summary.md', 'partial-output.md', 'SOLUTION.md'):
             output = self._read(directory, filename)
             if output:
                 state['output'] = output
