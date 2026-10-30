@@ -335,6 +335,15 @@ prompts:
 
       ## 5. Is the retained machinery necessary and illuminating?
 
+      Refactor this manuscript at the level of mathematical dependencies. Seek substantial simplifications
+      of lemma contracts and algorithmic interfaces, including changes to constructions when useful. For
+      each major construction, first inspect all its downstream uses and identify exactly which properties
+      they require. Then look for a simpler existential or algorithmic lemma exposing those properties.
+      Keep the construction rules and their auxiliary notation inside the limited scopes (proof,
+      subsection, section). Autonomously identify and implement the strongest justified improvements.
+      Verify the mathematical guarantees and running-time analysis, update every consumer, and repeat the
+      dependency audit.
+
       - Distinguish the theorem's requirements from auxiliary choices made in its proof. Preserve the
         original claim, not avoidable arities, encodings, or cumbersome illustrative witnesses.
       - Actively compare a long derivative, coordinate, case, or invariant calculation with a plausible
