@@ -1719,13 +1719,13 @@ function completedRunOutcome(job) {
     // Writing & polishing, the convention critic in the critic's stage), else the stage's first step.
     const steps = {review: ["statement_reviewer"], solve: ["author"], repair: ["author"], critic: ["critic", "convention"],
       final: ["latex_editor", "latex_compile"], failure: ["failure_summary"]}[job.stoppedStage] || [];
-    return outcome("Stopped", "stopped", "You stopped this job. Saved partial work and checkpoints remain available.",
+    return outcome("Stopped", "stopped", "You stopped this job. Its checkpoints remain available.",
       "stopped by you", steps.includes(node) ? node : steps[0] || node);
   }
   // A saved run whose last checkpoint says it was still running (a crash or a restart).
   if (job.interrupted) {
     return outcome("Interrupted", "failed", "The run stopped part-way, while its last checkpoint says it was "
-      + "still running. Saved partial work and checkpoints remain available.", "the run stopped part-way");
+      + "still running. Its checkpoints remain available.", "the run stopped part-way");
   }
   if (job.resultKind === "review" || job.statementReviewOnly) {
     return outcome("Review complete", "done", "The statement review is saved.",
@@ -1738,7 +1738,7 @@ function completedRunOutcome(job) {
   }
   if (job.resultKind === "failure" || job.error) {
     return outcome("Incomplete", "failed",
-      "No completed answer was produced. Saved partial work and checkpoints remain available.",
+      "No completed answer was produced. Its checkpoints remain available.",
       String(job.error || "").trim() || "the run ended without a complete result");
   }
   if (job.resultKind === "proof") {
@@ -1768,7 +1768,7 @@ function completedRunOutcome(job) {
     return outcome("Answer ready", "done", summary, ended, "latex_compile");
   }
   return outcome("Incomplete", "failed",
-    "No completed answer was produced. Saved partial work and checkpoints remain available.",
+    "No completed answer was produced. Its checkpoints remain available.",
     "the run ended without a complete result");
 }
 
@@ -2099,18 +2099,20 @@ function renderRunOverview() {
     }));
   }
   renderCriticReviewHistory();
-  const savedOutput = Boolean(state.output && ["done", "paused"].includes(state.phase));
-  show(ui.resultPanel, savedOutput);
   const final = state.resultKind === "final" || state.canDownloadTex;
+  // Only a result is shown here; an unfinished run's own text is not (its progress summary says where it stands).
+  const savedOutput = Boolean(state.output && ["done", "paused"].includes(state.phase)
+    && (final || ["proof", "needs-revision", "failure"].includes(state.resultKind) || state.revisionRequired));
+  show(ui.resultPanel, savedOutput);
   ui.resultHeading.textContent = final ? (state.canDownloadTex ? "Final answer · LaTeX source" : "Final answer")
     : state.resultKind === "proof" ? (stages.critic ? "Accepted proof" : "Proof (not reviewed)")
     : state.revisionRequired ? "Candidate and critic feedback"
-    : state.resultKind === "failure" ? "Failure report" : "Saved partial work";
+    : "Failure report";
   ui.resultDescription.textContent = final ? "The complete saved output is shown here."
     : state.resultKind === "proof" ? (stages.critic ? "The complete proof, as the critic accepted it."
       : "The complete proof the author wrote. No critic reviewed it.")
     : state.revisionRequired ? "The critic found unresolved errors in this candidate."
-    : "This is preserved work from an incomplete run; it has not completed the proof and critic workflow.";
+    : "This run ended without a complete result; this is its failure report.";
   if (savedOutput && ui.resultOutput.textContent !== state.output) ui.resultOutput.textContent = state.output;
   // A LaTeX source published without its PDF says so; the activity log has the reason.
   if (final && state.canDownloadTex && !state.canDownloadPdf) {

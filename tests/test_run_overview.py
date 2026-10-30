@@ -178,9 +178,8 @@ renderRunOverview(); assert.match(ui.runHealth.textContent, /No active process/)
 state.phase = 'paused'; state.output = 'Saved exploration';
 renderRunOverview();
 assert.match(ui.runNextStep.textContent, /No final answer yet/);
-assert.equal(ui.resultHeading.textContent, 'Saved partial work');
-assert.equal(ui.resultOutput.textContent, state.output);
-assert.equal(ui.resultPanel.hidden, false);
+// An unfinished run's own text is not shown as a result: its progress summary says where it stands.
+assert.equal(ui.resultPanel.hidden, true);
 state.phase = 'done'; state.resultKind = 'final'; state.output = 'Complete proof';
 renderRunOverview();
 assert.equal(ui.resultPanel.open, true);

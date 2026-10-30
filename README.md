@@ -1085,8 +1085,10 @@ that call, kept over every attempt.
 The run overview displays the exact checked statement, the original
 wording when it differs, current stage, active time and remaining workflow
 budget, local process status, recent public activity, and saved model settings.
-Completed answers and preserved partial work have separate labels and a readable
-output panel. A finished job says what it produced and what was skipped: with
+A finished result (a final answer, an accepted proof, a candidate with critic
+feedback, or a failure report) appears in a readable output panel; an unfinished
+run's own text is not shown there, since its progress summary says where it
+stands (the text stays in `partial-output.md`). A finished job says what it produced and what was skipped: with
 the critic on and **Writing & polishing** off, a passing proof is **Proof
 accepted** (*The critic accepted the proof. Writing & polishing was not
 selected for this run, so no PDF was made.*); with the critic off, the author's
