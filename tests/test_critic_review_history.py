@@ -1,9 +1,10 @@
-"""Exact critic inputs and decisions stay paired and readable in metadata."""
+"""Coordinator's exact inputs and decisions stay paired and readable in metadata."""
 
 import shutil
 import subprocess
 import unittest
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
 
 
@@ -52,7 +53,7 @@ assert(!text(rows[0]).includes('SECOND exact'));
 assert.match(text(rows[1]), /SECOND exact proof/); assert.match(text(rows[1]), /SECOND exact bugs/);
 assert(!text(rows[1]).includes('FIRST exact'));
 assert.notEqual(rows[0].dataset.reviewKey, rows[1].dataset.reviewKey);
-assert.match(text(rows[0]), /Full critic decision RAW reject: FIRST exact bugs/);
+assert.match(text(rows[0]), /Coordinator's raw decision RAW reject: FIRST exact bugs/);
 assert.equal(ui.criticReviewHistory.open, false);
 assert(all(ui.criticReviewHistory).filter(node => node.tagName === 'details').every(node => !node.open));
 """)
@@ -63,8 +64,8 @@ state.trace = [request('t1', 'First attempt'), request('t2', 'Exact recovery inp
 renderCriticReviewHistory();
 assert.equal(reviews().length, 1);
 assert.match(text(reviews()[0]), /Awaiting decision/);
-assert.match(text(reviews()[0]), /Exact critic input · attempt 1 First attempt/);
-assert.match(text(reviews()[0]), /Exact critic input · attempt 2 Exact recovery input/);
+assert.match(text(reviews()[0]), /Coordinator's exact input · attempt 1 First attempt/);
+assert.match(text(reviews()[0]), /Coordinator's exact input · attempt 2 Exact recovery input/);
 state.trace.push(result('t3', 'pass'));
 renderCriticReviewHistory();
 assert.match(text(reviews()[0]), /Round 1 · Pass — edits and next step not recorded/);
@@ -89,10 +90,37 @@ state.trace = [request('t1', 'Abandoned review'), {kind: 'request', stage: 'repa
 renderCriticReviewHistory();
 assert.equal(reviews().length, 2);
 assert.match(text(reviews()[0]), /No recorded decision/);
-assert.match(text(reviews()[1]), /exact critic input was not recorded/);
+assert.match(text(reviews()[1]), /exact input was not recorded/);
 assert(!text(reviews()[1]).includes('Abandoned review'));
 assert(!text(ui.criticReviewHistory).includes('Independent audit input'));
 assert(!text(ui.criticReviewHistory).includes('Another independent audit input'));
+""")
+
+    def test_a_round_whose_critics_run_awaits_its_coordinator_in_the_same_row(self):
+        self.run_history(r"""
+const visit = (tag, number) => [
+  {kind: 'status', stage: 'critic', node: 'critic', label: 'Workflow step: critic', visit: number, time: `${tag}-step`},
+  {kind: 'proof_handoff', stage: 'critic', label: 'Submitted proof captured', round: number, time: `${tag}-proof`},
+  ...[1, 2, 3].map(index => request(`${tag}-audit${index}`, `Audit input ${index}`,
+    {label: `Independent critic audit ${index}`}))];
+state.trace = [...visit('v1', 1), request('v1-c', 'First coordinator input', {label: 'Critic coordinator'}),
+  result('v1-r', 'pass', '', {outcome: 'fixed'}), ...visit('v2', 2)];
+renderCriticReviewHistory();
+assert.equal(reviews().length, 2);
+assert.match(text(reviews()[1]), /Round 2 · Awaiting decision/);
+// An older transcript's own critics' requests are no inputs of the round: it awaits its critic's input.
+assert.match(text(reviews()[1]), /The critic is starting\. Its exact input appears here once it is sent\./);
+assert(!text(ui.criticReviewHistory).includes('Audit input'));
+state.trace = [...state.trace, request('v2-c', 'Second coordinator input', {label: 'Critic coordinator'})];
+renderCriticReviewHistory();
+assert.equal(reviews().length, 2);
+assert.match(text(reviews()[1]), /Coordinator's exact input Second coordinator input/);
+assert(!text(reviews()[1]).includes('The critic is starting'));
+assert.match(text(reviews()[1]), /The critic is reviewing the proof\./);
+// A finished job keeps no round for a visit that ended before its coordinator was asked.
+state.trace = state.trace.slice(0, -1); state.phase = 'done';
+renderCriticReviewHistory();
+assert.equal(reviews().length, 1);
 """)
 
     def test_explicit_request_identity_matches_even_when_arrival_order_differs(self):
@@ -155,8 +183,8 @@ for (const boundary of [
   renderCriticReviewHistory();
   assert.equal(reviews().length, 2);
   assert.match(text(reviews()[1]), /Rejected — returned to author/);
-  assert.match(text(reviews()[1]), /Rejection \/ unresolved bugs Later bugs/);
-  assert.match(text(reviews()[1]), /exact critic input was not recorded/);
+  assert.match(text(reviews()[1]), /Critical bugs: Later bugs/);
+  assert.match(text(reviews()[1]), /exact input was not recorded/);
   assert(!text(reviews()[1]).includes('Abandoned input'));
 }
 """)
@@ -165,7 +193,7 @@ for (const boundary of [
         self.run_history(r"""
 state.trace = [{kind: 'critic_result', round: 1, report: {verdict: 'reject', bugs: 'Legacy bugs', solution: 'Legacy proof'}}];
 renderCriticReviewHistory();
-assert.match(text(reviews()[0]), /exact critic input was not recorded/);
+assert.match(text(reviews()[0]), /exact input was not recorded/);
 assert.match(text(reviews()[0]), /Legacy bugs/);
 assert.match(text(reviews()[0]), /Legacy proof/);
 state.trace = [];
@@ -221,6 +249,68 @@ state.trace = [state.trace[0], state.trace[1], approval, state.trace[2]];
 renderCriticReviewHistory();
 assert.equal(cycles().length, 1); assert.equal(reviews().length, 1);
 assert.equal(reviews()[0].dataset.outcome, 'pass_edited_limit');
+""")
+
+    def test_a_round_awaiting_its_coordinator_says_what_the_job_does(self):
+        self.run_history(r"""
+state.trace = [{kind: 'status', stage: 'critic', node: 'critic', label: 'Workflow step: critic', visit: 1, time: 'v1'},
+  request('v1-audit1', 'Audit input', {label: 'Independent critic audit 1'})];
+const note = () => text(reviews()[0]);
+renderCriticReviewHistory();
+assert.match(note(), /Round 1 · Awaiting decision/);
+assert.match(note(), /The critic is starting\. Its exact input appears here once it is sent\./);
+assert.match(note(), /Coordinator decision Not decided yet\./);
+// No critic runs while the job is paused (by an error, a safety stop or a restart): the round starts again.
+for (const phase of ['paused', 'pausing']) {
+  state.phase = phase;
+  renderCriticReviewHistory();
+  assert.match(note(), /Round 1 · Awaiting decision/);
+  assert(note().includes('Paused before the critic was asked. The round starts again, with fresh independent '
+    + 'critics, when the job resumes.'), note());
+  assert(!note().includes('The critic is starting'));
+}
+state.phase = 'stopping';
+renderCriticReviewHistory();
+assert.match(note(), /The job is stopping before the critic was asked\./);
+""")
+
+    def test_open_rows_stay_open_when_the_coordinator_is_asked(self):
+        self.run_history(r"""
+// A round is keyed by its visit's start until its coordinator's input exists, then by that input.
+state.trace = [{kind: 'status', stage: 'critic', node: 'critic', label: 'Workflow step: critic', visit: 1, time: 'v1'},
+  {kind: 'proof_handoff', stage: 'critic', label: 'Submitted proof captured', round: 1, time: 'v1-proof'},
+  ...[1, 2, 3].map(index => request(`v1-audit${index}`, 'Audit input', {label: `Independent critic audit ${index}`}))];
+renderCriticReviewHistory();
+cycles()[0].open = true; reviews()[0].open = true;
+const keys = () => [cycles()[0].dataset.reviewKey, reviews()[0].dataset.reviewKey];
+const before = keys();
+state.trace = [...state.trace, request('v1-coordinator', 'Coordinator input', {label: 'Critic coordinator'})];
+renderCriticReviewHistory();
+assert.notDeepEqual(keys(), before);
+assert(cycles()[0].open); assert(reviews()[0].open);
+state.trace = [...state.trace, result('v1-result', 'pass', '', {outcome: 'fixed'})];
+renderCriticReviewHistory();
+assert(cycles()[0].open); assert(reviews()[0].open);
+""")
+
+    def test_a_resumed_round_is_one_round_with_its_earlier_input(self):
+        self.run_history(r"""
+// Round 1's coordinator was interrupted; the restarted runner continued the same visit.
+const visit = (tag, number) => [
+  {kind: 'status', stage: 'critic', node: 'critic', label: 'Workflow step: critic', visit: number, time: `${tag}-step`},
+  {kind: 'proof_handoff', stage: 'critic', label: 'Submitted proof captured', round: number, time: `${tag}-proof`},
+  ...[1, 2, 3].map(index => request(`${tag}-audit${index}`, 'Audit input', {label: `Independent critic audit ${index}`}))];
+state.trace = [...visit('v1', 1), request('v1-c', 'Interrupted coordinator input', {label: 'Critic coordinator'}),
+  {kind: 'workflow_paused', stage: 'critic', node: 'critic', time: 'v1-paused'},
+  ...visit('v1b', 1), request('v1b-c', 'Resumed coordinator input', {label: 'Critic coordinator'}),
+  result('v1b-r', 'pass', '', {outcome: 'fixed'}), ...visit('v2', 2)];
+renderCriticReviewHistory();
+assert.match(text(ui.criticReviewHistory.children[0]), /1 cycle · 2 rounds/);
+assert.equal(reviews().length, 2);
+assert.match(text(reviews()[0]), /^\s*Round 1 \(resumed\) · Pass with fixes — another review/);
+assert.match(text(reviews()[0]), /Coordinator's exact input · attempt 1 Interrupted coordinator input/);
+assert.match(text(reviews()[0]), /Coordinator's exact input · attempt 1 after resume Resumed coordinator input/);
+assert.match(text(reviews()[1]), /^\s*Round 2 · Awaiting decision/);
 """)
 
 

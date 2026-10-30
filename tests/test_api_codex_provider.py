@@ -18,8 +18,9 @@ try:
 except ImportError:  # Python < 3.11
     tomllib = None
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
-from runner import providers
+from runner import confinement, providers
 import test_goal_runtime as goal_test
 
 KEY = "sk-test-codex-gateway-0123456789"
@@ -123,9 +124,12 @@ class ProviderArgumentTests(ApiCase):
         with mock.patch.object(runtime.sys, "platform", "darwin"):
             profile = runtime.private_permission_arguments(":read-only", self.model(label="Other"))
         overrides = dict((key, tomllib.loads(f"value = {value}")["value"]) for key, value in self.overrides(profile))
+        self.assertEqual(set(overrides), {"default_permissions", f"permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem"})
         self.assertEqual(overrides["default_permissions"], runtime.PRIVATE_PERMISSIONS)
-        self.assertEqual(overrides[f"permissions.{runtime.PRIVATE_PERMISSIONS}.extends"], ":read-only")
-        self.assertEqual(set(overrides[f"permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem"].values()), {"deny"})
+        filesystem = overrides[f"permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem"]
+        self.assertEqual(filesystem[":workspace_roots"]["."], "read")
+        for path in (*providers.private_paths(), *providers.user_login_files()):
+            self.assertEqual(filesystem[str(path)], "deny")
         # Labels with control characters are refused by the store; quoting still escapes them.
         self.assertEqual(tomllib.loads("value = " + runtime.toml_string("tab\t del\x7f"))["value"], "tab\t del\x7f")
 
@@ -238,50 +242,61 @@ class StructuredProcessTests(ApiCase):
                     # "-s read-only" would override the profile, so it is absent.
                     self.assertNotIn("-s", command)
                     self.assertIn(f'default_permissions="{runtime.PRIVATE_PERMISSIONS}"', overrides)
-                    self.assertIn(f'permissions.{runtime.PRIVATE_PERMISSIONS}.extends=":read-only"', overrides)
+                    self.assertFalse([value for value in overrides if ".extends=" in value])
+                    # A live run (without saved settings) reaches the internet.
+                    self.assertIn(f'permissions.{runtime.PRIVATE_PERMISSIONS}.network={{"enabled"=true}}', overrides)
                     denied = next(value for value in overrides if value.startswith(
                         f"permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem="))
                     for path in (*providers.private_paths(), *providers.user_login_files()):
                         self.assertIn(json.dumps(str(path)) + '="deny"', denied)
+                    # The API model's private home holds the apply_patch helpers.
+                    arg0 = os.path.join(os.path.realpath(runtime.api_codex_home(self.workspace)), "tmp", "arg0")
+                    self.assertIn(json.dumps(arg0) + '="read"', denied)
+                    self.assertNotIn(json.dumps(os.path.join(os.path.realpath(Path.home() / ".codex"), "tmp", "arg0")),
+                                     denied)
                 else:
                     self.assertIn(("-s", "read-only"), list(zip(command, command[1:])))
                     self.assertFalse([value for value in overrides if "permissions" in value])
         with mock.patch.object(runtime.sys, "platform", "darwin"):
             native = runtime.private_permissions(":workspace", "gpt-6.1-sol")
             auditor = runtime.private_permissions(":read-only", None)
-        # Native models keep their own login; only TCS Prover's private state is hidden.
-        # A derived profile drops Codex's read-only project folders, so it names them again.
-        self.assertEqual(native, {"extends": ":workspace", "filesystem": {
-            **{str(path): "deny" for path in providers.private_paths()},
-            ":workspace_roots": {".": "write", ".codex": "read", ".agents": "read", ".git": "read", ".aws": "read"}}})
-        # None is a native model (research auditors); read-only needs no carve-outs.
-        self.assertEqual(auditor, {"extends": ":read-only",
-                                   "filesystem": {str(path): "deny" for path in providers.private_paths()}})
+            elsewhere = runtime.private_permissions(":workspace", "gpt-6.1-sol", codex_home=self.root / "other-home")
+        # No built-in profile underneath: the system runtime, the toolchains and Codex's own programs
+        # are readable, /tmp and /var/tmp are closed again, and only the private temp folder
+        # ($TMPDIR) and the workspace are writable. Native models keep their own login; only
+        # TCS Prover's private state is hidden. Codex's project folders and the controller's
+        # files in the run folder stay read-only.
+        protected = {".codex": "read", ".agents": "read", ".git": "read", ".aws": "read",
+                     "job-settings.json": "read", "pause.json": "read",
+                     "checked-statement.md": "read", "prompts": "read", "related-works": "read"}
+        common = {
+            ":minimal": "read", ":slash_tmp": "deny", "/private/var/tmp": "deny", ":tmpdir": "write",
+            **{str(path): "read" for path in (*confinement.toolchain_folders(), *confinement.codex_packages())},
+            os.path.join(os.path.realpath(Path.home() / ".codex"), "tmp", "arg0"): "read",
+            **{str(path): "deny" for path in providers.private_paths()}}
+        self.assertEqual(native, {"filesystem": {**common, ":workspace_roots": {".": "write", **protected}}})
+        # None is a native model (statement reviewer); read-only keeps the same reads.
+        self.assertEqual(auditor, {"filesystem": {**common, ":workspace_roots": {".": "read", **protected}}})
+        self.assertEqual(elsewhere["filesystem"][os.path.join(os.path.realpath(self.root / "other-home"), "tmp", "arg0")],
+                         "read")
 
-    def test_workspace_profile_carries_the_users_workspace_write_settings(self):
+    def test_network_is_the_only_difference_of_a_live_profile(self):
         private = providers.private_paths()
-        extra = str(self.root / "extra")
-        legacy = {"network_access": True, "exclude_slash_tmp": True, "exclude_tmpdir_env_var": True,
-                  "writable_roots": [extra, str(private[0]), str(private[2] / "inner"), "relative/root"]}
         with mock.patch.object(runtime.sys, "platform", "darwin"):
-            profile = runtime.private_permissions(":workspace", "gpt-6.1-sol", legacy)
-            plain = runtime.private_permissions(":workspace", "gpt-6.1-sol", {
-                "network_access": False, "exclude_slash_tmp": False, "exclude_tmpdir_env_var": False,
-                "writable_roots": []})
-            unset = runtime.private_permissions(":workspace", "gpt-6.1-sol")
-            read_only = runtime.private_permissions(":read-only", "gpt-6.1-sol", legacy)
-        filesystem = profile["filesystem"]
-        self.assertEqual(profile["network"], {"enabled": True})
-        self.assertEqual((filesystem[extra], filesystem[":slash_tmp"], filesystem[":tmpdir"]), ("write", "read", "read"))
-        # A writable root never reopens private state, and relative roots are ignored.
-        self.assertEqual(filesystem[str(private[0])], "deny")
-        self.assertNotIn(str(private[2] / "inner"), filesystem)
-        self.assertNotIn("relative/root", filesystem)
-        # Codex's defaults (no network, writable /tmp and $TMPDIR) add nothing.
-        self.assertEqual(plain, unset)
-        self.assertNotIn("network", plain)
-        self.assertFalse({":slash_tmp", ":tmpdir"} & set(plain["filesystem"]))
-        self.assertEqual(read_only, {"extends": ":read-only", "filesystem": {str(path): "deny" for path in private}})
+            for base in (":workspace", ":read-only"):
+                live = runtime.private_permissions(base, "gpt-6.1-sol", live=True)
+                offline = runtime.private_permissions(base, "gpt-6.1-sol")
+                with self.subTest(base=base):
+                    self.assertEqual(live, {**offline, "network": {"enabled": True}})
+                    self.assertNotIn("network", offline)
+                    filesystem = live["filesystem"]
+                    self.assertEqual((filesystem[":slash_tmp"], filesystem["/private/var/tmp"], filesystem[":tmpdir"]),
+                                     ("deny", "deny", "write"))
+                    self.assertEqual(filesystem[str(private[0])], "deny")
+            # The user's [sandbox_workspace_write] settings are no input: neither their network
+            # access nor their writable roots and /tmp settings reach the profile.
+            with self.assertRaises(TypeError):
+                runtime.private_permissions(":workspace", "gpt-6.1-sol", {"network_access": True})
 
     @unittest.skipIf(tomllib is None, "tomllib is needed to parse Codex overrides")
     def test_profile_flags_render_nested_tables_as_toml(self):
@@ -379,10 +394,13 @@ class GoalSessionTests(ApiCase):
         self.assertEqual((start["model"], start["modelProvider"]), ("gpt-gateway-x", "tcs_api"))
         self.assertFalse(start["config"]["features"]["fast_mode"])
 
-    def test_app_server_author_runs_in_the_profile_that_hides_private_state(self):
+    @unittest.skipIf(tomllib is None, "tomllib is needed to parse Codex overrides")
+    def test_app_server_author_runs_in_the_confined_profile(self):
         model = self.model()
         goal_cwd = self.root / "goal-workspace"
         goal_cwd.mkdir()
+        run_tmp = self.root / "controller" / "run" / "tmp"
+        run_tmp.parent.mkdir(parents=True)
 
         class Double(goal_test.Runtime):
             API_PROVIDER = runtime.API_PROVIDER
@@ -408,34 +426,59 @@ class GoalSessionTests(ApiCase):
                 with mock.patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace()) as spawn:
                     session = runtime.goal_session(double, goal_test.PROMPT, prompts=goal_test.PROMPTS,
                                                    settings={**goal_test.SETTINGS, "model": model},
-                                                   options={"goal_cwd": str(goal_cwd)})
+                                                   options={"goal_cwd": str(goal_cwd), "run_tmp_dir": str(run_tmp)})
                     self.addCleanup(session.close)
                     self.assertEqual(next(session)["outcome"], "done")
                 start = next(params for method, params in double.rpc.calls if method == "thread/start")
+                argv, environment = spawn.call_args.args[0], spawn.call_args.kwargs["env"]
+                # Every platform: the user's apps and plugins are off, and so is image viewing.
+                self.assertEqual(start["config"]["apps"], {"_default": {"enabled": False}})
+                self.assertEqual({key: start["config"]["features"][key] for key in ("apps", "plugins", "view_image")},
+                                 {"apps": False, "plugins": False, "view_image": False})
                 if platform == "darwin":
                     self.assertNotIn("sandbox", start)
                     self.assertEqual(start["permissions"], runtime.PRIVATE_PERMISSIONS)
                     self.assertEqual(start["config"]["default_permissions"], runtime.PRIVATE_PERMISSIONS)
                     profile = start["config"]["permissions"][runtime.PRIVATE_PERMISSIONS]
-                    self.assertEqual(profile["extends"], ":workspace")
-                    self.assertEqual(set(profile["filesystem"]), {":workspace_roots", *(str(path) for path in (
-                        *providers.private_paths(), *providers.user_login_files()))})
+                    self.assertNotIn("extends", profile)
+                    filesystem = profile["filesystem"]
+                    for path in (*providers.private_paths(), *providers.user_login_files()):
+                        self.assertEqual(filesystem[str(path)], "deny")
+                    self.assertEqual((filesystem[":minimal"], filesystem[":slash_tmp"], filesystem["/private/var/tmp"],
+                                      filesystem[":tmpdir"]), ("read", "deny", "deny", "write"))
+                    # The private home of the API model holds the apply_patch helpers.
+                    home = os.path.realpath(runtime.api_codex_home(goal_cwd))
+                    self.assertEqual(filesystem[os.path.join(home, "tmp", "arg0")], "read")
                     # The run folder cannot create the project folders Codex trusts (.codex, ...).
-                    self.assertEqual(profile["filesystem"][":workspace_roots"],
-                                     {".": "write", ".codex": "read", ".agents": "read", ".git": "read", ".aws": "read"})
+                    self.assertEqual(filesystem[":workspace_roots"],
+                                     {".": "write", ".codex": "read", ".agents": "read", ".git": "read", ".aws": "read",
+                                      "job-settings.json": "read", "pause.json": "read",
+                                      "checked-statement.md": "read", "prompts": "read", "related-works": "read"})
+                    # The app-server defines the same profile, so the startup check can use it.
+                    overrides = dict(self.overrides(argv))
+                    self.assertEqual(overrides["default_permissions"], f'"{runtime.PRIVATE_PERMISSIONS}"')
+                    self.assertEqual(tomllib.loads("value = " + overrides[
+                        f"permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem"])["value"], filesystem)
+                    # Its private temp folder: the run's, owner-only and outside the workspace.
+                    temp = os.path.realpath(run_tmp)
+                    self.assertEqual((environment["TMPDIR"], environment["TMPPREFIX"], environment["GIT_CONFIG_GLOBAL"]),
+                                     (temp, os.path.join(temp, "zsh"), os.devnull))
+                    self.assertEqual(stat.S_IMODE(os.stat(temp).st_mode), 0o700)
                 else:
                     self.assertEqual(start["sandbox"], "workspace-write")
                     self.assertNotIn("permissions", start)
+                    self.assertFalse([value for value in argv if "permissions" in value])
+                    self.assertNotIn("TMPPREFIX", environment)
                 # The shell of the author never inherits the key either.
-                self.assertIn('shell_environment_policy.exclude=["TCS_PROVER_API_TOKEN","OPENAI_API_KEY"]',
-                              spawn.call_args.args[0])
+                self.assertIn('shell_environment_policy.exclude=["TCS_PROVER_API_TOKEN","OPENAI_API_KEY"]', argv)
 
-    def test_native_author_profile_keeps_the_users_workspace_write_settings(self):
+    def test_native_author_takes_none_of_the_users_workspace_write_settings(self):
         extra = str(self.root / "extra-root")
         legacy = {"writable_roots": [extra], "network_access": True,
                   "exclude_tmpdir_env_var": True, "exclude_slash_tmp": False}
 
         class Double(goal_test.Runtime):
+            Error = runtime.Error  # A failed attempt is retried as with the real runner.
             private_permissions = staticmethod(runtime.private_permissions)
             config_error = None
 
@@ -448,38 +491,56 @@ class GoalSessionTests(ApiCase):
                         return call(method, params)
                     rpc.calls.append((method, params))
                     if self.config_error:
-                        raise goal_test.TransportError(self.config_error)
-                    return {"config": {"sandbox_workspace_write": legacy}, "origins": {}}
+                        raise runtime.RPCError(self.config_error)
+                    return {"config": {"sandbox_workspace_write": legacy, "plugins": {"slack@openai-curated": {
+                        "enabled": True}}, "mcp_servers": {"node_repl": {"command": "node_repl", "enabled": True}},
+                        "apps": {"calendar": {"enabled": True}}}, "origins": {}}
                 rpc.call = answer
                 return rpc
 
-        for platform, failure in (("darwin", None), ("darwin", "config/read failed: unsupported"), ("linux", None)):
-            with self.subTest(platform=platform, failure=failure), mock.patch.object(runtime.sys, "platform", platform):
+        for platform, failure, mode in (("darwin", None, "live"), ("darwin", None, "disabled"),
+                                        ("darwin", "config/read failed: unsupported", "live"), ("linux", None, "live"),
+                                        ("linux", None, "disabled")):
+            with self.subTest(platform=platform, failure=failure, mode=mode), \
+                    mock.patch.object(runtime.sys, "platform", platform), \
+                    mock.patch.dict(os.environ, {"TCS_PROVER_RETRIEVAL_MODE": mode}):
                 double = Double([goal_test.success()])
                 double.config_error = failure
-                with mock.patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace()):
+                with mock.patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace()) as spawn:
                     session = runtime.goal_session(double, goal_test.PROMPT, prompts=goal_test.PROMPTS,
                                                    settings={**goal_test.SETTINGS, "model": "gpt-6.1-sol"},
                                                    options={"goal_cwd": str(self.workspace)})
                     self.addCleanup(session.close)
+                    if failure:
+                        # Without the settings the user's MCP servers would load: retried, never started.
+                        with self.assertRaises(runtime.WorkflowPaused) as paused:
+                            next(session)
+                        self.assertIn("Could not read Codex's settings", paused.exception.reason)
+                        self.assertIsNotNone(paused.exception.retry)
+                        self.assertFalse(any(method in {"thread/start", "turn/start"}
+                                             for method, _ in double.rpc.calls))
+                        continue
                     self.assertEqual(next(session)["outcome"], "done")
                 start = next(params for method, params in double.rpc.calls if method == "thread/start")
                 reads = [params for method, params in double.rpc.calls if method == "config/read"]
-                if platform != "darwin":
-                    # The legacy sandbox applies [sandbox_workspace_write] itself.
-                    self.assertEqual((start["sandbox"], reads), ("workspace-write", []))
-                    continue
                 self.assertEqual(reads, [{"cwd": str(self.workspace)}])
-                profile = start["config"]["permissions"][runtime.PRIVATE_PERMISSIONS]
-                if failure:
-                    self.assertNotIn("network", profile)
-                    self.assertNotIn(extra, profile["filesystem"])
-                    self.assertTrue(any("sandbox_workspace_write" in str(event.get("text"))
-                                        for event in double.events if event["kind"] == "diagnostic"))
+                # Each MCP server, plugin and app the settings name is turned off by name.
+                self.assertEqual((start["config"]["mcp_servers"], start["config"]["plugins"], start["config"]["apps"]),
+                                 ({"node_repl": {"enabled": False}}, {"slack@openai-curated": {"enabled": False}},
+                                  {"_default": {"enabled": False}, "calendar": {"enabled": False}}))
+                live = mode == "live"
+                if platform != "darwin":
+                    # The legacy sandbox's network follows the search mode, not network_access = true.
+                    self.assertEqual(start["sandbox"], "workspace-write")
+                    self.assertIn(f"sandbox_workspace_write.network_access={str(live).lower()}",
+                                  spawn.call_args.args[0])
                     continue
-                self.assertEqual(profile["network"], {"enabled": True})
-                self.assertEqual((profile["filesystem"][extra], profile["filesystem"][":tmpdir"]), ("write", "read"))
-                self.assertNotIn(":slash_tmp", profile["filesystem"])
+                profile = start["config"]["permissions"][runtime.PRIVATE_PERMISSIONS]
+                # A live run reaches the internet; a web cutoff of -1 does not, whatever network_access says.
+                self.assertEqual(profile.get("network"), {"enabled": True} if live else None)
+                self.assertNotIn(extra, profile["filesystem"])
+                self.assertEqual((profile["filesystem"][":tmpdir"], profile["filesystem"][":slash_tmp"]),
+                                 ("write", "deny"))
                 for path in providers.private_paths():
                     self.assertEqual(profile["filesystem"][str(path)], "deny")
 

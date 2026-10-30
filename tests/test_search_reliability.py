@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_search as hs
 import test_historical_search as fixtures
 from test_historical_search import FakeClient, SOURCE, snapshot
@@ -128,11 +129,13 @@ class ReliabilityTests(unittest.TestCase):
         engine.provider.persistent_cache.put(SOURCE, {
             **stored.__dict__, 'body': base64.b64encode(stored.body).decode('ascii'),
             'memento_datetime': 'Fri, 02 Oct 2026 12:00:00 GMT'})
-        with self.assertRaises(hs.HistoricalSearchError) as error:
-            engine.open(SOURCE)
-        self.assertEqual(error.exception.code, 'cache_invalid')
+        # The entry is never output: it is moved aside and the archive is asked again.
+        result = engine.open(SOURCE)['result']
+        self.assertEqual(result['capture_time'], hs.utc_text(hs.capture_datetime(stored.capture)))
+        self.assertTrue(engine.provider.client.calls)
+        self.assertEqual(len(list((self.root.resolve() / 'pacing' / 'captures' / '.quarantine').iterdir())), 1)
 
-    def test_transient_cache_hit_audit_failure_aborts_entire_search(self):
+    def test_transient_cache_hit_audit_failure_is_written_later_without_stopping_the_search(self):
         self.scholarly_engine().open(SOURCE)
         engine = self.scholarly_engine()
         original = engine.audit.path
@@ -146,12 +149,20 @@ class ReliabilityTests(unittest.TestCase):
                     raise OSError('simulated private diagnostic')
                 return original.open(*args, **kwargs)
 
+            def __str__(self):
+                return str(original) + '#transient'
+
         engine.audit.path = TransientAuditPath()
-        with patch.object(engine.provider, 'candidates', return_value=[SOURCE]):
-            with self.assertRaises(hs.HistoricalSearchError) as error:
-                engine.search('graph')
-        self.assertEqual(error.exception.code, 'audit_failure')
-        self.assertNotIn('private', str(error.exception))
+        with patch.object(engine.provider, 'candidates', return_value=[SOURCE]), \
+                patch.object(hs.threading, 'Thread'):
+            result = engine.search('graph')
+        self.assertEqual(result['results'][0]['url'], SOURCE)
+        self.assertNotIn('archive_cache_hit', original.read_text())
+        self.assertTrue(hs.AuditLog.flush_pending())
+        hs.AuditLog._flusher = None
+        events = [json.loads(line)['event'] for line in original.read_text().splitlines()]
+        # Records that waited keep their order: nothing is written ahead of them.
+        self.assertEqual(events[-4:], ['search_requested', 'archive_cache_hit', 'capture_verified', 'search_completed'])
 
     def test_partial_archive_outage_returns_only_verified_results_with_warning(self):
         unavailable_source = 'https://other.example/paper'

@@ -7,6 +7,7 @@ import threading
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from tests.test_api_models_server import HttpCase, StoreCase
 from ui import server
 from ui.batches import BatchCatalog, ORIGINAL_BATCH
@@ -58,7 +59,9 @@ class StageValidationTests(StoreCase):
 
     def test_selected_graph_has_only_enabled_model_stages(self):
         graph = server.workflow_graph(stages("review", "critic"))
-        self.assertEqual(set(graph["nodes"]), {"statement_reviewer", "critic", "failure_summary"})
+        # The convention critic belongs to the critic stage.
+        self.assertEqual(set(graph["nodes"]), {"statement_reviewer", "critic", "convention", "failure_summary"})
+        self.assertTrue(any(edge["from"] == "critic" and edge["to"] == "convention" for edge in graph["edges"]))
         self.assertTrue(any(edge["from"] == "statement_reviewer" and edge["to"] == "critic" for edge in graph["edges"]))
         self.assertFalse(any(edge["to"] == "author" for edge in graph["edges"]))
 
@@ -274,7 +277,13 @@ class WorkflowStageResultTests(StoreCase):
         self.assertEqual(plan["action"], "final")
         restored = server.restore_saved_app(server.App(app.trace_file, runs=self.runs))
         self.assertTrue(restored.state["finalInputReady"])
-        self.assertEqual(server.Server._stopped_continuation_plan(restored)["action"], "final")
+        # Lifecycle I-066: after a restart the interrupted writing step continues by itself from the
+        # exact saved input in the same run; Resume is its manual control.
+        checkpoint = json.loads((app.run_dir / server.PAUSE_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual((restored.state["phase"], checkpoint["node"]), ("paused", "latex_editor"))
+        self.assertEqual(checkpoint["state"], {"statement": "Approved task", "solution": "Existing work"})
+        self.assertTrue(restored.state["autoResumeAt"])
+        self.assertEqual(server.Server._stopped_continuation_plan(restored)["action"], "resume")
 
 
 if __name__ == "__main__":

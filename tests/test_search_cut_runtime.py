@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import queue
+import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -16,9 +18,10 @@ import tomllib
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import runtime as retrieval
 import workflow_runner as runtime
-from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, success
+from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, answer, completed, success
 
 
 class HistoricalPolicyTests(unittest.TestCase):
@@ -121,9 +124,44 @@ class HistoricalPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "active protected"):
             retrieval.role_workspace(first, "critic")
 
+    def test_parallel_critics_get_one_independent_session_each(self):
+        # The independent critics of one round run at once, each attempt in its own session.
+        policy = self.policy()
+        auth = self.protected_auth()
+        count, entered, sessions, problems = 5, threading.Barrier(5), [], []
+        lock = threading.Lock()
+
+        def critic(number):
+            try:
+                with retrieval.critic_session(policy) as session:
+                    home = retrieval.role_home(session, "critic")
+                    workspace = retrieval.role_workspace(session, "critic")
+                    (workspace / "proof.md").write_text(f"snapshot {number}")
+                    entered.wait(10)  # Every session is open at the same time.
+                    with lock:
+                        sessions.append((home, workspace, (home / "auth.json").read_bytes()))
+                    self.assertEqual((workspace / "proof.md").read_text(), f"snapshot {number}")
+                    self.assertEqual(retrieval.role_home(session, "critic"), home)
+            except BaseException as exc:  # Reported below: an assertion in a thread would be lost.
+                problems.append(exc)
+
+        threads = [threading.Thread(target=critic, args=(number,)) for number in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(problems, [])
+        self.assertEqual(len({home for home, _, _ in sessions}), count)
+        self.assertEqual(len({workspace for _, workspace, _ in sessions}), count)
+        self.assertEqual({copied for _, _, copied in sessions}, {auth.read_bytes()})
+        # Each session gave up its copy of the login when it ended; the master is untouched.
+        self.assertFalse(any((home / "auth.json").exists() for home, _, _ in sessions))
+        self.assertEqual(json.loads(auth.read_text()), {"tokens": {"access_token": "protected-login"}})
+
     def test_critic_auth_prefers_structured_and_falls_back_only_when_missing(self):
         structured = self.protected_auth("structured", "structured-token")
         author = self.protected_auth("author", "author-token")
+        os.utime(author, (1, 1))  # Older than the structured copy.
         with retrieval.critic_session(self.policy()) as critic:
             self.assertEqual((retrieval.role_home(critic, "critic") / "auth.json").read_bytes(),
                              structured.read_bytes())
@@ -131,10 +169,13 @@ class HistoricalPolicyTests(unittest.TestCase):
         with retrieval.critic_session(self.policy()) as critic:
             self.assertEqual((retrieval.role_home(critic, "critic") / "auth.json").read_bytes(),
                              author.read_bytes())
+        # An invalid structured copy is replaced from a valid login (I-081), never used as is.
         structured.write_text('{"tokens": {}}')
-        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "protected critic"):
-            with retrieval.critic_session(self.policy()):
-                self.fail("Invalid preferred auth must not fall back.")
+        structured.chmod(0o600)
+        with retrieval.critic_session(self.policy()) as critic:
+            self.assertEqual((retrieval.role_home(critic, "critic") / "auth.json").read_bytes(),
+                             author.read_bytes())
+        self.assertEqual(structured.read_bytes(), author.read_bytes())
 
     def test_critic_rejects_missing_linked_and_oversized_auth(self):
         self.protected_auth("author")
@@ -153,6 +194,13 @@ class HistoricalPolicyTests(unittest.TestCase):
                     structured.write_text('{"OPENAI_API_KEY":"one","OPENAI_API_KEY":"two"}')
                 else:
                     author.unlink()
+                if kind in ("oversized", "duplicate"):
+                    # Never used as is: replaced from the valid login first (I-081).
+                    with retrieval.critic_session(self.policy()) as critic:
+                        copied = (retrieval.role_home(critic, "critic") / "auth.json").read_bytes()
+                    self.assertEqual(copied, author.read_bytes())
+                    self.assertEqual(structured.stat().st_nlink, 1)
+                    continue
                 with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "protected critic"):
                     with retrieval.critic_session(self.policy()):
                         self.fail("Invalid auth must fail closed.")
@@ -262,8 +310,18 @@ class HistoricalPolicyTests(unittest.TestCase):
         retrieval.role_workspace(policy, role).mkdir(parents=True, exist_ok=True)
         retrieval.verify_protected_directories(policy, role, create=True)
         config = retrieval.configuration(policy, role)
+        environment = {"CODEX_HOME": str(retrieval.role_home(policy, role))}
+        layers = []
+        if policy["isolation"]["adapter"] == retrieval.MACOS_ADAPTER:
+            # The process's private temp folder (retrieval.private_temp()), set by its session flags.
+            temp = retrieval.private_temp(policy, role)
+            self.addCleanup(shutil.rmtree, temp, True)
+            environment["TMPDIR"] = str(temp)
+            overrides = retrieval.temp_overrides(policy, environment)
+            config["shell_environment_policy"]["set"].update(overrides["shell_environment_policy"]["set"])
+            layers.append({"name": {"type": "sessionFlags"}, "config": overrides})
         messages = {
-            "config/read": {"config": config, "layers": []},
+            "config/read": {"config": config, "layers": layers},
             "windowsSandbox/readiness": {"status": "ready"},
             "mcpServerStatus/list": {"data": [{"name": retrieval.BROKER_NAME,
                 "tools": {name: {} for name in retrieval.BROKER_TOOLS}}] if role == "author" else []},
@@ -271,7 +329,136 @@ class HistoricalPolicyTests(unittest.TestCase):
         }
         rpc = Mock()
         rpc.call.side_effect = lambda method, params: messages[method]
-        return policy, messages, rpc, {"CODEX_HOME": str(retrieval.role_home(policy, role))}
+        return policy, messages, rpc, environment
+
+    def test_the_subagent_limits_of_a_session_are_audited_exactly(self):
+        # The limits are session flags on top of the generated `features.multi_agent_v2 = false`.
+        limits = retrieval.agent_limits(3, "Up to 3 subagents.")
+        for role, overrides in (("structured", False), ("author", True)):
+            with self.subTest(role=role), patch.object(retrieval, "_sandbox_canaries"), \
+                    patch.object(retrieval, "_macos_network_canaries"):
+                policy, messages, rpc, environment = self.configured_rpc(role)
+                read = messages["config/read"]
+                read["config"]["features"]["multi_agent_v2"] = {"enabled": False,
+                                                                 **limits["features"]["multi_agent_v2"]}
+                read["config"]["agents"] = {"enabled": None, "max_depth": 1, "default_subagent_model": None,
+                                            "max_concurrent_threads_per_session": 3}
+                read["layers"].insert(0, {"name": {"type": "sessionFlags"}, "config": json.loads(json.dumps(limits))})
+                retrieval.verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=overrides,
+                                     agent_limits=limits)
+                # Without the limits it was started with, the same settings are refused.
+                with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "multi_agent_v2|inherited"):
+                    retrieval.verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=overrides)
+                for change in (lambda config: config["agents"].update(max_depth=2),
+                               lambda config: config["features"]["multi_agent_v2"].update(
+                                   max_concurrent_threads_per_session=11)):
+                    changed = json.loads(json.dumps(read))
+                    change(changed["config"])
+                    messages["config/read"] = changed
+                    with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "subagent limits|inherited agents"):
+                        retrieval.verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=overrides,
+                                             agent_limits=limits)
+                messages["config/read"] = read
+        # A structured process's session flags must be exactly its limits (and its temp folder's).
+        with patch.object(retrieval, "_sandbox_canaries"), patch.object(retrieval, "_macos_network_canaries"):
+            policy, messages, rpc, environment = self.configured_rpc("structured")
+            read = messages["config/read"]
+            read["config"]["features"]["multi_agent_v2"] = {"enabled": False, "max_concurrent_threads_per_session": 1}
+            read["layers"].insert(0, {"name": {"type": "sessionFlags"}, "config": {
+                "features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 1}},
+                "model_reasoning_effort": "max"}})
+            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "inherited configuration"):
+                retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=retrieval.agent_limits(0))
+            read["layers"][0]["config"].pop("model_reasoning_effort")
+            retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=retrieval.agent_limits(0))
+
+    def test_a_process_checked_without_subagent_limits_must_have_the_feature_off(self):
+        # The launch preflight (ui/retrieval.py) and the First Proof launcher check their processes without limits:
+        # the generated `features.multi_agent_v2 = false` must then be exactly what Codex reports.
+        retrieval._check_agent_limits({"features": {"multi_agent_v2": False}}, None)
+        loosened = ({"enabled": True}, {"enabled": False, "max_concurrent_threads_per_session": 50}, {}, None, True)
+        for value in loosened:
+            with self.subTest(value=value), self.assertRaisesRegex(retrieval.RetrievalPolicyError, "multi_agent_v2"):
+                retrieval._check_agent_limits({"features": {"multi_agent_v2": value}}, None)
+        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "multi_agent_v2"):
+            retrieval._check_agent_limits({"features": {}}, None)
+        for role, overrides in (("structured", False), ("author", True)):
+            with self.subTest(role=role), patch.object(retrieval, "_sandbox_canaries"), \
+                    patch.object(retrieval, "_macos_network_canaries"):
+                policy, messages, rpc, environment = self.configured_rpc(role)
+                retrieval.verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=overrides)
+                for value in loosened[:2]:
+                    messages["config/read"]["config"]["features"]["multi_agent_v2"] = value
+                    with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "multi_agent_v2"):
+                        retrieval.verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=overrides)
+
+    def test_the_launch_preflight_refuses_a_process_whose_subagent_feature_is_on(self):
+        # As ui/retrieval.py calls it: preflight() without agent limits, here on macOS with stand-in processes.
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        executable = str(self.trusted_bin / "codex")
+        started, checked, real_verify = [], [], retrieval.verify_rpc
+        for loosened in (False, {"enabled": True}, {"enabled": False, "max_concurrent_threads_per_session": 50}):
+            with self.subTest(loosened=loosened), patch.object(retrieval, "_sandbox_canaries"), \
+                    patch.object(retrieval, "_macos_network_canaries"):
+                policy, messages, configured, configured_environment = self.configured_rpc("structured")
+                messages["config/read"]["config"]["features"]["multi_agent_v2"] = loosened
+
+                def verify(rpc, policy, role, environment, agent_limits=None):
+                    # Codex's answers for the checked process, with the limits preflight() passes on.
+                    checked.append(agent_limits)
+                    return real_verify(configured, policy, role, configured_environment, agent_limits=agent_limits)
+
+                def probe(process):
+                    rpc = Mock()
+                    rpc.call.side_effect = lambda method, params: {"codexHome": started[-1][1]["CODEX_HOME"]}
+                    return rpc
+
+                with patch.object(retrieval.sys, "platform", "darwin"), \
+                        patch.object(retrieval, "_native_macos_binary", return_value=True), \
+                        patch.object(retrieval.subprocess, "Popen",
+                                     side_effect=lambda argv, **kwargs: started.append((argv, kwargs["env"])) or Mock()), \
+                        patch.object(retrieval, "_ProbeRPC", side_effect=probe), \
+                        patch.object(retrieval, "verify_rpc", side_effect=verify):
+                    if loosened is False:
+                        retrieval.remove_private_temp(policy, retrieval.preflight(policy, "structured", executable,
+                                                                                  {"PATH": "/usr/bin"}))
+                    else:
+                        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "multi_agent_v2"):
+                            retrieval.preflight(policy, "structured", executable, {"PATH": "/usr/bin"})
+        self.assertEqual(checked, [None, None, None])
+        # No agent limits reach the checked app-server either.
+        self.assertFalse([argument for argv, _ in started for argument in argv if "agent" in argument])
+
+    def test_a_web_cutoff_authors_thread_keeps_the_subagent_limits_of_its_app_server(self):
+        # A thread's config replaces the app-server's features table (generated with multi_agent_v2 = false), so
+        # the thread must carry the limits itself; Codex 0.160 keeps the feature off for this merged table. The
+        # generated table turns multi_agent on for every role: the setting decides, as for the app-server.
+        policy = self.policy()
+
+        class Author:
+            Error = runtime.Error
+            wire_model = staticmethod(lambda model: model)
+
+        hint = runtime.SUBAGENT_HINT.format(count=2, s="s")
+        for features, count, expected_v2, expected_agents in (
+                (["multi_agent"], 2, {"max_concurrent_threads_per_session": 3, "multi_agent_mode_hint_text": hint},
+                 {"max_concurrent_threads_per_session": 2, "max_depth": 1}),
+                ([], 0, {"max_concurrent_threads_per_session": 1}, None)):
+            with self.subTest(count=count):
+                options = runtime._author_thread_options(
+                    Author, None, directory=str(self.workspace), policy=policy, role="author", model="gpt-6.1-sol",
+                    settings={"effort": "max", "speed": "standard", "subagents": count}, summary="concise",
+                    features=features, classic=False, emit=lambda *args, **kwargs: None, environment={})
+                config = options["config"]
+                self.assertEqual(options["permissions"], retrieval.PROFILE)
+                self.assertEqual(config["features"]["multi_agent_v2"], expected_v2)
+                self.assertEqual(config.get("agents"), expected_agents)
+                self.assertEqual(config["features"]["multi_agent"], bool(count))
+                # Exactly what the app-server was started with and verify_rpc() checked.
+                limits = runtime.subagent_limits(features, count)
+                self.assertEqual(config["features"]["multi_agent_v2"], limits["features"]["multi_agent_v2"])
+                self.assertEqual(config.get("agents"), limits.get("agents"))
 
     def test_configuration_serializes_valid_toml_and_broker_is_author_only(self):
         policy = self.policy()
@@ -404,6 +591,9 @@ class HistoricalPolicyTests(unittest.TestCase):
                    {**correct, "settingsDelete": True}, {**correct, "settingsRename": True},
                    {**correct, "settingsCanariesRead": False},
                    {**correct, "publicNetwork": True}]
+        # A failed positive control proves nothing either way: it is checked again (I-005).
+        unproven = ({**correct, "insideOk": False}, {**correct, "insideWrite": False},
+                    {**correct, "settingsCanariesRead": False})
         settings_before = (self.workspace / "job-settings.json").read_bytes()
         for report in reports:
             rpc = Mock()
@@ -411,6 +601,9 @@ class HistoricalPolicyTests(unittest.TestCase):
             with self.subTest(report=report), patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), patch.object(retrieval, "_public_network_control") as public_control:
                 if report == correct:
                     retrieval._sandbox_canaries(rpc, policy, "author")
+                elif report in unproven:
+                    with self.assertRaises(retrieval.IsolationCheckUnavailable):
+                        retrieval._sandbox_canaries(rpc, policy, "author")
                 else:
                     with self.assertRaises(retrieval.RetrievalPolicyError):
                         retrieval._sandbox_canaries(rpc, policy, "author")
@@ -495,6 +688,107 @@ class HistoricalPolicyTests(unittest.TestCase):
                 self.assertEqual(params["permissions"], "historical")
                 self.assertEqual(set(params["config"]["mcp_servers"]), {"historical_search"})
                 self.assertFalse(params["config"]["tools"]["web_search"])
+
+    def test_web_cutoff_processes_run_with_their_own_private_temp_folder_and_remove_it(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        policy = self.policy()
+        made, limits = [], []
+
+        def preflight(policy, role, executable, inherited, agent_limits=None):
+            # The verified environment names a folder made for this one process (retrieval.private_temp()).
+            limits.append(agent_limits)
+            temp = retrieval.private_temp(policy, role)
+            made.append(temp)
+            return {"CODEX_HOME": str(retrieval.role_home(policy, role)), "TMPDIR": str(temp),
+                    "TMPPREFIX": str(temp / "zsh")}
+
+        def flags(temp):
+            return [f"shell_environment_policy.set.TMPDIR={json.dumps(str(temp))}",
+                    f"shell_environment_policy.set.TMPPREFIX={json.dumps(str(temp / 'zsh'))}"]
+
+        with patch.object(runtime, "retrieval_policy", return_value=policy), \
+                patch.object(retrieval, "codex_executable", return_value="codex-mock"), \
+                patch.object(retrieval, "preflight", side_effect=preflight), \
+                patch.object(runtime.subprocess, "Popen", side_effect=RuntimeError("mock process boundary")) as process:
+            with self.assertRaisesRegex(RuntimeError, "mock process boundary"):
+                runtime.run_structured_attempt("Task", {}, "final", runtime.MODEL, "max", "fast", "concise")
+        command, environment = process.call_args.args[0], process.call_args.kwargs["env"]
+        self.assertEqual(environment["TMPDIR"], str(made[-1]))
+        for flag in flags(made[-1]):
+            self.assertIn(flag, command)
+        self.assertLess(command.index(flags(made[-1])[0]), command.index("exec"))
+        self.assertFalse(made[-1].exists())  # Removed when the call ended.
+        # The writer has no subagents: its check and its process both have the session limit of one thread.
+        self.assertEqual(limits[-1], retrieval.agent_limits(0))
+        self.assertIn("features.multi_agent_v2.max_concurrent_threads_per_session=1", command)
+
+        def thread_shell(instance):
+            """The shell environment the author's thread/start or thread/resume gives its commands."""
+            [params] = [params for method, params in instance.rpc.calls if method in {"thread/start", "thread/resume"}]
+            return params["config"]["shell_environment_policy"]
+
+        def expected_shell(temp):
+            # The audited one, and the folder the app-server's session flags name: a thread's table replaces those.
+            shell = retrieval.configuration(policy, "author")["shell_environment_policy"]
+            return {**shell, "set": {**shell["set"], "TMPDIR": str(temp), "TMPPREFIX": str(temp / "zsh")}}
+
+        for resume in (False, True):
+            options = {"goal_cwd": str(self.workspace), **({"goal_thread_id": "thread-1"} if resume else {})}
+            with self.subTest(resume=resume), patch.dict(os.environ, {retrieval.POLICY_ENV: str(self.path)}), \
+                    patch.object(retrieval, "codex_executable", return_value="codex-mock"), \
+                    patch.object(retrieval, "preflight", side_effect=preflight), \
+                    patch.object(retrieval, "verify_rpc"), \
+                    patch.object(runtime.subprocess, "Popen", return_value=Mock()) as process:
+                instance = Runtime([success("proof")])
+                session = runtime.goal_session(instance, PROMPT, prompts=PROMPTS,
+                                               settings={**SETTINGS, "model": runtime.MODEL}, options=options)
+                self.assertEqual(next(session)["outcome"], "done")
+                temp = made[-1]
+                self.assertTrue(temp.is_dir())  # The author's for as long as its app-server runs.
+                self.assertEqual(process.call_args.kwargs["env"]["TMPDIR"], str(temp))
+                command = process.call_args.args[0]
+                for flag in flags(temp):
+                    self.assertIn(flag, command)
+                self.assertEqual(thread_shell(instance), expected_shell(temp))
+                session.close()
+                self.assertFalse(temp.exists())
+        # A paused author's reply too, in a new app-server with a new folder.
+        with patch.dict(os.environ, {retrieval.POLICY_ENV: str(self.path)}), \
+                patch.object(retrieval, "codex_executable", return_value="codex-mock"), \
+                patch.object(retrieval, "preflight", side_effect=preflight), \
+                patch.object(retrieval, "verify_rpc"), \
+                patch.object(runtime.subprocess, "Popen", return_value=Mock()) as process:
+            instance = Runtime([[answer("Lemma 2 is open."), completed()]])
+            result = runtime.author_conversation(
+                instance, "Summarize.", settings={**SETTINGS, "model": runtime.MODEL},
+                options={"goal_cwd": str(self.workspace), "goal_thread_id": "thread-1"}, features=[],
+                conversation_id="c" * 32, label="Progress summary requested")
+        self.assertEqual(result["reply"], "Lemma 2 is open.")
+        for flag in flags(made[-1]):
+            self.assertIn(flag, process.call_args.args[0])
+        self.assertEqual(thread_shell(instance), expected_shell(made[-1]))
+        self.assertNotEqual(made[-1], temp)
+        self.assertFalse(made[-1].exists())
+        # An environment without a private temp folder (another adapter's) leaves the audited shell environment.
+        options = runtime._author_thread_options(
+            Runtime([]), None, directory=str(self.workspace), policy=policy, role="author", model=runtime.MODEL,
+            settings={**SETTINGS, "speed": "standard"}, summary="concise", features=(), classic=False, emit=None,
+            environment={"CODEX_HOME": str(retrieval.role_home(policy, "author"))})
+        self.assertEqual(options["config"]["shell_environment_policy"],
+                         retrieval.configuration(policy, "author")["shell_environment_policy"])
+        # An app-server that cannot be started leaves no folder behind either.
+        with patch.dict(os.environ, {retrieval.POLICY_ENV: str(self.path)}), \
+                patch.object(retrieval, "codex_executable", return_value="codex-mock"), \
+                patch.object(retrieval, "preflight", side_effect=preflight), \
+                patch.object(runtime.subprocess, "Popen", side_effect=OSError("cannot start")):
+            session = runtime.goal_session(Runtime([success("proof")]), PROMPT, prompts=PROMPTS,
+                                           settings={**SETTINGS, "model": runtime.MODEL},
+                                           options={"goal_cwd": str(self.workspace)})
+            with self.assertRaises(runtime.WorkflowPaused):
+                next(session)
+        self.assertFalse(made[-1].exists())
+        self.assertEqual(list((Path(policy["isolation"]["codexHome"]) / "tmp").iterdir()), [])
 
     def test_native_start_resume_defaults_enable_live_search_without_changing_features(self):
         native_workspace = self.root / "native-run"
@@ -586,11 +880,12 @@ class HistoricalPolicyTests(unittest.TestCase):
             (self.workspace / name).write_text("untrusted executable")
         path = os.pathsep.join((str(self.workspace), ".", str(self.trusted_bin)))
         self.assertEqual(retrieval.codex_executable(policy, path), str(self.trusted_bin / "codex.exe"))
-        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "native codex.exe"):
+        # No usable binary (also while Codex updates itself): checked again later.
+        with self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, "native codex.exe"):
             retrieval.codex_executable(policy, os.pathsep.join((str(self.workspace), ".")))
         (self.trusted_bin / "codex.exe").unlink()
         (self.trusted_bin / "codex.cmd").write_text("unverified wrapper")
-        with self.assertRaises(retrieval.RetrievalPolicyError):
+        with self.assertRaises(retrieval.IsolationCheckUnavailable):
             retrieval.codex_executable(policy, str(self.trusted_bin))
 
     def test_historical_external_commands_block_before_lookup_or_output_changes(self):
@@ -643,7 +938,7 @@ class HistoricalPolicyTests(unittest.TestCase):
         search_path = os.pathsep.join((str(self.workspace), ".", str(self.trusted_bin)))
         self.assertEqual(retrieval.codex_executable(policy, search_path), str(self.trusted_bin / "codex"))
         (self.trusted_bin / "codex").write_text("#!/bin/sh\nexit 0\n")
-        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "Mach-O"):
+        with self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, "Mach-O"):
             retrieval.codex_executable(policy, search_path)
 
     def test_macos_effective_config_accepts_cli_normalization_and_checks_raw_layer(self):
@@ -652,7 +947,7 @@ class HistoricalPolicyTests(unittest.TestCase):
         self.value["broker"]["args"][6] = hashlib.sha256(self.broker_policy.read_bytes()).hexdigest()
         self.save()
         policy, messages, rpc, environment = self.configured_rpc()
-        raw = copy.deepcopy(messages["config/read"]["config"])
+        raw = retrieval.configuration(policy, "author")
         messages["config/read"]["layers"] = [{"name": {"type": "user", "file": str(retrieval.role_home(policy, "author") / "config.toml")}, "config": raw}]
         effective = messages["config/read"]["config"]
         effective["tools"]["web_search"] = None
@@ -675,7 +970,8 @@ class HistoricalPolicyTests(unittest.TestCase):
                   "protectedWrite": False, "settingsWrite": False,
                   "settingsDelete": False, "settingsRename": False,
                   "settingsCanariesRead": True, "outsideRead": False,
-                  "network": False, "publicNetwork": False}
+                  "network": False, "publicNetwork": False,
+                  "slashTmpRead": False, "slashTmpWrite": False, "varTmpRead": False, "varTmpWrite": False}
         rpc = Mock()
         rpc.call.return_value = {"exitCode": 0, "stdout": json.dumps(report)}
         settings = (self.workspace / "job-settings.json").read_bytes()
@@ -683,9 +979,382 @@ class HistoricalPolicyTests(unittest.TestCase):
             retrieval._sandbox_canaries(rpc, policy, "author")
         command = rpc.call.call_args.args[1]["command"]
         self.assertEqual(command[:2], ["/bin/sh", "-c"])
-        for command_part in ("exec 3>>", "/bin/rm", "/bin/mv", "/usr/bin/nc", "127.0.0.1", "1.1.1.1"):
+        for command_part in ("exec 3>>", "/bin/rm", "/bin/mv", "/usr/bin/nc", "127.0.0.1", "1.1.1.1",
+                             f"/bin/cat /private/tmp/.retrieval-tmp-canary-{nonce}",
+                             f"> /private/tmp/.retrieval-tmp-write-{nonce}",
+                             f"/bin/cat /private/var/tmp/.retrieval-tmp-canary-{nonce}",
+                             f"> /private/var/tmp/.retrieval-tmp-write-{nonce}"):
             self.assertIn(command_part, command[-1])
         self.assertEqual((self.workspace / "job-settings.json").read_bytes(), settings)
+
+    def test_macos_canary_proves_the_private_temp_folder_and_closes_its_neighbours(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        policy = self.policy()
+        temp = retrieval.private_temp(policy, "author")
+        self.addCleanup(shutil.rmtree, temp, True)
+        nonce = "tempnonce"
+        correct = {"nonce": nonce, "insideOk": True, "insideWrite": True, "protectedWrite": False,
+                   "settingsWrite": False, "settingsDelete": False, "settingsRename": False,
+                   "settingsCanariesRead": True, "outsideRead": False, "network": False, "publicNetwork": False,
+                   "slashTmpRead": False, "slashTmpWrite": False, "varTmpRead": False, "varTmpWrite": False,
+                   "privateTempWrite": True, "privateTempNeighborRead": False}
+        written, neighbor = temp / f".retrieval-temp-canary-{nonce}", temp.parent / f".retrieval-temp-neighbor-{nonce}"
+        seen = []
+
+        def answer(report):
+            def call(method, params):
+                # The controller's file in codex-home/tmp/, next to the folder, exists while the command runs.
+                seen.append((neighbor.read_text() if neighbor.exists() else None, params["command"][-1]))
+                if "privateTempWrite" in report:
+                    written.write_text(nonce)
+                return {"exitCode": 0, "stdout": json.dumps(report)}
+            return call
+
+        for change, outcome in (({}, None), ({"privateTempNeighborRead": True}, retrieval.RetrievalPolicyError),
+                                ({"privateTempWrite": False}, retrieval.IsolationCheckUnavailable)):
+            with self.subTest(change=change):
+                rpc = Mock()
+                rpc.call.side_effect = answer({**correct, **change})
+                with patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), \
+                        patch.object(retrieval, "_public_network_control"):
+                    if outcome is None:
+                        retrieval._sandbox_canaries(rpc, policy, "author", temp)
+                    else:
+                        with self.assertRaises(outcome) as caught:
+                            retrieval._sandbox_canaries(rpc, policy, "author", temp)
+                        if outcome is retrieval.RetrievalPolicyError:
+                            self.assertNotIsInstance(caught.exception, retrieval.IsolationCheckUnavailable)
+                text, script = seen[-1]
+                self.assertEqual(text, nonce)
+                # Written through $TMPDIR, read back where it must be; TMPPREFIX there too.
+                for part in (f'printf %s {nonce} > "$TMPDIR"/{written.name}', f"/bin/cat {written})\" = {nonce}",
+                             f'test "$TMPPREFIX" = {temp / "zsh"}', f"/bin/cat {neighbor}"):
+                    self.assertIn(part, script)
+                self.assertFalse(written.exists())
+                self.assertFalse(neighbor.exists())
+        # Without the private temp folder (the Windows adapter, a direct call) nothing about it is probed.
+        rpc = Mock()
+        rpc.call.side_effect = answer({key: value for key, value in correct.items() if "privateTemp" not in key})
+        with patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), \
+                patch.object(retrieval, "_public_network_control"):
+            retrieval._sandbox_canaries(rpc, policy, "author")
+        self.assertEqual(seen[-1][0], None)
+        self.assertNotIn("TMPDIR", seen[-1][1])
+        self.assertEqual(list(temp.iterdir()), [])
+
+        # Given the folder that holds every process's temp folder (as verify_rpc() would without its folder
+        # check), the controller's file is still in that folder: inside the grant, so the command reads it.
+        def neighbor_read(method, params):
+            seen.append((neighbor.read_text() if neighbor.exists() else None, params["command"][-1]))
+            return {"exitCode": 0, "stdout": json.dumps({**correct, "privateTempNeighborRead": True})}
+
+        rpc = Mock()
+        rpc.call.side_effect = neighbor_read
+        with patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), \
+                patch.object(retrieval, "_public_network_control"), \
+                self.assertRaisesRegex(retrieval.RetrievalPolicyError, "private temp folders"):
+            retrieval._sandbox_canaries(rpc, policy, "author", temp.parent)
+        self.assertEqual(seen[-1][0], nonce)
+        self.assertIn(f"/bin/cat {neighbor}", seen[-1][1])
+        self.assertFalse(neighbor.exists())
+
+    def test_private_temp_folders_are_fresh_owner_only_outside_the_workspace_and_swept(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        policy = self.policy()
+        parent = Path(policy["isolation"]["codexHome"]) / "tmp"
+        first, second = retrieval.private_temp(policy, "author"), retrieval.private_temp(policy, "structured")
+        for folder, role in ((first, "author"), (second, "structured")):
+            self.assertEqual(folder.parent, parent.resolve())
+            self.assertRegex(folder.name, rf"^{role}-{os.getpid()}-\w{{8}}$")
+            self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+            self.assertFalse(folder.is_relative_to(self.workspace))
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o700)
+        environment = retrieval.isolated_environment(policy, "author", {"PATH": "/usr/bin"}, temp=first)
+        self.assertEqual((environment["TMPDIR"], environment["TMPPREFIX"]), (str(first), str(first / "zsh")))
+        self.assertNotIn("TMPDIR", retrieval.isolated_environment(policy, "author", {"TMPDIR": "/var/folders/x"}))
+        # The folders of processes that ended go at the next start; nothing else does.
+        dead, living = parent / "critic-999999-abcdefgh", parent / f"author-{os.getppid()}-abcdefgh"
+        other = [parent / "notes", parent / "author-12-short"]
+        for path in (dead, living, *other):
+            path.mkdir()
+        third = retrieval.private_temp(policy, "author")
+        self.assertFalse(dead.exists())
+        self.assertTrue(all(path.exists() for path in (first, second, living, *other)))
+        # Removed when its process ends: only a folder of this kind in this run's codex-home/tmp/.
+        retrieval.remove_private_temp(policy, {"TMPDIR": str(first)})
+        self.assertFalse(first.exists())
+        for environment in ({"TMPDIR": str(self.workspace)}, {"TMPDIR": str(parent / "notes")}, {}, None):
+            retrieval.remove_private_temp(policy, environment)
+        retrieval.remove_private_temp(None, {"TMPDIR": str(second)})
+        # A policy without its isolation settings (a test double) names no folder of its own either.
+        retrieval.remove_private_temp({"_path": str(self.path)}, {"TMPDIR": str(second)})
+        self.assertEqual(retrieval.temp_overrides({"_path": str(self.path)}, {"TMPDIR": str(second)}), {})
+        self.assertTrue(all(path.exists() for path in (self.workspace, parent / "notes", second, third)))
+        link = parent / f"author-{os.getpid()}-linkfold"
+        link.symlink_to(self.workspace)
+        retrieval.remove_private_temp(policy, {"TMPDIR": str(link)})
+        self.assertTrue(link.is_symlink() and self.workspace.is_dir())
+        link.unlink()
+        # A critic's folder is outside its snapshot too.
+        self.protected_auth()
+        with retrieval.critic_session(policy) as critic:
+            folder = retrieval.private_temp(critic, "critic")
+            self.assertTrue(folder.name.startswith(f"critic-{os.getpid()}-"))
+            self.assertFalse(folder.is_relative_to(retrieval.role_workspace(critic, "critic")))
+        # A parent that is a link is not the controller's; a folder that cannot be made is checked again.
+        shutil.rmtree(parent)
+        parent.symlink_to(self.workspace)
+        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "inspect"):
+            retrieval.private_temp(policy, "author")
+        parent.unlink()
+        with patch.object(retrieval.tempfile, "mkdtemp", side_effect=OSError("disk full")), \
+                self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, "disk full"):
+            retrieval.private_temp(policy, "author")
+        self.assertEqual([path for path in self.workspace.iterdir() if path.name.startswith(("author-", "critic-"))], [])
+
+    def test_macos_preflight_checks_a_fresh_private_temp_folder_that_failures_remove(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        policy = self.policy()
+        executable = str(self.trusted_bin / "codex")
+        started, checked = [], []
+
+        def verify(rpc, policy, role, environment, agent_limits=None):
+            checked.append(Path(environment["TMPDIR"]).is_dir())
+
+        def probe(process):
+            rpc = Mock()
+            rpc.call.side_effect = lambda method, params: {"codexHome": started[-1][1]["CODEX_HOME"]}
+            return rpc
+
+        with patch.object(retrieval.sys, "platform", "darwin"), \
+                patch.object(retrieval, "_native_macos_binary", return_value=True), \
+                patch.object(retrieval.subprocess, "Popen",
+                             side_effect=lambda argv, **kwargs: started.append((argv, kwargs["env"])) or Mock()), \
+                patch.object(retrieval, "_ProbeRPC", side_effect=probe):
+            with patch.object(retrieval, "verify_rpc", side_effect=verify):
+                environment = retrieval.preflight(policy, "structured", executable, {"PATH": "/usr/bin"})
+            temp = Path(environment["TMPDIR"])
+            argv, process_environment = started[-1]
+            self.assertEqual(argv, [executable, "--strict-config", "app-server",
+                                    *retrieval.temp_arguments(policy, environment)])
+            self.assertEqual(process_environment, environment)
+            self.assertEqual((temp.parent, checked), ((Path(policy["isolation"]["codexHome"]) / "tmp").resolve(),
+                                                      [True]))
+            self.assertEqual(environment["TMPPREFIX"], str(temp / "zsh"))
+            self.assertTrue(temp.is_dir())  # The process that runs next uses it, then removes it.
+            retrieval.remove_private_temp(policy, environment)
+            self.assertFalse(temp.exists())
+            with patch.object(retrieval, "verify_rpc", side_effect=retrieval.RetrievalPolicyError("violation")), \
+                    self.assertRaisesRegex(retrieval.RetrievalPolicyError, "violation"):
+                retrieval.preflight(policy, "structured", executable, {"PATH": "/usr/bin"})
+            self.assertFalse(Path(started[-1][1]["TMPDIR"]).exists())
+        self.assertEqual(list((Path(policy["isolation"]["codexHome"]) / "tmp").iterdir()), [])
+
+    def test_macos_canary_proves_tmp_and_var_tmp_closed_and_cleans_up(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.save()
+        policy = self.policy()
+        nonce = "tmpnonce"
+        correct = {"nonce": nonce, "insideOk": True, "insideWrite": True, "protectedWrite": False,
+                   "settingsWrite": False, "settingsDelete": False, "settingsRename": False,
+                   "settingsCanariesRead": True, "outsideRead": False, "network": False, "publicNetwork": False,
+                   "slashTmpRead": False, "slashTmpWrite": False, "varTmpRead": False, "varTmpWrite": False}
+        canaries = [Path("/private/tmp") / f".retrieval-tmp-canary-{nonce}",
+                    Path("/private/var/tmp") / f".retrieval-tmp-canary-{nonce}"]
+        written = [Path("/private/tmp") / f".retrieval-tmp-write-{nonce}",
+                   Path("/private/var/tmp") / f".retrieval-tmp-write-{nonce}"]
+        seen = []
+
+        def answer(report, write=False):
+            def call(method, params):
+                # The controller's files exist while the command runs; a write that held leaves one behind.
+                seen.append([path.read_text() for path in canaries])
+                if write:
+                    for path in written:
+                        path.write_text("x")
+                return {"exitCode": 0, "stdout": json.dumps(report)}
+            return call
+
+        for change, outcome in (({}, None), ({"slashTmpRead": True}, retrieval.RetrievalPolicyError),
+                                ({"varTmpWrite": True}, retrieval.RetrievalPolicyError),
+                                ({"slashTmpWrite": True}, retrieval.RetrievalPolicyError)):
+            with self.subTest(change=change):
+                rpc = Mock()
+                rpc.call.side_effect = answer({**correct, **change}, write=bool(change))
+                with patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), \
+                        patch.object(retrieval, "_public_network_control"):
+                    if outcome is None:
+                        retrieval._sandbox_canaries(rpc, policy, "author")
+                    else:
+                        with self.assertRaisesRegex(outcome, "/tmp and /var/tmp"):
+                            retrieval._sandbox_canaries(rpc, policy, "author")
+                self.assertEqual(seen[-1], [nonce, nonce])
+                for path in (*canaries, *written):
+                    self.assertFalse(path.exists(), path)
+        # A report without the /tmp probes proves nothing: it is checked again.
+        rpc = Mock()
+        rpc.call.side_effect = answer({key: value for key, value in correct.items() if "Tmp" not in key})
+        with patch.object(retrieval.uuid, "uuid4", return_value=Mock(hex=nonce)), \
+                patch.object(retrieval, "_public_network_control"), \
+                self.assertRaises(retrieval.IsolationCheckUnavailable):
+            retrieval._sandbox_canaries(rpc, policy, "author")
+
+    def test_macos_profile_denies_tmp_and_var_tmp_and_verification_accepts_only_that(self):
+        for adapter, expected in ((retrieval.WINDOWS_ADAPTER, {}),
+                                  (retrieval.MACOS_ADAPTER, {":slash_tmp": "deny", "/private/var/tmp": "deny",
+                                                             ":tmpdir": "write"})):
+            self.value["isolation"]["adapter"] = adapter
+            self.save()
+            policy = self.policy()
+            for role in ("author", "structured"):
+                with self.subTest(adapter=adapter, role=role):
+                    filesystem = retrieval.configuration(policy, role)["permissions"]["historical"]["filesystem"]
+                    self.assertEqual({key: value for key, value in filesystem.items()
+                                      if key not in (":minimal", ":workspace_roots")}, expected)
+                    written = tomllib.loads(retrieval.config_text(policy, role))
+                    self.assertEqual(written["permissions"]["historical"]["filesystem"], filesystem)
+        self.broker_policy.write_text('{"schema_version":1,"provider":"duckduckgo_wayback"}')
+        self.value["broker"]["args"][6] = hashlib.sha256(self.broker_policy.read_bytes()).hexdigest()
+        self.save()
+        for change, error in (({}, None), ({":slash_tmp": "read"}, "mismatch"), ({"/Users": "read"}, "additional"),
+                              ({"/private/var/tmp": None}, "mismatch"), ({":tmpdir": "read"}, "mismatch"),
+                              ({":tmpdir": None}, "mismatch"), ({"/private/tmp": "write"}, "additional")):
+            with self.subTest(change=change):
+                policy, messages, rpc, environment = self.configured_rpc()
+                filesystem = messages["config/read"]["config"]["permissions"]["historical"]["filesystem"]
+                for key, value in change.items():
+                    if value is None:
+                        filesystem.pop(key)
+                    else:
+                        filesystem[key] = value
+                with patch.object(retrieval, "_sandbox_canaries"), patch.object(retrieval, "_macos_network_canaries"):
+                    if error is None:
+                        retrieval.verify_rpc(rpc, policy, "author", environment)
+                    else:
+                        with self.assertRaisesRegex(retrieval.RetrievalPolicyError, error):
+                            retrieval.verify_rpc(rpc, policy, "author", environment)
+
+    def test_verification_accepts_exactly_the_process_private_temp_flags(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.broker_policy.write_text('{"schema_version":1,"provider":"duckduckgo_wayback"}')
+        self.value["broker"]["args"][6] = hashlib.sha256(self.broker_policy.read_bytes()).hexdigest()
+        self.save()
+        policy, messages, rpc, environment = self.configured_rpc()
+        temp = Path(environment["TMPDIR"])
+        self.assertEqual(retrieval.temp_overrides(policy, environment), {"shell_environment_policy": {"set": {
+            "TMPDIR": str(temp), "TMPPREFIX": str(temp / "zsh")}}})
+        self.assertEqual(retrieval.temp_arguments(policy, environment), [
+            "-c", f"shell_environment_policy.set.TMPDIR={json.dumps(str(temp))}",
+            "-c", f"shell_environment_policy.set.TMPPREFIX={json.dumps(str(temp / 'zsh'))}"])
+        with patch.object(retrieval, "_sandbox_canaries") as canaries, patch.object(retrieval, "_macos_network_canaries"):
+            retrieval.verify_rpc(rpc, policy, "author", environment)
+        # The canaries probe this process's own folder.
+        self.assertEqual(canaries.call_args.args[3], temp)
+
+        def other_folder(read, environment):
+            # Commands that would write their temp files elsewhere.
+            for table in (read["config"], read["layers"][0]["config"]):
+                table["shell_environment_policy"]["set"].update(TMPDIR="/Users/someone", TMPPREFIX="/tmp/zsh")
+
+        def more_flags(read, environment):
+            read["layers"][0]["config"]["sandbox_workspace_write"] = {"network_access": True}
+
+        def inherited_variable(read, environment):
+            read["layers"][0]["config"]["shell_environment_policy"]["set"]["OPENAI_API_KEY"] = "secret"
+
+        def effective_only(read, environment):
+            read["config"]["shell_environment_policy"]["set"]["TMPPREFIX"] = "/tmp/zsh"
+
+        for change, error in ((other_folder, "mismatch"), (effective_only, "mismatch"),
+                              (more_flags, "inherited configuration"), (inherited_variable, "inherited configuration"),
+                              (lambda read, environment: environment.pop("TMPDIR"), "private temp folder")):
+            with self.subTest(change=change), patch.object(retrieval, "_sandbox_canaries") as canaries, \
+                    patch.object(retrieval, "_macos_network_canaries"):
+                policy, messages, rpc, environment = self.configured_rpc()
+                change(messages["config/read"], environment)
+                with self.assertRaisesRegex(retrieval.RetrievalPolicyError, error):
+                    retrieval.verify_rpc(rpc, policy, "author", environment)
+                canaries.assert_not_called()
+        # The author's own app-server also has its search and feature flags; its temp entries stay exact.
+        policy, messages, rpc, environment = self.configured_rpc()
+        messages["config/read"]["layers"][0]["config"]["features"] = {"multi_agent": True}
+        with patch.object(retrieval, "_sandbox_canaries"), patch.object(retrieval, "_macos_network_canaries"):
+            retrieval.verify_rpc(rpc, policy, "author", environment, allow_runtime_overrides=True)
+            messages["config/read"]["config"]["shell_environment_policy"]["set"]["TMPDIR"] = "/private/tmp"
+            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "mismatch"):
+                retrieval.verify_rpc(rpc, policy, "author", environment, allow_runtime_overrides=True)
+        # Windows keeps TEMP and TMP from the system environment: no private temp folder or flags.
+        self.value["isolation"]["adapter"] = retrieval.WINDOWS_ADAPTER
+        self.save()
+        policy = self.policy()
+        self.assertIsNone(retrieval.private_temp(policy, "author"))
+        self.assertEqual(retrieval.temp_arguments(policy, {"TMPDIR": str(temp)}), [])
+
+    def test_verification_requires_the_fresh_private_temp_folder_of_this_process_and_role(self):
+        self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
+        self.broker_policy.write_text('{"schema_version":1,"provider":"duckduckgo_wayback"}')
+        self.value["broker"]["args"][6] = hashlib.sha256(self.broker_policy.read_bytes()).hexdigest()
+        self.save()
+        policy = self.policy()
+        own = retrieval.private_temp(policy, "author")
+        self.addCleanup(shutil.rmtree, own, True)
+        parent = own.parent
+
+        def made(path, mode=0o700, link=None):
+            if link is not None:
+                path.symlink_to(link)
+                self.addCleanup(path.unlink)
+            else:
+                path.mkdir()
+                path.chmod(mode)
+                self.addCleanup(shutil.rmtree, path, True)
+            return path
+
+        gone = retrieval.private_temp(policy, "author")
+        shutil.rmtree(gone)
+        not_folder = parent / f"author-{os.getpid()}-afile123"
+        not_folder.write_text("x")
+        self.addCleanup(not_folder.unlink)
+        alias = made(self.root / "alias", link=parent)
+        cases = (
+            # Not this process's own folder: a violation, found before any request to Codex.
+            (parent, retrieval.RetrievalPolicyError),
+            (retrieval.private_temp(policy, "structured"), retrieval.RetrievalPolicyError),
+            (made(parent / "author-1-abcdefgh"), retrieval.RetrievalPolicyError),
+            (made(self.control / f"author-{os.getpid()}-abcdefgh"), retrieval.RetrievalPolicyError),
+            (alias / own.name, retrieval.RetrievalPolicyError),
+            (made(parent / f"author-{os.getpid()}-linklink", link=self.workspace), retrieval.RetrievalPolicyError),
+            # Its own folder no longer owner-only (its commands can chmod it), gone or no folder: checked again.
+            (gone, retrieval.IsolationCheckUnavailable),
+            (made(parent / f"author-{os.getpid()}-modemode", mode=0o755), retrieval.IsolationCheckUnavailable),
+            (not_folder, retrieval.IsolationCheckUnavailable),
+        )
+        for temp, error in cases:
+            with self.subTest(temp=temp):
+                policy, messages, rpc, environment = self.configured_rpc()
+                # The process's environment, session flags and settings all name ``temp``.
+                environment["TMPDIR"] = str(temp)
+                overrides = retrieval.temp_overrides(policy, environment)
+                messages["config/read"]["config"]["shell_environment_policy"]["set"].update(
+                    overrides["shell_environment_policy"]["set"])
+                messages["config/read"]["layers"] = [{"name": {"type": "sessionFlags"}, "config": overrides}]
+                with patch.object(retrieval, "_sandbox_canaries") as canaries, \
+                        patch.object(retrieval, "_macos_network_canaries"):
+                    with self.assertRaisesRegex(error, "private temp folder") as caught:
+                        retrieval.verify_rpc(rpc, policy, "author", environment)
+                    canaries.assert_not_called()
+                rpc.call.assert_not_called()
+                if error is retrieval.RetrievalPolicyError:
+                    self.assertNotIsInstance(caught.exception, retrieval.IsolationCheckUnavailable)
+        # Its own fresh folder passes, and the canaries probe exactly that folder.
+        policy, messages, rpc, environment = self.configured_rpc()
+        with patch.object(retrieval, "_sandbox_canaries") as canaries, patch.object(retrieval, "_macos_network_canaries"):
+            retrieval.verify_rpc(rpc, policy, "author", environment)
+        self.assertEqual(canaries.call_args.args[3], Path(environment["TMPDIR"]))
+        self.assertTrue(Path(environment["TMPDIR"]).name.startswith(f"author-{os.getpid()}-"))
 
     def test_macos_preflight_rejects_wrong_host_and_script_before_process(self):
         self.value["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
@@ -696,7 +1365,7 @@ class HistoricalPolicyTests(unittest.TestCase):
                 retrieval.preflight(policy, "author", "/bin/sh", {})
             process.assert_not_called()
         with patch.object(retrieval.sys, "platform", "darwin"), patch.object(retrieval.subprocess, "Popen") as process:
-            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "Mach-O"):
+            with self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, "Mach-O"):
                 retrieval.preflight(policy, "author", str(self.trusted_bin / "codex.exe"), {})
             process.assert_not_called()
 
@@ -722,6 +1391,10 @@ class HistoricalPolicyTests(unittest.TestCase):
                     evidence = retrieval._macos_network_canaries(rpc, policy, 'author')
                     self.assertTrue(evidence['positiveControls'])
                     self.assertEqual(set(evidence['networkProbes'].values()), {'denied'})
+                elif any(report[name] is False for name in ready):
+                    # A probe tool missing in the sandbox proves nothing: checked again.
+                    with self.assertRaises(retrieval.IsolationCheckUnavailable):
+                        retrieval._macos_network_canaries(rpc, policy, 'author')
                 else:
                     with self.assertRaisesRegex(retrieval.RetrievalPolicyError, 'network denial'):
                         retrieval._macos_network_canaries(rpc, policy, 'author')
@@ -755,7 +1428,7 @@ class HistoricalPolicyTests(unittest.TestCase):
             rpc = Mock()
             with patch.object(retrieval, '_local_network_controls', return_value=nullcontext((1234, 1235, lambda: {'tcp': 0, 'udp': 0}))), \
                     patch.object(retrieval.subprocess, 'run', return_value=result):
-                with self.assertRaisesRegex(retrieval.RetrievalPolicyError, 'positive controls failed'):
+                with self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, 'positive controls failed'):
                     retrieval._macos_network_canaries(rpc, self.policy(), 'author')
             rpc.call.assert_not_called()
 
@@ -845,7 +1518,7 @@ class HistoricalPolicyTests(unittest.TestCase):
         executable.write_bytes(b"\xcf\xfa\xed\xfe" + b"not executed")
         executable.chmod(0o755)
         with patch.object(retrieval.sys, "platform", "darwin"), patch.object(retrieval.subprocess, "Popen") as process:
-            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "codex-code-mode-host"):
+            with self.assertRaisesRegex(retrieval.IsolationCheckUnavailable, "codex-code-mode-host"):
                 retrieval.preflight(policy, "author", str(executable), {})
             process.assert_not_called()
 
@@ -855,7 +1528,7 @@ class HistoricalPolicyTests(unittest.TestCase):
         policy["isolation"]["adapter"] = retrieval.MACOS_ADAPTER
         try:
             host = Path(retrieval.codex_executable(policy)).with_name("codex-code-mode-host")
-        except retrieval.RetrievalPolicyError:
+        except (retrieval.RetrievalPolicyError, retrieval.IsolationCheckUnavailable):
             self.skipTest("native Codex is not installed")
         if not host.is_file():
             self.skipTest("native code-mode host is not installed")

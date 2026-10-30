@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import yaml
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 
 

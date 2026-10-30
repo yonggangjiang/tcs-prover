@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from runner import proof_handoff as handoff
 
 
@@ -45,7 +46,7 @@ class ProofReferenceTests(unittest.TestCase):
                 self.assertIsNone(handoff.extract_proof_reference(message))
 
     def test_invalid_or_conflicting_explicit_references_fail(self):
-        for message in ('PROOF_FILE:', 'PROOF_FILE proof.md', 'PROOF_FILE: "unterminated',
+        for message in ('PROOF_FILE:', 'PROOF_FILE: "unterminated',
                         'PROOF_FILE: proof.md\nPROOF_FILE: other.md',
                         '{"proof_file":"proof.md","proof_file":"other.md"}',
                         '{"proof_file":3}', '{"proof_file":"proof.md","extra":true}',
@@ -112,6 +113,21 @@ class ProofSnapshotTests(unittest.TestCase):
             with self.subTest(reference=reference):
                 with self.assertRaises(handoff.ProofHandoffError):
                     self.resolve(reference)
+
+    def test_related_works_and_the_progress_summary_are_never_the_proof(self):
+        related = self.workspace / 'related-works'
+        related.mkdir()
+        (related / 'paper.md').write_bytes(self.data)
+        (related / 'notes').mkdir()
+        (related / 'notes' / 'proof.md').write_bytes(self.data)
+        (self.workspace / 'progress-summary.md').write_bytes(self.data)
+        for reference in ('related-works/paper.md', 'related-works/notes/proof.md', 'Related-Works/paper.md',
+                          str(related / 'paper.md'), 'progress-summary.md', 'PROGRESS-SUMMARY.md'):
+            with self.subTest(reference=reference):
+                with self.assertRaisesRegex(handoff.ProofHandoffError, 'protected or hidden'):
+                    self.resolve(reference)
+        # A proof of the author's own beside them is still handed over.
+        self.assertEqual(self.resolve().content, self.data)
 
     def test_missing_empty_invalid_utf8_oversized_and_special_files_fail(self):
         with self.assertRaises(handoff.ProofHandoffError):

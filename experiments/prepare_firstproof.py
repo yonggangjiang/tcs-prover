@@ -17,7 +17,7 @@ DISCOVERY_PROVIDER = 'codex_wayback'
 HOLD = 'Prepared for user launch on MacBook; compatible isolation and compiler adapters plus host preflight are required.'
 SETTING_KEYS = (
     'reviewModel', 'authorModel', 'criticModel', 'writerModel', 'reasoningEffort',
-    'reviewEffort', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds',
+    'reviewEffort', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'criticCount',
     'thinkingHours', 'speedMode', 'reasoningSummary',
     'problemMode', 'skipStatementReview', 'statementReviewOnly',
     'preparedRun', 'sourceFile', 'goalThreadId', 'goalWorkspace', 'goalResume',

@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from experiments import launch_firstproof as launch
 from experiments import prepare_firstproof as preparation
 
@@ -164,6 +165,10 @@ class LaunchTests(unittest.TestCase):
         settings['goalResume'] = True
         launch.write_json(settings_path, settings)
         with self.assertRaisesRegex(ValueError, 'settings changed'):
+            launch.batch_plan(runs, controls)
+        # The prepared number of independent critics is the default too.
+        launch.write_json(settings_path, {**json.loads(original), 'criticCount': 5})
+        with self.assertRaisesRegex(ValueError, 'settings changed or run already started'):
             launch.batch_plan(runs, controls)
         settings_path.write_text(original)
         policy_path = controls / 'P09/retrieval-policy.json'

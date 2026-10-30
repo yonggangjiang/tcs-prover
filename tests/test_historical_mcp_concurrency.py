@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_search as hs
 from retrieval import scholarly_discovery as sd
 
@@ -135,7 +136,7 @@ class ConcurrentMCPTests(unittest.TestCase):
 
         harness = Harness(self, factory)
         harness.release_on_close(release)
-        self.assertIn('at most 4 concurrent', harness.initialization['result']['instructions'])
+        self.assertIn('at most 4 calls at once', harness.initialization['result']['instructions'])
         harness.input.send(search(1, 'slow'))
         self.assertTrue(started.wait(1))
         harness.input.send(request(2, 'ping'))
@@ -148,7 +149,7 @@ class ConcurrentMCPTests(unittest.TestCase):
         release.set()
         self.assertEqual(harness.receive()['id'], 1)
 
-    def test_four_calls_and_immediate_busy_without_factory(self):
+    def test_four_calls_run_and_a_fifth_waits_its_turn(self):
         entered, release = queue.Queue(), threading.Event()
         factories = []
 
@@ -168,14 +169,14 @@ class ConcurrentMCPTests(unittest.TestCase):
         for _ in range(4):
             entered.get(timeout=1)
         harness.input.send(search(5))
-        rejected = harness.receive()
-        self.assertEqual(rejected['id'], 5)
-        self.assertIn('busy', rejected['result']['content'][0]['text'])
+        with self.assertRaises(queue.Empty):
+            harness.receive(timeout=0.2)  # Queued, not answered 'busy'.
         self.assertEqual(len(factories), 4)
         release.set()
-        records = [harness.receive() for _ in range(4)]
-        self.assertEqual({record['id'] for record in records}, {0, 1, 2, 3})
+        records = [harness.receive() for _ in range(5)]
+        self.assertEqual({record['id'] for record in records}, {0, 1, 2, 3, 5})
         self.assertTrue(all(not record['result']['isError'] for record in records))
+        self.assertEqual(len(factories), 5)
         self.assertEqual(len(harness.output.lines), 6)
         self.assertTrue(all(line.endswith('\n') and len(line.splitlines()) == 1
                             for line in harness.output.lines))
@@ -195,10 +196,11 @@ class ConcurrentMCPTests(unittest.TestCase):
         harness.input.send({'jsonrpc': '2.0', 'method': 'notifications/cancelled',
                             'params': {'requestId': 1}})
         harness.input.send(search(2))
-        rejected = harness.receive()
-        self.assertEqual(rejected['id'], 2)
-        self.assertIn('busy', rejected['result']['content'][0]['text'])
+        # The cancelled call keeps its slot until it exits: the next one waits.
+        with self.assertRaises(queue.Empty):
+            harness.receive(timeout=0.2)
         release.set()
+        self.assertEqual(harness.receive()['id'], 2)
         self.wait_idle(harness)
         self.assertTrue(harness.output.records.empty())
         harness.input.send(search(3))
@@ -224,8 +226,9 @@ class ConcurrentMCPTests(unittest.TestCase):
             expired = harness.receive(timeout=1)
             self.assertLess(time.monotonic() - began, 0.8)
             self.assertIn('deadline', expired['result']['content'][0]['text'])
+            # The slot stays held: a queued call is answered by its own deadline.
             harness.input.send(search(2))
-            self.assertIn('busy', harness.receive()['result']['content'][0]['text'])
+            self.assertIn('deadline', harness.receive(timeout=1)['result']['content'][0]['text'])
             release.set()
             self.wait_idle(harness)
             self.assertFalse(provider_calls)

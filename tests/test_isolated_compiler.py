@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import isolated_compiler as compiler
 import workflow_runner as runtime
 
@@ -47,7 +48,7 @@ class CompilerBoundaryTests(unittest.TestCase):
         os.chdir(self.workspace)
         self.addCleanup(os.chdir, previous)
         with patch.object(runtime, "retrieval_policy", return_value=self.policy), patch.object(compiler, "compile_command", return_value={"status": "pass"}) as isolated:
-            self.assertEqual(runtime._run_command(CONFIG, {"state": {}}), {"status": "pass"})
+            self.assertEqual(runtime._run_command(CONFIG, {"state": {}})["status"], "pass")
         isolated.assert_called_once_with(self.policy, CONFIG, compiler.LATEX_ARGV, self.workspace)
 
     def test_source_symlinks_and_hardlinks_are_rejected(self):

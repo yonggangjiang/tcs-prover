@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import runtime as retrieval
 import workflow_runner as runtime
 from test_goal_runtime import Runtime, PROMPTS, PROMPT, SETTINGS, success
@@ -35,14 +36,22 @@ class SearchModesRuntimeTests(unittest.TestCase):
             self.assertEqual(retrieval.search_mode(self.workspace), mode)
             self.assertIn(f'web_search="{mode}"', retrieval.native_search_arguments(self.workspace))
 
-    def test_saved_mode_cannot_change_through_child_environment(self):
+    def test_a_live_run_follows_its_controller_and_the_file_only_cross_checks(self):
+        # The controller's mode wins over a file the live author can edit (or that cannot be read).
         self.save({'retrievalMode': 'disabled'})
         with patch.dict(os.environ, {retrieval.MODE_ENV: 'live'}):
-            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, 'differs'):
-                retrieval.search_mode(self.workspace)
+            self.assertEqual(retrieval.search_mode(self.workspace), 'live')
         self.save({'retrievalMode': 'live'})
         with patch.dict(os.environ, {retrieval.MODE_ENV: 'disabled'}):
-            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, 'differs'):
+            self.assertEqual(retrieval.search_mode(self.workspace), 'disabled')
+            (self.workspace / 'job-settings.json').write_text('{"retrievalMode": ')
+            self.assertEqual(retrieval.search_mode(self.workspace), 'disabled')
+            self.assertIsNone(retrieval.policy_for_workspace(self.workspace))
+        # A file that names a historical run still stops a live child before any process.
+        for saved in ({'retrievalMode': 'historical'}, {'retrievalPolicyPath': '/elsewhere/policy.json'}):
+            self.save(saved)
+            with patch.dict(os.environ, {retrieval.MODE_ENV: 'live'}), \
+                    self.assertRaisesRegex(retrieval.RetrievalPolicyError, 'historical'):
                 retrieval.search_mode(self.workspace)
 
     def test_missing_historical_policy_and_invalid_mode_fail_before_process(self):
@@ -85,12 +94,14 @@ class SearchModesRuntimeTests(unittest.TestCase):
                 snapshot = Path(command[command.index('-C') + 1])
                 self.addCleanup(shutil.rmtree, snapshot)
                 self.assertIn(f'web_search="{mode}"', command)
-                # Read-only either way; on macOS the profile also hides TCS Prover's private state.
+                # Read-only either way; on macOS in the confined profile with a read-only snapshot.
                 if runtime.private_permissions(':read-only', runtime.MODEL) is None:
                     self.assertEqual(command[command.index('-s') + 1], 'read-only')
                 else:
                     self.assertNotIn('-s', command)
-                    self.assertIn(f'permissions.{runtime.PRIVATE_PERMISSIONS}.extends=":read-only"', command)
+                    profile = next(value for value in command
+                                   if value.startswith(f'permissions.{runtime.PRIVATE_PERMISSIONS}.filesystem='))
+                    self.assertIn('":workspace_roots"={"."="read"', profile)
                 for name, value in files:
                     self.assertEqual((snapshot / name).read_text(), value)
                     if os.name != 'nt':

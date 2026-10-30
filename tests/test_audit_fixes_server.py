@@ -15,6 +15,7 @@ import threading
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from retrieval import runtime as retrieval_runtime
 from ui import retrieval, server
@@ -146,10 +147,15 @@ class RunFolderWriteTests(TemporaryRuns):
             return real_open(path, *args, **kwargs)
 
         with mock.patch.object(server.os, "open", side_effect=exhausted):
-            with self.assertRaises(OSError):
-                self.app.add_trace({"kind": "status", "stage": "solve", "label": "Not written"})
+            self.app.add_trace({"kind": "status", "stage": "solve", "label": "Not written"})
         self.assertEqual(list(self.run.glob(".transcript.jsonl.*")), [])
         self.assertIn("Kept record", self.app.trace_file.read_text())
+        # I-103: the record is kept and the failure reported; the log is written once it can be.
+        self.assertNotIn("Not written", self.app.trace_file.read_text())
+        self.assertTrue(any("Saving the transcript failed" in str(entry.get("text"))
+                            for entry in self.app.state["trace"]))
+        self.assertTrue(self.app.flush_trace(force=True))
+        self.assertIn("Not written", self.app.trace_file.read_text())
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores file permissions")
     def test_log_without_write_permission_is_kept_beside_a_new_one(self):
@@ -187,7 +193,8 @@ class RunFolderWriteTests(TemporaryRuns):
 
     def test_saved_artifacts_replace_planted_links(self):
         names = ["partial-output.md", server.PAUSE_FILENAME, server.PAUSE_REQUEST_FILENAME,
-                 server.AUTHOR_LIMIT_FILENAME, server.AUTHOR_STEER_FILENAME, server.MANUAL_STOP_FILENAME]
+                 server.AUTHOR_STEER_FILENAME, server.MANUAL_STOP_FILENAME]
+        (self.run / server.AUTHOR_LIMIT_FILENAME).symlink_to(self.outside)
         legacy_temporaries = [".pause.tmp", ".author-limit.json.tmp", ".author-steer.json.tmp"]
         for name in names + legacy_temporaries:
             (self.run / name).symlink_to(self.outside)
@@ -202,7 +209,10 @@ class RunFolderWriteTests(TemporaryRuns):
             info = (self.run / name).lstat()
             self.assertTrue(stat.S_ISREG(info.st_mode), name)
             self.assertEqual(stat.S_IMODE(info.st_mode), 0o600, name)
-        self.assertEqual(json.loads((self.run / server.AUTHOR_LIMIT_FILENAME).read_text()), {"hours": 3})
+        # The time limit the runner reads lives in the controller folder, which the author cannot write.
+        limit = server.controller_directory(self.run) / server.AUTHOR_LIMIT_FILENAME
+        self.assertEqual(json.loads(limit.read_text()), {"hours": 3})
+        self.assertEqual(stat.S_IMODE(limit.stat().st_mode), 0o600)
         self.assertEqual(json.loads((self.run / server.AUTHOR_STEER_FILENAME).read_text())["id"], command_id)
         # The workspace temporary names are no longer used, and staging is cleaned up.
         self.assertTrue(all((self.run / name).is_symlink() for name in legacy_temporaries))
@@ -360,10 +370,11 @@ class DamagedTranscriptTests(TemporaryRuns):
         (broken / "transcript.jsonl").write_text(json.dumps(
             {"kind": "request", "stage": "solve", "node": "author", "time": "2026-10-01T08:00:00+00:00"}) + "\n")
         (broken / server.PAUSE_FILENAME).write_text(json.dumps({"status": "running", "state": [1, 2]}))
-        with mock.patch("sys.stderr", new_callable=io.StringIO) as errors:
-            jobs = server.restore_saved_jobs(self.runs)
-        self.assertEqual(set(jobs), {"healthy"})
-        self.assertIn("Skipped damaged saved run broken", errors.getvalue())
+        jobs = server.restore_saved_jobs(self.runs)
+        # I-083: the damaged run stays listed; its author continues from the transcript.
+        self.assertEqual(set(jobs), {"healthy", "broken"})
+        self.assertEqual(jobs["broken"].state["phase"], "paused")
+        self.assertEqual(jobs["broken"].state["stage"], "solve")
 
     def test_newest_transcript_vanishing_during_lookup_is_ignored(self):
         self.saved_run("kept")
@@ -519,7 +530,8 @@ class FailedReviewRetryTests(TemporaryRuns):
         self.manager = socketless_server(self.runs)
 
     def folders(self):
-        return sorted(path.name for path in self.runs.iterdir() if path.is_dir())
+        # The hidden controller folder is not a job.
+        return sorted(path.name for path in self.runs.iterdir() if path.is_dir() and not path.name.startswith("."))
 
     def test_failed_review_retries_in_its_own_folder(self):
         app = self.manager.start_job({"statement": "Original draft"})
@@ -764,12 +776,20 @@ class JobListTests(TemporaryRuns):
     def test_stopped_historical_job_offers_no_continuation_that_creates_a_run(self):
         self.historical(phase="done", stage="solve", activeNode="author", manuallyStopped=True,
                         stoppedStage="solve", error="Stopped.")
-        self.assertIsNone(server.Server._stopped_continuation_plan(self.app))
+        # It continues in its own folder under its fixed policy (I-070), never in a new run.
+        plan = server.Server._stopped_continuation_plan(self.app)
+        self.assertEqual((plan["action"], plan["inPlace"]), ("author", True))
         row = self.manager.job_list()[0]
-        self.assertFalse(row["canContinueStopped"] or row["canResumeCritic"])
+        self.assertTrue(row["canContinueStopped"] and row["continueStoppedInPlace"])
+        # Its critic and checkpoints continue in the same folder too (start_saved_critic_job).
+        self.assertTrue(row["canResumeCritic"])
         self.assertTrue(row["checkpoints"])
+        self.assertTrue(all(checkpoint["resumable"] for checkpoint in row["checkpoints"]))
+        # A held run offers only Re-run preflight; the job's own cached checkpoints are not modified.
+        self.app.state["launchHold"] = "Needs attention: The policy is missing. Choose Re-run preflight after fixing it."
+        row = self.manager.job_list()[0]
+        self.assertFalse(row["canResumeCritic"])
         self.assertFalse(any(checkpoint["resumable"] for checkpoint in row["checkpoints"]))
-        # The job's own cached checkpoints are not modified.
         self.assertTrue(all(checkpoint["resumable"] for checkpoint in self.app.snapshot()["checkpoints"]))
 
     def test_paused_historical_job_still_resumes_in_place(self):
@@ -989,7 +1009,9 @@ class HistoricalBatchErrorTests(TemporaryRuns):
             with self.assertRaises(ValueError) as raised:
                 self.start("first", "second", "third")
         self.assertEqual(str(raised.exception), "Could not start the job for first.md: sandbox unavailable. "
-                                                "The 3 prepared jobs are held and will not start.")
+                                                "The 3 prepared jobs are held; choose Re-run preflight on each "
+                                                "after fixing the cause.")
+        self.assertTrue(all("sandbox unavailable" in app.state["launchHold"] for app in self.manager.jobs.values()))
         self.assertEqual(self.launches, [])
         self.assertTrue(all(app.state["launchHold"] for app in self.manager.jobs.values()))
 
@@ -998,25 +1020,34 @@ class HistoricalBatchErrorTests(TemporaryRuns):
             with self.assertRaises(ValueError) as raised:
                 self.start("first", "second")
         self.assertEqual(str(raised.exception), "Could not start the historical batch: no LaTeX sandbox. "
-                                                "The 2 prepared jobs are held and will not start.")
+                                                "The 2 prepared jobs are held; choose Re-run preflight on each "
+                                                "after fixing the cause.")
         self.assertEqual(self.launches, [])
 
-    def test_launch_failure_counts_started_and_held_jobs(self):
+    def test_a_launch_failure_after_preflight_stops_nothing_and_is_retried(self):
         def launch(argv, **kwargs):
-            if self.launches:
+            if len(self.launches) == 1 and not failed:
+                failed.append(1)
                 raise OSError("No space left on device")
             return self.launch(argv, **kwargs)
 
-        stopped = []
+        failed, stopped = [], []
         with mock.patch.object(server.subprocess, "Popen", side_effect=launch), \
                 mock.patch.object(server.App, "stop", autospec=True, side_effect=stopped.append):
-            with self.assertRaises(ValueError) as raised:
-                self.start("first", "second", "third")
-        self.assertEqual(str(raised.exception),
-                         "Could not start the job for second.md: No space left on device. "
-                         "The 1 job it had already started were stopped. "
-                         "The 2 prepared jobs are held and will not start.")
-        self.assertEqual([app.state["sourceFile"] for app in stopped], ["first.md"])
+            started = self.start("first", "second", "third")
+            self.assertEqual(started.notice, "Could not start the job for second.md (No space left on device); it "
+                                             "is tried again every 1 minute.")
+            self.assertEqual(stopped, [])
+            phases = {app.state["sourceFile"]: app.state["phase"] for app in started}
+            self.assertEqual(phases, {"first.md": "running", "second.md": "prepared", "third.md": "running"})
+            second = next(app for app in started if app.state["sourceFile"] == "second.md")
+            self.assertTrue(second.state["launchQueued"])
+            self.assertFalse(second.state["launchHold"])
+            # The retry loop starts it once its minute has passed.
+            self.manager._retry_stop = threading.Event()
+            self.manager._retry_paused_jobs(now=second.state["autoResumeAt"] + 1)
+        self.assertEqual(second.state["phase"], "running")
+        self.assertEqual(len(self.launches), 3)
 
 
 if __name__ == "__main__":

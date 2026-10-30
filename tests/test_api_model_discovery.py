@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from runner import providers
 from tests.test_api_models_server import ANTHROPIC_KEY, HttpCase, KEY
 from ui import server

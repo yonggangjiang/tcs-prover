@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
 
 

@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_codex_discovery as discovery
 from retrieval import historical_search as hs
 from retrieval import isolated_compiler
@@ -264,7 +265,9 @@ class StaleCanaryTests(RuntimePolicyFixture):
     def rpc(self):
         report = {'nonce': self.NONCE, 'insideOk': True, 'insideWrite': True, 'protectedWrite': False,
                   'settingsWrite': False, 'settingsDelete': False, 'settingsRename': False,
-                  'settingsCanariesRead': True, 'outsideRead': False, 'network': False, 'publicNetwork': False}
+                  'settingsCanariesRead': True, 'outsideRead': False, 'network': False, 'publicNetwork': False,
+                  # macOS: /tmp and /var/tmp can be neither read nor written.
+                  'slashTmpRead': False, 'slashTmpWrite': False, 'varTmpRead': False, 'varTmpWrite': False}
         observed = []
 
         def call(method, params):
@@ -446,7 +449,8 @@ class DashboardMetadataTests(UIRetrievalFixture):
         loaded = self.info(policy_path, saved_cutoff=UI_CUTOFF)
         self.assertTrue(loaded['available'])
         self.assertEqual(loaded['cutoffExclusiveUtc'], UI_CUTOFF)
-        self.update_codex()
+        broker = Path(json.loads(Path(policy_path).read_text())['broker']['policyFile'])
+        broker.write_text(broker.read_text() + ' ')  # No longer the pinned broker policy.
         failed = self.info(policy_path, saved_cutoff=UI_CUTOFF)
         self.assertEqual((failed['mode'], failed['available'], failed['fixed']), ('historical', False, True))
         self.assertEqual(failed['cutoffExclusiveUtc'], UI_CUTOFF)
@@ -468,8 +472,15 @@ class DashboardMetadataTests(UIRetrievalFixture):
             self.assertTrue(self.info(policy_path)['available'])
             self.assertEqual(hashed.call_count, 1)
             self.update_codex()
-            self.assertFalse(self.info(policy_path)['available'])
-            self.assertEqual(hashed.call_count, 2)
+            # A changed discovery binary no longer hides the run's statistics (I-097):
+            # it is named as needing attention instead.
+            info = self.info(policy_path)
+            self.assertTrue(info['available'])
+            self.assertIn('needs attention', info['attention'])
+            calls = hashed.call_count
+            self.assertLessEqual(calls, 3)  # The pinned path, then the kept link.
+            self.info(policy_path)
+            self.assertEqual(hashed.call_count, calls)
 
     def test_display_memo_rechecks_changed_controller_files(self):
         policy_path = self.prepare()

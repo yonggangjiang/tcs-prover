@@ -8,6 +8,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import runtime as retrieval_runtime
 from ui import retrieval, server
 
@@ -232,7 +233,7 @@ class RetrievalUITests(unittest.TestCase):
 
     def test_non_author_endpoints_reject_historical_setting(self):
         for method in (self.manager.start_job, self.manager.start_latex_job):
-            with self.assertRaisesRegex(ValueError, 'direct proof|Skip statement review'):
+            with self.assertRaisesRegex(ValueError, 'requires Proof author enabled and Statement review disabled'):
                 method(self.body(content='A theorem and its proof.'))
         self.assertFalse(self.order)
 
@@ -268,12 +269,15 @@ class RetrievalUITests(unittest.TestCase):
         self.assertNotIn('secret.example', text)
         self.assertNotIn(str(self.root), text)
 
-    def test_wrong_workspace_or_malformed_audit_never_reports_available(self):
+    def test_wrong_workspace_never_reports_available_and_malformed_records_are_skipped(self):
         app = self.manager.start_direct_job(self.body())
         policy = retrieval_runtime.load_policy(app.state['retrievalPolicyPath'])
         self.assertFalse(retrieval.public_retrieval_info(policy['_path'], run_dir=self.root)['available'])
         Path(policy['broker']['auditLog']).write_text('{bad}\n')
-        self.assertFalse(retrieval.public_retrieval_info(policy['_path'], run_dir=app.run_dir)['available'])
+        retrieval._CACHE.clear()
+        public = retrieval.public_retrieval_info(policy['_path'], run_dir=app.run_dir)
+        self.assertTrue(public['available'])
+        self.assertEqual((public['skippedRecords'], public['counts']['searches']), (1, 0))
 
     def public_events(self, events):
         app = self.manager.start_direct_job(self.body())
@@ -390,9 +394,12 @@ class RetrievalUITests(unittest.TestCase):
 
     def test_missing_policy_restoration_holds_historical_job(self):
         app = self.manager.start_direct_job(self.body())
-        settings = json.loads((app.run_dir / 'job-settings.json').read_text())
+        # Restoring trusts the controller's copy, which the author cannot reach.
+        saved = server.controlled_path(app.run_dir, 'job-settings.json')
+        self.assertNotEqual(saved.parent, app.run_dir)
+        settings = json.loads(saved.read_text())
         settings['retrievalPolicyPath'] = ''
-        (app.run_dir / 'job-settings.json').write_text(json.dumps(settings))
+        saved.write_text(json.dumps(settings))
         restored = server.restore_saved_app(server.App(app.run_dir / 'transcript.jsonl', self.runs))
         self.assertIn('policy is missing', restored.state['launchHold'])
 

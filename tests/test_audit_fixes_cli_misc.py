@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import web_ui
 import workflow_runner as runtime
 from ui import batches, cli, legacy_overview, live_gateway, review, retrieval, server
@@ -111,7 +112,42 @@ class HeadlessCliTests(unittest.TestCase):
         code, errors = self.run_headless(start)
         self.assertTrue(finished.is_set())
         self.assertEqual(code, 1)
-        self.assertIn('[problem.md] Proof failed: Workflow time limit reached.', errors)
+        # I-003: a pause that waits for the user says how to continue from a terminal.
+        self.assertIn('[problem.md] Paused: Workflow time limit reached.', errors)
+        self.assertIn('--resume-research', errors)
+
+    def test_a_time_limit_pause_waits_for_its_summary_and_ends_as_before(self):
+        output, errors = io.StringIO(), io.StringIO()
+
+        def start(app, statement, **options):
+            app.run_dir = self.runs / 'job'
+            app.state.update(phase='paused', error='Workflow time limit reached.', stage='solve', activeNode='author')
+            app._conversation.append({'id': 'c_0123456789', 'kind': 'summary', 'origin': 'time-limit', 'text': '',
+                                      'status': 'queued', 'createdAt': '', 'dueAt': 0, 'reply': '', 'error': ''})
+
+        def reply(app, now=None, check=None):
+            # The summary turn's runner prints its reply; the item is answered.
+            with app.lock:
+                item = app._conversation[0]
+                if item['status'] != 'queued':
+                    return False
+                item['status'] = 'answered'
+            app.output_stream.write(json.dumps({'kind': 'conversation_reply', 'stage': 'conversation',
+                                                'conversationKind': 'summary', 'label': 'Progress summary',
+                                                'text': 'Lemma 1 holds; Lemma 2 is open.'}) + '\n')
+            return True
+
+        with mock.patch.object(cli, 'direct_cli_options', return_value={}), \
+                mock.patch.object(server.App, 'start_direct_statement', autospec=True, side_effect=start), \
+                mock.patch.object(server.App, 'start_conversation_if_due', autospec=True, side_effect=reply), \
+                mock.patch.object(server.App, 'snapshot', side_effect=AssertionError('full snapshot')):
+            code = cli.run_headless_markdown(self.statement, runs=self.runs, output_stream=output,
+                                             error_stream=errors)
+        self.assertEqual(code, 1)
+        self.assertEqual(output.getvalue(), '[problem.md] Progress summary:\nLemma 1 holds; Lemma 2 is open.\n')
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(lines[0], '[problem.md] Paused: Workflow time limit reached.')
+        self.assertIn('--resume-research', lines[-1])
 
     def test_job_stays_active_while_its_reader_saves_artifacts(self):
         app = server.App(runs=self.runs)
@@ -173,8 +209,8 @@ class CliMainTests(unittest.TestCase):
         model = next(name for name in cli.OFFERED_MODELS if name != cli.DEFAULT_AUTHOR_MODEL)
         self.assertEqual(self.resume('-thinking', '24', '--author-m', model),
                          {'thinkingHours': 24.0, 'authorModel': model})
-        self.assertEqual(self.resume('-speed', 'fast', '-authorE', 'low', '--critic-r', '5'),
-                         {'speedMode': 'fast', 'authorEffort': 'low', 'criticRounds': 5})
+        self.assertEqual(self.resume('-speed', 'fast', '-authorE', 'low', '--critic-r', '5', '--critic-c', '4'),
+                         {'speedMode': 'fast', 'authorEffort': 'low', 'criticRounds': 5, 'criticCount': 4})
 
     def test_resume_author_keeps_saved_settings_without_overrides(self):
         self.assertEqual(self.resume(), {})

@@ -8,16 +8,26 @@ workspace boundary. Inline proofs continue to work on every platform.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import stat
 
 
 MAX_PROOF_BYTES = 8 * 1024 * 1024
 PROOF_SUFFIXES = {".md", ".txt", ".tex"}
+# A plain PROOF_FILE line is a pointer only in a message this short (without
+# its marker lines); in a longer one it is a leftover beside an inline proof.
+POINTER_MAX_CHARS = 1500
+# PROOF_FILE (in any case, possibly in Markdown emphasis) and a colon, or a
+# space before the path. A line written as an inline-code span is not one.
+_MARKER = r"^[ \t]*(?:\*\*|__|\*|_)?PROOF_FILE(?:\*\*|__|\*|_)?(?:[ \t]*:(?:\*\*|__|\*|_)?|(?=[ \t]+\S))"
+MARKER_LINE = re.compile(_MARKER + r"(.*)$", re.I | re.M)
+_MARKER_WHOLE_LINE = re.compile(_MARKER + r"[^\n]*(?:\n|\Z)", re.I | re.M)
+_LINK = r"\[[^\]\n]+\]\("
 PROTECTED_COMPONENTS = {
     "prompts", "codex-home", "discovery-auth", "discovery-state",
     "input.md", "draft.md", "checked-statement.md", "job-settings.json",
@@ -25,11 +35,21 @@ PROTECTED_COMPONENTS = {
     "transcript.jsonl", "saved-candidate.md", "final-input.json",
     "latex-input.md", "final.tex", "failure-summary.md", "partial-output.md",
     "fresh-critic-audits", "config", "credentials",
+    # The user's related works and the paused author's progress summary are never the proof.
+    "related-works", "progress-summary.md",
 }
 
 
 class ProofHandoffError(ValueError):
     """An explicit proof reference could not be safely resolved."""
+
+
+class ProofTooLarge(ProofHandoffError):
+    """A proof file over the handoff size limit; ``size_bytes`` says how large it is (at least)."""
+
+    def __init__(self, size_bytes, limit):
+        super().__init__("The proof file exceeds the handoff size limit.")
+        self.size_bytes, self.limit = size_bytes, limit
 
 
 @dataclass(frozen=True)
@@ -38,6 +58,8 @@ class ProofSnapshot:
     text: str
     sha256: str
     size_bytes: int
+    # An inline proof whose leftover PROOF_FILE lines were removed: no file.
+    removed_marker_lines: int = 0
 
     @property
     def content(self):
@@ -45,6 +67,9 @@ class ProofSnapshot:
         return self.text.encode("utf-8")
 
     def receipt(self):
+        if self.removed_marker_lines:
+            return {"kind": "inline", "removed_marker_lines": self.removed_marker_lines,
+                    "sha256": self.sha256, "size_bytes": self.size_bytes}
         return {"proof_file": self.relative_path, "sha256": self.sha256,
                 "size_bytes": self.size_bytes}
 
@@ -72,11 +97,77 @@ def _undecorated_marker_value(reference):
     return reference
 
 
+def _marker_path(value):
+    """The path a PROOF_FILE line names: a quoted or inline-code path, or the
+    first path with a proof suffix ("proof.md (complete)" names proof.md)."""
+    value = re.sub(r"^\*{1,2}(?=\S)", "", value.strip())  # A bold or italic path.
+    if value.startswith('"'):
+        try:
+            reference, _ = json.JSONDecoder().raw_decode(value)
+        except ValueError as exc:
+            raise ProofHandoffError("Invalid quoted PROOF_FILE path.") from exc
+    elif value.startswith("`") and "`" in value[1:]:
+        reference = value[1:value.index("`", 1)]
+    else:
+        # A suffix counts only before the end, a space, or punctuation that
+        # ends the value or a word, so "proof.md?x=1" stays one (refused) path.
+        named = re.match(r"(.*?\.(?:md|txt|tex))(?=$|\s|[.,;:!?)\]*_]+(?:\s|$))", value, re.I)
+        reference = named.group(1) if named else _undecorated_marker_value(value)
+    if not isinstance(reference, str) or not reference.strip():
+        raise ProofHandoffError("PROOF_FILE needs a nonempty path.")
+    return reference
+
+
+def _marker_word(value):
+    """The first word of a PROOF_FILE value that is a proof path ("see `proof.md`" names proof.md).
+
+    Only a fallback: the value as written wins whenever it names a readable
+    file, so a path with spaces keeps working. A single word is never
+    reread, and a word must already be a plain path, so removing punctuation
+    cannot turn a refused path ("proof.md/..") into another one.
+    """
+    words = value.split()
+    for word in words if len(words) > 1 else ():
+        word = word.strip("`'\"*([<").rstrip(".,;:!?").strip("`'\"*)]>").rstrip(".,;:!?")
+        if word and Path(word).suffix.lower() in PROOF_SUFFIXES and _comparable(word) == word:
+            return word
+    return None
+
+
+def _marker_snapshot(value, workspace, max_bytes):
+    """Snapshot the file a PROOF_FILE line names; failing that, its first word that is a proof path."""
+    reference = _marker_path(value)
+    try:
+        return _snapshot(reference, workspace, max_bytes)
+    except ProofHandoffError as error:
+        alternative = _marker_word(value)
+        if alternative is None or _comparable(alternative) == _comparable(reference):
+            raise
+        try:
+            return _snapshot(alternative, workspace, max_bytes)
+        except ProofHandoffError:
+            raise error from error.__cause__  # The reason names the path as written.
+
+
+def _comparable(reference):
+    # "proof.md", "./proof.md" and "proof.md/." name one file; ".." is kept.
+    return PurePosixPath(reference).as_posix()
+
+
+def _without_markers(text):
+    return _MARKER_WHOLE_LINE.sub("", text)
+
+
 def extract_proof_reference(final_message, *, code_span=True):
     """Return an explicit local file reference, or None for an inline proof.
 
     Prefer ``PROOF_FILE: proof.md`` or an exact ``{"proof_file":"proof.md"}``
-    object. Compatibility accepts a short message whose opening sentence says
+    object. A marker line is a pointer only in a pointer-sized message; beside
+    a complete inline proof it is a leftover that resolve_author_proof()
+    removes. Near-misses whose intent is clear are accepted: ``PROOF_FILE
+    proof.md``, Markdown emphasis around the marker, words after the path,
+    equivalent paths on several marker lines, and links after the first blank
+    line. Compatibility accepts a short message whose opening sentence says
     that the complete proof is in a Markdown link, followed by a short synopsis.
     An incidental file link within an inline argument is never a handoff.
     With ``code_span``, a pointer-sized message may also write its marker line
@@ -101,26 +192,22 @@ def extract_proof_reference(final_message, *, code_span=True):
     # it is the only pointer of a pointer-sized message. Beside a plain marker,
     # a JSON key or a link, or inside a complete proof, it stays text, so those
     # messages resolve exactly as they did before.
-    if (code_span and len(message) <= 1500
-            and not re.search(r'^\s*PROOF_FILE\s*:|"proof_file"\s*:|\[[^\]\n]+\]\(', unwrapped, re.M)):
+    if (code_span and len(message) <= POINTER_MAX_CHARS and not MARKER_LINE.search(unwrapped)
+            and not re.search(r'"proof_file"\s*:|' + _LINK, unwrapped)):
         unwrapped = re.sub(r"(?m)^([ \t]*)`(PROOF_FILE[ \t]*:[^`\n]*)`\.?[ \t\r]*$", r"\1\2", unwrapped)
-    marker_lines = re.findall(r"^\s*PROOF_FILE\s*:(.*)$", unwrapped, re.M)
+    marker_lines = MARKER_LINE.findall(unwrapped)
     if marker_lines:
-        if re.search(r'"proof_file"\s*:|\[[^\]\n]+\]\(', unwrapped):
-            raise ProofHandoffError("Use one proof reference format; mixed pointers are ambiguous.")
-        references = []
-        for raw in marker_lines:
-            reference = _undecorated_marker_value(raw.strip())
-            if reference.startswith('"'):
-                try:
-                    reference = json.loads(reference)
-                except ValueError as exc:
-                    raise ProofHandoffError("Invalid quoted PROOF_FILE path.") from exc
-            if not isinstance(reference, str) or not reference.strip():
-                raise ProofHandoffError("PROOF_FILE needs a nonempty path.")
-            references.append(reference)
-        if len(set(references)) != 1:
-            raise ProofHandoffError("The author returned conflicting proof file references.")
+        if len(_without_markers(unwrapped).strip()) > POINTER_MAX_CHARS:
+            return None  # A complete inline proof with a leftover marker line.
+        # Links after the first blank line belong to a synopsis, not the pointer.
+        head = re.split(r"\n[ \t\r]*\n", unwrapped, maxsplit=1)[0]
+        if re.search(r'"proof_file"\s*:', unwrapped) or re.search(_LINK, head):
+            raise ProofHandoffError("Use one proof reference format; mixed pointers are ambiguous. Give PROOF_FILE "
+                                    "without a Markdown link before the first blank line and without a proof_file key.")
+        references = [_marker_path(raw) for raw in marker_lines]
+        if len({_comparable(reference) for reference in references}) != 1:
+            names = ", ".join(dict.fromkeys(references))
+            raise ProofHandoffError(f"The author returned conflicting proof file references ({names}).")
         return references[0]
     if re.match(r"^PROOF_FILE\b", unwrapped):
         raise ProofHandoffError("Use PROOF_FILE: followed by a local proof path.")
@@ -128,7 +215,7 @@ def extract_proof_reference(final_message, *, code_span=True):
     # Existing author messages use these two opening sentences, with optional
     # short summaries afterward. The opening, not the mere presence of a link,
     # must explicitly designate the proof artifact.
-    if len(message) > 1500:
+    if len(message) > POINTER_MAX_CHARS:
         return None
     link = r"\[(?P<label>[^\]\n]+)\]\(\s*(?P<path><[^>\n]+>|[^()\n]+?)\s*\)"
     opening = re.match(
@@ -240,7 +327,7 @@ def _secure_read(workspace, parts, max_bytes, expected_root):
         if before.st_uid != os.geteuid():
             raise ProofHandoffError("The proof must belong to the controller's local user.")
         if before.st_size > max_bytes:
-            raise ProofHandoffError("The proof file exceeds the handoff size limit.")
+            raise ProofTooLarge(before.st_size, max_bytes)
         fd = open_at(parts[-1], parent)
         if _identity(before) != _identity(os.fstat(fd)):
             raise ProofHandoffError("The proof file changed before it could be read.")
@@ -252,7 +339,7 @@ def _secure_read(workspace, parts, max_bytes, expected_root):
             chunks.append(chunk)
             size += len(chunk)
             if size > max_bytes:
-                raise ProofHandoffError("The proof file exceeds the handoff size limit.")
+                raise ProofTooLarge(size, max_bytes)
         if (_identity(before) != _identity(os.fstat(fd))
                 or _identity(before) != _identity(os.stat(parts[-1], dir_fd=parent, follow_symlinks=False))):
             raise ProofHandoffError("The proof file changed while it was read.")
@@ -271,12 +358,23 @@ def resolve_author_proof(final_message, workspace, *, max_bytes=MAX_PROOF_BYTES)
     A pointer written only as an inline-code marker line is honored when its
     file resolves; otherwise the message is reviewed as text, as it was before
     such pointers were recognized, instead of refusing the handoff.
+
+    A complete inline proof that also has plain PROOF_FILE lines is reviewed
+    as text without those lines (an inline snapshot whose receipt says so).
+    When a named file is readable and is not the same proof, the handoff is
+    refused, so that the author says which one it submits.
     """
     if type(max_bytes) is not int or max_bytes < 1:
         raise ProofHandoffError("The proof handoff size limit must be a positive integer.")
     reference = extract_proof_reference(final_message, code_span=False)
     if reference is not None:
+        markers = MARKER_LINE.findall(final_message)
+        if markers and _marker_path(markers[0]) == reference:
+            return _marker_snapshot(markers[0], workspace, max_bytes)
         return _snapshot(reference, workspace, max_bytes)
+    inline = _inline_proof(final_message, workspace, max_bytes)
+    if inline is not None:
+        return inline
     try:
         reference = extract_proof_reference(final_message)
         return None if reference is None else _snapshot(reference, workspace, max_bytes)
@@ -284,8 +382,60 @@ def resolve_author_proof(final_message, workspace, *, max_bytes=MAX_PROOF_BYTES)
         return None
 
 
+def _proof_lines(text):
+    """The lines that carry a proof: blank lines, Markdown headings and spacing do not count."""
+    lines = (" ".join(line.split()) for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    return "\n" + "\n".join(line for line in lines if line and not re.match(r"#{1,6}(?:\s|$)", line)) + "\n"
+
+
+def _inline_proof(final_message, workspace, max_bytes):
+    """A complete inline proof with leftover PROOF_FILE lines, as text without them."""
+    markers = MARKER_LINE.findall(final_message)
+    text = _without_markers(final_message)
+    if not markers or len(text.strip()) <= POINTER_MAX_CHARS:
+        return None
+    for value in dict.fromkeys(markers):
+        try:
+            named = _marker_snapshot(value, workspace, max_bytes)
+        except ProofHandoffError:
+            continue  # No readable file: only the inline proof was submitted.
+        # A title or spacing of its own does not make the file another proof.
+        if _proof_lines(named.text) not in _proof_lines(text):
+            raise ProofHandoffError(
+                f"The response contains a complete proof and also names {named.relative_path} as the proof "
+                "file, and the two differ. Submit one of them: the complete proof without the PROOF_FILE line, "
+                "or only the PROOF_FILE line.")
+    data = text.encode("utf-8")
+    return ProofSnapshot("", text, hashlib.sha256(data).hexdigest(), len(data), removed_marker_lines=len(markers))
+
+
+def _read_problem(error, parts):
+    """Why a proof file could not be read, in plain words and without its content."""
+    if isinstance(error, UnicodeDecodeError):
+        return f"not UTF-8 text at byte {error.start}"
+    if isinstance(error, UnicodeError):
+        return "not UTF-8 text"
+    if isinstance(error, FileNotFoundError):
+        missing = error.filename
+        if parts and missing in parts[:-1]:
+            return f"folder {missing} not found"
+        return "file not found" if parts and missing in (None, parts[-1]) else "author workspace not found"
+    if isinstance(error, PermissionError):
+        return "permission denied"
+    if isinstance(error, NotADirectoryError):
+        return "a folder on its path is not a folder"
+    if isinstance(error, OSError) and error.errno == errno.ELOOP:
+        return "a symbolic link on its path"
+    if isinstance(error, OSError) and error.strerror:
+        return error.strerror[:1].lower() + error.strerror[1:]
+    if isinstance(error, RuntimeError):
+        return "its path could not be resolved"
+    return type(error).__name__
+
+
 def _snapshot(reference, workspace, max_bytes):
     _require_secure_access()
+    parts = ()
     try:
         root = Path(workspace)
         if not root.is_absolute():
@@ -308,5 +458,8 @@ def _snapshot(reference, workspace, max_bytes):
         if not text.strip() or "\x00" in text:
             raise ProofHandoffError("The proof file must contain nonempty UTF-8 text.")
     except (OSError, UnicodeError, RuntimeError) as exc:
-        raise ProofHandoffError("The referenced proof file could not be safely read.") from exc
+        # The name and the cause tell the author what to fix; the content is never shown.
+        name = Path(*parts).as_posix() if parts else reference
+        raise ProofHandoffError(f"The referenced proof file could not be safely read "
+                                f"({name}: {_read_problem(exc, parts)}).") from exc
     return ProofSnapshot(Path(*parts).as_posix(), text, hashlib.sha256(data).hexdigest(), len(data))

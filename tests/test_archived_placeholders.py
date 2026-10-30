@@ -4,6 +4,7 @@ from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_search as hs
 import test_historical_search as fixtures
 from test_historical_search import FakeClient, SOURCE, snapshot
@@ -41,7 +42,7 @@ class PlaceholderTests(unittest.TestCase):
                     item.result(hs.parse_cutoff(fixtures.CUTOFF), 20000, query)
                 self.assertEqual(caught.exception.code, 'unusable_capture')
 
-    def test_cached_placeholder_is_a_miss_but_corrupted_placeholder_is_fatal(self):
+    def test_cached_placeholder_is_a_miss_and_corrupted_placeholder_is_moved_aside(self):
         policy = {'schema_version': 1, 'provider': 'scholarly_wayback',
                   'rate_limit_directory': str(self.root.resolve() / 'pacing'),
                   'solver_workspace': str(self.root.resolve() / 'solver')}
@@ -58,9 +59,9 @@ class PlaceholderTests(unittest.TestCase):
                 engine = self.engine(FakeClient(captures=[older]), policy=policy)
                 stored['memento_datetime'] = 'Fri, 02 Oct 2026 12:00:00 GMT'
                 engine.provider.persistent_cache.put(SOURCE, stored)
-                with self.assertRaises(hs.HistoricalSearchError) as caught:
-                    engine.open(SOURCE)
-                self.assertEqual(caught.exception.code, 'cache_invalid')
+                # A corrupted entry is never used: it is moved aside and fetched again.
+                self.assertEqual(engine.open(SOURCE)['result']['sha256'], older.body_sha256)
+                self.assertTrue(engine.provider.client.calls)
 
     def test_in_memory_placeholder_is_a_miss(self):
         engine = self.engine(FakeClient())

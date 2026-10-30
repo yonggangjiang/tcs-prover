@@ -4,6 +4,10 @@ Only a controller-owned policy can configure the historical MCP server. Native
 search follows the saved run mode and is disabled under a historical policy. An isolation status in JSON is never
 accepted as proof: the exact Codex process must pass configuration and sandbox
 canaries before a model turn is allowed.
+
+A check that could not finish (no connectivity for the controls, a slow or
+exited app-server, unreadable probe output) raises IsolationCheckUnavailable,
+which callers retry; only a proven violation raises RetrievalPolicyError.
 """
 
 from datetime import datetime, timezone
@@ -16,10 +20,12 @@ from pathlib import Path
 import queue
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -42,13 +48,36 @@ SYSTEM_ENV = ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP
 SYSTEM_SKILLS = ("imagegen", "openai-docs", "review-agent", "skill-creator", "skill-installer")
 PROTECTED_DIRECTORIES = (".codex", ".agents", ".git", ".aws")
 PROTECTED_SETTINGS = "job-settings.json"
+# The folder of the user's related works in the author workspace (ui/related_works.FOLDER).
+RELATED_WORKS_FOLDER = "related-works"
 SETTINGS_BOUNDARY_CANARIES = (".retrieval-delete-canary", ".retrieval-rename-canary")
 BENCHMARK_FILES = ("input.md", "draft.md", "checked-statement.md")
 BENCHMARK_DIRECTORIES = ("prompts",)
+# Codex's ":minimal" also grants /tmp and /var/tmp (verified with Codex 0.160), where other runs keep
+# files and live authors download papers: the macOS profile denies both again. (Codex reports
+# "none" as "deny", so the exact value is "deny".)
+SHARED_TEMP_DENIED = {":slash_tmp": "deny", "/private/var/tmp": "deny"}
+# Instead, each macOS process of a run gets a private temp folder of its own (private_temp()):
+# owner-only, made fresh in codex-home/tmp/ of the controller's folder (outside every workspace) and
+# removed when the process ends. It is the process's TMPDIR, which ":tmpdir" lets commands write,
+# and its commands' TMPDIR and TMPPREFIX (where zsh, which runs the model's commands, writes
+# heredocs), set for that process alone by session flags (temp_overrides()) and, since a thread's
+# shell environment replaces them, in the author's thread settings too.
+PRIVATE_TEMP_GRANT = {":tmpdir": "write"}
+PRIVATE_TEMP_FOLDER = "tmp"
+PRIVATE_TEMP_NAME = re.compile(r"(?:author|structured|critic)-(\d+)-[A-Za-z0-9_]{8}\Z")
 PUBLIC_EGRESS_CANARY = ("1.1.1.1", 443)
 WINDOWS_ADAPTER = "codex-windows-mxc-v1"
 MACOS_ADAPTER = "codex-macos-seatbelt-v1"
 SETTINGS_READ_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16)
+BUNDLED_SKILLS_FILE = ".bundled-skills.json"
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+LOGIN_HOME_ENV = "TCS_PROVER_UI_AUTH_HOME"
+BROKER_SERVER_KEYS = frozenset({"command", "args", "required", "env_vars", "tool_timeout_sec", "enabled_tools",
+                                "tools", "startup_timeout_sec"})
+# Critic session folders kept for audit (each attempt makes one); older ones
+# beyond this count are removed once they are a day old.
+CRITIC_SESSIONS_KEPT = 50
 BROKER_MODULES = ('__init__.py', 'historical_transport.py', 'historical_rate_limit.py', 'historical_cache.py',
                   'scholarly_discovery.py', 'historical_codex_discovery.py',
                   'historical_discovery_auth.py')
@@ -64,16 +93,68 @@ class RetrievalPolicyError(RuntimeError):
     """A historical run cannot safely start or continue."""
 
 
+class NeedsAttention(RetrievalPolicyError):
+    """A fixed problem that no retry solves and no isolation check found.
+
+    For example a moved or missing policy, a pinned discovery binary with no
+    verified replacement, or an isolated config holding settings TCS Prover
+    never writes. The controller holds the run and names the problem instead
+    of retrying it every minute.
+    """
+
+
+class IsolationCheckUnavailable(OSError):
+    """An isolation check could not finish, so it proved nothing either way.
+
+    No connectivity for the positive controls, a slow or exited app-server,
+    unreadable probe output, or a native binary missing during an update. Like
+    any OSError it is retried; a proven violation is a RetrievalPolicyError.
+    """
+
+
+class SettingsUnavailable(RetrievalPolicyError):
+    """The saved job settings cannot be read right now (an I/O error or an unfinished write).
+
+    Nothing starts without them; unlike a setting that is wrong, a later
+    attempt may read them, so the caller retries.
+    """
+
+
+def _live_mode():
+    """The live search mode the controller gave this process, or None (historical runs and direct CLI use)."""
+
+    mode = os.environ.get(MODE_ENV)
+    return mode if mode in ("live", "disabled") and not os.environ.get(POLICY_ENV) else None
+
+
+def _cross_check(settings_path):
+    """Saved settings of a live run, read only to confirm it is not historical ({} when unreadable)."""
+
+    try:
+        return _read_saved_settings(settings_path, "Cannot verify saved run retrieval settings.")
+    except RetrievalPolicyError:
+        return {}
+
+
 def search_mode(workspace=None, *, policy=None):
     """Keep a launched job's mode fixed, preserving main's native-search default.
 
-    Historical controller policies always take precedence. A fresh CLI invocation
-    without saved job settings uses native live search, matching the UI default.
+    Historical controller policies always take precedence. A live run trusts
+    the mode its controller supplied and reads job-settings.json only as a
+    cross-check that the run is not historical: an unreadable file does not
+    stop it. A fresh CLI invocation without saved job settings uses native
+    live search, matching the UI default.
     """
     settings_path = Path(workspace or Path.cwd()).resolve() / "job-settings.json"
     saved = None
+    live = None if policy else _live_mode()
     if settings_path.exists() or settings_path.is_symlink():
-        saved = _read_saved_settings(settings_path, "Cannot verify saved run retrieval settings.")
+        saved = (_cross_check(settings_path) if live
+                 else _read_saved_settings(settings_path, "Cannot verify saved run retrieval settings."))
+    if live:
+        if (saved or {}).get("retrievalPolicyPath") or (saved or {}).get("retrievalMode") == "historical":
+            raise RetrievalPolicyError("A live search mode was supplied for a historical run; no model was started.")
+        return live
     if policy or os.environ.get(POLICY_ENV) or (saved or {}).get("retrievalPolicyPath"):
         return "historical"
     inherited = os.environ.get(MODE_ENV)
@@ -122,7 +203,8 @@ def codex_executable(policy, search_path=None):
         if candidate.is_file() and (not macos or _native_macos_binary(candidate)):
             return str(candidate)
     name = "Mach-O codex binary" if macos else "codex.exe"
-    raise RetrievalPolicyError(f"Historical execution requires an absolute native {name} outside the run workspace; script shims are not supported.")
+    # Also seen while Codex updates itself: a later attempt finds it again.
+    raise IsolationCheckUnavailable(f"Historical execution requires an absolute native {name} outside the run workspace; script shims are not supported.")
 
 
 def _native_macos_binary(path):
@@ -153,6 +235,9 @@ def load_policy(path):
     path = _absolute(os.fspath(path), "policy path")
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError as exc:
+        raise NeedsAttention(f"The historical retrieval policy {path} is missing; restore its controller folder "
+                             "or move the checkout back, then resume the run.") from exc
     except (OSError, UnicodeError, ValueError) as exc:
         raise RetrievalPolicyError(f"Cannot read historical retrieval policy: {exc}") from exc
     required = {"schemaVersion", "mode", "runId", "cutoffExclusiveUtc", "broker", "isolation"}
@@ -187,7 +272,9 @@ def load_policy(path):
                              (_absolute(broker["auditLog"], "broker audit log"), "broker audit log")):
         _outside(candidate, workspace, label)
     if not Path(broker["command"]).is_file() or not Path(broker["policyFile"]).is_file():
-        raise RetrievalPolicyError("Historical broker executable or policy file is missing.")
+        missing = broker["command"] if not Path(broker["command"]).is_file() else broker["policyFile"]
+        raise NeedsAttention(f"Historical broker executable or policy file is missing: {missing}. Restore it, "
+                             "then resume the run.")
     try:
         broker_policy = json.loads(Path(broker["policyFile"]).read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, ValueError) as exc:
@@ -211,7 +298,7 @@ def load_policy(path):
         value["broker"] = broker = {**broker, "args": arguments}
     _outside(script, workspace, "broker script")
     if not script.is_file():
-        raise RetrievalPolicyError("Historical broker script is missing.")
+        raise NeedsAttention(f"Historical broker script is missing: {script}. Restore the checkout, then resume the run.")
     value["_path"] = str(path)
     value["_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
     value["_brokerScriptSha256"] = hashlib.sha256(script.read_bytes()).hexdigest()
@@ -237,10 +324,19 @@ def load_policy(path):
         raise RetrievalPolicyError("Historical broker credential environment is not in the audited allowlist.")
     value["_credentialEnv"] = credential_env
     if broker_policy.get('provider') == 'codex_wayback':
-        from retrieval.historical_codex_discovery import validate_settings
+        from retrieval.historical_codex_discovery import DiscoveryError, validate_settings
         from retrieval.historical_transport import HistoricalSearchError
         try:
-            discovery = validate_settings(broker_policy.get('discovery'), workspace=workspace)
+            try:
+                validate_settings(broker_policy.get('discovery'), workspace=workspace)
+            except DiscoveryError as exc:
+                if exc.code != 'discovery_binary':
+                    raise
+                # Only discovery runs this binary: other roles continue, and the
+                # author's preflight re-pins it or holds the run (preflight()).
+                value['_discoveryProblem'] = str(exc)
+                validate_settings(broker_policy.get('discovery'), workspace=workspace, require_binary=False)
+            discovery = dict(broker_policy['discovery'])
         except (HistoricalSearchError, ValueError, OSError) as exc:
             raise RetrievalPolicyError('Historical Codex discovery configuration is invalid.') from exc
         if (Path(discovery['auth_home']) != path.parent / 'discovery-auth'
@@ -271,9 +367,9 @@ def _read_saved_settings(path, error):
             if attempt < len(SETTINGS_READ_RETRY_DELAYS):
                 time.sleep(SETTINGS_READ_RETRY_DELAYS[attempt])
                 continue
-            raise RetrievalPolicyError(error) from exc
+            raise SettingsUnavailable(error) from exc
         except OSError as exc:
-            raise RetrievalPolicyError(error) from exc
+            raise SettingsUnavailable(error) from exc
         if not isinstance(value, dict):
             raise RetrievalPolicyError(error)
         return value
@@ -285,7 +381,9 @@ def policy_for_workspace(workspace=None):
     settings = {}
     settings_path = workspace / "job-settings.json"
     if settings_path.is_file() or settings_path.is_symlink():
-        settings = _read_saved_settings(settings_path, "Cannot verify saved run retrieval settings.")
+        # A live run trusts its controller: an unreadable file is only a skipped cross-check.
+        settings = (_cross_check(settings_path) if _live_mode()
+                    else _read_saved_settings(settings_path, "Cannot verify saved run retrieval settings."))
         if settings.get("launchHold"):
             raise RetrievalPolicyError(f"Run launch is held: {settings['launchHold']}")
     supplied, saved = os.environ.get(POLICY_ENV), settings.get("retrievalPolicyPath")
@@ -316,15 +414,18 @@ def configuration(policy, role):
             "filesystem": {":minimal": "read", ":workspace_roots": {
                 ".": "write" if role == "author" else "read",
                 **{name: "read" for name in PROTECTED_DIRECTORIES},
+                # The user's related works: read-only inputs (a folder run hard-links one copy into every job).
+                RELATED_WORKS_FOLDER: "read",
                 PROTECTED_SETTINGS: "read",
                 **{name: "read" for name in SETTINGS_BOUNDARY_CANARIES},
                 **{name: "read" for name in (*BENCHMARK_FILES, *BENCHMARK_DIRECTORIES)},
-            }},
+            }, **({**SHARED_TEMP_DENIED, **PRIVATE_TEMP_GRANT}
+                  if policy["isolation"]["adapter"] == MACOS_ADAPTER else {})},
             "network": {"enabled": False},
         }},
         "mcp_servers": {},
         "skills": {"config": [{"path": str(role_home(policy, role) / "skills/.system" / name / "SKILL.md"),
-                               "enabled": False} for name in SYSTEM_SKILLS]},
+                               "enabled": False} for name in bundled_skills(policy)]},
     }
     if policy["isolation"]["adapter"] == WINDOWS_ADAPTER:
         config["windows"] = {"sandbox": "mxc"}
@@ -338,6 +439,116 @@ def configuration(policy, role):
             "tools": {name: {"approval_mode": "approve"} for name in BROKER_TOOLS},
         }
     return config
+
+
+def bundled_skills(policy):
+    """System skills to turn off: the known ones and those a Codex update added.
+
+    Codex installs its bundled skills into each home when it starts; a name not
+    yet listed is recorded by verify_rpc() and disabled from the next start.
+    """
+    names = set(SYSTEM_SKILLS)
+    path = Path(policy["isolation"]["codexHome"]) / BUNDLED_SKILLS_FILE
+    try:
+        if not path.is_symlink() and path.is_file() and path.stat().st_size <= 64 * 1024:
+            recorded = json.loads(path.read_text(encoding="utf-8")).get("names")
+            if isinstance(recorded, list):
+                names.update(name for name in recorded if isinstance(name, str) and SKILL_NAME.fullmatch(name))
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        pass
+    return sorted(names)
+
+
+def _record_bundled_skills(policy, names):
+    home = Path(policy["isolation"]["codexHome"])
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = home / f".{BUNDLED_SKILLS_FILE}.{uuid.uuid4().hex}.tmp"
+    try:
+        recorded = (set(bundled_skills(policy)) | set(names)) - set(SYSTEM_SKILLS)
+        temporary.write_text(json.dumps({"schemaVersion": 1, "names": sorted(recorded)}) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(home / BUNDLED_SKILLS_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def controller_audit(policy, event, **fields):
+    """Append one controller record (a migration, a re-pin) to the run's broker audit log.
+
+    Raises IsolationCheckUnavailable when the log refuses it, so the change it
+    records waits for a later attempt instead of happening unrecorded.
+    """
+    try:
+        provider = json.loads(Path(policy["broker"]["policyFile"]).read_text(encoding="utf-8-sig")).get("provider")
+        cutoff = datetime.fromisoformat(policy["cutoffExclusiveUtc"].replace("Z", "+00:00"))
+        record = {"event": event, "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                  "cutoff": cutoff.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                  "provider": provider, "source": "controller", **fields}
+        descriptor = os.open(policy["broker"]["auditLog"], os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except (OSError, UnicodeError, ValueError, KeyError, AttributeError) as exc:
+        raise IsolationCheckUnavailable("The historical audit log did not accept a controller record; "
+                                        "checking again.") from exc
+
+
+def _login_source():
+    """The user's own Codex login, read exactly as the launch preflight reads it."""
+    home = os.environ.get(LOGIN_HOME_ENV) or os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(home).expanduser().resolve() / "auth.json"
+
+
+def _login(path):
+    """(stamp, bytes) of a valid login, or None; never follows links."""
+    from retrieval.historical_discovery_auth import _read_auth
+    try:
+        raw, _ = _read_auth(path)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    try:
+        refreshed = json.loads(raw).get("last_refresh")
+        stamp = datetime.fromisoformat(refreshed.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        stamp = path.stat().st_mtime
+    return stamp, raw
+
+
+def sync_login(policy, targets, source=None):
+    """Give isolated homes the newest valid Codex login before a process starts.
+
+    Candidates are the user's current login (checked as at launch) and each
+    isolated copy; the newest by Codex's ``last_refresh`` wins, so a login the
+    user renewed, or a refresh one role made, reaches the other roles on their
+    next attempt. The user's own file is only read, never written.
+    """
+    homes = [Path(policy["isolation"]["codexHome"]) / role for role in ("author", "structured")]
+    if policy.get("_discoverySettings"):
+        homes.append(Path(policy["_discoverySettings"]["auth_home"]))
+    candidates = [Path(source) if source else _login_source(), *(home / "auth.json" for home in homes)]
+    logins = {path: _login(path) for path in candidates if os.path.lexists(path)}
+    valid = [(login[0], str(path), login[1]) for path, login in logins.items() if login is not None]
+    if not valid:
+        return
+    stamp, _, raw = max(valid)
+    for target in targets:
+        target = Path(target) / "auth.json"
+        current = logins.get(target)
+        if target.is_symlink() or (current is not None and (current[1] == raw or current[0] >= stamp)):
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = target.with_name(f".auth-sync-{uuid.uuid4().hex}.tmp")
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def role_home(policy, role):
@@ -370,13 +581,32 @@ def _critic_paths(policy):
     return session["home"], session["workspace"]
 
 
+def prune_folders(parent, pattern, keep, minimum_age=24 * 3600):
+    """Remove the folders matching ``pattern`` beyond the newest ``keep`` that are older than ``minimum_age`` seconds."""
+
+    try:
+        folders = [path for path in Path(parent).glob(pattern) if path.is_dir() and not path.is_symlink()]
+        folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    cutoff = time.time() - minimum_age
+    for path in folders[keep:]:
+        try:
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
 @contextmanager
 def critic_session(policy):
     """Create one auth-only home and read-only snapshot workspace per attempt.
 
     The caller writes the selected proof/statement snapshots into role_workspace
     before preflight, and keeps this context open until the critic process ends.
-    Sessions remain private on disk for audit; their capability expires on exit.
+    Sessions remain private on disk for audit (the newest CRITIC_SESSIONS_KEPT,
+    and any younger than a day); their capability expires on exit, and the copy
+    of the login is deleted as soon as its refresh is preserved.
     No config, history, skills, project state or ambient credentials are copied.
     """
     from retrieval.historical_discovery_auth import _directory, _read_auth, preserve_refresh
@@ -388,6 +618,12 @@ def critic_session(policy):
         base = Path(verified["isolation"]["codexHome"])
         _directory(base)
         master = None
+        if (base / "structured").is_dir() and not (base / "structured").is_symlink():
+            # The newest login (the user's renewed one, or another role's refresh) first.
+            try:
+                sync_login(verified, [base / "structured"])
+            except OSError:
+                pass  # The existing copy is checked below as before.
         for role in ("structured", "author"):
             candidate_home = base / role
             if not candidate_home.exists() and not candidate_home.is_symlink():
@@ -409,6 +645,7 @@ def critic_session(policy):
         _directory(sessions)
         if os.name != "nt" and sessions.stat().st_mode & 0o077:
             raise ValueError("Critic sessions must be private.")
+        prune_folders(sessions, "session-*", CRITIC_SESSIONS_KEPT)
         marker = uuid.uuid4().hex
         root = sessions / ("session-" + marker)
         home, workspace = root / "home", root / "workspace"
@@ -440,6 +677,11 @@ def critic_session(policy):
             pass
         finally:
             _CRITIC_SESSIONS.pop(marker, None)
+            # The session keeps its record for audit, but no copy of the login.
+            try:
+                (home / "auth.json").unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _toml_value(value):
@@ -544,6 +786,15 @@ def _validate_user_configuration(policy, role, actual, label="Isolated Codex con
     """
     expected = configuration(policy, role)
     refreshed = False
+    skills = actual.get("skills") if isinstance(actual, dict) else None
+    if skills != expected["skills"] and _disabled_system_skills(policy, role, skills):
+        if refresh_environment:
+            # Codex bundled a new skill since this config was written: turn it off too.
+            actual = {**actual, "skills": expected["skills"]}
+            refreshed = True
+        else:
+            # This process started before a newly bundled skill was recorded.
+            expected["skills"] = skills
     if (refresh_environment and isinstance(actual, dict)
             and _system_environment_policy(actual.get("shell_environment_policy"))
             and not _exact_configuration(expected["shell_environment_policy"],
@@ -563,10 +814,80 @@ def _validate_user_configuration(policy, role, actual, label="Isolated Codex con
     if isinstance(actual, dict) and "projects" in actual:
         remaining = {key: value for key, value in actual.items() if key != "projects"}
         if _exact_configuration(expected, remaining):
-            allowed = {str(_project_trust_root(policy, role)): {"trust_level": "trusted"}}
-            if _exact_configuration(allowed, actual["projects"]):
+            if _exact_configuration(_trust_record(policy, role), actual["projects"]):
                 return True
     raise RetrievalPolicyError(f"{label} has changed; re-prepare the run.")
+
+
+def _trust_record(policy, role):
+    """The [projects] table Codex itself writes into a role's config: trust in the run's project.
+
+    Codex 0.160 writes it at an author's thread/start; the next start
+    removes it (_verify_saved_configuration()).
+    """
+    return {str(_project_trust_root(policy, role)): {"trust_level": "trusted"}}
+
+
+def _disabled_system_skills(policy, role, value):
+    """A skills table that only turns off bundled system skills of this role's home."""
+    try:
+        entries = value["config"]
+        if set(value) != {"config"} or not isinstance(entries, list):
+            return False
+        root, names = role_home(policy, role) / "skills/.system", set()
+        for entry in entries:
+            path = Path(entry["path"])
+            if (set(entry) != {"path", "enabled"} or entry["enabled"] is not False or path.name != "SKILL.md"
+                    or path.parent.parent != root or not SKILL_NAME.fullmatch(path.parent.name)):
+                return False
+            names.add(path.parent.name)
+        return names >= set(SYSTEM_SKILLS)
+    except (KeyError, TypeError, AttributeError, RetrievalPolicyError):
+        return False
+
+
+_MISSING = object()
+
+
+def _config_differences(policy, role, actual):
+    """Key paths where a saved config differs from ours, and those a migration may not touch.
+
+    A controller or Codex update adds settings, retires disabled features,
+    changes the bundled-skill list or the broker's timeouts. Any other change
+    (an enabled feature, network, approval, a foreign table) is not migrated.
+    A shell environment of system variables only (a PATH of an earlier
+    controller start) is replaced exactly, and Codex's own trust record of
+    the run's project (_trust_record()) is removed, as at every start.
+    """
+    changed, blocking = [], []
+    saved_shell = actual.get("shell_environment_policy") if isinstance(actual, dict) else None
+    refreshable = _system_environment_policy(saved_shell)
+    try:
+        trusted = isinstance(actual, dict) and _exact_configuration(_trust_record(policy, role), actual.get("projects"))
+    except RetrievalPolicyError:
+        trusted = False  # No verifiable project identity: the table is not Codex's record.
+
+    def walk(want, have, path):
+        if isinstance(want, dict) and isinstance(have, dict):
+            for key in sorted(set(want) | set(have), key=str):
+                walk(want.get(key, _MISSING), have.get(key, _MISSING), (*path, str(key)))
+            return
+        if want is not _MISSING and have is not _MISSING and _exact_configuration(want, have):
+            return
+        name = ".".join(path)
+        changed.append(name)
+        # The shell environment has its own exact refresh (system variables only).
+        shell = path[:1] == ("shell_environment_policy",)
+        added = have is _MISSING and not shell
+        retired = want is _MISSING and len(path) == 2 and path[0] == "features" and have is False
+        tuned = (path[:1] == ("skills",)
+                 or (path[:2] == ("mcp_servers", BROKER_NAME) and len(path) == 3
+                     and path[2] in ("tool_timeout_sec", "startup_timeout_sec")))
+        if not (added or retired or tuned or (shell and refreshable) or (trusted and path == ("projects",))):
+            blocking.append(name)
+
+    walk(configuration(policy, role), actual if isinstance(actual, dict) else {"": actual}, ())
+    return changed, blocking
 
 
 def _verify_saved_configuration(policy, role, config, expected):
@@ -576,8 +897,22 @@ def _verify_saved_configuration(policy, role, config, expected):
     try:
         actual = tomllib.loads(original.decode("utf-8"))
     except (UnicodeError, ValueError) as exc:
-        raise RetrievalPolicyError("Isolated Codex configuration has changed; re-prepare the run.") from exc
-    rewrite = _validate_user_configuration(policy, role, actual, refresh_environment=True)
+        raise NeedsAttention(f"Isolated Codex configuration has changed and cannot be read: {config}. "
+                             "Inspect it, then resume the run.") from exc
+    try:
+        rewrite = _validate_user_configuration(policy, role, actual, refresh_environment=True)
+    except RetrievalPolicyError:
+        changed, blocking = _config_differences(policy, role, actual)
+        if blocking:
+            raise NeedsAttention(f"Isolated Codex configuration has changed in ways TCS Prover does not write "
+                                 f"({', '.join(blocking[:6])}); inspect {config} and remove them, then resume the "
+                                 "run.") from None
+        # Written by an earlier TCS Prover or for an earlier Codex: migrate it,
+        # recorded before the change is made.
+        controller_audit(policy, "isolated_config_migrated", role=role, changed_keys=changed[:64],
+                         previous_sha256=hashlib.sha256(original).hexdigest(),
+                         sha256=hashlib.sha256(expected.encode("utf-8")).hexdigest())
+        rewrite = True
     if not rewrite:
         return
     # Do not carry native auto-trust metadata or an earlier controller PATH into
@@ -595,12 +930,204 @@ def _verify_saved_configuration(policy, role, config, expected):
         temporary.unlink(missing_ok=True)
 
 
-def isolated_environment(policy, role, inherited):
-    """Ignore user runtime overrides; shell children receive no provider secrets."""
+def private_temp(policy, role):
+    """A fresh private temp folder for one macOS process of ``role`` (None for other adapters).
+
+    Owner-only, never a link, made in codex-home/tmp/ of the controller's
+    folder (outside every workspace) and named <role>-<PID>-<8 characters>:
+    first the folders of processes that ended are removed. The caller
+    removes it when its process ends (remove_private_temp()). A folder that
+    cannot be made is checked again; a parent that is a link or another
+    user's is not a controller folder.
+    """
+    if policy["isolation"]["adapter"] != MACOS_ADAPTER:
+        return None
+    parent = Path(policy["isolation"]["codexHome"]) / PRIVATE_TEMP_FOLDER
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RetrievalPolicyError(f"Historical private temp folders need a controller folder {parent}; inspect "
+                                       "and remove it, then resume the run.")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            parent.chmod(0o700)
+        for entry in parent.iterdir():
+            match = PRIVATE_TEMP_NAME.match(entry.name)
+            if not match or int(match.group(1)) == os.getpid():
+                continue
+            try:
+                entry_info = entry.lstat()
+                if stat.S_ISDIR(entry_info.st_mode) and entry_info.st_uid == os.getuid():
+                    os.kill(int(match.group(1)), 0)
+            except ProcessLookupError:
+                shutil.rmtree(entry, ignore_errors=True)  # Its process ended without removing it.
+            except OSError:
+                pass
+        temp = Path(os.path.realpath(tempfile.mkdtemp(prefix=f"{role}-{os.getpid()}-", dir=parent)))
+    except OSError as exc:
+        raise IsolationCheckUnavailable(f"Cannot prepare a private temp folder ({exc}); checking again.") from exc
+    try:
+        _outside(temp, role_workspace(policy, role).resolve(), "private temp folder")
+    except BaseException:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+    return temp
+
+
+def remove_private_temp(policy, environment):
+    """Remove the private temp folder (private_temp()) named by the TMPDIR of a process that ended.
+
+    Nothing else: a live run (no ``policy``) or a path outside codex-home/tmp/
+    of this run's controller folder is left alone.
+    """
+    temp = environment.get("TMPDIR") if policy and isinstance(environment, dict) else None
+    home = (policy.get("isolation") or {}).get("codexHome") if temp else None
+    if not home:
+        return
+    path = Path(temp)
+    parent = Path(os.path.realpath(Path(home) / PRIVATE_TEMP_FOLDER))
+    if path.parent == parent and PRIVATE_TEMP_NAME.match(path.name) and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _verified_private_temp(policy, role, environment):
+    """The private temp folder that the TMPDIR of a macOS process's ``environment`` names (None for other adapters).
+
+    It must be one that private_temp() made for this ``role`` in this
+    process: TMPDIR is its real path in codex-home/tmp/ of the controller's
+    folder, named <role>-<this PID>-<8 characters>, outside the role's
+    workspace (anything else, such as no folder or the folder that holds
+    every process's, is a violation), and on disk a folder of this user
+    that is not a link (a violation too: the grant would follow a link) and
+    is owner-only. Its commands cannot remove, rename or replace it, but
+    they can change its mode (verified with Codex 0.160): a folder that is
+    gone, is no folder or is not owner-only is checked again, and the next
+    process gets a new one.
+    """
+    if policy["isolation"]["adapter"] != MACOS_ADAPTER:
+        return None
+    temp = environment.get("TMPDIR") if isinstance(environment, dict) else None
+    parent = os.path.realpath(Path(policy["isolation"]["codexHome"]) / PRIVATE_TEMP_FOLDER)
+    match = PRIVATE_TEMP_NAME.match(os.path.basename(temp)) if isinstance(temp, str) else None
+    if (not match or os.path.dirname(temp) != parent or not os.path.basename(temp).startswith(f"{role}-")
+            or int(match.group(1)) != os.getpid()):
+        raise RetrievalPolicyError("Historical isolation requires the process's own private temp folder.")
+    path = Path(temp)
+    _outside(path, role_workspace(policy, role).resolve(), "private temp folder")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise IsolationCheckUnavailable(f"The process's private temp folder {path} is gone ({exc}); checking "
+                                        "again.") from exc
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise RetrievalPolicyError(f"Historical isolation requires the process's own private temp folder; {path} is "
+                                   "a link or another user's.")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+        raise IsolationCheckUnavailable(f"The process's private temp folder {path} is no longer an owner-only "
+                                        "folder; checking again.")
+    return path
+
+
+# Codex 0.160's own subagent limits, verified with its binary, `codex debug prompt-input` and `codex exec`
+# against a local stand-in for the model API (no model was started):
+# - features.multi_agent_v2.max_concurrent_threads_per_session: how many agent threads of one session may be
+#   active at once, the root included and subagents of subagents too (models of multi-agent version 2: GPT 6.x,
+#   GPT 5.6 Sol and Terra). 1 refuses every spawn ("collab spawn failed: agent thread limit reached"); a finished
+#   subagent frees its slot. Codex lists its collaboration tools to these models even with multi_agent off.
+# - agents.max_concurrent_threads_per_session (also read as agents.max_threads): how many subagents may be
+#   active at once (models of version 1, such as API models). agents.max_depth = 1 gives their subagents no
+#   subagent tool; version 2 ignores max_depth. Turning multi_agent off removes the version 1 tools.
+# - features.multi_agent_v2.multi_agent_mode_hint_text replaces the delegation hint (the <multi_agent_mode>
+#   developer message) of the root agent and of its subagents.
+def agent_limits(count, hint=""):
+    """The settings that let one Codex process run at most ``count`` subagents at a time (0: none at all).
+
+    None leaves Codex's own defaults (a workflow node that declares no count).
+    """
+    if count is None:
+        return {}
+    multi_agent_v2 = {"max_concurrent_threads_per_session": count + 1}
+    if count and hint:
+        multi_agent_v2["multi_agent_mode_hint_text"] = hint
+    limits = {"features": {"multi_agent_v2": multi_agent_v2}}
+    if count:
+        limits["agents"] = {"max_concurrent_threads_per_session": count, "max_depth": 1}
+    return limits
+
+
+def agent_limit_arguments(limits):
+    """The `-c` flags that apply agent_limits() to one Codex process."""
+
+    def flags(value, prefix):
+        for key, item in value.items():
+            if isinstance(item, dict):
+                yield from flags(item, f"{prefix}{key}.")
+            else:
+                yield from ("-c", f"{prefix}{key}={_toml_value(item)}")
+
+    return list(flags(limits or {}, ""))
+
+
+def _merged(base, extra):
+    """``base`` with the nested tables of ``extra`` merged in (both unchanged)."""
+    result = copy.deepcopy(base)
+    for key, value in (extra or {}).items():
+        result[key] = (_merged(result[key], value) if isinstance(value, dict) and isinstance(result.get(key), dict)
+                       else copy.deepcopy(value))
+    return result
+
+
+def _check_agent_limits(config, limits):
+    """Require exactly the audited subagent limits (agent_limits()) in Codex's effective settings, or none."""
+    expected_v2 = ((limits or {}).get("features") or {}).get("multi_agent_v2")
+    actual_v2 = (config.get("features") or {}).get("multi_agent_v2")
+    if expected_v2 is None:
+        if actual_v2 is not False:
+            raise RetrievalPolicyError("Historical isolation mismatch: config.features.multi_agent_v2.")
+    elif not _exact_configuration({"enabled": False, **expected_v2}, actual_v2):
+        # The generated config turns the feature off; the session flags add exactly these limits.
+        raise RetrievalPolicyError("Historical isolation rejects unexpected subagent limits.")
+    actual_agents = config.get("agents")
+    if isinstance(actual_agents, dict):
+        actual_agents = {key: value for key, value in actual_agents.items() if value is not None}
+    if not _exact_configuration((limits or {}).get("agents") or {}, actual_agents or {}):
+        raise RetrievalPolicyError("Historical isolation rejects inherited agents.")
+
+
+def temp_overrides(policy, environment):
+    """The session settings that give a macOS process's commands its private temp folder ({} without one).
+
+    TMPDIR, and TMPPREFIX for zsh's heredocs, as the TMPDIR of the
+    process's own environment names it (isolated_environment()).
+    """
+    temp = environment.get("TMPDIR") if isinstance(environment, dict) else None
+    if not temp or (policy.get("isolation") or {}).get("adapter") != MACOS_ADAPTER:
+        return {}
+    return {"shell_environment_policy": {"set": {"TMPDIR": temp, "TMPPREFIX": os.path.join(temp, "zsh")}}}
+
+
+def temp_arguments(policy, environment):
+    """The `-c` flags that apply temp_overrides() to one Codex process."""
+    values = temp_overrides(policy, environment).get("shell_environment_policy", {}).get("set", {})
+    return [part for name, value in values.items()
+            for part in ("-c", f"shell_environment_policy.set.{name}={_toml_value(value)}")]
+
+
+def isolated_environment(policy, role, inherited, temp=None):
+    """Ignore user runtime overrides; shell children receive no provider secrets.
+
+    With a private ``temp`` folder (private_temp()) the process's TMPDIR and
+    TMPPREFIX name it: Codex grants it as ":tmpdir" (PRIVATE_TEMP_GRANT).
+    """
     home = role_home(policy, role)
     home.mkdir(parents=True, exist_ok=True)
     role_workspace(policy, role).mkdir(parents=True, exist_ok=True)
     verify_protected_directories(policy, role, create=True)
+    if role in ("author", "structured"):
+        # A renewed or refreshed login reaches this role's next process; the
+        # author also carries discovery's login for the broker it starts.
+        sync_login(policy, [home, *([Path(policy["_discoverySettings"]["auth_home"])]
+                                    if role == "author" and policy.get("_discoverySettings") else [])])
     expected = config_text(policy, role)
     config = home / "config.toml"
     if config.exists() or config.is_symlink():
@@ -610,6 +1137,8 @@ def isolated_environment(policy, role, inherited):
     environment = {key: value for key, value in inherited.items() if key.upper() in {k.upper() for k in SYSTEM_ENV}}
     environment.update(CODEX_HOME=str(home), HOME=str(home), USERPROFILE=str(home),
                        RUST_LOG="error", TCS_PROVER_RETRIEVAL_POLICY=policy["_path"])
+    if temp is not None:
+        environment.update(TMPDIR=str(temp), TMPPREFIX=os.path.join(str(temp), "zsh"))
     # Independent broker discovery is optional and receives its key only in the
     # controller process. shell_environment_policy never passes it to the author.
     credential_env = policy.get("_credentialEnv")
@@ -668,9 +1197,19 @@ def _subset(expected, actual, label="config"):
         raise RetrievalPolicyError(f"Historical isolation mismatch: {label}.")
 
 
-def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
-    """No model calls: inspect effective config and exercise the actual sandbox."""
+def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False, agent_limits=None):
+    """No model calls: inspect effective config and exercise the actual sandbox.
+
+    On macOS the process must have its own private temp folder: its
+    ``environment`` names it (_verified_private_temp()) and its session
+    flags are exactly temp_overrides() (``allow_runtime_overrides``, the
+    author's own app-server, also has its search and feature flags there),
+    plus exactly the subagent limits ``agent_limits`` (agent_limits()), whose
+    values are checked exactly in the effective settings too.
+    """
     workspace = str(role_workspace(policy, role))
+    temp = _verified_private_temp(policy, role, environment)
+    overrides = _merged(temp_overrides(policy, environment), agent_limits)
     verify_protected_directories(policy, role)
     if (hashlib.sha256(Path(policy["_path"]).read_bytes()).hexdigest() != policy["_sha256"]
             or hashlib.sha256(Path(policy["broker"]["args"][0]).read_bytes()).hexdigest() != policy["_brokerScriptSha256"]
@@ -681,9 +1220,12 @@ def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
     result = rpc.call("config/read", {"cwd": workspace, "includeLayers": True})
     config = result.get("config", {})
     expected = configuration(policy, role)
+    if isinstance(config, dict) and _disabled_system_skills(policy, role, config.get("skills")):
+        # This process started before a newly bundled skill was recorded.
+        expected["skills"] = config["skills"]
     if allow_runtime_overrides and (config.get("features") or {}).get("multi_agent") is False:
-        # Reviewer/final stages can remove delegation; critic/author retain
-        # their default subagents with the parent's immutable permissions.
+        # Reviewer, critic and final stages remove delegation; the author retains
+        # its default subagents with the parent's immutable permissions.
         expected["features"]["multi_agent"] = False
     # Codex 0.160 serializes tools.web_search=false as null after normalizing
     # it into the disabled top-level mode. All other values remain exact.
@@ -693,10 +1235,15 @@ def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
         actual_broker = (config.get("mcp_servers") or {}).get(BROKER_NAME) or {}
         if "env_vars" not in actual_broker:
             expected["mcp_servers"][BROKER_NAME].pop("env_vars")
+    # The commands' private temp folder, added by this process's session flags.
+    expected["shell_environment_policy"]["set"].update(overrides.get("shell_environment_policy", {}).get("set", {}))
+    # The subagent limits are checked exactly below (_check_agent_limits).
+    expected["features"].pop("multi_agent_v2")
     _subset(expected, config)
+    _check_agent_limits(config, agent_limits)
     for key in ("sandbox_mode", "sandbox_workspace_write", "instructions", "developer_instructions",
                 "model_instructions_file", "experimental_compact_prompt_file", "compact_prompt",
-                "hooks", "plugins", "marketplaces", "agents", "orchestrator", "notify",
+                "hooks", "plugins", "marketplaces", "orchestrator", "notify",
                 "model_catalog_json", "js_repl_node_module_dirs"):
         if config.get(key):
             raise RetrievalPolicyError(f"Historical isolation rejects inherited {key}.")
@@ -704,7 +1251,9 @@ def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
     if set(actual_servers) != ({BROKER_NAME} if role == "author" else set()):
         raise RetrievalPolicyError("Historical isolation rejects inherited MCP servers.")
     profile = config["permissions"][PROFILE]
-    if set(profile.get("filesystem", {})) - {":minimal", ":workspace_roots", "glob_scan_max_depth"}:
+    # Only the generated entries (their values were compared above), e.g. the /tmp and /var/tmp denials.
+    allowed = set(configuration(policy, role)["permissions"][PROFILE]["filesystem"]) | {"glob_scan_max_depth"}
+    if set(profile.get("filesystem", {})) - allowed:
         raise RetrievalPolicyError("Historical isolation rejects additional filesystem grants.")
     if profile.get("extends") or profile.get("workspace_roots"):
         raise RetrievalPolicyError("Historical isolation rejects inherited permission profiles.")
@@ -715,7 +1264,8 @@ def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
     for layer in result.get("layers") or []:
         source = layer.get("name") or {}
         if (source.get("type") != "user" and layer.get("config")
-                and not (allow_runtime_overrides and source.get("type") == "sessionFlags")):
+                and not (source.get("type") == "sessionFlags"
+                         and (allow_runtime_overrides or _exact_configuration(overrides, layer["config"])))):
             raise RetrievalPolicyError("Historical isolation rejects nonempty inherited configuration layers.")
         if source.get("type") == "user" and Path(source.get("file", "")).resolve() != Path(environment["CODEX_HOME"]) / "config.toml":
             raise RetrievalPolicyError("Historical isolation loaded a different Codex home.")
@@ -727,28 +1277,96 @@ def verify_rpc(rpc, policy, role, environment, allow_runtime_overrides=False):
             raise RetrievalPolicyError(f"Historical isolation is unavailable: Windows sandbox {readiness.get('status', 'unknown')}.")
     servers = rpc.call("mcpServerStatus/list", {})
     if not isinstance(servers.get("data"), list):
-        raise RetrievalPolicyError("Historical isolation cannot verify the MCP inventory.")
+        raise IsolationCheckUnavailable("Historical isolation cannot verify the MCP inventory; checking again.")
     names = {row.get("name") for row in servers.get("data") or []}
     if servers.get("nextCursor") or names != ({BROKER_NAME} if role == "author" else set()):
         raise RetrievalPolicyError("Historical isolation found missing or unexpected live MCP servers.")
     for server in servers.get("data") or []:
+        if (server.get("toolsError") and not server.get("tools") and not server.get("resources")
+                and not server.get("resourceTemplates")):
+            # The broker itself failed to start: nothing extra is exposed.
+            raise IsolationCheckUnavailable("The historical search broker did not start; checking again.")
         if (set(server.get("tools") or {}) != set(BROKER_TOOLS)
                 or server.get("resources") or server.get("resourceTemplates") or server.get("toolsError")):
             raise RetrievalPolicyError("Historical broker has missing or unexpected tools.")
     skills = rpc.call("skills/list", {"cwds": [workspace], "forceReload": True})
     if not isinstance(skills.get("data"), list) or not skills["data"]:
-        raise RetrievalPolicyError("Historical isolation cannot verify the skills inventory.")
+        raise IsolationCheckUnavailable("Historical isolation cannot verify the skills inventory; checking again.")
+    added = set()
     for row in skills.get("data") or []:
-        if row.get("errors") or any(skill.get("enabled") is not False for skill in row.get("skills", [])):
+        if row.get("errors"):
             raise RetrievalPolicyError("Historical isolation rejects enabled or unreadable skills.")
-    _sandbox_canaries(rpc, policy, role)
+        for skill in row.get("skills", []):
+            if skill.get("enabled") is False:
+                continue
+            name = _new_bundled_skill(policy, role, skill)
+            if name is None:
+                raise RetrievalPolicyError("Historical isolation rejects enabled or unreadable skills.")
+            added.add(name)
+    if added:
+        # A Codex update bundled another system skill: record it so the next
+        # start turns it off, and start no model turn with it on.
+        _record_bundled_skills(policy, added)
+        try:
+            controller_audit(policy, "bundled_skill_disabled", role=role, names=sorted(added))
+        except IsolationCheckUnavailable:
+            pass
+        raise IsolationCheckUnavailable(f"Codex added the bundled skill {', '.join(sorted(added))}; it is turned "
+                                        "off before the next start.")
+    _sandbox_canaries(rpc, policy, role, temp)
     if policy["isolation"]["adapter"] == MACOS_ADAPTER:
         _macos_network_canaries(rpc, policy, role)
 
 
-def _sandbox_canaries(rpc, policy, role):
-    """Prove allowed I/O works, external reads fail, and local TCP egress fails."""
+def _new_bundled_skill(policy, role, skill):
+    """The name of an enabled skill Codex bundled into this home and we do not yet disable."""
+    try:
+        path = Path(skill["path"])
+        root = role_home(policy, role) / "skills/.system"
+        if (path.is_absolute() and path.name == "SKILL.md" and path.parent.parent == root
+                and SKILL_NAME.fullmatch(path.parent.name) and path.parent.name not in bundled_skills(policy)):
+            return path.parent.name
+    except (KeyError, TypeError, ValueError, RetrievalPolicyError):
+        pass
+    return None
+
+
+def _canary_verdict(report, expected, label, violation):
+    """Raise for a proven violation; IsolationCheckUnavailable when evidence is missing.
+
+    A denial that did not hold (a write, read or connection that should have
+    failed) is a violation. Malformed output, or a positive control that failed
+    (the sandbox blocked even allowed work), proves nothing either way.
+    """
+    if not isinstance(report, dict) or set(report) != set(expected) or report.get("nonce") != expected["nonce"]:
+        raise IsolationCheckUnavailable(f"{label} returned no valid evidence; checking again.")
+    if any(report[key] is not False for key, value in expected.items() if value is False):
+        raise RetrievalPolicyError(violation)
+    if report != expected:
+        raise IsolationCheckUnavailable(f"{label} could not complete its positive controls; checking again.")
+
+
+def _sandbox_canaries(rpc, policy, role, temp=None):
+    """Prove allowed I/O works, external reads fail, and local TCP egress fails.
+
+    On macOS also that /tmp and /var/tmp can be neither read nor written
+    (SHARED_TEMP_DENIED): the controller puts a file in each, which the
+    command must not read, and the command must not create one there. With
+    the process's private ``temp`` folder (private_temp()), that the command
+    can write a file through its TMPDIR and read it there, that its
+    TMPPREFIX is in it, and that it cannot read a controller file in
+    codex-home/tmp/, the folder that holds the folders of other processes
+    (so a TMPDIR naming that folder, or one that holds it, fails too).
+    """
     nonce = uuid.uuid4().hex
+    macos = policy["isolation"]["adapter"] == MACOS_ADAPTER
+    shared = (("slashTmp", Path("/private/tmp")), ("varTmp", Path("/private/var/tmp"))) if macos else ()
+    shared_temp = [(name, folder / f".retrieval-tmp-canary-{nonce}", folder / f".retrieval-tmp-write-{nonce}")
+                   for name, folder in shared]
+    private = ((Path(temp), Path(temp) / f".retrieval-temp-canary-{nonce}",
+                Path(os.path.realpath(Path(policy["isolation"]["codexHome"]) / PRIVATE_TEMP_FOLDER))
+                / f".retrieval-temp-neighbor-{nonce}") if macos and temp is not None else None)
+    created_shared = []
     outside = Path(policy["_path"]).parent / f".read-canary-{nonce}"
     inside = role_workspace(policy, role) / f".isolation-canary-{nonce}"
     protected = role_workspace(policy, role) / ".codex" / f".isolation-canary-{nonce}"
@@ -761,6 +1379,15 @@ def _sandbox_canaries(rpc, policy, role):
     try:
         outside.write_text(nonce, encoding="utf-8")
         inside.write_text(nonce, encoding="utf-8")
+        for readable in (*(readable for _, readable, _ in shared_temp), *([private[2]] if private else [])):
+            try:
+                descriptor = os.open(readable, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                                     0o600)
+            except OSError as exc:
+                raise IsolationCheckUnavailable(f"Cannot prepare the {readable.parent} canary; checking again.") from exc
+            created_shared.append(readable)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(nonce)
         for sentinel in (delete_canary, rename_canary):
             # Never overwrite an existing path, including a symlink planted in
             # a previously unisolated workspace. Only a plain file left by an
@@ -812,7 +1439,7 @@ def _sandbox_canaries(rpc, policy, role):
         if policy["isolation"]["adapter"] == MACOS_ADAPTER:
             command = _macos_canary_command(
                 nonce, inside, protected, settings, delete_canary, rename_canary,
-                renamed_canary, outside, port,
+                renamed_canary, outside, port, shared_temp, private,
             )
         result = rpc.call("command/exec", {
             "command": command,
@@ -821,10 +1448,23 @@ def _sandbox_canaries(rpc, policy, role):
         try:
             report = json.loads(result.get("stdout", ""))
         except (TypeError, ValueError) as exc:
-            raise RetrievalPolicyError("Historical sandbox canary returned no valid evidence.") from exc
-        _public_network_control()
-        if result.get("exitCode") != 0 or report != {"nonce": nonce, "insideOk": True, "insideWrite": role == "author", "protectedWrite": False, "settingsWrite": False, "settingsDelete": False, "settingsRename": False, "settingsCanariesRead": True, "outsideRead": False, "network": False, "publicNetwork": False}:
-            raise RetrievalPolicyError("Historical sandbox did not enforce workspace I/O, outside-read denial and TCP denial.")
+            raise IsolationCheckUnavailable("Historical sandbox canary returned no valid evidence; checking again.") from exc
+        try:
+            _public_network_control()
+            offline = None
+        except IsolationCheckUnavailable as exc:
+            offline = exc
+        expected = {"nonce": nonce, "insideOk": True, "insideWrite": role == "author", "protectedWrite": False, "settingsWrite": False, "settingsDelete": False, "settingsRename": False, "settingsCanariesRead": True, "outsideRead": False, "network": False, "publicNetwork": False,
+                    **{name + access: False for name, _, _ in shared_temp for access in ("Read", "Write")},
+                    **({"privateTempWrite": True, "privateTempNeighborRead": False} if private else {})}
+        # A denial that did not hold is a violation whatever the connectivity.
+        _canary_verdict(report, expected, "Historical sandbox canary",
+                        "Historical sandbox did not enforce workspace I/O, outside-read denial (including /tmp and "
+                        "/var/tmp and other private temp folders) and TCP denial.")
+        if offline is not None:
+            raise offline
+        if result.get("exitCode") != 0:
+            raise IsolationCheckUnavailable("Historical sandbox canary exited abnormally; checking again.")
     finally:
         listener.close()
         outside.unlink(missing_ok=True)
@@ -833,6 +1473,10 @@ def _sandbox_canaries(rpc, policy, role):
         for sentinel in created_sentinels:
             sentinel.unlink(missing_ok=True)
         renamed_canary.unlink(missing_ok=True)
+        for path in (*created_shared, *(written for _, _, written in shared_temp), *([private[1]] if private else [])):
+            # Only this check's own files: never a link someone else put there.
+            if path.is_file() and not path.is_symlink():
+                path.unlink(missing_ok=True)
 
 
 def _remove_stale_sentinel(path):
@@ -849,11 +1493,16 @@ def _remove_stale_sentinel(path):
 
 
 def _macos_canary_command(nonce, inside, protected, settings, delete_canary,
-                          rename_canary, renamed_canary, outside, port):
+                          rename_canary, renamed_canary, outside, port, shared_temp=(), private=None):
     """Use only Apple system tools, with positive controls for every probe.
 
     No model is involved. Opening settings for append does not write or truncate
     their contents; deletion and rename target disposable protected sentinels.
+    ``shared_temp`` holds (name, a controller file to read, a file to create)
+    for /tmp and /var/tmp, probed as <name>Read and <name>Write. ``private``
+    holds (the private temp folder, a file to create there through $TMPDIR,
+    a controller file in codex-home/tmp/), probed as privateTempWrite and
+    privateTempNeighborRead.
     """
     q = lambda path: shlex.quote(str(path))
     probes = {
@@ -869,6 +1518,15 @@ def _macos_canary_command(nonce, inside, protected, settings, delete_canary,
         "network": f"/usr/bin/nc -z -G 2 -w 2 127.0.0.1 {int(port)}",
         "publicNetwork": f"/usr/bin/nc -z -G 2 -w 2 {q(PUBLIC_EGRESS_CANARY[0])} {int(PUBLIC_EGRESS_CANARY[1])}",
     }
+    for name, readable, written in shared_temp:
+        probes[name + "Read"] = f"/bin/cat {q(readable)}"
+        probes[name + "Write"] = f"printf %s {q(nonce)} > {q(written)}"
+    if private:
+        temp, written, neighbor = private
+        probes["privateTempWrite"] = (f'printf %s {q(nonce)} > "$TMPDIR"/{q(written.name)} && '
+                                      f'test "$(/bin/cat {q(written)})" = {q(nonce)} && '
+                                      f'test "$TMPPREFIX" = {q(temp / "zsh")}')
+        probes["privateTempNeighborRead"] = f"/bin/cat {q(neighbor)}"
     lines = [f"if ( {probe} ) >/dev/null 2>&1; then {key}=true; else {key}=false; fi"
              for key, probe in probes.items()]
     template = json.dumps({"nonce": nonce, **{key: "%s" for key in probes}}, separators=(",", ":"))
@@ -882,7 +1540,9 @@ def _public_network_control():
         with socket.create_connection(PUBLIC_EGRESS_CANARY, timeout=3):
             pass
     except OSError as exc:
-        raise RetrievalPolicyError("Cannot verify public network isolation: controller connectivity canary failed.") from exc
+        # Offline, a VPN switch or a captive portal: denial cannot be shown now.
+        raise IsolationCheckUnavailable("Cannot verify public network isolation: controller connectivity canary "
+                                        "failed; checking again.") from exc
 
 
 @contextmanager
@@ -1016,7 +1676,8 @@ def _network_observer_barrier(port, dns_port):
             if not response.startswith(b'\x01\x02\x81\x83'):
                 raise OSError("UDP observer did not respond")
     except OSError as exc:
-        raise RetrievalPolicyError("Cannot verify macOS egress: network observer stopped responding.") from exc
+        raise IsolationCheckUnavailable("Cannot verify macOS egress: network observer stopped responding; "
+                                        "checking again.") from exc
 
 
 def _macos_network_canaries(rpc, policy, role):
@@ -1046,11 +1707,13 @@ def _macos_network_canaries(rpc, policy, role):
             if positive.returncode or json.loads(positive.stdout) != expected_positive:
                 raise ValueError
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            raise RetrievalPolicyError("Cannot verify macOS egress: network probe positive controls failed.") from exc
+            raise IsolationCheckUnavailable("Cannot verify macOS egress: network probe positive controls failed; "
+                                            "checking again.") from exc
         _network_observer_barrier(port, dns_port)
         before = contacts()
         if not before["tcp"] or not before["udp"]:
-            raise RetrievalPolicyError("Cannot verify macOS egress: local network controls were not observed.")
+            raise IsolationCheckUnavailable("Cannot verify macOS egress: local network controls were not observed; "
+                                            "checking again.")
         result = rpc.call("command/exec", {
             "command": _shell_boolean_report(nonce, {**ready, **probes}),
             "cwd": str(role_workspace(policy, role)), "permissionProfile": PROFILE, "timeoutMs": 10000,
@@ -1059,11 +1722,16 @@ def _macos_network_canaries(rpc, policy, role):
         try:
             report = json.loads(result.get("stdout", ""))
         except (ValueError, TypeError) as exc:
-            raise RetrievalPolicyError("Historical macOS network canaries returned no valid evidence.") from exc
+            raise IsolationCheckUnavailable("Historical macOS network canaries returned no valid evidence; "
+                                            "checking again.") from exc
         _network_observer_barrier(port, dns_port)
         after_barrier = {name: count + 1 for name, count in before.items()}
-        if result.get("exitCode") != 0 or report != expected or contacts() != after_barrier:
+        if contacts() != after_barrier:
             raise RetrievalPolicyError("Historical macOS sandbox did not enforce IP, DNS, proxy and descendant network denial.")
+        _canary_verdict(report, expected, "Historical macOS network canaries",
+                        "Historical macOS sandbox did not enforce IP, DNS, proxy and descendant network denial.")
+        if result.get("exitCode") != 0:
+            raise IsolationCheckUnavailable("Historical macOS network canaries exited abnormally; checking again.")
         return {"networkProbes": {name: "denied" for name in probes},
                 "positiveControls": True, "sandboxToolsReady": True,
                 "unexpectedTcpContacts": 0, "unexpectedUdpContacts": 0}
@@ -1090,19 +1758,63 @@ class _ProbeRPC:
             try:
                 line = self.messages.get(timeout=20)
             except queue.Empty as exc:
-                raise RetrievalPolicyError("Historical isolation preflight timed out.") from exc
+                raise IsolationCheckUnavailable("Historical isolation preflight timed out; checking again.") from exc
             if line is None:
-                raise RetrievalPolicyError("Historical isolation preflight process exited.")
-            message = json.loads(line)
-            if message.get("id") != self.number:
+                raise IsolationCheckUnavailable("Historical isolation preflight process exited; checking again.")
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue  # Not a protocol message (for example a launcher's own output line).
+            if not isinstance(message, dict) or message.get("id") != self.number:
                 continue
             if "error" in message:
-                raise RetrievalPolicyError(f"Historical isolation {method} failed: {message['error']}")
+                raise IsolationCheckUnavailable(f"Historical isolation {method} failed: {message['error']}")
             return message.get("result", {})
 
 
-def preflight(policy, role, executable, inherited):
-    """Return the isolated child env only after real host enforcement passes."""
+def _ensure_discovery_binary(policy, executable):
+    """Re-pin discovery to the installed Codex once the pinned bytes are gone.
+
+    A no-model preflight of the installed binary comes first and the audit log
+    records both hashes. If it fails, the hard link kept at preparation still
+    serves; without one the run needs attention, naming the binary and hash.
+    """
+    from retrieval import historical_codex_discovery as discovery
+    settings, workspace = policy["_discoverySettings"], policy["isolation"]["workspace"]
+    if not discovery.needs_repin(settings, workspace):
+        return
+    record = discovery._repin_record(settings)
+    if record is not None and discovery._usable(record["codex_path"], record["codex_sha256"], workspace):
+        installed = discovery._hash(Path(executable).resolve())
+        if installed == record["codex_sha256"]:
+            return
+    try:
+        record = discovery.repin(settings, executable, workspace)
+    except (discovery.DiscoveryError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        if policy.get("_discoveryProblem"):
+            raise NeedsAttention(policy["_discoveryProblem"] + f" The installed Codex ({executable}) did not pass "
+                                 "the no-model discovery check.") from exc
+        return
+    try:
+        controller_audit(policy, "codex_discovery_repinned", previous_sha256=settings["codex_sha256"],
+                         codex_sha256=record["codex_sha256"])
+    except IsolationCheckUnavailable:
+        # Never leave a re-pin unrecorded: undo it and try again next time.
+        (Path(settings["auth_home"]).parent / discovery.REPIN_RECORD).unlink(missing_ok=True)
+        raise
+    policy.pop("_discoveryProblem", None)
+
+
+def preflight(policy, role, executable, inherited, agent_limits=None):
+    """Return the isolated child env only after real host enforcement passes.
+
+    On macOS the environment names the private temp folder made for the
+    process that uses it (private_temp()), which the check proves; that
+    process's argv adds temp_arguments(), and its caller removes the folder
+    when it ends (remove_private_temp()). A failed check removes it here.
+    The process's subagent limits (``agent_limits``, see agent_limits()) are
+    passed to the checked app-server too and verified exactly.
+    """
     if policy is None:
         return inherited
     adapter = policy["isolation"]["adapter"]
@@ -1111,35 +1823,45 @@ def preflight(policy, role, executable, inherited):
     if adapter == MACOS_ADAPTER and sys.platform != "darwin":
         raise RetrievalPolicyError("Historical isolation adapter requires macOS Seatbelt; no fallback is allowed.")
     if adapter == MACOS_ADAPTER and not _native_macos_binary(Path(executable)):
-        raise RetrievalPolicyError("Historical macOS execution requires a trusted native Mach-O Codex binary.")
+        # Missing while Codex updates itself; a later attempt finds it again.
+        raise IsolationCheckUnavailable("Historical macOS execution requires a trusted native Mach-O Codex binary.")
     if adapter == MACOS_ADAPTER:
         host = Path(executable).resolve().with_name("codex-code-mode-host")
         _outside(host.resolve(), Path(policy["isolation"]["workspace"]).resolve(), "code-mode host")
         _outside(host.resolve(), role_workspace(policy, role).resolve(), "code-mode host")
         if not _native_macos_binary(host):
-            raise RetrievalPolicyError("Historical macOS execution requires the trusted native codex-code-mode-host alongside Codex.")
-    environment = isolated_environment(policy, role, inherited)
-    process = subprocess.Popen(
-        [executable, "--strict-config", "app-server"],
-        cwd=str(role_workspace(policy, role)), env=environment,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, encoding="utf-8", errors="replace", bufsize=1,
-    )
+            raise IsolationCheckUnavailable("Historical macOS execution requires the trusted native codex-code-mode-host alongside Codex.")
+    if role == "author" and policy.get("_discoverySettings"):
+        _ensure_discovery_binary(policy, executable)
+    temp = private_temp(policy, role)
     try:
-        rpc = _ProbeRPC(process)
-        initialized = rpc.call("initialize", {
-            "clientInfo": {"name": "tcs_retrieval_preflight", "version": "1"},
-            "capabilities": {"experimentalApi": True},
-        })
-        if Path(initialized.get("codexHome", "")).resolve() != Path(environment["CODEX_HOME"]).resolve():
-            raise RetrievalPolicyError("Historical preflight loaded a different Codex home.")
-        rpc.send({"method": "initialized", "params": {}})
-        verify_rpc(rpc, policy, role, environment)
-    finally:
-        process.terminate()
+        environment = isolated_environment(policy, role, inherited, temp=temp)
+        process = subprocess.Popen(
+            [executable, "--strict-config", "app-server", *temp_arguments(policy, environment),
+             *agent_limit_arguments(agent_limits)],
+            cwd=str(role_workspace(policy, role)), env=environment,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
         try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            rpc = _ProbeRPC(process)
+            initialized = rpc.call("initialize", {
+                "clientInfo": {"name": "tcs_retrieval_preflight", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            })
+            if Path(initialized.get("codexHome", "")).resolve() != Path(environment["CODEX_HOME"]).resolve():
+                raise RetrievalPolicyError("Historical preflight loaded a different Codex home.")
+            rpc.send({"method": "initialized", "params": {}})
+            verify_rpc(rpc, policy, role, environment, agent_limits=agent_limits)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except BaseException:
+        if temp is not None:
+            remove_private_temp(policy, {"TMPDIR": str(temp)})
+        raise
     return environment

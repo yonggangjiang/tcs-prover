@@ -11,7 +11,9 @@ import threading
 import time
 import unittest
 from unittest import mock
+import uuid
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import claude_cli, providers
 
@@ -50,9 +52,11 @@ def log(record):
 
 secret = SCENARIO.get("secret") or "\0"
 settings_path = option("--settings")
-record = {"event": "start", "argv": argv, "cwd": os.getcwd(), "settings_path": settings_path,
+# The --bare start that checks an API model's configuration folder is logged apart.
+probe = "--bare" in argv and option("--input-format") == "stream-json" and "--no-session-persistence" in argv
+record = {"event": "probe" if probe else "start", "argv": argv, "cwd": os.getcwd(), "settings_path": settings_path,
           "env": {key: value for key, value in os.environ.items()
-                  if key.startswith(("CLAUDE", "ANTHROPIC", "TCS_PROVER", "OPENAI", "CODEX"))},
+                  if key.startswith(("CLAUDE", "ANTHROPIC", "TCS_PROVER", "OPENAI", "CODEX", "SSH_", "GPG_"))},
           "secret_in_env": any(secret in value for value in os.environ.values()),
           "secret_in_argv": any(secret in value for value in argv)}
 if settings_path:
@@ -106,14 +110,27 @@ def result(**fields):
     write(value)
 
 
+unread = bytearray()
+
+
 def read_line(timeout):
-    if not select.select([sys.stdin], [], [], timeout)[0]:
-        return None
-    line = sys.stdin.readline()
-    if not line:
-        return ""
-    log({"event": "input", "message": json.loads(line)})
-    return json.loads(line)
+    # Unbuffered: select() cannot see lines a buffered readline() already took from the pipe.
+    deadline = time.time() + timeout
+    while b"\n" not in unread:
+        remaining = deadline - time.time()
+        if remaining <= 0 or not select.select([sys.stdin], [], [], remaining)[0]:
+            return None
+        chunk = os.read(sys.stdin.fileno(), 65536)
+        if not chunk:
+            if not unread:
+                return ""
+            break
+        unread.extend(chunk)
+    line, _, rest = bytes(unread).partition(b"\n")
+    unread[:] = rest
+    message = json.loads(line.decode("utf-8"))
+    log({"event": "input", "message": message})
+    return message
 
 
 def echo(message):
@@ -212,6 +229,21 @@ def next_turn(default):
 for line in SCENARIO.get("noise", []):
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+if probe:
+    # Like Claude Code: initialize names the output-styles folder of the configuration folder in use; a
+    # launcher that drops CLAUDE_CONFIG_DIR leaves the CLI with $HOME/.claude.
+    message = read_line(30)
+    if message and message.get("type") == "control_request" and not SCENARIO.get("silent_probe"):
+        home = (None if SCENARIO.get("drops_config_dir") else os.environ.get("CLAUDE_CONFIG_DIR")) \
+            or os.path.join(os.environ["HOME"], ".claude")
+        write({"type": "control_response", "response": {"subtype": "success", "request_id": message["request_id"],
+               "response": {"commands": [], "agents": [], "output_style": "default", "account": {},
+                            "user_output_styles_dir": os.path.join(home, "output-styles")}}})
+    read_line(30)
+    sys.exit(0)
+resumed = option("--resume")
+if resumed and SCENARIO.get("transcripts_required") and not os.path.exists(transcript(resumed)):
+    SCENARIO.setdefault("gone_sessions", []).append(resumed)
 if option("--resume") and (option("--resume") in SCENARIO.get("gone_sessions", []) or SCENARIO.get("all_resumes_gone")):
     # Like Claude Code: a missing conversation ends the CLI before it reads any input.
     result(subtype="error_during_execution", is_error=True, result=None, num_turns=0, terminal_reason=None,
@@ -312,6 +344,11 @@ class FakeClaudeCase(unittest.TestCase):
         waits = mock.patch.object(runtime, "MODEL_RETRY_SECONDS", 0)
         waits.start()
         self.addCleanup(waits.stop)
+        # What earlier CLIs of the runner process taught it stays within each test.
+        for name, value in (("DISALLOWED_TOOLS", set()), ("_CONFIG_CHECKS", {}), ("_REFUSALS", {})):
+            remembered = mock.patch.object(claude_cli, name, value)
+            remembered.start()
+            self.addCleanup(remembered.stop)
         # Private settings directories are created here, so checks see only this test.
         private_temp = self.root / "tmp"
         private_temp.mkdir()
@@ -448,14 +485,31 @@ class StructuredTests(FakeClaudeCase):
         sandbox = start["settings"]["sandbox"]
         self.assertEqual((sandbox["enabled"], sandbox["failIfUnavailable"], sandbox["allowUnsandboxedCommands"]),
                          (True, True, False))
-        self.assertEqual(sandbox["network"], {"allowedDomains": [], "strictAllowlist": True})
-        # The store, its staging folder, the private Codex homes and every
-        # settings folder (other runs' too) are hidden from Bash.
+        # A live run (this case's search mode): every host, never a prompt.
+        self.assertEqual(sandbox["network"], {"allowedDomains": ["*"], "strictAllowlist": True})
+        # The store, its staging folder, the private Codex and Claude homes, every
+        # settings folder (other runs' too), the conversation copies, the session tokens,
+        # the lock records, the workflow copies and the installation settings are hidden from Bash.
         hidden = [str(path) for path in providers.private_paths()]
-        self.assertEqual(sandbox["filesystem"], {"denyRead": hidden, "denyWrite": hidden})
+        # On macOS Bash reads only its working directory, its private temp folder (CLAUDE_CODE_TMPDIR,
+        # removed with the settings) and the system; it writes only those two.
+        temp = start["env"]["CLAUDE_CODE_TMPDIR"]
+        self.assertRegex(temp, r"^/tmp/tcs-prover-\d+-\w{8}$")
+        self.assertFalse(os.path.exists(temp))
+        # The checkout and the folder holding the working directory, here outside the home folder.
+        outside = [os.path.realpath(providers.ROOT), os.path.dirname(os.path.realpath(start["cwd"]))]
+        self.assertEqual(sandbox["filesystem"], {
+            "denyRead": [os.path.realpath(Path.home()), "/Volumes", "/private/tmp", "/private/var/tmp",
+                         "/private/var/folders", *dict.fromkeys(outside), *hidden],
+            "allowRead": [os.path.realpath(start["cwd"]), os.path.realpath(temp)],
+            "allowWrite": [os.path.realpath(temp)],
+            "denyWrite": [*hidden, "/tmp/claude", "/private/tmp/claude"]})
         state = providers.state_directory().resolve()
         self.assertEqual(hidden, [str(providers.store_path().resolve()), str(state / ".api-models-staging"),
-                                  str(state / "codex-homes"), str(state / "claude-settings")])
+                                  str(state / "codex-homes"), str(state / "claude-settings"),
+                                  str(state / "claude-homes"), str(state / "claude-transcripts"),
+                                  str(state / "sessions"), str(state / "run-owners"), str(state / "servers"),
+                                  str(state / "last-good-workflows"), str(state / "settings.json")])
         self.assertIn(str(Path(start["settings_path"]).parent.parent.resolve()), hidden)
         self.assertEqual((start["settings_mode"], start["settings_dir_mode"]), ("0o600", "0o700"))
         self.assertNotIn("env", start["settings"])
@@ -506,7 +560,7 @@ class StructuredTests(FakeClaudeCase):
     def test_timeout_stops_the_request(self):
         self.script([["init", {"hang": 30}]])
         started = time.monotonic()
-        with self.assertRaisesRegex(runtime.Error, "did not respond within 1 seconds"):
+        with self.assertRaisesRegex(runtime.Error, "wrote no output for 1 s; the attempt was stopped"):
             runtime.structured("Review.", SCHEMA, "review", model="claude-haiku-5-5", timeout=1, attempts=1)
         self.assertLess(time.monotonic() - started, 20)
 
@@ -516,15 +570,19 @@ class StructuredTests(FakeClaudeCase):
             runtime.structured("Review.", SCHEMA, "review", model="claude-haiku-5-5", attempts=1)
 
     def test_critic_snapshot_runs_in_its_read_only_workspace_without_shell(self):
+        # An independent critic: no subagents (Task), no shell, and only its read-only snapshot.
         self.script([["init", {"structured": {"statement": "S", "notes": ""}}]])
         manifest = json.dumps({"schemaVersion": 1})
         files = (("proof.md", "Proof"), ("statement.md", "Statement"), ("manifest.json", manifest))
-        runtime.structured("Review.", SCHEMA, "critic", model="claude-opus-5-5", features=("multi_agent",), input_files=files)
+        runtime.structured("Review.", SCHEMA, "critic", model="claude-opus-5-5", input_files=files,
+                           request_label="Independent critic audit 1", activity_label="Critic 1 of 3")
         start = self.records("start")[0]
         self.assertEqual(sorted(path.name for path in Path(start["cwd"]).iterdir()), ["manifest.json", "proof.md", "statement.md"])
         argv = start["argv"]
-        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Task,WebSearch,WebFetch")
-        self.assertIn("READ-ONLY PROOF FILES", self.records("stdin")[0]["text"])
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,WebSearch,WebFetch")
+        prompt = self.records("stdin")[0]["text"]
+        self.assertIn("READ-ONLY PROOF FILES", prompt)
+        self.assertNotIn("subagents", prompt)
         shutil.rmtree(start["cwd"])
 
     def test_disabled_search_offers_no_web_tools(self):
@@ -540,7 +598,8 @@ class StructuredTests(FakeClaudeCase):
                 runtime.run_structured_attempt("Review.", SCHEMA, "review", "claude-opus-5-5", "max", "standard", "concise")
         self.assertEqual(self.records(), [])
 
-    def test_anthropic_api_model_uses_bare_mode_and_a_private_gateway_settings_file(self):
+    def test_anthropic_api_model_runs_in_its_private_configuration_folder_with_a_private_gateway_settings_file(self):
+        home = claude_cli.claude_home(self.run_dir, runtime)
         for header, source in (("x-api-key", ""), ("Authorization", "Zephy-TCS-Prover"),
                                ("X-Gateway-Key", "Research client")):
             with self.subTest(header=header, source=source):
@@ -554,10 +613,12 @@ class StructuredTests(FakeClaudeCase):
                     runtime.structured("Review.", SCHEMA, "review", model=model, features=("shell_tool",))
                 start = self.records("start")[0]
                 argv = start["argv"]
-                self.assertIn("--bare", argv)
+                # A --bare start (no login, no request) confirmed that the CLI receives the private
+                # folder, so the model runs without --bare and gets the web tools too.
+                self.assertNotIn("--bare", argv)
                 self.assertEqual(argv[argv.index("--model") + 1], "gateway-claude")
-                self.assertEqual(argv[argv.index("--tools") + 1], "Read,Bash")  # --bare offers no web tools.
-                self.assertIn("Claude API mode tools", self.labels("status"))
+                self.assertEqual(argv[argv.index("--tools") + 1], "Read,Bash,WebSearch,WebFetch")
+                self.assertNotIn("Claude API mode tools", self.labels("status"))
                 self.assertEqual((start["settings_mode"], start["settings_dir_mode"]), ("0o600", "0o700"))
                 gateway = start["settings"]["env"]
                 self.assertEqual(gateway["ANTHROPIC_BASE_URL"], "https://gateway.example.com")
@@ -570,8 +631,10 @@ class StructuredTests(FakeClaudeCase):
                     self.assertEqual(gateway[alias], "gateway-claude")
                 self.assertEqual(gateway["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
                 self.assertTrue(start["settings"]["sandbox"]["enabled"])
-                # API mode keeps no Claude login location at all.
-                self.assertNotIn("CLAUDE_CONFIG_DIR", start["env"])
+                # API mode runs in the run's private configuration folder, never the login folder.
+                self.assertEqual(start["env"]["CLAUDE_CONFIG_DIR"], str(home))
+                self.assertEqual(home.parent, providers.state_directory() / providers.CLAUDE_HOMES)
+                self.assertEqual(oct(home.stat().st_mode & 0o777), "0o700")
                 self.assertNoSecretLeaks()
                 self.assertPrivateFilesRemoved()
 
@@ -726,6 +789,57 @@ class GoalTests(FakeClaudeCase):
         session.close()
         self.assertPrivateFilesRemoved()
 
+    def test_the_author_shell_reads_and_writes_only_its_run_folder_and_private_temp_folder(self):
+        self.script([["init", "echo", complete()]])
+        agents = {"SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.x/Listeners", "SSH_AGENT_PID": "4242",
+                  "GPG_AGENT_INFO": "/Users/u/.gnupg/S.gpg-agent:0:1"}
+        with mock.patch.object(claude_cli, "sandbox_supported", return_value=True), \
+                mock.patch.object(claude_cli.sys, "platform", "darwin"), mock.patch.dict(os.environ, agents):
+            session = self.goal()
+            self.assertEqual(next(session)["outcome"], "done")
+            start = self.records("start")[0]
+            temp = start["env"]["CLAUDE_CODE_TMPDIR"]
+            # Short enough for Claude Code to give Bash $TMPDIR=<temp>/claude-<uid> (at most 44 bytes).
+            self.assertLessEqual(len(os.path.join(temp, f"claude-{os.getuid()}").encode()), 44)
+            self.assertTrue(os.path.isdir(temp))
+            session.close()
+        self.assertFalse(os.path.exists(temp))  # Removed with the settings file.
+        # The CLI and its shell do not learn where the user's SSH and GPG agents listen.
+        self.assertFalse(set(agents) & set(start["env"]))
+        hidden = [str(path) for path in providers.private_paths()]
+        run, temp = os.path.realpath(self.run_dir), os.path.realpath(temp)
+        # The run folder's protected entries stay read-only for the shell, as for the file tools below.
+        protected = [str(self.run_dir / name) for name in (".codex", ".agents", ".git", ".aws", "job-settings.json",
+                                                           "pause.json", "checked-statement.md", "prompts",
+                                                           "related-works")]
+        self.assertEqual(start["settings"]["sandbox"]["filesystem"], {
+            "denyRead": [os.path.realpath(Path.home()), "/Volumes", "/private/tmp", "/private/var/tmp",
+                         "/private/var/folders", os.path.realpath(providers.ROOT), os.path.dirname(run), *hidden],
+            "allowRead": [run, temp], "allowWrite": [temp],
+            "denyWrite": [*hidden, *protected, "/tmp/claude", "/private/tmp/claude"]})
+        # Named by the run folder's real path, so entries of these names deeper in it stay writable as for Bash.
+        self.assertEqual(start["settings"]["permissions"]["deny"], [
+            f"Edit(/{run}/.codex)", f"Edit(/{run}/.codex/**)", f"Edit(/{run}/.agents)", f"Edit(/{run}/.agents/**)",
+            f"Edit(/{run}/.git)", f"Edit(/{run}/.git/**)", f"Edit(/{run}/.aws)", f"Edit(/{run}/.aws/**)",
+            f"Edit(/{run}/job-settings.json)", f"Edit(/{run}/pause.json)", f"Edit(/{run}/checked-statement.md)",
+            f"Edit(/{run}/prompts)", f"Edit(/{run}/prompts/**)", f"Edit(/{run}/related-works)",
+            f"Edit(/{run}/related-works/**)"])
+        # Everything else in the run folder stays writable: the proof, notes, new folders.
+        argv = start["argv"]
+        self.assertIn("Edit(./**)", argv[argv.index("--allowedTools") + 1].split(","))
+        # Other platforms keep Claude's default reads, without a private temp folder.
+        self.script([["init", "echo", complete()]])
+        with mock.patch.object(claude_cli, "sandbox_supported", return_value=True), \
+                mock.patch.object(claude_cli.sys, "platform", "linux"):
+            session = self.goal()
+            self.assertEqual(next(session)["outcome"], "done")
+            session.close()
+        start = self.records("start")[-1]
+        self.assertNotIn("CLAUDE_CODE_TMPDIR", start["env"])
+        self.assertEqual(start["settings"]["sandbox"]["filesystem"],
+                         {"denyRead": hidden, "denyWrite": [*hidden, *protected]})
+        self.assertEqual(len(start["settings"]["permissions"]["deny"]), 15)
+
     def test_in_progress_turn_is_continued_until_complete(self):
         self.script([["init", "echo", in_progress("Outlined the approach.")], ["init", "echo", complete("Inline proof")]])
         session = self.goal()
@@ -793,7 +907,7 @@ class GoalTests(FakeClaudeCase):
         self.assertEqual((paused.exception.reason, paused.exception.thread_id), ("", thread))
         self.assertEqual([message["request"]["subtype"] for message in self.inputs("control_request")][:1], ["interrupt"])
         status = [event for event in self.events if event.get("label") == "Author paused"]
-        self.assertEqual(status[0]["text"], "Author paused at the current turn boundary.")
+        self.assertEqual(status[0]["text"], "Author paused; its current turn was interrupted.")
         turn = [event["event"] for event in self.events if event["kind"] == "codex_event"
                 and event["event"].get("method") == "turn/completed"]
         self.assertEqual(turn[-1]["params"]["turn"]["status"], "interrupted")
@@ -825,35 +939,120 @@ class GoalTests(FakeClaudeCase):
         resumed = next(event for event in self.events if event.get("label") == "Goal resumed")
         self.assertEqual(resumed["threadId"], thread)
 
-    def test_missing_saved_session_starts_a_new_one_unless_resume_is_required(self):
-        thread = "123e4567-e89b-42d3-a456-426614174000"
-        self.script([["init", "echo", complete()]], missing_sessions=[thread])
-        session = self.goal(goal_thread_id=thread)
-        self.assertEqual(next(session)["outcome"], "done")
-        starts = self.records("start")
-        self.assertEqual(len(starts), 2)
-        self.assertIn("--resume", starts[0]["argv"])
-        self.assertIn("--session-id", starts[1]["argv"])
-        diagnostic = next(event["text"] for event in self.events if event["kind"] == "diagnostic")
-        self.assertTrue(diagnostic.startswith("Saved session unavailable; starting a new session"), diagnostic)
-        self.assertIn("No conversation found", diagnostic)
-        self.assertIn("Goal started", self.labels("status"))
+    def test_goal_reanchor_sends_the_full_resume_prompt_to_a_resumed_session(self):
+        """After a conversation turn compacted the context, a resumed session gets the resume prompt, not reopen."""
+        prompts = {**PROMPTS, "reopen": "Continue the same goal in this session."}
+        resume = PROMPTS["resume"].format(directory=self.run_dir, original_prompt="Prove S exactly.")
+        repair = "Revision 1; critic round 2: Gap\nCandidate: Proof"
+        for options, expected in (({"goal_reanchor": True}, resume + "\n\n" + repair),
+                                  ({}, prompts["reopen"] + "\n\n" + repair)):
+            with self.subTest(options=options):
+                self.log.unlink(missing_ok=True)
+                thread = str(uuid.uuid4())
+                self.script([["init", "echo", complete()]])
+                session = claude_cli.goal_session(
+                    runtime, "Prove S exactly.", prompts=prompts, initial_instruction=repair,
+                    settings={"model": "claude-opus-5-5", "effort": "max", "speed": "standard", "summary": "concise"},
+                    options={"goal_cwd": str(self.run_dir), "goal_thread_id": thread, "goal_resume": True,
+                             "goal_require_resume": True, **options}, features=[])
+                self.addCleanup(session.close)
+                self.assertEqual(next(session)["outcome"], "done")
+                self.assertEqual(self.texts(), [expected])
+                self.assertEqual([start["argv"][:2] for start in self.records("start")], [["--resume", thread]])
 
+    def handoff_session(self, note, initial_instruction="", prompts=PROMPTS, **options):
+        session = claude_cli.goal_session(
+            runtime, "Prove S exactly.", prompts=prompts, initial_instruction=initial_instruction, handoff_note=note,
+            settings={"model": "claude-opus-5-5", "effort": "max", "speed": "standard", "summary": "concise"},
+            options={"goal_cwd": str(self.run_dir), **options}, features=[])
+        self.addCleanup(session.close)
+        return session
+
+    def replaced_start(self):
+        """What the "Conversation replaced" notice says the new conversation starts from."""
+        text = next(event["text"] for event in self.events if event.get("label") == "Conversation replaced")
+        return text[text.index("It starts from"):]
+
+    def test_a_refused_submission_is_explained_after_any_critic_feedback_in_a_resumed_session(self):
+        """The controller's note on a refused submission travels apart from the critic's feedback, as with Codex."""
+        prompts = {**PROMPTS, "reopen": "Continue the same goal in this session."}
+        note = "Your last submission was not handed to the critic: proof.md: file not found."
+        repair = "Revision 1; critic round 2: Gap\nCandidate: Proof"
+        for received, initial, expected in ((False, "", prompts["reopen"] + "\n\n" + note),
+                                            (False, repair, prompts["reopen"] + "\n\n" + repair + "\n\n" + note),
+                                            # Feedback the session already received is not sent again; the note is.
+                                            (True, repair, prompts["reopen"] + "\n\n" + note)):
+            with self.subTest(received=received, initial=initial):
+                self.log.unlink(missing_ok=True)
+                self.events.clear()
+                thread = str(uuid.uuid4())
+                delivered = {"thread": thread, "digest": runtime._repair_digest(repair)}
+                self.script([["init", "echo", complete()]])
+                session = self.handoff_session(note, initial, prompts, goal_thread_id=thread, goal_resume=True,
+                                               goal_require_resume=True,
+                                               **({"author_repair_delivered": delivered} if received else {}))
+                self.assertEqual(next(session)["outcome"], "done")
+                self.assertEqual(self.texts(), [expected])
+                # Only the critic's feedback is recorded as delivered: the note is never taken for it.
+                self.assertEqual([event["repairDelivered"] for event in self.events
+                                  if event.get("label") == "Critic feedback delivered"],
+                                 [delivered["digest"]] if repair in expected else [])
+
+    def test_a_new_conversation_is_told_too_and_the_note_ends_with_the_next_submission(self):
+        note = "Your last submission was not handed to the critic: proof.md: file not found."
+        thread = "123e4567-e89b-42d3-a456-426614174000"
+        resume = PROMPTS["resume"].format(directory=self.run_dir, original_prompt="Prove S exactly.")
+        repair = "Revision 1; critic round 1: Lemma 2 fails.\nCandidate: First proof"
+        # Claude no longer has the saved session: the new conversation starts from the resume prompt and the note.
+        self.script([["init", "echo", complete("First proof")], ["init", "echo", complete("Repaired proof")]],
+                    missing_sessions=[thread])
+        session = self.handoff_session(note, goal_thread_id=thread, goal_resume=True, goal_require_resume=True)
+        self.assertEqual(next(session)["output"], "First proof")
+        self.assertEqual(self.replaced_start(), "It starts from the resume prompt, then the note on why its last "
+                                                "submission was refused; the time budget continues.")
+        # The repair after the next submission's rejection has the critic's feedback only.
+        self.assertEqual(session.send({"solution": "First proof", "bugs": "Lemma 2 fails.", "round": 1})["output"],
+                         "Repaired proof")
+        self.assertEqual(self.texts(), [resume + "\n\n" + note, resume + "\n\n" + note, repair])
+        # A conversation replaced after that submission starts from the resume prompt and the repair alone.
         self.log.unlink()
         self.events.clear()
-        self.script([], missing_sessions=[thread])
-        required = self.goal(goal_thread_id=thread, goal_require_resume=True)
-        with self.assertRaises(runtime.WorkflowPaused) as paused:
-            next(required)
-        self.assertIn("Could not resume the saved Claude conversation; no replacement was started.", paused.exception.reason)
-        self.assertEqual(len(self.records("start")), 1)
+        self.script([["init", "echo", complete("First proof"), {"exit": 0}],
+                     ["init", "echo", complete("Repaired proof")]], all_resumes_gone=True)
+        session = self.handoff_session(note)
+        self.assertEqual(next(session)["output"], "First proof")
+        self.assertEqual(session.send({"solution": "First proof", "bugs": "Lemma 2 fails.", "round": 1})["output"],
+                         "Repaired proof")
+        self.assertEqual(self.replaced_start(), "It starts from the resume prompt and the critic's last report; the "
+                                                "time budget continues.")
+        self.assertEqual((self.texts()[0], self.texts()[-1]), ("Prove S exactly.\n\n" + note, f"{resume}\n\n{repair}"))
 
-    def test_required_resume_without_a_saved_session_fails_before_launch(self):
-        self.script([])
-        with self.assertRaises(runtime.WorkflowPaused) as paused:
-            next(self.goal(goal_require_resume=True))
-        self.assertIn("saved Claude session ID is missing", paused.exception.reason)
-        self.assertEqual(self.records(), [])
+    def test_a_missing_saved_session_is_replaced_by_a_new_one_also_when_resume_is_required(self):
+        thread = "123e4567-e89b-42d3-a456-426614174000"
+        for options in ({}, {"goal_require_resume": True}):
+            with self.subTest(options=options):
+                self.log.unlink(missing_ok=True)
+                self.events.clear()
+                self.script([["init", "echo", complete()]], missing_sessions=[thread])
+                session = self.goal(goal_thread_id=thread, **options)
+                self.assertEqual(next(session)["outcome"], "done")
+                starts = self.records("start")
+                self.assertEqual(len(starts), 2)
+                self.assertIn("--resume", starts[0]["argv"])
+                self.assertIn("--session-id", starts[1]["argv"])
+                replaced = next(event for event in self.events if event.get("label") == "Conversation replaced")
+                self.assertIn("(it no longer has it)", replaced["text"])
+                self.assertEqual(replaced["replacedThreadId"], thread)
+                self.assertIn("Goal started", self.labels("status"))
+                session.close()
+
+    def test_required_resume_without_a_saved_session_continues_in_a_new_conversation(self):
+        self.script([["init", "echo", complete()]])
+        self.assertEqual(next(self.goal(goal_require_resume=True, goal_resume=True))["outcome"], "done")
+        self.assertEqual(["--session-id" in start["argv"] for start in self.records("start")], [True])
+        replaced = next(event for event in self.events if event.get("label") == "Conversation replaced")
+        self.assertIn("(the saved session ID is missing)", replaced["text"])
+        self.assertEqual(self.texts(), [PROMPTS["resume"].format(directory=self.run_dir, original_prompt="Prove S exactly.")])
 
     def test_time_limit_interrupts_and_pauses_with_its_reason(self):
         deadline = time.monotonic() + 1.5
@@ -910,12 +1109,10 @@ class GoalTests(FakeClaudeCase):
             self.assertEqual(next(session)["outcome"], "done")
         starts = self.records("start")
         self.assertEqual(["--resume" in start["argv"] for start in starts], [True, False])
-        diagnostic = next(event["text"] for event in self.events if event["kind"] == "diagnostic")
-        self.assertTrue(diagnostic.startswith("Saved session unavailable; starting a new session"), diagnostic)
         # The attempt Claude never confirmed published no prompt and no turn;
-        # the new session's status comes first, as with Codex.
+        # after the notice the new session's status comes first, as with Codex.
         labels = [event.get("label") for event in self.events if event["kind"] in {"status", "request"}]
-        self.assertEqual(labels[:2], ["Goal started", "Exact solve input"])
+        self.assertEqual(labels[:3], ["Conversation replaced", "Goal started", "Exact solve input"])
         self.assertEqual(labels.count("Exact solve input"), 1)
         self.assertEqual(self.turns(), [("started", 1), ("completed", 1)])
 
@@ -928,8 +1125,11 @@ class GoalTests(FakeClaudeCase):
         self.assertEqual(repaired["output"], "Repaired proof")
         argvs = [start["argv"] for start in self.records("start")]
         self.assertEqual(["--resume" in argv for argv in argvs], [False, True, False])
+        # Claude no longer had the conversation: the new one gets the resume prompt and the repair.
         repair = "Revision 1; critic round 1: Lemma 2 fails.\nCandidate: First proof"
-        self.assertEqual(self.texts()[-1], repair)
+        resume = PROMPTS["resume"].format(directory=self.run_dir, original_prompt="Prove S exactly.")
+        self.assertEqual(self.texts()[-1], f"{resume}\n\n{repair}")
+        self.assertIn("Conversation replaced", self.labels("status"))
         self.assertIn("The Claude CLI exited between turns; resuming its saved session.",
                       [event.get("text") for event in self.events if event["kind"] == "diagnostic"])
 
@@ -969,16 +1169,14 @@ class GoalTests(FakeClaudeCase):
         self.assertEqual(self.turns(), [("started", 1), ("completed", 1), ("started", 2), ("interrupted", 2),
                                         ("started", 3), ("completed", 3)])
 
-    def test_required_resume_of_a_gone_conversation_pauses_without_automatic_retry(self):
+    def test_required_resume_of_a_gone_conversation_continues_in_a_new_one_without_waiting(self):
         thread = "123e4567-e89b-42d3-a456-426614174000"
-        self.script([], gone_sessions=[thread])
-        with self.assertRaises(runtime.WorkflowPaused) as paused:
-            next(self.goal(goal_thread_id=thread, goal_resume=True, goal_require_resume=True))
-        self.assertTrue(paused.exception.session_unavailable)
-        self.assertIn("No conversation found with session ID", paused.exception.reason)
-        self.assertIn("cleanupPeriodDays", paused.exception.reason)
-        self.assertIn("Choose Continue proof author", paused.exception.reason)
-        self.assertNotIn("Exact solve input", self.labels("request"))
+        self.script([["init", "echo", complete()]], gone_sessions=[thread])
+        self.assertEqual(next(self.goal(goal_thread_id=thread, goal_resume=True, goal_require_resume=True))["outcome"],
+                         "done")
+        self.assertEqual(["--resume" in start["argv"] for start in self.records("start")], [True, False])
+        self.assertEqual(self.labels("status")[:2], ["Conversation replaced", "Goal started"])
+        self.assertEqual(self.labels("request"), ["Exact solve input"])
 
     def test_a_live_instruction_that_misses_its_turn_is_never_sent_during_review(self):
         released = threading.Event()
@@ -1066,22 +1264,37 @@ class GoalTests(FakeClaudeCase):
             next(self.goal())
         self.assertIn("unexpected tools (RemoteTrigger)", paused.exception.reason)
 
-    def test_anthropic_api_author_runs_bare_with_the_key_only_in_the_private_settings(self):
-        model = self.api_model("Authorization")
-        self.script([["init", "echo", complete()]])
-        with mock.patch.object(claude_cli, "sandbox_supported", return_value=True):
-            session = self.goal(model=model)
-            next(session)
-        start = self.records("start")[0]
-        argv = start["argv"]
-        self.assertIn("--bare", argv)
-        self.assertEqual(argv[argv.index("--tools") + 1], "Bash,Read,Edit")
-        self.assertEqual(start["settings"]["env"]["ANTHROPIC_AUTH_TOKEN"], SECRET)
-        self.assertEqual(start["settings_mode"], "0o600")
-        self.assertIn("Claude API mode tools", self.labels("status"))
-        session.close()
-        self.assertNoSecretLeaks()
-        self.assertPrivateFilesRemoved()
+    def test_anthropic_api_author_gets_every_tool_with_the_key_only_in_the_private_settings(self):
+        # A model saved before connections existed, and one chosen from a connection's discovered models.
+        connection = providers.save_api_connection(
+            {"format": "anthropic", "baseUrl": "https://gateway.example.com/v1", "apiKey": SECRET,
+             "label": "Gateway connection"}, [{"id": "gateway-claude-2", "label": "Gateway Claude 2"}])
+        for model, wire in ((self.api_model("Authorization"), "gateway-claude"),
+                            (connection["models"][0]["modelId"], "gateway-claude-2")):
+            with self.subTest(model=model):
+                self.log.unlink(missing_ok=True)
+                self.events.clear()
+                self.script([["init", "echo", complete()]])
+                with mock.patch.object(claude_cli, "sandbox_supported", return_value=True):
+                    session = self.goal(model=model)
+                    next(session)
+                start = self.records("start")[0]
+                argv = start["argv"]
+                self.assertNotIn("--bare", argv)
+                self.assertEqual(argv[argv.index("--model") + 1], wire)
+                self.assertEqual(argv[argv.index("--tools") + 1],
+                                 "Task,Bash,Read,Write,Edit,TodoWrite,WebSearch,WebFetch")
+                self.assertEqual(start["env"]["CLAUDE_CONFIG_DIR"], str(claude_cli.claude_home(self.run_dir, runtime)))
+                # The protocol fixes the authentication: the key travels only as x-api-key, also for a
+                # model saved with an Authorization header.
+                gateway = start["settings"]["env"]
+                self.assertEqual(gateway["ANTHROPIC_API_KEY"], SECRET)
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", gateway)
+                self.assertEqual(start["settings_mode"], "0o600")
+                self.assertNotIn("Claude API mode tools", self.labels("status"))
+                session.close()
+                self.assertNoSecretLeaks()
+                self.assertPrivateFilesRemoved()
 
     def short_key_model(self, key):
         # Registered keys are process-wide: keep this test's short key out of later tests.
@@ -1160,6 +1373,22 @@ class GoalTests(FakeClaudeCase):
             state = runtime._execute(workflow, {"input": "x"}, {"author_model": "claude-sonnet-5-5"}, workflow["prompts"])
         self.assertEqual((state["output"], calls), ("Complete", ["claude-sonnet-5-5"]))
 
+    def test_the_workflow_tells_a_resumed_claude_author_why_its_last_submission_was_refused(self):
+        """The real Claude goal session behind _execute, with the built-in prompts."""
+        workflow = runtime.builtin_workflow("author_critic")
+        prompts = workflow["prompts"]
+        reason = "Cannot hand the submitted proof to the critic: (proof.md: file not found)."
+        thread = str(uuid.uuid4())
+        self.script([["init", "echo", complete("A complete inline proof.")]])
+        with mock.patch.object(runtime, "goal_session", side_effect=AssertionError("Codex session started")):
+            state = runtime._execute(workflow, {"statement": "Exact statement S.", "handoff_refused": reason}, {
+                "author_model": "claude-opus-5-5", "goal_cwd": str(self.run_dir), "goal_thread_id": thread,
+                "goal_resume": True, "goal_require_resume": True,
+                "workflow_stages": {"review": False, "author": True, "critic": False, "writing": False}}, prompts)
+        self.assertEqual(self.texts(), [prompts["reopen"] + "\n\n"
+                                        + runtime.render_template(prompts["handoff_refused"], {"reason": reason})])
+        self.assertEqual((state["output"], "handoff_refused" in state), ("A complete inline proof.", False))
+
 
 class TranslatorTests(unittest.TestCase):
     def test_tool_kinds_and_styles_match_the_ui_renderer(self):
@@ -1234,10 +1463,15 @@ class TranslatorTests(unittest.TestCase):
         subscription = claude_cli.child_environment(base, "high", api=False)
         self.assertEqual({key for key in subscription if key.startswith(("CLAUDE", "ANTHROPIC"))},
                          {"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_EFFORT_LEVEL",
-                          "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"})
+                          "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                          "CLAUDE_CODE_RETRY_WATCHDOG"})
         api = claude_cli.child_environment(base, "high", api=True)
         self.assertNotIn("CLAUDE_CONFIG_DIR", api)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", api)
+        # An API model's own configuration folder replaces the login folder.
+        private = claude_cli.child_environment(base, "high", api=True, config=Path("/private/home"))
+        self.assertEqual(private["CLAUDE_CONFIG_DIR"], str(Path("/private/home")))
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", private)
 
 
 class PrivateSettingsTests(unittest.TestCase):

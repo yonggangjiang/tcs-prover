@@ -4,10 +4,15 @@ Live results, reasoning and diagnostics stay in controller-owned traces. A
 completed native web-search call is required. Candidate URLs must occur in its
 actual result rows; model suggestions outside that set are discarded. These
 URLs remain untrusted until the broker independently verifies their archives.
+
+The pinned native binary is used only while its bytes match the policy. After a
+Codex update replaces or removes it, discovery uses the binary that the
+controller re-pinned after a no-model preflight (``discovery-codex.json``), else
+a hard link to the pinned bytes kept at preparation (``discovery-codex/``).
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -15,6 +20,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -42,15 +48,29 @@ SYSTEM_SKILLS = ('imagegen', 'openai-docs', 'review-agent', 'skill-creator', 'sk
 MAX_AUTH_BYTES = 1024 * 1024
 MAX_TRACE_BYTES = 16 * 1024 * 1024
 MAX_FINAL_BYTES = 1024 * 1024
+MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+UNAVAILABLE_MODEL_WORDS = ('not supported', 'not found', 'does not exist', 'not available', 'unsupported',
+                           'no access', 'do not have access', 'unknown model', 'deprecated', 'retired')
+BINARY_STORE = 'discovery-codex'
+REPIN_RECORD = 'discovery-codex.json'
+# Discovery folders kept as evidence (one per search); older ones beyond this
+# count are removed once they are a day old. The audit log keeps their hashes.
+DISCOVERIES_KEPT = 200
 
 
 class DiscoveryError(ValueError):
-    """Content-free failure safe to classify in the broker's audit log."""
+    """Content-free failure safe to classify in the broker's audit log.
 
-    def __init__(self, *, timeout=False):
-        self.code = 'discovery_timeout' if timeout else 'discovery_unavailable'
+    ``binary`` marks a pinned executable that no longer matches, with no
+    verified replacement; ``model_unavailable`` a model the account cannot use.
+    """
+
+    def __init__(self, *, timeout=False, model_unavailable=False, binary=None):
+        self.code = ('discovery_timeout' if timeout else 'discovery_model_unavailable' if model_unavailable
+                     else 'discovery_binary' if binary else 'discovery_unavailable')
         super().__init__('Protected web discovery timed out.' if timeout else
-                         'Protected web discovery is unavailable.')
+                         'Protected web discovery model is unavailable.' if model_unavailable else
+                         binary if binary else 'Protected web discovery is unavailable.')
 
 
 def _path(value):
@@ -92,20 +112,110 @@ def build_settings(codex_path, auth_home, state_root, model, timeout_seconds=120
                               'model': model, 'timeout_seconds': timeout_seconds})
 
 
-def validate_settings(settings, workspace=None):
-    """Read-only validation; preparation may precede credential provisioning."""
+def _controller(settings):
+    """The controller folder owning this discovery's auth home (its parent)."""
+    return Path(settings['auth_home']).parent
+
+
+def _usable(path, digest, workspace):
+    """Whether this exact native binary may run discovery."""
+    try:
+        path = _path(str(path))
+        _native(path)
+        if workspace is not None:
+            solver = Path(workspace).resolve()
+            if path == solver or solver in path.parents:
+                return False
+        return _hash(path) == digest
+    except (OSError, DiscoveryError):
+        return False
+
+
+def _repin_record(settings):
+    """The controller's audited replacement for a changed pinned binary, if valid."""
+    path = _controller(settings) / REPIN_RECORD
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
+            return None
+        if os.name != 'nt' and path.stat().st_mode & 0o022:
+            return None
+        value = _json(path.read_bytes())
+        if (not isinstance(value, dict) or value.get('schemaVersion') != 1
+                or value.get('pinnedSha256') != settings['codex_sha256']
+                or not isinstance(value.get('codex_path'), str)
+                or not isinstance(value.get('codex_sha256'), str)
+                or not re.fullmatch('[0-9a-f]{64}', value['codex_sha256'])):
+            return None
+        return value
+    except (OSError, ValueError):
+        return None
+
+
+def kept_binary(settings, digest=None):
+    """The hard link to pinned bytes that preparation kept, for ``digest``."""
+    return _controller(settings) / BINARY_STORE / (digest or settings['codex_sha256']) / 'codex'
+
+
+def keep_binary(settings, source=None, digest=None):
+    """Hard-link the native binary (and its code-mode host) beside the controller.
+
+    The link keeps the exact bytes after an update deletes or replaces the
+    original path. Linking fails across volumes; then nothing is kept and a
+    later update needs a re-pin. Returns the kept path, or None.
+    """
+    source = Path(source or settings['codex_path'])
+    digest = digest or settings['codex_sha256']
+    target = kept_binary(settings, digest)
+    try:
+        if _usable(target, digest, None):
+            return target
+        target.parent.parent.mkdir(exist_ok=True, mode=0o700)
+        target.parent.mkdir(exist_ok=True, mode=0o700)
+        for name in ('codex', 'codex-code-mode-host'):
+            origin, link = source.with_name(name) if name != 'codex' else source, target.with_name(name)
+            if not origin.is_file() or origin.is_symlink():
+                continue
+            link.unlink(missing_ok=True)
+            os.link(origin, link)
+        return target if _usable(target, digest, None) else None
+    except OSError:
+        return None
+
+
+def _effective(settings, workspace):
+    """Choose the binary discovery runs: pinned bytes, re-pin, then kept link."""
+    executable = _path(settings['codex_path'])
+    if _usable(executable, settings['codex_sha256'], workspace):
+        return str(executable), settings['codex_sha256']
+    record = _repin_record(settings)
+    if record is not None and _usable(record['codex_path'], record['codex_sha256'], workspace):
+        return record['codex_path'], record['codex_sha256']
+    kept = kept_binary(settings)
+    if _usable(kept, settings['codex_sha256'], workspace):
+        return str(kept), settings['codex_sha256']
+    raise DiscoveryError(binary=(
+        f"Historical discovery needs attention: the pinned Codex binary {settings['codex_path']} "
+        f"(SHA-256 {settings['codex_sha256'][:16]}…) was replaced or removed, and no verified "
+        'replacement is available. Install a working Codex: the next author start re-pins discovery to it '
+        'after a check that makes no model call.'))
+
+
+def validate_settings(settings, workspace=None, *, require_binary=True):
+    """Read-only validation; preparation may precede credential provisioning.
+
+    The result names the binary discovery uses now (see _effective). With
+    ``require_binary`` false the binary is not checked (left for a re-pin).
+    """
     try:
         if not isinstance(settings, dict) or set(settings) != SETTINGS_KEYS:
             raise DiscoveryError()
         executable, auth, state = (_path(settings[key])
                                    for key in ('codex_path', 'auth_home', 'state_root'))
-        _native(executable)
         if (not isinstance(settings['codex_sha256'], str)
-                or not re.fullmatch('[0-9a-f]{64}', settings['codex_sha256'])
-                or _hash(executable) != settings['codex_sha256']):
+                or not re.fullmatch('[0-9a-f]{64}', settings['codex_sha256'])):
             raise DiscoveryError()
         if (not isinstance(settings['model'], str)
-                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', settings['model'])
+                or not MODEL_NAME.fullmatch(settings['model'])
                 or type(settings['timeout_seconds']) not in (int, float)
                 or not 1 <= settings['timeout_seconds'] <= 300):
             raise DiscoveryError()
@@ -126,9 +236,53 @@ def validate_settings(settings, workspace=None):
         if credential.exists() or credential.is_symlink():
             if credential.is_symlink() or not credential.is_file():
                 raise DiscoveryError()
-        return dict(settings)
+        result = dict(settings)
+        if require_binary:
+            result['codex_path'], result['codex_sha256'] = _effective(settings, workspace)
+        return result
+    except DiscoveryError:
+        raise
     except (OSError, TypeError, ValueError):
         raise DiscoveryError() from None
+
+
+def repin(settings, candidate, workspace=None):
+    """Pin discovery to an installed native Codex after a no-model preflight.
+
+    Used by the controller when the pinned bytes are gone. Keeps a hard link to
+    the new bytes too, so a further update needs another re-pin only if this
+    link cannot be made. Returns the record written, or raises DiscoveryError.
+    """
+    candidate = Path(candidate).resolve()
+    _native(candidate)
+    digest = _hash(candidate)
+    kept = keep_binary(settings, candidate, digest)
+    replacement = {**settings, 'codex_path': str(kept or candidate), 'codex_sha256': digest}
+    if not _usable(replacement['codex_path'], digest, workspace):
+        raise DiscoveryError()
+    preflight(replacement)
+    record = {'schemaVersion': 1, 'pinnedSha256': settings['codex_sha256'],
+              'codex_path': replacement['codex_path'], 'codex_sha256': digest,
+              'previousPath': settings['codex_path'],
+              'verifiedAtUtc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}
+    path = _controller(settings) / REPIN_RECORD
+    temporary = path.with_name(f'.{REPIN_RECORD}.{os.getpid()}.tmp')
+    try:
+        with temporary.open('w', encoding='utf-8') as stream:
+            stream.write(json.dumps(record, indent=2) + '\n')
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return record
+
+
+def needs_repin(settings, workspace=None):
+    """Whether the pinned bytes are gone (a re-pin or the kept link then serves)."""
+    try:
+        return not _usable(_path(settings['codex_path']), settings['codex_sha256'], workspace)
+    except (KeyError, TypeError, DiscoveryError):
+        return True
 
 
 def _auth(path):
@@ -207,13 +361,42 @@ def _arguments(config):
     return result
 
 
-def _prepare(settings):
+def _prune(state):
+    """Remove old discovery folders beyond the newest DISCOVERIES_KEPT (never one younger than a day)."""
+    try:
+        folders = [path for path in state.glob('discovery-*') if path.is_dir() and not path.is_symlink()]
+        folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    cutoff = time.time() - 24 * 3600
+    for path in folders[DISCOVERIES_KEPT:]:
+        try:
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _forget_auth(prepared):
+    """Delete the copied login of one finished call; its refresh was preserved first."""
+    try:
+        (prepared[2] / 'auth.json').unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _prepare(settings, model=None):
     settings = validate_settings(settings)
+    if model is not None:
+        if not isinstance(model, str) or not MODEL_NAME.fullmatch(model):
+            raise DiscoveryError()
+        settings['model'] = model
     raw = _auth(Path(settings['auth_home']) / 'auth.json')
     state = Path(settings['state_root'])
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != 'nt' and state.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise DiscoveryError()
+    _prune(state)
     root = Path(tempfile.mkdtemp(prefix='discovery-', dir=state)).resolve()
     home, workspace = root / 'home', root / 'workspace'
     home.mkdir(mode=0o700)
@@ -368,7 +551,10 @@ def preflight(settings):
         try:
             return _verify(prepared, time.monotonic() + min(settings['timeout_seconds'], 20))
         finally:
-            _preserve_auth(prepared, original)
+            try:
+                _preserve_auth(prepared, original)
+            finally:
+                _forget_auth(prepared)
     except DiscoveryError:
         raise
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -396,7 +582,19 @@ def _preserve_auth(prepared, original_sha256):
                             home / 'auth.json', original_sha256)
 
 
-def _trace(path, final_path, maximum):
+def _model_unavailable(texts, model):
+    """Whether a provider error says this exact model cannot be used."""
+    return bool(model) and any(
+        isinstance(text, str) and model.casefold() in text.casefold()
+        and any(word in text.casefold() for word in UNAVAILABLE_MODEL_WORDS) for text in texts)
+
+
+def _error_texts(event):
+    error = event.get('error')
+    return [event.get('message'), error.get('message') if isinstance(error, dict) else error]
+
+
+def _trace(path, final_path, maximum, model=None):
     if path.stat().st_size > MAX_TRACE_BYTES or final_path.stat().st_size > MAX_FINAL_BYTES:
         raise DiscoveryError()
     searches, completed, messages, observed = set(), False, [], set()
@@ -415,7 +613,7 @@ def _trace(path, final_path, maximum):
                 # still complete with a grounded search below.
                 continue
             if kind in ('turn.failed', 'error'):
-                raise DiscoveryError()
+                raise DiscoveryError(model_unavailable=_model_unavailable(_error_texts(event), model))
             if kind == 'turn.completed':
                 completed = True
             elif kind in ('item.started', 'item.updated', 'item.completed'):
@@ -446,7 +644,10 @@ def _trace(path, final_path, maximum):
                             observed.add(_candidate_url(row['url']))
                 if kind == 'item.completed' and item_type == 'agent_message':
                     messages.append(item.get('text'))
-            elif kind not in ('thread.started', 'turn.started'):
+            elif (not isinstance(kind, str) or kind.startswith('item.') or 'error' in kind
+                    or 'fail' in kind):
+                # Unknown item events could carry a tool call; unknown thread or
+                # turn notices (a newer Codex's progress events) carry none.
                 raise DiscoveryError()
     if not searches or not completed or not messages:
         raise DiscoveryError()
@@ -471,8 +672,12 @@ def _trace(path, final_path, maximum):
     return urls, len(searches), len([value for value in suggestions if value not in observed])
 
 
-def discover(query, cutoff, max_candidates, settings, audit_callback, deadline=None):
-    """Return URL-only candidates; caller must apply the complete archive gate."""
+def discover(query, cutoff, max_candidates, settings, audit_callback, deadline=None, model=None):
+    """Return URL-only candidates; caller must apply the complete archive gate.
+
+    ``model`` replaces the pinned discovery model for this call (see
+    CodexWaybackProvider); the audit log records the model used.
+    """
     if (not isinstance(query, str) or not query.strip() or len(query) > 2000
             or type(max_candidates) is not int or not 1 <= max_candidates <= 100):
         raise DiscoveryError()
@@ -488,12 +693,13 @@ def discover(query, cutoff, max_candidates, settings, audit_callback, deadline=N
             raise DiscoveryError()
         expires = min(expires, deadline)
     _remaining(expires)
-    prepared = _prepare(settings)
+    prepared = _prepare(settings, model)
     settings, root, home, workspace, environment, config = prepared
     run_id = root.name
     original_auth_sha256 = _hash(home / 'auth.json')
     audit_callback('codex_discovery_started', discovery_id=run_id,
-                   query_sha256=hashlib.sha256(query.encode()).hexdigest())
+                   query_sha256=hashlib.sha256(query.encode()).hexdigest(), model=settings['model'],
+                   codex_sha256=settings['codex_sha256'])
     try:
         _verify(prepared, expires)
         schema = {'type': 'object', 'properties': {'urls': {'type': 'array',
@@ -530,8 +736,15 @@ def discover(query, cutoff, max_candidates, settings, audit_callback, deadline=N
             finally:
                 _stop(process)
         if process.returncode:
-            raise DiscoveryError()
-        urls, searches, ungrounded = _trace(trace_path, final_path, max_candidates)
+            texts = []
+            for name in ('exec.stderr', 'events.jsonl'):
+                try:
+                    with (root / name).open(encoding='utf-8', errors='replace') as stream:
+                        texts.append(stream.read(256 * 1024))
+                except OSError:
+                    pass
+            raise DiscoveryError(model_unavailable=_model_unavailable(texts, settings['model']))
+        urls, searches, ungrounded = _trace(trace_path, final_path, max_candidates, settings['model'])
         audit_callback('codex_discovery_completed', discovery_id=run_id,
                        web_search_count=searches, candidates_count=len(urls),
                        ungrounded_suggestions_count=ungrounded,
@@ -544,4 +757,7 @@ def discover(query, cutoff, max_candidates, settings, audit_callback, deadline=N
         audit_callback('codex_discovery_rejected', discovery_id=run_id, error_code='discovery_unavailable')
         raise DiscoveryError() from None
     finally:
-        _preserve_auth(prepared, original_auth_sha256)
+        try:
+            _preserve_auth(prepared, original_auth_sha256)
+        finally:
+            _forget_auth(prepared)

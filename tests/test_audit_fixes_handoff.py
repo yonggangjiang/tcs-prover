@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from runner import proof_handoff as handoff
 
 
@@ -22,9 +23,8 @@ class DecoratedMarkerTests(unittest.TestCase):
         self.assertEqual(handoff.extract_proof_reference('PROOF_FILE: "my proof.md".'), 'my proof.md')
         self.assertEqual(handoff.extract_proof_reference('PROOF_FILE: `proofs/full.tex`'), 'proofs/full.tex')
 
-    def test_decorations_never_rescue_empty_colonless_or_conflicting_markers(self):
-        for message in ('PROOF_FILE: ``', 'PROOF_FILE: ` `', '`PROOF_FILE:`', 'PROOF_FILE `proof.md`',
-                        'PROOF_FILE proof.md.', 'PROOF_FILE: "unterminated.',
+    def test_decorations_never_rescue_empty_or_conflicting_markers(self):
+        for message in ('PROOF_FILE: ``', 'PROOF_FILE: ` `', '`PROOF_FILE:`', 'PROOF_FILE: "unterminated.',
                         'PROOF_FILE: `proof.md`\nPROOF_FILE: `other.md`.'):
             with self.subTest(message=message), self.assertRaises(handoff.ProofHandoffError):
                 handoff.extract_proof_reference(message)

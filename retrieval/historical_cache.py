@@ -28,6 +28,7 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_JSON_BYTES = 6 * 1024 * 1024
 MAX_ENTRIES = 64
 LOCK_TIMEOUT = 5.0
+QUARANTINE = ".quarantine"
 RECORD_FIELDS = frozenset({"url", "capture", "archive_url", "mime_type", "cdx_digest",
                          "memento_datetime", "body", "body_sha256", "content_encoding"})
 ENTRY_NAME = re.compile(r"[0-9a-f]{64}\.json\Z")
@@ -35,11 +36,16 @@ TEMP_NAME = re.compile(r"\.capture-[a-z0-9_]+\.tmp\Z")
 
 
 class CacheError(RuntimeError):
-    """Static failure safe to expose without source contents or local paths."""
+    """Static failure safe to expose without source contents or local paths.
 
-    def __init__(self, message="Verified capture cache validation failed."):
+    ``kind`` says how a caller may recover: "invalid" (an entry that can be
+    moved aside), "busy" (a lock wait timed out) or "unavailable".
+    """
+
+    def __init__(self, message="Verified capture cache validation failed.", kind="unavailable"):
         super().__init__(message)
         self.code = "capture_cache_error"
+        self.kind = kind if kind in ("invalid", "busy", "unavailable") else "unavailable"
 
 
 def _canonical_path(value):
@@ -58,12 +64,28 @@ def _private_file(path, descriptor=None):
             or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
             or (hasattr(os, "getuid") and info.st_uid != os.getuid())
             or (os.name != "nt" and info.st_mode & 0o077)):
-        raise CacheError("Capture cache file is not private controller-owned state.")
+        raise CacheError("Capture cache file is not private controller-owned state.", kind="invalid")
     if descriptor is not None:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
             raise CacheError("Capture cache file changed during access.")
     return info
+
+
+def _tighten_mode(path):
+    """Restore 0600 on our own regular file that only became readable to others.
+
+    A file others could write may have been forged, so it is never repaired.
+    """
+    if os.name == "nt":
+        return
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_mode & 0o077
+            and not info.st_mode & 0o022 and (not hasattr(os, "getuid") or info.st_uid == os.getuid())):
+        os.chmod(path, 0o600)
 
 
 def _unique_object(pairs):
@@ -84,11 +106,13 @@ class CaptureCache:
     never deleted and is released automatically when a process dies.
     """
 
-    def __init__(self, directory, *, workspace_root):
+    def __init__(self, directory, *, workspace_root, on_quarantine=None):
         self.directory = _canonical_path(directory)
         workspace = _canonical_path(workspace_root)
         if self.directory == workspace or workspace in self.directory.parents:
             raise CacheError("Capture cache must be outside the solver workspace.")
+        # Called with a reason after an entry was moved aside; never with contents.
+        self.on_quarantine = on_quarantine
         try:
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             self._check_directory()
@@ -97,7 +121,13 @@ class CaptureCache:
 
     def _check_directory(self):
         _canonical_path(self.directory)
-        info = self.directory.stat()
+        info = self.directory.lstat()
+        if (stat.S_ISDIR(info.st_mode) and os.name != "nt" and info.st_mode & 0o077
+                and (not hasattr(os, "getuid") or info.st_uid == os.getuid())):
+            # A backup restore, copy or chmod loosened our own folder: tighten it
+            # again instead of disabling the cache for every job.
+            os.chmod(self.directory, 0o700)
+            info = self.directory.lstat()
         if (not stat.S_ISDIR(info.st_mode)
                 or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
                 or (hasattr(os, "getuid") and info.st_uid != os.getuid())
@@ -121,7 +151,13 @@ class CaptureCache:
             self._check_directory()
             path = self.directory / ".cache.lock"
             if path.exists() or path.is_symlink():
-                _private_file(path)
+                _tighten_mode(path)
+                try:
+                    _private_file(path)
+                except CacheError:
+                    # A linked or foreign lock name: replace it rather than
+                    # disabling the cache for every job.
+                    self._move_aside(path, "invalid lock")
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
                                  | getattr(os, "O_NONBLOCK", 0), 0o600)
             os.set_inheritable(descriptor, False)
@@ -131,7 +167,7 @@ class CaptureCache:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise CacheError("Verified capture cache coordination timed out.")
+                    raise CacheError("Verified capture cache coordination timed out.", kind="busy")
                 try:
                     if os.name == "nt":
                         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -179,16 +215,17 @@ class CaptureCache:
                 raise ValueError
             return dict(value)
         except (UnicodeError, TypeError, ValueError):
-            raise CacheError("Verified capture cache record is invalid.") from None
+            raise CacheError("Verified capture cache record is invalid.", kind="invalid") from None
 
     def _read(self, url, key):
         path = self.directory / (key + ".json")
         try:
+            _tighten_mode(path)
             info = _private_file(path)
         except FileNotFoundError:
             return None
         if info.st_size > MAX_JSON_BYTES:
-            raise CacheError("Verified capture cache entry exceeds its size limit.")
+            raise CacheError("Verified capture cache entry exceeds its size limit.", kind="invalid")
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                              | getattr(os, "O_NONBLOCK", 0))
         try:
@@ -208,7 +245,7 @@ class CaptureCache:
                 raise ValueError
             return self._record(url, envelope["record"])
         except (UnicodeError, TypeError, ValueError, RecursionError):
-            raise CacheError("Verified capture cache entry is invalid.") from None
+            raise CacheError("Verified capture cache entry is invalid.", kind="invalid") from None
 
     def get(self, url):
         """Return a structurally intact record, or None only for an absent URL."""
@@ -216,18 +253,66 @@ class CaptureCache:
         with self._locked():
             return self._read(url, key)
 
+    def _move_aside(self, path, reason):
+        """Rename one invalid name into the private quarantine folder without following it.
+
+        Moved names are kept for inspection (the 64 latest) and never read again.
+        """
+        folder = self.directory / QUARANTINE
+        try:
+            folder.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        info = folder.lstat()
+        if not stat.S_ISDIR(info.st_mode) or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
+            raise CacheError("Verified capture cache quarantine is not a private folder.")
+        if os.name != "nt" and info.st_mode & 0o077:
+            os.chmod(folder, 0o700)
+        label = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)[:64]
+        os.rename(path, folder / f"{time.time_ns()}-{os.urandom(4).hex()}-{label}")
+        kept = sorted(folder.iterdir(), key=lambda item: item.name)
+        for old in kept[:-MAX_ENTRIES]:
+            if old.is_symlink() or not old.is_dir():
+                old.unlink(missing_ok=True)
+        if self.on_quarantine is not None:
+            try:
+                self.on_quarantine(reason)
+            except Exception:
+                pass  # The moved file itself remains the record.
+
+    def quarantine(self, url, reason="invalid entry"):
+        """Move a URL's entry aside after it failed validation; True if one was moved."""
+        path = self.directory / (self._key(url) + ".json")
+        with self._locked():
+            if not os.path.lexists(path):
+                return False
+            try:
+                self._move_aside(path, reason)
+            except OSError:
+                raise CacheError("Verified capture cache entry could not be moved aside.") from None
+            return True
+
     def _entries(self):
         entries = []
         for path in self.directory.iterdir():
-            if ENTRY_NAME.fullmatch(path.name):
-                info = _private_file(path)
-                entries.append((info.st_mtime_ns, path.name, path))
-            elif TEMP_NAME.fullmatch(path.name):
-                # With the global lock held, these can only be abandoned writes.
-                _private_file(path)
-                path.unlink()
-            elif path.name != ".cache.lock":
-                raise CacheError("Verified capture cache contains an unexpected entry.")
+            if path.name in (".cache.lock", QUARANTINE):
+                continue
+            try:
+                if ENTRY_NAME.fullmatch(path.name):
+                    _tighten_mode(path)
+                    info = _private_file(path)
+                    entries.append((info.st_mtime_ns, path.name, path))
+                    continue
+                if TEMP_NAME.fullmatch(path.name):
+                    # With the global lock held, these can only be abandoned writes.
+                    _private_file(path)
+                    path.unlink()
+                    continue
+            except CacheError:
+                pass
+            # A Finder .DS_Store, a linked or loosened entry: one stray name
+            # must not disable the shared cache for every job.
+            self._move_aside(path, "unexpected entry")
         return sorted(entries)
 
     def put(self, url, record):
@@ -242,7 +327,13 @@ class CaptureCache:
         if len(data) > MAX_JSON_BYTES:
             raise CacheError("Verified capture cache entry exceeds its size limit.")
         with self._locked():
-            self._read(url, key)  # Never silently overwrite corrupt or linked state.
+            try:
+                self._read(url, key)
+            except CacheError as error:
+                if error.kind != "invalid":
+                    raise
+                # Never overwrite corrupt or linked state in place: keep it aside.
+                self._move_aside(self.directory / (key + ".json"), "invalid entry")
             self._entries()  # Validate the directory and clear interrupted writes.
             temporary = None
             try:

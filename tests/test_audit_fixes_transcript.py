@@ -11,6 +11,7 @@ import types
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from transcript import view_transcript as vt
 
 

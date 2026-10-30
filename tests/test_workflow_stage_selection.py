@@ -8,7 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
+from tests import critic_doubles
 
 
 ROOT = Path(runtime.__file__).parent
@@ -41,14 +43,22 @@ class WorkflowStageSelectionTests(unittest.TestCase):
     def execute(self, stages=None, *, initial=None, model=None, **settings):
         self.candidate = PROOF if stages is None or stages.get("author", True) else SUPPLIED
         options = {**settings, **({"workflow_stages": stages} if stages is not None else {})}
+        # The convention critic finds the proof faithful; the critic's and every other call go to the stand-in.
         with patch.object(runtime, "goal_session", side_effect=self.author) as author, \
-                patch.object(runtime, "structured", side_effect=model or self.structured) as structured, \
+                patch.object(runtime, "structured",
+                             side_effect=critic_doubles.coordinator(model or self.structured)) as structured, \
                 patch.object(runtime, "require_model_credentials") as credentials, \
                 patch.object(runtime, "_run_command", return_value={"status": "pass", "output": ""}) as compiler, \
                 patch.object(runtime, "emit") as events:
             state = runtime.execute_workflows(
                 PATHS, {"statement": "The exact statement.", "solution": SUPPLIED, **(initial or {})}, options)
         return state, author, structured, credentials, compiler, events
+
+    @staticmethod
+    def decisions(structured):
+        """The calls of a patched structured() other than the convention critic's."""
+
+        return [call for call in structured.call_args_list if not critic_doubles.convention_critic(call.kwargs)]
 
     def test_every_stage_combination_skips_disabled_requests_credentials_and_outputs(self):
         for review, author, critic, writing in itertools.product((False, True), repeat=4):
@@ -105,8 +115,11 @@ class WorkflowStageSelectionTests(unittest.TestCase):
             self.assertEqual((saved["statement"], saved["solution"]), ("The exact statement.", SUPPLIED))
             raise runtime.Error("Stopped while writing")
 
-        with self.assertRaisesRegex(runtime.Error, "Stopped while writing"):
-            self.execute({"author": False, "critic": False}, model=model)
+        # The writing step pauses with its exact input (graph I-002), after the checks above passed.
+        state, *_, events = self.execute({"author": False, "critic": False}, model=model)
+        self.assertTrue(state["paused"])
+        pause = next(call.kwargs for call in events.call_args_list if call.args[0] == "workflow_paused")
+        self.assertEqual((pause["node"], pause["reason"]), ("latex_editor", "Stopped while writing"))
 
     def test_disabled_critic_ignores_invalid_instruction_and_input_prompt_overrides(self):
         state, author, model, _, compiler, _ = self.execute(
@@ -122,7 +135,7 @@ class WorkflowStageSelectionTests(unittest.TestCase):
         state, author, model, _, compiler, events = self.execute(
             {"author": False}, model=lambda *_args, **_kwargs: (report, json.dumps(report)))
         author.assert_not_called()
-        model.assert_called_once()
+        self.assertEqual(len(self.decisions(model)), 1)
         compiler.assert_not_called()
         self.assertTrue(state["failed"])
         self.assertTrue(state["revisionRequired"])
@@ -133,21 +146,22 @@ class WorkflowStageSelectionTests(unittest.TestCase):
         self.assertEqual(len(terminal), 1)
         self.assertEqual((terminal[0]["resultKind"], terminal[0]["bugs"]), ("needs-revision", report["bugs"]))
 
-    def test_critic_without_author_rechecks_edited_passes_and_stops_at_the_round_limit(self):
-        count = 0
+    def test_critic_without_author_rechecks_edited_passes_and_verifies_at_the_round_limit(self):
+        prompts = []
 
-        def model(_prompt, _schema, stage, **_kwargs):
-            nonlocal count
+        def model(prompt, _schema, stage, **_kwargs):
             self.assertEqual(stage, "critic")
-            count += 1
-            report = {"verdict": "pass", "solution": SUPPLIED + " Repair." * count, "bugs": ""}
+            prompts.append(prompt)
+            report = {"verdict": "pass", "solution": SUPPLIED + " Repair." * len(prompts), "bugs": ""}
             return report, json.dumps(report)
 
         state, author, model_calls, _, compiler, _ = self.execute(
             {"author": False, "writing": False}, model=model, critic_rounds=3)
         author.assert_not_called()
         compiler.assert_not_called()
-        self.assertEqual(model_calls.call_count, 3)
+        # At the limit one more read-only round checks the latest edits (I-048): it cannot change them.
+        self.assertEqual(len(self.decisions(model_calls)), 4)
+        self.assertIn("FINAL VERIFICATION", prompts[-1])
         self.assertEqual(state["output"], SUPPLIED + " Repair." * 3)
         self.assertFalse(state.get("failed"))
 
@@ -155,14 +169,16 @@ class WorkflowStageSelectionTests(unittest.TestCase):
         supplied = "A different complete user proof."
         seen = []
 
-        def model(prompt, _schema, _stage, **_kwargs):
-            seen.append(prompt)
+        def model(prompt, _schema, _stage, **kwargs):
+            # The critic reads the candidate from its proof.md (graph I-046), not from its prompt.
+            seen.append((prompt, dict(kwargs["input_files"])["proof.md"]))
             report = {"verdict": "pass", "solution": supplied, "bugs": ""}
             return report, json.dumps(report)
 
         state, author, _, _, compiler, _ = self.execute(
             {"author": False, "writing": False}, input_solution=supplied, model=model)
-        self.assertIn(supplied, seen[0])
+        self.assertEqual(seen[0][1], supplied)
+        self.assertNotIn(supplied, seen[0][0])
         self.assertEqual(state["output"], supplied)
         author.assert_not_called()
         compiler.assert_not_called()
@@ -207,7 +223,7 @@ prompts:
         self.assertEqual(self.calls, ["author", "critic", "final"])
         self.assertEqual(state["output"], LATEX)
         author.assert_called_once()
-        self.assertEqual(model.call_count, 2)
+        self.assertEqual(len(self.decisions(model)), 2)
         compiler.assert_called_once()
 
     def test_invalid_selections_fail_before_credentials_or_requests(self):

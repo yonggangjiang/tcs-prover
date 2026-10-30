@@ -10,6 +10,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import current_run as cr
 from ui import cli
 
@@ -248,7 +249,7 @@ class CurrentRunTests(unittest.TestCase):
                 patch.object(cli, 'Server', return_value=fake) as server, \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(), 0)
-        server.assert_called_once_with((cli.HOST, cli.PORT), runs=self.runs)
+        server.assert_called_once_with((cli.HOST, cli.PORT), runs=self.runs, single_instance=True)
 
 
 if __name__ == '__main__':

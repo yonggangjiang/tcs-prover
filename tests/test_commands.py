@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 
 
@@ -58,10 +59,11 @@ class CommandTests(unittest.TestCase):
         self.assertIn('3 seconds', log)
         self.assertIn('partial output', log)
 
-    def test_storage_errors_propagate(self):
+    def test_storage_errors_are_reported_without_ending_the_command(self):
         with patch.object(runtime.shutil, 'which', return_value=None), patch.object(runtime, '_private_atomic_write', side_effect=PermissionError('disk full')):
-            with self.assertRaisesRegex(PermissionError, 'disk full'):
-                runtime._run_command(self.config, self.context)
+            result = runtime._run_command(self.config, self.context)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('disk full', result['log_error'])
 
     def test_invalid_timeouts_and_escape_outputs_are_rejected(self):
         for timeout in (0, -1, True, float('inf'), float('nan')):

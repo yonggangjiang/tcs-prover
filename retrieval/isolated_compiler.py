@@ -4,6 +4,8 @@ Only the built-in compiler command is supported. Neither PATH, user TeX
 configuration, nor files planted alongside a model's source are trusted.
 """
 
+from collections import deque
+import errno
 import json
 import math
 import os
@@ -14,20 +16,40 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 
 ADAPTER = "codex-macos-seatbelt-v1"
+# Without -halt-on-error one compile reports every error of the document.
 LATEX_ARGV = [
     "latexmk", "-norc", "-pdf", "-g", "-interaction=nonstopmode",
-    "-halt-on-error", "-file-line-error", "-no-shell-escape",
+    "-file-line-error", "-no-shell-escape",
     "-jobname=final", "latex-source.tex",
 ]
 ARTIFACTS = ("final.pdf", "final.log", "final.aux")
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
+# Model-written TeX can print without end: only the head and the tail of the
+# output (each OUTPUT_KEEP characters) are kept, the copies of final.log and
+# final.aux keep ARTIFACT_KEEP bytes, and a compile whose output or final.log
+# grows past OUTPUT_LIMIT is stopped like one that timed out.
+OUTPUT_KEEP = 1_000_000
+OUTPUT_LIMIT = 256 * 1024 * 1024
+ARTIFACT_KEEP = 8 * 1024 * 1024
+# Opening a file can fail for want of resources; that passes, unlike a refusal.
+_RESOURCE_ERRNOS = {errno.EMFILE, errno.ENFILE, errno.ENOMEM, errno.EAGAIN, errno.EINTR, errno.EIO}
 
 
 class CompilerIsolationError(RuntimeError):
     """The compiler's boundary could not be established."""
+
+
+class CompilerNotReady(CompilerIsolationError):
+    """The protected toolchain or the sandbox failed its checks; they can pass later, as during a TeX update."""
+
+
+class CompilerRefusal(CompilerIsolationError):
+    """The source, or a file TeX produced, is not one the boundary accepts; nothing of it is used."""
 
 
 def supported():
@@ -41,7 +63,7 @@ def _root_owned(path):
     for item in (canonical, *canonical.parents):
         info = item.stat()
         if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise CompilerIsolationError(f"Compiler toolchain is not root-owned and protected: {item}")
+            raise CompilerNotReady(f"Compiler toolchain is not root-owned and protected: {item}")
     return canonical
 
 
@@ -54,11 +76,11 @@ def toolchain():
         engine = _root_owned(binary_directory / "pdflatex")
         for path in (latexmk, engine):
             if root not in path.parents or not path.is_file():
-                raise CompilerIsolationError("Historical TeX tools must belong to the protected MacTeX distribution.")
+                raise CompilerNotReady("Historical TeX tools must belong to the protected MacTeX distribution.")
         for executable in ("/usr/bin/sandbox-exec", "/usr/bin/perl", "/bin/sh"):
             _root_owned(executable)
     except OSError as exc:
-        raise CompilerIsolationError(f"Historical compilation requires MacTeX and sandbox-exec: {exc}") from exc
+        raise CompilerNotReady(f"Historical compilation requires MacTeX and sandbox-exec: {exc}") from exc
     # Retain the pdflatex basename: resolving that symlink to pdftex changes
     # TeX's implicit format selection.
     return root, binary_directory, latexmk
@@ -90,24 +112,110 @@ def environment(stage, binary_directory):
     }
 
 
-def _run(profile, argv, stage, env, timeout):
+class _Output:
+    """A command's output as it arrives: the head and the tail are kept, the middle only counted."""
+
+    def __init__(self, keep=OUTPUT_KEEP):
+        self.keep, self.size, self.omitted = keep, 0, 0
+        self.head, self.tail, self.tail_size = [], deque(), 0
+        self.lock = threading.Lock()
+
+    def read(self, descriptor):
+        try:
+            with open(descriptor, encoding="utf-8", errors="replace") as stream:
+                for line in iter(lambda: stream.readline(65536), ""):
+                    self.add(line)
+        except (OSError, ValueError):
+            pass  # The pipe closed under the reader; what arrived is kept.
+
+    def add(self, text):
+        with self.lock:
+            room = self.keep - self.size
+            self.size += len(text)
+            if room > 0:
+                self.head.append(text[:room])
+                text = text[room:]
+            if text:
+                self.tail.append(text)
+                self.tail_size += len(text)
+                while self.tail_size - len(self.tail[0]) >= self.keep:
+                    self.tail_size -= len(self.tail[0])
+                    self.omitted += len(self.tail.popleft())
+
+    def text(self):
+        with self.lock:
+            tail = "".join(self.tail)
+            cut = max(0, len(tail) - self.keep)
+            omitted = self.omitted + cut
+            return "".join(self.head) + (f"\n[{omitted} characters omitted]\n" if omitted else "") + tail[cut:]
+
+
+def _size(path):
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return 0
+
+
+def _stop_session(process):
+    """Kill the compile's whole session, which it started with start_new_session."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Gone already: macOS reports EPERM for a session whose members exited
+        # but are not reaped yet, as when a compile ends just as it times out.
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+def _run(profile, argv, stage, env, timeout, watch=()):
+    """Run one sandboxed command; a timeout, Stop or any other interruption kills its whole session.
+
+    Only the head and tail of its output are kept (_Output). A command whose
+    output, or one of the `watch` files, grows past OUTPUT_LIMIT is stopped
+    like one that timed out: TimeoutExpired with `runaway` saying why.
+    """
     process = subprocess.Popen(
         ["/usr/bin/sandbox-exec", "-p", profile, *argv], cwd=stage, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", umask=0o077,
-        start_new_session=True,
+        umask=0o077, start_new_session=True,
     )
+    output, reader = _Output(), None
     try:
-        output, _ = process.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(argv, process.returncode, output)
-    except subprocess.TimeoutExpired as exc:
+        # The reader owns a duplicate: closing the pipe here never waits for it.
+        reader = threading.Thread(target=output.read, args=(os.dup(process.stdout.fileno()),), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout
+        while reader.is_alive():
+            reader.join(min(1.0, max(0.0, deadline - time.monotonic())))
+            runaway = (f"printed more than {OUTPUT_LIMIT // 2 ** 20} MB of output" if output.size > OUTPUT_LIMIT
+                       else next((f"wrote more than {OUTPUT_LIMIT // 2 ** 20} MB to {path.name}" for path in watch
+                                  if _size(path) > OUTPUT_LIMIT), ""))
+            if runaway or (reader.is_alive() and time.monotonic() >= deadline):
+                expired = subprocess.TimeoutExpired(argv, timeout)
+                expired.runaway = runaway
+                raise expired
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            process.wait(max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(argv, timeout) from None
+        return subprocess.CompletedProcess(argv, process.returncode, output.text())
+    except BaseException as exc:
+        _stop_session(process)
+        if reader is not None:
+            reader.join(5)  # Bounded: a process outside the session could still hold the pipe.
+        try:
+            process.wait(5)
+        except subprocess.TimeoutExpired:
             pass
-        output, _ = process.communicate()
-        exc.stdout = output
+        if isinstance(exc, subprocess.TimeoutExpired):
+            exc.stdout = output.text()
         raise
+    finally:
+        process.stdout.close()
 
 
 def verify_sandbox(profile, stage, env):
@@ -144,21 +252,29 @@ print "TCS_COMPILER_ISOLATED\n";
 '''
         result = _run(profile, ["/usr/bin/perl", "-e", script, str(secret), str(outside / "write.txt"), str(port)], stage, env, 15)
         if result.returncode != 0 or result.stdout.strip() != "TCS_COMPILER_ISOLATED" or (outside / "write.txt").exists():
-            raise CompilerIsolationError(f"Compiler sandbox canaries failed (exit {result.returncode}): " + result.stdout[-3000:])
+            raise CompilerNotReady(f"Compiler sandbox canaries failed (exit {result.returncode}): " + result.stdout[-3000:])
 
 
-def _regular_file(path, limit=None):
+def _regular_file(path, limit=None, keep=None):
+    """Read a regular, unlinked file; a larger one than `limit` is refused, of one larger than `keep` only its ends."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
-        raise CompilerIsolationError(f"Cannot safely open compiler file {path.name}: {exc}") from exc
+        if exc.errno in _RESOURCE_ERRNOS:
+            raise
+        raise CompilerRefusal(f"Cannot safely open compiler file {path.name}: {exc}") from exc
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (limit is not None and info.st_size > limit):
-            raise CompilerIsolationError(f"Compiler requires a regular, unlinked file within its size limit: {path.name}")
+            raise CompilerRefusal(f"Compiler requires a regular, unlinked file within its size limit: {path.name}")
+        if keep is not None and info.st_size > keep:
+            head = handle.read(keep // 2)
+            handle.seek(-(keep // 2), os.SEEK_END)
+            tail = handle.read(keep // 2)
+            return head + f"\n[{info.st_size - len(head) - len(tail)} bytes omitted]\n".encode() + tail
         data = handle.read(None if limit is None else limit + 1)
     if limit is not None and len(data) > limit:
-        raise CompilerIsolationError(f"Compiler input exceeds its size limit: {path.name}")
+        raise CompilerRefusal(f"Compiler input exceeds its size limit: {path.name}")
     return data
 
 
@@ -175,7 +291,13 @@ def _replace(path, data):
 
 
 def compile_command(policy, config, argv, directory):
-    """Return the workflow command result, preserving outputs on boundary failure."""
+    """Return the workflow command result, preserving outputs on boundary failure.
+
+    CompilerNotReady (the toolchain or the sandbox fails its checks, which can
+    pass later) and CompilerRefusal (a source or produced file the boundary
+    does not accept) leave the run's files as they are. The result's output is
+    the head and tail of the compiler output; the controller writes the log.
+    """
     if not supported() or policy["isolation"]["adapter"] != ADAPTER:
         raise CompilerIsolationError("An isolated compiler/command adapter has not been verified for this platform.")
     workspace = Path(policy["isolation"]["workspace"]).resolve()
@@ -196,18 +318,18 @@ def compile_command(policy, config, argv, directory):
             verify_sandbox(profile, stage, env)
         except subprocess.TimeoutExpired as exc:
             # Its command line holds the whole profile and script: keep the message short.
-            raise CompilerIsolationError(
+            raise CompilerNotReady(
                 f"Compiler sandbox canaries did not finish within {exc.timeout:g} seconds.") from exc
         except (subprocess.SubprocessError, OSError) as exc:
-            raise CompilerIsolationError(f"Compiler sandbox canaries could not run: {exc}") from exc
+            raise CompilerNotReady(f"Compiler sandbox canaries could not run: {exc}") from exc
         (stage / "latex-source.tex").write_bytes(source)
         # Root-owned latexmk is a Perl script; invoke the system interpreter
         # explicitly and pin its engine. Disable bibliography subprocesses.
         command = ["/usr/bin/perl", str(latexmk), *LATEX_ARGV[1:-1], "-bibtex-",
                    f"-pdflatex={binary_directory}/pdflatex %O %S", LATEX_ARGV[-1]]
-        code, output = None, ""
+        code, output, details = None, "", {}
         try:
-            result = _run(profile, command, stage, env, timeout)
+            result = _run(profile, command, stage, env, timeout, watch=(stage / "final.log",))
             code, output = result.returncode, result.stdout or ""
             pdf = _regular_file(stage / "final.pdf") if (stage / "final.pdf").exists() else b""
             status = "pass" if code == 0 and pdf.startswith(b"%PDF-") else "fail"
@@ -215,12 +337,19 @@ def compile_command(policy, config, argv, directory):
             if code == 0 and status != "pass":
                 diagnostic += " A valid PDF was not produced."
         except subprocess.TimeoutExpired as exc:
-            status, diagnostic = "fail", f"Command exceeded {timeout:g} seconds."
+            status, details = "fail", {"timed_out": True}
+            runaway = getattr(exc, "runaway", "")
+            diagnostic = f"Command {runaway} and was stopped." if runaway else f"Command exceeded {timeout:g} seconds."
+            if runaway:
+                details["runaway"] = True
             output = exc.stdout or ""
             if isinstance(output, bytes):
                 output = output.decode("utf-8", errors="replace")
         except OSError as exc:
+            # The tools passed their checks just now: this start failure is for
+            # want of processes, files or memory, which passes (I-022).
             status, diagnostic = "unavailable", f"Isolated compiler could not run: {exc}"
+            details = {"transient": True}
         # Nothing in the run directory is exposed to TeX; the controller copies
         # only these named artifacts after the bounded child exits.
         for name in ARTIFACTS:
@@ -228,9 +357,8 @@ def compile_command(policy, config, argv, directory):
             if name == "final.pdf" and status != "pass":
                 (workspace / name).unlink(missing_ok=True)
             elif artifact.exists():
-                _replace(workspace / name, _regular_file(artifact))
-        _replace(workspace / "latex-compile.log", (diagnostic + "\n\n" + output).encode("utf-8"))
-        return {"status": status, "diagnostic": diagnostic, "returncode": code, "output": output[-24000:]}
+                _replace(workspace / name, _regular_file(artifact, keep=None if name == "final.pdf" else ARTIFACT_KEEP))
+        return {**details, "status": status, "diagnostic": diagnostic, "returncode": code, "output": output}
 
 
 def preflight(policy):

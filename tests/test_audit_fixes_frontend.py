@@ -130,12 +130,12 @@ const sentCount = async count => { for (let i = 0; i < 50 && sent.length < count
 # Batch and job lists: the same slice and fakes as tests/test_batch_navigation.py, plus Back.
 BATCHES = [
     ["function request(", "function selectedProblemMode("],
+    ["function completedRunLabel(", "function localDateTime("],
     ["window.onpopstate =", "\nrefresh();"],
 ]
 BATCHES_SETUP = r"""
 let currentJob = '', currentBatch = '', composingProblem = false, batchCatalog = [], state = {phase: 'input'};
-let requests = Promise.resolve(), previousPhase = '', timer, clock, jobsTimer, memoryRequest = 0, memoryTimer;
-let memoryJob = null;
+let requests = Promise.resolve(), previousPhase = '', timer, clock, jobsTimer;
 const sessionToken = 'test-token', timelineRows = new Map(), detailRows = new Map();
 const location = {pathname: '/', search: ''};
 const history = {urls: [], pushState(a, b, url) { this.urls.push(url); }};
@@ -143,7 +143,6 @@ const clearTimeout = () => {}, clearInterval = () => {}, setTimeout = () => 1;
 const document = {createElement: tag => new Element(tag)};
 const window = {open() {}};
 const localDateTime = value => value;
-const completedRunLabel = job => job.resultKind === 'final' ? 'Answer ready' : 'Incomplete';
 const confirm = () => true, alert = () => {};
 let refreshed = 0;
 const refresh = async () => { refreshed += 1; };
@@ -598,6 +597,7 @@ assert.equal(ui.runLatestAction.textContent, 'Latest activity · 12:00:00 · Aut
     def test_critic_history_keeps_its_scroll_position_across_polls(self):
         slices = [
             ["// Group the recorded critic calls", "function renderCriticReviewHistory()"],
+            ["function completedRunLabel(", "function localDateTime("],
             ["function renderWorkflow()", "function renderClock()"],
         ]
         self.run_app(slices, r"""

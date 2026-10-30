@@ -15,7 +15,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
+from tests import critic_doubles
 from ui import server
 import test_goal_runtime as goal_test
 from test_workflow_runner import LATEX, PROOF, ROOT, review_report, workspace
@@ -183,14 +185,19 @@ class TextExpressionTests(unittest.TestCase):
         with workspace() as directory, patch.object(runtime, "_run_command", return_value={"status": "pass", "output": "", "returncode": 0}):
             (directory / "build.yaml").write_text(runtime.yaml.safe_dump(workflow))
             (directory / "state.json").write_text("{}")
-            with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with contextlib.redirect_stderr(io.StringIO()) as errors, contextlib.redirect_stdout(io.StringIO()) as output:
                 code = runtime.main([str(directory / "build.yaml"), "--state-file", str(directory / "state.json")])
-        self.assertEqual(code, 1)
-        self.assertEqual(errors.getvalue().strip(), "error: The build printed nothing.")
+        # The step pauses with the node's own error text (resumed automatically), and no traceback is printed.
+        self.assertEqual(code, 0)
+        self.assertEqual(errors.getvalue(), "")
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        pause = next(record for record in records if record["kind"] == "workflow_paused")
+        self.assertEqual((pause["node"], pause["reason"]), ("build", "The build printed nothing."))
 
 
 class ResumedStateTests(unittest.TestCase):
     @staticmethod
+    @critic_doubles.coordinator
     def model(prompt, schema, stage, **settings):
         value = review_report() if stage == "critic" else {"latex": LATEX}
         return value, json.dumps(value)
@@ -204,13 +211,16 @@ class ResumedStateTests(unittest.TestCase):
         with workspace() as directory, patch.object(runtime, "structured", side_effect=self.model) as calls, patch.object(runtime, "_run_command", return_value={"status": "pass", "output": ""}):
             result = runtime.execute_workflows(PROOF_WORKFLOWS, state, {"start_node": "critic"})
             self.assertEqual((directory / "final.tex").read_text(), LATEX)
-        self.assertEqual([call.args[2] for call in calls.call_args_list], ["critic", "final"])
+        # The critic, the convention critic on the accepted proof, then the writer.
+        self.assertEqual([(call.args[2], call.kwargs.get("activity_label")) for call in calls.call_args_list],
+                         [("critic", "Critic coordinator"), ("critic", "Convention critic"), ("final", None)])
         self.assertEqual(result["output"], LATEX)
         self.assertNotIn("paused", result)
         self.assertNotIn("failed", result)
 
     def test_cli_resume_from_a_paused_checkpoint_emits_the_workflow_result(self):
-        with workspace() as directory, patch.object(runtime, "structured", side_effect=self.model), patch.object(runtime, "_run_command", return_value={"status": "pass", "output": ""}):
+        # main() checks the models' CLIs before the run; no CLI may start here.
+        with workspace() as directory, patch.object(runtime, "structured", side_effect=self.model), patch.object(runtime, "_run_command", return_value={"status": "pass", "output": ""}), patch.object(runtime, "check_clis"):
             (directory / "paused.json").write_text(json.dumps(self.paused_state()))
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 code = runtime.main([*map(str, PROOF_WORKFLOWS), "--state-file", str(directory / "paused.json"),
@@ -229,21 +239,29 @@ class ResumedStateTests(unittest.TestCase):
 
 
 class CriticPointerTests(unittest.TestCase):
+    @staticmethod
+    def pause_reason(emit):
+        # A stand-in for structured() skips its retries: the critic step pauses with the reason.
+        pause = next(call.kwargs for call in emit.call_args_list if call.args[0] == "workflow_paused")
+        assert pause["node"] == "critic", pause
+        return pause["reason"]
+
     def review(self, answers, reviewed):
         def model(prompt, schema, stage, **settings):
             reviewed.append(dict(settings["input_files"])["proof.md"])
             report = review_report(answers[len(reviewed) - 1])
             return report, json.dumps(report)
-        return model
+        return critic_doubles.coordinator(model)
 
     def test_pointer_answer_stops_before_replacing_the_saved_candidate(self):
         with workspace() as directory:
             (directory / "proof.md").write_text("Real proof from the author file")
             state = {"statement": "Task", "solution": "PROOF_FILE: proof.md"}
             reviewed = []
-            with patch.object(runtime, "structured", side_effect=self.review(["PROOF_FILE: proof.md"], reviewed)):
-                with self.assertRaisesRegex(runtime.Error, "file pointer instead of the complete proof"):
-                    runtime.execute_workflows(PROOF_WORKFLOWS, state, {"start_node": "critic"})
+            with patch.object(runtime, "structured", side_effect=self.review(["PROOF_FILE: proof.md"], reviewed)), \
+                    patch.object(runtime, "emit") as emit:
+                runtime.execute_workflows(PROOF_WORKFLOWS, state, {"start_node": "critic"})
+            self.assertIn("file pointer instead of the complete proof", self.pause_reason(emit))
             self.assertEqual(reviewed, ["Real proof from the author file"])
             self.assertEqual((directory / "saved-candidate.md").read_text(), "Real proof from the author file")
             self.assertEqual(state["solution"], "Real proof from the author file")
@@ -255,9 +273,10 @@ class CriticPointerTests(unittest.TestCase):
             state = {"statement": "Task", "solution": "PROOF_FILE: proof.md"}
             reviewed = []
             answers = ["Critic repaired proof", "PROOF_FILE: proof.md"]
-            with patch.object(runtime, "structured", side_effect=self.review(answers, reviewed)):
-                with self.assertRaisesRegex(runtime.Error, "file pointer"):
-                    runtime.execute_workflows(PROOF_WORKFLOWS, state, {"start_node": "critic", "critic_rounds": 2})
+            with patch.object(runtime, "structured", side_effect=self.review(answers, reviewed)), \
+                    patch.object(runtime, "emit") as emit:
+                runtime.execute_workflows(PROOF_WORKFLOWS, state, {"start_node": "critic", "critic_rounds": 2})
+            self.assertIn("file pointer", self.pause_reason(emit))
             self.assertEqual(reviewed, ["Author proof", "Critic repaired proof"])
             self.assertEqual((directory / "saved-candidate.md").read_text(), "Critic repaired proof")
             self.assertFalse((directory / "final-input.json").exists())
@@ -294,10 +313,12 @@ class CriticPointerTests(unittest.TestCase):
         for answer in ("`PROOF_FILE: proof.md`", "PROOF_FILE: other.md", "Lemma 1 holds.\nPROOF_FILE: proof.md\nHence."):
             with self.subTest(answer=answer), workspace() as directory:
                 (directory / "proof.md").write_text(captured)
-                with patch.object(runtime, "structured", side_effect=self.review([answer], [])):
-                    with self.assertRaisesRegex(runtime.Error, "file pointer"):
-                        runtime.execute_workflows([PROOF_WORKFLOWS[0]],
-                            {"statement": "Task", "solution": "PROOF_FILE: proof.md"}, {"start_node": "critic"})
+                with patch.object(runtime, "structured", side_effect=self.review([answer], [])), \
+                        patch.object(runtime, "emit") as emit:
+                    state = runtime.execute_workflows([PROOF_WORKFLOWS[0]],
+                        {"statement": "Task", "solution": "PROOF_FILE: proof.md"}, {"start_node": "critic"})
+                self.assertTrue(state["paused"])
+                self.assertIn("file pointer", self.pause_reason(emit))
 
     def test_resuming_the_critic_with_a_long_saved_candidate_reviews_it_inline(self):
         candidate = "\n".join(f"Step {index}: case {index} follows." for index in range(100)) + "\n\n`PROOF_FILE: proof.md`"
@@ -324,7 +345,7 @@ class CriticPointerTests(unittest.TestCase):
             return report, json.dumps(report)
 
         with workspace(), patch.object(runtime, "goal_session", side_effect=author), \
-                patch.object(runtime, "structured", side_effect=model):
+                patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(model)):
             state = runtime.execute_workflows([PROOF_WORKFLOWS[0]], {"statement": "Task"})
         self.assertEqual(reviewed, [("`PROOF_FILE: missing.md`", "inline"), (PROOF, "inline")])
         self.assertEqual(feedback[0]["bugs"], "A gap remains.")
@@ -475,14 +496,16 @@ class PlantedLinkWriteTests(unittest.TestCase):
 
 
 class LunaEffortTests(unittest.TestCase):
-    def test_luna_models_run_ultra_as_max_and_keep_listed_efforts(self):
-        for model in ("gpt-6-luna", "gpt-5.6-luna"):
+    def test_every_model_runs_the_retired_ultra_as_max_and_keeps_listed_efforts(self):
+        # Ultra is no longer offered: a saved job, script or flag that says ultra runs as max everywhere.
+        self.assertNotIn("ultra", runtime.EFFORTS)
+        for model in ("gpt-6-luna", "gpt-5.6-luna", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol",
+                      "gpt-5.6-terra"):
             with self.subTest(model=model):
                 self.assertEqual(runtime.effective_effort(model, "ultra"), "max")
+                self.assertNotIn("ultra", runtime.MODEL_EFFORTS[model])
                 for effort in runtime.MODEL_EFFORTS[model]:
                     self.assertEqual(runtime.effective_effort(model, effort), effort)
-        for model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"):
-            self.assertEqual(runtime.effective_effort(model, "ultra"), "ultra")
         # Claude lists no Ultra either; its other levels pass through unchanged.
         self.assertEqual(runtime.effective_effort("claude-opus-5-5", "ultra"), "max")
         self.assertEqual(runtime.effective_effort("claude-opus-5-5", "low"), "low")

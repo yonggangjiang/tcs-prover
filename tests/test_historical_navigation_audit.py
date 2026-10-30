@@ -4,6 +4,7 @@ import hashlib
 import json
 import unittest
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import audit_historical_trajectory as auditor
 from retrieval.historical_search import canonical_json, LIMITATION
 try:

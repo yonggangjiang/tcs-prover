@@ -8,6 +8,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
 
 # Error pauses are retried every minute, like every other model call.
@@ -112,6 +113,8 @@ class AutoResumeTests(unittest.TestCase):
         argv = popen.call_args.args[0]
         self.assertIn('goal_thread_id="saved-thread"', argv)
         self.assertIn('goal_require_resume=true', argv)
+        # The resumed author keeps the run's private temp folder.
+        self.assertIn("run_tmp_dir=" + json.dumps(str(server.controller_directory(self.run) / "tmp")), argv)
         self.assertEqual(popen.call_args.kwargs["cwd"], self.run)
         self.assertEqual(self.app.state["phase"], "running")
         self.assertEqual(self.app.state["autoResumeAt"], 0)
@@ -155,12 +158,30 @@ class AutoResumeTests(unittest.TestCase):
         retry.assert_not_called()
 
     def test_exhausted_budget_does_not_retry(self):
+        self.app.state["thinkingHours"] = 168  # A finite limit; the default is unlimited.
         self.fail(reason="Workflow time limit reached.")
         self.assertEqual(self.app.state["autoResumeAt"], 0)
         checkpoint = self.checkpoint()
         checkpoint.update(error="Connection lost", elapsedSeconds=168 * 3600)
         self.app._configure_auto_resume(checkpoint, now=1_000)
         self.assertEqual(checkpoint["autoResumeAt"], 0)
+
+    def test_a_time_limit_pause_has_its_own_cause_and_waits_for_the_user(self):
+        self.app.state["thinkingHours"] = 1
+        self.fail(reason="Workflow time limit reached.")
+        checkpoint = self.checkpoint()
+        self.assertEqual((checkpoint["pauseCause"], checkpoint["autoResumeAt"]), ("time-limit", 0))
+        never = Mock(side_effect=AssertionError("resumed by itself"))
+        self.assertFalse(self.app.auto_resume_if_due(never, now=10**9))
+        # Raising the limit does not resume it either; Resume is the user's.
+        self.app.set_author_time_limit(5)
+        self.assertFalse(self.app.auto_resume_if_due(never, now=10**9))
+        restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
+        self.assertEqual((restored.state["autoResumeAt"], restored.snapshot()["pauseCause"]), (0, "time-limit"))
+        restored.auto_resume_if_due(never, now=10**9)
+        # Keep paused keeps the cause.
+        self.app.pause()
+        self.assertEqual(self.checkpoint()["pauseCause"], "time-limit")
 
     def test_legacy_failure_is_scheduled_but_legacy_manual_pause_is_not(self):
         self.fail()
@@ -262,11 +283,19 @@ class AutoResumeTests(unittest.TestCase):
         self.assertTrue(any(text.startswith("Automatic resume failed: Claude CLI is not installed")
                             and text.endswith("Retrying in 1 minute.") for text in trace), trace)
         self.assertFalse(any(text.startswith("Automatic resume stopped") for text in trace))
-        # A missing API key is a settings error: automatic resume stops until the user fixes it.
+        # A missing API key waits for the settings: checked again every minute, said once, never launched.
         self.app.state["autoResumeAt"] = 1_000 + 2 * WAIT
-        with patch.object(server, "require_model_access", side_effect=ValueError("Add an API key for Gateway.")):
-            self.app.auto_resume_if_due(self.app.resume, now=1_000 + 2 * WAIT)
-        self.assertEqual(self.app.state["autoResumeAt"], 0)
+        with patch.object(server, "require_model_access", side_effect=ValueError("Add an API key for Gateway.")), \
+                patch.object(server.subprocess, "Popen") as popen:
+            for tick in (2, 3):
+                self.assertTrue(self.app.auto_resume_if_due(self.app.resume, now=1_000 + tick * WAIT))
+        popen.assert_not_called()
+        self.assertEqual(self.app.state["autoResumeAt"], 1_000 + 4 * WAIT)
+        waits = [entry["text"] for entry in self.app.state["trace"]
+                 if entry.get("text", "").startswith("Automatic resume waits for the model settings")]
+        self.assertEqual(waits, ["Automatic resume waits for the model settings: Add an API key for Gateway. The job "
+                                 "checks again every 1 minute and continues by itself once they are fixed."])
+        self.assertEqual(self.app.attention()["kind"], "settings")
 
     def test_runtime_reports_a_missing_cli_as_transient_and_a_missing_key_as_settings(self):
         with patch.object(server.runtime, "verify_model_credentials",

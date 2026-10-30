@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit, quote
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_search as hs
 
 CUTOFF = '2026-10-02T12:00:00Z'

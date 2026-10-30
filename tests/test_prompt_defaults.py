@@ -10,7 +10,11 @@ from unittest.mock import patch
 
 import yaml
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
+
+# The notebook files of older runs: only the author ever wrote them, never the controller.
+RESEARCH_MEMORY_FILES = ("INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md")
 
 
 class PromptDefaultsTests(unittest.TestCase):
@@ -79,7 +83,7 @@ class PromptDefaultsTests(unittest.TestCase):
                     options = app._proof_options_locked()
                     path = Path(options[options.index("--author-prompt-file") + 1])
                     self.assertEqual(path.read_text().strip(), server.default_prompts()["author"])
-                for name in server.RESEARCH_MEMORY_FILES:
+                for name in RESEARCH_MEMORY_FILES:
                     self.assertFalse((app.run_dir / name).exists(), "Only the LLM creates memory")
 
     def test_explicit_browser_edit_applies_to_one_job_only(self):
@@ -120,7 +124,8 @@ const functions = app.slice(app.indexOf('const promptLabels ='), app.indexOf('fu
 const setup = `
 let currentJob = '', currentBatch = '', activePrompt = 'review';
 let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
-const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', critic: 'Critic', final: 'Final'};
+const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', critic: 'Critic',
+                  convention: 'Convention critic: {statement}', final: 'Final'};
 let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};
 const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATEMENT]'}),
                       setItem: () => {throw Error('Prompts must not be persisted');}};

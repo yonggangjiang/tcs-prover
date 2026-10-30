@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 from urllib.request import Request, urlopen
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from ui import server
 
@@ -60,7 +61,7 @@ class FolderBatchTests(unittest.TestCase):
             {"name": "c.md", "statement": "  Another statement.\n"},
         ]
         started = self.manager.start_direct_batch({
-            "statements": statements, "criticRounds": 3, "thinkingHours": 4,
+            "statements": statements, "criticRounds": 3, "criticCount": 5, "thinkingHours": 4,
             "authorModel": "gpt-5.6-sol", "criticEffort": "high", "speedMode": "standard",
             "promptOverrides": {"critic": "Shared critic."},
         })
@@ -77,6 +78,9 @@ class FolderBatchTests(unittest.TestCase):
                                  ["author_critic.yaml", "clean_up.yaml"])
                 self.assertNotIn("--start-node", argv)
                 self.assertEqual(argv[argv.index("--critic-rounds") + 1], "3")
+                self.assertEqual(argv[argv.index("--critic-count") + 1], "5")
+                self.assertFalse(any(item.startswith("critic_audit_file=") for item in argv))
+                self.assertEqual(app.state["criticCount"], 5)
                 self.assertEqual(float(argv[argv.index("--thinking-hours") + 1]), 4)
                 self.assertEqual(argv[argv.index("--author-model") + 1], "gpt-5.6-sol")
                 self.assertEqual(argv[argv.index("--critic-effort") + 1], "high")
@@ -120,6 +124,10 @@ class FolderBatchTests(unittest.TestCase):
             ({"statements": [*good, {"name": "c\0.md", "statement": "Task"}]}, "Statement 3: A source file name"),
             ({"statements": good, "authorModel": "bogus"}, "Choose"),
             ({"statements": good, "criticRounds": 0}, "round"),
+            ({"statements": good, "criticCount": 0}, "Choose 1 to 10 independent critics"),
+            ({"statements": good, "criticCount": 11}, "Choose 1 to 10 independent critics"),
+            ({"statements": good, "criticCount": 2.5}, "independent critics must be an integer"),
+            ({"statements": good, "criticCount": True}, "independent critics must be an integer"),
             ({"statements": good, "thinkingHours": -1}, "hours"),
             ({"statements": good, "speedMode": "warp"}, "speed"),
             ({"statements": good, "promptOverrides": {"author": "No marker."}}, "STATEMENT"),
@@ -135,7 +143,7 @@ class FolderBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "home screen"):
             self.manager.start_direct_batch({"statements": good}, "some-job")
 
-    def test_a_launch_failure_stops_the_jobs_already_started(self):
+    def test_a_launch_failure_stops_no_other_job_and_is_retried_every_minute(self):
         calls = []
 
         def popen(argv, **kwargs):
@@ -147,12 +155,26 @@ class FolderBatchTests(unittest.TestCase):
         stopped = []
         with mock.patch.object(server.subprocess, "Popen", side_effect=popen), \
                 mock.patch.object(server.App, "stop", autospec=True, side_effect=stopped.append):
-            with self.assertRaisesRegex(ValueError, r"b\.md: No space left on device\. The 1 job it had "
-                                                    r"already started were stopped\."):
-                self.manager.start_direct_batch({"statements": self.statements("a.md", "b.md", "c.md")})
-        self.assertEqual(len(calls), 2, "No job starts after a failure")
-        self.assertEqual([app.state["sourceFile"] for app in stopped], ["a.md"])
-        self.assertEqual([app.state["sourceFile"] for app in self.manager.jobs.values()], ["a.md"])
+            started = self.manager.start_direct_batch({"statements": self.statements("a.md", "b.md", "c.md")})
+            self.assertEqual(stopped, [])
+            self.assertEqual(started.notice, "Could not start the job for b.md (No space left on device); it is "
+                                             "tried again every 1 minute.")
+            jobs = {app.state["sourceFile"]: app for app in self.manager.jobs.values()}
+            self.assertEqual({name: app.state["phase"] for name, app in jobs.items()},
+                             {"a.md": "running", "b.md": "prepared", "c.md": "running"})
+            self.assertEqual(jobs["b.md"].state["error"], "Could not start: No space left on device.")
+            listed = {job["sourceFile"]: job for job in self.manager.job_list()}
+            self.assertTrue(listed["b.md"]["launchQueued"])
+            self.assertEqual((listed["b.md"]["canContinueStopped"], listed["b.md"]["continueStoppedLabel"]),
+                             (True, "Start now"))
+            # Not before its minute; then the server's retry loop starts it.
+            self.manager._retry_stop = threading.Event()
+            self.manager._retry_paused_jobs(now=jobs["b.md"].state["autoResumeAt"] - 1)
+            self.assertEqual(jobs["b.md"].state["phase"], "prepared")
+            self.manager._retry_paused_jobs(now=jobs["b.md"].state["autoResumeAt"] + 1)
+        self.assertEqual(jobs["b.md"].state["phase"], "running")
+        self.assertEqual(jobs["b.md"].state["error"], "")
+        self.assertEqual(len(calls), 4)
 
     def test_run_folders_stay_unique_when_jobs_start_together(self):
         count = 24
@@ -209,7 +231,7 @@ class FolderBatchTests(unittest.TestCase):
         # The batch route keeps the existing local-token protection and bounds.
         for request_headers, expected_status in (
             ({"Content-Type": "application/json"}, 403),
-            ({**headers, "Content-Length": str(server.MAX_DOCUMENT_REQUEST_BYTES + 1)}, 400),
+            ({**headers, "Content-Length": str(server.MAX_DOCUMENT_REQUEST_BYTES + 1)}, 413),
         ):
             connection.request("POST", "/direct-batch", body=b"{}", headers=request_headers)
             response = connection.getresponse()
@@ -234,7 +256,8 @@ let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides 
 let state = {phase: 'input', workflow: {settings: {}}};
 const values = {reviewModel:'gpt-6.1-sol',reviewEffort:'max',authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol',
   writerModel: 'gpt-5.6-luna', authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
-  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', thinkingHours: '168',
+  speedMode: 'fast', reasoningSummary: 'concise', criticRounds: '2', criticCount: '5', authorSubagents: '2',
+  thinkingHours: '168',
   retrievalMode: 'live', retrievalCutoffUtc: ''};
 const ui = new Proxy({}, {get(target, name) {
   return target[name] ||= {dataset: {}, value: values[name], scrollIntoView() { this.scrolled = true; }};
@@ -273,12 +296,14 @@ const checks = `
     statements: [{name: '02_cutquery_reachability', statement: 'Extensionless statement.'}, {name: 'A.md', statement: 'Prove A.'}, {name: 'b.md', statement: 'Prove B.'},
                  {name: 'c.MD', statement: 'Prove C.'}, {name: 'notes.txt', statement: 'Text statement.'},
                  {name: 'problem.tex', statement: 'TeX statement.'}],
-    empty: ['empty.md'], binary: [],
+    empty: ['empty.md'], binary: [], large: [],
   });
 
   await startFolderBatch(folder);
   assert.equal(questions.length, 1);
-  assert.match(questions[0], /^Start 6 parallel jobs\\? Each runs the selected workflow and uses its own quota\\./);
+  // All jobs share the same logins' limits (no job has a quota of its own), and a queue may hold some.
+  assert.match(questions[0], /^Start 6 parallel jobs\\? Each runs the selected workflow\\. All of them share the rate and usage limits of the same CLI logins and API keys; jobs beyond the running-jobs limit \\(Models & API\\) wait in a queue\\./);
+  assert.doesNotMatch(questions[0], /own quota/);
   assert.match(questions[0], /Folder: statements\\n/);
   assert.match(questions[0], /selected stages/);
   assert.match(questions[0], /Skipped 1 empty file: empty\\.md\\./);
@@ -293,7 +318,7 @@ const checks = `
     authorModel: 'gpt-6-astra', criticModel: 'gpt-5.6-sol', writerModel: 'gpt-5.6-luna',
     authorEffort: 'ultra', criticEffort: 'high', writerEffort: 'medium',
     promptOverrides: {critic: 'Shared critic.'},
-    criticRounds: 2, thinkingHours: 168,
+    criticRounds: 2, criticCount: 5, authorSubagents: 2, thinkingHours: 168,
     speedMode: 'fast', reasoningSummary: 'concise',
     retrievalMode: 'live', retrievalCutoffUtc: '',
   });
@@ -333,11 +358,18 @@ const checks = `
   assert.equal(ui.batchStatus.hidden, true);
   failure = null;
 
-  // Files the server could never accept are refused before reading or sending them.
+  // Files the server could never accept are skipped unread and listed; the others still start.
   const huge = {...file('big/huge.md', 'x'), size: 9 * 1024 * 1024};
   await startFolderBatch([huge]);
   assert.equal(sent.length, 3);
-  assert.match(ui.notice.textContent, /huge\\.md is larger than 8 MB/);
+  assert.match(ui.notice.textContent, /Skipped 1 file too large for one statement \\(over 8 MB or 2,000,000 characters\\): huge\\.md\\./);
+  questions = [];
+  await startFolderBatch([huge, file('big/long.md', 'x'.repeat(2000001)), file('big/a.md', 'Prove A.')]);
+  assert.equal(sent.length, 4);
+  assert.deepEqual(sent[3].body.statements.map(item => item.name), ['a.md']);
+  assert.match(questions[0], /Skipped 2 files too large for one statement \\(over 8 MB or 2,000,000 characters\\): huge\\.md, long\\.md\\./);
+  assert.equal(ui.batchStatus.textContent, 'Started 1 job from big.\\nSkipped 2 files too large for one statement '
+    + '(over 8 MB or 2,000,000 characters): huge.md, long.md.');
 })();
 `;
 Promise.resolve(vm.runInNewContext(setup + code + checks, {assert, TextEncoder}))

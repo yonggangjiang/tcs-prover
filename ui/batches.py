@@ -12,7 +12,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import stat
 import threading
 
@@ -23,9 +22,12 @@ MAX_TRACE_BYTES = 2 * 1024 * 1024
 MAX_TRACE_RECORDS = 1500
 RUN_MARKERS = ('job-settings.json', 'transcript.jsonl', 'draft.md', 'checked-statement.md')
 DOWNLOADS = {'transcript.jsonl', 'final.tex', 'final.pdf'}
-MEMORY_FILES = {'INITIAL_PROMPT.md', 'APPROACHES.md', 'PROVED.md', 'audit.md'}
-APPROACH_FILE = re.compile(r'APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z')
-AUDIT_FILE = re.compile(r'(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z')
+# A queued job that never started may already hold the controller's notes about it (its related works,
+# a time limit set while it waited), as small transcript records; only then is its transcript read for
+# a list, and at most this much of it.
+MAX_NOTES_BYTES = 256 * 1024
+# The controller's own copies of a conversation and a related-works record are read up to this size.
+MAX_CONTROLLER_BYTES = 16 * 1024 * 1024
 
 
 def _component(value):
@@ -51,6 +53,47 @@ def _finite_number(value):
 def _timestamp(value):
     parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def job_tone(job):
+    """One job row's status, classified as jobTone and completedRunOutcome in app.js classify it.
+
+    "running", "paused", "queued" (waiting for a running slot), "waiting" (for the user), or a finished
+    job's tone: "done" for every successful outcome (counted under Complete), else "failed" or
+    "stopped" (both counted under Incomplete).
+    """
+    phase = job.get('phase')
+    if phase in {'reviewing', 'running', 'stopping', 'pausing'}:
+        return 'running'
+    if phase == 'paused':
+        return 'paused'
+    if phase == 'prepared' and job.get('launchQueued'):
+        return 'queued'
+    if phase in {'reviewed', 'prepared'}:
+        return 'waiting'
+    if job.get('manuallyStopped'):
+        return 'stopped'
+    if phase != 'done' or job.get('interrupted'):
+        return 'failed'
+    kind = job.get('resultKind')
+    if kind == 'review' or job.get('statementReviewOnly'):
+        return 'done'
+    if kind in {'needs-revision', 'failure'} or job.get('revisionRequired') or job.get('error'):
+        return 'failed'
+    return 'done' if kind in {'proof', 'final'} or job.get('canDownloadTex') else 'failed'
+
+
+def batch_counts(rows):
+    """A batch card's counts, each job once: by phase, except that a finished job counts as "done" only
+    for a successful outcome (the check mark) and as "incomplete" otherwise (failed, stopped or
+    interrupted), as the batch page's Complete and Incomplete filters count them."""
+    counts = {}
+    for row in rows:
+        phase = row.get('phase') or 'unknown'
+        if phase == 'done' and job_tone(row) != 'done':
+            phase = 'incomplete'
+        counts[phase] = counts.get(phase, 0) + 1
+    return counts
 
 
 def _active_seconds(phase, settings, pause, started, end):
@@ -134,16 +177,25 @@ class BatchCatalog:
                 yield stream
 
     def _read(self, directory, name, limit=MAX_ARTIFACT_BYTES):
+        """A saved text file; '' when it is missing, unreadable or (with a ``limit``) larger than it."""
         try:
             with self._open(directory, name) as stream:
-                raw = stream.read(limit + 1)
-            return raw.decode('utf-8') if len(raw) <= limit else ''
+                raw = stream.read() if limit is None else stream.read(limit + 1)
+            return raw.decode('utf-8') if limit is None or len(raw) <= limit else ''
         except (OSError, ValueError, UnicodeError):
             return ''
 
-    def _json(self, directory, name):
+    def _too_large(self, directory, name):
+        """A notice for a saved file too large to show here, else ''."""
+        info = self._info(directory, name)
+        if info is None or info.st_size <= MAX_ARTIFACT_BYTES:
+            return ''
+        return (f'{name} is too large to show here ({info.st_size / 1048576:.1f} MB). '
+                f'See {name} in the run folder {directory}.')
+
+    def _json(self, directory, name, limit=MAX_ARTIFACT_BYTES):
         try:
-            value = json.loads(self._read(directory, name))
+            value = json.loads(self._read(directory, name, limit))
             return value if isinstance(value, dict) else {}
         except (ValueError, TypeError):
             return {}
@@ -237,10 +289,8 @@ class BatchCatalog:
         for identity, directory in self._batches().items():
             jobs = self._runs(directory)
             started = [self._started_at(job, self._json(job, 'job-settings.json')) for job in jobs]
-            counts = {'running': 0, 'done': 0, 'paused': 0, 'prepared': 0}
-            for path in jobs:
-                phase = self._summary(path)['phase']
-                counts[phase] = counts.get(phase, 0) + 1
+            counts = {'running': 0, 'done': 0, 'paused': 0, 'prepared': 0, 'incomplete': 0,
+                      **batch_counts([self._summary(path) for path in jobs])}
             name = 'Original batch' if identity == ORIGINAL_BATCH else directory.name
             cards.append({'id': identity, 'name': name, 'label': name,
                           'folder': 'runs' if identity == ORIGINAL_BATCH else 'runs/' + directory.name,
@@ -250,14 +300,15 @@ class BatchCatalog:
         return sorted(cards, key=lambda card: (not card['current'], card['id'] != ORIGINAL_BATCH, card['label']))
 
     def _summary(self, directory):
-        from .server import saved_workflow_stages
+        from .server import saved_convention_warning, saved_workflow_stages
 
-        settings = self._json(directory, 'job-settings.json')
+        # Controller state is read whole: a paused job must never look finished.
+        settings = self._json(directory, 'job-settings.json', None)
         try:
             selected = saved_workflow_stages(settings)
         except ValueError:
             selected = saved_workflow_stages({key: value for key, value in settings.items() if key != 'workflowStages'})
-        pause = self._json(directory, 'pause.json')
+        pause = self._json(directory, 'pause.json', None)
         stopped = self._json(directory, 'manual-stop.json')
         draft = self._read(directory, 'draft.md').strip()
         if draft.startswith('# Draft problem'):
@@ -270,10 +321,12 @@ class BatchCatalog:
         phase = 'paused' if _text(pause.get('status')) in {'paused', 'pausing'} else 'done'
         if (final and final.st_size) or (proof and proof.st_size):
             phase = 'done'
-        if settings.get('preparedRun') is True and (trace_info is None or not trace_info.st_size) and not final and not proof and not failed:
+        if (settings.get('preparedRun') is True and self._never_started(directory, trace_info)
+                and not final and not proof and not failed):
             phase, started = 'prepared', ''
         stage = _text(stopped.get('stage') or pause.get('stage'))
-        active_node = _text(pause.get('node')) or {
+        # A stop marker names the step it stopped (the compile step, not only the writing stage).
+        active_node = _text(stopped.get('node')) or _text(pause.get('node')) or {
             'review': 'statement_reviewer', 'solve': 'author', 'repair': 'author',
             'critic': 'critic', 'final': 'latex_editor', 'failure': 'failure_summary',
         }.get(stage, '')
@@ -281,11 +334,22 @@ class BatchCatalog:
         # Lists never read transcripts, so the transcript's mtime ends the segment.
         elapsed = _active_seconds(phase, settings, pause, started, last_activity)
         retrieval = self._retrieval_settings(directory, settings)
+        # Its last checkpoint says it was running: the run stopped part-way (a crash or a restart).
+        interrupted = (phase == 'done' and not stopped and not (final and final.st_size)
+                       and not (failed and failed.st_size) and _text(pause.get('status')) == 'running')
+        # Why a paused job paused (the time limit, the user, an error, ...), as the live job page says it.
+        cause = _text(pause.get('pauseCause')) if phase == 'paused' else ''
+        # The convention critic's loophole warning as the job saved it; the list tags it until it was ignored.
+        warning = saved_convention_warning(settings.get('conventionWarning'))
         return {'runId': directory.name, 'phase': phase, 'draft': draft, 'title': draft.split('\n', 1)[0],
                 'sourceFile': _text(settings.get('sourceFile')), 'startedAt': started,
                 'lastActivityAt': last_activity, 'finishedAt': last_activity,
                 'stage': stage, 'activeNode': active_node, 'stageLabel': '',
-                'error': 'Stopped.' if stopped else _text(pause.get('error')),
+                'error': 'Stopped.' if stopped else _text(pause.get('error')) or (
+                    'Interrupted: the run stopped part-way, while its last checkpoint says it was running.'
+                    if interrupted else ''),
+                'interrupted': interrupted,
+                'pauseCause': cause if cause in {'error', 'user', 'interrupted', 'restart', 'time-limit'} else '',
                 'manuallyStopped': bool(stopped), 'stoppedStage': _text(stopped.get('stage')),
                 'problemMode': _text(settings.get('problemMode')) or 'statement',
                 'workflowStages': selected, 'revisionRequired': settings.get('revisionRequired') is True,
@@ -294,12 +358,68 @@ class BatchCatalog:
                                else 'needs-revision' if failed and settings.get('revisionRequired') is True
                                else 'failure' if failed and failed.st_size else
                                'review' if settings.get('resultKind') == 'review' else ''),
+                'conventionWarning': warning, 'loopholeWarning': bool(warning and not warning['dismissed']),
                 'settingsWarning': '', 'launchHold': _text(settings.get('launchHold')),
                 'retrieval': retrieval, 'retrievalMode': retrieval['mode'],
                 'retrievalCutoffUtc': retrieval['cutoffExclusiveUtc'], 'retrievalPolicyPath': '',
                 'workerActive': False, 'processAlive': False, 'activeElapsedSeconds': elapsed,
                 'canResumeCritic': False, 'canContinueStopped': False, 'checkpoints': [],
                 'readOnly': True, 'readOnlyReason': 'Saved batch — viewing does not resume or change this job.'}
+
+    def _never_started(self, directory, trace_info):
+        """Whether a transcript holds only the controller's notes about a job (restore_saved_app skips them too)."""
+        from .server import controller_note
+
+        if trace_info is None or not trace_info.st_size:
+            return True
+        if trace_info.st_size > MAX_NOTES_BYTES:
+            return False
+        lines = self._read(directory, 'transcript.jsonl', MAX_NOTES_BYTES).splitlines()
+        try:
+            records = [json.loads(line) for line in lines if line.strip()]
+        except ValueError:
+            return False
+        return bool(records) and all(isinstance(record, dict) and (controller_note(record)
+                                                                   or record.get('label') == 'Total time limit set')
+                                     for record in records)
+
+    def _controller_json(self, directory, name):
+        """A file of the controller's folder of one saved run (runs/.controller/<run>); {} when unreadable."""
+        from .server import CONTROLLER_FOLDER
+
+        return self._json(directory.parent, f'{CONTROLLER_FOLDER}/{directory.name}/{name}', MAX_CONTROLLER_BYTES)
+
+    def _conversation(self, directory, reason):
+        """The saved summaries, messages and replies of a run, as the job page lists them (nothing can be sent).
+
+        A conversation too large to read here gets a notice instead of its items.
+        """
+        from .server import CONTROLLER_FOLDER, CONVERSATION_FILENAME, saved_conversation_items
+
+        conversation = {'available': False, 'reason': reason, 'busy': False, 'readOnly': True, 'items': []}
+        info = self._info(directory.parent, f'{CONTROLLER_FOLDER}/{directory.name}/{CONVERSATION_FILENAME}')
+        if info is not None and info.st_size > MAX_CONTROLLER_BYTES:
+            path = directory.parent / CONTROLLER_FOLDER / directory.name / CONVERSATION_FILENAME
+            conversation['notice'] = (f'The saved conversation is too large to show here ({info.st_size / 1048576:.1f} MB). '
+                                      f'See {path}.')
+            return conversation
+        conversation['items'] = [{**item, 'status': 'stopped' if item['status'] in {'queued', 'running'} else item['status']}
+                                 for item in saved_conversation_items(self._controller_json(directory, CONVERSATION_FILENAME))]
+        return conversation
+
+    def _related_works(self, directory, settings, reason):
+        """A saved run's related works, as the job page lists them (none can be added)."""
+        from . import related_works
+        from .server import CONTROLLER_FOLDER
+
+        workspace = directory
+        saved = Path(_text(settings.get('goalWorkspace')) or directory)
+        # A continuation reads its source's related works, when that run is in the same saved batch.
+        if saved.is_absolute() and saved.parent == directory.parent and self._directory(saved):
+            workspace = saved
+        manifest = workspace.parent / CONTROLLER_FOLDER / workspace.name
+        items = related_works.listing(workspace, manifest) if self._directory(manifest) else []
+        return {'available': False, 'reason': reason, 'count': len(items), 'items': items, 'batch': None}
 
     def jobs(self, batch_id):
         return sorted(({**self._summary(path), 'batchId': batch_id}
@@ -343,12 +463,13 @@ class BatchCatalog:
             return [], False, 0
 
     def state(self, batch_id, run_id, after=None):
-        from .server import (empty_state, event_node, model_menu_settings, saved_api_models, workflow_graph)
+        from .server import (RESUME_MARGIN_SECONDS, controller_note, empty_state, event_node, follow_time_limit,
+                             model_menu_settings, saved_api_models, saved_time_limit_history, workflow_graph)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
         state['batchId'] = batch_id
-        settings = self._json(directory, 'job-settings.json')
+        settings = self._json(directory, 'job-settings.json', None)
         policy_path = _text(settings.get('retrievalPolicyPath'))
         if policy_path:
             from .retrieval import public_retrieval_info
@@ -369,11 +490,15 @@ class BatchCatalog:
         for key in ('preparedRun', 'skipStatementReview', 'statementReviewOnly'):
             if isinstance(settings.get(key), bool):
                 state[key] = settings[key]
-        for key in ('thinkingHours', 'criticRounds'):
+        for key in ('thinkingHours', 'criticRounds', 'criticCount', 'authorSubagents'):
             if _finite_number(settings.get(key)):
                 state[key] = settings[key]
+        state['criticCountRecorded'] = _finite_number(settings.get('criticCount'))
+        state['authorSubagentsRecorded'] = _finite_number(settings.get('authorSubagents'))
         for role in ('review', 'author', 'critic', 'final'):
-            prompt = self._read(directory, f'prompts/{role}.txt')
+            # Never the current default in place of a saved prompt that is too large to show.
+            prompt = (self._too_large(directory, f'prompts/{role}.txt')
+                      or self._read(directory, f'prompts/{role}.txt'))
             if prompt:
                 state[role + 'Prompt'] = prompt
         checked = self._read(directory, 'checked-statement.md').replace('\r\n', '\n').lstrip()
@@ -393,9 +518,15 @@ class BatchCatalog:
         graph = state['workflow']
         state['workflow'] = {**graph, 'settings': {**graph['settings'], **model_menu_settings()}}
         records, truncated, version = self._trace(directory)
+        # The time limit's history: the job settings keep it whole; older jobs rebuild it from recent records.
+        history = saved_time_limit_history(settings.get('timeLimitHistory'))
+        rebuild = not history
         for record in records:
+            if rebuild:
+                follow_time_limit(history, record)
             kind = _text(record.get('kind'))
-            if isinstance(record.get('stage'), str) and record['stage']:
+            # The controller's notes (the paused author's replies, related works) are not workflow steps.
+            if isinstance(record.get('stage'), str) and record['stage'] and not controller_note(record):
                 state['stage'] = record['stage']
                 state['activeNode'] = event_node({'stage': record['stage'], 'node': _text(record.get('node'))}, state['activeNode'])
             if type(record.get('round')) is int:
@@ -414,10 +545,16 @@ class BatchCatalog:
             if not truncated:
                 state['startedAt'] = _text(records[0].get('time')) or state['startedAt']
         state['activeElapsedSeconds'] = _active_seconds(
-            state['phase'], settings, self._json(directory, 'pause.json'),
+            state['phase'], settings, self._json(directory, 'pause.json', None),
             state['startedAt'], state['lastActivityAt'])
+        # As App._time_limit_exhausted_locked: a paused author whose limit is used up.
+        hours = state.get('thinkingHours') if _finite_number(state.get('thinkingHours')) else 0
+        state['timeLimitExhausted'] = bool(
+            state['phase'] == 'paused' and state['workflowStages']['author'] and state['activeNode'] == 'author'
+            and hours > 0 and hours * 3600 - state['activeElapsedSeconds'] < RESUME_MARGIN_SECONDS)
         for filename in ('final.tex', 'proof-output.md', 'failure-summary.md', 'partial-output.md', 'SOLUTION.md'):
-            output = self._read(directory, filename)
+            # A file too large to show is named, never replaced by another file.
+            output = self._too_large(directory, filename) or self._read(directory, filename)
             if output:
                 state['output'] = output
                 break
@@ -432,7 +569,10 @@ class BatchCatalog:
                                 'transcript.jsonl in its run folder; read it with '
                                 'python3 transcript/view_transcript.py <run folder>.'
                                 if truncated else '')
+        state['timeLimitHistory'] = history
         state['processHealthSource'] = 'Saved batch (read only)'
+        state['conversation'] = self._conversation(directory, state['readOnlyReason'])
+        state['relatedWorks'] = self._related_works(directory, settings, state['readOnlyReason'])
         return state
 
     def artifact(self, batch_id, run_id, name):
@@ -467,10 +607,6 @@ class BatchCatalog:
             except (ValueError, TypeError):
                 raise ValueError('Invalid saved transcript position.') from None
             body = self.state(batch, job, after)
-        elif path == '/memory':
-            body = self.memory(batch, job, query.get('file', ''), query.get('version', ''))
-        elif path == '/approach-graph':
-            body = self.approach_graph(batch, job)
         elif path in {'/transcript', '/download-tex', '/download-pdf'}:
             name = {'/transcript': 'transcript.jsonl', '/download-tex': 'final.tex',
                     '/download-pdf': 'final.pdf'}[path]
@@ -481,60 +617,3 @@ class BatchCatalog:
         else:
             raise ValueError('Unknown saved batch request.')
         return body, content_type, headers
-
-    def memory(self, batch_id, run_id, name, version=''):
-        directory = self._run(batch_id, run_id)
-        if not isinstance(name, str):
-            raise ValueError('Unknown research memory file.')
-        approach = name in {'APPROACHES', 'APPROACHES.md'} or bool(APPROACH_FILE.fullmatch(name))
-        audit = name in {'AUDITS', 'audit_history', 'audit.md'} or bool(AUDIT_FILE.fullmatch(name))
-        if name not in MEMORY_FILES and not approach and not audit:
-            raise ValueError('Unknown research memory file.')
-        result = {'name': name, 'status': 'missing', 'workspace': directory.name}
-        if approach or audit:
-            folder = 'APPROACHES' if approach else 'audit_history' if name == 'audit.md' or name.startswith('audit_history') else 'AUDITS'
-            matcher = APPROACH_FILE if approach else AUDIT_FILE
-            location = directory / folder
-            entries = []
-            if self._directory(location):
-                try:
-                    entries = [f'{folder}/{entry.name}' for entry in location.iterdir()
-                               if matcher.fullmatch(f'{folder}/{entry.name}')
-                               and self._info(directory, f'{folder}/{entry.name}') is not None]
-                except OSError:
-                    pass
-            entries.sort(reverse=not approach)
-            if approach:
-                index = next((item for item in entries if Path(item).name in {'index.md', 'INDEX.md'}), '')
-                entries = ([index] if index else []) + [item for item in entries if item != index]
-            legacy = 'APPROACHES.md' if approach else 'audit.md'
-            if (approach or folder == 'audit_history') and self._info(directory, legacy) is not None:
-                entries.append(legacy)
-            result['files'] = entries
-            if name in {'APPROACHES', 'AUDITS', 'audit_history'}:
-                if not entries:
-                    return result
-                name = entries[0]
-                result['name'] = name
-        info = self._info(directory, name)
-        if info is None:
-            return result
-        current = f'{info.st_ino}:{info.st_mtime_ns}:{info.st_size}'
-        result.update(status='ready', version=current, modifiedAt=_iso(info.st_mtime))
-        if version == current:
-            return {**result, 'unchanged': True}
-        if info.st_size > MAX_ARTIFACT_BYTES:
-            return {**result, 'status': 'unavailable'}
-        return {**result, 'content': self._read(directory, name)}
-
-    def approach_graph(self, batch_id, run_id):
-        from .server import approach_metadata
-        listing = self.memory(batch_id, run_id, 'APPROACHES')
-        files = listing.get('files', [])
-        nodes = []
-        for name in files:
-            if re.fullmatch(r'APPROACHES/A\d{3,}(?:-[A-Za-z0-9_-]+)?\.md', name):
-                document = self.memory(batch_id, run_id, name)
-                nodes.append({**approach_metadata(name, document.get('content', '')), 'readStatus': document['status']})
-        return {'nodes': nodes, 'files': files, 'status': listing['status'],
-                'indexFile': next((name for name in files if Path(name).name in {'index.md', 'INDEX.md'}), '')}

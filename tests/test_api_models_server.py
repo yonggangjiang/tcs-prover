@@ -21,6 +21,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import providers
 from ui import batches, cli, retrieval, review, server
@@ -53,8 +54,18 @@ class MockEndpoint:
                     return self.reply(200, {"output_text": "late"})
                 if self.path.startswith("/redirect"):
                     return self.reply(307, {}, location="/target/v1/responses")
+                if self.path.startswith("/basic") and body.get("stream"):
+                    # Accepts only the minimal request, as some gateways do.
+                    return self.reply(400, {"error": {"message": "Unsupported parameter: 'tools'.",
+                                                      "type": "invalid_request_error"}})
                 if self.path.endswith("/responses"):
                     offered = headers.get("authorization", "").removeprefix("Bearer ") or headers.get("x-gateway-key", "")
+                    if offered == KEY and body.get("stream"):
+                        return self.events([
+                            {"type": "response.created", "response": {"model": "gpt-gateway-2026"}},
+                            {"type": "response.output_text.delta", "delta": '{"ok": '},
+                            {"type": "response.output_text.delta", "delta": "true}"},
+                            {"type": "response.completed", "response": {"model": "gpt-gateway-2026"}}])
                     if offered == KEY:
                         return self.reply(200, {"id": "resp_1", "model": "gpt-gateway-2026", "status": "completed",
                                                 "output": [{"type": "message", "content": [
@@ -64,12 +75,29 @@ class MockEndpoint:
                                                       "type": "invalid_request_error"}})
                 if self.path.endswith("/v1/messages"):
                     offered = headers.get("x-api-key") or headers.get("authorization", "").removeprefix("Bearer ")
+                    if offered == ANTHROPIC_KEY and body.get("stream"):
+                        return self.events([
+                            {"type": "message_start", "message": {"model": "claude-gateway"}},
+                            {"type": "content_block_start", "index": 0,
+                             "content_block": {"type": "tool_use", "name": "StructuredOutput", "input": {}}},
+                            {"type": "content_block_delta", "index": 0,
+                             "delta": {"type": "input_json_delta", "partial_json": '{"ok": true}'}},
+                            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+                            {"type": "message_stop"}])
                     if offered == ANTHROPIC_KEY:
                         return self.reply(200, {"type": "message", "model": "claude-gateway",
                                                 "content": [{"type": "text", "text": "OK"}]})
                     return self.reply(401, {"type": "error", "error": {
                         "type": "authentication_error", "message": f"invalid x-api-key {offered}"}})
                 return self.reply(404, {"error": {"message": "no such route"}})
+
+            def events(self, events):
+                raw = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
 
             def reply(self, status, value, location=None):
                 raw = json.dumps(value).encode()
@@ -244,11 +272,16 @@ class ApiModelEndpointTests(HttpCase):
         self.assertEqual(value["error"], "Gateway is in use by a running job. Stop that job before removing "
                                          "this API model.")
         self.assertTrue(providers.is_known(model["id"]))
+        # A job waiting to resume cannot change its model, so the model stays until no job waits for it.
         app.state["phase"] = "paused"
         status, value = self.call("/api-models/delete", {"id": model["id"]})
-        self.assertEqual(status, 200)
-        self.assertEqual(value["warning"], "1 job waiting to start or resume still uses Gateway; it cannot "
-                                           "continue until you add it again with the same format, base URL and model ID.")
+        self.assertEqual(status, 400)
+        self.assertEqual(value["error"], "Gateway is used by 1 job waiting to start or resume, which cannot "
+                                         "continue without it. Edit the connection instead, or delete that job first.")
+        self.assertTrue(providers.is_known(model["id"]))
+        app.state["phase"] = "done"
+        status, value = self.call("/api-models/delete", {"id": model["id"]})
+        self.assertEqual((status, value["warning"]), (200, ""))
         self.assertFalse(providers.is_known(model["id"]))
 
     def test_format_change_is_refused_while_jobs_use_the_model(self):
@@ -277,7 +310,8 @@ class ApiModelEndpointTests(HttpCase):
         app = self.new_app()
         self.http.jobs[app.state["runId"]] = app
         app.state.update(phase=phase, criticModel=model, apiModels=server.api_model_snapshot([model]))
-        self.assertEqual(self.call("/api-models/delete", {"id": model})[0], 200)
+        # Removed outside the page (the page refuses it while a job waits for the model).
+        self.assertTrue(providers.delete_api_model(model))
         return model, app
 
     def test_adding_a_removed_model_again_restores_its_id_whatever_its_name(self):
@@ -297,8 +331,8 @@ class ApiModelEndpointTests(HttpCase):
                 status, value = self.call("/api-models", {**endpoint, "label": label})
                 self.assertEqual((status, value["model"]["id"], value["model"]["label"]), (200, model, expected))
                 app._check_launch_models_locked()  # Resume and Approve can launch again.
-                self.assertEqual(self.call("/api-models/delete", {"id": model})[0], 200)
                 del self.http.jobs[app.state["runId"]]
+                self.assertEqual(self.call("/api-models/delete", {"id": model})[0], 200)
         # Other settings are another model, with an id of its own.
         model, app = self.removed_model_job()
         status, value = self.call("/api-models", {**endpoint, "model": "gpt-other", "label": "Other"})
@@ -367,9 +401,10 @@ class CatalogTests(HttpCase):
         self.assertEqual(rows[anthropic["id"]]["efforts"], list(providers.CLAUDE_EFFORTS))
         efforts = settings["model_efforts"]
         self.assertTrue(set(rows) | set(runtime.LEGACY_MODELS) <= set(efforts))
+        # Ultra is no longer offered by any model.
         self.assertNotIn("ultra", efforts["claude-haiku-5-5"])
         self.assertNotIn("ultra", efforts["gpt-6-luna"])
-        self.assertIn("ultra", efforts["gpt-6.1-sol"])
+        self.assertNotIn("ultra", efforts["gpt-6.1-sol"])
         # The keys the current UI reads are unchanged.
         self.assertEqual(settings["models"], list(runtime.OFFERED_MODELS))
         self.assertEqual(settings["model"], runtime.MODEL)
@@ -408,18 +443,25 @@ class ProbeTests(HttpCase):
         return providers.save_api_model({"format": "openai", "baseUrl": self.endpoint.base + "/v1",
                                          "model": "gpt-gateway", "apiKey": KEY, "label": "Local", **values})
 
-    def test_openai_success_sends_one_request_and_records_the_result(self):
+    def test_openai_success_sends_a_request_shaped_like_a_run_and_records_the_result(self):
         model = self.saved()
         status, result = self.call("/api-models/test", {"id": model["id"]})
         self.assertEqual(status, 200)
-        self.assertEqual({key: result[key] for key in ("ok", "status", "message", "model", "recorded")},
-                         {"ok": True, "status": 200, "message": "The model replied: OK", "model": "gpt-gateway-2026",
-                          "recorded": True})
+        self.assertEqual({key: result[key] for key in ("ok", "status", "message", "model", "recorded", "effort")},
+                         {"ok": True, "status": 200, "message": 'The model replied with the requested JSON: {"ok": true}',
+                          "model": "gpt-gateway-2026", "recorded": True, "effort": "max"})
         self.assertIsInstance(result["latencyMs"], int)
         [request] = self.endpoint.requests
         self.assertEqual(request["path"], "/v1/responses")
         self.assertEqual(request["headers"]["authorization"], f"Bearer {KEY}")
-        self.assertEqual(request["body"], {"model": "gpt-gateway", "input": "Reply with OK.", "max_output_tokens": 16})
+        self.assertEqual(request["headers"]["accept"], "text/event-stream")
+        body = request["body"]
+        # Streamed, one tool, a JSON answer (the prompt contract Codex uses for these models), at the effort.
+        self.assertEqual((body["model"], body["stream"], body["reasoning"]["effort"], body["tool_choice"]),
+                         ("gpt-gateway", True, "max", "auto"))
+        self.assertEqual([tool["name"] for tool in body["tools"]], ["report_result"])
+        self.assertIn('{"ok": true}', body["input"][0]["content"])
+        self.assertNotIn("max_output_tokens", body)
         last = providers.api_model(model["id"])["lastTest"]
         self.assertEqual((last["ok"], last["status"], last["latencyMs"]), (True, 200, result["latencyMs"]))
         self.assertEqual(result["apiModel"]["lastTest"], last)
@@ -432,13 +474,31 @@ class ProbeTests(HttpCase):
                                                   "model": "claude-gw", "apiKey": ANTHROPIC_KEY})
                 status, result = self.call("/api-models/test", {"id": model["id"]})
                 self.assertEqual((status, result["ok"], result["model"]), (200, True, "claude-gateway"))
+                self.assertEqual(result["message"], 'The model answered through the StructuredOutput tool: {"ok": true}')
                 [request] = self.endpoint.requests
                 self.assertEqual(request["path"], "/v1/messages")
                 self.assertEqual(request["headers"]["x-api-key"], ANTHROPIC_KEY)
                 self.assertEqual(request["headers"]["anthropic-version"], "2023-06-01")
                 self.assertNotIn("authorization", request["headers"])
-                self.assertEqual(request["body"], {"model": "claude-gw", "max_tokens": 16,
-                                                   "messages": [{"role": "user", "content": "Reply with OK."}]})
+                body = request["body"]
+                # The Claude CLI's structured output tool, its output budget and the effort, streamed.
+                self.assertEqual((body["stream"], body["max_tokens"], body["output_config"], body["tool_choice"]),
+                                 (True, 32000, {"effort": "max"}, {"type": "auto"}))
+                self.assertEqual([tool["name"] for tool in body["tools"]], ["StructuredOutput"])
+                providers.save_api_model({"id": model["id"], "maxOutputTokens": 8000})
+                self.endpoint.requests.clear()
+                self.call("/api-models/test", {"id": model["id"]})
+                self.assertEqual(self.endpoint.requests[0]["body"]["max_tokens"], 8000)
+
+    def test_an_endpoint_that_refuses_the_shape_of_run_requests_is_named_as_such(self):
+        model = self.saved(baseUrl=self.endpoint.base + "/basic")
+        status, result = self.call("/api-models/test", {"id": model["id"]})
+        self.assertEqual((status, result["ok"], result["status"]), (200, False, 400))
+        self.assertEqual(result["message"], "The endpoint answers a minimal request but refuses the requests runs "
+                                            "send (streamed, with a tool and a JSON answer at max effort): "
+                                            "Unsupported parameter: 'tools'.")
+        # The representative request, then one minimal request.
+        self.assertEqual([request["body"].get("stream", False) for request in self.endpoint.requests], [True, False])
 
     def test_request_source_reaches_the_router_without_changing_authentication(self):
         model = self.saved(headerName="Zephy-TCS-Prover", requestSource="Zephy-TCS-Prover", label="Local menu only")
@@ -628,9 +688,10 @@ class LaunchValidationTests(StoreCase):
                                     else which(name, *a, **k))
         with present:
             options = self.options(author_model="claude-opus-5-5", author_effort="ultra", speed_mode="fast")
-        # Claude lists no Ultra: it runs at Max. Fast stays saved; the runner runs Claude standard.
+        # Ultra is retired: it is kept as given and runs at Max. Fast stays saved; the runner runs Claude standard.
         self.assertEqual((options["authorModel"], options["authorEffort"], options["speedMode"]),
-                         ("claude-opus-5-5", "max", "fast"))
+                         ("claude-opus-5-5", "ultra", "fast"))
+        self.assertEqual(runtime.effective_effort("claude-opus-5-5", options["authorEffort"]), "max")
         self.assertNotIn("apiModels", options)
 
     def test_web_cutoff_timestamps_require_native_codex_models(self):
@@ -753,7 +814,7 @@ class RemovedModelRestoreTests(StoreCase):
         self.assertTrue(app.state["settingsWarning"].startswith(
             "Proof author and LaTeX editor: DeepSeek is no longer supported; this role now uses GPT 6.1 Sol."))
 
-    def test_an_error_paused_deepseek_job_waits_for_an_explicit_resume(self):
+    def test_an_error_paused_deepseek_job_resumes_with_the_replacement_and_keeps_the_warning(self):
         pause = {"status": "paused", "node": "author", "stage": "solve", "state": {"statement": "Saved statement"},
                  "pauseCause": "error", "error": "Network error", "elapsedSeconds": 30, "autoResumeAt": 0}
         record = {"kind": "request", "stage": "solve", "label": "Exact solve input", "model": "deepseek-v4-pro",
@@ -765,16 +826,25 @@ class RemovedModelRestoreTests(StoreCase):
         jobs = server.restore_saved_jobs(self.runs)
         replaced, unchanged = jobs["deepseek"], jobs["codex"]
         self.assertEqual((replaced.state["phase"], unchanged.state["phase"]), ("paused", "paused"))
-        self.assertEqual(replaced.state["autoResumeAt"], 0)
+        self.assertGreater(replaced.state["autoResumeAt"], 0)
         self.assertGreater(unchanged.state["autoResumeAt"], 0)
-        self.assertEqual(replaced.state["settingsWarning"],
-                         "Proof author: DeepSeek is no longer supported; this role now uses GPT 6.1 Sol. Automatic "
-                         "retry is off; choose Resume to continue with the replacement.")
-        saved = json.loads((self.runs / "deepseek" / server.PAUSE_FILENAME).read_text(encoding="utf-8"))
-        self.assertEqual(saved["autoResumeAt"], 0)
-        self.assertFalse(replaced.auto_resume_if_due(lambda: self.fail("resumed"), now=saved.get("autoResumeAt", 0) + 10**9))
+        warning = "Proof author: DeepSeek is no longer supported; this role now uses GPT 6.1 Sol."
+        self.assertEqual(replaced.state["settingsWarning"], warning)
+        self.assertEqual(replaced.state["authorModel"], "gpt-6.1-sol")
+        # The retry resumes with the documented replacement.
+        resumed = []
+        self.assertTrue(replaced.auto_resume_if_due(lambda: resumed.append(1),
+                                                    now=replaced.state["autoResumeAt"] + 1))
+        self.assertEqual(resumed, [1])
+        # Its settings are rewritten once with the replacement, and the warning survives restarts.
+        replaced._save_job_settings(replaced.state)
+        settings = json.loads((self.runs / "deepseek" / server.JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual((settings["authorModel"], settings["replacedRoles"]), ("gpt-6.1-sol", ["author"]))
+        again = server.restore_saved_jobs(self.runs)["deepseek"]
+        self.assertEqual(again.state["settingsWarning"], warning)
+        self.assertGreater(again.state["autoResumeAt"], 0)
 
-    def test_a_job_whose_api_model_was_removed_waits_for_an_explicit_resume(self):
+    def test_a_job_whose_api_model_was_removed_keeps_checking_until_it_is_added_again(self):
         pause = {"status": "paused", "node": "author", "stage": "solve", "state": {"statement": "Saved statement"},
                  "pauseCause": "error", "error": "Network error", "elapsedSeconds": 30, "autoResumeAt": 0}
         record = {"kind": "request", "stage": "solve", "label": "Exact solve input", "model": "api:gone",
@@ -783,15 +853,24 @@ class RemovedModelRestoreTests(StoreCase):
                     "writerModel": "gpt-6.1-sol", "thinkingHours": 24}
         self.saved_run("gone", settings, [record], pause)
         app = server.restore_saved_jobs(self.runs)["gone"]
-        self.assertEqual((app.state["phase"], app.state["autoResumeAt"]), ("paused", 0))
+        self.assertEqual(app.state["phase"], "paused")
+        self.assertGreater(app.state["autoResumeAt"], 0)
         self.assertEqual(app.state["settingsWarning"],
                          "The API model api:gone chosen for the proof author is not configured. Add it again under "
                          "New problem → Advanced settings → API connections with the display name “gone” to continue "
-                         "this job. Automatic retry is off; choose Resume once the model is configured.")
-        self.assertEqual(json.loads((self.runs / "gone" / server.PAUSE_FILENAME).read_text())["autoResumeAt"], 0)
-        self.assertFalse(app.auto_resume_if_due(lambda: self.fail("resumed"), now=10**12))
+                         "this job. The job checks again every 1 minute and continues by itself once the model is "
+                         "configured.")
+        attempts, due = [], app.state["autoResumeAt"]
+        self.assertTrue(app.auto_resume_if_due(lambda: attempts.append(1), now=due))
+        self.assertEqual(attempts, [])
+        self.assertEqual(app.attention()["kind"], "settings")
+        # Added again with that id: the next check resumes it.
+        self.openai_model(id="api:gone", label="gone")
+        self.assertTrue(app.auto_resume_if_due(lambda: attempts.append(1), now=app.state["autoResumeAt"]))
+        self.assertEqual(attempts, [1])
+        self.assertIsNone(app.attention())
 
-    def test_automatic_resume_stops_when_a_model_is_removed_while_waiting(self):
+    def test_automatic_resume_waits_while_a_model_is_removed_and_continues_when_it_is_back(self):
         model = self.openai_model()["id"]
         pause = {"status": "paused", "node": "author", "stage": "solve", "state": {"statement": "Saved statement"},
                  "pauseCause": "error", "error": "Network error", "elapsedSeconds": 30, "autoResumeAt": 0}
@@ -803,16 +882,23 @@ class RemovedModelRestoreTests(StoreCase):
         app = server.restore_saved_jobs(self.runs)["later"]
         self.assertGreater(app.state["autoResumeAt"], 0)
         self.assertEqual(app.state["settingsWarning"], "")
+        entry = providers.api_model(model)
         providers.delete_api_model(model)
-        attempts = []
-        self.assertTrue(app.auto_resume_if_due(lambda: attempts.append(1), now=app.state["autoResumeAt"] + 1))
-        self.assertEqual((attempts, app.state["autoResumeAt"]), ([], 0))
-        self.assertFalse(app.auto_resume_if_due(lambda: attempts.append(1), now=10**12))
+        attempts, due = [], app.state["autoResumeAt"]
+        for tick in range(3):
+            self.assertTrue(app.auto_resume_if_due(lambda: attempts.append(1), now=due + 1))
+            due = app.state["autoResumeAt"]
+        self.assertEqual(attempts, [])
+        self.assertGreater(due, 0)
         notes = [record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic"]
-        self.assertEqual(notes, [f"Automatic resume stopped: The API model {model} chosen for the proof author is not "
-                                 "configured. Add it again under New problem → Advanced settings → API connections with "
-                                 f"the display name “{model[4:]}” to continue this job. "
-                                 "Choose Resume after fixing the settings."])
+        self.assertEqual(notes, [f"Automatic resume waits for the model settings: The API model {model} chosen for "
+                                 "the proof author is not configured. Add it again under New problem → Advanced "
+                                 f"settings → API connections with the display name “{model[4:]}” to continue this job. "
+                                 "The job checks again every 1 minute and continues by itself once they are fixed."])
+        providers.save_api_model({"id": model, "format": "openai", "baseUrl": entry["baseUrl"],
+                                  "model": entry["model"], "apiKey": KEY, "label": entry["label"]})
+        self.assertTrue(app.auto_resume_if_due(lambda: attempts.append(1), now=due))
+        self.assertEqual(attempts, [1])
 
     def test_a_cli_author_continuation_reports_the_replacement(self):
         source = self.saved_run("source", {"authorModel": "deepseek-v4-pro", "criticModel": "deepseek-v4-pro"})
@@ -994,7 +1080,9 @@ class CommandLineModelTests(StoreCase):
                                              writer_model="claude-haiku-5-5", reasoning_effort="ultra")
         self.assertEqual((options["author_model"], options["critic_model"], options["writer_model"]),
                          ("claude-sonnet-5-5", api, "claude-haiku-5-5"))
-        self.assertEqual((options["author_effort"], options["critic_effort"]), ("max", "max"))
+        # A retired Ultra is kept as given; the runner runs it as max and says so once.
+        self.assertEqual((options["author_effort"], options["critic_effort"]), ("ultra", "ultra"))
+        self.assertEqual(runtime.effective_effort("claude-sonnet-5-5", options["author_effort"]), "max")
 
 
 if __name__ == "__main__":

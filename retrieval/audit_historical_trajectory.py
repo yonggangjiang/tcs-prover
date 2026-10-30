@@ -23,6 +23,8 @@ from retrieval.historical_search import canonical_json, canonical_url, parse_cut
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / 'experiments' / 'firstproof-batch3' / 'manifest.json'
 FULL_DOCUMENT_NAVIGATION = 'full-document-v1'
+# open() without a length returns one page of the policy's open_default_chars.
+BOUNDED_PAGE_NAVIGATION = 'bounded-page-v2'
 CODEX_DISCOVERY_PROVIDER = 'codex_wayback'
 MAX_SAFE_INTEGER = 2 ** 53 - 1
 LIMITATIONS = [
@@ -145,8 +147,11 @@ def _arguments_valid(tool, arguments, limit, full_document_default=False):
             and type(count) is int and 1 <= count <= (MAX_SAFE_INTEGER if full_document_default else 20))
 
 
-def _check_navigation(tool, arguments, doc, limit, full_document_default=False):
-    """Independently check returned ranges/digests; receipts also bind the text."""
+def _check_navigation(tool, arguments, doc, limit, full_document_default=False, default_page=None):
+    """Independently check returned ranges/digests; receipts also bind the text.
+
+    ``default_page`` is the paged interface's length for an open() without one.
+    """
     offset, total = doc.get('offset'), doc.get('total_chars')
     if (type(offset) is not int or type(total) is not int or not 0 <= offset <= total
             or offset != arguments.get('offset', 0)
@@ -160,7 +165,8 @@ def _check_navigation(tool, arguments, doc, limit, full_document_default=False):
         raise ValueError('Returned document differs from the requested body digest.')
     if tool == 'open':
         text, end = doc.get('text'), doc.get('end_offset')
-        requested_length = arguments.get('length', total - offset if full_document_default else limit)
+        requested_length = arguments.get('length', default_page if default_page
+                                         else total - offset if full_document_default else limit)
         if (not isinstance(text, str) or type(end) is not int
                 or end != offset + len(text) or end > total
                 or len(text) != min(requested_length, total - offset)
@@ -378,7 +384,7 @@ def _native_terminated_cells(records):
 
 def audit_problem(problem_id, cutoff, transcript_path, broker_log_path, expected_thread_id=None,
                   native_session_path=None, content_limit=20000, require_navigation_receipts=False,
-                  full_document_default=False):
+                  full_document_default=False, default_page=None):
     """Audit one transcript/log pair; callers must bind paths to their controller.
 
     ``passed`` means no recorded evidence violations, not that all work completed.
@@ -386,11 +392,13 @@ def audit_problem(problem_id, cutoff, transcript_path, broker_log_path, expected
     additionally checks manifest, per-problem policy, workspace and session binding.
     ``full_document_default`` selects the versioned interface; the default retains
     the earlier policy-bounded page and find rules for historical records.
+    ``default_page`` (with it) selects the paged interface, bounded-page-v2.
     """
     issues = []
     counts = dict.fromkeys(COUNT_KEYS, 0)
     report = {'problem_id': problem_id, 'cutoff': cutoff, 'passed': False,
-              'navigation_version': FULL_DOCUMENT_NAVIGATION if full_document_default else 'legacy-paged',
+              'navigation_version': (BOUNDED_PAGE_NAVIGATION if full_document_default and default_page
+                                     else FULL_DOCUMENT_NAVIGATION if full_document_default else 'legacy-paged'),
               'issues': issues, 'counts': counts, 'sources': [], 'checkpoint': {},
               'warnings': [],
               'limitations': list(LIMITATIONS),
@@ -411,11 +419,25 @@ def audit_problem(problem_id, cutoff, transcript_path, broker_log_path, expected
     broker, report['checkpoint']['broker'] = _read_jsonl(broker_log_path, issues, 'broker')
     evidence = {}
     broker_counts = Counter()
+    # What the user supplied to the run besides the statement (the controller records it).
+    supplied = report['user_supplied'] = {'related_works': [], 'messages': []}
     for line, event in broker:
         event_name = event.get('event')
         broker_counts[str(event_name)] += 1
         if not _same_time(event.get('cutoff'), cutoff_time):
             _issue(issues, 'cutoff_mismatch', 'Broker event does not have the expected fixed cutoff.', line, 'broker')
+            continue
+        if event.get('source') == 'controller' and event_name == 'related_works_added':
+            for work in event.get('relatedWorks') or ():
+                if isinstance(work, dict):
+                    supplied['related_works'].append({**{key: work.get(key) for key in (
+                        'name', 'originalName', 'kind', 'size', 'sha256', 'textName', 'textSize', 'textSha256',
+                        'addedAt', 'addedIn', 'batch')
+                        if key in work}, 'line': line})
+            continue
+        if event.get('source') == 'controller' and event_name == 'author_message_sent':
+            supplied['messages'].append({key: event.get(key) for key in (
+                'time', 'conversationId', 'conversationKind', 'textChars', 'textSha256', 'text', 'notice')} | {'line': line})
             continue
         if event_name not in ('capture_verified', 'open_completed', 'find_completed'):
             continue
@@ -615,7 +637,7 @@ def audit_problem(problem_id, cutoff, transcript_path, broker_log_path, expected
                         or result.get('_meta') is not None):
                     _issue(issues, 'unvalidated_navigation_envelope', 'Navigation reply contains unvalidated content outside the receipted document.', line, record_source)
                 try:
-                    _check_navigation(tool, arguments, doc, content_limit, full_document_default)
+                    _check_navigation(tool, arguments, doc, content_limit, full_document_default, default_page)
                 except (ValueError, TypeError, KeyError) as exc:
                     _issue(issues, 'invalid_navigation_result', str(exc), line, record_source)
                 digest = _sha(canonical_json(doc))
@@ -687,7 +709,7 @@ def audit_batch(control_root, manifest_path=DEFAULT_MANIFEST, problems=None):
     selected = prepared.get('selectedProblemIds')
     navigation_version = prepared.get('navigationVersion')
     discovery_provider = prepared.get('discoveryProvider')
-    if navigation_version not in (None, FULL_DOCUMENT_NAVIGATION):
+    if navigation_version not in (None, FULL_DOCUMENT_NAVIGATION, BOUNDED_PAGE_NAVIGATION):
         raise ValueError('Prepared navigation interface version is unknown.')
     if navigation_version and (prepared.get('schemaVersion') != 2 or selected is None):
         raise ValueError('Versioned navigation requires a bound schema-two preparation record.')
@@ -790,9 +812,14 @@ def audit_batch(control_root, manifest_path=DEFAULT_MANIFEST, problems=None):
             limit = broker_policy.get('max_content_chars', 20000)
             if type(limit) is not int or not 100 <= limit <= 50000:
                 raise ValueError('Invalid pinned document page budget.')
+            default_page = broker_policy.get('open_default_chars')
+            if navigation_version == BOUNDED_PAGE_NAVIGATION and (type(default_page) is not int or default_page < 1):
+                raise ValueError('Paged navigation requires a pinned default page length.')
             report = audit_problem(problem, cutoff, folder / 'transcript.jsonl', log_path, thread, session['path'],
                                    content_limit=limit, require_navigation_receipts=prepared.get('schemaVersion') == 2,
-                                   full_document_default=navigation_version == FULL_DOCUMENT_NAVIGATION)
+                                   full_document_default=navigation_version in (FULL_DOCUMENT_NAVIGATION,
+                                                                                BOUNDED_PAGE_NAVIGATION),
+                                   default_page=default_page if navigation_version == BOUNDED_PAGE_NAVIGATION else None)
             report['ownership'] = 'manifest_prepared_policy_workspace_input_thread_and_native_session_bound'
             report['session'] = session
             report['binding'] = {'run_id': plan['runId'], 'workspace': str(folder),
@@ -812,7 +839,8 @@ def audit_batch(control_root, manifest_path=DEFAULT_MANIFEST, problems=None):
             _issue(binding, 'run_binding_failed', str(exc))
         if report is None:
             report = {'problem_id': problem, 'cutoff': cutoff, 'counts': dict.fromkeys(COUNT_KEYS, 0),
-                      'issues': [], 'sources': [], 'checkpoint': {}, 'checkpoint_pending': False}
+                      'issues': [], 'sources': [], 'checkpoint': {}, 'checkpoint_pending': False,
+                      'user_supplied': {'related_works': [], 'messages': []}}
         report['issues'].extend(binding)
         report['passed'] = not report['issues']
         report['status'] = 'issues' if report['issues'] else 'pending' if report['checkpoint_pending'] else 'passed'

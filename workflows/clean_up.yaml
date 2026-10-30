@@ -10,10 +10,11 @@ nodes:
     inputs:
       statement: "get(state, 'statement', '')"
       solution: "get(state, 'solution', get(state, 'source', ''))"
-    response: {latex: string}
-    require: ["strip(result.latex) != ''"]
+    edit: {file: latex-source.tex, field: latex}
+    response: {summary: string}
+    require: ["strip(result.latex) != ''", "latex_intact(result.latex, get(state, 'solution', get(state, 'source', '')))"]
     after:
-      - set: {output: result.latex}
+      - set: {output: result.latex, edited_latex: result.latex}
     next: latex_compile
 
   latex_compile:
@@ -24,15 +25,13 @@ nodes:
     before:
       - write: {path: latex-source.tex, text: state.output}
     command:
-      argv: [latexmk, -norc, -pdf, -g, -interaction=nonstopmode, -halt-on-error, -file-line-error, -no-shell-escape, -jobname=final, latex-source.tex]
+      argv: [latexmk, -norc, -pdf, -g, -interaction=nonstopmode, -file-line-error, -no-shell-escape, -jobname=final, latex-source.tex]
       requires: [pdflatex]
       env: {openin_any: p, openout_any: p}
-      timeout: 120
+      timeout: 300
       produces: [final.pdf]
       log: latex-compile.log
       result: compilation
-    require: ["result.status != 'unavailable'"]
-    error: "LaTeX compilation is unavailable. Install latexmk and a TeX distribution with pdflatex, then restart TCS Prover. The source is saved in latex-source.tex."
     outcome: result.status
     next:
       pass:
@@ -44,6 +43,12 @@ nodes:
         to: latex_repair
         after:
           - emit: {kind: diagnostic, label: Fixing LaTeX compilation, text: '=result.diagnostic'}
+      uncompiled:
+        to: end
+        after:
+          - write: {path: final.tex, text: state.output}
+          - emit: {kind: diagnostic, label: PDF not compiled, text: '=result.diagnostic'}
+          - emit: {kind: final_result, label: LaTeX document without a compiled PDF, text: '=state.output', output: '=state.output'}
 
   latex_repair:
     run: structured
@@ -51,13 +56,14 @@ nodes:
     skip: end
     role: writer
     stage: final
-    prompt: compilation_repair
+    prompt: {when: "get(state.compilation, 'timed_out', False)", then: compilation_timeout, else: compilation_repair}
     inputs:
       latex: state.output
       diagnostic: state.compilation.diagnostic
       compiler_output: state.compilation.output
-    response: {latex: string}
-    require: ["strip(result.latex) != ''"]
+    edit: {file: latex-source.tex, field: latex, input: latex}
+    response: {summary: string}
+    require: ["strip(result.latex) != ''", "latex_kept(result.latex, get(state, 'edited_latex', ''))"]
     after:
       - set: {output: result.latex}
     next: latex_compile
@@ -72,9 +78,16 @@ prompts:
 
     COMPILER OUTPUT:
     {compiler_output}
+  compilation_timeout: |-
+    The LaTeX compilation below did not finish. Check the source for an infinite loop or
+    a runaway computation and fix it with the smallest necessary changes; do not change
+    any content.
 
-    LATEX SOURCE:
-    {latex}
+    COMPILER DIAGNOSTIC:
+    {diagnostic}
+
+    COMPILER OUTPUT:
+    {compiler_output}
   final: |-
       Prune the input mathematical proof into a good paper by using the following guidance. Clarity is the
       main concern, not a target length: make the argument easy for a human expert to follow, with enough
@@ -392,6 +405,8 @@ prompts:
       - Check every cited theorem, lemma, equation, figure, and section reference. Use stable labels and
         compatible hyperlinks. Check for missing or duplicate labels, unresolved citations, and references
         invalidated by reordering.
+      - Give the bibliography as an inline thebibliography environment; no .bib file or bibliography
+        program is available when the manuscript is compiled.
 
       ## 8. Is the exact final manuscript ready for handover?
 
@@ -419,7 +434,7 @@ prompts:
         Handover is clean only when that full pass finds no actionable flags and makes no changes; report
         any genuinely unresolved issue as specified above rather than calling it solved.
 
-      Return only the complete revised manuscript in LaTeX.
+      Produce only the complete revised manuscript in LaTeX.
   solution_input: |-
     {instructions}
 

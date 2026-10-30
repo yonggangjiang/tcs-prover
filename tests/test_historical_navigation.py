@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_search as hs
 import test_historical_search as fixtures
 

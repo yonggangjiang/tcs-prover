@@ -28,7 +28,7 @@ const ui = new Proxy({}, {get(target, name) {return target[name] ||= {
 const document = {activeElement: null};
 const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
-const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {};
+const ingest = () => {}, renderWorkflow = () => {}, renderClock = () => {};
 const renderBatchNavigation = () => {}, refresh = () => {};
 const restoreRetrievalSettings = () => {}, syncPrompts = () => {}, updateModelSummary = () => {};
 const setProblemMode = () => {}, restoreWorkflowStages = () => {}, appendFormattedText = () => {};
@@ -146,7 +146,8 @@ vm.runInNewContext(setup + code + checks, {assert, console, process, Element});
         self.run_node(r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const code = source.slice(source.indexOf('function request('), source.indexOf('function selectedProblemMode('));
+const code = source.slice(source.indexOf('function request('), source.indexOf('function selectedProblemMode('))
+  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('));
 class Element {
   constructor() { this.children = []; this.dataset = {}; this.hidden = false; this.textContent = ''; this.classList = {toggle() {}}; }
   append(...children) { this.children.push(...children); }
@@ -158,14 +159,12 @@ const ui = new Proxy({}, {get: (target, key) => target[key] ||= new Element()});
 const setup = `
 let currentJob = '', currentBatch = 'v4', composingProblem = false, batchCatalog = [{id: 'v4', label: 'Batch four', current: true}];
 let state = {phase: 'input'}, requests = Promise.resolve(), previousPhase = '', timer, clock, jobsTimer;
-let memoryRequest = 0, memoryTimer, memoryJob = null;
 const sessionToken = 'token', timelineRows = new Map(), detailRows = new Map();
 const location = {pathname: '/'}, history = {pushState() {}};
 const clearTimeout = () => {}, clearInterval = () => {}, setTimeout = () => 1;
 const document = {createElement: () => new Element()};
 const window = {open() {}};
 const localDateTime = value => value;
-const completedRunLabel = job => job.resultKind === 'final' ? 'Answer ready' : 'Incomplete';
 const confirm = () => true, alert = () => {};
 const refresh = async () => {};
 `;

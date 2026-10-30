@@ -1,7 +1,9 @@
 """Manage proof jobs and serve the local browser interface."""
 
+import decimal
 import errno
 import getpass
+import hashlib
 import http.client
 import json
 import math
@@ -18,16 +20,17 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 from collections import deque
-from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import workflow_runner as runtime
+from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, providers
-from . import retrieval
+from . import ownership, related_works, retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -39,6 +42,22 @@ WORKFLOWS = ROOT / "workflows"
 HOST, PORT = "127.0.0.1", 8765
 DEFAULT_CRITIC_ROUNDS = runtime.DEFAULT_CRITIC_ROUNDS
 MAX_CRITIC_ROUNDS = runtime.MAX_CRITIC_ROUNDS
+# Independent critics per critic round (workflow_runner.py --critic-count): the subagents the critic starts; the
+# runner's default (from author_critic.yaml) and limit, or 3 and 10 when the runner does not define them.
+try:
+    DEFAULT_CRITIC_COUNT = runtime.DEFAULT_CRITIC_COUNT
+except Exception:  # noqa: BLE001 - an edited workflow file must never keep the server from starting.
+    DEFAULT_CRITIC_COUNT = 3
+MAX_CRITIC_COUNT = getattr(runtime, "MAX_CRITIC_COUNT", 10)
+# Subagents the proof author may start at a time (workflow_runner.py --author-subagents); 0 gives it no subagent tool.
+try:
+    DEFAULT_AUTHOR_SUBAGENTS = runtime.DEFAULT_AUTHOR_SUBAGENTS
+except Exception:  # noqa: BLE001 - an edited workflow file must never keep the server from starting.
+    DEFAULT_AUTHOR_SUBAGENTS = 0
+MAX_AUTHOR_SUBAGENTS = getattr(runtime, "MAX_AUTHOR_SUBAGENTS", 10)
+# Long diffs of the critic coordinator's changes, in the run's controller folder (see App.critic_diff).
+CRITIC_DIFFS_FOLDER = "critic-diffs"
+CRITIC_DIFF_NAME = re.compile(r"round-[0-9]+-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.diff")
 MAX_THINKING_HOURS = runtime.MAX_AUTHOR_HOURS
 DEFAULT_THINKING_HOURS = runtime.DEFAULT_AUTHOR_HOURS
 MODELS = runtime.MODELS
@@ -54,51 +73,180 @@ DEFAULT_REVIEW_EFFORT = runtime.REVIEW_EFFORT
 REASONING_SUMMARIES = runtime.REASONING_SUMMARIES
 DEFAULT_REASONING_SUMMARY = runtime.DEFAULT_REASONING_SUMMARY
 STOP_TIMEOUT_SECONDS = 2
+# A closing server waits this long for paused authors and interrupted runners before stopping them.
+SHUTDOWN_WAIT_SECONDS = 15
 # Stop interrupts a POSIX runner group this long before killing it, so the
 # runner's cleanup deletes any key-bearing Claude settings file it holds.
 STOP_GRACE_SECONDS = 3
+# A paused author may finish its current step for the runner's interrupt grace;
+# only a runner that has not ended this long after a pause is closed.
+PAUSE_ACKNOWLEDGE_SECONDS = runtime.INTERRUPT_GRACE_SECONDS + 15
 WINDOWS_EVERYONE_SID = "*S-1-1-0"
 AUTHOR_LIMIT_FILENAME = "author-limit.json"
 AUTHOR_STEER_FILENAME = "author-steer.json"
+# The whole stderr of the author's Codex app-server (redacted), across attempts.
+AUTHOR_STDERR_FILENAME = "codex-app-server.log"
+# Earlier live instructions a continued author reads when they do not fit in one instruction.
+INSTRUCTION_HISTORY_FILENAME = "USER_INSTRUCTIONS.md"
 PAUSE_FILENAME = "pause.json"
 PAUSE_REQUEST_FILENAME = "pause-request.json"
 JOB_SETTINGS_FILENAME = "job-settings.json"
 MANUAL_STOP_FILENAME = "manual-stop.json"
 CONTINUATION_SOURCE_FILENAME = "continuation-source.json"
 REVIEW_INPUT_FILENAME = "review-input.json"
-RESEARCH_MEMORY_FILES = {"INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md"}
-APPROACH_MEMORY_FILE = re.compile(r"APPROACHES/(?:index|INDEX|A[0-9]{3,}(?:-[A-Za-z0-9_-]+)?)\.md\Z")
-AUDIT_MEMORY_FILE = re.compile(r"(?:AUDITS|audit_history)/[A-Za-z0-9][A-Za-z0-9_.-]*\.md\Z")
 MAX_REQUEST_BYTES = 100_000
+# Every request that creates or starts a job (one statement, a folder batch,
+# LaTeX to polish, an edited statement to approve) may be this large, and so
+# may each statement in it, so a statement accepted in a folder is accepted
+# on its own too.
 MAX_DOCUMENT_REQUEST_BYTES = 8 * 1024 * 1024
+JOB_REQUEST_PATHS = {"/review", "/direct", "/direct-batch", "/start-workflow", "/finalize", "/approve", "/solve",
+                     "/uploads/note"}
 MAX_BATCH_STATEMENTS = 200
-MAX_BATCH_STATEMENT_CHARS = 100_000
+MAX_BATCH_STATEMENT_CHARS = 2_000_000
+MAX_STATEMENT_CHARS = MAX_BATCH_STATEMENT_CHARS
+# The body of a refused request is read and dropped up to this size, so the
+# browser receives the reason instead of a reset connection.
+MAX_DISCARDED_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_FILE_CHARS = 255
 # An error-paused author is resumed automatically after the same wait as
 # every other model-call retry (workflow_runner.MODEL_RETRY_SECONDS).
 AUTO_RESUME_SECONDS = runtime.MODEL_RETRY_SECONDS
+# The server starts jobs by itself (automatic resumes, queued folder-batch jobs)
+# at most this often, so jobs that came due together reach the provider spread
+# out instead of in the same second.
+AUTO_LAUNCH_SPACING_SECONDS = 2
+# Installation settings beside the API model store (the running-jobs limit).
+INSTALLATION_SETTINGS = providers.INSTALLATION_SETTINGS
+MAX_RUNNING_JOBS = 1000
 # How the runner's own messages begin when the workflow budget runs out
 # ("Workflow time limit reached." or "...; saved work remains resumable.").
 # A provider or CLI error that merely mentions a time limit is still retried.
 WORKFLOW_TIME_LIMIT_ERROR = "Workflow time limit reached"
+# The phases in which a job with an Author stage takes a new time limit (it applies at the
+# author's next step, or at launch or Resume).
+TIME_LIMIT_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "paused"}
+# Resume needs at least this much of the time limit left, so a resumed author never pauses at once.
+RESUME_MARGIN_SECONDS = 60
+# Talking to a paused author: one turn in its saved conversation (workflow_runner.py --converse).
+CONVERSATION_FILENAME = "conversation.json"
+PROGRESS_SUMMARY_FILENAME = "progress-summary.md"
+MAX_CONVERSATION_CHARS = runtime.CONVERSATION_MAX_CHARS  # The runner refuses a longer request.
+CONVERSATION_ID = re.compile(r"c_[0-9a-f]{10}\Z")
+CONVERSATION_KINDS = ("summary", "message")
+CONVERSATION_STATUSES = ("queued", "running", "answered", "failed", "stopped")
+CONVERSATION_BUSY = "The author is replying. Wait for the reply or stop it."
+CONVERSATION_STAGES = {"review": False, "author": True, "critic": False, "writing": False}
+# Related works can be added while the job can still reach its author.
+RELATED_WORKS_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "paused"}
+# The transcript stage of controller records about related works. Like conversation records,
+# a restart skips them: they say nothing about where the workflow is.
+RELATED_WORKS_STAGE = "related-works"
+# The author's questions to the user (Codex's request_user_input_async). The author does not wait for
+# an answer: once the turn in which it asked has ended and this long has passed since it asked, it no
+# longer waits for one, and the question closes. Controller records about a question have their own
+# transcript stage, which a restart skips like the conversation's.
+AUTHOR_QUESTION_WAIT_SECONDS = 600
+AUTHOR_QUESTION_STAGE = "author-question"
+AUTHOR_QUESTION_CLOSED = "The author's question is no longer open."
+# Pauses that a restart of TCS Prover causes ("restart") or finds ("interrupted"): the author continues
+# its conversation by itself after them, so its open question stays open.
+RESTART_PAUSE_CAUSES = {"restart", "interrupted"}
+# A folder batch ("Run a folder…") shares one related-works store among its jobs.
+FOLDER_BATCH_ID = re.compile(r"b_[0-9a-f]{10}\Z")
+# Staged uploads older than a day are removed at most this often (and when the server starts).
+UPLOAD_PRUNE_SECONDS = 3600
 ROLES = ("review", "author", "critic", "writer")
+# The role whose model makes the calls of each transcript stage.
+TRACE_STAGE_ROLES = {"review": "review", "solve": "author", "repair": "author", "critic": "critic", "final": "writer"}
 ROLE_LABELS = {
     "review": "statement reviewer", "author": "proof author",
     "critic": "critic", "writer": "LaTeX editor",
 }
 # Jobs whose model processes are running or about to run.
 ACTIVE_PHASES = {"reviewing", "running", "stopping", "pausing"}
+# What a job takes from its saved files when its output reader failed (App._settle_from_saved_run).
+SETTLED_FIELDS = ("phase", "stage", "activeNode", "error", "autoResumeAt", "output", "resultKind", "finishedAt",
+                  "elapsedSeconds", "resumedAt", "sessionUnavailable", "safetyStop", "manuallyStopped",
+                  "stoppedStage", "finalInputReady", "goalThreadId", "revisionRequired", "criticBugs")
+# Holds that "Re-run preflight" may release once a historical job's checks pass.
+HISTORICAL_PENDING_HOLD = "Historical batch preflight is pending; every run must pass before launch."
+HISTORICAL_RETRY_SUFFIX = " The check runs again every minute."
+HISTORICAL_FIX_ADVICE = " Choose Re-run preflight after fixing it."
+HISTORICAL_RECHECK_HOLDS = ("Historical batch preflight", "Historical batch launch failed",
+                            "Historical search preflight failed", "Historical compiler preflight failed",
+                            "Historical run check", "Needs attention:")
+
+
+def recheckable_hold(text):
+    return isinstance(text, str) and text.startswith(HISTORICAL_RECHECK_HOLDS)
+
+
+def historical_checks(stages):
+    """What a historical launch check covers: the compiler only when the run writes LaTeX."""
+    return "policy, logins, sandboxes and compiler" if stages["writing"] else "policy, logins and sandboxes"
+
+
 # Idle jobs that launch again with their saved models (Resume, Approve, Start).
 WAITING_PHASES = {"paused", "reviewed", "prepared"}
-# The API model Test button sends one tiny request and follows no redirect.
+# The API model Test button sends a request shaped like the ones runs send
+# (streamed, with one tool and a JSON answer, at the configured effort) and
+# follows no redirect; a minimal one follows only when that one is refused.
 API_TEST_TIMEOUT_SECONDS = 30
 API_TEST_PROMPT = "Reply with OK."
 API_TEST_MAX_TOKENS = 16
-API_TEST_MAX_RESPONSE_BYTES = 64 * 1024
+API_TEST_MAX_RESPONSE_BYTES = 256 * 1024
+API_TEST_STRUCTURED_PROMPT = (
+    'This is a connection test. Answer with exactly this JSON object and nothing else: {"ok": true}'
+)
+API_TEST_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
+                   "additionalProperties": False}
+# Real runs ask for long answers; an endpoint that caps the output lower fails them.
+API_TEST_RUN_OUTPUT_TOKENS = 32000
 API_MODELS_MAX_RESPONSE_BYTES = 1024 * 1024
 API_MODELS_MAX_PAGES = 100
 API_MODELS_MAX_COUNT = 5000
 ANTHROPIC_VERSION = "2023-06-01"
+
+
+def load_installation_settings():
+    """This installation's settings: how many jobs may run at once (0: no limit); defaults when unreadable."""
+
+    try:
+        value = json.loads((providers.state_directory() / INSTALLATION_SETTINGS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        value = {}
+    limit = value.get("maxRunningJobs") if isinstance(value, dict) else None
+    valid = isinstance(limit, int) and not isinstance(limit, bool) and 0 <= limit <= MAX_RUNNING_JOBS
+    return {"maxRunningJobs": limit if valid else 0}
+
+
+def save_installation_settings(values):
+    """Validate and save this installation's settings (owner-only, beside the API model store)."""
+
+    limit = values.get("maxRunningJobs") if isinstance(values, dict) else None
+    if isinstance(limit, str) and limit.strip().isdigit():
+        limit = int(limit.strip())
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 0 <= limit <= MAX_RUNNING_JOBS:
+        raise ValueError(f"Enter how many jobs may run at once: 0 for no limit, or at most {MAX_RUNNING_JOBS}.")
+    folder = providers.private_directory(providers.state_directory())
+    runtime._private_atomic_write(folder / INSTALLATION_SETTINGS, json.dumps({"maxRunningJobs": limit}) + "\n")
+    return {"maxRunningJobs": limit}
+
+
+class BatchStart(list):
+    """The jobs a folder batch created, with a note about any that wait or could not start yet."""
+
+    notice = ""
+    # The folder batch's ID, which names its shared related works (see Server.add_batch_related_works).
+    folder_batch = ""
+
+
+def settings_problem(text):
+    """Whether a failure says the model cannot be used or the endpoint refuses the requests (see workflow_runner)."""
+
+    text = str(text or "")
+    return runtime.MODEL_UNAVAILABLE_LABEL in text or runtime.REQUEST_REJECTED_LABEL in text
 
 
 def retry_interval_text(seconds=None):
@@ -120,17 +268,46 @@ def load_pause_checkpoint(run_dir):
     """
 
     try:
-        checkpoint = json.loads((Path(run_dir) / PAUSE_FILENAME).read_text(encoding="utf-8"))
+        checkpoint = json.loads(controlled_path(run_dir, PAUSE_FILENAME).read_text(encoding="utf-8"))
     except (ValueError, RecursionError) as exc:
         raise ValueError(f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged: {exc}") from exc
-    elapsed = checkpoint.get("elapsedSeconds") if isinstance(checkpoint, dict) else None
-    if not (isinstance(checkpoint, dict) and isinstance(checkpoint.get("state"), dict)
-            and all(isinstance(checkpoint.get(key), str) and checkpoint[key] for key in ("node", "stage"))
-            and isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
-            and math.isfinite(elapsed) and elapsed >= 0):
+    if not complete_pause_checkpoint(checkpoint):
         raise ValueError(f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged: it lacks the saved "
                          "workflow state, node, stage or elapsed time")
     return checkpoint
+
+
+def finite_seconds(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def saved_seconds(value, default):
+    """A saved non-negative number of seconds, or `default` for anything else."""
+
+    return float(value) if finite_seconds(value) else default
+
+
+def complete_pause_checkpoint(checkpoint):
+    """Whether a checkpoint holds everything Resume needs: workflow state, node, stage and elapsed time."""
+
+    return (isinstance(checkpoint, dict) and isinstance(checkpoint.get("state"), dict)
+            and all(isinstance(checkpoint.get(key), str) and checkpoint[key] for key in ("node", "stage"))
+            and finite_seconds(checkpoint.get("elapsedSeconds")))
+
+
+# What a damaged checkpoint still decides when it is rebuilt from the transcript.
+DAMAGED_CHECKPOINT_FIELDS = {
+    "pauseCause": lambda value: value in {"error", "user", "interrupted", "restart", "time-limit"},
+    "autoResumeAt": finite_seconds,
+    "error": lambda value: isinstance(value, str),
+    "elapsedSeconds": finite_seconds,
+    "goalThreadId": lambda value: isinstance(value, str) and "\0" not in value,
+    "sessionUnavailable": lambda value: isinstance(value, bool),
+    "safetyStop": lambda value: isinstance(value, bool),
+    "criticFeedbackPending": lambda value: isinstance(value, bool),
+    "summaryRequested": lambda value: isinstance(value, bool),
+}
 
 
 def read_pause_object(run_dir):
@@ -140,10 +317,228 @@ def read_pause_object(run_dir):
     """
 
     try:
-        checkpoint = json.loads((Path(run_dir) / PAUSE_FILENAME).read_text(encoding="utf-8"))
+        checkpoint = json.loads(controlled_path(run_dir, PAUSE_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return {}
     return checkpoint if isinstance(checkpoint, dict) else {}
+
+
+def span_text(seconds):
+    """A duration in words ("45 s", "2 h 5 min"), as the runner writes it."""
+
+    return runtime._span_text(seconds)
+
+
+def hours_text(hours):
+    """A time limit as the page writes it: "1 hour", "1.5 hours", "1,000 hours" (at most two decimals).
+
+    A limit under 0.01 hours keeps two significant digits ("0.003 hours"), so it never reads as 0.
+    """
+
+    value = float(hours)
+    if 0 < value < 0.01:
+        return f"{decimal.Decimal(f'{value:.2g}'):f} hours"
+    value = round(value, 2)
+    number = f"{value:,.2f}".rstrip("0").rstrip(".")
+    return f"{number} hour{'' if value == 1 else 's'}"
+
+
+# The author time limit's history, as the job's Run settings list it (state["timeLimitHistory"]): every
+# change of the limit ("set"), every pause at it ("reached"), the progress summary the author wrote at
+# that pause ("summary") and the Resume after it ("resumed"). Built from the transcript records, so a
+# restart rebuilds it, and saved with the job settings for saved batches, which read only recent records.
+TIME_LIMIT_EVENTS = ("set", "reached", "summary", "resumed")
+
+
+def follow_time_limit(history, record):
+    """Add the time-limit event one transcript record states to ``history``; return whether it did."""
+
+    if not isinstance(record, dict) or not isinstance(record.get("time"), str):
+        return False
+    kind, label, hours = record.get("kind"), record.get("label"), record.get("authorLimitHours")
+    event = None
+    if kind == "status" and label == "Total time limit set" and finite_seconds(hours):
+        event = {"event": "set", "hours": float(hours)}
+    elif kind == "status" and label == "Time limit reached" and finite_seconds(hours):
+        event = {"event": "reached", "hours": float(hours),
+                 "elapsedSeconds": saved_seconds(record.get("elapsedSeconds"), 0.0)}
+    else:
+        # Since the latest pause at the limit: its summary (the first one written), then its Resume.
+        pause = next((index for index in range(len(history) - 1, -1, -1)
+                      if history[index]["event"] == "reached"), None)
+        since = {item["event"] for item in history[pause + 1:]} if pause is not None else set()
+        if pause is None or "resumed" in since:
+            return False
+        if (kind == "conversation_reply" and record.get("conversationKind") == "summary"
+                and "summary" not in since):
+            event = {"event": "summary"}
+        elif kind == "status" and label == "Resume requested":
+            # The limit it resumes with: the latest one set, else the one it paused at.
+            limit = next(item["hours"] for item in reversed(history) if "hours" in item)
+            event = {"event": "resumed", "hours": limit}
+    if event is None:
+        return False
+    history.append({**event, "time": record["time"]})
+    return True
+
+
+# The critic's progress records (workflow_runner.SubagentProgress and its SUBAGENT*_LABEL texts): one
+# "requested" per attempt, then what its event stream shows of each of its independent critics (its
+# subagents), or only that it waits for them.
+CRITICS_REQUESTED = re.compile(r"(\d+) independent critics? requested")
+CRITIC_STARTED_OR_FINISHED = re.compile(r"Independent critic (\d+) (started|finished)")
+CRITICS_WAITING = runtime.SUBAGENTS_WAITING_LABEL
+
+
+def _critic_progress(count, requested=False):
+    """A critic round's progress before any of its critics showed up (see follow_critic_progress)."""
+
+    count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+    return {"count": max(0, count), "requested": requested, "started": [], "finished": [], "failed": [],
+            "waiting": False}
+
+
+def follow_critic_progress(progress, record, critic_count=None):
+    """The progress of the critic round that runs, after one more transcript record (None outside one).
+
+    {"count": its independent critics, "requested": whether the critic's current attempt has asked for
+    them, "started" and "finished": the 1-based numbers of those its event stream showed starting and
+    ending, "failed": those among the finished that failed, "waiting": whether it waited for them (all that
+    Codex shows of a web-cutoff call of multi-agent version 2)}. Every attempt starts its critics anew, and
+    so their numbering; a failed attempt's critics are gone while it waits to retry. The job page names the step from it ("Critic 2 of 3 working"); the records themselves
+    leave the page's window of recent events.
+    """
+
+    if not isinstance(record, dict) or record.get("root") is False or record.get("stage") == "conversation":
+        return progress
+    kind, label = record.get("kind"), record.get("label")
+    label = label if isinstance(label, str) else ""
+    if kind == "status" and label.startswith("Workflow step: "):
+        return _critic_progress(critic_count) if record.get("node") == "critic" else None
+    if progress is None:
+        return None
+    if kind == "critic_result":
+        return None
+    if (kind == "status" and record.get("stage") == "critic" and label.endswith(runtime.RETRY_LABEL)
+            and finite_seconds(record.get("retryAt"))):
+        # The critic's failed call waits to retry: its critics ended with it, and the retry starts them again.
+        return {**progress, "started": [], "finished": [], "failed": [], "waiting": False}
+    if kind != "status" or record.get("subagentProgress") is not True:
+        return progress
+    # A new dict for every change: a snapshot taken earlier keeps the one it copied.
+    if CRITICS_REQUESTED.fullmatch(label):
+        count = record.get("auditCount")
+        known = isinstance(count, int) and not isinstance(count, bool)
+        return _critic_progress(count if known else progress["count"], True)
+    if label == CRITICS_WAITING:
+        return progress if progress["waiting"] else {**progress, "waiting": True}
+    event, index = CRITIC_STARTED_OR_FINISHED.fullmatch(label), record.get("auditIndex")
+    if event is None or not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        return progress
+    if event.group(2) == "started":
+        return progress if index in progress["started"] else {**progress, "started": sorted([*progress["started"], index])}
+    if index in progress["finished"]:
+        return progress
+    return {**progress, "started": sorted({*progress["started"], index}),
+            "finished": sorted([*progress["finished"], index]),
+            "failed": sorted([*progress["failed"], index]) if record.get("failed") is True else progress["failed"]}
+
+
+def saved_time_limit_history(value):
+    """The valid events of a saved time-limit history, oldest first ([] when it is damaged)."""
+
+    if not isinstance(value, list):
+        return []
+    return [{key: item[key] for key in ("event", "time", "hours", "elapsedSeconds") if key in item}
+            for item in value
+            if isinstance(item, dict) and item.get("event") in TIME_LIMIT_EVENTS and isinstance(item.get("time"), str)
+            and all(finite_seconds(item[key]) for key in ("hours", "elapsedSeconds") if key in item)
+            and (item["event"] == "summary" or "hours" in item)]
+
+
+def staged_uploads(runs):
+    """The staging area of related-work uploads: runs/.uploads, owner-only, kept a day."""
+
+    return related_works.UploadStage(Path(runs) / related_works.STAGING_FOLDER)
+
+
+def folder_batch_store(runs, batch_id):
+    """The related-works store of one folder batch: runs/.controller/.batches/<batch ID>."""
+
+    if not isinstance(batch_id, str) or not FOLDER_BATCH_ID.match(batch_id):
+        raise ValueError("That folder batch is not available in this TCS Prover session.")
+    return related_works.BatchStore(related_works.batch_directory(Path(runs) / CONTROLLER_FOLDER, batch_id))
+
+
+def related_works_tokens(value):
+    """Validate the upload tokens a request attaches: a list of 1 to MAX_ITEMS strings."""
+
+    if (not isinstance(value, list) or not 1 <= len(value) <= related_works.MAX_ITEMS
+            or not all(isinstance(token, str) and token for token in value)):
+        raise ValueError(f"Send the related works as a list of 1 to {related_works.MAX_ITEMS} upload tokens.")
+    return value
+
+
+def related_works_text(entries, *, batch=False):
+    """The text of a "Related works added" record."""
+
+    listed = "; ".join(related_works.describe_entry(entry) for entry in entries)
+    where = "the folder batch's related works, linked into this job's" if batch else "the author's"
+    return f"Added {listed} to {where} related-works folder."
+
+
+def related_works_record(entries, *, batch=""):
+    """A "Related works added" transcript record (a restart skips its stage)."""
+
+    return {"kind": "status", "stage": RELATED_WORKS_STAGE, "label": "Related works added",
+            "relatedWorks": [{"name": entry["name"], "originalName": entry.get("originalName", ""),
+                              "sizeText": related_works.size_text(entry.get("size", 0)),
+                              **({"batch": batch} if batch else {})} for entry in entries],
+            "text": related_works_text(entries, batch=bool(batch)),
+            **({"folderBatch": batch} if batch else {})}
+
+
+def valid_conversation_item(item):
+    """Whether one saved conversation item can be shown and continued."""
+
+    return (isinstance(item, dict) and isinstance(item.get("id"), str) and bool(CONVERSATION_ID.match(item["id"]))
+            and item.get("kind") in CONVERSATION_KINDS and item.get("status") in CONVERSATION_STATUSES
+            and all(isinstance(item.get(key), str) for key in ("text", "reply", "error", "createdAt"))
+            and finite_seconds(item.get("dueAt", 0)))
+
+
+def controller_note(record):
+    """Whether a transcript record is a controller note that says nothing about the workflow's progress.
+
+    The paused author's replies (stage "conversation") and related-works
+    records are written while a job waits or is paused; a restart skips them.
+    """
+
+    return isinstance(record, dict) and record.get("stage") in {"conversation", RELATED_WORKS_STAGE,
+                                                                 AUTHOR_QUESTION_STAGE}
+
+
+def saved_conversation_items(value):
+    """The valid items of a saved conversation.json value, oldest first (none when it is damaged)."""
+
+    items = value.get("items") if isinstance(value, dict) and value.get("schemaVersion") == 1 else None
+    if not isinstance(items, list):
+        return []
+    loaded = []
+    for item in items:
+        if not valid_conversation_item(item):
+            continue
+        notice = item.get("notice") if isinstance(item.get("notice"), list) else []
+        loaded.append({
+            **{key: item[key] for key in ("id", "kind", "text", "status", "createdAt", "reply", "error")},
+            "origin": "time-limit" if item.get("origin") == "time-limit" else "user",
+            "dueAt": float(item.get("dueAt") or 0),
+            "startedAt": item.get("startedAt") if isinstance(item.get("startedAt"), str) else "",
+            "finishedAt": item.get("finishedAt") if isinstance(item.get("finishedAt"), str) else "",
+            "attempts": item["attempts"] if type(item.get("attempts")) is int else 0,
+            "notice": [name for name in notice if isinstance(name, str)],
+            "compacted": item.get("compacted") is True})
+    return loaded
 
 
 def goal_thread_from_record(record):
@@ -159,10 +554,97 @@ def goal_thread_from_record(record):
     return ""
 
 
-def critic_uses_parallel_audits():
-    """Whether the built-in critic supports legacy controller audit checkpoints."""
+def question_entries(value):
+    """The valid [{"title", "options"}] of a question call, in order; options [] for free text only."""
 
-    return bool(runtime.builtin_workflow("author_critic")["nodes"]["critic"].get("parallel"))
+    entries = []
+    for entry in value if isinstance(value, list) else []:
+        title = entry.get("title") if isinstance(entry, dict) else None
+        if not isinstance(title, str) or not title.strip() or "\0" in title:
+            continue
+        options = entry.get("options") if isinstance(entry.get("options"), list) else []
+        entries.append({"title": title.strip(), "options": [option.strip() for option in options
+                                                            if isinstance(option, str) and option.strip()
+                                                            and "\0" not in option]})
+    return entries
+
+
+def author_question(record):
+    """{"id", "turnId", "questions"} of a question the running author asks the user, else None.
+
+    Codex's request_user_input_async tool delivers it as an agent message
+    with "delivery": "async" and its "questions", once when it starts and
+    once when it completes. Only the root author's own records count: never a
+    subagent's, a parallel call's or the paused author's conversation.
+    """
+
+    event = record.get("event") if record.get("kind") == "codex_event" else None
+    if (not isinstance(event, dict) or record.get("root") is False or record.get("activityLabel")
+            or record.get("stage") not in {"solve", "repair"} or record.get("node") not in {None, "author"}
+            or event.get("method") not in {"item/started", "item/completed"}):
+        return None
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    item = params.get("item")
+    if (not isinstance(item, dict) or item.get("type") not in {"agentMessage", "agent_message"}
+            or item.get("delivery") != "async" or not isinstance(item.get("id"), str) or not item["id"]):
+        return None
+    questions = question_entries(item.get("questions"))
+    text = item.get("text")
+    if not questions and isinstance(text, str) and text.strip() and "\0" not in text:
+        questions = [{"title": text.strip(), "options": []}]
+    turn = params.get("turnId")
+    return {"id": item["id"], "turnId": turn if isinstance(turn, str) else "",
+            "questions": questions} if questions else None
+
+
+def saved_author_question(value):
+    """The open question saved with a job's settings, or None when there is none or it is damaged."""
+
+    if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not value["id"]:
+        return None
+    questions = question_entries(value.get("questions"))
+    asked, ended = value.get("askedAt"), value.get("turnEndedAt")
+    if not questions or not finite_seconds(asked) or not (ended is None or finite_seconds(ended)):
+        return None
+    turn = value.get("turnId")
+    return {"id": value["id"], "askedAt": float(asked), "turnId": turn if isinstance(turn, str) else "",
+            "questions": questions, "turnEndedAt": None if ended is None else float(ended)}
+
+
+def author_answer_text(questions, answers):
+    """The live instruction that answers a question call; ``answers`` is [{"index", "answer"}].
+
+    Empty answers are left out. One question: Answer to your question
+    "<title>": <answer>. Several: "Answers to your questions:", then one
+    line "<title>": <answer> per answered question, in the questions' order.
+    """
+
+    if not isinstance(answers, list):
+        raise ValueError("Send the answers as a list, one per answered question.")
+    given = {}
+    for entry in answers:
+        index = entry.get("index") if isinstance(entry, dict) else None
+        answer = entry.get("answer") if isinstance(entry, dict) else None
+        if (type(index) is not int or not 0 <= index < len(questions) or index in given
+                or not isinstance(answer, str)):
+            raise ValueError("Send each answer once, with the number of the question it answers.")
+        if answer.strip():
+            given[index] = answer.strip()
+    if not given:
+        raise ValueError("Choose an option or write an answer first.")
+    if len(questions) == 1:
+        return f'Answer to your question "{questions[0]["title"]}": {given[0]}'
+    return "\n".join(["Answers to your questions:", *(f'"{questions[index]["title"]}": {given[index]}'
+                                                       for index in sorted(given))])
+
+
+def delivered_repair(record):
+    """{"thread", "digest"} of critic feedback a root author status says its conversation received, else None."""
+
+    digest, thread = record.get("repairDelivered"), goal_thread_from_record(record)
+    if record.get("kind") == "status" and thread and isinstance(digest, str) and digest:
+        return {"thread": thread, "digest": digest}
+    return None
 
 
 def isolated_process_options():
@@ -171,6 +653,63 @@ def isolated_process_options():
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
+
+
+class SleepWatch:
+    """Machine sleep: wall time that passed while the awake clock (time.monotonic) stood still.
+
+    The runner's budget clock is time.monotonic, which stops while the machine
+    sleeps; the controller leaves the same sleep out of a job's active time.
+    """
+
+    MARGIN_SECONDS = 2.0
+
+    def __init__(self):
+        self._wall, self._awake = time.time(), time.monotonic()
+
+    def slept(self):
+        """Seconds asleep since the previous call; 0 below a small margin."""
+
+        wall, awake = time.time(), time.monotonic()
+        gap = (wall - self._wall) - (awake - self._awake)
+        self._wall, self._awake = wall, awake
+        return gap if gap > self.MARGIN_SECONDS else 0.0
+
+
+def reap_runner(process):
+    """Wait for a runner, then kill what it left behind in its process group.
+
+    A descendant that outlived the runner (a double-forked compiler, say) is
+    still in the group, and while it exists no other process gets its ID.
+    """
+
+    code = process.wait()
+    pid = getattr(process, "pid", None)
+    if os.name != "nt" and isinstance(pid, int) and not isinstance(pid, bool):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass  # Nothing was left.
+    return code
+
+
+def raise_open_file_limit():
+    """Allow many parallel jobs: each holds pipes and owner locks, and macOS starts processes with 256."""
+
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = 8192 if hard == resource.RLIM_INFINITY else min(8192, hard)
+        if soft != resource.RLIM_INFINITY and soft < wanted:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def runner_lock_options(descriptors):
+    """Hand a run's owner locks to its runner, so they outlive a crash of this process."""
+
+    return {"pass_fds": tuple(descriptors)} if descriptors and os.name != "nt" else {}
 
 
 def stop_process_tree(process):
@@ -334,12 +873,12 @@ def open_run_log(path, flags, *, private=True):
     return None
 
 
-def append_run_log(path, text):
+def append_run_log(path, text, durable=False):
     """Append to a private run log, replacing anything planted in its place.
 
     A link, FIFO, or hard link is unlinked; a folder, or a log that can no
     longer be opened, is moved aside so no record is lost. Return whether the
-    entry had to be replaced.
+    entry had to be replaced. ``durable`` also flushes the log to disk.
     """
 
     path = Path(path)
@@ -371,6 +910,9 @@ def append_run_log(path, text):
         raise OSError(f"Cannot replace the linked run log {path}.")
     with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
         stream.write(text)
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
     return replaced
 
 
@@ -400,10 +942,40 @@ def default_prompts():
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
         "critic": author_critic["critic"],
+        # The convention critic's prompt (its own step after the critic accepts); a template with {statement}.
+        "convention": author_critic["convention_critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
     }
     _last_default_prompts = prompts
     return dict(prompts)  # Callers adjust their copy.
+
+
+# Default prompts of earlier versions that no longer fit the workflow, by role. Every job saves its prompts, so
+# a job created with one of these unchanged defaults gets the current default when it is resumed or continued
+# (see current_prompt); a prompt the user edited stays as it is.
+RETIRED_DEFAULT_PROMPTS = {
+    # The coordinator of the controller-run parallel critics, which were replaced by the critic's own subagents:
+    # it expected critic reports in its input, which no longer come.
+    "critic": ((
+        "Act as a rigorous proof critic. The controller runs several fresh, independent critics on the exact statement\n"
+        "and candidate proof in parallel, each with a different auditing focus, and gives you their complete reports. The\n"
+        "critics aggressively look for bugs and identify exactly which definitions and omitted arguments must be expanded\n"
+        "to make the proof complete and rigorous.\n"
+        "\n"
+        "Examine their objections and decide which are valid. Try to fix every valid bug yourself by editing proof.md,\n"
+        "defining missing terms and fully expanding omitted arguments. Reject only for a critical error that a critic\n"
+        "found and that you confirm but cannot rigorously fix: then keep the safe fixes in proof.md and return\n"
+        "verdict=reject with every unresolved bug and its exact location in bugs. Otherwise return verdict=pass and an\n"
+        "empty bugs string. If no edits are needed, leave proof.md unchanged. Return only the requested JSON."),),
+}
+
+
+def current_prompt(role, text):
+    """A saved prompt of ``role``, or the current default when it is a retired default (RETIRED_DEFAULT_PROMPTS)."""
+
+    if isinstance(text, str) and text.strip() in {value.strip() for value in RETIRED_DEFAULT_PROMPTS.get(role, ())}:
+        return default_prompts()[role]
+    return text
 
 
 def web_prompt_options(body, roles, source=None):
@@ -413,7 +985,7 @@ def web_prompt_options(body, roles, source=None):
     selected = normalize_workflow_stages(body.get("workflowStages")) if "workflowStages" in body else (
         saved_workflow_stages(source) if source else normalize_workflow_stages())
     if not isinstance(overrides, dict) or any(
-        name not in {"review", "author", "critic", "final"}
+        name not in PROMPT_ROLES
         or (selected[ROLE_STAGES[PROMPT_ROLES[name]]] and not isinstance(value, str))
         for name, value in overrides.items()
     ):
@@ -427,8 +999,95 @@ def web_prompt_options(body, roles, source=None):
 TRACE_LIMIT = 1500
 PINNED_KINDS = {
     "request", "review_result", "critic_result", "author_result",
-    "final_result", "failure_result", "partial_result", "diagnostic", "error",
+    "final_result", "failure_result", "partial_result", "diagnostic", "error", "convention_result",
 }
+# Pinned milestones kept in memory: every result and approval, plus the first
+# PINNED_HEAD and the latest of the others, PINNED_LIMIT in all. transcript.jsonl keeps every record.
+PINNED_LIMIT, PINNED_HEAD, PINNED_SLACK = 2000, 200, 500
+LASTING_KINDS = {"review_result", "critic_result", "author_result", "final_result", "failure_result",
+                 "partial_result", "convention_result"}
+
+
+def convention_verdict(record):
+    """Whether one transcript record is a verdict of the convention critic (a root convention_result)."""
+
+    return isinstance(record, dict) and record.get("kind") == "convention_result" and record.get("root") is not False
+
+
+def convention_warning(record):
+    """The loophole warning one convention critic record raises, or None.
+
+    Only a verdict of loophole with its explanation and suggested statement
+    warns (a faithful verdict shows only in the critic review history). The
+    job keeps its latest verdict's warning: a later faithful verdict (on a
+    later accepted proof) closes an earlier warning. The warning keeps its
+    round and the record's time, which identify it: the user ignores this
+    very warning, and a later loophole verdict shows again.
+    """
+
+    if not convention_verdict(record):
+        return None
+    fields = {key: record.get(key) for key in ("intended", "assessment", "loophole", "suggestedStatement")}
+    if (record.get("verdict") != "loophole" or not all(isinstance(value, str) for value in fields.values())
+            or not fields["loophole"].strip() or not fields["suggestedStatement"].strip()):
+        return None
+    number = record.get("round")
+    return {"round": number if type(number) is int and number > 0 else None,
+            "time": record.get("time") if isinstance(record.get("time"), str) else "",
+            **fields, "dismissed": False}
+
+
+def saved_convention_warning(value):
+    """A loophole warning as job-settings.json saved it (convention_warning()), or None when it is not one."""
+
+    fields = ("time", "intended", "assessment", "loophole", "suggestedStatement")
+    if (not isinstance(value, dict) or not all(isinstance(value.get(key), str) for key in fields)
+            or not value["loophole"].strip() or not value["suggestedStatement"].strip()):
+        return None
+    number = value.get("round")
+    return {"round": number if type(number) is int and number > 0 else None,
+            **{key: value[key] for key in fields}, "dismissed": value.get("dismissed") is True}
+
+
+def same_convention_warning(saved, warning):
+    """Whether a saved warning (job-settings.json) is this warning, so its dismissal still applies."""
+
+    return (isinstance(saved, dict) and isinstance(warning, dict) and saved.get("dismissed") is True
+            and saved.get("time") == warning["time"] and saved.get("round") == warning["round"])
+
+
+def bounded_pinned(pinned):
+    """Drop the oldest pinned milestones beyond the bound, never a result or an approval."""
+
+    others = [index for index, record in enumerate(pinned)
+              if record.get("kind") not in LASTING_KINDS and record.get("label") != "Critic approved"]
+    if len(others) <= PINNED_LIMIT:
+        return pinned
+    dropped = set(others[PINNED_HEAD:len(others) - (PINNED_LIMIT - PINNED_HEAD)])
+    return [record for index, record in enumerate(pinned) if index not in dropped]
+
+
+def without_completed_deltas(records):
+    """Leave out streamed fragments whose completed item is in the same records; it replaces them on the page."""
+
+    def key(record, delta):
+        event = record.get("event") if record.get("kind") == "codex_event" else None
+        params = event.get("params") if isinstance(event, dict) else None
+        if not isinstance(params, dict):
+            return None
+        if delta:
+            kind = {"item/agentMessage/delta": "agent",
+                    "item/reasoning/summaryTextDelta": "reasoning"}.get(event.get("method"))
+            identity = params.get("itemId")
+        else:
+            item = params.get("item")
+            kind = ({"agentMessage": "agent", "agent_message": "agent", "reasoning": "reasoning"}.get(item.get("type"))
+                    if event.get("method") == "item/completed" and isinstance(item, dict) else None)
+            identity = item.get("id") if kind else None
+        return (str(record.get("activityLabel") or ""), kind, identity) if kind and isinstance(identity, str) else None
+
+    completed = {key(record, False) for record in records} - {None}
+    return [record for record in records if key(record, True) not in completed] if completed else records
 
 
 def readable_record(record):
@@ -468,6 +1127,10 @@ def important_record(record):
             and not record.get("activityLabel")):
         # A PASS can either trigger another review or accept the proof. Keep
         # the controller's exact acceptance reason after routine events age out.
+        return True
+    if kind == "status" and record.get("root") is not False and record.get("subagentProgress") is True:
+        # A round's critics (the critic's subagents) requested, started or finished: a few records per
+        # attempt, which the job page's progress line reads while the critic's own events fill the window.
         return True
     if kind != "codex_event" or record.get("root") is False:
         return False
@@ -509,6 +1172,16 @@ PUBLIC_GRAPH = {
             "minimum": 1,
             "maximum": MAX_CRITIC_ROUNDS,
         },
+        "critic_count": {
+            "default": DEFAULT_CRITIC_COUNT,
+            "minimum": 1,
+            "maximum": MAX_CRITIC_COUNT,
+        },
+        "author_subagents": {
+            "default": DEFAULT_AUTHOR_SUBAGENTS,
+            "minimum": 0,
+            "maximum": MAX_AUTHOR_SUBAGENTS,
+        },
         "thinking_hours": {
             "default": DEFAULT_THINKING_HOURS,
             "minimum": 0,
@@ -535,7 +1208,15 @@ PUBLIC_GRAPH = {
         "critic": {
             "label": "Independent critic", "short_label": "Critic",
             "stage": "critic",
-            "description": "One critic call uses fresh independent subagents, checks the proof, and fixes issues. Unfixable issues return to the author.",
+            "description": "One critic starts independent critics as its subagents, weighs their reports and fixes "
+                           "the valid issues. Unfixable issues return to the author.",
+        },
+        "convention": {
+            "label": "Convention critic", "short_label": "Convention",
+            "stage": "critic",
+            "description": "Checks once, after the critic accepts the proof and before writing, whether the proof "
+                           "does what a mathematician would want or exploits a loophole in the statement. It only "
+                           "warns; the run continues either way.",
         },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
@@ -543,7 +1224,8 @@ PUBLIC_GRAPH = {
         },
         "latex_compile": {
             "label": "Compile PDF", "short_label": "Compile", "stage": "final",
-            "description": "Compiles LaTeX, fixes compilation errors, and repeats until the source and PDF are ready.",
+            "description": "Compiles LaTeX, fixes compilation errors, and repeats until the source and PDF are ready, "
+                           "or until three attempts fail the same way; the source is then kept without a PDF.",
         },
         "latex_repair": {
             "label": "Fix LaTeX errors", "short_label": "Fix LaTeX", "stage": "final",
@@ -559,7 +1241,7 @@ PUBLIC_GRAPH = {
         {
             "from": "author", "to": "critic",
             "label": "Audit candidate", "when": "author writes or revises the proof",
-            "prompt_change": "Send the latest candidate to a fresh critic.",
+            "prompt_change": "Send the latest candidate to the critic, which starts fresh independent critics.",
         },
         {
             "from": "author", "to": "failure_summary",
@@ -568,8 +1250,9 @@ PUBLIC_GRAPH = {
         },
         {
             "from": "critic", "to": "critic",
-            "label": "Recheck repair", "when": "critic fixes all bugs and the round limit is not reached",
-            "prompt_change": "Send the repaired solution to a fresh critic call with new independent subagents.",
+            "label": "Recheck repair",
+            "when": "the critic fixes all bugs; at the round limit the recheck cannot edit",
+            "prompt_change": "Send the repaired proof to the critic and new independent critics.",
         },
         {
             "from": "critic", "to": "author",
@@ -577,13 +1260,18 @@ PUBLIC_GRAPH = {
             "prompt_change": "Send unresolved bugs back to the proof author.",
         },
         {
-            "from": "critic", "to": "latex_editor",
-            "label": "Format reviewed proof", "when": "critic passes without edits or passes with edits at the round limit",
+            "from": "critic", "to": "convention",
+            "label": "Check conventions", "when": "critic accepts the proof",
+            "prompt_change": "Send the accepted proof and the statement to the convention critic.",
+        },
+        {
+            "from": "convention", "to": "latex_editor",
+            "label": "Format reviewed proof", "when": "the convention critic has answered, whatever its verdict",
             "prompt_change": "Send the independently reviewed solution to the LaTeX editor.",
         },
         {
             "from": "critic", "to": "failure_summary",
-            "label": "Save verification checkpoint", "when": "the critic is interrupted or the time budget is reached",
+            "label": "Save verification checkpoint", "when": "the critic is interrupted",
             "prompt_change": "Keep the latest saved proof for continuation at the critic.",
         },
         {"from": "latex_editor", "to": "latex_compile", "label": "Compile LaTeX"},
@@ -631,7 +1319,7 @@ REVIEW_ONLY_GRAPH = {
 WORKFLOW_STAGES = ("review", "author", "critic", "writing")
 STAGE_ROLES = {"review": "review", "author": "author", "critic": "critic", "writing": "writer"}
 ROLE_STAGES = {role: stage for stage, role in STAGE_ROLES.items()}
-PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "final": "writer"}
+PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "convention": "critic", "final": "writer"}
 
 
 def normalize_workflow_stages(value=None):
@@ -646,6 +1334,38 @@ def normalize_workflow_stages(value=None):
     if not any(result.values()):
         raise ValueError("Select at least one workflow stage.")
     return result
+
+
+def valid_author_subagents(value):
+    """Require a whole number of author subagents, 0 (no subagent tool) to MAX_AUTHOR_SUBAGENTS."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+        if not isinstance(value, str) and value != parsed:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("The number of author subagents must be an integer.") from exc
+    if not 0 <= parsed <= MAX_AUTHOR_SUBAGENTS:
+        raise ValueError(f"Choose 0 to {MAX_AUTHOR_SUBAGENTS} author subagents.")
+    return parsed
+
+
+def valid_critic_count(value):
+    """Require a whole number of independent critics per critic round, 1 to MAX_CRITIC_COUNT."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+        if not isinstance(value, str) and value != parsed:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("The number of independent critics must be an integer.") from exc
+    if not 1 <= parsed <= MAX_CRITIC_COUNT:
+        raise ValueError(f"Choose 1 to {MAX_CRITIC_COUNT} independent critics.")
+    return parsed
 
 
 def saved_workflow_stages(state):
@@ -673,19 +1393,35 @@ def workflow_graph(stages):
     if stages["author"]:
         enabled.append("author")
     if stages["critic"]:
-        enabled.append("critic")
+        enabled.extend(("critic", "convention"))
     if stages["writing"]:
         enabled.extend(("latex_editor", "latex_compile", "latex_repair"))
     nodes = {name: PUBLIC_GRAPH["nodes"][name] for name in enabled}
     if stages["author"] or stages["critic"]:
         nodes["failure_summary"] = PUBLIC_GRAPH["nodes"]["failure_summary"]
     edges = [edge for edge in PUBLIC_GRAPH["edges"] if edge["from"] in nodes and edge["to"] in nodes]
-    sequence = [name for name in ("statement_reviewer", "author", "critic", "latex_editor") if name in nodes]
+    sequence = [name for name in ("statement_reviewer", "author", "critic", "convention", "latex_editor")
+                if name in nodes]
     for previous, following in zip(sequence, sequence[1:]):
         if not any(edge["from"] == previous and edge["to"] == following for edge in edges):
             edges.append({"from": previous, "to": following,
                           "label": "Approve statement" if previous == "statement_reviewer" else "Continue"})
     return {"settings": PUBLIC_GRAPH["settings"], "nodes": nodes, "edges": edges}
+
+
+def checkpoint_roles(node, stages=None):
+    """The model roles the steps after a paused step can use, which a relaunch checks.
+
+    After the critic only the LaTeX writer remains. The critic's own step can
+    reject to the author or pass to the writer, and the runner checks every
+    model it is given when it starts, so it needs all three. Only the roles of
+    the job's selected stages count (see saved_workflow_stages): a LaTeX-only
+    job, for example, needs only the writer.
+    """
+
+    selected = normalize_workflow_stages(stages)
+    roles = ("writer",) if node in LATEX_GRAPH["nodes"] else ("author", "critic", "writer")
+    return tuple(role for role in roles if selected[ROLE_STAGES[role]])
 
 
 def event_node(record, current=""):
@@ -716,6 +1452,79 @@ def direct_run_directory(path, runs):
         return False
 
 
+# The controller's own folder of each run, beside the runs (hidden, so never a run or batch).
+CONTROLLER_FOLDER = ".controller"
+
+
+def controller_directory(run_dir):
+    """The controller's folder for one run: runs/.controller/<run>, outside every model sandbox.
+
+    The author can write its run folder, so the files that steer a run live
+    here (author-limit.json, pause-request.json), and the controller keeps its
+    own copies of the prompts, the checked statement, the job settings and the
+    pause checkpoint, which it trusts over the run folder's. Those stay in the
+    run folder too, for display and older tools.
+    """
+
+    run_dir = Path(run_dir)
+    return run_dir.parent / CONTROLLER_FOLDER / run_dir.name
+
+
+# The author's private temp folder in the controller's folder of its run, outside every workspace
+# (the runner creates it owner-only; see runner/confinement.py).
+RUN_TMP_FOLDER = "tmp"
+
+
+TRASH_FOLDER = ".trash"
+TRASH_KEPT_DAYS = 30
+TRASH_INDEX = ".deleted-at.json"
+
+
+def prune_trash(runs, now=None):
+    """Remove the deleted jobs that have been in runs/.trash for TRASH_KEPT_DAYS days.
+
+    The trash records when each job arrived; one without a record (deleted
+    by an older version, or just now) starts its time when it is first seen.
+    """
+
+    trash, now = Path(runs) / TRASH_FOLDER, time.time() if now is None else now
+    try:
+        if trash.is_symlink() or not trash.is_dir():
+            return
+        try:
+            recorded = json.loads((trash / TRASH_INDEX).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {}
+        recorded = recorded if isinstance(recorded, dict) else {}
+        kept = {}
+        for path in trash.iterdir():
+            if not path.is_dir() or path.is_symlink():
+                continue
+            arrived = recorded.get(path.name)
+            if not isinstance(arrived, (int, float)) or isinstance(arrived, bool) or not math.isfinite(arrived):
+                arrived = now
+            if now - arrived >= TRASH_KEPT_DAYS * 24 * 3600:
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                kept[path.name] = arrived
+        if kept != recorded:
+            runtime._private_atomic_write(trash / TRASH_INDEX, json.dumps(kept, sort_keys=True) + "\n")
+    except (OSError, UnicodeError, ValueError):
+        pass  # The trash is tidied again at the next deletion or start.
+
+
+def controlled_path(run_dir, name):
+    """The controller's copy of a run file when it has one (older runs have none), else the run folder's."""
+
+    private = controller_directory(run_dir) / name
+    try:
+        if private.is_file() and not private.is_symlink():
+            return private
+    except OSError:
+        pass
+    return Path(run_dir) / name
+
+
 def validated_continuation_source(path, runs):
     """Resolve one run while refusing symlink escapes through its artifacts."""
 
@@ -742,6 +1551,8 @@ def empty_state(trace=None, trace_version=0):
         "originalContent": "",
         "preparedRun": False,
         "launchHold": "",
+        # Set while another process owns the run; nothing here may change it.
+        "runningElsewhere": "",
         "retrievalPolicyPath": "",
         "retrievalMode": "live",
         "retrievalCutoffUtc": "",
@@ -759,6 +1570,21 @@ def empty_state(trace=None, trace_version=0):
         "goalWorkspace": "",
         "goalResume": False,
         "authorSteerDelivered": "",
+        # The running author's newest open question to the user ({"id", "askedAt", "turnId", "questions",
+        # "turnEndedAt"}), or None; App._author_question_locked closes it.
+        "authorQuestion": None,
+        # Why the job is paused ("error", "user", "time-limit", ...), from its checkpoint.
+        "pauseCause": "",
+        # The critic rejected the latest proof and the paused author has not received its report.
+        "criticFeedbackPending": False,
+        # The latest loophole warning of the convention critic (see convention_warning), or None.
+        "conventionWarning": None,
+        # A conversation turn compacted the author's context: the next Resume sends the full resume prompt.
+        "pendingReanchor": False,
+        # Related works added while paused; the author is told with the next message or at Resume.
+        "relatedWorksPending": [],
+        # The folder batch ("Run a folder…") whose related works this job shares, or "".
+        "folderBatch": "",
         "latexInput": "",
         "review": None,
         "reviewModel": DEFAULT_REVIEW_MODEL,
@@ -776,9 +1602,25 @@ def empty_state(trace=None, trace_version=0):
         "reviewPrompt": prompts["review"],
         "authorPrompt": prompts["author"],
         "criticPrompt": prompts["critic"],
+        "conventionPrompt": prompts["convention"],
         "finalPrompt": prompts["final"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
+        "criticCount": DEFAULT_CRITIC_COUNT,
+        # Subagents the proof author may start at a time (0: no subagent tool).
+        "authorSubagents": DEFAULT_AUTHOR_SUBAGENTS,
+        # False for a saved job that never recorded its number of critics (older jobs): the job page
+        # does not credit it with independent critics it may never have run.
+        "criticCountRecorded": True,
+        # False for a saved job from before the Author subagents setting, when the critic ran its independent
+        # critics itself and the author always had the subagent tool: the job page does not describe it with
+        # the newer settings.
+        "authorSubagentsRecorded": True,
         "thinkingHours": DEFAULT_THINKING_HOURS,
+        # The author time limit's changes and pauses at it (see follow_time_limit).
+        "timeLimitHistory": [],
+        # While a critic round runs: its independent critics, those finished, and whether the
+        # coordinator was asked (see follow_critic_progress).
+        "criticProgress": None,
         "stage": "",
         "activeNode": "",
         "round": 0,
@@ -866,16 +1708,24 @@ def unconfigured_job_model_error(model, role, snapshot):
             f"under New problem → Advanced settings → API connections {how} to continue this job.")
 
 
-def require_known_models(models):
-    """Reject an unknown, removed or unconfigured model for any role in ``models``."""
-
-    for role, model in models.items():
-        if not isinstance(model, str) or not providers.is_known(model):
-            raise ValueError(model_choice_error(model, role))
-
-
 class TransientLaunchError(ValueError):
     """A model cannot start right now for a reason that passes by itself (its CLI is updating)."""
+
+
+def require_known_models(models):
+    """Reject an unknown, removed or unconfigured model for any role in ``models``.
+
+    An API model store that cannot be read right now is a TransientLaunchError,
+    never an unconfigured model.
+    """
+
+    for role, model in models.items():
+        try:
+            known = isinstance(model, str) and providers.is_known(model)
+        except providers.StoreUnavailable as exc:
+            raise TransientLaunchError(str(exc)) from exc
+        if not known:
+            raise ValueError(model_choice_error(model, role))
 
 
 def require_model_access(models):
@@ -887,6 +1737,8 @@ def require_model_access(models):
     except runtime.CLIUnavailable as exc:
         raise TransientLaunchError(str(exc)) from exc
     except runtime.Error as exc:
+        if isinstance(exc.__cause__, providers.StoreUnavailable):
+            raise TransientLaunchError(str(exc)) from exc  # Unreadable for a moment, not removed.
         raise ValueError(str(exc)) from exc
 
 
@@ -959,20 +1811,87 @@ def _api_endpoint_path(entry, endpoint):
     return path + "/" + endpoint
 
 
-def _api_test_request(entry):
-    """Path, headers and body of the one minimal request a Test sends."""
+def _api_test_request(entry, effort=None):
+    """Path, headers and body of a Test request.
 
+    With an ``effort`` the request is shaped like the ones runs send: it
+    streams its answer (server-sent events), offers one tool, asks for a JSON
+    answer (Codex's prompt contract for OpenAI-format models, the structured
+    output tool of the Claude CLI for Anthropic-format ones) at that effort,
+    with the model's max output (Anthropic: what runs ask for when none is
+    set). Without one it is the minimal request ("Reply with OK.", 16 tokens).
+    """
+
+    headers = _api_connection_headers(entry)
+    if effort:
+        headers["Accept"] = "text/event-stream"
+    output = entry.get("maxOutputTokens")
     if entry["format"] == providers.OPENAI_FORMAT:
         # Codex sends Responses requests to <base URL>/responses.
         path = _api_endpoint_path(entry, "responses")
         body = {"model": entry["model"], "input": API_TEST_PROMPT,
                 "max_output_tokens": API_TEST_MAX_TOKENS}
+        if effort:
+            body = {"model": entry["model"], "stream": True,
+                    "input": [{"role": "user", "content": API_TEST_STRUCTURED_PROMPT}],
+                    "reasoning": {"effort": effort, "summary": DEFAULT_REASONING_SUMMARY},
+                    "tools": [{"type": "function", "name": "report_result", "strict": True,
+                               "description": "Report the result of the connection test.",
+                               "parameters": API_TEST_SCHEMA}],
+                    "tool_choice": "auto", **({"max_output_tokens": output} if output else {})}
     else:
         # The Claude CLI takes the base URL without /v1 and adds /v1/messages.
         path = _api_endpoint_path(entry, "messages")
         body = {"model": entry["model"], "max_tokens": API_TEST_MAX_TOKENS,
                 "messages": [{"role": "user", "content": API_TEST_PROMPT}]}
-    return path, _api_connection_headers(entry), json.dumps(body).encode("utf-8")
+        if effort:
+            body = {"model": entry["model"], "max_tokens": output or API_TEST_RUN_OUTPUT_TOKENS, "stream": True,
+                    "messages": [{"role": "user", "content": API_TEST_STRUCTURED_PROMPT
+                                  + " Give it by calling the StructuredOutput tool."}],
+                    "tools": [{"name": claude_cli.STRUCTURED_OUTPUT_TOOL,
+                               "description": "Return the final answer as JSON.", "input_schema": API_TEST_SCHEMA}],
+                    "tool_choice": {"type": "auto"}, "output_config": {"effort": effort}}
+    return path, headers, json.dumps(body).encode("utf-8")
+
+
+def _api_test_stream(text):
+    """What a streamed (server-sent events) reply says: (reply text, tool called, model, error message)."""
+
+    reply, partial, tool, model, error = [], [], "", "", ""
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("type") or "")
+        if kind in {"error", "response.failed"}:
+            failure = event.get("error") or (event.get("response") or {}).get("error") or event
+            error = _api_test_error({"error": failure} if isinstance(failure, dict) else event, str(failure))
+        elif kind == "response.output_text.delta" and isinstance(event.get("delta"), str):
+            reply.append(event["delta"])
+        elif kind == "response.output_item.done" and isinstance(event.get("item"), dict):
+            if event["item"].get("type") == "function_call":
+                tool = str(event["item"].get("name") or "a tool")
+                if isinstance(event["item"].get("arguments"), str):
+                    partial.append(event["item"]["arguments"])
+        elif kind in {"response.created", "response.completed"} and isinstance(event.get("response"), dict):
+            model = event["response"].get("model") or model
+        elif kind == "message_start" and isinstance(event.get("message"), dict):
+            model = event["message"].get("model") or model
+        elif kind == "content_block_start" and isinstance(event.get("content_block"), dict):
+            if event["content_block"].get("type") == "tool_use":
+                tool = str(event["content_block"].get("name") or "a tool")
+        elif kind == "content_block_delta" and isinstance(event.get("delta"), dict):
+            delta = event["delta"]
+            if isinstance(delta.get("text"), str):
+                reply.append(delta["text"])
+            if isinstance(delta.get("partial_json"), str):
+                partial.append(delta["partial_json"])
+    return "".join(reply) or "".join(partial), tool, model if isinstance(model, str) else "", error
 
 
 def _api_test_text(text, key):
@@ -1038,20 +1957,11 @@ def _api_test_failure(exc, timeout):
     return f"The request failed ({name})."
 
 
-def probe_api_endpoint(entry, timeout=None):
-    """Send ONE minimal model request to an API model's endpoint and describe the result.
+def _api_test_exchange(entry, effort, timeout):
+    """Send one Test request (see _api_test_request); (status or None, Location, body text, content type, failure)."""
 
-    ``entry`` holds validated settings including the key. The exchange has one
-    overall deadline, follows no redirect, and the key travels only in the
-    protocol's standard authentication header; no returned text contains it.
-    """
-
-    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
     parts = urlsplit(entry["baseUrl"])
-    result = {"ok": False, "status": None, "latencyMs": None, "message": "", "model": entry["model"],
-              "testedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    started = time.monotonic()
-    deadline, status, location, raw = started + timeout, None, "", b""
+    deadline, status, location, kind, chunks = time.monotonic() + timeout, None, "", "", []
     connection = (
         http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
                                     context=ssl.create_default_context())
@@ -1059,7 +1969,7 @@ def probe_api_endpoint(entry, timeout=None):
         http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
     )
     try:
-        path, headers, body = _api_test_request(entry)
+        path, headers, body = _api_test_request(entry, effort)
         connection.request("POST", path or "/", body=body, headers=headers)
         # The response keeps reading through this socket after getresponse().
         channel = connection.sock
@@ -1077,40 +1987,92 @@ def probe_api_endpoint(entry, timeout=None):
         bound()
         response = connection.getresponse()
         status, location = response.status, response.getheader("Location") or ""
-        chunks, size = [], 0
+        kind = (response.getheader("Content-Type") or "").lower()
+        size = 0
         while size < API_TEST_MAX_RESPONSE_BYTES:
             bound()
-            chunk = response.read(min(16384, API_TEST_MAX_RESPONSE_BYTES - size))
+            chunk = response.read1(min(16384, API_TEST_MAX_RESPONSE_BYTES - size))
             if not chunk:
                 break
             chunks.append(chunk)
             size += len(chunk)
-        raw = b"".join(chunks)
     except Exception as exc:  # Network, TLS, protocol or encoding failure.
         if status is None:
-            result.update(latencyMs=round((time.monotonic() - started) * 1000),
-                          message=_api_test_text(_api_test_failure(exc, timeout), entry["apiKey"]))
-            return result
-        # A body cut short still leaves a usable status line.
+            return None, "", "", "", _api_test_failure(exc, timeout)
+        # A body cut short still leaves a usable status line and what arrived.
     finally:
         connection.close()
-    result.update(status=status, latencyMs=round((time.monotonic() - started) * 1000))
-    text = raw.decode("utf-8", "replace")
+    return status, location, b"".join(chunks).decode("utf-8", "replace"), kind, ""
+
+
+def _api_test_outcome(status, location, text, kind, streamed):
+    """(ok, model or "", message) of one Test exchange."""
+
     try:
         value = json.loads(text)
     except ValueError:
         value = None
-    if 200 <= status < 300:
+    if 300 <= status < 400:
+        return False, "", (f"The endpoint redirected to {location or 'another URL'}; redirects are not "
+                           "followed. Enter the final API base URL.")
+    if not 200 <= status < 300:
+        detail = _api_test_error(value, text).strip()
+        return False, "", detail or f"HTTP {status} without an error message."
+    if not streamed:
         reply = _api_test_reply(value)
         reported = value.get("model") if isinstance(value, dict) else None
-        result.update(ok=True, model=reported if isinstance(reported, str) and reported.strip() else entry["model"],
-                      message=f"The model replied: {reply}" if reply.strip() else "The endpoint accepted the request.")
-    elif 300 <= status < 400:
-        result["message"] = (f"The endpoint redirected to {location or 'another URL'}; redirects are not "
-                             "followed. Enter the final API base URL.")
-    else:
-        detail = _api_test_error(value, text).strip()
-        result["message"] = detail or f"HTTP {status} without an error message."
+        return True, reported if isinstance(reported, str) else "", (
+            f"The model replied: {reply}" if reply.strip() else "The endpoint accepted the request.")
+    if "text/event-stream" not in kind and not text.lstrip().startswith(("event:", "data:")):
+        return False, "", ("The endpoint answered without streaming (server-sent events), which the CLIs need "
+                           "for every request.")
+    reply, tool, model, error = _api_test_stream(text)
+    if error:
+        return False, model, error
+    if tool:
+        return True, model, f"The model answered through the {tool} tool: {reply.strip() or '(no arguments)'}"
+    try:
+        answered = json.loads(reply.strip().strip("`").removeprefix("json").strip()) == {"ok": True}
+    except ValueError:
+        answered = False
+    if not reply.strip():
+        return True, model, "The endpoint streamed an answer without text."
+    return True, model, (f"The model replied with the requested JSON: {reply.strip()}" if answered
+                         else f"The model replied, but not with the requested JSON: {reply.strip()}")
+
+
+def probe_api_endpoint(entry, timeout=None, effort=None):
+    """Test an API model's endpoint with a request like the ones runs send, and describe the result.
+
+    The request streams its answer, offers one tool and asks for a JSON
+    answer at ``effort`` (the menus' default when None), with the model's
+    output limit (see _api_test_request). When the endpoint refuses it, one
+    minimal request tells a request the endpoint does not accept (a settings
+    problem) from an endpoint that refuses everything. ``entry`` holds
+    validated settings including the key. Each exchange has one overall
+    deadline, follows no redirect, and the key travels only in the
+    protocol's standard authentication header; no returned text contains it.
+    """
+
+    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
+    effort = providers.API_EFFORTS[entry["format"]][-1] if effort not in providers.API_EFFORTS[entry["format"]] else effort
+    result = {"ok": False, "status": None, "latencyMs": None, "message": "", "model": entry["model"],
+              "effort": effort, "testedAt": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    started = time.monotonic()
+    status, location, text, kind, failure = _api_test_exchange(entry, effort, timeout)
+    result.update(status=status, latencyMs=round((time.monotonic() - started) * 1000))
+    if status is None:
+        result["message"] = _api_test_text(failure, entry["apiKey"])
+        return result
+    ok, model, message = _api_test_outcome(status, location, text, kind, True)
+    if not ok and 400 <= status < 500 and status not in {401, 403, 404}:
+        basic = _api_test_exchange(entry, None, timeout)
+        if basic[0] is not None and 200 <= basic[0] < 300:
+            message = (f"The endpoint answers a minimal request but refuses the requests runs send (streamed, with "
+                       f"a tool and a JSON answer at {effort} effort): {message}")
+    elif ok and "not with the requested JSON" in message:
+        message += " Runs ask again until the answer is valid JSON."
+    result.update(ok=ok, model=model.strip() or entry["model"], message=message)
     result["model"] = _api_test_text(result["model"], entry["apiKey"])
     result["message"] = _api_test_text(result["message"], entry["apiKey"])
     return result
@@ -1231,40 +2193,6 @@ def discover_api_models(entry, timeout=None):
     return result
 
 
-def approach_metadata(name, content):
-    """Extract graph labels from one node's own header and summary sections."""
-
-    identity = Path(name).name.split("-", 1)[0].removesuffix(".md")
-    fallback = Path(name).stem[len(identity):].lstrip("-").replace("-", " ") or identity
-    # Metadata belongs before the first section, not in examples or later prose.
-    header = re.split(r"(?m)^\s*##\s+", content, maxsplit=1)[0]
-    title = re.search(r"(?m)^#\s+(.+?)\s*$", header)
-    title = re.sub(r"^" + re.escape(identity) + r"\b[\s:—–-]*", "", title[1]) if title else fallback
-    fields = {}
-    for line in header.splitlines():
-        match = re.match(r"^\s*(Parents?|Children|Status)\s*:\s*(.*?)\s*$", line.replace("**", ""), re.I)
-        if match:
-            key = match[1].lower()
-            fields["parent" if key == "parents" else key] = match[2]
-    parents = list(dict.fromkeys(re.findall(r"\bA\d{3,}\b", fields.get("parent", ""))))
-    status = fields.get("status", "").strip().rstrip(".").upper()
-    if status == "PARKED":  # Older research notes used this name.
-        status = "BLOCKED"
-    if status not in {"ACTIVE", "BLOCKED", "CLOSED", "RESOLVED"}:
-        status = "UNSPECIFIED"
-    sections = re.split(r"(?m)^##\s+(.+?)\s*$", content)
-    summaries = {sections[i].strip().lower(): sections[i + 1].strip()
-                 for i in range(1, len(sections) - 1, 2)}
-    preferred = "obstacles" if status == "BLOCKED" else "conclusions" if status in {"CLOSED", "RESOLVED"} else "context and objective"
-    summary = summaries.get(preferred) or summaries.get("context and objective") or ""
-    summary = re.split(r"\n\s*\n", summary, maxsplit=1)[0].strip()
-    if len(summary) > 1000:
-        summary = summary[:997].rstrip() + "…"
-    return {"id": identity, "file": name, "title": title or fallback,
-            "parents": parents, "status": status, "result": summary,
-            "hasParents": "parent" in fields}
-
-
 class App:
     """Own one review-and-solve workflow."""
 
@@ -1286,11 +2214,25 @@ class App:
         self.lock = threading.RLock()
         self._checkpoint_cache = []
         self._checkpoint_cache_signature = None
-        self._approach_cache = {}
         # Start of the runner's current retry wait, which is not active time.
         self._retry_wait_started = None
-        # The model calls now waiting to retry, by activity (parallel audits wait separately).
-        self._model_retries = {}
+        # The model calls now waiting to retry, by activity (each labelled call waits separately), and
+        # each one's latest failed attempt with the time its failures began.
+        self._model_retries, self._retry_starts = {}, {}
+        # The owner locks of this run while it may start a runner here (see ownership).
+        self._claims = ownership.Claims()
+        weakref.finalize(self, self._claims.release_all)
+        self._worker_thread = None
+        # A pause checkpoint that could not be written yet (for example on a full disk).
+        self._unsaved_checkpoint = None
+        # Transcript lines kept after a failed write, and when to try writing them again.
+        self._unsaved_trace, self._trace_retry_at = [], 0.0
+        # The summaries, messages and replies of the paused author (conversation.json), oldest first.
+        self._conversation = []
+        # Whether the author resumed by the last Resume had not yet received the critic's latest report.
+        self._carry_critic_feedback = False
+        # The author's questions that closed; a late copy of one (its "completed" event) never reopens it.
+        self._closed_questions = set()
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -1358,33 +2300,59 @@ class App:
             self.run_dir / name, content, staging_directory=self.run_dir.parent,
         )
 
+    def _controller_directory(self):
+        """Create (owner-only) and return this run's controller folder."""
+
+        folder = controller_directory(self.run_dir)
+        for path in (folder.parent, folder):
+            path.mkdir(exist_ok=True, mode=0o700)
+        return folder
+
+    def _save_controlled(self, name, content, *, run_copy=True):
+        """Save a file the controller relies on: its own copy and, unless ``run_copy`` is False, the run folder's."""
+
+        path = self._controller_directory() / name
+        runtime._private_atomic_write(path, content)
+        if run_copy:
+            self._save(name, content)
+        return path
+
+    def _save_prompt(self, role, text):
+        """Save one role prompt; return the controller's copy, which the runner reads."""
+
+        return self._save_controlled(f"prompts/{role}.txt", text + "\n")
+
     def _save_job_settings(self, options):
         """Persist restart-safe workflow settings without prompt duplication."""
 
         keys = (
             "reviewModel", "authorModel", "criticModel", "writerModel",
             "reasoningEffort", "reviewEffort", "authorEffort",
-            "criticEffort", "writerEffort", "criticRounds",
+            "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
             "workflowStages", "originalContent",
             "resultKind", "revisionRequired",
             "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
-            "sourceFile", "apiModels",
+            "sourceFile", "apiModels", "replacedRoles", "launchQueued", "queuedAt", "launchError",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
+            "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
+            "timeLimitHistory", "conventionWarning",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
         # Stage outside the writable workspace so a same-UID sandboxed author
         # cannot alter temporary contents before the controller installs them.
-        runtime._private_atomic_write(
-            self.run_dir / JOB_SETTINGS_FILENAME,
-            json.dumps(
-                {key: options[key] for key in keys if key in options},
-                ensure_ascii=False, indent=2, sort_keys=True,
-            ) + "\n",
-            staging_directory=self.run_dir.parent,
-        )
+        payload = json.dumps(
+            {key: options[key] for key in keys if key in options},
+            ensure_ascii=False, indent=2, sort_keys=True,
+        ) + "\n"
+        # The controller's copy first: restoring trusts it, and the run
+        # folder's copy is only what the author may read.
+        for folder in (self._controller_directory(), self.run_dir):
+            runtime._private_atomic_write(
+                folder / JOB_SETTINGS_FILENAME, payload, staging_directory=self.run_dir.parent,
+            )
 
     def _prepare_continuation(
         self, source_run="", stopped_stage="", allow_external_source=False,
@@ -1400,7 +2368,7 @@ class App:
         )
         if source == self.run_dir.resolve():
             raise ValueError("A continuation must use a new run directory.")
-        source_settings_path = source / JOB_SETTINGS_FILENAME
+        source_settings_path = controlled_path(source, JOB_SETTINGS_FILENAME)
         if source_settings_path.exists():
             source_settings = json.loads(source_settings_path.read_text(encoding="utf-8"))
             if source_settings.get("retrievalPolicyPath") or source_settings.get("launchHold"):
@@ -1433,6 +2401,7 @@ class App:
         try:
             worker = threading.Thread(target=target, args=args, daemon=True)
             worker.start()
+            self._worker_thread = (token, worker)
         except Exception:
             with self.lock:
                 if self.worker_token is token:
@@ -1446,6 +2415,48 @@ class App:
 
         with self.lock:
             return self.worker_token is not None
+
+    def _claim_run_locked(self):
+        """Own this run, and the workspace of the author it continues, before a runner starts.
+
+        Raise OwnedElsewhere while another process owns either. Return the lock
+        descriptors to hand to the runner.
+        """
+
+        folders = [self.run_dir]
+        workspace = self.state.get("goalWorkspace")
+        if workspace:
+            try:
+                workspace = Path(workspace).expanduser().resolve()
+                if workspace != self.run_dir.resolve() and workspace.is_dir():
+                    folders.append(workspace)
+            except OSError:
+                pass
+        return [descriptor for descriptor in map(self._claims.claim, folders) if descriptor is not None]
+
+    def _settle_run_claim(self):
+        """Give up the owner locks once nothing here can start this run's runner by itself."""
+
+        with self.lock:
+            problem = self.state.get("settingsProblem")
+            if (self.worker_token is not None or self.state["phase"] in ACTIVE_PHASES
+                    or (self.state["phase"] == "paused" and (self.state.get("autoResumeAt")
+                                                             or (isinstance(problem, dict) and problem.get("models"))))
+                    # A reply the server starts by itself.
+                    or self._conversation_busy_locked()):
+                return
+            self._claims.release_all()
+
+    def _check_owned_here(self):
+        if self.state.get("runningElsewhere"):
+            raise ValueError(self.state["runningElsewhere"])
+
+    def _reader_gone_locked(self):
+        """Whether the current reader thread ended without settling its job."""
+
+        reader = self._worker_thread
+        return (self.worker_token is not None and reader is not None
+                and reader[0] is self.worker_token and not reader[1].is_alive())
 
     def _finish_stopped_locked(self, token, message):
         """Publish a stopped job only after its matching reader has settled."""
@@ -1461,23 +2472,47 @@ class App:
                 finishedAt=datetime.now(timezone.utc).isoformat(),
             )
             self.state["output"] = self.state["output"] or message
+        self._settle_run_claim()
 
     def _write_author_limit(self, hours):
-        """Atomically publish the total workflow limit to the active solver."""
+        """Atomically publish the total workflow limit to the active solver (from the controller folder)."""
 
-        self._save(AUTHOR_LIMIT_FILENAME, json.dumps({"hours": hours}))
-        return self.run_dir / AUTHOR_LIMIT_FILENAME
+        return self._save_controlled(AUTHOR_LIMIT_FILENAME, json.dumps({"hours": hours}), run_copy=False)
 
     def _write_author_steer(self, instruction):
-        """Atomically publish one live instruction to the active author."""
+        """Atomically append one live instruction to the active author's queue.
+
+        The author receives queued instructions one at a time and in order
+        (runtime.pending_author_steer); the ones it already accepted are
+        dropped here. The newest entry is repeated at the top level, which is
+        the whole file an older runner reads.
+        """
 
         command_id = secrets.token_hex(12)
-        self._save(AUTHOR_STEER_FILENAME, json.dumps({
-            "id": command_id,
-            "instruction": instruction,
-            "createdAt": datetime.now(timezone.utc).isoformat(),
-        }, ensure_ascii=False))
+        entry = {"id": command_id, "instruction": instruction, "createdAt": datetime.now(timezone.utc).isoformat()}
+        queue = [item for item in self._author_steer_queue()
+                 if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        identities = [item["id"] for item in queue]
+        delivered = self.state.get("authorSteerDelivered")
+        if delivered in identities:
+            queue = queue[identities.index(delivered) + 1:]
+        self._save(AUTHOR_STEER_FILENAME, json.dumps({**entry, "queue": [*queue, entry]}, ensure_ascii=False))
         return command_id
+
+    def _author_steer_queue(self):
+        """The queued live instructions; the author can write its run folder, so a link or FIFO reads as none."""
+
+        try:
+            descriptor = open_run_log(self.run_dir / AUTHOR_STEER_FILENAME, os.O_RDONLY, private=False)
+            if descriptor is None:
+                return []
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                value = json.loads(stream.read())
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            return []
+        if isinstance(value, dict) and isinstance(value.get("queue"), list):
+            return value["queue"]
+        return [value] if isinstance(value, dict) else []
 
     def _load_trace(self):
         """Restore the append-only local transcript after a restart."""
@@ -1500,9 +2535,11 @@ class App:
                             records.append(record)
                             if important_record(record):
                                 pinned.append(record)
+                                if len(pinned) > PINNED_LIMIT + PINNED_SLACK:
+                                    pinned = bounded_pinned(pinned)
                     except (ValueError, RecursionError):
                         continue
-            return list(records), total, pinned
+            return without_completed_deltas(list(records)), total, bounded_pinned(pinned)
         except OSError:
             return [], 0, []
 
@@ -1517,7 +2554,7 @@ class App:
         ]
 
     def add_trace(self, record):
-        """Timestamp, retain, and persist one transcript record."""
+        """Timestamp, retain, and persist one transcript record; return it as it was saved."""
 
         # Put the receipt time last so a child cannot replace the audit timestamp.
         entry = {**record, "time": datetime.now(timezone.utc).isoformat()}
@@ -1525,21 +2562,34 @@ class App:
             # Secure the private log before writing its first sensitive byte.
             if not self.trace_file:
                 raise OSError("No problem run is active.")
-            # The run folder was made private once, when it was created.
-            self.trace_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            replaced = append_run_log(
-                self.trace_file, json.dumps(entry, ensure_ascii=False) + "\n",
-            )
-            self.state["trace"].append(entry)
-            self.state["trace"][:] = self.state["trace"][-TRACE_LIMIT:]
-            if important_record(entry):
-                self.pinned.append(entry)
-            self.state["traceVersion"] += 1
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
+            try:
+                line.encode("utf-8")
+            except UnicodeEncodeError:
+                line = json.dumps(entry) + "\n"  # A lone surrogate from a JSON escape stays escaped.
+            replaced, notice = self._persist_trace(line, durable=entry.get("kind") != "codex_event")
+            for added in (entry, notice) if notice else (entry,):
+                self.state["trace"].append(added)
+                self.state["trace"][:] = self.state["trace"][-TRACE_LIMIT:]
+                if important_record(added):
+                    self.pinned.append(added)
+                    if len(self.pinned) > PINNED_LIMIT + PINNED_SLACK:
+                        self.pinned = bounded_pinned(self.pinned)
+                self.state["traceVersion"] += 1
             self.state["lastActivityAt"] = entry["time"]
-            if record.get("node"):
+            if isinstance(record.get("node"), str) and record["node"]:
                 self.state["activeNode"] = record["node"]
             if isinstance(record.get("round"), int):
                 self.state["round"] = record["round"]
+            self.state["criticProgress"] = follow_critic_progress(self.state.get("criticProgress"), entry,
+                                                                  self.state.get("criticCount"))
+            history = self.state.setdefault("timeLimitHistory", [])
+            if follow_time_limit(history, entry) and self.run_dir:
+                # Saved batches read only recent records: the job settings keep the whole history.
+                try:
+                    self._save_job_settings(self.state)
+                except (OSError, ValueError, runtime.Error):
+                    pass  # The transcript has the record; a restart rebuilds the history from it.
             if replaced and record.get("label") != "Transcript replaced":
                 self.add_trace({
                     "kind": "diagnostic", "stage": self.state["stage"], "label": "Transcript replaced",
@@ -1547,6 +2597,49 @@ class App:
                             "or another unusable entry. It was not followed; a new private "
                             "transcript continues from this record.",
                 })
+        return entry
+
+    def _persist_trace(self, line, durable=False):
+        """Append one transcript line; a failed write keeps it, and later lines, for a retry every minute.
+
+        Losing the disk for a while (full, too many open files, an I/O error)
+        must not stop a working runner: the job keeps every record in memory
+        and writes them in order once the transcript can be written again.
+        Return (whether the log was replaced, a notice record for a first failure).
+        """
+
+        if self._unsaved_trace:
+            self._unsaved_trace.append(line)
+            self.flush_trace()
+            return False, None
+        try:
+            # The run folder was made private once, when it was created.
+            self.trace_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            return append_run_log(self.trace_file, line, durable=durable), None
+        except OSError as exc:
+            notice = {"kind": "diagnostic", "stage": self.state["stage"],
+                      "text": f"Saving the transcript failed ({exc}). The job keeps working; its events are kept, "
+                              f"and saving them is retried in {retry_interval_text()}.",
+                      "time": datetime.now(timezone.utc).isoformat()}
+            self._unsaved_trace = [line, json.dumps(notice, ensure_ascii=False) + "\n"]
+            self._trace_retry_at = time.monotonic() + AUTO_RESUME_SECONDS
+            return False, notice
+
+    def flush_trace(self, force=False):
+        """Write transcript lines kept after a failed write, at most once a minute; True when none are left."""
+
+        with self.lock:
+            if not self._unsaved_trace:
+                return True
+            if not force and time.monotonic() < self._trace_retry_at:
+                return False
+            try:
+                append_run_log(self.trace_file, "".join(self._unsaved_trace), durable=True)
+            except OSError:
+                self._trace_retry_at = time.monotonic() + AUTO_RESUME_SECONDS
+                return False
+            self._unsaved_trace = []
+            return True
 
     @staticmethod
     def parse_line(line, stage):
@@ -1556,7 +2649,7 @@ class App:
             record = json.loads(line)
             if isinstance(record, dict):
                 return record
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             pass
         return {"kind": "diagnostic", "stage": stage, "text": line.rstrip()}
 
@@ -1583,238 +2676,36 @@ class App:
             )
         return value.strip() if isinstance(value, str) else ""
 
-    def memory_file(self, name, version="", *, include_files=True, listing_only=False):
-        """Display one author-owned file on demand, without modifying it."""
-
-        approach = name in {"APPROACHES", "APPROACHES.md"} or bool(APPROACH_MEMORY_FILE.fullmatch(name))
-        audit = name in {"AUDITS", "audit_history", "audit.md"} or bool(AUDIT_MEMORY_FILE.fullmatch(name))
-        audit_folder = "audit_history" if name in {"audit_history", "audit.md"} or name.startswith("audit_history/") else "AUDITS"
-        if name not in RESEARCH_MEMORY_FILES and not approach and not audit:
-            raise ValueError("Unknown research memory file.")
-        with self.lock:
-            directory = self.state.get("goalWorkspace") or self.run_dir
-        result = {"name": name, "status": "missing"}
-        if not directory:
-            return result
-        directory = Path(directory).expanduser().resolve()
-        result["workspace"] = directory.name
-        try:
-            if os.name == "nt":
-                return self._memory_file_portable(directory, name, version, result, approach,
-                                                  include_files=include_files, listing_only=listing_only)
-            # Pin directories while reading so a concurrent rename or symlink swap
-            # cannot redirect the viewer outside the selected author's workspace.
-            with ExitStack() as opened:
-                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-                parent = os.open(directory, flags)
-                opened.callback(os.close, parent)
-                filename = name
-                if approach:
-                    result["files"] = []
-                    try:
-                        folder = os.open("APPROACHES", flags, dir_fd=parent)
-                    except FileNotFoundError:
-                        if name not in {"APPROACHES", "APPROACHES.md"}:
-                            return result
-                        filename = "APPROACHES.md"
-                        result["name"] = filename
-                        if listing_only:
-                            try:
-                                if stat.S_ISREG(os.stat(filename, dir_fd=parent, follow_symlinks=False).st_mode):
-                                    result["files"] = [filename]
-                            except FileNotFoundError:
-                                pass
-                    else:
-                        opened.callback(os.close, folder)
-                        if not include_files and APPROACH_MEMORY_FILE.fullmatch(name):
-                            # Read a known node without rescanning the whole directory.
-                            parent, filename = folder, name.split("/")[1]
-                        else:
-                            self._list_approach_files(folder, parent, result, listing_only)
-                            index = next((Path(item).name for item in result["files"]
-                                          if Path(item).name in {"index.md", "INDEX.md"}), "INDEX.md")
-                            if name != "APPROACHES.md":
-                                parent = folder
-                                filename = index if name == "APPROACHES" else name.split("/")[1]
-                                result["name"] = f"APPROACHES/{filename}"
-                    if listing_only:
-                        return {**result, "status": "ready"}
-                elif audit:
-                    result["files"] = []
-                    try:
-                        folder = os.open(audit_folder, flags, dir_fd=parent)
-                    except FileNotFoundError:
-                        folder = None
-                    else:
-                        opened.callback(os.close, folder)
-                        entries = []
-                        for entry in os.listdir(folder):
-                            if not AUDIT_MEMORY_FILE.fullmatch(f"{audit_folder}/{entry}"):
-                                continue
-                            try:
-                                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
-                                    entries.append(f"{audit_folder}/{entry}")
-                            except FileNotFoundError:
-                                continue
-                        result["files"] = sorted(entries, reverse=True)
-                    try:
-                        if audit_folder == "audit_history" and stat.S_ISREG(os.stat("audit.md", dir_fd=parent, follow_symlinks=False).st_mode):
-                            result["files"].append("audit.md")
-                    except FileNotFoundError:
-                        pass
-                    if name in {"AUDITS", "audit_history"}:
-                        if not result["files"]:
-                            return result
-                        name = result["files"][0]
-                    result["name"] = name
-                    filename = name
-                    if name.startswith(("AUDITS/", "audit_history/")):
-                        if folder is None:
-                            return result
-                        parent, filename = folder, name.split("/")[1]
-                descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-                with os.fdopen(descriptor, "r", encoding="utf-8") as source:
-                    info = os.fstat(source.fileno())
-                    if not stat.S_ISREG(info.st_mode):
-                        return {**result, "status": "unavailable"}
-                    current_version = f"{directory}:{result['name']}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
-                    result.update(status="ready", version=current_version,
-                                  modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
-                    if current_version == version:
-                        return {**result, "unchanged": True}
-                    return {**result, "content": source.read()}
-        except FileNotFoundError:
-            return {**result, "status": "missing"}
-        except (OSError, UnicodeError):
-            return {**result, "status": "unavailable"}
-
-    @staticmethod
-    def _list_approach_files(folder, parent, result, existing_only):
-        names = os.listdir(folder)
-        index = "index.md" if "index.md" in names else "INDEX.md"
-        entries = []
-        for entry in names:
-            relative = f"APPROACHES/{entry}"
-            if not APPROACH_MEMORY_FILE.fullmatch(relative):
-                continue
-            try:
-                if stat.S_ISREG(os.stat(entry, dir_fd=folder, follow_symlinks=False).st_mode):
-                    entries.append(relative)
-            except FileNotFoundError:
-                continue
-        index_path = f"APPROACHES/{index}"
-        result["files"] = ([index_path] if not existing_only or index_path in entries else []) + sorted(
-            entry for entry in entries if Path(entry).name not in {"index.md", "INDEX.md"})
-        try:
-            if stat.S_ISREG(os.stat("APPROACHES.md", dir_fd=parent, follow_symlinks=False).st_mode):
-                result["files"].append("APPROACHES.md")
-        except FileNotFoundError:
-            pass
-
-    def approach_graph(self):
-        """Read node metadata independently of the optional index; cache unchanged files."""
-
-        with self.lock:
-            listing = self.memory_file("APPROACHES", listing_only=True)
-            files = listing.get("files", [])
-            cache, nodes = {}, []
-            for name in files:
-                if not re.fullmatch(r"APPROACHES/A\d{3,}(?:-[A-Za-z0-9_-]+)?\.md", name):
-                    continue
-                previous = self._approach_cache.get(name, {})
-                document = self.memory_file(name, previous.get("version", ""), include_files=False)
-                if document.get("unchanged"):
-                    cached = previous
-                else:
-                    node = approach_metadata(name, document.get("content", ""))
-                    node["readStatus"] = document["status"]
-                    # Failed reads must be retried even if the file's stat is unchanged.
-                    cached = {"version": document.get("version", "") if document["status"] == "ready" else "", "node": node}
-                cache[name] = cached
-                nodes.append(cached["node"])
-            self._approach_cache = cache
-            return {"nodes": nodes, "files": files, "status": listing["status"],
-                    "indexFile": next((name for name in files if Path(name).name in {"index.md", "INDEX.md"}), "")}
-
-    @staticmethod
-    def _memory_file_portable(directory, name, version, result, approach, *, include_files=True, listing_only=False):
-        """Keep the read-only viewer available where directory descriptors are unsupported."""
-
-        def linked(path):
-            return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
-
-        path = directory / name
-        if approach:
-            folder = directory / "APPROACHES"
-            result["files"] = []
-            if linked(folder):
-                return {**result, "status": "unavailable"}
-            if folder.exists():
-                if not folder.is_dir():
-                    return {**result, "status": "unavailable"}
-                entries = list(folder.iterdir()) if include_files else []
-                index = "index.md" if any(entry.name == "index.md" for entry in entries) else "INDEX.md"
-                index_path = folder / index
-                result["files"] = ([f"APPROACHES/{index}"] if not listing_only or (not linked(index_path) and index_path.is_file()) else []) + sorted(
-                    f"APPROACHES/{entry.name}" for entry in entries
-                    if entry.name not in {"INDEX.md", "index.md"} and APPROACH_MEMORY_FILE.fullmatch(f"APPROACHES/{entry.name}")
-                    and not linked(entry) and entry.is_file()
-                )
-                legacy = directory / "APPROACHES.md"
-                if not linked(legacy) and legacy.is_file():
-                    result["files"].append("APPROACHES.md")
-                name = f"APPROACHES/{index}" if name == "APPROACHES" else name
-            elif name == "APPROACHES":
-                name = "APPROACHES.md"
-                if listing_only and not linked(directory / name) and (directory / name).is_file():
-                    result["files"] = [name]
-            result["name"] = name
-            path = directory / name
-            if listing_only:
-                return {**result, "status": "ready"}
-        elif name in {"AUDITS", "audit_history", "audit.md"} or AUDIT_MEMORY_FILE.fullmatch(name):
-            audit_folder = "audit_history" if name in {"audit_history", "audit.md"} or name.startswith("audit_history/") else "AUDITS"
-            folder = directory / audit_folder
-            result["files"] = []
-            if linked(folder) or (folder.exists() and not folder.is_dir()):
-                return {**result, "status": "unavailable"}
-            if folder.exists():
-                result["files"] = sorted((f"{audit_folder}/{entry.name}" for entry in folder.iterdir()
-                                          if AUDIT_MEMORY_FILE.fullmatch(f"{audit_folder}/{entry.name}")
-                                          and not linked(entry) and entry.is_file()), reverse=True)
-            legacy = directory / "audit.md"
-            if audit_folder == "audit_history" and not linked(legacy) and legacy.is_file():
-                result["files"].append("audit.md")
-            if name in {"AUDITS", "audit_history"}:
-                if not result["files"]:
-                    return result
-                name = result["files"][0]
-            result["name"] = name
-            path = directory / name
-        if linked(path) or path.resolve() != path:
-            return {**result, "status": "unavailable"}
-        if not path.is_file():
-            return result
-        info = path.stat()
-        current_version = f"{directory}:{name}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"
-        result.update(status="ready", version=current_version,
-                      modifiedAt=datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat())
-        if current_version == version:
-            return {**result, "unchanged": True}
-        content = path.read_text(encoding="utf-8")
-        if linked(path) or path.resolve() != path:
-            return {**result, "status": "unavailable"}
-        return {**result, "content": content}
-
     def snapshot(self, after=None):
         """Copy state, optionally returning only newly appended records."""
 
         with self.lock:
+            # First: closing a question adds a record, which this copy must include.
+            question = self._author_question_locked()
             state = dict(self.state)
+            state["authorQuestion"] = (self._public_question(question)
+                                       if question and self._author_running_locked() else None)
             run_dir = self.run_dir
+            state["needsAttention"] = self.attention(state)
             state["workerActive"] = self.has_active_worker()
             state["processAlive"] = bool(self.process is not None and self.process.poll() is None)
             state["activeElapsedSeconds"] = self._elapsed_seconds()
+            paused = state["phase"] in {"paused", "pausing"}
+            checkpoint = read_pause_object(run_dir) if paused and run_dir else {}
+            state["pauseCause"] = str(checkpoint.get("pauseCause") or "") if paused else ""
+            state["criticFeedbackPending"] = paused and checkpoint.get("criticFeedbackPending") is True
+            state["timeLimitExhausted"] = self._time_limit_exhausted_locked(state["activeElapsedSeconds"])
+            state["relatedWorksPending"] = list(state.get("relatedWorksPending") or [])
+            historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+            talk_problem = self._conversation_problem_locked()
+            state["conversation"] = {"available": not talk_problem, "reason": talk_problem,
+                                     "busy": self._conversation_busy_locked(),
+                                     # Live runs answer read-only; a web-cutoff author keeps its audited launch.
+                                     "readOnly": not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True),
+                                     "items": self._conversation_copies_locked()}
+            works_problem = self.related_works_problem()
+            workspace = self._author_workspace() if run_dir else None
+            folder_batch = state.get("folderBatch") or ""
             try:
                 state["statement"] = saved_statement(self.run_dir) if self.run_dir else ""
             except ValueError:
@@ -1824,18 +2715,14 @@ class App:
             # completed action as failed. Launches still read the YAML strictly.
             try:
                 prompts = default_prompts()
-                include_transcript = state["phase"] not in {
-                    "reviewing", "running", "stopping", "pausing",
-                }
-                signature = checkpoint_artifact_signature(
-                    self.run_dir, include_transcript=include_transcript,
-                )
+                signature = checkpoint_artifact_signature(self.run_dir)
                 if signature != self._checkpoint_cache_signature:
                     self._checkpoint_cache = (
                         saved_run_checkpoints(self.run_dir) if self.run_dir else []
                     )
                     self._checkpoint_cache_signature = signature
-                state["workflowWarning"] = ""
+                # Set when an edit does not load and the last version that did is used.
+                state["workflowWarning"] = runtime.workflow_warnings()
             except (ValueError, KeyError) as exc:
                 prompts = dict(_last_default_prompts or graph["settings"].get("prompts", {}))
                 state["workflowWarning"] = f"The workflow YAML cannot be read: {exc}"
@@ -1854,12 +2741,29 @@ class App:
                 and not (self.run_dir / "final.pdf").is_symlink()
                 and (self.run_dir / "final.pdf").stat().st_size > 0
             )
+            # The approved proof and the working LaTeX source are results too,
+            # while the LaTeX stage runs or waits for TeX (I-013, I-068). A run
+            # without its writing stage returns the proof itself as its result.
+            state["canDownloadProof"] = bool(self.run_dir and state.get("finalInputReady")
+                                             and state.get("problemMode") != "latex"
+                                             and saved_workflow_stages(state)["writing"])
+            state["canDownloadSource"] = bool(
+                not state["canDownloadTex"] and self.run_dir
+                and (self.run_dir / "latex-source.tex").is_file()
+                and not (self.run_dir / "latex-source.tex").is_symlink()
+            )
             trace, version = self.state["trace"], self.state["traceVersion"]
             first = version - len(trace)
             if isinstance(after, int) and first <= after <= version:
                 state["trace"], state["traceFrom"] = list(trace[after - first:]), after
             else:
                 state["trace"], state["traceFrom"] = self.retained_trace(), first
+            if first > 0:
+                # Older routine events left the live window: say so, and where the rest is.
+                state["traceTruncated"] = True
+                state["traceNotice"] = (f"Showing the latest {len(trace):,} of {version:,} events; every prompt, "
+                                        "result and error stays listed. The complete history is in this job's "
+                                        "transcript.jsonl.")
         # Policy metadata can hash the pinned Codex binary: never hold the job
         # lock (and its transcript reader) meanwhile. A policy that no longer
         # loads still shows the cutoff saved with the job.
@@ -1871,18 +2775,31 @@ class App:
         if state["retrieval"]["mode"] == "historical":
             state["retrievalMode"] = "historical"
             state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
+        # Read from the manifests without the job lock (listing never raises).
+        items = related_works.listing(workspace, controller_directory(workspace)) if workspace else []
+        batch = None
+        if folder_batch:
+            try:
+                shared = folder_batch_store(self.runs, folder_batch).listing()
+                batch = {"id": folder_batch, "count": len(shared), "items": shared}
+            except ValueError:
+                batch = None
+        state["relatedWorks"] = {"available": not works_problem, "reason": works_problem, "count": len(items),
+                                 "items": items, "batch": batch}
         return state
 
     @staticmethod
     def _workflow_options(
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        critic_count=DEFAULT_CRITIC_COUNT,
+        author_subagents=DEFAULT_AUTHOR_SUBAGENTS,
         thinking_hours=DEFAULT_THINKING_HOURS,
         author_model=DEFAULT_AUTHOR_MODEL,
         critic_model=DEFAULT_CRITIC_MODEL,
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
         review_model=DEFAULT_REVIEW_MODEL, review_effort=None,
         review_prompt=None, include_review=True,
         speed_mode=DEFAULT_SPEED,
@@ -1907,7 +2824,7 @@ class App:
         reasoning_summary = str(reasoning_summary or "")
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
-            "critic": critic_prompt, "final": final_prompt,
+            "critic": critic_prompt, "convention": convention_prompt, "final": final_prompt,
         }
         defaults = default_prompts()
         prompts = {
@@ -1922,14 +2839,17 @@ class App:
         require_known_models(role_models)
         all_efforts = {"review": review_effort, "author": author_effort, "critic": critic_effort, "writer": writer_effort}
         efforts = [all_efforts[role] for role in role_models]
-        if any(effort not in EFFORTS for effort in efforts):
+        if any(effort not in EFFORTS and effort not in runtime.RETIRED_EFFORTS for effort in efforts):
             raise ValueError("Choose a valid reasoning effort for every role.")
         selected_models = list(role_models.values())
         defaults_models = {"review": DEFAULT_REVIEW_MODEL, "author": DEFAULT_AUTHOR_MODEL,
                            "critic": DEFAULT_CRITIC_MODEL, "writer": DEFAULT_WRITER_MODEL}
         for role in all_models:
             if role in role_models:
-                all_efforts[role] = runtime.effective_effort(all_models[role], all_efforts[role])
+                # A retired effort (Ultra, from a script or a saved job) is kept as given: the runner runs it as
+                # Max and says so once in the activity log.
+                if all_efforts[role] not in runtime.RETIRED_EFFORTS:
+                    all_efforts[role] = runtime.effective_effort(all_models[role], all_efforts[role])
             else:
                 all_models[role] = defaults_models[role]
                 all_efforts[role] = DEFAULT_REVIEW_EFFORT if role == "review" else DEFAULT_REASONING_EFFORT
@@ -1951,20 +2871,31 @@ class App:
             raise ValueError(
                 f"The author prompt must contain exactly one {runtime.MARKER}."
             )
+        if stages["critic"]:
+            try:
+                runtime._template_parts(prompts["critic"], {"count"})
+            except ValueError as exc:
+                raise ValueError(f"The critic prompt cannot be used ({exc}). Write {{count}} where the number of "
+                                 "independent critics goes, and double any other brace: {{ and }}.") from exc
+            try:
+                runtime._template_parts(prompts["convention"], {"statement", "instructions"})
+            except ValueError as exc:
+                raise ValueError(f"The convention critic prompt cannot be used ({exc}). Write {{statement}} where "
+                                 "the statement goes, and double any other brace: {{ and }}.") from exc
         try:
             critic_rounds = runtime.critic_limit(critic_rounds) if stages["critic"] else DEFAULT_CRITIC_ROUNDS
         except runtime.Error as exc:
             raise ValueError(str(exc)) from exc
+        critic_count = valid_critic_count(critic_count) if stages["critic"] else DEFAULT_CRITIC_COUNT
+        author_subagents = valid_author_subagents(author_subagents) if stages["author"] else DEFAULT_AUTHOR_SUBAGENTS
         try:
             if workflow_stages is not None and not stages["author"]:
                 thinking_hours = DEFAULT_THINKING_HOURS
             thinking_hours = float(thinking_hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total workflow time limit must be a number.") from exc
-        if not math.isfinite(thinking_hours) or not 0 <= thinking_hours <= MAX_THINKING_HOURS:
-            raise ValueError(
-                f"Choose 0 for unlimited, or at most {MAX_THINKING_HOURS} hours."
-            )
+        if not math.isfinite(thinking_hours) or thinking_hours < 0:
+            raise ValueError("Choose 0 for unlimited, or a positive number of hours.")
         # Web cutoff timestamps need Codex models: say so before any CLI check.
         search_options = retrieval.validate_options(
             retrieval_mode, retrieval_cutoff_utc, models=selected_models)
@@ -1992,8 +2923,11 @@ class App:
             ),
             "authorPrompt": prompts["author"],
             "criticPrompt": prompts["critic"],
+            "conventionPrompt": prompts["convention"],
             "finalPrompt": prompts["final"],
             "criticRounds": critic_rounds,
+            "criticCount": critic_count,
+            "authorSubagents": author_subagents,
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
@@ -2001,6 +2935,8 @@ class App:
 
     def start_review(
         self, statement, feedback="", critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        critic_count=DEFAULT_CRITIC_COUNT,
+        author_subagents=DEFAULT_AUTHOR_SUBAGENTS,
         review_model=DEFAULT_REVIEW_MODEL,
         thinking_hours=DEFAULT_THINKING_HOURS,
         author_model=DEFAULT_AUTHOR_MODEL,
@@ -2010,7 +2946,7 @@ class App:
         review_effort=None, author_effort=None,
         critic_effort=None, writer_effort=None,
         review_prompt=None, author_prompt=None,
-        critic_prompt=None, final_prompt=None,
+        critic_prompt=None, final_prompt=None, convention_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         review_only=False,
@@ -2018,11 +2954,18 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         revise_existing=False,
         workflow_stages=None, original_content=None, source_file=None,
+        _prepare_only=False,
+        related_works=None, folder_batch=None,
     ):
         """Start the review and return immediately so the page can poll.
 
+        ``related_works`` (upload tokens) and ``folder_batch`` are installed in
+        a new run as in start_direct_statement; a "Retry statement review" in a
+        new run copies its source's related works.
         ``revise_existing`` means the request names this job: it may only retry
-        a reviewed or failed review in place, never start another run.
+        a reviewed or failed review in place, or start its queued review, never
+        start another run. ``_prepare_only`` (a folder batch) saves the job as a
+        queued one, whose review the server starts when a running slot is free.
         """
 
         self._check_input_replacement()
@@ -2031,6 +2974,8 @@ class App:
         feedback = str(feedback or "").strip()
         if "\0" in statement or "\0" in feedback:
             raise ValueError("Statement review input cannot contain NUL characters.")
+        if len(statement) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"The problem statement is longer than {MAX_STATEMENT_CHARS:,} characters.")
         if not isinstance(review_only, bool):
             raise ValueError("Statement review only must be enabled or disabled.")
         stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else (
@@ -2038,6 +2983,7 @@ class App:
             normalize_workflow_stages())
         if not stages["review"]:
             raise ValueError("Enable statement review before starting a review request.")
+        tokens = self._new_related_works_tokens(related_works, stages)
         review_only = not any(stages[name] for name in ("author", "critic", "writing"))
         if review_only:
             # Proof-stage settings are irrelevant to this terminal workflow.
@@ -2047,11 +2993,15 @@ class App:
             author_effort = DEFAULT_REASONING_EFFORT
             critic_effort = DEFAULT_REASONING_EFFORT
             writer_effort = DEFAULT_REASONING_EFFORT
-            author_prompt = critic_prompt = final_prompt = None
+            author_prompt = critic_prompt = final_prompt = convention_prompt = None
             critic_rounds = DEFAULT_CRITIC_ROUNDS
+            critic_count = DEFAULT_CRITIC_COUNT
+            author_subagents = DEFAULT_AUTHOR_SUBAGENTS
             thinking_hours = DEFAULT_THINKING_HOURS
         options = self._workflow_options(
             critic_rounds=critic_rounds,
+            critic_count=critic_count,
+            author_subagents=author_subagents,
             thinking_hours=thinking_hours,
             author_model=author_model,
             critic_model=critic_model,
@@ -2062,6 +3012,7 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
+            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             review_model=review_model,
             review_effort=review_effort,
@@ -2088,15 +3039,20 @@ class App:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("A model is already working on this job.")
             # Feedback retries, and retries of a failed review, stay in the
-            # selected job's problem folder; one job keeps one run id.
-            failed_retry = revise_existing and self.state["phase"] == "input"
+            # selected job's problem folder; one job keeps one run id. So does
+            # the start of a queued review.
+            failed_retry = revise_existing and (self.state["phase"] == "input" or (
+                self.state["phase"] == "prepared" and self._queued_review()))
             retry = self.run_dir is not None and (
                 self.state["phase"] == "reviewed" or failed_retry
             )
             if revise_existing and not retry:
                 raise ValueError("Start a new problem from the home screen.")
+            if retry and tokens:
+                raise ValueError("Add related works on the job page.")
             if failed_retry:
                 self._save("draft.md", f"# Draft problem\n\n{statement}\n")
+            works = ([], "")
             if not retry:
                 self._new_run(statement)
                 if not self.fixed_trace:
@@ -2104,6 +3060,15 @@ class App:
                 self._prepare_continuation(
                     continuation_source, stopped_stage,
                 )
+                # A continuation stays in its source's folder batch, and takes its related works.
+                folder_batch = folder_batch or (saved_folder_batch(continuation_source) if continuation_source
+                                                else "")
+                works = self._install_new_related_works_locked(tokens, folder_batch, self.run_dir, "",
+                                                               copy_from=continuation_source)
+            else:
+                folder_batch = self.state.get("folderBatch") or ""
+            if folder_batch:
+                options["folderBatch"] = folder_batch
             self._save(
                 REVIEW_INPUT_FILENAME,
                 json.dumps({
@@ -2114,7 +3079,7 @@ class App:
             )
             prompt_names = [name for name, role in PROMPT_ROLES.items() if stages[ROLE_STAGES[role]]]
             for name in prompt_names:
-                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+                self._save_prompt(name, options[f"{name}Prompt"])
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
@@ -2123,10 +3088,12 @@ class App:
             })
             trace = self.state["trace"] if retry or self.fixed_trace else []
             version = self.state["traceVersion"] if retry or self.fixed_trace else 0
+            previous_review = self.state.get("review") if retry and feedback else None
             self.state = {
                 **empty_state(trace, version),
                 "phase": "reviewing",
                 "draft": statement,
+                "review": previous_review,
                 "reviewStatement": statement,
                 "reviewFeedback": feedback,
                 "reviewInputRecorded": True,
@@ -2138,6 +3105,11 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
+            self._record_new_related_works_locked(*works)
+            if _prepare_only:
+                self.state.update(phase="prepared", preparedRun=True, launchQueued=True, queuedAt=time.time())
+                self._save_job_settings(self.state)
+                return
             token = self.active_token = object()
             self.worker_token = token
         self._spawn_worker(
@@ -2149,7 +3121,35 @@ class App:
             token,
         )
 
-    def _review(
+    def _review(self, statement, feedback="", review_model=DEFAULT_REVIEW_MODEL,
+                reasoning_effort=DEFAULT_REVIEW_EFFORT, token=None):
+        """Run one review; an unexpected failure still settles the job (its reviewer is stopped)."""
+
+        try:
+            self._review_records(statement, feedback, review_model, reasoning_effort, token)
+        except Exception as exc:
+            with self.lock:
+                if self.active_token not in (None, token) or self.worker_token not in (None, token):
+                    return
+                self.process = self.active_token = self.worker_token = None
+                self._end_retry_wait_locked()
+                self._model_retries, self._retry_starts = {}, {}
+                self.state["modelRetry"] = None
+                if self.state["phase"] == "stopping":
+                    self._finish_stopped_locked(None, "The reviewer was stopped before it produced a checked statement.")
+                elif self.state["phase"] == "reviewing":
+                    # As in _review_records: a failed revision returns to the statement it revised.
+                    problem = f"Review failed: {exc or type(exc).__name__}"
+                    revision = bool(self.state.get("review")) and bool(self.state.get("reviewFeedback"))
+                    self.state.update(phase="reviewed" if revision else "input", error=problem)
+                    try:
+                        self.add_trace({"kind": "status", "stage": "review", "node": "statement_reviewer",
+                                        "label": "Statement review failed", "text": problem})
+                    except OSError:
+                        pass
+        self._settle_run_claim()
+
+    def _review_records(
         self, statement, feedback="", review_model=DEFAULT_REVIEW_MODEL,
         reasoning_effort=DEFAULT_REVIEW_EFFORT, token=None,
     ):
@@ -2170,6 +3170,8 @@ class App:
                 )
                 return
         try:
+            with self.lock:
+                locks = self._claim_run_locked()
             process = subprocess.Popen(
                 [
                     sys.executable, "-u", str(ROOT / "web_ui.py"), "--review-worker",
@@ -2178,15 +3180,16 @@ class App:
                     "--reasoning-summary", self.state["reasoningSummary"],
                     "--speed", self.state["speedMode"],
                     "--review-prompt-file",
-                    str(self.run_dir / "prompts/review.txt"),
+                    str(controlled_path(self.run_dir, "prompts/review.txt")),
                     "--thinking-hours", str(self.state["thinkingHours"]),
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                 errors="replace", bufsize=1, cwd=self.run_dir,
                 env=self._retrieval_child_environment(),
-                **isolated_process_options(),
+                **isolated_process_options(), **runner_lock_options(locks),
             )
+            ownership.note_runner(self.run_dir, process.pid)
             with self.lock:
                 stop_now = (
                     self.active_token is not token
@@ -2236,7 +3239,7 @@ class App:
                         )
                         with self.lock:
                             self.state["output"] = "\n\n".join(visible)
-            code = process.wait()
+            code = reap_runner(process)
             if code or not isinstance(report, dict) or not all(
                 isinstance(report.get(key), str) for key in ("statement", "notes")
             ):
@@ -2245,7 +3248,7 @@ class App:
                     if failure_detail
                     else "Review failed. See the transcript for details."
                 )
-        except (OSError, TypeError, AttributeError) as exc:
+        except (OSError, TypeError, AttributeError, ValueError) as exc:
             problem = str(exc)
         finally:
             # Reap a child even if a quick stop breaks its stdin or transcript.
@@ -2268,12 +3271,12 @@ class App:
                 self.process = None
             # A reviewer that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
-            self._model_retries = {}
+            self._model_retries, self._retry_starts = {}, {}
             self.state["modelRetry"] = None
             stopped = self.state["phase"] == "stopping"
             if valid:
                 self._clear_manual_stop()
-                self._save(
+                self._save_controlled(
                     "checked-statement.md",
                     f"# Checked statement\n\n{report['statement']}\n\n"
                     f"# Reviewer notes\n\n{report['notes'] or 'None.'}\n",
@@ -2298,13 +3301,66 @@ class App:
                     "The reviewer was stopped before it produced a checked statement.",
                 )
             elif problem:
-                self.state["phase"], self.state["error"] = "input", problem
+                # A failed revision returns to the statement it revised (its feedback is
+                # saved for Retry); a first review returns to the draft.
+                revision = bool(self.state.get("review")) and bool(self.state.get("reviewFeedback"))
+                self.state.update(phase="reviewed" if revision else "input", error=problem)
+                try:
+                    # Recorded, so a restart restores the failure (not a vanished or interrupted review).
+                    self.add_trace({"kind": "status", "stage": "review", "node": "statement_reviewer",
+                                    "label": "Statement review failed", "text": problem})
+                except OSError:
+                    pass
             if self.active_token is token:
                 self.active_token = None
             if self.worker_token is token:
                 self.worker_token = None
             if valid:
                 self._save_job_settings(self.state)
+        self._settle_run_claim()
+
+    def retry_review(self):
+        """Run the statement review again in this job from its saved input (review-input.json), feedback included."""
+
+        with self.lock:
+            state = dict(self.state)
+        self.start_review(
+            statement=state.get("reviewStatement") or state.get("draft", ""), feedback=state.get("reviewFeedback", ""),
+            critic_rounds=state["criticRounds"], critic_count=state["criticCount"],
+            author_subagents=state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
+            thinking_hours=state["thinkingHours"],
+            review_model=state["reviewModel"], author_model=state["authorModel"],
+            critic_model=state["criticModel"], writer_model=state["writerModel"],
+            reasoning_effort=state["reasoningEffort"], review_effort=state["reviewEffort"],
+            author_effort=state["authorEffort"], critic_effort=state["criticEffort"],
+            writer_effort=state["writerEffort"], review_prompt=state["reviewPrompt"],
+            author_prompt=state["authorPrompt"], critic_prompt=state["criticPrompt"],
+            convention_prompt=state.get("conventionPrompt"),
+            final_prompt=state["finalPrompt"], speed_mode=state["speedMode"],
+            reasoning_summary=state["reasoningSummary"], workflow_stages=saved_workflow_stages(state),
+            original_content=state.get("originalContent"), source_file=state.get("sourceFile"),
+            retrieval_mode=state.get("retrievalMode", "live"),
+            retrieval_cutoff_utc=state.get("retrievalCutoffUtc", ""), revise_existing=True,
+        )
+
+    def retry_review_if_due(self, now=None):
+        """Start a statement review that a restart interrupted, once its time has come; return whether it tried."""
+
+        now = time.time() if now is None else now
+        with self.lock:
+            due = self.state.get("reviewRetryAt") or 0
+            if (not due or now < due or self.state["phase"] not in {"input", "reviewed"}
+                    or self.worker_token is not None):
+                return False
+            self.state["reviewRetryAt"] = 0
+        try:
+            self.retry_review()
+        except (OSError, ValueError, RuntimeError) as exc:
+            with self.lock:
+                self.state.update(reviewRetryAt=now + AUTO_RESUME_SECONDS,
+                                  error=f"The statement review could not start again: {str(exc).rstrip('.')}. "
+                                        f"Trying again in {retry_interval_text()}.")
+        return True
 
     def _retrieval_child_environment(self):
         """Bind each worker, including independent reviewers, to its saved mode."""
@@ -2316,30 +3372,41 @@ class App:
             child_environment["TCS_PROVER_RETRIEVAL_POLICY"] = self.state["retrievalPolicyPath"]
         return child_environment
 
-    def _launch_workflow_locked(self, workflows, source, options, stage, node, state=None):
-        """Launch YAML graphs in this job, preserving worker ownership on errors."""
+    def _spawn_runner_locked(self, workflows, stdin_text, options):
+        """Start one workflow runner for this job and own it: (process, token).
+
+        The runner works in the run folder, in its own process group, with this
+        run's owner locks and retrieval environment, and reads ``stdin_text``.
+        Any failure leaves no runner and no token behind.
+        """
 
         self._check_launch_hold()
+        # An edit that does not load runs the last version that did (with a warning).
+        paths = [runtime.builtin_workflow_path(Path(name).stem) for name in workflows]
+        locks = self._claim_run_locked()
         child_environment = self._retrieval_child_environment()
         token = self.active_token = object()
-        if state is not None:
-            self._save("workflow-input.json", json.dumps(state, ensure_ascii=False))
-            options = [*options, "--state-file", str(self.run_dir / "workflow-input.json")]
-        process = subprocess.Popen(
-            [
-                sys.executable, "-u", str(ROOT / "workflow_runner.py"),
-                *(str(WORKFLOWS / name) for name in workflows), *options,
-            ],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", bufsize=1, cwd=self.run_dir,
-            env=child_environment,
-            **isolated_process_options(),
-        )
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-u", str(ROOT / "workflow_runner.py"),
+                    *map(str, paths), *options,
+                ],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                errors="replace", bufsize=1, cwd=self.run_dir,
+                env=child_environment,
+                **isolated_process_options(), **runner_lock_options(locks),
+            )
+        except BaseException:
+            if self.active_token is token:
+                self.active_token = None
+            raise
         self.worker_token = token
         self.process = process
+        ownership.note_runner(self.run_dir, process.pid)
         try:
-            process.stdin.write(source)
+            process.stdin.write(stdin_text)
             process.stdin.close()
         except (OSError, TypeError, ValueError):
             try:
@@ -2358,9 +3425,21 @@ class App:
             if self.worker_token is token:
                 self.worker_token = None
             raise
+        return process, token
+
+    def _launch_workflow_locked(self, workflows, source, options, stage, node, state=None):
+        """Launch YAML graphs in this job, preserving worker ownership on errors."""
+
+        self._check_launch_hold()
+        if state is not None:
+            self._save("workflow-input.json", json.dumps(state, ensure_ascii=False))
+            options = [*options, "--state-file", str(self.run_dir / "workflow-input.json")]
+        process, token = self._spawn_runner_locked(workflows, source, options)
         self.state.update(
             phase="running", stage=stage, activeNode=node, round=0, output="", resultKind="",
         )
+        if runtime.workflow_warnings():
+            self.add_trace({"kind": "diagnostic", "stage": stage, "text": runtime.workflow_warnings()})
         return process, token
 
     def _proof_options_locked(self):
@@ -2371,8 +3450,12 @@ class App:
         author_steer_file = self.run_dir / AUTHOR_STEER_FILENAME
         if not self.state.get("goalResume"):
             author_steer_file.unlink(missing_ok=True)
+        # From now on the job runs (and saves) this number of critics, and its author this number of subagents.
+        self.state["criticCountRecorded"] = self.state["authorSubagentsRecorded"] = True
         options = [
             "--critic-rounds", str(self.state["criticRounds"]),
+            "--critic-count", str(self.state["criticCount"]),
+            "--author-subagents", str(self.state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS)),
             "--thinking-hours", str(self.state["thinkingHours"]),
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
@@ -2388,11 +3471,13 @@ class App:
                 f"--{role}-model", self.state[f"{role}Model"],
                 f"--{role}-effort", self.state[f"{role}Effort"],
             ])
-        for role in ("author", "critic", "final"):
+        # Rewritten from the controller's copy at every launch: the author can
+        # change the run folder's prompts, never the ones the runner reads.
+        for role in ("author", "critic", "convention", "final"):
             if not stages[ROLE_STAGES[PROMPT_ROLES[role]]]:
                 continue
             options.extend([
-                f"--{role}-prompt-file", str(self.run_dir / f"prompts/{role}.txt"),
+                f"--{role}-prompt-file", str(self._save_prompt(role, self.state[f"{role}Prompt"])),
             ])
         if self.state.get("goalThreadId"):
             options.extend(["--set", "goal_thread_id=" + json.dumps(self.state["goalThreadId"])])
@@ -2402,7 +3487,20 @@ class App:
             options.extend(["--set", "goal_resume=true"])
             if self.state.get("authorSteerDelivered"):
                 options.extend(["--set", "author_steer_delivered=" + json.dumps(self.state["authorSteerDelivered"])])
-        options.extend(["--set", "goal_pause_file=" + json.dumps(str(self.run_dir / PAUSE_REQUEST_FILENAME))])
+            if isinstance(self.state.get("authorRepairDelivered"), dict):
+                # Critic feedback the saved conversation already received is not sent again.
+                options.extend(["--set", "author_repair_delivered=" + json.dumps(self.state["authorRepairDelivered"])])
+        options.extend(["--set", "goal_pause_file=" + json.dumps(str(self._pause_request_path()))])
+        options.extend(["--set", "goal_stderr_log=" + json.dumps(str(self.run_dir / AUTHOR_STDERR_FILENAME))])
+        # A diff of the coordinator's changes too long for its critic result is saved here (see critic_diff).
+        options.extend(["--set", "critic_diff_dir=" + json.dumps(
+            str((self._controller_directory() / CRITIC_DIFFS_FOLDER).absolute()))])
+        options.extend(["--set", "run_tmp_dir=" + json.dumps(str(self._controller_directory() / RUN_TMP_FOLDER))])
+        if stages["author"]:
+            # The author's first prompt points to its related works (web-cutoff runs too: they are local inputs).
+            workspace = self._author_workspace()
+            if related_works.count(workspace, controller_directory(workspace)):
+                options.extend(["--set", "related_works=true"])
         return options
 
     def _launch_solver_locked(self, statement):
@@ -2459,7 +3557,8 @@ class App:
             return
         change = record.get("budgetClock")
         label = record.get("label")
-        retrying = isinstance(label, str) and label.endswith(runtime.RETRY_LABEL)
+        retrying = isinstance(label, str) and label.endswith(
+            (runtime.RETRY_LABEL, runtime.COMMAND_RETRY_LABEL, runtime.STORAGE_RETRY_LABEL))
         if change not in {"paused", "running"} and not retrying:
             return
         with self.lock:
@@ -2469,19 +3568,37 @@ class App:
             elif change == "running":
                 self._end_retry_wait_locked(now)
             if retrying:
-                # Parallel requests wait and retry separately: one that retries
+                # Labelled requests wait and retry separately: one that retries
                 # now must not hide another that still waits.
                 key = str(record.get("activityLabel") or record.get("node") or record.get("stage") or "")
                 retry_at = record.get("retryAt")
                 waits = getattr(self, "_model_retries", None)
                 if waits is None:
                     waits = self._model_retries = {}
+                starts = getattr(self, "_retry_starts", None)
+                if starts is None:
+                    starts = self._retry_starts = {}
                 waits.pop(key, None)
                 if isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and math.isfinite(retry_at):
+                    attempt = record.get("retryAttempt") if isinstance(record.get("retryAttempt"), int) else None
+                    first = starts.get(key)
+                    if finite_seconds(record.get("retryingSeconds")):
+                        # When this call first failed: the runner counts the seconds it has been retrying.
+                        since = (now - timedelta(seconds=float(record["retryingSeconds"]))).isoformat()
+                    elif first and attempt is not None and first[0] is not None and first[0] < attempt:
+                        # A wait without that count (a file write): a later attempt keeps the first failure's time.
+                        since = first[1]
+                    else:
+                        since = now.isoformat()
+                    starts[key] = (attempt, since)
                     waits[key] = {
-                        "text": str(record.get("text") or ""), "retryAt": float(retry_at),
-                        "attempt": record.get("retryAttempt") if isinstance(record.get("retryAttempt"), int) else None,
+                        "text": str(record.get("text") or ""), "retryAt": float(retry_at), "since": since,
+                        "attempt": attempt,
                         "stage": record.get("stage") if isinstance(record.get("stage"), str) else "",
+                        "failure": record.get("failure") if isinstance(record.get("failure"), str) else "",
+                        # What waits: a model call, a command that could not run (TeX), or a file write.
+                        "kind": ("command" if label.endswith(runtime.COMMAND_RETRY_LABEL)
+                                 else "storage" if label.endswith(runtime.STORAGE_RETRY_LABEL) else "model"),
                     }
                 # The latest wait that has not ended yet, if any.
                 self.state["modelRetry"] = next(reversed(waits.values()), None)
@@ -2509,10 +3626,45 @@ class App:
             except (OSError, UnicodeError, TypeError, ValueError):
                 pass  # The in-memory segment still excludes the wait.
 
+    def exclude_sleep(self, seconds):
+        """Leave machine sleep out of the active time of a working job, as the runner's own clock does."""
+
+        with self.lock:
+            if seconds <= 0 or self.state["phase"] not in ACTIVE_PHASES:
+                return
+            if self._retry_wait_started is not None:
+                # The wait is excluded separately; only its awake part may count as the wait.
+                self._retry_wait_started += timedelta(seconds=seconds)
+            segment = self.state.get("resumedAt") or self.state.get("startedAt")
+            try:
+                start = datetime.fromisoformat(segment)
+            except (TypeError, ValueError):
+                return
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            self.state["resumedAt"] = (start + timedelta(seconds=seconds)).isoformat()
+            if self.run_dir is not None:
+                try:
+                    self._save_job_settings(self.state)
+                except (OSError, UnicodeError, TypeError, ValueError):
+                    pass  # The in-memory segment still excludes the sleep.
+
     def _save_pause(self, checkpoint):
         """Atomically store the author's controller checkpoint."""
 
-        self._save(PAUSE_FILENAME, json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
+        self._save_controlled(PAUSE_FILENAME, json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n")
+
+    def _pause_request_path(self):
+        """Where Pause asks the runner to pause: the controller folder, which the author cannot write."""
+
+        return controller_directory(self.run_dir) / PAUSE_REQUEST_FILENAME
+
+    def _pause_requested(self):
+        return self._pause_request_path().exists() or (self.run_dir / PAUSE_REQUEST_FILENAME).exists()
+
+    def _clear_pause_request(self):
+        for path in (self._pause_request_path(), self.run_dir / PAUSE_REQUEST_FILENAME):
+            path.unlink(missing_ok=True)
 
     def _configure_auto_resume(self, checkpoint, now=None):
         """Persist the retry deadline and distinguish errors from deliberate pauses."""
@@ -2523,19 +3675,43 @@ class App:
             # failed runs recorded an error instead.
             checkpoint["pauseCause"] = (
                 "error" if checkpoint.get("error")
-                and not (self.run_dir / PAUSE_REQUEST_FILENAME).exists() else "user"
+                and not self._pause_requested() else "user"
             )
-        exhausted = (
+        # The time limit stops only the author: steps after its submission always finish. It
+        # counts as used up with the margin Resume uses (_time_limit_exhausted_locked), so an
+        # automatic resume is never scheduled that Resume would refuse.
+        hours = saved_seconds(self.state.get("thinkingHours"), 0.0)
+        exhausted = checkpoint.get("node", "author") == "author" and (
             str(checkpoint.get("error", "")).startswith(WORKFLOW_TIME_LIMIT_ERROR)
-            or (float(self.state["thinkingHours"]) > 0 and
-                float(checkpoint.get("elapsedSeconds", 0))
-                >= float(self.state["thinkingHours"]) * 3600)
+            or (hours > 0 and hours * 3600 - saved_seconds(checkpoint.get("elapsedSeconds"), 0.0)
+                < RESUME_MARGIN_SECONDS)
         )
-        # A conversation the CLI no longer has cannot be resumed by a retry, and
-        # an author stopped by a safety check waits for the user.
-        retry = (checkpoint["pauseCause"] == "error" and not exhausted
+        if exhausted and checkpoint["pauseCause"] in {"error", "interrupted", "restart"}:
+            # Whatever paused the author (an error, a restart, an older version's
+            # record), its limit is used up: a time-limit pause, which waits for
+            # the user and asks the author for its progress summary. A pause this
+            # version recorded says so in summaryRequested; restart and interrupted
+            # pauses exist only in this version; an older error pause gets none.
+            if checkpoint["pauseCause"] in {"interrupted", "restart"}:
+                checkpoint.setdefault("summaryRequested", False)
+            checkpoint["pauseCause"] = "time-limit"
+        if (checkpoint.get("settingsProblem") is None and checkpoint["pauseCause"] == "error"
+                and settings_problem(checkpoint.get("error"))):
+            # A model this account cannot use, or an endpoint that refuses the
+            # request: a retry cannot help. It resumes once an API model it uses
+            # is changed under Models & API (see _settings_changed_locked), or on Resume.
+            checkpoint["settingsProblem"] = {"models": self._api_settings_versions()}
+        # A Codex author whose saved thread ID is missing cannot be resumed by
+        # a retry, an author stopped by a safety check waits for the user, and
+        # a held run waits until its hold is released (never "failing" every
+        # minute). A runner that ended with its server ('interrupted') or was
+        # paused by a closing server ('restart') continues like an error pause.
+        retry = (checkpoint["pauseCause"] in {"error", "interrupted", "restart"} and not exhausted
                  and checkpoint.get("sessionUnavailable") is not True
-                 and checkpoint.get("safetyStop") is not True)
+                 and checkpoint.get("safetyStop") is not True
+                 and not self.state.get("launchHold")
+                 and not checkpoint.get("settingsProblem"))
+        self.state["settingsProblem"] = checkpoint.get("settingsProblem") or None
         deadline = checkpoint.get("autoResumeAt", 0)
         if not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= 0:
             deadline = now + AUTO_RESUME_SECONDS
@@ -2548,11 +3724,25 @@ class App:
         now = time.time() if now is None else now
         with self.lock:
             deadline = self.state.get("autoResumeAt", 0)
-            if (self.state["phase"] != "paused" or not deadline or now < deadline
-                    or self.has_active_worker()
-                    or self.state.get("manuallyStopped")):
+            if not deadline and self._settings_changed_locked(now):
+                deadline = now
+            if self.state["phase"] != "paused" or not deadline or now < deadline or self.state.get("manuallyStopped"):
+                return False
+            reply = next((item for item in self._conversation if item["status"] in {"queued", "running"}), None)
+            if reply is not None:
+                # A reply of the paused author goes first, but one that has already
+                # failed never holds the run's own retry: it is stopped with a visible
+                # reason, and the run resumes once its runner is gone.
+                if not self._reply_failed_before(reply):
+                    return False
+                self._stop_failing_reply_locked(reply)
+                return True
+            if self.has_active_worker():
                 return False
             try:
+                if self._unsaved_checkpoint is not None:
+                    self._save_pause(self._unsaved_checkpoint)
+                    self._unsaved_checkpoint = None
                 checkpoint = load_pause_checkpoint(self.run_dir)
             except (OSError, ValueError) as exc:
                 # A missing or damaged checkpoint stops neither this job's
@@ -2562,6 +3752,9 @@ class App:
             self._configure_auto_resume(checkpoint, now)
             if not self.state["autoResumeAt"]:
                 self._save_pause(checkpoint)
+                # A pause whose limit turned out to be used up records it and asks for its summary.
+                self._time_limit_reached_locked(checkpoint)
+                self._settle_run_claim()
                 return False
             # Reserve the next attempt before launching. A failed launch, or a
             # server restart during it, must not cause retries every polling tick.
@@ -2571,23 +3764,127 @@ class App:
             self.add_trace({"kind": "status", "stage": self.state["stage"],
                             "label": "Automatic resume", "text": "Retrying after an error pause."})
             try:
-                self._check_launch_models_locked()
+                # Only the models of the selected steps that remain (see checkpoint_roles).
+                self._check_launch_models_locked(
+                    checkpoint_roles(checkpoint["node"], saved_workflow_stages(self.state)))
             except TransientLaunchError:
                 pass  # For example a CLI updating itself: resume() reports it and the next try is reserved.
             except ValueError as exc:
-                # A model that is not configured (or has no key) is a settings
-                # error, not a transient one: wait for an explicit Resume.
-                checkpoint["autoResumeAt"] = self.state["autoResumeAt"] = 0
-                self._save_pause(checkpoint)
-                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": f"Automatic resume stopped: {exc} Choose Resume after fixing the settings."})
+                # A model that is not configured (removed, or without its key):
+                # checked again at every retry, resumed once it is configured again.
+                self._wait_for_settings_locked(str(exc))
                 return True
+            self.state["waitingForSettings"] = ""
             try:
                 resume()
             except (OSError, ValueError, RuntimeError) as exc:
-                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": f"Automatic resume failed: {exc}. Retrying in {retry_interval_text()}."})
+                # A failed historical check holds the job and names its cause itself (no retry).
+                if not self.state.get("launchHold"):
+                    self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                    "text": f"Automatic resume failed: {str(exc).rstrip('.')}. Retrying in {retry_interval_text()}."})
             return True
+
+    def _wait_for_settings_locked(self, reason):
+        """Show why an automatic resume waits for the model settings (once per reason); retries go on."""
+
+        if self.state.get("waitingForSettings") != reason:
+            self.state["waitingForSettings"] = reason
+            self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                            "text": f"Automatic resume waits for the model settings: {reason} The job checks "
+                                    f"again every {retry_interval_text()} and continues by itself once they are fixed."})
+
+    def _api_settings_versions(self):
+        """{api model id: when its settings last changed ('' when absent)} for the roles Resume runs."""
+
+        versions = {}
+        for role in ("author", "critic", "writer"):
+            model = self.state.get(f"{role}Model")
+            if providers.is_api_id(model) and model not in versions:
+                try:
+                    entry = providers.api_model(model, cached=False)
+                except providers.StoreUnavailable:
+                    return {}
+                versions[model] = (entry or {}).get("updatedAt") or ""
+        return versions
+
+    def _settings_changed_locked(self, now):
+        """Whether an API model that a settings-problem pause waits for has been changed since (checked twice a minute)."""
+
+        problem = self.state.get("settingsProblem")
+        if (self.state["phase"] != "paused" or not isinstance(problem, dict) or not problem.get("models")
+                or now - getattr(self, "_settings_checked_at", 0.0) < AUTO_RESUME_SECONDS / 2):
+            return False
+        self._settings_checked_at = now
+        current = self._api_settings_versions()
+        if not current or all(current.get(model) == version for model, version in problem["models"].items()):
+            return False
+        checkpoint = read_pause_object(self.run_dir)
+        if checkpoint.get("pauseCause") != "error":
+            return False  # Keep paused: only Resume continues.
+        # A later step that stopped on this problem was marked "no automatic retry" for it alone.
+        cleared = {} if str(checkpoint.get("error") or "").startswith("Stopped for safety") else {"safetyStop": False}
+        checkpoint.update(settingsProblem=False, autoResumeAt=now, **cleared)
+        self._save_pause(checkpoint)
+        self.state.update(settingsProblem=None, autoResumeAt=now, **cleared)
+        self.add_trace({"kind": "status", "stage": self.state["stage"], "label": "Settings changed",
+                        "text": "The API model settings this job waited for have changed; resuming."})
+        return True
+
+    def attention(self, state=None):
+        """Why this job needs you, as {kind, title, text, retrying}, or None.
+
+        Only causes you must fix: a login, a usage limit, a rejected API key, a
+        model your account cannot use, an endpoint that refuses the requests, a
+        removed model, a Codex author whose saved thread ID is missing, or a
+        safety stop. Retries of the causes that can pass by themselves go on
+        meanwhile.
+        """
+
+        state = self.state if state is None else state
+        phase, error = state.get("phase"), str(state.get("error") or "")
+        retry = state.get("modelRetry") if isinstance(state.get("modelRetry"), dict) else None
+        if retry and phase in {"reviewing", "running"}:
+            cause, role = retry.get("failure") or "", TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
+        elif phase == "paused":
+            cause, role = runtime._plain_failure(error), TRACE_STAGE_ROLES.get(state.get("stage"), "author")
+        else:
+            cause, role = "", ""
+        if state.get("waitingForSettings") and phase == "paused":
+            return {"kind": "settings", "title": "Model not configured", "retrying": True,
+                    "text": state["waitingForSettings"]}
+        hold = str(state.get("launchHold") or "")
+        if hold.startswith("Needs attention:") and phase in {"paused", "prepared", "done"}:
+            # A web-cutoff check that no retry fixes holds the job (see _historical_hold_text).
+            return {"kind": "historical", "title": "Web cutoff check needs attention", "retrying": False,
+                    "text": hold.removeprefix("Needs attention:").strip()}
+        for label, kind, title in ((runtime.MODEL_UNAVAILABLE_LABEL, "model", "Model unavailable"),
+                                   (runtime.REQUEST_REJECTED_LABEL, "request", "Endpoint refuses the requests")):
+            if label in error and phase in {"paused", "done", "input", "reviewed"}:
+                return {"kind": kind, "title": title, "text": error, "retrying": False}
+        if phase == "paused" and state.get("sessionUnavailable"):
+            return {"kind": "conversation", "title": "Saved conversation ID missing", "text": error, "retrying": False}
+        if phase == "paused" and state.get("safetyStop"):
+            return {"kind": "safety", "title": "Stopped for safety", "text": error, "retrying": False}
+        if cause not in {"authentication failed", "usage limit reached"}:
+            return None
+        model = state.get(f"{role}Model") or ""
+        try:
+            api = providers.provider_kind(model) == providers.API
+            name = providers.model_label(model) if api else "Claude" if providers.harness(model) == providers.CLAUDE else "Codex"
+        except (providers.ProviderError, TypeError):
+            api, name = False, "The CLI"
+        retrying = bool(retry) or bool(state.get("autoResumeAt"))
+        if cause == "usage limit reached":
+            return {"kind": "usage", "title": "Usage limit reached", "retrying": retrying,
+                    "text": f"{name} reports a usage limit. The job retries every {retry_interval_text()} and "
+                            "continues by itself when the limit resets."}
+        if api:
+            return {"kind": "key", "title": "API key rejected", "retrying": retrying,
+                    "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; "
+                            "the job continues by itself."}
+        return {"kind": "login", "title": f"{name} login needed", "retrying": retrying,
+                "text": f"Log in to the {name} CLI again ({'codex login' if name == 'Codex' else 'claude, then /login'}); "
+                        "the job continues by itself."}
 
     def defer_auto_resume(self, problem, now=None):
         """Report a due automatic resume that could not run; the next try follows after the usual wait."""
@@ -2616,34 +3913,45 @@ class App:
                                     round=report_record.get("round", self.state["round"]))
         return checkpoint_state
 
-    def pause(self):
-        """Interrupt the author while retaining its native session for resume."""
+    def pause(self, *, _for_restart=False):
+        """Interrupt the author while retaining its native session for resume.
+
+        ``_for_restart`` is the pause of a closing server: its cause, 'restart',
+        resumes the author automatically when TCS Prover starts again.
+        """
 
         with self.lock:
+            self._check_owned_here()
             if self.state["phase"] in {"pausing", "paused"}:
                 # A damaged checkpoint is left for Resume to report, but its
                 # automatic retry stops.
                 checkpoint = read_pause_object(self.run_dir)
                 if checkpoint:
-                    checkpoint.update(pauseCause="user", autoResumeAt=0)
+                    # A time-limit pause keeps its cause (it never resumes by itself anyway).
+                    checkpoint.update(pauseCause="time-limit" if checkpoint.get("pauseCause") == "time-limit"
+                                      else "user", autoResumeAt=0)
                     self._save_pause(checkpoint)
                 self.state["autoResumeAt"] = 0
             if self.state["phase"] in {"pausing", "paused"}:
+                self._settle_run_claim()
                 return
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
                 raise ValueError("Pause is available while the proof author is working.")
             checkpoint_state = self._author_checkpoint_state()
+            cause = "restart" if _for_restart else "user"
             self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
-                              "pauseCause": "user", "autoResumeAt": 0,
+                              "pauseCause": cause, "autoResumeAt": 0,
                               "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
                               "goalThreadId": self.state.get("goalThreadId", "")})
-            self._save(PAUSE_REQUEST_FILENAME, "{}\n")
+            self._save_controlled(PAUSE_REQUEST_FILENAME, "{}\n", run_copy=False)
             self.state.update(phase="pausing", error="", autoResumeAt=0)
             self._save_job_settings(self.state)
             self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
-                            "label": "Pause requested",
-                            "text": "Interrupting the author and preserving its saved conversation for Resume."})
+                            "label": "Paused for a restart" if _for_restart else "Pause requested",
+                            "text": ("TCS Prover is closing: preserving the author conversation, which resumes "
+                                     "automatically when TCS Prover starts again." if _for_restart
+                                     else "Interrupting the author and preserving its saved conversation for Resume.")})
             process, token = self.process, self.active_token
 
         def finish_if_unresponsive():
@@ -2651,23 +3959,198 @@ class App:
             if process is None:
                 return
             try:
-                process.wait(timeout=10)
-                return
+                process.wait(timeout=PAUSE_ACKNOWLEDGE_SECONDS)
             except subprocess.TimeoutExpired:
-                pass
-            with self.lock:
-                if self.active_token is not token or self.state["phase"] != "pausing":
-                    return
-                self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                "text": "The author did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
-            stop_process_tree(process)
+                with self.lock:
+                    if self.active_token is not token or self.state["phase"] != "pausing":
+                        return
+                    self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
+                                    "text": "The author did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
+                stop_process_tree(process)
+            self._settle_pause_without_reader(token)
 
         threading.Thread(target=finish_if_unresponsive, daemon=True).start()
+
+    def _settle_pause_without_reader(self, token):
+        """Keep a requested pause whose reader ended without settling the job."""
+
+        time.sleep(1)  # A live reader settles the job itself right after the runner exits.
+        with self.lock:
+            if self.active_token is not token or self.state["phase"] != "pausing" or not self._reader_gone_locked():
+                return
+            self.process = self.active_token = self.worker_token = None
+            checkpoint = read_pause_object(self.run_dir)
+            try:
+                if checkpoint.get("node") and checkpoint.get("stage"):
+                    checkpoint["status"] = "paused"
+                    self._configure_auto_resume(checkpoint)
+                    self._save_pause(checkpoint)
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass
+            self.state.update(phase="paused", finishedAt="")
+            try:
+                if checkpoint.get("node") and checkpoint.get("stage"):
+                    self._time_limit_reached_locked(checkpoint)
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass
+            self._settle_run_claim()
 
     def _check_launch_hold(self):
         """A held run must fail before credentials, workers or elapsed clocks."""
         if self.state.get("launchHold"):
             raise ValueError("Prepared run is held: " + str(self.state["launchHold"]))
+
+    def _historical_hold_text(self, exc):
+        """The hold shown after a failed historical check: its cause, then what happens next.
+
+        A failed batch can quote a job's own hold, which already starts with
+        "Needs attention:" or ends with the advice or the retry note; each is
+        given once.
+        """
+        text = str(exc).strip()
+        if isinstance(exc, retrieval.NeedsAttention):
+            text = text if text.startswith("Needs attention:") else f"Needs attention: {text}"
+        elif not text.startswith("Historical"):
+            text = f"Historical search preflight failed: {text}"
+        ending = HISTORICAL_RETRY_SUFFIX if isinstance(exc, retrieval.PreflightRetry) else HISTORICAL_FIX_ADVICE
+        return text if text.endswith(ending) else text + ending
+
+    def _hold_after_failed_check(self, exc):
+        """Hold this job with the cause; a check that could not finish runs again every minute."""
+        self.state["launchHold"] = self._historical_hold_text(exc)
+        self.state["autoResumeAt"] = 0
+        self._hold_retry_at = time.time() + AUTO_RESUME_SECONDS if isinstance(exc, retrieval.PreflightRetry) else 0
+        self._save_job_settings(self.state)
+        if self.state["phase"] == "paused" and self.run_dir and controlled_path(self.run_dir, PAUSE_FILENAME).exists():
+            try:
+                checkpoint = load_pause_checkpoint(self.run_dir)
+                checkpoint["autoResumeAt"] = 0
+                self._save_pause(checkpoint)
+            except (OSError, ValueError):
+                pass
+        self.add_trace({"kind": "diagnostic", "stage": self.state.get("stage") or "solve",
+                        "text": self.state["launchHold"]})
+        # A held job starts its runner only after a passing check: keep no owner lock meanwhile.
+        self._settle_run_claim()
+
+    def _check_historical_locked(self):
+        """Recheck a historical run's policy, configs and discovery before a process starts.
+
+        A moved bundle is adopted and saved (retrieval.check_run). A problem no
+        retry fixes holds the job with its message and no automatic retry.
+        """
+        if not self.state.get("retrievalPolicyPath"):
+            return
+        try:
+            path = retrieval.check_run(self.state["retrievalPolicyPath"], self.run_dir)
+        except retrieval.NeedsAttention as exc:
+            self._hold_after_failed_check(exc)
+            raise ValueError(self.state["launchHold"]) from exc
+        self._adopt_policy_path_locked(path)
+
+    def _adopt_policy_path_locked(self, path):
+        """Use the policy path a check returned, with this run's own folder as the author's workspace.
+
+        A moved checkout moves both: the policy then names the new paths, and the
+        saved workspace follows the run folder.
+        """
+        workspace = str(self.run_dir.resolve())
+        if path == self.state["retrievalPolicyPath"] and self.state.get("goalWorkspace") == workspace:
+            return
+        moved = path != self.state["retrievalPolicyPath"]
+        self.state.update(retrievalPolicyPath=path, goalWorkspace=workspace)
+        self._save_job_settings(self.state)
+        if moved:
+            self.add_trace({"kind": "status", "stage": self.state.get("stage") or "solve",
+                            "label": "Historical policy moved",
+                            "text": "This run's controller folder moved with the checkout; its policy now names "
+                                    "the new paths (recorded in the search audit log). The cutoff is unchanged."})
+
+    def rerun_historical_preflight(self):
+        """Check a held historical job again; once every check passes, release its hold.
+
+        A prepared job then starts and a paused one resumes; a stopped one waits
+        for its own continuation. The checks can take a minute, so they run
+        without the job lock: the job list, this job's page and the server's
+        once-a-second loop never wait for them.
+        """
+        with self.lock:
+            if (not self.state.get("retrievalPolicyPath") or not recheckable_hold(self.state.get("launchHold"))
+                    or self.has_active_worker() or self.state["phase"] in ACTIVE_PHASES):
+                raise ValueError("This job has no historical check to run again.")
+            if getattr(self, "_hold_check_running", False):
+                raise ValueError("This job's historical checks are already running.")
+            self._hold_check_running = True
+            hold, policy_path = self.state["launchHold"], self.state["retrievalPolicyPath"]
+            stages = saved_workflow_stages(self.state)
+        try:
+            failure = None
+            try:
+                path = retrieval.check_run(policy_path, self.run_dir)
+                retrieval.preflight_policy(path)
+                if stages["writing"]:
+                    retrieval.preflight_compiler(path)
+            except ValueError as exc:
+                failure = exc
+            with self.lock:
+                if (self.state.get("launchHold") != hold or self.state.get("retrievalPolicyPath") != policy_path
+                        or self.has_active_worker() or self.state["phase"] in ACTIVE_PHASES
+                        or not self.run_dir.is_dir()):
+                    raise ValueError("This job changed while its historical checks ran; check it again.")
+                if failure is not None:
+                    self._hold_after_failed_check(failure)
+                    raise ValueError(self.state["launchHold"]) from failure
+                self.state["launchHold"] = ""
+                self._hold_retry_at = 0
+                self._adopt_policy_path_locked(path)
+                self._save_job_settings(self.state)
+                self.add_trace({"kind": "status", "stage": self.state.get("stage") or "solve",
+                                "label": "Historical checks passed",
+                                "text": f"The {historical_checks(stages)} passed their checks; the hold is released."})
+                phase = self.state["phase"]
+                try:
+                    if phase == "prepared":
+                        self.start_prepared_run()
+                    elif phase == "paused" and not self.resume_refusal():
+                        # A reply being written, or a used-up time limit, keeps the job paused for the user.
+                        self.resume()
+                except (OSError, ValueError, RuntimeError) as exc:
+                    if not self.state.get("launchHold"):
+                        # Hold it again with the cause: one that can pass by itself (a CLI
+                        # updating, a full disk) is checked again every minute.
+                        passing = isinstance(exc, (OSError, RuntimeError, TransientLaunchError,
+                                                   retrieval.PreflightRetry))
+                        self._hold_after_failed_check((retrieval.PreflightRetry if passing else ValueError)(
+                            f"Historical run check passed, but the run did not start: {str(exc).rstrip('.')}."))
+                    raise
+        finally:
+            with self.lock:
+                self._hold_check_running = False
+        return self
+
+    def retry_historical_hold_if_due(self, now=None):
+        """Run a historical check that could not finish again, every minute.
+
+        The check runs in its own thread: it can take a minute, and the retry
+        loop serves every job.
+        """
+        now = time.time() if now is None else now
+        with self.lock:
+            due = getattr(self, "_hold_retry_at", 0)
+            if (not due or now < due or getattr(self, "_hold_check_running", False) or self.has_active_worker()
+                    or self.state["phase"] in ACTIVE_PHASES or not recheckable_hold(self.state.get("launchHold"))):
+                return False
+            # Reserve the next attempt first: a failure must not retry every tick.
+            self._hold_retry_at = now + AUTO_RESUME_SECONDS
+
+        def check():
+            try:
+                self.rerun_historical_preflight()
+            except (OSError, ValueError, RuntimeError):
+                pass  # The hold names the cause; a check that could not finish stays scheduled.
+
+        threading.Thread(target=check, daemon=True).start()
+        return True
 
     def _check_launch_models_locked(self, roles=("author", "critic", "writer")):
         """Recheck saved role models before a launch from an idle job.
@@ -2679,7 +4162,14 @@ class App:
         stages = saved_workflow_stages(self.state)
         models = {role: self.state[f"{role}Model"] for role in roles if stages[ROLE_STAGES[role]]}
         for role, model in models.items():
-            if providers.is_api_id(model) and not providers.is_known(model):
+            if not providers.is_api_id(model):
+                continue
+            # Read strictly: a store that cannot be read now is not a removed model.
+            try:
+                configured = providers.api_model(model, cached=False) is not None
+            except providers.StoreUnavailable as exc:
+                raise TransientLaunchError(str(exc)) from exc
+            if not configured:
                 raise ValueError(unconfigured_job_model_error(model, role, self.state.get("apiModels")))
         require_known_models(models)
         if (self.state.get("retrievalMode") == "historical" or self.state.get("retrievalPolicyPath")) and any(
@@ -2704,17 +4194,19 @@ class App:
             if self.state["phase"] != "prepared" or self.has_active_worker():
                 raise ValueError("This workspace is no longer waiting to start.")
             statement = saved_statement(self.run_dir)
+            self._check_historical_locked()
             self._check_launch_models_locked()
-            for role in ("author", "critic", "final"):
+            for role in ("author", "critic", "convention", "final"):
                 if not saved_workflow_stages(self.state)[ROLE_STAGES[PROMPT_ROLES[role]]]:
                     continue
-                self._save(f"prompts/{role}.txt", self.state[f"{role}Prompt"] + "\n")
+                self._save_prompt(role, self.state[f"{role}Prompt"])
             previous = dict(self.state)
+            queued = bool(self.state.get("launchQueued"))
             now = datetime.now(timezone.utc).isoformat()
             self.state.update(preparedRun=False, goalResume=False, goalThreadId="",
                               goalWorkspace=str(self.run_dir.resolve()), authorSteerDelivered="",
                               elapsedSeconds=0, startedAt=now, resumedAt=now, finishedAt="",
-                              error="")
+                              error="", launchQueued=False, launchError="", autoResumeAt=0)
             process = None
             try:
                 self._save_job_settings(self.state)
@@ -2725,22 +4217,161 @@ class App:
                     stop_process_tree(process)
                 self.state = previous
                 self.process = self.active_token = self.worker_token = None
+                self._settle_run_claim()
                 self._save_job_settings(self.state)
                 raise
             self.add_trace({"kind": "status", "stage": "solve", "node": "author",
-                            "label": "Prepared research started",
-                            "text": "Started a fresh author session in the prepared workspace."})
+                            "label": "Queued job started" if queued else "Prepared research started",
+                            "text": "Started the author of this queued job." if queued
+                            else "Started a fresh author session in the prepared workspace."})
+
+    def occupies_slot(self):
+        """Whether this job counts against the running-jobs limit (a model process runs or is about to)."""
+
+        with self.lock:
+            # A historical check that is running starts or resumes its job once it passes.
+            return (self.state["phase"] in ACTIVE_PHASES or self.worker_token is not None
+                    or getattr(self, "_hold_check_running", False))
+
+    def _queued_review(self):
+        """Whether this prepared job's start is its statement review (a folder batch with the review stage)."""
+
+        return bool(self.state.get("preparedRun") and self.state.get("reviewInputRecorded")
+                    and not self.state.get("skipStatementReview") and not self.state.get("review")
+                    and saved_workflow_stages(self.state)["review"])
+
+    def start_queued(self):
+        """Start this queued (or prepared) job now: its statement review when it has one to run, else its author."""
+
+        with self.lock:
+            review = self.state["phase"] == "prepared" and self._queued_review()
+        if review:
+            self.retry_review()
+        else:
+            self.start_prepared_run()
+
+    def queue_launch(self, problem=None, now=None):
+        """Wait as a queued job, which the server starts when a running slot is free.
+
+        After a start that failed (``problem``), the next try comes AUTO_RESUME_SECONDS later.
+        """
+
+        now = time.time() if now is None else now
+        with self.lock:
+            # A failed historical check holds the job instead, with its cause and advice (no retry).
+            held = bool(self.state.get("launchHold"))
+            error = (f"Could not start: {str(problem).rstrip('.') or type(problem).__name__}."
+                     if problem and not held else "")
+            self.state.update(phase="prepared", preparedRun=True, launchQueued=True, launchError=error, error=error,
+                              queuedAt=self.state.get("queuedAt") or now,
+                              autoResumeAt=now + AUTO_RESUME_SECONDS if error else 0)
+            review = self._queued_review()
+            self.state.update(stage="review" if review else "solve",
+                              activeNode="statement_reviewer" if review else "author")
+            try:
+                self._save_job_settings(self.state)
+            except (OSError, ValueError):
+                pass  # The queue is in memory as well; the next start saves the settings again.
+
+    def leave_queue(self):
+        """Take a queued job out of the queue: it stays prepared and starts only when asked."""
+
+        with self.lock:
+            if self.state["phase"] != "prepared" or not self.state.get("launchQueued"):
+                return False
+            self.state.update(launchQueued=False, autoResumeAt=0, launchError="", error="")
+            self._save_job_settings(self.state)
+            return True
+
+    def launch_due_at(self, now):
+        """(When the server may start this job by itself, its queue order), or (inf, 0) when it may not.
+
+        A paused job is due at its automatic retry (or when the settings it
+        waited for change); a queued job from when it was queued, or at the
+        next try after a failed start; a held historical job when its check
+        runs again.
+        """
+
+        with self.lock:
+            if self.worker_token is not None or self.state.get("runningElsewhere"):
+                return math.inf, 0
+            # A held job's check runs again even after a manual stop (a stopped job then
+            # only gets its hold released, see rerun_historical_preflight).
+            check = getattr(self, "_hold_retry_at", 0) if recheckable_hold(self.state.get("launchHold")) else 0
+            if check and not getattr(self, "_hold_check_running", False):
+                return check, 0
+            if self.state.get("manuallyStopped"):
+                return math.inf, 0
+            if self.state["phase"] == "paused":
+                if not self.state.get("autoResumeAt"):
+                    try:
+                        self._settings_changed_locked(now)
+                    except OSError:
+                        pass  # Saved at its next check (a full disk); the other jobs' starts go on.
+                return self.state.get("autoResumeAt") or math.inf, 0
+            if self.state["phase"] == "prepared" and self.state.get("launchQueued") and not self.state.get("launchHold"):
+                queued = self.state.get("queuedAt") or 0
+                return max(self.state.get("autoResumeAt") or 0, queued), queued
+            if self.state["phase"] in {"input", "reviewed"} and self.state.get("reviewRetryAt"):
+                return self.state["reviewRetryAt"], 0
+            return math.inf, 0
+
+    def start_queued_if_due(self, now=None):
+        """Start this queued job when its next try has come; return whether a start was tried."""
+
+        now = time.time() if now is None else now
+        with self.lock:
+            if (self.state["phase"] != "prepared" or not self.state.get("launchQueued") or self.state.get("launchHold")
+                    or self.worker_token is not None or now < (self.state.get("autoResumeAt") or 0)):
+                return False
+            try:
+                if not self._queued_review():
+                    try:
+                        saved_statement(self.run_dir)
+                    except ValueError:
+                        # A start that failed early (a full disk) may not have saved it yet.
+                        self._save_controlled("checked-statement.md",
+                                              "# Statement sent directly to the proof author\n\n"
+                                              f"{self.state['draft']}\n\n# Statement review\n\nSkipped by the user.\n")
+                self.start_queued()
+            except Exception as exc:
+                self.queue_launch(exc, now)
+            return True
+
+    def discard_unstarted_run(self):
+        """Remove the folders of a job that was never registered or started (nothing in them is model work)."""
+
+        if self.run_dir is not None and not self.fixed_trace and direct_run_directory(self.run_dir, self.runs):
+            shutil.rmtree(controller_directory(self.run_dir), ignore_errors=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
 
     def resume(self):
         """Reopen this run with a new CLI process and the saved goal/thread."""
 
+        with self.lock:
+            refusal = self.resume_refusal()
+            if refusal:
+                raise ValueError(refusal)
         self._check_launch_hold()
 
         with self.lock:
             if self.state["phase"] != "paused" or self.has_active_worker():
                 raise ValueError("Wait until the author is paused before resuming.")
-            self._check_launch_models_locked()
-            checkpoint = load_pause_checkpoint(self.run_dir)
+            # Again under the lock that launches: a reply may have been queued while it was released.
+            refusal = self.resume_refusal()
+            if refusal:
+                raise ValueError(refusal)
+            self._check_historical_locked()
+            if self._unsaved_checkpoint is not None:
+                self._save_pause(self._unsaved_checkpoint)
+                self._unsaved_checkpoint = None
+            try:
+                checkpoint = load_pause_checkpoint(self.run_dir)
+            except (OSError, ValueError):
+                # Without a usable checkpoint, a model problem is still reported first.
+                self._check_launch_models_locked()
+                raise
+            self._check_launch_models_locked(checkpoint_roles(checkpoint["node"], saved_workflow_stages(self.state)))
             workflow_state = dict(checkpoint["state"])
             workflow_state.pop("paused", None)
             workflow_state.pop("failed", None)
@@ -2749,34 +4380,123 @@ class App:
                 self.state["goalThreadId"] = checkpoint["goalThreadId"]
             self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
                               resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="", autoResumeAt=0,
-                              sessionUnavailable=False, safetyStop=False)
-            (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
+                              sessionUnavailable=False, safetyStop=False, settingsProblem=None, waitingForSettings="")
+            self._clear_pause_request()
             process = None
             try:
                 self._save_pause({**checkpoint, "status": "running", "error": "",
                                   "pauseCause": "", "autoResumeAt": 0, "sessionUnavailable": False,
-                                  "safetyStop": False})
+                                  "safetyStop": False, "settingsProblem": None})
                 self._save_job_settings(self.state)
+                # A LaTeX step runs its own graph, as every other final-stage launch does.
+                final = checkpoint["node"] in runtime.builtin_workflow("clean_up")["nodes"]
+                if final and checkpoint["node"] != "latex_editor" and isinstance(workflow_state.get("output"), str):
+                    # Repairs keep the content of the saved source (latex_kept), as _launch_compile_locked does.
+                    workflow_state.setdefault("edited_latex", workflow_state["output"])
                 resume_options = (["--set", "goal_require_resume=true"]
-                                  if self.state.get("goalThreadId") else [])
+                                  if self.state.get("goalThreadId") and not final else [])
+                if self.state.get("pendingReanchor") and not final:
+                    # A conversation turn compacted the author's context: send the full resume prompt.
+                    resume_options.extend(["--set", "goal_reanchor=true"])
                 process, token = self._launch_workflow_locked(
-                    ["author_critic.yaml", "clean_up.yaml"], "",
-                    [*self._proof_options_locked(), *resume_options,
-                     "--elapsed-seconds", str(checkpoint["elapsedSeconds"]),
+                    ["clean_up.yaml"] if final else ["author_critic.yaml", "clean_up.yaml"], "",
+                    [*(self._final_options() if final else [
+                        *self._proof_options_locked(), *resume_options,
+                        "--elapsed-seconds", str(checkpoint["elapsedSeconds"])]),
                      "--start-node", checkpoint["node"]],
                     checkpoint["stage"], checkpoint["node"], state=workflow_state,
                 )
+                # The new reader starts from whether the author still has to receive the critic's report.
+                self._carry_critic_feedback = checkpoint.get("criticFeedbackPending") is True
+                self._spawn_worker(self._read_output, (process, token), token)
+            except (OSError, ValueError, RuntimeError):
+                self._carry_critic_feedback = False
+                if process is not None:
+                    stop_process_tree(process)
+                self.state = previous
+                self.process = self.active_token = self.worker_token = None
+                self._settle_run_claim()
+                self._save_pause(checkpoint)
+                self._save_job_settings(self.state)
+                raise
+            self.add_trace({"kind": "status", "stage": checkpoint["stage"], "node": checkpoint["node"],
+                            "label": "Resume requested",
+                            "text": "Reopening the saved author conversation in this same run folder."
+                            if checkpoint["node"] == "author" else
+                            "Continuing at the saved step with its exact input in this same run folder."})
+            # Related works added while paused reach the author once, as a live instruction.
+            pending = list(self.state.get("relatedWorksPending") or [])
+            if pending:
+                try:
+                    self._queue_related_works_notice_locked(pending)
+                    self.state["relatedWorksPending"] = []
+                    self._save_job_settings(self.state)
+                except (OSError, UnicodeError, TypeError, ValueError) as exc:
+                    self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE,
+                                    "text": f"The author could not be told about the related works added while it "
+                                            f"was paused ({exc}); it is told when the run resumes next."})
+
+    def continue_historical(self, action):
+        """Continue a stopped historical run in its own folder under its fixed policy.
+
+        Every new-run continuation is impossible here: the policy binds this
+        workspace and cutoff. ``action`` is "author" (resuming the saved author
+        conversation when it still exists, else a new one with the YAML resume
+        prompt), "critic" (the saved proof) or "final" (the saved final input).
+        Like a continuation in a new run, the time budget starts again.
+        """
+        with self.lock:
+            if self.has_active_worker() or self.state["phase"] in ACTIVE_PHASES:
+                raise ValueError("A model is already working on this job.")
+            self._check_launch_hold()
+            self._check_historical_locked()
+            self._check_launch_models_locked()
+            previous = dict(self.state)
+            now = datetime.now(timezone.utc).isoformat()
+            self._clear_manual_stop()
+            self.state.update(elapsedSeconds=0, resumedAt=now, finishedAt="", error="", autoResumeAt=0,
+                              sessionUnavailable=False, safetyStop=False, settingsProblem=None,
+                              waitingForSettings="")
+            if action == "author":
+                thread = self.state.get("goalThreadId") or saved_goal_thread_id(self.run_dir)
+                self.state.update(goalThreadId="" if previous.get("sessionUnavailable") else thread,
+                                  goalResume=True, goalWorkspace=str(self.run_dir.resolve()))
+            self._clear_pause_request()
+            # A pause checkpoint belongs to the conversation being replaced; the
+            # continuation starts its workflow, and its time budget, afresh.
+            pause = controlled_path(self.run_dir, PAUSE_FILENAME)
+            paused = pause.read_bytes() if pause.is_file() else None
+            for path in (controller_directory(self.run_dir) / PAUSE_FILENAME, self.run_dir / PAUSE_FILENAME):
+                path.unlink(missing_ok=True)
+            process = None
+            try:
+                self._save_job_settings(self.state)
+                if action == "author":
+                    process, token = self._launch_solver_locked(saved_statement(self.run_dir))
+                elif action == "critic":
+                    source = saved_critic_source(self.run_dir)
+                    process, token = self._launch_critic_resume_locked(source["statement"], source["solution"])
+                elif action == "final":
+                    final_input = saved_final_input(self.run_dir)
+                    process, token = self._launch_saved_final_locked(final_input["statement"], final_input["solution"])
+                else:
+                    raise ValueError("This job has no saved stage available to continue.")
                 self._spawn_worker(self._read_output, (process, token), token)
             except (OSError, ValueError, RuntimeError):
                 if process is not None:
                     stop_process_tree(process)
                 self.state = previous
                 self.process = self.active_token = self.worker_token = None
-                self._save_pause(checkpoint)
+                self._settle_run_claim()
                 self._save_job_settings(self.state)
+                if paused is not None:
+                    self._save_controlled(PAUSE_FILENAME, paused.decode("utf-8"))
                 raise
-            self.add_trace({"kind": "status", "stage": checkpoint["stage"], "node": checkpoint["node"],
-                            "label": "Resume requested", "text": "Reopening the saved author conversation in this same run folder."})
+            # A pause checkpoint restore could not save belongs to the replaced conversation too.
+            self._unsaved_checkpoint = None
+            self.add_trace({"kind": "status", "stage": self.state["stage"], "node": self.state["activeNode"],
+                            "label": "Historical run continued",
+                            "text": "Continuing in this same run folder under the saved web cutoff."})
 
     def final_tex(self):
         """Read the finished LaTeX artifact for an authenticated download."""
@@ -2794,6 +4514,36 @@ class App:
                 raise ValueError("A completed final.pdf is not available for this job.")
             return (self.run_dir / "final.pdf").read_bytes()
 
+    def approved_proof(self):
+        """Read the proof handed to the LaTeX stage (critic-approved when the critic runs), for a download."""
+
+        with self.lock:
+            if not self.snapshot()["canDownloadProof"]:
+                raise ValueError("No approved proof is saved for this job.")
+            return (saved_final_input(self.run_dir)["solution"] + "\n").encode("utf-8")
+
+    def critic_diff(self, name):
+        """Read one saved diff of the critic coordinator's changes, too long for its critic result."""
+
+        name = str(name or "")
+        if not CRITIC_DIFF_NAME.fullmatch(name):
+            raise ValueError("Unknown saved changes.")
+        with self.lock:
+            if not self.run_dir:
+                raise ValueError("Unknown saved changes.")
+            path = controller_directory(self.run_dir) / CRITIC_DIFFS_FOLDER / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("These saved changes are no longer available.")
+        return path.read_bytes()
+
+    def latex_source(self):
+        """Read the working LaTeX source, for an authenticated download before final.tex exists."""
+
+        with self.lock:
+            if not self.snapshot()["canDownloadSource"]:
+                raise ValueError("No LaTeX source is saved for this job.")
+            return (self.run_dir / "latex-source.tex").read_bytes()
+
     def _final_options(self):
         return [
             "--writer-model", self.state["writerModel"],
@@ -2801,7 +4551,7 @@ class App:
             "--writer-effort", self.state["writerEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
             "--speed", self.state["speedMode"],
-            "--final-prompt-file", str(self.run_dir / "prompts/final.txt"),
+            "--final-prompt-file", str(self._save_prompt("final", self.state["finalPrompt"])),
             "--set", "workflow_stages=" + json.dumps({"review": False, "author": False, "critic": False, "writing": True}),
         ]
 
@@ -2820,6 +4570,15 @@ class App:
             state={"statement": statement, "solution": solution},
         )
 
+    def _launch_compile_locked(self, state):
+        """Compile saved LaTeX source again; compiler errors go to the repair step, not the editor."""
+
+        return self._launch_workflow_locked(
+            ["clean_up.yaml"], "", [*self._final_options(), "--start-node", "latex_compile"],
+            # Without an editor call, repairs keep the content of the saved source (latex_kept).
+            "final", "latex_compile", state={"edited_latex": state["output"], **state},
+        )
+
     def _launch_critic_resume_locked(self, statement, solution):
         """Resume the same graph at its critic with the saved candidate."""
 
@@ -2833,13 +4592,15 @@ class App:
     def start_direct_statement(
         self, statement,
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        critic_count=DEFAULT_CRITIC_COUNT,
+        author_subagents=DEFAULT_AUTHOR_SUBAGENTS,
         thinking_hours=DEFAULT_THINKING_HOURS,
         author_model=DEFAULT_AUTHOR_MODEL,
         critic_model=DEFAULT_CRITIC_MODEL,
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
@@ -2848,8 +4609,14 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
         workflow_stages=None, original_content=None,
+        related_works=None, folder_batch=None,
     ):
-        """Send a statement directly to the proof author without review."""
+        """Send a statement directly to the proof author without review.
+
+        ``related_works`` are upload tokens installed in the new run before
+        anything starts (the caller discards them once the job is registered);
+        ``folder_batch`` is the folder batch whose related works the job shares.
+        """
 
         self._check_input_replacement()
 
@@ -2859,12 +4626,15 @@ class App:
             raise ValueError("Enter a problem statement.")
         if "\0" in statement:
             raise ValueError("The problem statement cannot contain NUL characters.")
+        if len(statement) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"The problem statement is longer than {MAX_STATEMENT_CHARS:,} characters.")
         stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
             "review": False, "author": True, "critic": True, "writing": True}
         if stages["review"]:
             raise ValueError("Start the selected statement review before later workflow stages.")
+        tokens = self._new_related_works_tokens(related_works, stages)
         if continuation_source:
-            saved_prompt = Path(continuation_source) / "prompts" / "author.txt"
+            saved_prompt = controlled_path(continuation_source, "prompts/author.txt")
             if saved_prompt.is_file():
                 original_template = read_utf8(saved_prompt, "saved author prompt")
                 if author_prompt is not None and str(author_prompt).strip() != original_template.strip():
@@ -2872,6 +4642,8 @@ class App:
                 author_prompt = original_template
         options = self._workflow_options(
             critic_rounds=critic_rounds,
+            critic_count=critic_count,
+            author_subagents=author_subagents,
             thinking_hours=thinking_hours,
             author_model=author_model,
             critic_model=critic_model,
@@ -2882,6 +4654,7 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
+            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
@@ -2907,30 +4680,44 @@ class App:
             )
             if continuation_source:
                 options.update(saved_goal_options(continuation_source))
-            for name in ("author", "critic", "final"):
+            for name in ("author", "critic", "convention", "final"):
                 if not stages[ROLE_STAGES[PROMPT_ROLES[name]]]:
                     continue
-                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+                self._save_prompt(name, options[f"{name}Prompt"])
             if options["retrievalMode"] == "historical":
                 self._save("input.md", statement + "\n")
                 options["retrievalPolicyPath"] = retrieval.prepare_policy(
                     self.run_dir, options["retrievalCutoffUtc"])
                 options["goalWorkspace"] = str(self.run_dir.resolve())
+            # A continuation stays in its source's folder batch.
+            folder_batch = folder_batch or (saved_folder_batch(continuation_source) if continuation_source else "")
+            if folder_batch:
+                options["folderBatch"] = folder_batch
+            # Related works are in the author's workspace before anything runs (a web-cutoff run audits them).
+            works = self._install_new_related_works_locked(
+                tokens, folder_batch, options.get("goalWorkspace") or self.run_dir,
+                options.get("retrievalPolicyPath", ""))
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
                 "skipStatementReview": True,
                 "statementReviewOnly": False,
             })
-            self._save(
+            self._save_controlled(
                 "checked-statement.md",
                 "# Statement sent directly to the proof author\n\n"
                 f"{statement}\n\n# Statement review\n\nSkipped by the user.\n",
             )
+            failed_check = None
             if options["retrievalMode"] == "historical" and not _prepare_only:
-                retrieval.preflight_policy(options["retrievalPolicyPath"])
-                if stages["writing"]:
-                    retrieval.preflight_compiler(options["retrievalPolicyPath"])
+                try:
+                    retrieval.preflight_policy(options["retrievalPolicyPath"])
+                    if stages["writing"]:
+                        retrieval.preflight_compiler(options["retrievalPolicyPath"])
+                except ValueError as exc:
+                    # Keep the prepared job, held with the real cause, instead of
+                    # an orphaned folder; a check that could not finish runs again.
+                    failed_check = exc
             trace = self.state["trace"] if self.fixed_trace else []
             version = self.state["traceVersion"] if self.fixed_trace else 0
             self.state = {
@@ -2943,10 +4730,17 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
-            if _prepare_only:
+            self._record_new_related_works_locked(*works)
+            if _prepare_only or failed_check is not None:
+                # A folder-batch job: historical ones wait for their batch's
+                # sandbox checks, live ones in the queue the server starts.
+                historical = options["retrievalMode"] == "historical"
                 self.state.update(phase="prepared", preparedRun=True,
                                   stage="solve", activeNode="author", startedAt="",
-                                  launchHold="Historical batch preflight is pending; every run must pass before launch.")
+                                  launchHold=HISTORICAL_PENDING_HOLD if historical else "",
+                                  launchQueued=not historical, queuedAt=0 if historical else time.time())
+                if failed_check is not None:
+                    self._hold_after_failed_check(failed_check)
                 self._save_job_settings(self.state)
                 return
             process, token = self._launch_solver_locked(statement)
@@ -2961,8 +4755,12 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
         retrieval_mode="live", retrieval_cutoff_utc="",
+        latex_source="",
     ):
-        """Polish one combined theorem-and-proof input without earlier stages."""
+        """Polish one combined theorem-and-proof input without earlier stages.
+
+        ``latex_source`` (a saved latex-source.tex) is compiled at once instead.
+        """
 
         self._check_input_replacement()
 
@@ -2971,6 +4769,8 @@ class App:
             raise ValueError("Enter the theorem and proof.")
         if "\0" in source:
             raise ValueError("The theorem and proof cannot contain NUL characters.")
+        if len(source) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"The theorem and proof are longer than {MAX_STATEMENT_CHARS:,} characters.")
         options = self._workflow_options(
             writer_model=writer_model,
             reasoning_effort=reasoning_effort,
@@ -2996,7 +4796,7 @@ class App:
             self._prepare_continuation(
                 continuation_source, stopped_stage,
             )
-            self._save("prompts/final.txt", options["finalPrompt"] + "\n")
+            self._save_prompt("final", options["finalPrompt"])
             self._save_job_settings({
                 **options,
                 "problemMode": "latex",
@@ -3016,7 +4816,12 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
-            process, token = self._launch_final_locked(source)
+            if latex_source:
+                self._save("latex-source.tex", latex_source)
+                process, token = self._launch_compile_locked(
+                    {"input": source, "statement": source, "source": source, "output": latex_source})
+            else:
+                process, token = self._launch_final_locked(source)
         self._spawn_worker(self._read_output, (process, token), token)
 
     def start_final_resume(
@@ -3029,8 +4834,12 @@ class App:
         continuation_source="", stopped_stage="final",
         critic_model=DEFAULT_CRITIC_MODEL, critic_effort=None,
         retrieval_mode="live", retrieval_cutoff_utc="",
+        latex_source="",
     ):
-        """Retry normal finalization with its exact statement/proof contract."""
+        """Retry normal finalization with its exact statement/proof contract.
+
+        ``latex_source`` (a saved latex-source.tex) is compiled at once instead.
+        """
 
         self._check_input_replacement()
 
@@ -3070,14 +4879,14 @@ class App:
             self._prepare_continuation(
                 continuation_source, stopped_stage,
             )
-            self._save("prompts/final.txt", options["finalPrompt"] + "\n")
+            self._save_prompt("final", options["finalPrompt"])
             self._save_job_settings({
                 **options,
                 "problemMode": "final-resume",
                 "skipStatementReview": True,
                 "statementReviewOnly": False,
             })
-            self._save(
+            self._save_controlled(
                 "checked-statement.md", f"# Checked statement\n\n{statement}\n",
             )
             runtime.save_final_input(statement, solution, directory=self.run_dir)
@@ -3095,29 +4904,34 @@ class App:
                 "startedAt": datetime.now(timezone.utc).isoformat(),
                 "runId": self.run_dir.name,
             }
-            process, token = self._launch_saved_final_locked(
-                statement, solution,
-            )
+            if latex_source:
+                self._save("latex-source.tex", latex_source)
+                process, token = self._launch_compile_locked(
+                    {"statement": statement, "solution": solution, "output": latex_source})
+            else:
+                process, token = self._launch_saved_final_locked(
+                    statement, solution,
+                )
         self._spawn_worker(self._read_output, (process, token), token)
 
     def start_critic_resume(
         self, statement, solution, source_run="",
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
+        critic_count=DEFAULT_CRITIC_COUNT,
+        author_subagents=DEFAULT_AUTHOR_SUBAGENTS,
         thinking_hours=DEFAULT_THINKING_HOURS,
         author_model=DEFAULT_AUTHOR_MODEL,
         critic_model=DEFAULT_CRITIC_MODEL,
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
-        audit_checkpoint="",
-        recover_audit_checkpoint=True,
         retrieval_mode="live", retrieval_cutoff_utc="",
         workflow_stages=None, original_content=None,
     ):
-        """Create a new job that audits one complete saved candidate proof."""
+        """Create a new job that audits one complete saved candidate proof; its critic starts afresh."""
 
         self._check_input_replacement()
 
@@ -3129,6 +4943,8 @@ class App:
 
         options = self._workflow_options(
             critic_rounds=critic_rounds,
+            critic_count=critic_count,
+            author_subagents=author_subagents,
             thinking_hours=thinking_hours,
             author_model=author_model,
             critic_model=critic_model,
@@ -3139,6 +4955,7 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
+            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
@@ -3163,31 +4980,21 @@ class App:
             )
             if source_run:
                 options.update(saved_goal_options(source_run))
-            for name in ("author", "critic", "final"):
+                # It shares its source's workspace, and so its folder batch's related works.
+                if saved_folder_batch(source_run):
+                    options["folderBatch"] = saved_folder_batch(source_run)
+            for name in ("author", "critic", "convention", "final"):
                 if not options["workflowStages"][ROLE_STAGES[PROMPT_ROLES[name]]]:
                     continue
-                self._save(f"prompts/{name}.txt", options[f"{name}Prompt"] + "\n")
+                self._save_prompt(name, options[f"{name}Prompt"])
             self._save_job_settings({
                 **options,
                 "problemMode": "critic-resume",
                 "skipStatementReview": True,
                 "statementReviewOnly": False,
             })
-            self._save("checked-statement.md", f"# Checked statement\n\n{statement}\n")
+            self._save_controlled("checked-statement.md", f"# Checked statement\n\n{statement}\n")
             self._save(runtime.SAVED_CANDIDATE_FILENAME, solution + "\n")
-            if audit_checkpoint and critic_uses_parallel_audits():
-                self._save(
-                    runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME,
-                    str(audit_checkpoint),
-                )
-            if not recover_audit_checkpoint and critic_uses_parallel_audits():
-                self._save(
-                    runtime.CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME,
-                    (
-                        "This continuation starts from the saved proof and "
-                        "intentionally runs fresh independent audits.\n"
-                    ),
-                )
             self._save(
                 "resume-source.json",
                 json.dumps({"sourceRun": str(source_run)}, indent=2) + "\n",
@@ -3229,7 +5036,7 @@ class App:
                 raise ValueError("The approved statement cannot be empty.")
             if statement != self.state["review"]["statement"]:
                 self.state["review"] = {**self.state["review"], "statement": statement}
-                self._save(
+                self._save_controlled(
                     "checked-statement.md",
                     f"# Checked statement\n\n{statement}\n\n"
                     f"# Reviewer notes\n\n"
@@ -3249,18 +5056,97 @@ class App:
                 for key in ("elapsedSeconds", "resumedAt"):
                     self.state.pop(key, None)
                 self.state.update(previous)
+                self._settle_run_claim()
                 raise
         self._spawn_worker(self._read_output, (process, token), token)
 
     def _read_output(self, process, token=None):
+        """Read one runner to its end; nothing it prints, and no failed write, leaves the job unsettled."""
+
+        try:
+            self._read_records(process, token)
+        except Exception as exc:
+            self._read_after_failure(process, token, exc)
+        self._settle_run_claim()
+
+    def _read_after_failure(self, process, token, failure):
+        """Keep saving a runner's output after handling it failed, then settle as a restart would."""
+
+        def save(record):
+            try:
+                self.add_trace(record)
+            except Exception:
+                pass  # The runner must still be drained; the transcript keeps what it can.
+
+        save({"kind": "diagnostic", "stage": self.state["stage"] or "solve",
+              "text": f"A runner event could not be handled ({type(failure).__name__}: {failure}). The job "
+                      "keeps running; its remaining events are saved, and it settles from its saved files "
+                      "when the runner ends."})
+        try:
+            for line in process.stdout:
+                record = self.parse_line(line, self.state["stage"] or "solve")
+                if record.get("kind") != "node_input":  # A step's input stays in memory only (see _read_records).
+                    save(record)
+        except Exception:
+            try:
+                stop_process_tree(process)  # Its output can no longer be read.
+            except Exception:
+                pass
+        try:
+            reap_runner(process)
+        except Exception:
+            pass
+        self._settle_from_saved_run(process, token)
+
+    def _settle_from_saved_run(self, process, token):
+        """Settle a job whose reader failed with the outcome a restart would restore from its files."""
+
+        self.flush_trace(force=True)  # The outcome is read from the transcript.
+        conversation = None
+        try:
+            settled = restore_saved_app(App(self.trace_file, self.runs))
+            restored, conversation, problem = settled.state, settled._conversation, None
+        except Exception as exc:
+            restored, problem = None, exc
+        with self.lock:
+            if self.active_token not in (None, token) or self.worker_token not in (None, token):
+                return  # A newer run of this job owns it now.
+            if self.process is process:
+                self.process = None
+            self.active_token = self.worker_token = None
+            self._end_retry_wait_locked()
+            self._model_retries, self._retry_starts = {}, {}
+            self.state["modelRetry"] = None
+            if restored is not None:
+                self.state.update({key: restored[key] for key in SETTLED_FIELDS if key in restored})
+                # The settled pause may have asked for its progress summary (see _restore_conversation).
+                self._conversation = conversation
+            else:
+                self.state.update(phase="done", finishedAt=datetime.now(timezone.utc).isoformat(),
+                                  error=f"The job's output reader failed ({str(problem) or type(problem).__name__}). "
+                                        "Continue from a saved checkpoint.")
+
+    def _read_records(self, process, token=None):
         """Store tagged solver events and build the visible final answer."""
 
         problem, answers, order, final, failed = "", {}, [], False, False
         latest_critic_solution = ""
         last_work_node = self.state["activeNode"]
+        # Whether the critic rejected the latest proof and the author has not received that report yet;
+        # a resumed run starts from its checkpoint's value.
+        with self.lock:
+            critic_feedback, self._carry_critic_feedback = self._carry_critic_feedback, False
+        # The exact input of the step after the author that runs now: a runner
+        # that ends during that step pauses there (see the end of this method).
+        # A resumed step starts from its checkpoint until the runner reports it.
+        resumed = read_pause_object(self.run_dir) if self.run_dir else {}
+        step_input = (resumed if resumed.get("status") == "running" and isinstance(resumed.get("state"), dict)
+                      and resumed.get("node") == last_work_node != "author" else None)
         # Only the first repair turn after an author submission starts a new
         # answer; live instructions and continuation turns extend it.
         repair_pending = False
+        # Whether the author submitted during this runner (see the end of this method).
+        submitted = False
         try:
             for line in process.stdout:
                 if self.output_stream is not None:
@@ -3272,8 +5158,31 @@ class App:
                         self.output_stream = None
                 # Untagged errors belong to the most recently active stage.
                 record = self.parse_line(line, self.state["stage"] or "solve")
-                self.add_trace(record)
+                if record.get("kind") == "node_input":
+                    # Kept in memory only, for this runner: it repeats the whole workflow state.
+                    if isinstance(record.get("node"), str) and isinstance(record.get("state"), dict):
+                        step_input = record
+                    continue
+                entry = self.add_trace(record)
                 self._follow_model_retry(record)
+                self._follow_author_question(record)
+                if convention_verdict(entry):
+                    # The latest verdict decides: a new loophole verdict shows again, whatever the user did
+                    # with an earlier one, and a faithful verdict on a later accepted proof closes it.
+                    with self.lock:
+                        self.state["conventionWarning"] = convention_warning(entry)
+                        self._save_job_settings(self.state)
+                if (record.get("kind") == "critic_result" and record.get("root") is not False
+                        and isinstance(record.get("report"), dict) and record["report"].get("verdict") == "reject"):
+                    critic_feedback = True
+                if (record.get("kind") == "request" and record.get("label") == "Exact solve input"
+                        and record.get("stage") in {"solve", "repair"} and record.get("root") is not False):
+                    # The author's turn carries the critic's report, and the full prompt a re-anchor needed.
+                    critic_feedback = False
+                    with self.lock:
+                        if self.state.get("pendingReanchor"):
+                            self.state["pendingReanchor"] = False
+                            self._save_job_settings(self.state)
                 goal_thread = goal_thread_from_record(record)
                 if goal_thread:
                     with self.lock:
@@ -3286,6 +5195,11 @@ class App:
                         and record.get("root") is not False and isinstance(delivered, str) and delivered):
                     with self.lock:
                         self.state["authorSteerDelivered"] = delivered
+                        self._save_job_settings(self.state)
+                repair = delivered_repair(record)
+                if repair:
+                    with self.lock:
+                        self.state["authorRepairDelivered"] = repair
                         self._save_job_settings(self.state)
                 if (
                     record.get("kind") == "diagnostic"
@@ -3306,19 +5220,13 @@ class App:
                     with self.lock:
                         self.state["stage"] = record_stage
                         self.state["activeNode"] = event_node(record, self.state["activeNode"])
+                # A critic round is one visit of the critic step, whose proof handoff and result carry
+                # its number; its requests (the critics, the coordinator, their retries) are not rounds.
                 if isinstance(record.get("round"), int):
                     with self.lock:
                         self.state["round"] = record["round"]
-                elif (
-                    record.get("kind") == "request"
-                    and record_stage == "critic"
-                    # A retry of the same critic call is not another round.
-                    and record.get("attempt") in (None, 1)
-                ):
-                    with self.lock:
-                        self.state["round"] += 1
                 if record.get("kind") == "author_result":
-                    repair_pending = True
+                    repair_pending = submitted = True
                 if record.get("kind") == "final_input":
                     with self.lock:
                         self.state["finalInputReady"] = True
@@ -3348,13 +5256,19 @@ class App:
                             checkpoint = read_pause_object(self.run_dir)
                             reason = record.get("reason", "")
                             cause = checkpoint.get("pauseCause") if self.state["phase"] == "pausing" else "error"
-                            if cause not in {"user", "error"}:
+                            # A closing server's pause ('restart') resumes by itself at the next start.
+                            if cause not in {"user", "error", "restart"}:
                                 cause = "error" if reason else "user"
+                            if (cause in {"error", "restart"} and record["node"] == "author"
+                                    and str(reason).startswith(WORKFLOW_TIME_LIMIT_ERROR)):
+                                # Reaching the time limit is the user's choice: no automatic resume,
+                                # also when a closing server was pausing the author at that moment.
+                                cause = "time-limit"
                             paused_stage = record["stage"]
                             if (record["node"] == "author"
                                     and record["state"].get("report", {}).get("verdict") == "reject"):
                                 paused_stage = "repair"
-                            # The saved conversation is gone: retrying the same
+                            # The saved thread ID is missing: retrying the same
                             # resume cannot help, so only an explicit choice continues.
                             unavailable = record.get("sessionUnavailable") is True
                             # A safety check stopped the author: only the user resumes it.
@@ -3365,7 +5279,10 @@ class App:
                                               "elapsedSeconds": self._elapsed_seconds(),
                                               "goalThreadId": self.state.get("goalThreadId", ""),
                                               "stage": paused_stage, "sessionUnavailable": unavailable,
-                                              "safetyStop": safety})
+                                              "safetyStop": safety, "criticFeedbackPending": critic_feedback,
+                                              # A pause of this version: its summary is still to be asked
+                                              # for, even if the reader never reaches its exit (P2).
+                                              "summaryRequested": False})
                             self.state.update(phase="pausing", error=reason, sessionUnavailable=unavailable,
                                               safetyStop=safety)
                             self._save_job_settings(self.state)
@@ -3440,6 +5357,8 @@ class App:
                 elif (
                     method == "item/completed"
                     and item.get("type") in {"agentMessage", "agent_message"}
+                    # A question to the user is shown in its own box, never as part of the answer.
+                    and not runtime.asks_user(item)
                 ):
                     item_id, answer = item.get("id", ""), item.get("text", "")
                 else:
@@ -3453,11 +5372,10 @@ class App:
                 answers[item_id] = answers[item_id] + answer if append else answer
                 with self.lock:
                     self.state["output"] = "".join(answers[key] for key in order)
-            code = process.wait()
-        except OSError as exc:
-            problem = str(exc)
-            stop_process_tree(process)
-            code = process.poll()
+            code = reap_runner(process)
+        except Exception as exc:
+            # A record or a write that cannot be handled never stops a working runner.
+            return self._read_after_failure(process, token, exc)
         with self.lock:
             terminal_stop_race = (
                 final
@@ -3472,7 +5390,7 @@ class App:
             paused = self.state["phase"] == "pausing"
             # A runner that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
-            self._model_retries = {}
+            self._model_retries, self._retry_starts = {}, {}
             self.state["modelRetry"] = None
             if self.process is process:
                 self.process = None
@@ -3484,21 +5402,37 @@ class App:
             self.state["finishedAt"] = datetime.now(timezone.utc).isoformat()
             checkpoint = read_pause_object(self.run_dir)
             author_interrupted = (not stopped and last_work_node == "author" and (not final or failed))
-            if (paused or author_interrupted) and (not final or failed):
-                error = checkpoint.get("error", "") if paused else (
-                    problem or (self.state["output"] if failed else "")
-                    or f"The author exited before completing the task (code {code}).")
-                if not paused:
+            # A runner that ended during a later step (killed, out of memory) resumes that step from its input.
+            step_interrupted = (not stopped and not paused and not final and bool(problem or code)
+                                and step_input is not None and last_work_node == step_input["node"] != "author")
+            if (paused or author_interrupted or step_interrupted) and (not final or failed):
+                if step_interrupted:
+                    label = PUBLIC_GRAPH["nodes"].get(step_input["node"], {}).get("label", step_input["node"])
+                    error = problem or f"The runner stopped unexpectedly during the {label} step (exit code {code})."
+                    checkpoint.update(state=step_input["state"], node=step_input["node"],
+                                      stage=str(step_input.get("stage") or self.state["stage"] or "final"))
+                else:
+                    error = checkpoint.get("error", "") if paused else (
+                        problem or (self.state["output"] if failed else "")
+                        or f"The author exited before completing the task (code {code}).")
+                if author_interrupted and not paused:
                     workflow_state = {**checkpoint.get("state", {}), **self._author_checkpoint_state()}
+                    if submitted:
+                        # The state Resume saved may say why an earlier submission was refused: the runner
+                        # dropped that reason when the author submitted again, so the author is not told it again.
+                        workflow_state.pop("handoff_refused", None)
                     checkpoint.update(state=workflow_state, node="author",
                                       stage="repair" if workflow_state.get("report") else "solve")
+                # Every new pause says whether its automatic progress summary was asked for (a legacy one does not).
                 checkpoint.update(status="paused", elapsedSeconds=self._elapsed_seconds(),
-                                  goalThreadId=self.state.get("goalThreadId", ""), error=error)
+                                  goalThreadId=self.state.get("goalThreadId", ""), error=error,
+                                  criticFeedbackPending=critic_feedback, summaryRequested=False)
                 if not paused:
                     checkpoint.update(pauseCause="error", autoResumeAt=0)
                 self._configure_auto_resume(checkpoint)
                 self._save_pause(checkpoint)
                 self.state.update(phase="paused", error=error, activeNode=checkpoint["node"], stage=checkpoint["stage"], finishedAt="")
+                self._time_limit_reached_locked(checkpoint)
             elif final:
                 # A complete terminal record is durable and wins even when Stop
                 # killed the child before it closed stdout cleanly.
@@ -3520,6 +5454,8 @@ class App:
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
             self._save_job_settings(self.state)
+            # The author stopped running with this runner: its open question closes (unless a restart paused it).
+            self._author_question_locked()
 
 
     def clear_trace(self):
@@ -3528,6 +5464,9 @@ class App:
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Wait for the current model request to finish.")
+            if self.has_active_worker():
+                raise ValueError("The author is replying. Stop the reply first." if self._conversation_running_locked()
+                                 else "Wait for the current model request to finish.")
             self.state["trace"] = []
             self.state["traceVersion"] = 0
             self.pinned = []
@@ -3538,6 +5477,7 @@ class App:
         """Immediately stop the running CLI and all of its descendants."""
 
         with self.lock:
+            self._check_owned_here()
             if self.state["phase"] == "stopping" or (
                 self.state["phase"] == "done"
                 and self.state["error"] == "Stopped."
@@ -3571,14 +5511,22 @@ class App:
                 autoResumeAt=0,
                 stoppedStage=self.state["stage"],
             )
-            (self.run_dir / PAUSE_REQUEST_FILENAME).unlink(missing_ok=True)
-            (self.run_dir / PAUSE_FILENAME).unlink(missing_ok=True)
             process, self.state["phase"] = self.process, "stopping"
-            self._save_job_settings(self.state)
+            # A full disk or a planted entry must not leave the runner working after Stop.
+            try:
+                self._clear_pause_request()
+                for path in (controller_directory(self.run_dir) / PAUSE_FILENAME, self.run_dir / PAUSE_FILENAME):
+                    path.unlink(missing_ok=True)
+                self._save_job_settings(self.state)
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass
         stop_process_tree(process)
         with self.lock:
             # Real jobs stay non-continuable until their reader has drained all
-            # buffered output. Synthetic/no-worker callers can settle here.
+            # buffered output. Synthetic/no-worker callers, and jobs whose reader
+            # ended without settling, settle here.
+            if self.state["phase"] == "stopping" and self._reader_gone_locked():
+                self.worker_token = None
             if self.state["phase"] == "stopping" and self.worker_token is None:
                 self._finish_stopped_locked(
                     self.active_token,
@@ -3586,38 +5534,45 @@ class App:
                 )
 
     def set_author_time_limit(self, hours):
-        """Replace a running or paused author's total-workflow deadline."""
+        """Replace the total-workflow time limit of a job with an Author stage, until it finishes.
+
+        A running author reads it again within a moment; during the critic or
+        LaTeX steps it applies at the author's next step; before launch, at
+        launch; while pausing or paused, at Resume. It never schedules an
+        automatic resume: a paused job continues only when the user resumes it.
+        """
 
         try:
             hours = float(hours)
         except (TypeError, ValueError) as exc:
             raise ValueError("The total time limit must be a number of hours.") from exc
-        if not math.isfinite(hours) or not 0 <= hours <= MAX_THINKING_HOURS:
-            raise ValueError(
-                f"Set 0 for unlimited, or a total time limit at most "
-                f"{MAX_THINKING_HOURS} hours."
-            )
+        if not math.isfinite(hours) or hours < 0:
+            raise ValueError("Set 0 for unlimited, or a positive number of hours.")
         with self.lock:
-            if not (
-                self.state["phase"] in {"running", "paused"}
-                and self.state["activeNode"] == "author"
-                and self.state["stage"] in {"solve", "repair"}
-            ):
-                raise ValueError(
-                    "The total time limit can only be changed while the proof "
-                    "author is running or paused."
-                )
-            if self.state["phase"] == "running" and (self.process is None or self.process.poll() is not None):
+            self._check_owned_here()
+            phase = self.state["phase"]
+            if not (saved_workflow_stages(self.state)["author"] and phase in TIME_LIMIT_PHASES):
+                raise ValueError("The time limit can be changed until the job finishes, when the job has an "
+                                 "Author stage.")
+            if phase == "running" and (self.process is None or self.process.poll() is not None):
                 raise ValueError("The proof author is no longer running.")
             hours = round(hours, 10)
             self._write_author_limit(hours)
             self.state["thinkingHours"] = hours
             self._save_job_settings(self.state)
+            elapsed = self._elapsed_seconds()
+            text = ("The workflow has no configured time limit." if hours == 0
+                    else f"The total workflow time limit is now {hours_text(hours)}.")
+            if phase in {"running", "pausing"} and 0 < hours * 3600 <= elapsed:
+                text += (f" That is at or below the {span_text(elapsed)} of active work so far: the proof author "
+                         "stops at its next step and writes a progress summary; the critic and LaTeX steps still "
+                         "finish.")
+            elif phase == "paused" and 0 < hours * 3600 < elapsed + RESUME_MARGIN_SECONDS:
+                text += f" Raise it above the {span_text(elapsed)} of active work so far, or set 0, to resume."
+            # The critic or LaTeX step that runs now stays the active node.
             self.add_trace({
-                "kind": "status", "stage": self.state["stage"], "node": "author",
-                "label": "Total time limit set",
-                "text": "The workflow has no configured time limit." if hours == 0 else f"The total workflow time limit is now {hours:g} hours.",
-                "authorLimitHours": hours,
+                "kind": "status", "stage": self.state["stage"], "node": self.state["activeNode"] or "author",
+                "label": "Total time limit set", "text": text, "authorLimitHours": hours,
             })
             return hours
 
@@ -3635,24 +5590,876 @@ class App:
                 f"{runtime.AUTHOR_STEER_MAX_CHARS} characters."
             )
         with self.lock:
-            if not (
-                self.state["phase"] == "running"
-                and self.state["activeNode"] == "author"
-                and self.state["stage"] in {"solve", "repair"}
-            ):
+            if not self._author_running_locked():
                 raise ValueError(
                     "Live instructions can only be sent while the proof author "
                     "is running."
                 )
             if self.process is None or self.process.poll() is not None:
                 raise ValueError("The proof author is no longer running.")
-            command_id = self._write_author_steer(instruction)
-            self.add_trace({
-                "kind": "status", "stage": self.state["stage"],
-                "node": "author", "label": "Live instruction queued",
-                "text": instruction, "steerId": command_id,
-            })
+            return self._queue_live_instruction_locked(instruction)
+
+    def _author_running_locked(self):
+        return (self.state["phase"] == "running" and self.state["activeNode"] == "author"
+                and self.state["stage"] in {"solve", "repair"})
+
+    def _queue_live_instruction_locked(self, instruction, **fields):
+        """Queue a checked instruction for the running author and record it as the user's live instruction."""
+
+        command_id = self._write_author_steer(instruction)
+        self.add_trace({
+            "kind": "status", "stage": self.state["stage"],
+            "node": "author", "label": "Live instruction queued",
+            "text": instruction, "steerId": command_id, **fields,
+        })
+        return command_id
+
+    # --- The author's questions ------------------------------------------------------------------------------------
+
+    def _follow_author_question(self, record, now=None):
+        """Keep the running author's newest question to the user, and note when the turn that asked it ends.
+
+        A question replaces the open one, which closes with a note in the
+        activity log, unless it is that one again (each is delivered when it
+        starts and when it completes) or one that already closed. Its turn ends
+        at that turn's turn/completed, at the start of another turn, or when a
+        failed model call waits to retry.
+        """
+
+        if not isinstance(record, dict):
+            return
+        now = time.time() if now is None else now
+        with self.lock:
+            asked, current = author_question(record), self.state.get("authorQuestion")
+            if asked and asked["id"] not in self._closed_questions:
+                if current and current["id"] == asked["id"]:
+                    current["questions"] = asked["questions"]
+                else:
+                    if current:
+                        self._close_author_question_locked("The author's question closed: the author asked a "
+                                                           "newer question.")
+                    self.state["authorQuestion"] = {**asked, "askedAt": now, "turnEndedAt": None}
+                    self._save_question_locked()
+            elif current and current["turnEndedAt"] is None and self._ends_question_turn(record, current):
+                current["turnEndedAt"] = now
+                self._save_question_locked()
+            self._author_question_locked(now)
+
+    @staticmethod
+    def _ends_question_turn(record, question):
+        """Whether a root author record shows that the turn in which ``question`` was asked has ended."""
+
+        if record.get("stage") not in {"solve", "repair"} or record.get("root") is False or record.get("activityLabel"):
+            return False
+        label = record.get("label")
+        if record.get("kind") == "status" and isinstance(label, str) and label.endswith(runtime.RETRY_LABEL):
+            return True
+        event = record.get("event") if record.get("kind") == "codex_event" else None
+        params = event.get("params") if isinstance(event, dict) and isinstance(event.get("params"), dict) else {}
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        method = event.get("method") if isinstance(event, dict) else None
+        return ((method == "turn/completed" and (not question["turnId"] or turn.get("id") == question["turnId"]))
+                or (method == "turn/started" and bool(turn.get("id")) and turn.get("id") != question["turnId"]))
+
+    def _author_question_locked(self, now=None):
+        """The author's open question after the closing rules, or None; a question that closes stays closed.
+
+        It closes when the author stage stops running (the proof goes to the
+        critic, a pause by the user, at the time limit or after a failure, a
+        stop, the end of the job, any other step) and when the author no
+        longer waits for it: its turn has ended and AUTHOR_QUESTION_WAIT_SECONDS
+        have passed since it asked. A pause for a restart keeps it, without
+        showing it, until the author continues. The open question is shown
+        while the author runs (see snapshot).
+        """
+
+        question = self.state.get("authorQuestion")
+        if not isinstance(question, dict) or self.state.get("runningElsewhere"):
+            return None
+        now = time.time() if now is None else now
+        if not self._author_running_locked():
+            restarting = (self.state["phase"] in {"pausing", "paused"} and self.state["activeNode"] == "author"
+                          and self.run_dir is not None
+                          and read_pause_object(self.run_dir).get("pauseCause") in RESTART_PAUSE_CAUSES)
+            if restarting and question["turnEndedAt"] is None:
+                question["turnEndedAt"] = now  # The turn ends with the author's stage.
+                self._save_question_locked()
+            if not restarting:
+                self._close_author_question_locked("The author's question closed: the proof author is no longer "
+                                                   "running.")
+                return None
+        if question["turnEndedAt"] is not None and now >= question["askedAt"] + AUTHOR_QUESTION_WAIT_SECONDS:
+            self._close_author_question_locked(
+                f"The author's question closed: the step in which it asked has ended and "
+                f"{span_text(AUTHOR_QUESTION_WAIT_SECONDS)} have passed since it asked, so the author no longer "
+                "waits for an answer.")
+            return None
+        return question
+
+    def _close_author_question_locked(self, note="", label="Author question closed"):
+        """Close the open question for good and say why in the activity log (an answer says it itself)."""
+
+        question = self.state.get("authorQuestion")
+        if not question:
+            return
+        self._closed_questions.add(question["id"])
+        self.state["authorQuestion"] = None
+        self._save_question_locked()
+        if note:
+            try:
+                # Its own stage: the record says nothing about where the workflow is.
+                self.add_trace({"kind": "status", "stage": AUTHOR_QUESTION_STAGE, "label": label, "text": note,
+                                "questionId": question["id"]})
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass
+
+    def _save_question_locked(self):
+        # A failed write leaves the change in memory; the next settings save writes it.
+        if self.run_dir is not None:
+            try:
+                self._save_job_settings(self.state)
+            except (OSError, UnicodeError, TypeError, ValueError):
+                pass
+
+    def close_stale_author_question(self, now=None):
+        """Apply the closing rules now, so a question closes on time even when no page asks (server tick)."""
+
+        with self.lock:
+            self._author_question_locked(now)
+
+    def _open_question_locked(self, question_id, now=None):
+        question = self._author_question_locked(now)
+        if not question or not isinstance(question_id, str) or question["id"] != question_id:
+            raise ValueError(AUTHOR_QUESTION_CLOSED)
+        return question
+
+    def answer_author_question(self, question_id, answers, now=None):
+        """Send the answers to the author's open question as one live instruction, then close the question.
+
+        ``answers`` is [{"index": i, "answer": text}], i indexing the question's
+        questions; the empty ones are left out (see author_answer_text).
+        """
+
+        with self.lock:
+            self._check_owned_here()
+            question = self._open_question_locked(question_id, now)
+            if not self._author_running_locked():
+                raise ValueError("Answers can only be sent while the proof author is running.")
+            if self.process is None or self.process.poll() is not None:
+                raise ValueError("The proof author is no longer running.")
+            instruction = author_answer_text(question["questions"], answers)
+            if "\0" in instruction:
+                raise ValueError("The answer cannot contain NUL characters.")
+            if len(instruction) > runtime.AUTHOR_STEER_MAX_CHARS:
+                raise ValueError(f"The answer is too long to send: with the question it answers it has "
+                                 f"{len(instruction):,} characters, and a live instruction holds at most "
+                                 f"{runtime.AUTHOR_STEER_MAX_CHARS:,}. Shorten it.")
+            command_id = self._queue_live_instruction_locked(instruction, questionId=question["id"])
+            self._close_author_question_locked()
             return command_id
+
+    def dismiss_author_question(self, question_id, now=None):
+        """Close the author's open question without sending anything; the author keeps working."""
+
+        with self.lock:
+            self._check_owned_here()
+            self._open_question_locked(question_id, now)
+            self._close_author_question_locked("Nothing was sent to the author; it keeps working without an answer.",
+                                               label="Author question dismissed")
+
+    @staticmethod
+    def _public_question(question):
+        """The open question as the job page shows it."""
+
+        return {"id": question["id"], "askedAt": question["askedAt"], "turnId": question["turnId"],
+                "questions": [{"title": entry["title"], "options": list(entry["options"])}
+                              for entry in question["questions"]],
+                "turnEnded": question["turnEndedAt"] is not None,
+                "closesAt": question["askedAt"] + AUTHOR_QUESTION_WAIT_SECONDS}
+
+    def dismiss_convention_warning(self, identity=None):
+        """Ignore the convention critic's loophole warning; a later round's new warning shows again.
+
+        ``identity`` is the time of the warning the page showed: a newer one
+        that replaced it meanwhile is not ignored by that click.
+        """
+
+        with self.lock:
+            self._check_owned_here()
+            warning = self.state.get("conventionWarning")
+            if not isinstance(warning, dict) or warning.get("dismissed"):
+                raise ValueError("There is no loophole warning to ignore.")
+            if identity is not None and identity != warning.get("time"):
+                raise ValueError("A newer loophole warning replaced the one you ignored; it is shown now.")
+            self.state["conventionWarning"] = {**warning, "dismissed": True}
+            self._save_job_settings(self.state)
+
+    # --- Time limit ----------------------------------------------------------------------------------------------
+
+    def _time_limit_exhausted_locked(self, elapsed=None):
+        """Whether a paused author's time limit is used up: less than RESUME_MARGIN_SECONDS of it is left."""
+
+        state = self.state
+        try:
+            hours = float(state.get("thinkingHours") or 0)
+            author = saved_workflow_stages(state)["author"]
+        except (TypeError, ValueError):
+            return False
+        if not (state["phase"] == "paused" and author and state.get("activeNode") == "author" and hours > 0):
+            return False
+        elapsed = self._elapsed_seconds() if elapsed is None else elapsed
+        return hours * 3600 - elapsed < RESUME_MARGIN_SECONDS
+
+    def resume_refusal(self):
+        """Why Resume must wait, or "": a reply being written, or a time limit that is used up."""
+
+        with self.lock:
+            if self._conversation_busy_locked():
+                return CONVERSATION_BUSY
+            elapsed = self._elapsed_seconds()
+            if self._time_limit_exhausted_locked(elapsed):
+                return (f"The time limit is used up ({span_text(elapsed)} of {hours_text(self.state['thinkingHours'])}). "
+                        "Raise it, or set 0 for no limit, then resume.")
+            return ""
+
+    def _time_limit_reached_locked(self, checkpoint):
+        """Record a new time-limit pause and ask the author for its progress summary (once per pause).
+
+        Nothing starts here: the server's retry loop (or the terminal) starts the reply.
+        """
+
+        if checkpoint.get("pauseCause") != "time-limit" or checkpoint.get("summaryRequested") is True:
+            return
+        hours = float(self.state.get("thinkingHours") or 0)
+        elapsed = saved_seconds(checkpoint.get("elapsedSeconds"), 0.0)
+        self.add_trace({"kind": "status", "stage": checkpoint.get("stage") or "solve", "node": "author",
+                        "label": "Time limit reached", "elapsedSeconds": elapsed, "authorLimitHours": hours,
+                        "text": f"The proof author reached the time limit of {hours_text(hours)} after "
+                                f"{span_text(elapsed)} of active work and is paused."})
+        if not self._conversation_problem_locked() and not self._conversation_busy_locked():
+            self._queue_conversation_locked("summary", "", "time-limit")
+        checkpoint["summaryRequested"] = True
+        self._save_pause(checkpoint)
+
+    # --- Talking to a paused author --------------------------------------------------------------------------------
+
+    def _conversation_busy_locked(self):
+        return any(item["status"] in {"queued", "running"} for item in self._conversation)
+
+    def _conversation_running_locked(self):
+        return any(item["status"] == "running" for item in self._conversation)
+
+    def conversation_busy(self):
+        """Whether a summary or reply of the paused author is queued or being written."""
+
+        with self.lock:
+            return self._conversation_busy_locked()
+
+    def _conversation_copies_locked(self):
+        return [{**item, "notice": list(item.get("notice") or []),
+                 **({"retry": dict(item["retry"])} if isinstance(item.get("retry"), dict) else {})}
+                for item in self._conversation]
+
+    def _conversation_item_locked(self, identity):
+        return next((item for item in self._conversation if item["id"] == identity), None)
+
+    def _conversation_problem_locked(self):
+        """Why the paused author cannot be asked now, or "" when it can."""
+
+        state = self.state
+        try:
+            author = saved_workflow_stages(state)["author"]
+        except ValueError:
+            author = False
+        if not (state["phase"] == "paused" and author and state.get("activeNode") == "author"
+                and state.get("stage") in {"solve", "repair"}):
+            return "Talking to the author is available while the run is paused at the proof author."
+        if not state.get("goalThreadId"):
+            return "The author has not started its conversation yet."
+        if state.get("sessionUnavailable"):
+            return "The saved author conversation is no longer available."
+        if state.get("safetyStop"):
+            return "The author was stopped for safety; check the setup, then resume."
+        if state.get("launchHold"):
+            return f"Prepared run is held: {state['launchHold']}"
+        if state.get("runningElsewhere"):
+            return state["runningElsewhere"]
+        return ""
+
+    def _save_conversation_locked(self):
+        """Save the conversation in the controller folder only (the author cannot change it)."""
+
+        if self.run_dir is None:
+            return
+        items = [{key: value for key, value in item.items() if key != "retry"} for item in self._conversation]
+        try:
+            self._save_controlled(CONVERSATION_FILENAME, json.dumps({"schemaVersion": 1, "items": items},
+                                                                    ensure_ascii=False, indent=2) + "\n",
+                                  run_copy=False)
+        except (OSError, UnicodeError, ValueError) as exc:
+            try:
+                self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                                "text": f"The author conversation could not be saved ({exc}); it is kept here and "
+                                        "saved with its next change."})
+            except OSError:
+                pass
+
+    def _load_conversation(self):
+        """The saved conversation items (valid ones, oldest first); none when the file is missing or damaged."""
+
+        try:
+            value = json.loads((controller_directory(self.run_dir) / CONVERSATION_FILENAME).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, RecursionError, TypeError):
+            return []
+        return saved_conversation_items(value)
+
+    def _queue_conversation_locked(self, kind, text, origin):
+        """Queue one summary or message for the paused author; the retry loop starts it."""
+
+        item = {"id": "c_" + secrets.token_hex(5), "kind": kind, "origin": origin, "text": text, "status": "queued",
+                "createdAt": datetime.now(timezone.utc).isoformat(), "dueAt": 0, "startedAt": "", "finishedAt": "",
+                "attempts": 0, "reply": "", "error": "", "notice": [], "compacted": False}
+        self._conversation.append(item)
+        self._save_conversation_locked()
+        summary = kind == "summary"
+        self.add_trace({"kind": "status", "stage": "conversation", "node": "author", "conversationId": item["id"],
+                        "label": "Progress summary queued" if summary else "Message for the paused author queued",
+                        "text": "The author is asked for a progress summary." if summary else text})
+        return item
+
+    def _check_can_talk_locked(self):
+        self._check_owned_here()
+        problem = self._conversation_problem_locked()
+        if problem:
+            raise ValueError(problem)
+        if self._conversation_busy_locked():
+            raise ValueError(CONVERSATION_BUSY)
+
+    def ask_author(self, text):
+        """Queue one message for the paused author, which answers in its saved conversation."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Enter a message for the author.")
+        text = text.strip()
+        if "\0" in text:
+            raise ValueError("The message cannot contain NUL characters.")
+        if len(text) > MAX_CONVERSATION_CHARS:
+            raise ValueError(f"Keep the message at or below {MAX_CONVERSATION_CHARS:,} characters.")
+        with self.lock:
+            self._check_can_talk_locked()
+            return self._queue_conversation_locked("message", text, "user")
+
+    def request_author_summary(self):
+        """Ask the paused author for a progress summary."""
+
+        with self.lock:
+            self._check_can_talk_locked()
+            return self._queue_conversation_locked("summary", "", "user")
+
+    def stop_author_reply(self, identity=None):
+        """Cancel the queued or running reply (``identity``: the one the page shows); the job stays paused."""
+
+        identity = identity or None
+        with self.lock:
+            self._check_owned_here()
+            item = next((item for item in self._conversation if item["status"] in {"queued", "running"}), None)
+            if item is None:
+                raise ValueError("No author reply is being written.")
+            if identity is not None and identity != item["id"]:
+                raise ValueError("That reply has already finished.")
+            running = item["status"] == "running"
+            item.update(status="stopped", finishedAt=datetime.now(timezone.utc).isoformat())
+            item.pop("retry", None)
+            self._save_conversation_locked()
+            self.add_trace({"kind": "status", "stage": "conversation", "node": "author", "conversationId": item["id"],
+                            "label": "Author reply stopped", "text": "The reply was stopped; the job stays paused."})
+            process = None
+            if running:
+                # Its reader sees that it no longer owns the job, and only saves.
+                process, self.process, self.active_token = self.process, None, None
+        if process is not None:
+            threading.Thread(target=stop_process_tree, args=(process,), daemon=True).start()
+        else:
+            self._settle_run_claim()
+        return item
+
+    @staticmethod
+    def _reply_failed_before(item):
+        """Whether a queued or running reply already failed once (it waits for, or is in, a retry)."""
+
+        return (item.get("attempts") or 0) >= 1 and bool(item.get("error") or item.get("retry"))
+
+    def _stop_failing_reply_locked(self, item):
+        """Stop a reply that keeps failing so that the run's own automatic retry can go on."""
+
+        running = item["status"] == "running"
+        item.update(status="stopped", finishedAt=datetime.now(timezone.utc).isoformat(),
+                    error="Stopped so that the run could resume by itself; ask again when it pauses.")
+        item.pop("retry", None)
+        self._save_conversation_locked()
+        self.add_trace({"kind": "status", "stage": "conversation", "node": "author", "conversationId": item["id"],
+                        "label": "Author reply stopped",
+                        "text": "The reply kept failing and was stopped so that the run could resume by itself; "
+                                "ask again when it pauses."})
+        if running:
+            # Its reader sees that it no longer owns the job, and only saves.
+            process, self.process, self.active_token = self.process, None, None
+            threading.Thread(target=stop_process_tree, args=(process,), daemon=True).start()
+
+    def _finish_conversation_locked(self, item, status, error=""):
+        item.update(status=status, error=error, finishedAt=datetime.now(timezone.utc).isoformat())
+        item.pop("retry", None)
+        self._save_conversation_locked()
+        self._settle_run_claim()  # Nothing more may start this run's runner by itself.
+
+    def _delay_conversation_locked(self, item, now, error):
+        """Try a queued reply again after the usual wait (a CLI updating, a launch that failed)."""
+
+        item.update(dueAt=now + AUTO_RESUME_SECONDS, error=error)
+        self._save_conversation_locked()
+        return True
+
+    def defer_conversation(self, problem, now=None):
+        """Report a due reply whose start failed unexpectedly; it is tried again after the usual wait."""
+
+        now = time.time() if now is None else now
+        with self.lock:
+            item = next((item for item in self._conversation if item["status"] == "queued"), None)
+            if item is None:
+                return
+            self._delay_conversation_locked(item, now, f"Could not start the reply: {str(problem).rstrip('.')}. "
+                                                       f"It is tried again in {retry_interval_text()}.")
+            try:
+                self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                                "conversationId": item["id"],
+                                "text": f"The author's reply could not start ({problem}). Trying again in "
+                                        f"{retry_interval_text()}."})
+            except OSError:
+                pass
+
+    def _conversation_options_locked(self):
+        """The runner options of one conversation turn: no time limit, steering, pause file or prompt files."""
+
+        historical = bool(self.state.get("retrievalPolicyPath") or self.state.get("retrievalMode") == "historical")
+        options = [
+            "--converse",
+            "--author-model", self.state["authorModel"], "--author-effort", self.state["authorEffort"],
+            "--reasoning-effort", self.state["reasoningEffort"],
+            "--reasoning-summary", self.state["reasoningSummary"], "--speed", self.state["speedMode"],
+            "--thinking-hours", "0",
+            "--set", "workflow_stages=" + json.dumps(CONVERSATION_STAGES, separators=(",", ":")),
+            "--set", "goal_thread_id=" + json.dumps(self.state["goalThreadId"]),
+            "--set", "goal_cwd=" + json.dumps(self.state.get("goalWorkspace") or str(self.run_dir)),
+            "--set", "goal_require_resume=true",
+            "--set", "run_tmp_dir=" + json.dumps(str(self._controller_directory() / RUN_TMP_FOLDER)),
+        ]
+        if not historical:
+            options.extend(["--set", "goal_stderr_log=" + json.dumps(str(self.run_dir / AUTHOR_STDERR_FILENAME))])
+        return options
+
+    def start_conversation_if_due(self, now=None, check=None):
+        """Start the first queued reply of a paused author once it is due; return whether anything changed.
+
+        ``check()`` raises ValueError while another job works in this author's
+        workspace. A reply runs outside the time budget, in its own runner
+        (workflow_runner.py --converse), and never changes the phase or the
+        pause checkpoint.
+        """
+
+        now = time.time() if now is None else now
+        with self.lock:
+            if self.state["phase"] != "paused" or self.has_active_worker() or self.state.get("runningElsewhere"):
+                return False
+            item = next((item for item in self._conversation if item["status"] == "queued"), None)
+            if item is None or (item.get("dueAt") or 0) > now:
+                return False
+            resume_due = 0 < (self.state.get("autoResumeAt") or 0) <= now
+            if resume_due and self._reply_failed_before(item):
+                return False  # auto_resume_if_due stops it and resumes the run; no relaunch first.
+            problem = self._conversation_problem_locked()
+            if not problem and check is not None:
+                try:
+                    check()
+                except ValueError:
+                    problem = "Another job is working in this author workspace. Stop it, then ask again."
+            if problem:
+                self._finish_conversation_locked(item, "failed", problem)
+                return True
+            try:
+                self._check_launch_models_locked(roles=("author",))
+            except TransientLaunchError as exc:
+                return self._delay_conversation_locked(item, now, str(exc))
+            except ValueError as exc:
+                self._finish_conversation_locked(item, "failed", str(exc))
+                return True
+            try:
+                self._check_historical_locked()
+            except retrieval.PreflightRetry as exc:
+                return self._delay_conversation_locked(item, now, str(exc))
+            except ValueError as exc:
+                self._finish_conversation_locked(item, "failed", str(exc))
+                return True
+            # Related works added while paused are announced in front of this turn, exactly once.
+            pending = list(self.state.get("relatedWorksPending") or [])
+            request = {"schemaVersion": 1, "id": item["id"], "kind": item["kind"],
+                       "text": item["text"] if item["kind"] == "message" else "",
+                       "notice": related_works.notice_text(pending) if pending else ""}
+            policy_path = self.state.get("retrievalPolicyPath")
+            if policy_path and not item.get("audited"):
+                # A web-cutoff author receives nothing unrecorded: the cutoff audit lists what the user sent.
+                try:
+                    retrieval_runtime.controller_audit(
+                        retrieval_runtime.load_policy(policy_path), "author_message_sent",
+                        conversationId=item["id"], conversationKind=item["kind"], text=request["text"],
+                        textSha256=hashlib.sha256(request["text"].encode("utf-8")).hexdigest(),
+                        textChars=len(request["text"]), notice=request["notice"])
+                except Exception as exc:  # noqa: BLE001 - any audit failure keeps the message unsent.
+                    return self._delay_conversation_locked(
+                        item, now, f"Could not record the message in the cutoff audit: {str(exc).rstrip('.')}. "
+                                   f"It is tried again in {retry_interval_text()}.")
+                item["audited"] = True
+            try:
+                process, token = self._spawn_runner_locked(["author_critic.yaml"], json.dumps(request),
+                                                           self._conversation_options_locked())
+            except (OSError, ValueError, RuntimeError) as exc:
+                return self._delay_conversation_locked(
+                    item, now, f"Could not start the reply: {str(exc).rstrip('.') or type(exc).__name__}. "
+                               f"It is tried again in {retry_interval_text()}.")
+            item.update(status="running", startedAt=datetime.now(timezone.utc).isoformat(), error="",
+                        attempts=int(item.get("attempts") or 0) + 1, notice=pending)
+            item.pop("retry", None)
+            self._save_conversation_locked()
+            try:
+                self._spawn_worker(self._read_conversation_output, (process, token, item["id"]), token)
+            except Exception as exc:
+                if self.process is process:
+                    self.process = None
+                if self.active_token is token:
+                    self.active_token = None
+                threading.Thread(target=stop_process_tree, args=(process,), daemon=True).start()
+                item.update(status="queued", notice=[])
+                return self._delay_conversation_locked(
+                    item, now, f"Could not start the reply: {exc}. It is tried again in {retry_interval_text()}.")
+            return True
+
+    def _read_conversation_output(self, process, token, item_id):
+        """Keep one conversation runner's records, then settle its item: answered, failed or queued again."""
+
+        reply, compacted, failure, problem, code = None, False, "", "", None
+        try:
+            for line in process.stdout:
+                if self.output_stream is not None:
+                    try:
+                        self.output_stream.write(line)
+                        self.output_stream.flush()
+                    except (OSError, UnicodeError):
+                        self.output_stream = None
+                try:
+                    record = self.parse_line(line, "conversation")
+                    # Every record of a reply belongs to the conversation (a restart skips them).
+                    record["stage"] = "conversation"
+                    record.setdefault("node", "author")
+                    record["conversationId"] = item_id
+                    self.add_trace(record)
+                    kind, label = record.get("kind"), record.get("label")
+                    if kind == "status" and isinstance(label, str) and label.endswith(runtime.RETRY_LABEL):
+                        retry_at = record.get("retryAt")
+                        with self.lock:
+                            item = self._conversation_item_locked(item_id)
+                            if item is not None and item["status"] == "running":
+                                if finite_seconds(retry_at):
+                                    item["retry"] = {"text": str(record.get("text") or ""), "retryAt": float(retry_at)}
+                                else:
+                                    item.pop("retry", None)
+                    elif kind == "request":
+                        with self.lock:
+                            item = self._conversation_item_locked(item_id)
+                            if item is not None:
+                                item.pop("retry", None)  # The next attempt has started.
+                    elif kind == "conversation_reply" and isinstance(record.get("text"), str) and record["text"].strip():
+                        reply, compacted = record["text"], record.get("compacted") is True
+                    elif kind == "status" and label == "Author reply failed" and record.get("final") is True:
+                        failure = str(record.get("text") or "").strip() or "The author's reply failed."
+                    elif kind == "diagnostic" and str(record.get("text") or "").startswith("error: "):
+                        problem = str(record["text"])[7:].strip()
+                except Exception as exc:  # One record that cannot be handled never stops the reply.
+                    try:
+                        self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                                        "conversationId": item_id,
+                                        "text": f"A reply event could not be handled ({type(exc).__name__}: {exc})."})
+                    except Exception:
+                        pass
+            code = reap_runner(process)
+        except Exception:
+            # Its output can no longer be read: end it; the item is asked again.
+            try:
+                stop_process_tree(process)
+                code = process.poll()
+            except Exception:
+                pass
+        with self.lock:
+            if self.process is process:
+                self.process = None
+            cancelled = self.active_token is not token
+            if self.active_token is token:
+                self.active_token = None
+            if self.worker_token is token:
+                self.worker_token = None
+            item = self._conversation_item_locked(item_id)
+            if not cancelled and item is not None and item["status"] == "running":
+                item.pop("retry", None)
+                if reply is not None:
+                    item.update(status="answered", reply=reply, compacted=compacted, error="",
+                                finishedAt=datetime.now(timezone.utc).isoformat())
+                    self._conversation_answered_locked(item)
+                elif failure or problem:
+                    self._finish_conversation_locked(item, "failed", failure or problem)
+                else:
+                    item.update(status="queued", dueAt=time.time() + AUTO_RESUME_SECONDS,
+                                error=f"The reply was interrupted (exit code {code}); it is requested again in "
+                                      f"{retry_interval_text()}.")
+            self._save_conversation_locked()
+        self._settle_run_claim()
+
+    def _conversation_answered_locked(self, item):
+        """Keep what an answered turn changed: the newest summary, a compacted context, delivered notices."""
+
+        historical = bool(self.state.get("retrievalPolicyPath") or self.state.get("retrievalMode") == "historical")
+        if item["kind"] == "summary" and not historical:
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            try:
+                self._save(PROGRESS_SUMMARY_FILENAME, f"# Progress summary ({stamp})\n\n{item['reply']}\n")
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                                "conversationId": item["id"],
+                                "text": f"{PROGRESS_SUMMARY_FILENAME} could not be saved ({exc}); the summary is "
+                                        "shown on the job page."})
+        if item.get("compacted"):
+            # The next Resume sends the full resume prompt instead of the short reopen one.
+            self.state["pendingReanchor"] = True
+        delivered = set(item.get("notice") or [])
+        if delivered:
+            self.state["relatedWorksPending"] = [name for name in self.state.get("relatedWorksPending") or []
+                                                 if name not in delivered]
+        try:
+            self._save_job_settings(self.state)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            pass  # Kept in memory; saved with the next change.
+
+    def _restore_conversation(self, checkpoint, *, owned=True):
+        """Load the saved conversation after a restart (see restore_saved_app).
+
+        A paused job asks again for a reply the restart interrupted, and for the
+        automatic summary of a time-limit pause that never asked for it; any
+        other job's unfinished items end as stopped.
+        """
+
+        self._conversation = self._load_conversation()
+        if not owned:
+            return  # Another process owns the run: nothing in it is written.
+        paused = self.state["phase"] == "paused"
+        changed = False
+        for item in self._conversation:
+            if item["status"] == "running" and paused:
+                item.update(status="queued", dueAt=0)
+                changed = True
+                try:
+                    self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                                    "conversationId": item["id"],
+                                    "text": "The author's reply was interrupted by a restart; it is requested again."})
+                except OSError:
+                    pass
+            elif item["status"] in {"queued", "running"} and not paused:
+                item.update(status="stopped", finishedAt=item.get("finishedAt") or datetime.now(timezone.utc).isoformat())
+                changed = True
+        if changed:
+            self._save_conversation_locked()
+        # Absent means a pause saved before automatic summaries existed: it gets none.
+        if (paused and checkpoint.get("pauseCause") == "time-limit" and "summaryRequested" in checkpoint
+                and checkpoint.get("summaryRequested") is not True):
+            try:
+                # Records "Time limit reached" too, which a pause cut short by a restart never got.
+                self._time_limit_reached_locked(checkpoint)
+            except OSError:
+                if not self._conversation_problem_locked() and not self._conversation_busy_locked():
+                    self._queue_conversation_locked("summary", "", "time-limit")
+                checkpoint["summaryRequested"] = True
+
+    # --- Related works -------------------------------------------------------------------------------------------
+
+    def _author_workspace(self):
+        """The author's workspace, which holds related-works/: its saved workspace, else the run folder."""
+
+        return Path(self.state.get("goalWorkspace") or self.run_dir).resolve()
+
+    def related_works_problem(self):
+        """Why related works cannot be added to this job now, or "" when they can."""
+
+        with self.lock:
+            state = self.state
+            try:
+                author = saved_workflow_stages(state)["author"]
+            except ValueError:
+                author = False
+            if not author:
+                return "Related works are read by the proof author; this job has no Author stage."
+            if state.get("runningElsewhere"):
+                return state["runningElsewhere"]
+            if state.get("readOnly"):
+                return str(state.get("readOnlyReason") or "This saved job is read-only.")
+            if self.run_dir is None or state["phase"] not in RELATED_WORKS_PHASES:
+                return "This job has finished; continue it to add related works."
+            return ""
+
+    @staticmethod
+    def _related_works_audit(policy_path):
+        """record(entries) for an install into a web-cutoff run: its audit log lists what the user supplied.
+
+        Raising undoes the install, so nothing is added unrecorded.
+        """
+
+        if not policy_path:
+            return None
+
+        def record(entries):
+            policy = retrieval_runtime.load_policy(policy_path)
+            retrieval_runtime.controller_audit(policy, "related_works_added",
+                                               relatedWorks=[related_works.audit_fields(entry) for entry in entries])
+
+        return record
+
+    def _queue_related_works_notice_locked(self, names):
+        """Tell the author about new related works through its live-instruction queue."""
+
+        text = related_works.notice_text(names)
+        steer_id = self._write_author_steer(text)
+        self.add_trace({"kind": "status", "stage": self.state.get("stage") or "solve",
+                        "node": self.state.get("activeNode") or "author", "label": "Live instruction queued",
+                        "text": text, "steerId": steer_id, "relatedWorks": list(names)})
+
+    def _announce_related_works_locked(self, names):
+        """The notice rule: running or pausing, a live instruction now; paused, with the next message or at
+        Resume; before the first launch, nothing (the first prompt points to the folder)."""
+
+        if not names:
+            return ""
+        phase = self.state["phase"]
+        if phase in {"running", "pausing"}:
+            try:
+                self._queue_related_works_notice_locked(names)
+                return "instruction"
+            except (OSError, UnicodeError, TypeError, ValueError) as exc:
+                self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE,
+                                "text": f"The author could not be told about the new related works now ({exc}); "
+                                        "it is told with the next message to the paused author or when the run "
+                                        "resumes."})
+        elif phase != "paused":
+            return ""
+        self.state["relatedWorksPending"] = [*(self.state.get("relatedWorksPending") or []),
+                                             *(name for name in names
+                                               if name not in (self.state.get("relatedWorksPending") or []))]
+        self._save_job_settings(self.state)
+        return "pending"
+
+    def add_related_works(self, tokens, stage=None):
+        """Add staged uploads to this job's related works and tell its author per the notice rule."""
+
+        tokens = related_works_tokens(tokens)
+        stage = stage or staged_uploads(self.runs)
+        with self.lock:
+            self._check_owned_here()
+            problem = self.related_works_problem()
+            if problem:
+                raise ValueError(problem)
+            workspace = self._author_workspace()
+        with related_works.workspace_lock(workspace), self.lock:
+            problem = self.related_works_problem()
+            if problem:
+                raise ValueError(problem)
+            entries = related_works.install(workspace, controller_directory(workspace), tokens, stage,
+                                            run_id=self.run_dir.name,
+                                            record=self._related_works_audit(self.state.get("retrievalPolicyPath")))
+            if entries:
+                self.add_trace(related_works_record(entries))
+                self._announce_related_works_locked([entry["name"] for entry in entries])
+        return entries
+
+    def link_batch_related_works(self, store, names, workspace_run=None):
+        """Link new items of this job's folder batch into its workspace; {"entries", "diagnostic"}.
+
+        ``workspace_run`` names the run recorded as adding them (the job that owns a shared workspace).
+        """
+
+        with self.lock:
+            workspace = self._author_workspace()
+            policy = self.state.get("retrievalPolicyPath")
+            run_id = workspace_run or self.run_dir.name
+        return store.link_into(workspace, controller_directory(workspace), run_id=run_id, names=names,
+                               record=self._related_works_audit(policy))
+
+    def batch_related_works_linked(self, batch, entries, diagnostic):
+        """Record items of the folder batch linked into this job's workspace, and tell its author."""
+
+        with self.lock:
+            if entries:
+                self.add_trace(related_works_record(entries, batch=batch))
+            if diagnostic:
+                self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "folderBatch": batch,
+                                "text": diagnostic})
+            return self._announce_related_works_locked([entry["name"] for entry in entries])
+
+    def _install_new_related_works_locked(self, tokens, folder_batch, workspace, policy_path, copy_from=""):
+        """Put a new job's related works in its workspace before anything runs.
+
+        Returns [(entries, batch ID or ""), ...] and a diagnostic, for the
+        records added once the job's state exists (_record_new_related_works_locked).
+        """
+
+        workspace = Path(workspace).resolve()
+        manifest = controller_directory(workspace)
+        record = self._related_works_audit(policy_path)
+        store = folder_batch_store(self.runs, folder_batch) if folder_batch else None
+        added, diagnostic = [], ""
+        if copy_from:
+            # "Retry statement review": the new run gets the source's related works (batch ones linked again).
+            source = Path(copy_from).resolve()
+            saved = saved_goal_workspace(source)
+            source_workspace = Path(saved).resolve() if saved else source
+            copied = []
+
+            def keep(entries):
+                if record is not None:
+                    record(entries)
+                copied.extend(entries)
+
+            related_works.copy_into(source_workspace, controller_directory(source_workspace), workspace, manifest,
+                                    run_id=self.run_dir.name, batch=store, record=keep)
+            added.append((copied, ""))
+        if tokens:
+            added.append((related_works.install(workspace, manifest, tokens, staged_uploads(self.runs),
+                                                run_id=self.run_dir.name, keep_staged=True, record=record), ""))
+        if store is not None:
+            outcome = store.link_into(workspace, manifest, run_id=self.run_dir.name, record=record)
+            added.append((outcome["entries"], folder_batch))
+            diagnostic = outcome["diagnostic"]
+        return [(entries, batch) for entries, batch in added if entries], diagnostic
+
+    @staticmethod
+    def _new_related_works_tokens(value, stages):
+        """The upload tokens a new job attaches ([] for none); only a job with an Author stage takes them."""
+
+        if value is None or value == []:
+            return []
+        tokens = related_works_tokens(value)
+        if not stages["author"]:
+            raise ValueError("Related works are read by the proof author; turn on the Author stage or remove them.")
+        return tokens
+
+    def _record_new_related_works_locked(self, added, diagnostic):
+        for entries, batch in added:
+            self.add_trace(related_works_record(entries, batch=batch))
+        if diagnostic:
+            self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "text": diagnostic})
 
     def reset(self):
         """Return to the first screen when no child is active."""
@@ -3662,6 +6469,12 @@ class App:
         with self.lock:
             if self.state["phase"] in {"reviewing", "running", "stopping", "pausing"}:
                 raise ValueError("Stop the current work first.")
+            if self.has_active_worker():
+                raise ValueError("The author is replying. Stop the reply first." if self._conversation_running_locked()
+                                 else "Wait for the current model request to finish.")
+            queued = [item for item in self._conversation if item["status"] == "queued"]
+            for item in queued:
+                self._finish_conversation_locked(item, "stopped")
             trace, version = self.state["trace"], self.state["traceVersion"]
             self.state = empty_state(trace, version)
             self.state["runId"] = self.run_dir.name if self.run_dir else ""
@@ -3720,7 +6533,7 @@ def _joins_instructions(value, instructions):
 
 
 def saved_author_instructions(run_dir):
-    """Return bounded, deduplicated user steering from a stopped author run."""
+    """Return all deduplicated user steering of a stopped author run (and the runs it continued), oldest first."""
 
     labels = {
         "Live instruction queued", "Live author instruction sent",
@@ -3759,22 +6572,30 @@ def saved_author_instructions(run_dir):
                 continue
             seen.add(key)
             instructions.append(key)
+    return instructions
 
-    selected, size = [], 0
-    for instruction in reversed(instructions):
-        additional = len(instruction) + (2 if selected else 0)
-        if size + additional > runtime.AUTHOR_STEER_MAX_CHARS:
-            continue
-        selected.append(instruction)
-        size += additional
-    return list(reversed(selected))
+
+# Model-facing: the restored block that points a continued author to its instruction history.
+RESTORED_INSTRUCTIONS_NOTE = (
+    f"Your earlier live instructions from the user are saved, oldest first, in {INSTRUCTION_HISTORY_FILENAME} "
+    "in your working directory. Read that file and keep following them; the newest ones are repeated below."
+)
+
+
+def instruction_history(instructions):
+    """The text of INSTRUCTION_HISTORY_FILENAME: every earlier live instruction, oldest first."""
+
+    parts = ["# Earlier live instructions", "The user's live instructions to the proof author, oldest first."]
+    for number, instruction in enumerate(instructions, start=1):
+        parts += [f"## {number}", instruction]
+    return "\n\n".join(parts) + "\n"
 
 
 def saved_goal_thread_id(run_dir):
     """Recover the author session ID from existing settings or public statuses."""
 
     try:
-        settings = json.loads((Path(run_dir) / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+        settings = json.loads(controlled_path(run_dir, JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         settings = {}
     if isinstance(settings, dict):
@@ -3787,12 +6608,36 @@ def saved_goal_thread_id(run_dir):
     return identity
 
 
+def saved_job_setting(run_dir, key):
+    """One value of a run's saved job settings (the controller's copy), or None."""
+
+    try:
+        settings = json.loads(controlled_path(run_dir, JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    return settings.get(key) if isinstance(settings, dict) else None
+
+
+def saved_goal_workspace(run_dir):
+    """The author workspace a run saved, or ""."""
+
+    value = saved_job_setting(run_dir, "goalWorkspace")
+    return value if isinstance(value, str) and value and "\0" not in value else ""
+
+
+def saved_folder_batch(run_dir):
+    """The folder batch whose related works a run shares, or ""."""
+
+    value = saved_job_setting(run_dir, "folderBatch")
+    return value if isinstance(value, str) and FOLDER_BATCH_ID.match(value) else ""
+
+
 def saved_goal_options(run_dir):
     """Recover generic session/workspace settings without reading author files."""
 
     run_dir = Path(run_dir).resolve()
     try:
-        settings = json.loads((run_dir / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+        settings = json.loads(controlled_path(run_dir, JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         settings = {}
     workspace = settings.get("goalWorkspace") if isinstance(settings, dict) else None
@@ -3873,25 +6718,14 @@ def saved_manual_stop(run_dir, records=None):
     return result
 
 
-def checkpoint_artifact_signature(run_dir, include_transcript=True):
+def checkpoint_artifact_signature(run_dir):
     """Return a cheap cache key for files that define durable checkpoints."""
 
     if not run_dir:
         return ()
     run_dir = Path(run_dir)
     signature = []
-    names = [
-        "checked-statement.md",
-        "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME,
-    ]
-    if critic_uses_parallel_audits():
-        names.append(runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME)
-    # The live transcript changes on every heartbeat. Candidate and audit files
-    # cover checkpoints that can appear while a job is active; scan the full
-    # transcript once the job becomes idle to discover coordinator failures.
-    if include_transcript:
-        names.append("transcript.jsonl")
-    for name in names:
+    for name in ("checked-statement.md", "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME):
         try:
             stat = (run_dir / name).stat()
             signature.append((name, stat.st_mtime_ns, stat.st_size))
@@ -3900,74 +6734,16 @@ def checkpoint_artifact_signature(run_dir, include_transcript=True):
     return tuple(signature)
 
 
-def valid_saved_audit_reports(run_dir, source):
-    """Return only audit reports the runner can actually restore."""
-
-    if not critic_uses_parallel_audits():
-        return []
-    run_dir = Path(run_dir)
-    path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        reports = value.get("reports") if isinstance(value, dict) else None
-        if (
-            not isinstance(value, dict)
-            or value.get("schemaVersion")
-            != runtime.CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION
-            or not isinstance(reports, list)
-            or len(reports) != len(runtime.CRITIC_AUDIT_FOCI)
-        ):
-            return []
-        settings = {}
-        try:
-            loaded = json.loads(
-                (run_dir / JOB_SETTINGS_FILENAME).read_text(encoding="utf-8")
-            )
-            if isinstance(loaded, dict):
-                settings = loaded
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            pass
-        model = restored_model(settings.get(
-            "criticModel", value.get("model", DEFAULT_CRITIC_MODEL),
-        ))
-        effort = settings.get(
-            "criticEffort",
-            settings.get(
-                "reasoningEffort",
-                value.get("reasoningEffort", DEFAULT_REASONING_EFFORT),
-            ),
-        )
-        model = runtime.chosen_model(model)
-        effort = runtime.chosen_effort(effort)
-        audit_effort = runtime.effective_effort(model, effort)
-        instructions = runtime.text(source["critic_prompt"])
-        if runtime.CRITIC_MEMORY_PROMPT not in instructions:
-            instructions = f"{instructions}\n\n{runtime.CRITIC_MEMORY_PROMPT}"
-        expected = runtime.critic_audit_assignment_sha256(
-            source["statement"], source["solution"], model, audit_effort,
-            instructions,
-        )
-        if value.get("assignmentSha256") != expected:
-            return []
-        for report in reports:
-            if report is not None:
-                runtime.validate_json_schema(
-                    report, runtime.CRITIC_CHECK_SCHEMA,
-                )
-        return reports
-    except (
-        OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError,
-        runtime.Error,
-    ):
-        return []
-
-
 def saved_run_checkpoints(run_dir):
-    """Describe every durable, resumable critic checkpoint in one run."""
+    """Describe every durable, resumable critic checkpoint in one run.
+
+    The saved proof candidate is the only one; every listed continuation is a
+    new run, whose critic starts afresh.
+    """
 
     run_dir = Path(run_dir)
     statement_ready = bool(
-        (run_dir / "checked-statement.md").is_file()
+        controlled_path(run_dir, "checked-statement.md").is_file()
     )
     candidate_path = next(
         (
@@ -4000,87 +6776,229 @@ def saved_run_checkpoints(run_dir):
             "resumable": True,
             "resumeLabel": "Continue at critic",
         })
-
-    if not critic_uses_parallel_audits():
-        return checkpoints
-    audit_path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
-    reports = valid_saved_audit_reports(run_dir, source) if source else []
-    completed_audits = sum(report is not None for report in reports)
-    audit_verdicts = [
-        report["verdict"] for report in reports if report is not None
-    ]
-    if source is not None and completed_audits:
-        failures = audit_verdicts.count("fail")
-        checkpoints.append({
-            "id": "independent-audits",
-            "label": f"Independent audits {completed_audits}/3",
-            "stage": "critic",
-            "status": "complete" if completed_audits == 3 else "partial",
-            "completedAt": _artifact_time(audit_path),
-            "description": (
-                f"{completed_audits} audit"
-                f"{'s are' if completed_audits != 1 else ' is'} saved"
-                + (f"; {failures} reported proof issues." if failures else ".")
-                + (
-                    " Continue with only the missing audits."
-                    if completed_audits < 3
-                    else " Continue directly to coordinator adjudication."
-                )
-            ),
-            "resumable": True,
-            "resumeLabel": (
-                "Run missing audits" if completed_audits < 3
-                else "Continue coordinator"
-            ),
-            "completedAuditCount": completed_audits,
-            "failedAuditCount": failures,
-        })
-
-    coordinator_request, coordinator_result, coordinator_error = None, None, None
-    for record in _run_records(run_dir):
-        if (
-            record.get("kind") == "request"
-            and record.get("label") == "Critic coordinator adjudication"
-        ):
-            coordinator_request = record
-            coordinator_result = coordinator_error = None
-        elif coordinator_request is not None and record.get("kind") == "critic_result":
-            coordinator_result = record
-        elif (
-            coordinator_request is not None
-            and record.get("kind") == "diagnostic"
-            and str(record.get("text", "")).startswith("error: ")
-        ):
-            coordinator_error = record
-    if (
-        source is not None
-        and completed_audits == 3 and coordinator_request is not None
-        and coordinator_result is None
-    ):
-        stopped_at = coordinator_error or coordinator_request
-        checkpoints.append({
-            "id": "critic-coordinator",
-            "label": "Critic coordinator",
-            "stage": "critic",
-            "status": "failed" if coordinator_error else "interrupted",
-            "completedAt": stopped_at.get("time", ""),
-            "description": (
-                "All three independent audits are saved. Continue the "
-                "coordinator without rerunning them."
-            ),
-            "resumable": True,
-            "resumeLabel": "Retry coordinator",
-        })
     return checkpoints
 
 
-def restore_saved_app(app):
-    """Reconstruct one idle historical job for a newly started Web UI."""
+def saved_setting_problem(key, value):
+    """Why one saved job setting cannot be used, or "" when it can; the default replaces it."""
+
+    if key == "thinkingHours":
+        try:
+            valid = finite_seconds(value) and runtime.author_hours(value) == value
+        except runtime.Error:
+            valid = False
+    elif key in {"elapsedSeconds", "queuedAt"}:
+        valid = finite_seconds(value)
+    elif key == "criticRounds":
+        try:
+            valid = runtime.critic_limit(value) == value
+        except runtime.Error:
+            valid = False
+    elif key == "criticCount":
+        try:
+            # Saved as a whole number: a launch passes it to the runner as text.
+            valid = isinstance(value, int) and valid_critic_count(value) == value
+        except ValueError:
+            valid = False
+    elif key == "authorSubagents":
+        try:
+            valid = isinstance(value, int) and valid_author_subagents(value) == value
+        except ValueError:
+            valid = False
+    elif key.endswith(("Model", "Effort")) or key in {
+            "speedMode", "reasoningSummary", "problemMode", "goalThreadId", "goalWorkspace",
+            "authorSteerDelivered", "resumedAt", "launchError"}:
+        valid = isinstance(value, str)
+    else:
+        return ""
+    return "" if valid else f"The saved {key} setting in {JOB_SETTINGS_FILENAME} is invalid; the default is used."
+
+
+def restore_record(record):
+    """The part of one transcript record that restoring needs after its single pass, or None."""
+
+    kind = record.get("kind")
+    if kind == "critic_result":
+        return {key: record.get(key) for key in ("kind", "stage", "round", "report", "time")}
+    if kind == "author_result":
+        return {key: record.get(key) for key in ("kind", "stage", "text", "time")}
+    if kind == "proof_handoff":
+        return {"kind": kind, "manifest": record.get("manifest")}
+    if kind == "status" and record.get("label") in {"Workflow step: critic", "Resume requested"}:
+        # Which critic round a restart interrupted (see interrupted_critic_visit).
+        return {key: record.get(key) for key in ("kind", "stage", "label", "node", "visit", "verify")}
+    if kind == "request":
+        return {"kind": kind, "stage": record.get("stage")}
+    if kind in {"final_result", "failure_result", "review_result"}:
+        return {"kind": kind}
+    if kind == "status" and record.get("label") in {"Critic approved", "Stop requested", "Statement review failed"}:
+        return {key: record.get(key) for key in ("kind", "stage", "label", "node", "time", "text")}
+    if kind == "convention_result":
+        # The convention critic answered: its step is over (see interrupted_stage_checkpoint).
+        return {key: record.get(key) for key in ("kind", "stage", "round", "verdict", "time")}
+    return None
+
+
+# Steps that start again from their exact saved input when a restart interrupts them.
+INTERRUPTIBLE_NODES = {"critic", "convention", "latex_editor", "latex_compile", "latex_repair"}
+
+
+def interrupted_critic_candidate(run_dir, records):
+    """The exact proof an interrupted critic round was reviewing.
+
+    The saved candidate file when the round's capture record proves it is that
+    proof; otherwise the critic's own last repair (in a later round), else the
+    author's last submission, which the critic resolves again.
+    """
+
+    path = Path(run_dir) / runtime.SAVED_CANDIDATE_FILENAME
+    try:
+        saved = path.read_text(encoding="utf-8") if path.is_file() and not path.is_symlink() else ""
+    except (OSError, UnicodeError):
+        saved = ""
+    author = critic = capture = None
+    for index, record in enumerate(records):
+        if record.get("kind") == "author_result":
+            author, capture = (index, record), None
+        elif record.get("kind") == "critic_result":
+            critic = (index, record)
+        elif record.get("kind") == "proof_handoff":
+            capture = record.get("manifest")
+    files = capture.get("files") if isinstance(capture, dict) else None
+    proof = files.get("proof.md") if isinstance(files, dict) else None
+    if saved and isinstance(proof, dict) and proof.get("sha256") == hashlib.sha256(saved.encode("utf-8")).hexdigest():
+        return saved
+    if critic is not None and (author is None or critic[0] > author[0]):
+        report = critic[1].get("report")
+        repaired = report.get("solution") if isinstance(report, dict) else None
+        return repaired.strip() if isinstance(repaired, str) and repaired.strip() else saved
+    if author is not None and isinstance(author[1].get("text"), str) and author[1]["text"].strip():
+        return author[1]["text"]
+    return saved
+
+
+def interrupted_critic_visit(records, running=None):
+    """Which critic round a restart interrupted, as the runner's stepVisit record; None for a first round.
+
+    A step record names its visit and the instruction of a final read-only
+    check (see runtime.STEP_VISIT_KEY); the step's input record never reaches
+    the transcript. A round resumed before its runner reported the step
+    continues the visit that its Resume passed on: ``running`` is the state
+    of the running pause checkpoint of a Resume at the critic.
+    """
+
+    for record in reversed(records):
+        if record.get("kind") in {"author_result", "critic_result"}:
+            return None
+        if record.get("kind") != "status":
+            continue
+        if record.get("label") == "Workflow step: critic":
+            visit, verify = record.get("visit"), record.get("verify")
+            verify = verify if isinstance(verify, str) and verify else None
+            if type(visit) is not int or visit < 1 or (visit == 1 and not verify):
+                return None
+            return {"node": "critic", "visit": visit, **({"verify": verify} if verify else {})}
+        if record.get("label") == "Resume requested":
+            saved = (running or {}).get(runtime.STEP_VISIT_KEY)
+            return dict(saved) if record.get("node") == "critic" and isinstance(saved, dict) else None
+    return None
+
+
+def interrupted_stage_checkpoint(run_dir, node, state, records, running=None):
+    """Pause checkpoint fields that repeat an interrupted critic or LaTeX step from its exact saved input.
+
+    ``running`` is the state that a Resume at the critic passed to the runner (see interrupted_critic_visit).
+    """
+
+    try:
+        if node in {"critic", "convention"}:
+            author = critic = approved = convention = None
+            for index, record in enumerate(records):
+                if record.get("kind") == "author_result":
+                    author = index
+                elif record.get("kind") == "critic_result":
+                    critic = (index, record)
+                elif record.get("kind") == "status" and record.get("label") == "Critic approved":
+                    approved = index
+                elif record.get("kind") == "convention_result":
+                    convention = index
+            latest = max((index for index in (author, critic[0] if critic else None, approved, convention)
+                          if index is not None), default=None)
+            if latest is not None and latest == convention:
+                # The convention critic answered just before the runner ended: the LaTeX editor is next,
+                # when the writing stage is selected.
+                if not state["workflowStages"]["writing"]:
+                    return None
+                return interrupted_stage_checkpoint(run_dir, "latex_editor", state, records)
+            if latest is not None and latest == approved:
+                # The critic approved the proof just before the runner ended, or the convention critic was
+                # interrupted: it checks the accepted proof again.
+                report = critic[1].get("report") if critic is not None else None
+                accepted = report.get("solution") if isinstance(report, dict) else None
+                if not isinstance(accepted, str) or not accepted.strip():
+                    accepted = interrupted_critic_candidate(run_dir, records)
+                if not accepted.strip():
+                    return None
+                return {"node": "convention", "stage": "critic",
+                        "state": {"statement": saved_statement(run_dir), "solution": accepted.strip(),
+                                  "output": accepted.strip(), "round": critic[1].get("round") if critic else None},
+                        "error": "The convention critic was interrupted when its process ended; it checks the "
+                                 "accepted proof again automatically."}
+            report = critic[1].get("report") if critic is not None and latest == critic[0] else None
+            if isinstance(report, dict) and report.get("verdict") == "reject":
+                # The critic rejected the proof just before the runner ended: the author repairs it,
+                # when the author stage is selected.
+                if not state["workflowStages"]["author"]:
+                    return None
+                return {"node": "author", "stage": "repair",
+                        "state": {"statement": saved_statement(run_dir), "report": report,
+                                  "solution": report.get("solution", ""), "round": critic[1].get("round")},
+                        "error": "The previous author process ended without a final answer; "
+                                 "its saved conversation continues automatically."}
+            candidate = interrupted_critic_candidate(run_dir, records)
+            if not candidate.strip():
+                return None
+            resumed = {"statement": saved_statement(run_dir), "solution": candidate}
+            # The interrupted round keeps its number (and a final check stays read-only), so the
+            # reports its critics saved are reused.
+            visit = interrupted_critic_visit(records, running)
+            if visit:
+                resumed[runtime.STEP_VISIT_KEY] = visit
+            return {"node": "critic", "stage": "critic", "state": resumed,
+                    "error": "The critic was interrupted when its process ended; it continues automatically "
+                             "with the same saved proof."}
+        if state["problemMode"] == "latex":
+            source = read_utf8(run_dir / "latex-input.md", "saved LaTeX input").strip()
+            base = {"input": source, "statement": source, "source": source}
+        else:
+            base = saved_final_input(run_dir, records=records)
+        latex = run_dir / "latex-source.tex"
+        if node != "latex_editor" and latex.is_file() and not latex.is_symlink():
+            compiled = read_utf8(latex, "saved LaTeX source")
+            # Repairs keep the content of the saved source (latex_kept), as of the editor's version.
+            return {"node": "latex_compile", "stage": "final",
+                    "state": {**base, "output": compiled, "edited_latex": compiled},
+                    "error": "The LaTeX step was interrupted when its process ended; the saved LaTeX source "
+                             "is compiled again automatically."}
+        return {"node": "latex_editor", "stage": "final", "state": base,
+                "error": "The LaTeX editor was interrupted when its process ended; it starts again "
+                         "automatically from the saved final input."}
+    except ValueError:
+        return None
+
+
+def restore_saved_app(app, *, owned=True):
+    """Reconstruct one idle historical job for a newly started Web UI.
+
+    ``owned`` False restores a run that another process owns: nothing in it
+    is written and no automatic resume is scheduled.
+    """
 
     run_dir = app.run_dir
     if not run_dir:
         return app
-    records = _run_records(run_dir)
+    # One streaming pass over the transcript; only the records needed after it are kept.
+    relevant, first_time, last_time, any_records = [], "", "", False
     state = empty_state(app.state["trace"], app.state["traceVersion"])
     state.pop("workflowStages", None)  # Older jobs derive stages from their saved workflow mode.
     state["runId"] = run_dir.name
@@ -4111,12 +7029,16 @@ def restore_saved_app(app):
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         pass
 
-    settings_path = run_dir / JOB_SETTINGS_FILENAME
+    settings_path = controlled_path(run_dir, JOB_SETTINGS_FILENAME)
     persisted_settings = set()
+    # The loophole warning as last saved: whether the user ignored it (the transcript holds the warning itself).
+    saved_warning = None
     # Roles whose saved model was removed (DeepSeek) and now runs as its replacement.
     replaced_roles, settings_warnings = set(), []
+    settings_unreadable = False
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings_unreadable = not isinstance(settings, dict)
         if isinstance(settings, dict):
             try:
                 state["sourceFile"] = source_file_name(settings.get("sourceFile"))
@@ -4125,15 +7047,20 @@ def restore_saved_app(app):
             api_models = saved_api_models(settings.get("apiModels"))
             if api_models:
                 state["apiModels"] = api_models
+            # Roles a restart already moved to their replacement keep their warning.
+            if isinstance(settings.get("replacedRoles"), list):
+                replaced_roles.update(role for role in settings["replacedRoles"] if role in ROLES)
             for key in (
                 "reviewModel", "authorModel", "criticModel", "writerModel",
                 "reasoningEffort", "reviewEffort", "authorEffort",
-                "criticEffort", "writerEffort", "criticRounds",
+                "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
                 "workflowStages", "originalContent",
                 "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
+                "authorRepairDelivered",
+                "launchQueued", "queuedAt", "launchError",
             ):
                 if key in settings:
                     if key == "workflowStages":
@@ -4149,8 +7076,12 @@ def restore_saved_app(app):
                     if key in {"launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc"} and not isinstance(settings[key], str):
                         state["launchHold"] = "Invalid saved historical launch controls; repair before launch."
                         continue
+                    problem = saved_setting_problem(key, settings[key])
+                    if problem:
+                        settings_warnings.append(problem)
+                        continue
                     if key in {
-                        "skipStatementReview", "statementReviewOnly", "preparedRun",
+                        "skipStatementReview", "statementReviewOnly", "preparedRun", "launchQueued",
                     } and not isinstance(settings[key], bool):
                         continue
                     if (
@@ -4168,20 +7099,41 @@ def restore_saved_app(app):
                             replaced_roles.add(key[:-len("Model")])
                         continue
                     state[key] = settings[key]
-    except (OSError, UnicodeError, json.JSONDecodeError):
+            # A value of the wrong type (the run folder's copy is author-writable) keeps the default.
+            if isinstance(settings.get("pendingReanchor"), bool):
+                state["pendingReanchor"] = settings["pendingReanchor"]
+            if isinstance(settings.get("relatedWorksPending"), list):
+                state["relatedWorksPending"] = [name for name in settings["relatedWorksPending"]
+                                                if isinstance(name, str) and name and "\0" not in name]
+            if isinstance(settings.get("folderBatch"), str) and FOLDER_BATCH_ID.match(settings["folderBatch"]):
+                state["folderBatch"] = settings["folderBatch"]
+            # Kept below only when the author continues after this restart.
+            state["authorQuestion"] = saved_author_question(settings.get("authorQuestion"))
+            saved_warning = settings.get("conventionWarning")
+    except FileNotFoundError:
         pass
-    for name in ("review", "author", "critic", "final"):
-        prompt_path = run_dir / "prompts" / f"{name}.txt"
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        settings_unreadable = True
+    if settings_unreadable:
+        settings_warnings.append(f"The saved settings ({JOB_SETTINGS_FILENAME}) cannot be read; "
+                                 "this job shows and uses the default settings.")
+        if (run_dir / "input.md").is_file() and not state.get("retrievalPolicyPath"):
+            # Its web-cutoff policy may be among the lost settings: never run it as a live search.
+            state["launchHold"] = (f"The saved settings ({JOB_SETTINGS_FILENAME}) of this run cannot be read, so "
+                                   "its web-cutoff policy is unknown. Restore them before launch.")
+    for name in ("review", "author", "critic", "convention", "final"):
+        prompt_path = controlled_path(run_dir, f"prompts/{name}.txt")
         try:
-            state[f"{name}Prompt"] = prompt_path.read_text(
+            # A retired default gives way to the current one (see current_prompt).
+            state[f"{name}Prompt"] = current_prompt(name, prompt_path.read_text(
                 encoding="utf-8"
-            ).strip()
+            ).strip())
         except (OSError, UnicodeError):
             pass
 
     direct_statement = False
     try:
-        direct_statement = (run_dir / "checked-statement.md").read_text(
+        direct_statement = controlled_path(run_dir, "checked-statement.md").read_text(
             encoding="utf-8"
         ).lstrip().startswith("# Statement sent directly to the proof author")
     except (OSError, UnicodeError):
@@ -4236,6 +7188,8 @@ def restore_saved_app(app):
     state["skipStatementReview"] = not state["workflowStages"]["review"]
     state["statementReviewOnly"] = state["workflowStages"]["review"] and not any(
         state["workflowStages"][name] for name in ("author", "critic", "writing"))
+    state["criticCountRecorded"] = "criticCount" in persisted_settings
+    state["authorSubagentsRecorded"] = "authorSubagents" in persisted_settings
     state["originalContent"] = state.get("originalContent") or state.get("draft", "")
     state["workflow"] = workflow_graph(state["workflowStages"])
 
@@ -4244,7 +7198,33 @@ def restore_saved_app(app):
     post_review_request = False
     last_work_node = ""
     author_finished = False
-    for record in records:
+    # Whether the author submitted after the last Resume, which saved the state an
+    # interrupted runner leaves in its checkpoint (see the rebuilt checkpoint below).
+    submitted_since_resume = False
+    # Whether the runner reported a fatal error after its last step began.
+    ended_with_error = False
+    # The transcript holds every record of the time limit (the job settings keep a copy for saved batches).
+    state["timeLimitHistory"] = []
+    for record in _iter_run_records(run_dir):
+        follow_time_limit(state["timeLimitHistory"], record)
+        if controller_note(record):
+            continue
+        if not any_records and record.get("label") != "Total time limit set":
+            # A limit set while the job waited to start does not mean it started.
+            first_time, any_records = record.get("time"), True
+        last_time = record.get("time")
+        kept = restore_record(record)
+        if kept is not None:
+            relevant.append(kept)
+        if convention_verdict(record):
+            # The latest verdict's warning (None after a faithful one); an ignored one stays ignored
+            # (see same_convention_warning).
+            warning = convention_warning(record)
+            if warning is not None:
+                warning["dismissed"] = same_convention_warning(saved_warning, warning)
+            state["conventionWarning"] = warning
+        if record.get("kind") == "request" or str(record.get("label", "")).startswith("Workflow step: "):
+            ended_with_error = False
         goal_thread = goal_thread_from_record(record)
         if goal_thread:
             state["goalThreadId"] = goal_thread
@@ -4252,6 +7232,8 @@ def restore_saved_app(app):
         if (record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
                 and record.get("root") is not False and isinstance(delivered, str) and delivered):
             state["authorSteerDelivered"] = delivered
+        if delivered_repair(record):
+            state["authorRepairDelivered"] = delivered_repair(record)
         stage = record.get("stage")
         if stage:
             state["stage"] = stage
@@ -4260,8 +7242,14 @@ def restore_saved_app(app):
                 last_work_node = state["activeNode"]
         if record.get("kind") == "request" and stage in {"solve", "repair"}:
             author_finished = False
+        if (record.get("kind") == "status" and record.get("node") == "author"
+                and record.get("label") in {"Resume requested", "Workflow step: author"}):
+            # The author works again, also before its first request (such as while it retries starting).
+            author_finished = False
         if record.get("kind") == "author_result":
-            author_finished = True
+            author_finished = submitted_since_resume = True
+        elif record.get("kind") == "status" and record.get("label") == "Resume requested":
+            submitted_since_resume = False
         if record.get("kind") == "failure_result":
             state["resultKind"] = "needs-revision" if record.get("resultKind") == "needs-revision" else "failure"
             state["revisionRequired"] = state["resultKind"] == "needs-revision"
@@ -4332,6 +7320,7 @@ def restore_saved_app(app):
             and str(record.get("text", "")).startswith("error: ")
         ):
             state["error"] = str(record["text"])[7:]
+            ended_with_error = True
 
     if state["problemMode"] == "algorithmic":
         state["problemMode"] = "statement"
@@ -4352,20 +7341,25 @@ def restore_saved_app(app):
             f"This older run did not record the {names} model settings. "
             "Those roles will use the current defaults if you continue."
         )
-    # Only roles this job still runs are worth a warning.
+    # Only roles this job still runs are worth a warning: once proof work has
+    # started, the statement reviewer never runs again.
+    required_roles -= {"review"} if post_review_request else set()
     replaced_roles &= required_roles
     if replaced_roles:
         settings_warnings.insert(0, removed_model_warning(replaced_roles))
-    # An API model removed since the job ran: a settings error, never retried.
-    unconfigured_roles = [
-        role for role in ROLES if role in required_roles
-        and providers.is_api_id(state.get(f"{role}Model")) and not providers.is_known(state[f"{role}Model"])
-    ]
+        state["replacedRoles"] = sorted(replaced_roles)
+
+    def unconfigured(model):
+        try:
+            return providers.is_api_id(model) and not providers.is_known(model)
+        except providers.StoreUnavailable:
+            return False  # Unreadable now is not removed; Resume reads the store again.
+
+    # An API model removed since the job ran: retried every minute until it is added again.
+    unconfigured_roles = [role for role in ROLES if role in required_roles and unconfigured(state.get(f"{role}Model"))]
     settings_warnings.extend(unconfigured_job_model_error(state[f"{role}Model"], role, state.get("apiModels"))
                              for role in unconfigured_roles)
 
-    first_time = records[0].get("time") if records else ""
-    last_time = records[-1].get("time") if records else ""
     state["startedAt"] = (
         first_time if isinstance(first_time, str) and first_time
         else _artifact_time(run_dir)
@@ -4408,22 +7402,39 @@ def restore_saved_app(app):
             phase="reviewed", stage="review",
             activeNode="statement_reviewer", finishedAt="", error="",
         )
+    # The latest statement review never finished: it failed (recorded), or a
+    # restart interrupted it. A failed one waits for Retry statement review;
+    # an interrupted one starts again by itself from review-input.json.
+    attempts = [index for index, record in enumerate(relevant)
+                if record.get("stage") == "review" and (record.get("kind") == "request"
+                                                        or record.get("label") == "Statement review failed")]
+    results = [index for index, record in enumerate(relevant) if record.get("kind") == "review_result"]
+    if (state["problemMode"] == "statement" and not state["skipStatementReview"] and not post_review_request
+            and state["reviewInputRecorded"] and attempts and attempts[-1] > max(results, default=-1)):
+        failure = relevant[attempts[-1]] if relevant[attempts[-1]].get("kind") == "status" else None
+        state.update(phase="reviewed" if state["review"] and state["reviewFeedback"] else "input",
+                     stage="review", activeNode="statement_reviewer", finishedAt="", resultKind="", output="",
+                     error=str(failure.get("text") or "The statement review failed.") if failure else
+                     "A restart interrupted the statement review; it starts again by itself from its saved input.",
+                     reviewRetryAt=0 if failure else time.time())
     if state["problemMode"] != "latex" and state["workflowStages"]["writing"]:
         try:
-            saved_final_input(run_dir, records=records)
+            saved_final_input(run_dir, records=relevant)
             state["finalInputReady"] = True
         except ValueError:
             pass
-    manual_stop = saved_manual_stop(run_dir, records)
+    manual_stop = saved_manual_stop(run_dir, relevant)
     if manual_stop is not None:
         stopped_stage = manual_stop["stage"]
+        # The LaTeX step it stopped at (the PDF compiles in the same stage as the editor writes).
+        latex_node = manual_stop.get("node") if stopped_stage == "final" else None
         state.update(
             phase="done",
             error="Stopped.",
             manuallyStopped=True,
             stoppedStage=stopped_stage,
             stage=stopped_stage,
-            activeNode={
+            activeNode=latex_node if latex_node in {"latex_editor", "latex_compile", "latex_repair"} else {
                 "review": "statement_reviewer",
                 "solve": "author",
                 "repair": "author",
@@ -4440,44 +7451,68 @@ def restore_saved_app(app):
                 "This job was manually stopped. Continue it from the home page."
             )
     checkpoint = read_pause_object(run_dir)
-    if (manual_stop is None and state["resultKind"] not in {"final", "proof", "review"}
-            and last_work_node == "author" and not author_finished
-            and checkpoint.get("status") not in {"paused", "pausing"}):
+    damaged = {}
+    if checkpoint.get("status") in {"paused", "pausing"} and not complete_pause_checkpoint(checkpoint):
+        # Resume would refuse this checkpoint: rebuild it from the transcript below,
+        # keeping the cause, retry time, reason and elapsed time it still records.
+        damaged = {key: checkpoint[key] for key, valid in DAMAGED_CHECKPOINT_FIELDS.items()
+                   if key in checkpoint and valid(checkpoint[key])}
+        checkpoint = {}
+        settings_warnings.append(f"The saved pause checkpoint ({PAUSE_FILENAME}) was damaged and has been "
+                                 "rebuilt from the transcript.")
+    prior = checkpoint.get("state") if isinstance(checkpoint.get("state"), dict) else {}
+    interrupted = (manual_stop is None and state["resultKind"] not in {"final", "proof", "review"}
+                   and checkpoint.get("status") not in {"paused", "pausing"})
+    rebuilt = None
+    if interrupted and last_work_node == "author" and not author_finished:
         # A server/process crash leaves the last resume checkpoint marked running.
         # There is no worker attached to a restored job, and partial text is not a proof.
-        statement = checkpoint.get("state", {}).get("statement")
+        statement = prior.get("statement")
         if not statement:
             try:
                 statement = saved_statement(run_dir)
             except ValueError:
                 statement = state["draft"]
         if statement:
-            elapsed = checkpoint.get("elapsedSeconds", state.get("elapsedSeconds", 0))
-            try:
-                segment_start = datetime.fromisoformat(state.get("resumedAt") or state["startedAt"])
-                segment_end = datetime.fromisoformat(state["lastActivityAt"])
-                elapsed += max(0, (segment_end - segment_start).total_seconds())
-            except (TypeError, ValueError):
-                pass
-            recovered_state = checkpoint.get("state") or {"statement": statement}
+            recovered_state = prior or {"statement": statement}
+            if submitted_since_resume:
+                # The state Resume saved may say why an earlier submission was refused: the runner
+                # dropped that reason when the author submitted again, so the author is not told it again.
+                recovered_state = {key: value for key, value in recovered_state.items() if key != "handoff_refused"}
             # The unfinished author was repairing the latest rejection, even when
             # its new goal session logged as 'solve' or audit records followed it.
-            rejection = next((record for record in reversed(records)
+            rejection = next((record for record in reversed(relevant)
                               if record.get("kind") == "critic_result"), {})
             report = rejection.get("report")
             if isinstance(report, dict) and report.get("verdict") == "reject":
                 recovered_state = {**recovered_state, "report": report,
                                    "solution": report.get("solution", ""),
                                    "round": rejection.get("round", state["round"])}
-            checkpoint = {
-                **checkpoint, "status": "paused", "node": "author",
-                "state": recovered_state,
-                "stage": "repair" if recovered_state.get("report") else "solve",
-                "goalThreadId": checkpoint.get("goalThreadId") or state["goalThreadId"],
-                "elapsedSeconds": elapsed,
-                "error": "The previous author process ended without a final answer. Resume continues its saved conversation.",
-                "pauseCause": "interrupted", "autoResumeAt": 0,
-            }
+            rebuilt = {"node": "author", "state": recovered_state,
+                       "stage": "repair" if recovered_state.get("report") else "solve",
+                       "error": "The previous author process ended without a final answer; "
+                                "its saved conversation continues automatically."}
+    elif (interrupted and not ended_with_error and last_work_node in INTERRUPTIBLE_NODES
+          and state["resultKind"] not in {"failure", "needs-revision"}):
+        # The critic or LaTeX step continues from its exact saved input in this run folder.
+        running = prior if checkpoint.get("status") == "running" and checkpoint.get("node") == "critic" else None
+        rebuilt = interrupted_stage_checkpoint(run_dir, last_work_node, state, relevant, running)
+    if rebuilt:
+        elapsed = saved_seconds(checkpoint.get("elapsedSeconds"), saved_seconds(state.get("elapsedSeconds"), 0.0))
+        try:
+            segment_start = datetime.fromisoformat(state.get("resumedAt") or state["startedAt"])
+            segment_end = datetime.fromisoformat(state["lastActivityAt"])
+            elapsed += max(0, (segment_end - segment_start).total_seconds())
+        except (TypeError, ValueError):
+            pass
+        checkpoint = {
+            **checkpoint, "status": "paused", **rebuilt,
+            "goalThreadId": checkpoint.get("goalThreadId") or state["goalThreadId"],
+            "elapsedSeconds": elapsed, "pauseCause": "interrupted", "autoResumeAt": 0, **damaged,
+        }
+    elif damaged:
+        state["error"] = (f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged and could not be rebuilt "
+                          "from the transcript. Continue from a saved checkpoint.")
     if (checkpoint.get("status") in {"paused", "pausing"}
             and state["resultKind"] not in {"final", "proof", "review"} and manual_stop is None):
         state.update(phase="paused", stage=checkpoint["stage"], activeNode=checkpoint["node"],
@@ -4496,25 +7531,66 @@ def restore_saved_app(app):
         state["error"] = state["error"] or "Proof needs revision. See the critic feedback."
     if state.get("retrievalMode") == "historical" and not state.get("retrievalPolicyPath"):
         state["launchHold"] = "Historical search policy is missing; restore the controller policy before launch."
-    if state["preparedRun"] and not records and not state["output"]:
-        state.update(phase="prepared", stage="solve", activeNode="author", startedAt="",
+    if state["preparedRun"] and not any_records and not state["output"]:
+        # A queued folder-batch job starts with its statement review when its stages include it.
+        review = state["reviewInputRecorded"] and not state["skipStatementReview"] and state["workflowStages"]["review"]
+        state.update(phase="prepared", stage="review" if review else "solve",
+                     activeNode="statement_reviewer" if review else "author", startedAt="",
                      resumedAt="", elapsedSeconds=0, finishedAt="", error="")
+        if state.get("launchQueued"):
+            # A queued job starts when a running slot is free, as before the restart.
+            state["error"] = state.get("launchError") if isinstance(state.get("launchError"), str) else ""
     state["checkpoints"] = saved_run_checkpoints(run_dir)
     app._checkpoint_cache = list(state["checkpoints"])
     app._checkpoint_cache_signature = checkpoint_artifact_signature(run_dir)
     app.state = state
-    if state["phase"] == "paused":
-        pause_path = run_dir / PAUSE_FILENAME
-        app._configure_auto_resume(checkpoint, pause_path.stat().st_mtime if pause_path.exists() else time.time())
-        if replaced_roles and checkpoint.get("autoResumeAt"):
-            # A replaced model is never started unattended: Resume is explicit.
-            checkpoint["autoResumeAt"] = state["autoResumeAt"] = 0
-            settings_warnings.insert(1, "Automatic retry is off; choose Resume to continue with the replacement.")
+    if state["phase"] == "paused" and owned:
+        pause_path = controlled_path(run_dir, PAUSE_FILENAME)
+        if checkpoint.get("pauseCause") in {"interrupted", "restart"}:
+            # A runner that ended with its server continues about a minute after this start.
+            checkpoint["autoResumeAt"] = max(saved_seconds(checkpoint.get("autoResumeAt"), 0.0),
+                                             time.time() + AUTO_RESUME_SECONDS)
+        try:
+            changed = pause_path.stat().st_mtime
+        except OSError:
+            changed = time.time()
+        app._configure_auto_resume(checkpoint, changed)
+        # Before the checkpoint is saved: it records that a time-limit pause asked for its summary.
+        app._restore_conversation(checkpoint)
+        # Only a role the remaining steps use is worth a check before the job retries by itself; a
+        # replaced model resumes as its documented replacement, with the warning shown.
+        roles = set(checkpoint_roles(checkpoint.get("node"), state["workflowStages"]))
+        unconfigured_roles = [role for role in unconfigured_roles if role in roles]
         if unconfigured_roles and checkpoint.get("autoResumeAt"):
-            checkpoint["autoResumeAt"] = state["autoResumeAt"] = 0
-            settings_warnings.append("Automatic retry is off; choose Resume once the model is configured.")
-        app._save_pause(checkpoint)
+            settings_warnings.append(f"The job checks again every {retry_interval_text()} and continues by itself "
+                                     "once the model is configured.")
+        try:
+            app._save_pause(checkpoint)
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            # The job stays listed and paused; the next resume saves the checkpoint first.
+            app._unsaved_checkpoint = checkpoint
+            settings_warnings.append(f"The pause checkpoint could not be saved ({exc}); it is saved again "
+                                     "before the next resume.")
+    else:
+        app._restore_conversation(checkpoint, owned=owned)
+    question = state.get("authorQuestion")
+    if question and (state["phase"] == "paused" and state["activeNode"] == "author"
+                     and checkpoint.get("pauseCause") in RESTART_PAUSE_CAUSES):
+        # The author continues its conversation after this restart, and its question shows again then;
+        # the turn in which it asked ended with the previous server.
+        if question["turnEndedAt"] is None:
+            question["turnEndedAt"] = time.time()
+    else:
+        # Answered, dismissed, replaced or expired questions were saved as closed; any other open one
+        # closed when its author stopped working.
+        state["authorQuestion"] = None
     state["settingsWarning"] = " ".join(settings_warnings)
+    if owned and state.get("retrievalPolicyPath") and (
+            (state["phase"] == "prepared" and state.get("launchHold") == HISTORICAL_PENDING_HOLD)
+            or str(state.get("launchHold", "")).endswith(HISTORICAL_RETRY_SUFFIX)):
+        # A check interrupted by the restart, or one that could not finish:
+        # run it again now instead of holding the job forever.
+        app._hold_retry_at = time.time()
     app.fixed_trace = False
     return app
 
@@ -4540,16 +7616,62 @@ def restore_saved_jobs(runs):
             transcript.parent, runs
         ):
             continue
-        try:
-            app = restore_saved_app(App(transcript, runs))
-        except (OSError, UnicodeError, TypeError, AttributeError, KeyError,
-                ValueError, RecursionError) as exc:
-            # One damaged run folder must not keep the Web UI from starting.
-            print(f"Skipped damaged saved run {transcript.parent.name}: {exc}",
-                  file=sys.stderr, flush=True)
-            continue
+        app = restore_one_run(transcript, runs)
         jobs[app.state["runId"]] = app
     return jobs
+
+
+def restore_one_run(transcript, runs):
+    """Restore one saved run: owned here, shown as running elsewhere, or shown as damaged.
+
+    A run that another process still owns (a live terminal run, or a runner a
+    crashed server left behind) is restored without changing anything in it;
+    Server._adopt_released_runs takes it over once it is free.
+    """
+
+    app = None
+    try:
+        app = App(transcript, runs)
+        try:
+            app._claims.claim(app.run_dir)
+        except ownership.OwnedElsewhere as exc:
+            app = restore_saved_app(app, owned=False)
+            app.state.update(phase="running", runningElsewhere=str(exc), autoResumeAt=0, error="", finishedAt="")
+            return app
+        restore_saved_app(app)
+        app._settle_run_claim()
+        return app
+    except (OSError, UnicodeError, TypeError, AttributeError, KeyError,
+            ValueError, RecursionError, MemoryError) as exc:
+        # One damaged run folder must not keep the Web UI from starting, nor disappear from it.
+        if app is not None:
+            app._claims.release_all()
+        print(f"Restored damaged saved run {transcript.parent.name} with a warning: {exc}",
+              file=sys.stderr, flush=True)
+        return damaged_saved_app(transcript.parent, runs, exc)
+
+
+def damaged_saved_app(run_dir, runs, problem):
+    """A visible job for a run that cannot be restored; its files stay as they are."""
+
+    app = App(runs=runs, load_latest=False)
+    app.run_dir, app.trace_file, app.fixed_trace = Path(run_dir), Path(run_dir) / "transcript.jsonl", False
+    detail = str(problem) or type(problem).__name__
+    app.state.update(runId=app.run_dir.name, phase="done", startedAt=_artifact_time(app.run_dir),
+                     error=f"This saved run could not be restored ({detail}). Its files in "
+                           f"{app.run_dir.name} are unchanged.")
+    try:
+        draft = (app.run_dir / "draft.md").read_text(encoding="utf-8").strip()
+        app.state["draft"] = draft.removeprefix("# Draft problem").lstrip()
+    except (OSError, UnicodeError):
+        pass
+    try:
+        app.state["checkpoints"] = saved_run_checkpoints(app.run_dir)
+        app._checkpoint_cache = list(app.state["checkpoints"])
+        app._checkpoint_cache_signature = checkpoint_artifact_signature(app.run_dir)
+    except (OSError, UnicodeError, TypeError, AttributeError, KeyError, ValueError, RecursionError, MemoryError):
+        pass
+    return app
 
 
 def read_utf8(path, purpose):
@@ -4574,7 +7696,7 @@ def saved_statement(path):
     run_dir = source if source.is_dir() else source.parent
     if not run_dir.is_dir():
         raise ValueError(f"The saved run does not exist: {run_dir}")
-    checked_path = run_dir / "checked-statement.md"
+    checked_path = controlled_path(run_dir, "checked-statement.md")
     if checked_path.exists():
         checked = read_utf8(checked_path, "saved checked statement")
         reviewed_prefix = "# Checked statement"
@@ -4623,7 +7745,7 @@ def saved_final_input(path, records=None):
         pass
 
     # The workflow approves either an unchanged pass or an edited pass at its limit.
-    records = _run_records(run_dir) if records is None else records
+    records = _iter_run_records(run_dir) if records is None else records
     latest_solution, approved_solution = "", ""
     for record in records:
         if record.get("kind") == "critic_result":
@@ -4658,29 +7780,20 @@ def saved_critic_source(path):
     statement = saved_statement(run_dir)
     defaults = default_prompts()
     prompts = {}
-    for name in ("author", "critic", "final"):
-        prompt_path = run_dir / "prompts" / f"{name}.txt"
-        prompts[name] = (
+    for name in ("author", "critic", "convention", "final"):
+        prompt_path = controlled_path(run_dir, f"prompts/{name}.txt")
+        prompts[name] = current_prompt(name, (
             read_utf8(prompt_path, f"saved {name} prompt")
             if prompt_path.exists() else defaults[name]
-        )
-    checkpoint_path = run_dir / runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME
-    try:
-        audit_checkpoint = (
-            read_utf8(checkpoint_path, "saved critic audit checkpoint")
-            if critic_uses_parallel_audits() and checkpoint_path.exists() else ""
-        )
-    except ValueError:
-        # A corrupt optional audit must not hide the earlier valid candidate.
-        audit_checkpoint = ""
+        ))
     return {
         "run_dir": run_dir,
         "statement": statement,
         "solution": solution,
         "author_prompt": prompts["author"],
         "critic_prompt": prompts["critic"],
+        "convention_prompt": prompts["convention"],
         "final_prompt": prompts["final"],
-        "audit_checkpoint": audit_checkpoint,
     }
 
 
@@ -4691,7 +7804,7 @@ def saved_research_source(path):
     source = requested if requested.is_dir() else requested.parent
     source = validated_continuation_source(source, source.parent)
     settings = {}
-    settings_path = source / JOB_SETTINGS_FILENAME
+    settings_path = controlled_path(source, JOB_SETTINGS_FILENAME)
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -4707,12 +7820,12 @@ def saved_research_source(path):
             if settings[f"{role}Model"] != saved:
                 replaced.append(role)
     defaults = default_prompts()
-    for role in ("author", "critic", "final"):
-        path = source / "prompts" / f"{role}.txt"
-        settings[f"{role}Prompt"] = (
+    for role in ("author", "critic", "convention", "final"):
+        path = controlled_path(source, f"prompts/{role}.txt")
+        settings[f"{role}Prompt"] = current_prompt(role, (
             read_utf8(path, f"saved {role} prompt") if path.exists()
             else defaults[role]
-        )
+        ))
     return {"run_dir": source, "statement": saved_statement(source), "settings": settings,
             "replacedRoles": replaced}
 
@@ -4725,7 +7838,12 @@ class Server(ThreadingHTTPServer):
     # launch fails with "address in use"; POSIX keeps quick restarts.
     allow_reuse_address = os.name != "nt"
 
-    def __init__(self, address, runs=RUNS):
+    def __init__(self, address, runs=RUNS, *, single_instance=False):
+        """``single_instance`` is the launcher's server: the one owner of its runs
+        folder (AlreadyRunning names the server that already is), on another port
+        when the usual one is taken, with a session token that survives restarts.
+        """
+
         self.runs = Path(runs)
         from .batches import BatchCatalog
         # The catalog refuses a symlinked root itself; a linked runs folder
@@ -4734,31 +7852,218 @@ class Server(ThreadingHTTPServer):
         self.batch_catalog = BatchCatalog(root, current_root=root)
         self.jobs, self.jobs_lock = {}, threading.RLock()
         self._retry_stop = threading.Event()
-        super().__init__(address, Handler)
-        # Key-bearing Claude settings left by runners that were killed.
-        claude_cli.sweep_stale_settings()
-        self.jobs.update(restore_saved_jobs(self.runs))
-        # Only the unguessable launch URL can create this server's session.
-        self.token = secrets.token_urlsafe(32)
+        self._sleep = SleepWatch()
+        self.installation = load_installation_settings()
+        # Folder-batch statements whose job could not be created yet, retried every minute.
+        self._pending_jobs = []
+        self.instance = None
+        if single_instance:
+            prepare_runs_directory(self.runs)
+            self.instance = ownership.Instance(self.runs)
+            if not self.instance.acquire():
+                holder = self.instance.holder()
+                port = holder.get("port")
+                url = (f"http://{HOST}:{port}/#{ownership.session_token(self.runs)}"
+                       if isinstance(port, int) and not isinstance(port, bool) else "")
+                raise ownership.AlreadyRunning(holder, url)
+        try:
+            try:
+                super().__init__(address, Handler)
+            except OSError as exc:
+                if not (single_instance and exc.errno == errno.EADDRINUSE and address[1]):
+                    raise
+                # Another program holds the usual port; this folder's own server is not running.
+                super().__init__((address[0], 0), Handler)
+            # Key-bearing Claude settings left by runners that were killed.
+            claude_cli.sweep_stale_settings()
+            # Claude requests and API models need the private state folder: say at once what to fix.
+            self.state_problem = providers.check_private_state()
+            if self.state_problem:
+                print(f"Warning: {self.state_problem} Claude models and API models cannot start until it is fixed.",
+                      file=sys.stderr, flush=True)
+            self.jobs.update(restore_saved_jobs(self.runs))
+            prune_trash(self.runs)
+            # Related-work uploads wait here until a job takes them (pruned after a day).
+            self.upload_stage = staged_uploads(self.runs)
+            self._prune_uploads()
+        except BaseException:
+            if self.instance is not None:
+                self.instance.release()
+            raise
+        # Only the unguessable launch URL can create this server's session. The
+        # launcher's server keeps it, so tabs left open still work after a restart.
+        self.token = ownership.session_token(self.runs) if single_instance else secrets.token_urlsafe(32)
         self.origin = f"http://{HOST}:{self.server_port}"
+        if self.instance is not None:
+            self.instance.publish(port=self.server_port)
+
+    def _uploads(self):
+        """The staging area of related-work uploads (runs/.uploads)."""
+
+        stage = getattr(self, "upload_stage", None)
+        if stage is None:
+            stage = self.upload_stage = staged_uploads(self.runs)
+        return stage
+
+    def _prune_uploads(self, now=None):
+        """Remove staged uploads older than a day: when the server starts, then at most once an hour."""
+
+        self._uploads_pruned_at = time.monotonic()
+        try:
+            self._uploads().prune(now)
+        except OSError:
+            pass  # Tried again within the hour.
+        # A crash during a batch link or copy leaves its temporary file beside the target.
+        controller = Path(self.runs) / CONTROLLER_FOLDER
+        try:
+            folders = [*controller.iterdir(), *(controller / related_works.BATCH_FOLDER).iterdir()] \
+                if (controller / related_works.BATCH_FOLDER).is_dir() else list(controller.iterdir())
+        except OSError:
+            folders = []
+        for folder in folders:
+            if folder.is_dir() and not folder.is_symlink():
+                related_works.UploadStage.prune_leftovers(folder, now)
+
+    def running_jobs(self):
+        """How many jobs count against the running-jobs limit now."""
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        return sum(app.occupies_slot() for app in apps)
+
+    def free_slots(self):
+        """How many more jobs the server may start by itself now (inf without a limit)."""
+
+        limit = getattr(self, "installation", {}).get("maxRunningJobs", 0)
+        return math.inf if not limit else max(0, limit - self.running_jobs())
 
     def _retry_paused_jobs(self, now=None):
+        """Start what is due: automatic retries of error pauses, queued jobs, statement
+        reviews a restart interrupted, and the checks of held historical jobs.
+
+        Jobs that waited longest go first, within the running-jobs limit and at
+        most one start every AUTO_LAUNCH_SPACING_SECONDS, so jobs that came due
+        together reach the provider spread out.
+        """
+
+        now = time.time() if now is None else now
+        self._create_pending_jobs(now)
+        if time.monotonic() - getattr(self, "_uploads_pruned_at", -math.inf) >= UPLOAD_PRUNE_SECONDS:
+            self._prune_uploads()
         with self.jobs_lock:
+            # Replies of paused authors first: they are exempt from the launch spacing and the
+            # running-jobs limit, but occupy a slot while they run.
             for run_id, app in list(self.jobs.items()):
                 if self._retry_stop.is_set():
                     return
                 try:
-                    app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
+                    app.start_conversation_if_due(
+                        now, check=lambda app=app: self._check_author_workspace_idle(app.run_dir, exclude=app))
+                except Exception as exc:
+                    # Reported on that job, which tries again after the usual wait.
+                    app.defer_conversation(exc, now)
+            free = self.free_slots()
+            ready = now - getattr(self, "_last_auto_launch", -math.inf) >= AUTO_LAUNCH_SPACING_SECONDS
+            for run_id, app in sorted(self.jobs.items(), key=lambda item: item[1].launch_due_at(now)):
+                if self._retry_stop.is_set():
+                    return
+                if app.launch_due_at(now)[0] > now:
+                    break
+                if not ready or free <= 0:
+                    continue  # Still due at the next tick.
+                checking = False
+                try:
+                    if app.state["phase"] == "paused":
+                        app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
+                    elif app.state["phase"] == "prepared":
+                        app.start_queued_if_due(now)
+                    else:
+                        app.retry_review_if_due(now)
+                    # A passing check starts or resumes its job (see rerun_historical_preflight).
+                    checking = app.retry_historical_hold_if_due(now)
                 except Exception as exc:
                     # Nothing one job raises may stop the other jobs' retries:
                     # report it on that job, which tries again after the usual wait.
                     app.defer_auto_resume(exc, now)
+                if checking or app.occupies_slot():
+                    free, ready, self._last_auto_launch = free - 1, False, now
+
+    def _create_pending_jobs(self, now):
+        """Create the folder-batch jobs whose creation failed (for example on a full disk), every minute."""
+
+        for item in list(getattr(self, "_pending_jobs", [])):
+            if now < item["retryAt"]:
+                continue
+            app = App(runs=self.runs, load_latest=False)
+            batch = item.get("folderBatch") or None
+            try:
+                if "body" in item:
+                    self.start_workflow(item["body"], app=app, _prepare_only=True, _folder_batch=batch)
+                else:
+                    app.start_direct_statement(item["statement"], source_file=item["name"], _prepare_only=True,
+                                               folder_batch=batch, **item["options"])
+            except Exception as exc:
+                app.discard_unstarted_run()
+                item.update(retryAt=now + AUTO_RESUME_SECONDS, error=str(exc))
+                continue
+            self._pending_jobs.remove(item)
+            with self.jobs_lock:
+                self.jobs[app.state["runId"]] = app
+
+    def installation_settings(self):
+        """The running-jobs limit, with how many jobs run and wait in the queue now."""
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        return {**getattr(self, "installation", load_installation_settings()),
+                "runningJobs": sum(app.occupies_slot() for app in apps),
+                "queuedJobs": sum(app.state.get("phase") == "prepared" and bool(app.state.get("launchQueued"))
+                                  and not app.state.get("launchHold") for app in apps)}
+
+    def save_installation_settings(self, body):
+        self.installation = save_installation_settings(body)
+        return self.installation_settings()
+
+    def _tick_jobs(self):
+        """Keep machine sleep out of working jobs' active time; save transcript lines a failed write kept;
+        close the author questions whose author no longer waits for them."""
+
+        slept = self._sleep.slept()
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        for app in apps:
+            if slept:
+                app.exclude_sleep(slept)
+            app.flush_trace()
+            app.close_stale_author_question()
+
+    def _adopt_released_runs(self):
+        """Take over each job another process owned, once that process has let it go."""
+
+        with self.jobs_lock:
+            waiting = [(run_id, app) for run_id, app in self.jobs.items() if app.state.get("runningElsewhere")]
+        for run_id, app in waiting:
+            if self._retry_stop.is_set():
+                return
+            holder = ownership.held_elsewhere(app.run_dir)
+            if holder is not None:
+                with app.lock:
+                    app.state["runningElsewhere"] = ownership.describe(holder)
+                continue
+            adopted = restore_one_run(app.trace_file, self.runs)
+            with self.jobs_lock:
+                if self.jobs.get(run_id) is app:
+                    self.jobs[run_id] = adopted
+                    continue
+            adopted._claims.release_all()
 
     def serve_forever(self, poll_interval=0.5):
         # No browser tab or polling request is needed to retry a paused job.
         def retry_loop():
             while not self._retry_stop.wait(1):
                 try:
+                    self._tick_jobs()
+                    self._adopt_released_runs()
                     self._retry_paused_jobs()
                 except Exception:
                     # Every paused job depends on this one thread: keep it alive.
@@ -4779,6 +8084,13 @@ class Server(ThreadingHTTPServer):
     def server_close(self):
         self._retry_stop.set()
         super().server_close()
+        # The owner locks end with this server; runners still alive keep their own copy.
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        for app in apps:
+            app._claims.release_all()
+        if getattr(self, "instance", None) is not None:
+            self.instance.release()
 
     def get_job(self, run_id):
         """Return one exact job."""
@@ -4792,6 +8104,8 @@ class Server(ThreadingHTTPServer):
     def start_job(self, body, run_id=""):
         """Create a new job, or revise the selected existing job."""
 
+        if body.get("relatedWorks"):
+            raise ValueError("Related works are attached with Start workflow.")
         app = self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False)
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         review_only_option = (
@@ -4802,6 +8116,8 @@ class Server(ThreadingHTTPServer):
             statement=body.get("statement", ""),
             feedback=body.get("feedback", ""),
             critic_rounds=body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            critic_count=body.get("criticCount", DEFAULT_CRITIC_COUNT),
+            author_subagents=body.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
             review_model=body.get("reviewModel", DEFAULT_REVIEW_MODEL),
             thinking_hours=body.get("thinkingHours", DEFAULT_THINKING_HOURS),
             author_model=body.get("authorModel", DEFAULT_AUTHOR_MODEL),
@@ -4812,7 +8128,7 @@ class Server(ThreadingHTTPServer):
             author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("review", "author", "critic", "final"),
+            **web_prompt_options(body, ("review", "author", "critic", "convention", "final"),
                                  app.state if run_id else None),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
@@ -4828,40 +8144,70 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def start_workflow(self, body, run_id=""):
-        """Run the selected ordered stages on one input, preserving review approval."""
+    def start_workflow(self, body, run_id="", *, app=None, _prepare_only=False, _folder_batch=None):
+        """Run the selected ordered stages on one input, preserving review approval.
 
-        app = self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False)
+        A folder batch passes its new job's ``app``, ``_prepare_only`` and its
+        ``_folder_batch``: the job then waits in the queue the server starts
+        (see start_direct_batch). ``relatedWorks`` (upload tokens) are checked
+        before anything is created, installed in the new run before anything
+        starts, and discarded once the job is registered.
+        """
+
+        created = app is None and not run_id
+        app = app or (self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False))
         stages = normalize_workflow_stages(body.get("workflowStages", app.state.get("workflowStages") if run_id else None))
         content = body.get("content", body.get("statement", ""))
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Enter the statement or existing work to process.")
         if "\0" in content:
             raise ValueError("Workflow input cannot contain NUL characters.")
+        tokens = []
+        if "relatedWorks" in body:
+            tokens = related_works_tokens(body["relatedWorks"])
+            if run_id:
+                raise ValueError("Add related works on the job page.")
+            if not stages["author"]:
+                raise ValueError("Related works are read by the proof author; turn on the Author stage or remove "
+                                 "them.")
+            self._uploads().peek(tokens)
         effective_body = {**body, "workflowStages": stages}
         if run_id:
             defaults = {key: app.state[key] for key in (
                 "authorModel", "criticModel", "writerModel", "reasoningEffort", "authorEffort", "criticEffort", "writerEffort",
-                "criticRounds", "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc")}
+                "criticRounds", "criticCount", "authorSubagents", "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode",
+                "retrievalCutoffUtc")}
             effective_body = {**defaults, **effective_body}
         options = self._direct_options(effective_body)
-        options.update(web_prompt_options(effective_body, ("author", "critic", "final"), app.state if run_id else None))
+        options.update(web_prompt_options(effective_body, ("author", "critic", "convention", "final"), app.state if run_id else None))
         options["workflow_stages"] = stages
         options["original_content"] = app.state.get("originalContent") or content if run_id else content
         options["source_file"] = body.get("sourceFile", app.state.get("sourceFile") if run_id else None)
-        if stages["review"]:
-            legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
-            review_prompts = web_prompt_options(effective_body, ("review",), app.state if run_id else None)
-            app.start_review(content, feedback=body.get("feedback", ""),
-                             review_model=body.get("reviewModel", app.state["reviewModel"] if run_id else DEFAULT_REVIEW_MODEL),
-                             review_effort=body.get("reviewEffort", legacy_effort),
-                             **review_prompts, **options, revise_existing=bool(run_id))
-        else:
-            if run_id:
-                raise ValueError("Start a workflow without statement review from the home screen.")
-            app.start_direct_statement(content, **options)
+        if tokens:
+            options["related_works"] = tokens
+        if _folder_batch:
+            options["folder_batch"] = _folder_batch
+        try:
+            if stages["review"]:
+                legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
+                review_prompts = web_prompt_options(effective_body, ("review",), app.state if run_id else None)
+                app.start_review(content, feedback=body.get("feedback", ""),
+                                 review_model=body.get("reviewModel", app.state["reviewModel"] if run_id else DEFAULT_REVIEW_MODEL),
+                                 review_effort=body.get("reviewEffort", legacy_effort),
+                                 **review_prompts, **options, revise_existing=bool(run_id), _prepare_only=_prepare_only)
+            else:
+                if run_id:
+                    raise ValueError("Start a workflow without statement review from the home screen.")
+                app.start_direct_statement(content, **options, _prepare_only=_prepare_only)
+        except BaseException:
+            if created and tokens and app.process is None and not app.has_active_worker():
+                # Nothing ran: remove the new run folder; the uploads stay valid for another try.
+                app.discard_unstarted_run()
+            raise
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        for token in tokens:
+            self._uploads().discard(token)
         return app
 
 
@@ -4874,6 +8220,8 @@ class Server(ThreadingHTTPServer):
             "retrieval_mode": body.get("retrievalMode", "live"),
             "retrieval_cutoff_utc": body.get("retrievalCutoffUtc", ""),
             "critic_rounds": body.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            "critic_count": body.get("criticCount", DEFAULT_CRITIC_COUNT),
+            "author_subagents": body.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
             "thinking_hours": body.get("thinkingHours", DEFAULT_THINKING_HOURS),
             "author_model": body.get("authorModel", DEFAULT_AUTHOR_MODEL),
             "critic_model": body.get("criticModel", DEFAULT_CRITIC_MODEL),
@@ -4882,7 +8230,7 @@ class Server(ThreadingHTTPServer):
             "author_effort": body.get("authorEffort", legacy_effort),
             "critic_effort": body.get("criticEffort", legacy_effort),
             "writer_effort": body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("author", "critic", "final")),
+            **web_prompt_options(body, ("author", "critic", "convention", "final")),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
@@ -4893,6 +8241,8 @@ class Server(ThreadingHTTPServer):
 
         if run_id:
             raise ValueError("Start a direct proof from the home screen.")
+        if body.get("relatedWorks"):
+            raise ValueError("Related works are attached with Start workflow.")
         app = App(runs=self.runs, load_latest=False)
         app.start_direct_statement(
             statement=body.get("statement", ""), **self._direct_options(body),
@@ -4902,11 +8252,14 @@ class Server(ThreadingHTTPServer):
         return app
 
     def start_direct_batch(self, body, run_id=""):
-        """Start one direct proof job per statement, all sharing one set of settings.
+        """Start one proof job per statement, all sharing one set of settings.
 
         Every statement and the shared settings are validated before any job
-        starts. Each job is an ordinary /direct job (statement review skipped)
-        in its own run folder, and the jobs run in parallel.
+        starts. Each job is an ordinary /direct job (statement review skipped,
+        unless the selected stages include it) in its own run folder. The jobs
+        start at once up to the running-jobs limit and wait in a queue after
+        that. A job that cannot be created or started never stops the others:
+        it is tried again every minute, and the returned BatchStart says so.
         """
 
         if run_id:
@@ -4935,8 +8288,10 @@ class Server(ThreadingHTTPServer):
                     f"{label} is longer than {MAX_BATCH_STATEMENT_CHARS:,} characters."
                 )
             statements.append((name, statement.strip()))
+        # The batch's related works go to its own store, linked into every job it creates.
+        tokens = related_works_tokens(body["relatedWorks"]) if "relatedWorks" in body else []
         options = self._direct_options(
-            {key: value for key, value in body.items() if key != "statements"}
+            {key: value for key, value in body.items() if key not in {"statements", "relatedWorks"}}
         )
         # The jobs share these settings: reject them once, before any job starts.
         validation_options = dict(options)
@@ -4949,18 +8304,63 @@ class Server(ThreadingHTTPServer):
         historical = normalized["retrievalMode"] == "historical"
         if historical and len(statements) > 10:
             raise ValueError("Historical search supports at most 10 statements per launch so every sandbox can be checked before work starts.")
+        review = "workflowStages" in body and normalized["workflowStages"]["review"]
+        if review and historical:
+            raise ValueError("Historical search requires the statement review stage to be disabled.")
+        if tokens and not normalized["workflowStages"]["author"]:
+            raise ValueError("Related works are read by the proof author; turn on the Author stage or remove them.")
+        if tokens:
+            self._uploads().peek(tokens)
+        shared = {key: value for key, value in body.items() if key not in {"statements", "relatedWorks"}}
         # ``current`` indexes the statement being handled; None means a step
         # shared by the whole historical batch.
-        started, current = [], 0
+        started, current, notes = BatchStart(), 0, []
+        # Every folder batch has a related-works store, so related works can be added to it later.
+        batch_id = related_works.new_batch_id()
+        store = folder_batch_store(self.runs, batch_id)
+        if tokens:
+            try:
+                store.install(tokens, self._uploads(), keep_staged=True)
+            except BaseException:
+                shutil.rmtree(store.root, ignore_errors=True)
+                raise
+        started.folder_batch = batch_id
+
+        def label(index):
+            return statements[index][0] or f"statement {index + 1}"
+
+        def settle_uploads():
+            # The store keeps its own copy once a job uses it; otherwise the uploads stay valid.
+            if started or any(item.get("folderBatch") == batch_id for item in getattr(self, "_pending_jobs", [])):
+                for token in tokens:
+                    self._uploads().discard(token)
+            elif tokens:
+                shutil.rmtree(store.root, ignore_errors=True)
+
         try:
             for current, (name, statement) in enumerate(statements):
-                if "workflowStages" in body and normalized["workflowStages"]["review"]:
+                app = App(runs=self.runs, load_latest=False)
+                pending = ({"body": {**shared, "content": statement, "sourceFile": name}} if review
+                           else {"options": dict(options)})
+                try:
+                    if review:
+                        self.start_workflow(pending["body"], app=app, _prepare_only=True, _folder_batch=batch_id)
+                    else:
+                        app.start_direct_statement(statement, source_file=name, _prepare_only=True,
+                                                   folder_batch=batch_id, **options)
+                except Exception as exc:
                     if historical:
-                        raise ValueError("Historical search requires the statement review stage to be disabled.")
-                    app = self.start_workflow({**body, "content": statement, "sourceFile": name})
-                else:
-                    app = App(runs=self.runs, load_latest=False)
-                    app.start_direct_statement(statement, source_file=name, _prepare_only=historical, **options)
+                        raise
+                    # Nothing started: drop the half-made folder, and create it again every minute.
+                    app.discard_unstarted_run()
+                    self._pending_jobs = getattr(self, "_pending_jobs", [])
+                    self._pending_jobs.append({"name": name, "statement": statement, **pending,
+                                               "folderBatch": batch_id,
+                                               "retryAt": time.time() + AUTO_RESUME_SECONDS, "error": str(exc)})
+                    notes.append(f"Could not create the job for {label(current)} "
+                                 f"({str(exc).rstrip('.') or type(exc).__name__}); TCS Prover tries again every "
+                                 f"{retry_interval_text()} while it runs.")
+                    continue
                 started.append(app)
                 with self.jobs_lock:
                     self.jobs[app.state["runId"]] = app
@@ -4980,37 +8380,60 @@ class Server(ThreadingHTTPServer):
                 current = None
                 if normalized["workflowStages"]["writing"]:
                     retrieval.preflight_compiler(started[0].state["retrievalPolicyPath"])
-                for current, app in enumerate(started):
+                for app in started:
                     with app.lock:
-                        app.state["launchHold"] = ""
+                        # Every sandbox passed: the jobs join the queue.
+                        app.state.update(launchHold="", launchQueued=True, queuedAt=time.time())
                         app._save_job_settings(app.state)
-                        app.start_prepared_run()
         except Exception as exc:
-            # A launch failed after validation (for example, the disk is full). Stop
-            # the jobs this request started so a retry cannot duplicate them.
-            stopped = held = 0
+            # Only a historical batch gets here: no model has started, and the
+            # prepared jobs stay held.
+            held = 0
+            retrying = isinstance(exc, retrieval.PreflightRetry)
             for app in started:
-                prepared = app.state.get("phase") == "prepared"
-                held, stopped = held + prepared, stopped + (not prepared)
                 try:
-                    if prepared:
-                        app.state["launchHold"] = "Historical batch launch failed. Create a new batch."
-                        app._save_job_settings(app.state)
-                    else:
-                        app.stop()
+                    # Each held job names the cause and starts once its own checks
+                    # pass: automatically for a check that could not finish.
+                    cause = (retrieval.PreflightRetry if retrying else retrieval.NeedsAttention
+                             if isinstance(exc, retrieval.NeedsAttention) else ValueError)
+                    with app.lock:
+                        app._hold_after_failed_check(cause(
+                            f"Historical batch launch failed: {str(exc).rstrip('.') or type(exc).__name__}."))
+                    held += 1
                 except (OSError, ValueError):
                     pass
-            target = "the historical batch" if current is None else (
-                "the job for " + (statements[current][0] or f"statement {current + 1}")
-            )
+            target = "the historical batch" if current is None else f"the job for {label(current)}"
             detail = str(exc).rstrip(".") or type(exc).__name__
             message = f"Could not start {target}: {detail}."
-            if stopped:
-                message += f" The {stopped} job{'s' if stopped != 1 else ''} it had already started were stopped."
             if held:
-                message += (f" The {held} prepared job{'s are' if held != 1 else ' is'} "
-                            "held and will not start.")
+                message += (f" The {held} prepared job{'s are' if held != 1 else ' is'} held"
+                            + ("; each starts once its checks pass, which run again every minute."
+                               if retrying else "; choose Re-run preflight on each after fixing the cause."))
             raise ValueError(message) from exc
+        finally:
+            settle_uploads()
+        # Start what the running-jobs limit allows; the others wait in the queue.
+        free, queued = self.free_slots(), 0
+        for app in started:
+            if free <= 0:
+                queued += 1
+                continue
+            app.start_queued_if_due()
+            if app.occupies_slot():
+                free -= 1
+            elif app.state.get("launchHold"):
+                notes.append(f"The job for {app.state.get('sourceFile') or app.state['runId']} is held: "
+                             f"{app.state['launchHold']}")
+            elif app.state.get("launchError"):
+                notes.append(f"Could not start the job for {app.state.get('sourceFile') or app.state['runId']} "
+                             f"({app.state['launchError'].removeprefix('Could not start: ').rstrip('.')}); it is "
+                             f"tried again every {retry_interval_text()}.")
+        if queued:
+            limit = getattr(self, "installation", {}).get("maxRunningJobs", 0)
+            notes.insert(0, f"{queued} job{'s wait' if queued != 1 else ' waits'} in the queue: at most {limit} "
+                            f"job{'s run' if limit != 1 else ' runs'} at once, and the next one starts when one "
+                            "finishes or pauses.")
+        started.notice = " ".join(notes)
         return started
 
     def start_latex_job(self, body, run_id=""):
@@ -5037,9 +8460,7 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def start_saved_critic_job(
-        self, source_run, settings=None, include_audit_checkpoint=True,
-    ):
+    def start_saved_critic_job(self, source_run, settings=None):
         """Create a browser-visible job from one saved complete proof."""
 
         settings = {**saved_research_source(source_run)["settings"], **(settings or {})}
@@ -5049,6 +8470,11 @@ class Server(ThreadingHTTPServer):
         source = saved_critic_source(source_run)
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
+            historical = self._historical_source_job(source["run_dir"])
+        if historical is not None:
+            # A new run cannot take over its policy; its saved settings stay.
+            historical.continue_historical("critic")
+            return historical
         app = App(runs=self.runs, load_latest=False)
         app.start_critic_resume(
             statement=source["statement"],
@@ -5057,6 +8483,8 @@ class Server(ThreadingHTTPServer):
             critic_rounds=settings.get(
                 "criticRounds", DEFAULT_CRITIC_ROUNDS
             ),
+            critic_count=settings.get("criticCount", DEFAULT_CRITIC_COUNT),
+            author_subagents=settings.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
             thinking_hours=settings.get(
                 "thinkingHours", DEFAULT_THINKING_HOURS
             ),
@@ -5075,15 +8503,12 @@ class Server(ThreadingHTTPServer):
             critic_prompt=settings.get(
                 "criticPrompt", source["critic_prompt"]
             ),
+            convention_prompt=settings.get("conventionPrompt", source["convention_prompt"]),
             final_prompt=settings.get("finalPrompt", source["final_prompt"]),
             speed_mode=settings.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=settings.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
             ),
-            audit_checkpoint=(
-                source["audit_checkpoint"] if include_audit_checkpoint else ""
-            ),
-            recover_audit_checkpoint=include_audit_checkpoint,
             workflow_stages=stages, original_content=settings.get("originalContent"),
         )
         with self.jobs_lock:
@@ -5096,11 +8521,17 @@ class Server(ThreadingHTTPServer):
         source = saved_research_source(source_run)
         with self.jobs_lock:
             self._check_author_workspace_idle(source["run_dir"])
+            historical = self._historical_source_job(source["run_dir"])
+        if historical is not None:
+            historical.continue_historical("author")
+            return historical
         options = {**source["settings"], **(settings or {})}
         app = App(runs=self.runs, load_latest=False)
         app.start_direct_statement(
             source["statement"],
             critic_rounds=options.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
+            critic_count=options.get("criticCount", DEFAULT_CRITIC_COUNT),
+            author_subagents=options.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
             thinking_hours=options.get("thinkingHours", DEFAULT_THINKING_HOURS),
             author_model=options.get("authorModel", DEFAULT_AUTHOR_MODEL),
             critic_model=options.get("criticModel", DEFAULT_CRITIC_MODEL),
@@ -5111,6 +8542,7 @@ class Server(ThreadingHTTPServer):
             writer_effort=options.get("writerEffort"),
             author_prompt=options.get("authorPrompt"),
             critic_prompt=options.get("criticPrompt"),
+            convention_prompt=options.get("conventionPrompt"),
             final_prompt=options.get("finalPrompt"),
             speed_mode=options.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
@@ -5131,11 +8563,155 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def _check_author_workspace_idle(self, source_run):
-        """Keep two author processes from updating one shared workspace."""
+    # --- Related works of a folder batch -------------------------------------------------------------------------
 
-        workspace = saved_goal_options(source_run)["goalWorkspace"]
+    def _folder_batch_id(self, batch_id="", run_id=""):
+        """The folder batch a batch route names: by its ID, or through one of its jobs."""
+
+        if batch_id and batch_id != "__root__":
+            if not FOLDER_BATCH_ID.match(batch_id):
+                raise ValueError("That folder batch is not available in this TCS Prover session.")
+            return batch_id
+        if run_id:
+            app = self.get_job(run_id)
+            with app.lock:
+                batch = app.state.get("folderBatch")
+            if not batch:
+                raise ValueError("This job was not started from a folder, so it has no batch related works.")
+            return batch
+        raise ValueError("Name the folder batch.")
+
+    def _folder_batch_members(self, batch_id):
+        """(the batch's jobs in this session, whether some of its jobs wait to be created)."""
+
+        with self.jobs_lock:
+            jobs = [app for app in self.jobs.values() if app.state.get("folderBatch") == batch_id]
+        waiting = any(item.get("folderBatch") == batch_id for item in getattr(self, "_pending_jobs", []))
+        return jobs, waiting
+
+    @staticmethod
+    def _folder_batch_problem(jobs, waiting):
+        """Why nothing can be added to a folder batch now, or "" (some job's author can still read it)."""
+
+        problems = [app.related_works_problem() for app in jobs]
+        if waiting or any(not problem for problem in problems):
+            return ""
+        if not jobs:
+            return "That folder batch is not available in this TCS Prover session."
+        elsewhere = next((app.state["runningElsewhere"] for app in jobs if app.state.get("runningElsewhere")), "")
+        if elsewhere:
+            return elsewhere
+        if not any(saved_workflow_stages(app.state)["author"] for app in jobs):
+            return "Related works are read by the proof author; this batch's jobs have no Author stage."
+        return "Every job of this batch has finished; continue one to add related works."
+
+    def batch_related_works(self, batch_id="", run_id=""):
+        """The related works a folder batch shares: {id, available, reason, count, items, runIds}."""
+
+        batch_id = self._folder_batch_id(batch_id, run_id)
+        jobs, waiting = self._folder_batch_members(batch_id)
+        if not jobs and not waiting:
+            raise ValueError("That folder batch is not available in this TCS Prover session.")
+        problem = self._folder_batch_problem(jobs, waiting)
+        items = folder_batch_store(self.runs, batch_id).listing()
+        return {"id": batch_id, "available": not problem, "reason": problem, "count": len(items), "items": items,
+                "runIds": sorted(app.state["runId"] for app in jobs)}
+
+    def add_batch_related_works(self, tokens, batch_id="", run_id=""):
+        """Add uploads to a folder batch's store and link them into every job of the batch.
+
+        Each workspace is linked once (continuations share their source's), so
+        each job's author is told once, by the usual notice rule. A job whose
+        folder cannot take them is reported; the others still get them. Jobs of
+        the batch created later link everything the store holds.
+        """
+
+        tokens = related_works_tokens(tokens)
+        batch_id = self._folder_batch_id(batch_id, run_id)
+        jobs, waiting = self._folder_batch_members(batch_id)
+        problem = self._folder_batch_problem(jobs, waiting)
+        if problem:
+            raise ValueError(problem)
+        store = folder_batch_store(self.runs, batch_id)
+        names = [entry["name"] for entry in store.install(tokens, self._uploads())]
+        results, notes, groups = [], [], {}
+        for app in jobs:
+            with app.lock:
+                if app.state.get("runningElsewhere"):
+                    skipped = app.state["runningElsewhere"]
+                elif app.run_dir is None:
+                    skipped = "This job has no run folder."
+                elif not saved_workflow_stages(app.state)["author"]:
+                    skipped = "Related works are read by the proof author; this job has no Author stage."
+                else:
+                    skipped = ""
+                workspace = "" if skipped else str(app._author_workspace())
+            if skipped:
+                results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": skipped})
+                # The page shows only the notice: a job that did not get them is named there.
+                notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: {skipped.rstrip('.')}")
+                continue
+            groups.setdefault(workspace, []).append(app)
+        for workspace, apps in groups.items():
+            # The job whose run folder is the workspace is recorded as adding them.
+            owner = next((app for app in apps if app.run_dir.resolve() == Path(workspace)), apps[0])
+            try:
+                # Everything the store holds that this workspace lacks (link_into never links an item
+                # twice), so a job that missed an earlier addition gets it now too.
+                outcome = owner.link_batch_related_works(store, None, owner.run_dir.name)
+            except (OSError, ValueError) as exc:
+                for app in apps:
+                    results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": str(exc)})
+                    try:
+                        app.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "folderBatch": batch_id,
+                                       "text": f"The folder batch's new related works could not be linked into this "
+                                               f"job's related-works folder: {exc}"})
+                    except OSError:
+                        pass
+                notes.append(f"{', '.join(app.state.get('sourceFile') or app.state['runId'] for app in apps)}: "
+                             f"{str(exc).rstrip('.')}")
+                continue
+            added = [entry["name"] for entry in outcome["entries"]]
+            for app in apps:
+                try:
+                    notice = app.batch_related_works_linked(batch_id, outcome["entries"], outcome["diagnostic"])
+                except (OSError, ValueError) as exc:
+                    # The files are in its folder; only its record or notice failed. The others go on.
+                    results.append({"runId": app.state["runId"], "added": added, "notice": "", "problem": str(exc)})
+                    notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: the related works are in its "
+                                 f"folder, but its author could not be told ({str(exc).rstrip('.')})")
+                    continue
+                results.append({"runId": app.state["runId"], "added": added, "notice": notice, "problem": ""})
+        listing = self.batch_related_works(batch_id)
+        return {**listing, "added": names, "results": results,
+                "notice": (f"Could not add them to every job: {'; '.join(notes)}." if notes else "")}
+
+    def _historical_source_job(self, source_run):
+        """The registered job of a historical source run, which continues in place."""
+        source_run = Path(source_run).resolve()
+        for app in self.jobs.values():
+            if (app.run_dir is not None and app.run_dir.resolve() == source_run
+                    and (app.state.get("retrievalPolicyPath") or app.state.get("retrievalMode") == "historical")):
+                return app
+        return None
+
+    def _check_author_workspace_idle(self, source_run, exclude=None):
+        """Keep two author processes from updating one shared workspace (``exclude``: the job asking)."""
+
+        try:
+            workspace = saved_goal_options(source_run)["goalWorkspace"]
+        except ValueError:
+            # A web-cutoff run works in its own folder, which a moved checkout moved
+            # with it; its check adopts the new paths before anything starts.
+            if self._historical_source_job(source_run) is None:
+                raise
+            workspace = str(Path(source_run).resolve())
+        holder = ownership.held_elsewhere(workspace)
+        if holder is not None:
+            raise ownership.OwnedElsewhere(ownership.describe(holder), holder)
         for previous in self.jobs.values():
+            if previous is exclude:
+                continue
             if not previous.run_dir or not (
                 previous.has_active_worker()
                 or previous.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
@@ -5150,11 +8726,15 @@ class Server(ThreadingHTTPServer):
 
         with self.jobs_lock:
             app = self.get_job(run_id)
+            with app.lock:
+                refusal = app.resume_refusal()
+            if refusal:
+                raise ValueError(refusal)
             self._check_author_workspace_idle(app.run_dir)
             app.resume()
         return app
 
-    def resume_critic_job(self, run_id, include_audit_checkpoint=True):
+    def resume_critic_job(self, run_id):
         """Resume an idle job from its saved proof using its role settings."""
 
         source_app = self.get_job(run_id)
@@ -5165,17 +8745,14 @@ class Server(ThreadingHTTPServer):
             )
         settings = {
             key: source_state.get(key) for key in (
-                "criticRounds", "thinkingHours", "authorModel",
+                "criticRounds", "criticCount", "authorSubagents", "thinkingHours", "authorModel",
                 "criticModel", "writerModel", "reasoningEffort",
                 "authorEffort", "criticEffort", "writerEffort",
                 "speedMode", "reasoningSummary", "authorPrompt",
                 "workflowStages", "originalContent",
             )
         }
-        return self.start_saved_critic_job(
-            source_app.run_dir, settings,
-            include_audit_checkpoint=include_audit_checkpoint,
-        )
+        return self.start_saved_critic_job(source_app.run_dir, settings)
 
     def resume_checkpoint_job(self, run_id, checkpoint_id):
         """Continue one explicit durable checkpoint in a new browser job."""
@@ -5193,41 +8770,59 @@ class Server(ThreadingHTTPServer):
         )
         if not checkpoint or not checkpoint.get("resumable"):
             raise ValueError("That checkpoint is not available for continuation.")
-        return self.resume_critic_job(
-            run_id,
-            include_audit_checkpoint=checkpoint_id != "candidate",
-        )
+        return self.resume_critic_job(run_id)
 
     @staticmethod
     def _stopped_continuation_plan(source_app, state=None):
         """Describe a durable restart for manual stops, exhaustion, or errors."""
 
         state = source_app.snapshot() if state is None else state
-        if (state.get("resultKind") in {"final", "proof", "review"}
-                and not state.get("manuallyStopped") and not state.get("error")):
-            return None
         if (
             state.get("phase") in {"reviewing", "running", "stopping", "pausing"}
             or source_app.has_active_worker()
         ):
             return None
+        historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+        # Also after a finished result: a held run's critic can run again once the hold is released.
+        if historical and state.get("retrievalPolicyPath") and recheckable_hold(state.get("launchHold")):
+            return {"action": "preflight", "label": "Re-run preflight",
+                    "description": f"Checks this run's {historical_checks(saved_workflow_stages(state))} again; "
+                                   "once they pass, the hold is released and a prepared or paused run continues."}
+        if (state.get("resultKind") in {"final", "proof", "review"}
+                and not state.get("manuallyStopped") and not state.get("error")):
+            return None
+        if state.get("phase") == "paused" and state.get("timeLimitExhausted"):
+            # Resume would be refused: the job page raises the limit first.
+            return None
         if state.get("phase") == "paused" and not (
-                state.get("sessionUnavailable") and state.get("stage") in {"solve", "repair"}
-                and not state.get("retrievalPolicyPath") and state.get("retrievalMode") != "historical"):
+                state.get("sessionUnavailable") and state.get("stage") in {"solve", "repair"}):
             return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
         if state.get("phase") == "prepared":
             if state.get("launchHold"):
                 return None
+            if state.get("launchQueued"):
+                return {"action": "prepared", "label": "Start now",
+                        "description": "Start this queued job now, ahead of the queue and the running-jobs limit."}
             return {"action": "prepared", "label": "Start prepared run",
                     "description": "Start a fresh author session in this prepared research workspace."}
-        if state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical":
-            # Every other continuation creates a new run, which a historical
-            # run's fixed workspace and cutoff do not allow.
-            return None
+        if historical:
+            # Its policy binds this workspace and cutoff: continue in place.
+            return Server._historical_continuation_plan(source_app, state)
         stage = state.get("stoppedStage") or state.get("stage")
+        # A saved LaTeX source is compiled again instead of paying for another editor request.
+        latex = source_app.run_dir / "latex-source.tex" if source_app.run_dir else None
+        recompile = {
+            "action": "final",
+            "label": "Retry LaTeX compilation",
+            "description": (
+                "Compiles the saved LaTeX source again in a new run, without another "
+                "LaTeX-editor request; compiler errors go to the LaTeX repair step."
+            ),
+        } if latex is not None and latex.is_file() and not latex.is_symlink() else None
         if stage == "final" and state.get("error") and state.get("finalInputReady"):
-            return {"action": "final", "label": "Retry LaTeX editor",
-                    "description": "Retry only the writing stage from its exact saved statement and existing work."}
+            return recompile or {
+                "action": "final", "label": "Retry LaTeX editor",
+                "description": "Retry only the writing stage from its exact saved statement and existing work."}
         if (
             source_app.run_dir and stage in {"solve", "repair", "failure"}
             and not (source_app.run_dir / "final.tex").is_file()
@@ -5262,7 +8857,16 @@ class Server(ThreadingHTTPServer):
                     "author repair receives its exact recovery assignment."
                 ),
             }
-        if not state.get("manuallyStopped"):
+        if (state.get("phase") in {"input", "reviewed"} and state.get("error") and state.get("reviewInputRecorded")
+                and state.get("reviewStatement", "").strip()):
+            # A failed or interrupted review runs again in this job, feedback included.
+            return {"action": "review", "label": "Retry statement review", "inPlace": True,
+                    "description": "Runs the statement review again in this job from its saved input, with the "
+                                   "same feedback, settings and prompt."}
+        # The stage-specific retries are for a stage that ended without its result:
+        # stopped by the user, failed, or interrupted where it could not continue by itself.
+        if not (state.get("manuallyStopped")
+                or (state.get("error") and state.get("resultKind") not in {"final", "proof", "review", "needs-revision"})):
             return None
         if stage == "review" and state.get("reviewStatement", "").strip():
             legacy_input_warning = (
@@ -5309,8 +8913,8 @@ class Server(ThreadingHTTPServer):
                 "action": "critic",
                 "label": "Continue critic",
                 "description": (
-                    "Restores the saved proof for a fresh critic call and "
-                    "independent subagents in a new run with a renewed time budget."
+                    "Restores the saved proof for fresh independent critics and "
+                    "their coordinator in a new run with a renewed time budget."
                 ),
             }
         if stage == "final":
@@ -5318,6 +8922,8 @@ class Server(ThreadingHTTPServer):
                 ready = (source_app.run_dir / "latex-input.md").is_file()
             else:
                 ready = bool(state.get("finalInputReady"))
+            if ready and recompile:
+                return recompile
             if ready:
                 return {
                     "action": "final",
@@ -5339,8 +8945,48 @@ class Server(ThreadingHTTPServer):
         return None
 
     @staticmethod
+    def _historical_continuation_plan(source_app, state):
+        """In-place continuations of a stopped historical run (see App.continue_historical)."""
+        run_dir = source_app.run_dir
+        if run_dir is None or state.get("launchHold"):
+            return None
+        # Only stages this run's workflow selected continue.
+        stages = saved_workflow_stages(state)
+        stage = state.get("stoppedStage") or state.get("stage")
+        budget = " The time budget starts again."
+        if stage in {"solve", "repair", "failure"} and stages["author"] and not (run_dir / "final.tex").is_file():
+            try:
+                saved_statement(run_dir)
+            except ValueError:
+                return None
+            gone = state.get("phase") == "paused" and state.get("sessionUnavailable")
+            return {"action": "author", "inPlace": True, "label": "Continue proof author", "description": (
+                "The saved author conversation cannot be reopened (its thread ID is missing): starts a new "
+                "author conversation in this same run folder, under the saved web cutoff, with the YAML resume "
+                "prompt." if gone else
+                "Continues the author in this same run folder under the saved web cutoff, resuming the saved "
+                "author conversation when it still exists.") + budget}
+        candidate = (run_dir / runtime.SAVED_CANDIDATE_FILENAME).is_file() or (run_dir / "SOLUTION.md").is_file()
+        if stage == "final" and stages["writing"] and state.get("finalInputReady"):
+            return {"action": "final", "inPlace": True, "label": "Retry LaTeX editor",
+                    "description": "Runs the LaTeX stage again from the exact saved final input in this same run "
+                                   "folder under the saved web cutoff." + budget}
+        if stage in {"critic", "final"} and stages["critic"] and candidate:
+            return {"action": "critic", "inPlace": True, "label": "Continue critic",
+                    "description": "Runs the critic again on the saved proof in this same run folder under the "
+                                   "saved web cutoff." + budget}
+        return None
+
+    @staticmethod
     def _queue_saved_author_instructions(source_app, target_app):
-        """Replay prior user steering into a newly created author process."""
+        """Replay prior user steering into a newly created author process.
+
+        Every earlier instruction is queued as one block when they fit in one
+        live instruction. Otherwise the whole history is written to
+        INSTRUCTION_HISTORY_FILENAME in the author's workspace, and the block
+        points the author to it before repeating the newest instructions that
+        fit (the oldest are left to the file).
+        """
 
         if not saved_workflow_stages(target_app.state)["author"]:
             return
@@ -5351,16 +8997,46 @@ class Server(ThreadingHTTPServer):
         combined = (
             "\n\n".join(instructions)
         )
+        stage = target_app.state.get("stage") or "solve"
+        note = ""
+        if len(combined) > runtime.AUTHOR_STEER_MAX_CHARS:
+            workspace = Path(target_app.state.get("goalWorkspace") or target_app.run_dir)
+            try:
+                runtime._private_atomic_write(workspace / INSTRUCTION_HISTORY_FILENAME,
+                                              instruction_history(instructions),
+                                              staging_directory=target_app.run_dir.parent)
+                lead = RESTORED_INSTRUCTIONS_NOTE
+            except (OSError, UnicodeError, ValueError, runtime.Error) as exc:
+                lead = ""
+                target_app.add_trace({"kind": "diagnostic", "stage": stage, "node": "author",
+                                      "text": f"The earlier live instructions could not be saved to "
+                                              f"{INSTRUCTION_HISTORY_FILENAME}: {exc}"})
+            kept, size = [], len(lead)
+            for instruction in reversed(instructions):
+                additional = len(instruction) + (2 if lead or kept else 0)
+                if size + additional > runtime.AUTHOR_STEER_MAX_CHARS:
+                    break  # The oldest are left out first.
+                kept.insert(0, instruction)
+                size += additional
+            combined = "\n\n".join([lead, *kept] if lead else kept)
+            left = len(instructions) - len(kept)
+            note = (f"{left} older instruction{'s are' if left != 1 else ' is'} only in "
+                    f"{INSTRUCTION_HISTORY_FILENAME}, which the author is asked to read." if lead
+                    else f"{left} older instruction{'s were' if left != 1 else ' was'} left out because "
+                         "they do not fit in one live instruction.")
         command_id = target_app._write_author_steer(combined)
         target_app.add_trace({
             "kind": "status",
-            "stage": target_app.state.get("stage") or "solve",
+            "stage": stage,
             "node": "author",
             "label": "Restored live instructions queued",
             "text": combined,
             "restoredInstructions": instructions,
             "steerId": command_id,
         })
+        if note:
+            target_app.add_trace({"kind": "status", "stage": stage, "node": "author",
+                                  "label": "Earlier live instructions shortened", "text": note})
 
     def continue_stopped_job(self, run_id):
         """Continue a saved stage with new logs and the existing author workspace."""
@@ -5369,7 +9045,11 @@ class Server(ThreadingHTTPServer):
         with self.jobs_lock:
             source_app = self.get_job(run_id)
             with source_app.lock:
-                return self._continue_stopped_job_locked(source_app)
+                plan = self._stopped_continuation_plan(source_app)
+                if not plan or plan["action"] != "preflight":
+                    return self._continue_stopped_job_locked(source_app)
+        # Its checks can take a minute: never hold the job list meanwhile.
+        return source_app.rerun_historical_preflight()
 
     def _continue_stopped_job_locked(self, source_app):
         """Create a continuation while holding the source job lock."""
@@ -5381,16 +9061,22 @@ class Server(ThreadingHTTPServer):
             raise ValueError(
                 "This job has no saved stage available to continue."
             )
+        if plan.get("inPlace") and plan["action"] == "review":
+            # A failed or interrupted statement review runs again in its own job.
+            source_app.retry_review()
+            return source_app
+        if plan.get("inPlace"):
+            self._check_author_workspace_idle(source_app.run_dir)
+            source_app.continue_historical(plan["action"])
+            return source_app
         if plan["action"] == "resume":
             return self.resume_paused_job(source_state["runId"])
         if plan["action"] == "prepared":
             self._check_author_workspace_idle(source_app.run_dir)
-            source_app.start_prepared_run()
+            source_app.start_queued()
             return source_app
         if plan["action"] == "critic":
-            continued = self.resume_critic_job(
-                source_state["runId"], include_audit_checkpoint=True,
-            )
+            continued = self.resume_critic_job(source_state["runId"])
             if isinstance(continued, App):
                 self._queue_saved_author_instructions(source_app, continued)
             return continued
@@ -5408,6 +9094,8 @@ class Server(ThreadingHTTPServer):
                 statement=source_state["reviewStatement"],
                 feedback=source_state["reviewFeedback"],
                 critic_rounds=source_state["criticRounds"],
+                critic_count=source_state["criticCount"],
+                author_subagents=source_state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
                 thinking_hours=source_state["thinkingHours"],
                 review_model=source_state["reviewModel"],
                 author_model=source_state["authorModel"],
@@ -5421,6 +9109,7 @@ class Server(ThreadingHTTPServer):
                 review_prompt=source_state["reviewPrompt"],
                 author_prompt=source_state["authorPrompt"],
                 critic_prompt=source_state["criticPrompt"],
+                convention_prompt=source_state.get("conventionPrompt"),
                 final_prompt=source_state["finalPrompt"],
                 review_only=source_state["statementReviewOnly"],
                 workflow_stages=source_state["workflowStages"],
@@ -5431,6 +9120,8 @@ class Server(ThreadingHTTPServer):
             self._check_author_workspace_idle(source_run)
             author_options = {
                 "critic_rounds": source_state["criticRounds"],
+                "critic_count": source_state["criticCount"],
+                "author_subagents": source_state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS),
                 "thinking_hours": source_state["thinkingHours"],
                 "author_model": source_state["authorModel"],
                 "critic_model": source_state["criticModel"],
@@ -5441,6 +9132,7 @@ class Server(ThreadingHTTPServer):
                 "writer_effort": source_state["writerEffort"],
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
+                "convention_prompt": source_state.get("conventionPrompt"),
                 "final_prompt": source_state["finalPrompt"],
                 "workflow_stages": {**source_state["workflowStages"], "review": False},
                 "original_content": source_state.get("originalContent"),
@@ -5452,6 +9144,10 @@ class Server(ThreadingHTTPServer):
             )
             self._queue_saved_author_instructions(source_app, app)
         else:
+            # A saved LaTeX source is compiled again instead of paying for another editor request.
+            latex = source_run / "latex-source.tex"
+            common["latex_source"] = (read_utf8(latex, "saved LaTeX source")
+                                      if latex.is_file() and not latex.is_symlink() else "")
             if source_state["problemMode"] == "latex":
                 final_source = read_utf8(
                     source_run / "latex-input.md", "saved LaTeX input",
@@ -5500,13 +9196,29 @@ class Server(ThreadingHTTPServer):
                     "runId", "phase", "draft", "activeNode", "startedAt",
                     "finishedAt", "lastActivityAt", "error", "problemMode",
                     "manuallyStopped", "stoppedStage",
-                    "settingsWarning",
+                    "settingsWarning", "runningElsewhere",
                     "launchHold", "retrievalPolicyPath", "retrieval", "retrievalMode", "retrievalCutoffUtc",
                     "resultKind", "stage", "workerActive", "processAlive", "activeElapsedSeconds",
                     "workflowStages",
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
+            # The folder batch whose related works the job shares ("" for a job started alone).
+            job["folderBatch"] = state.get("folderBatch") or ""
+            # Whether the paused author is writing a summary or reply (Resume waits for it).
+            job["conversationBusy"] = bool(state.get("conversation", {}).get("busy"))
+            # Whether the running author has an open question (the job page shows it), by the same rules.
+            job["authorQuestionOpen"] = bool(state.get("authorQuestion"))
+            # Why the job needs you (it keeps retrying meanwhile when it can), and when it tries next.
+            job["needsAttention"] = state.get("needsAttention")
+            # The convention critic's loophole warning, until the user ignores it.
+            warning = state.get("conventionWarning")
+            job["loopholeWarning"] = isinstance(warning, dict) and not warning.get("dismissed")
+            job["autoResumeAt"] = state.get("autoResumeAt") or 0
+            retry = state.get("modelRetry") if isinstance(state.get("modelRetry"), dict) else {}
+            job["retryAt"] = retry.get("retryAt") or 0
+            job["launchQueued"] = (bool(state.get("launchQueued")) and state["phase"] == "prepared"
+                                   and not state.get("launchHold"))
             job["stageLabel"] = state["workflow"]["nodes"].get(state["activeNode"], {}).get("label", "")
             job["title"] = (
                 state["problemDescription"].strip().split("\n", 1)[0]
@@ -5516,13 +9228,14 @@ class Server(ThreadingHTTPServer):
             run_dir = app.run_dir
             checkpoints = state.get("checkpoints", [])
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
-            if historical:
-                # Critic continuations start new runs, which historical runs refuse.
+            if historical and state.get("launchHold"):
+                # A held run continues only after Re-run preflight releases it.
                 # Copy: the snapshot shares these dicts with the job's cache.
                 checkpoints = [{**checkpoint, "resumable": False} for checkpoint in checkpoints]
             job["checkpoints"] = checkpoints
+            # A historical run's critic continues in its own folder (start_saved_critic_job).
             job["canResumeCritic"] = bool(
-                not historical
+                not (historical and state.get("launchHold"))
                 and saved_workflow_stages(state)["critic"]
                 and state["phase"] not in {"reviewing", "running", "stopping", "pausing", "paused"}
                 and run_dir
@@ -5530,7 +9243,7 @@ class Server(ThreadingHTTPServer):
                     (run_dir / "SOLUTION.md").is_file()
                     or (run_dir / runtime.SAVED_CANDIDATE_FILENAME).is_file()
                 )
-                and (run_dir / "checked-statement.md").is_file()
+                and controlled_path(run_dir, "checked-statement.md").is_file()
             )
             continuation = self._stopped_continuation_plan(app, state)
             job["canContinueStopped"] = continuation is not None
@@ -5540,6 +9253,7 @@ class Server(ThreadingHTTPServer):
             job["continueStoppedDescription"] = (
                 continuation["description"] if continuation else ""
             )
+            job["continueStoppedInPlace"] = bool(continuation and continuation.get("inPlace"))
             jobs.append(job)
         return sorted(jobs, key=lambda job: job["startedAt"], reverse=True)
 
@@ -5551,6 +9265,8 @@ class Server(ThreadingHTTPServer):
             if not app:
                 raise ValueError("That job is not available in this TCS Prover session.")
             with app.lock:
+                if app._conversation_running_locked():
+                    raise ValueError("The author is replying. Stop the reply before deleting this job.")
                 if (
                     app.state["phase"] in {"reviewing", "running", "stopping", "pausing"}
                     or app.worker_token is not None
@@ -5568,22 +9284,43 @@ class Server(ThreadingHTTPServer):
                     workspace = other.state.get("goalWorkspace")
                     if workspace and Path(workspace).resolve() == folder.resolve():
                         raise ValueError("Stop the continuation using this author workspace before deleting it.")
-                trash = self.runs / ".trash"
+                trash = self.runs / TRASH_FOLDER
                 trash.mkdir(parents=True, exist_ok=True, mode=0o700)
                 trash.chmod(0o700)
                 target, number = trash / folder.name, 2
                 while target.exists():
                     target = trash / f"{folder.name}-{number}"
                     number += 1
-                folder.rename(target)
+                # Own the run while it moves, so no runner of another process still uses it.
+                app._claims.claim(folder)
+                try:
+                    folder.rename(target)
+                finally:
+                    app._claims.release_all()
+                # The controller's copies go with it (the trash keeps the run folder's).
+                shutil.rmtree(controller_directory(folder), ignore_errors=True)
                 del self.jobs[run_id]
+        # The trash keeps each deleted job for TRASH_KEPT_DAYS days.
+        prune_trash(self.runs)
         return {"deleted": run_id}
 
     def api_model_listing(self):
-        """Saved key connections and the role menus for their discovered models."""
+        """Saved key connections (never their keys), entries that cannot be used, and the role menus.
 
-        connections = providers.load_api_connections()
-        return {"connections": connections, "models": connections, "formats": API_MODEL_FORMATS, **model_menu_settings()}
+        A store that cannot be read is reported (storeProblem), never shown as
+        empty; jobs keep the settings their runner read last meanwhile.
+        """
+
+        try:
+            connections, invalid = providers.store_listing()
+            problem = ""
+        except providers.StoreUnavailable as exc:
+            connections, invalid = [], []
+            problem = (f"{exc} Saved connections cannot be listed or changed until it can be read; running jobs "
+                       f"keep the settings they read last, and waiting jobs check again every {retry_interval_text()}.")
+        return {"connections": connections, "models": connections, "invalid": invalid, "storeProblem": problem,
+                "stateProblem": getattr(self, "state_problem", ""), "formats": API_MODEL_FORMATS,
+                **model_menu_settings()}
 
     def _api_model_jobs(self, model_id):
         """Run ids of the jobs naming one model: (running, waiting to start or resume)."""
@@ -5593,13 +9330,17 @@ class Server(ThreadingHTTPServer):
             apps = list(self.jobs.values())
         for app in apps:
             with app.lock:
-                choices = [app.state.get(f"{role}Model") for role in ROLES]
+                busy = app.state["phase"] in ACTIVE_PHASES or app.worker_token is not None
+                # A paused or prepared job never runs its statement reviewer again (unless that is queued).
+                roles = (ROLES if busy or app.state["phase"] == "reviewed" or app._queued_review()
+                         else ("author", "critic", "writer"))
+                choices = [app.state.get(f"{role}Model") for role in roles]
                 snapshots = saved_api_models(app.state.get("apiModels"))
                 if not any(choice == model_id or
                            (providers.api_model(choice) or snapshots.get(choice) or {}).get("sourceId") == model_id
                            for choice in choices):
                     continue
-                if app.state["phase"] in ACTIVE_PHASES or app.worker_token is not None:
+                if busy:
                     active.append(app.state.get("runId", ""))
                 elif app.state["phase"] in WAITING_PHASES:
                     waiting.append(app.state.get("runId", ""))
@@ -5713,14 +9454,27 @@ class Server(ThreadingHTTPServer):
         return {"connection": connection, "model": connection, **self.api_model_listing()}
 
     def delete_api_model(self, body):
-        """Remove one API model unless a running job uses it."""
+        """Remove one API connection unless a job that runs or waits to start or resume uses one of its models.
 
+        An entry of the store that cannot be used is removed by its ``ref``
+        (see providers.invalid_api_models()) or its id.
+        """
+
+        reference = body.get("ref")
+        if isinstance(reference, str) and reference.startswith("invalid-"):
+            with self.jobs_lock:
+                if not providers.delete_invalid_api_model(reference):
+                    raise ValueError("That entry has changed since the list was read; open the list again.")
+            return {"deleted": reference, "warning": "", **self.api_model_listing()}
         model_id = body.get("id")
         if not providers.is_api_id(model_id):
             raise ValueError("Choose a configured API model to remove.")
         with self.jobs_lock:
-            saved = providers.api_connection(model_id)
+            saved = providers.api_connection(model_id, cached=False)
             if saved is None:
+                if any(entry["id"] == model_id for entry in providers.invalid_api_models()):
+                    providers.delete_api_model(model_id)
+                    return {"deleted": model_id, "warning": "", **self.api_model_listing()}
                 raise ValueError("That API model is not configured.")
             active, waiting = self._api_model_jobs(model_id)
             if active:
@@ -5728,16 +9482,16 @@ class Server(ThreadingHTTPServer):
                     f"{saved['label']} is in use by a running job. Stop that job before removing "
                     "this API model."
                 )
+            if waiting:
+                # A waiting job cannot change its model: it would wait until the model is added again.
+                count = len(waiting)
+                raise ValueError(
+                    f"{saved['label']} is used by {count} job{'s' if count != 1 else ''} waiting to start or "
+                    f"resume, which cannot continue without it. Edit the connection instead, or delete "
+                    f"{'that job' if count == 1 else 'those jobs'} first."
+                )
             providers.delete_api_model(model_id)
-        warning = ""
-        if waiting:
-            count = len(waiting)
-            warning = (
-                f"{count} job{'s' if count != 1 else ''} waiting to start or resume still "
-                f"use{'s' if count == 1 else ''} {saved['label']}; {'it' if count == 1 else 'they'} "
-                "cannot continue until you add it again with the same format, base URL and model ID."
-            )
-        return {"deleted": model_id, "warning": warning, **self.api_model_listing()}
+        return {"deleted": model_id, "warning": "", **self.api_model_listing()}
 
     def discover_api_models(self, body):
         """List the models a new or saved API key can access, before choosing one."""
@@ -5778,18 +9532,19 @@ class Server(ThreadingHTTPServer):
                         "latencyMs": result["latencyMs"], "at": result["testedAt"]})
                     result.update(recorded=True, connection=providers.api_connection(connection["id"]), apiModel=connection)
             return result
-        fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "label")
-                  if key in body}
+        fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "label",
+                                             "contextWindow", "maxOutputTokens") if key in body}
         if requested and not fields and providers.api_model(requested) is None:
             raise ValueError("That API model is not configured.")
         entry, saved = providers.validated_api_model(fields, requested)
-        result = probe_api_endpoint(entry)
-        request_fields = ("format", "baseUrl", "requestSource", "model", "apiKey")
+        result = probe_api_endpoint(entry, effort=body.get("effort"))
+        # The Test asks for the max output too, so a different one is a different test.
+        request_fields = ("format", "baseUrl", "requestSource", "model", "apiKey", "maxOutputTokens")
         result["recorded"] = False
-        if saved is not None and all(saved[key] == entry[key] for key in request_fields):
+        if saved is not None and all(saved.get(key) == entry.get(key) for key in request_fields):
             try:
                 _, current = providers.validated_api_model({}, requested)
-                if current is not None and all(current[key] == entry[key] for key in request_fields):
+                if current is not None and all(current.get(key) == entry.get(key) for key in request_fields):
                     result["apiModel"] = providers.record_api_model_test(requested, {
                         "ok": result["ok"], "status": result["status"], "message": result["message"],
                         "latencyMs": result["latencyMs"], "at": result["testedAt"],
@@ -5799,18 +9554,37 @@ class Server(ThreadingHTTPServer):
                 pass  # Removed or changed during the test: nothing to record.
         return result
 
-    def stop_all(self):
-        """Interrupt every live child when the local server itself closes."""
+    def stop_all(self, wait=SHUTDOWN_WAIT_SECONDS):
+        """Pause running authors and interrupt every other live child when the server closes.
 
+        An author pauses with the cause 'restart', which the next start resumes
+        automatically. Review, critic and LaTeX runners are interrupted; the next
+        start continues them from their saved input. Whatever still runs after
+        `wait` seconds is stopped, so no runner keeps working unobserved.
+        """
+
+        retry_stop = getattr(self, "_retry_stop", None)
+        if isinstance(retry_stop, threading.Event):
+            retry_stop.set()  # No automatic resume starts while the server closes.
         with self.jobs_lock:
             apps = list({id(app): app for app in self.jobs.values()}.values())
+        live = []
         for app in apps:
             with app.lock:
                 process = app.process
+                author = (app.state["phase"] == "running" and app.state["activeNode"] == "author"
+                          and app.state["stage"] in {"solve", "repair"})
             if process is None:
                 continue
+            live.append((app, process))
             # One job that cannot be stopped must not leave the others running.
             try:
+                if author:
+                    try:
+                        app.pause(_for_restart=True)
+                        continue
+                    except (OSError, UnicodeError, TypeError, ValueError):
+                        pass  # Interrupted instead: the next start continues it as an interrupted author.
                 if os.name == "nt":
                     # Windows Popen cannot send SIGINT, and runners in their own
                     # process group never see the console's Ctrl-C.
@@ -5820,6 +9594,28 @@ class Server(ThreadingHTTPServer):
                     process.send_signal(signal.SIGINT)
             except (OSError, ValueError, subprocess.SubprocessError):
                 pass
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline and any(
+                process.poll() is None or app.has_active_worker() for app, process in live):
+            time.sleep(0.1)
+        remaining = [process for _, process in live if process.poll() is None]
+        workers = [threading.Thread(target=stop_process_tree, args=(process,), daemon=True) for process in remaining]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+
+class CountingReader:
+    """A request body stream that counts what it has read (the rest is discarded after a refusal)."""
+
+    def __init__(self, stream):
+        self.stream, self.count = stream, 0
+
+    def read(self, size=-1):
+        data = self.stream.read(size)
+        self.count += len(data)
+        return data
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -5827,6 +9623,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
+
+    def receive_upload(self, query):
+        """POST /uploads?name=: stage one related-work file sent as its raw bytes (at most 64 MiB)."""
+
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return self.send({"error": "Send the file with its Content-Length, without transfer encoding."},
+                             status=400, headers={"Connection": "close"})
+        length = self.headers.get("Content-Length")
+        if length is None or not length.strip().isdigit():
+            self.close_connection = True
+            return self.send({"error": "Send the file's size in its Content-Length."}, status=411,
+                             headers={"Connection": "close"})
+        size = int(length)
+        if self.headers.get_content_type() != "application/octet-stream":
+            self.discard_body(size)
+            return self.send({"error": "Send the file's bytes as application/octet-stream."}, status=400,
+                             headers={"Connection": "close"})
+        reader = CountingReader(self.rfile)
+        try:
+            upload = self.server._uploads().receive((query.get("name") or [""])[0], reader, size)
+        except related_works.RelatedWorksError as exc:
+            # Every check comes before the bytes are read: drop the rest, so the browser gets this reason.
+            if reader.count < size:
+                self.discard_body(size - reader.count)
+            return self.send({"error": str(exc)}, status=exc.status, headers={"Connection": "close"})
+        return self.send({"upload": upload})
 
     def send(self, body, content_type="application/json", status=200, headers=None):
         """Send one complete response."""
@@ -5845,6 +9668,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def discard_body(self, size):
+        """Read and drop a refused body (up to MAX_DISCARDED_REQUEST_BYTES; a sender that stalls is left)."""
+
+        self.close_connection = True
+        left = min(max(size, 0), MAX_DISCARDED_REQUEST_BYTES)
+        try:
+            self.connection.settimeout(1)
+            while left > 0:
+                chunk = self.rfile.read(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:
+            pass
 
     def authorized(self):
         """Accept only this exact local origin and its secret request header."""
@@ -5868,6 +9706,14 @@ class Handler(BaseHTTPRequestHandler):
         if any(len(values) != 1 for values in query.values()):
             return self.send({"error": "Duplicate request parameters are not allowed."}, status=400)
         batch = (query.get("batch") or [None])[0]
+        if request.path == "/batch-related-works":
+            # Here ``batch`` names a folder batch ("Run a folder…"), or ``job`` one of its jobs.
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.batch_related_works(batch or "", run_id))
+            except ValueError as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/batches" or (batch is not None and request.path not in {"/", "/app.js", "/styles.css"}):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -5879,11 +9725,15 @@ class Handler(BaseHTTPRequestHandler):
                     root = {"id": "__root__", "name": "Runs", "folder": "."}
                     cards.insert(0, root)
                 if root is not None:
-                    counts = {}
-                    for row in jobs:
-                        phase = row.get("phase") or "unknown"
-                        counts[phase] = counts.get(phase, 0) + 1
-                    root.update(jobCount=len(jobs), counts=counts, current=True, readOnly=False)
+                    from .batches import batch_counts
+
+                    root.update(jobCount=len(jobs), counts=batch_counts(jobs), current=True, readOnly=False)
+                    # The home page's banner: jobs that need you, and the running-jobs limit.
+                    root["attention"] = [{**row["needsAttention"], "runId": row["runId"],
+                                          "job": row.get("sourceFile") or row["title"] or row["runId"]}
+                                         for row in jobs if row.get("needsAttention")]
+                    root["runningLimit"] = getattr(self.server, "installation", {}).get("maxRunningJobs", 0)
+                    root["queued"] = sum(1 for row in jobs if row.get("launchQueued"))
                 return self.send({"batches": cards, "currentBatch": "__root__"})
             if batch != "__root__":
                 try:
@@ -5915,21 +9765,27 @@ class Handler(BaseHTTPRequestHandler):
                                  headers={"Content-Disposition": f'attachment; filename="final.{"pdf" if pdf else "tex"}"'})
             except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
-        if request.path == "/approach-graph":
-            if not self.authorized():
-                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
-            try:
-                return self.send(self.server.get_job(run_id).approach_graph())
-            except ValueError as exc:
-                return self.send({"error": str(exc)}, status=400)
-        if request.path == "/memory":
+        if request.path == "/download-critic-diff":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             try:
                 name = (query.get("file") or [""])[0]
-                version = (query.get("version") or [""])[0]
-                return self.send(self.server.get_job(run_id).memory_file(name, version))
-            except ValueError as exc:
+                body = self.server.get_job(run_id).critic_diff(name)
+                return self.send(body, "text/x-diff; charset=utf-8",
+                                 headers={"Content-Disposition": f'attachment; filename="critic-changes-{name}"'})
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
+        if request.path in {"/download-proof", "/download-source"}:
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                app = self.server.get_job(run_id)
+                proof = request.path == "/download-proof"
+                return self.send(app.approved_proof() if proof else app.latex_source(),
+                                 "text/markdown; charset=utf-8" if proof else "application/x-tex; charset=utf-8",
+                                 headers={"Content-Disposition": "attachment; filename="
+                                          + ('"approved-proof.md"' if proof else '"latex-source.tex"')})
+            except (ValueError, OSError) as exc:
                 return self.send({"error": str(exc)}, status=400)
         if request.path == "/state":
             if not self.authorized():
@@ -5952,6 +9808,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.send(self.server.api_model_listing())
+        if request.path == "/settings":
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            return self.send(self.server.installation_settings())
         if request.path == "/transcript":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -5993,14 +9853,21 @@ class Handler(BaseHTTPRequestHandler):
             if any(len(values) != 1 for values in query.values()):
                 raise ValueError("Duplicate request parameters are not allowed.")
             batch = (query.get("batch") or [None])[0]
-            if batch is not None and batch != "__root__":
+            # Only the batch related-works route names a folder batch; elsewhere ``batch`` is a saved batch.
+            folder_batch = batch if request.path == "/batch-related-works/add" and batch != "__root__" else None
+            if batch is not None and batch != "__root__" and folder_batch is None:
                 return self.send({"error": "Saved batches are read-only."}, status=403)
+            if request.path == "/uploads":
+                return self.receive_upload(query)
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Expected a JSON request.")
             size = int(self.headers.get("Content-Length", "0"))
-            limit = MAX_DOCUMENT_REQUEST_BYTES if request.path == "/direct-batch" else MAX_REQUEST_BYTES
+            limit = MAX_DOCUMENT_REQUEST_BYTES if request.path in JOB_REQUEST_PATHS else MAX_REQUEST_BYTES
             if not 0 <= size <= limit:
-                raise ValueError("Request is too large.")
+                # Read the body first, so the browser receives this reason, not a reset connection.
+                self.discard_body(size)
+                return self.send({"error": f"This request is {size / 1048576:.1f} MB; the limit is "
+                                           f"{limit / 1048576:g} MB."}, status=413, headers={"Connection": "close"})
             body = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object.")
@@ -6011,16 +9878,29 @@ class Handler(BaseHTTPRequestHandler):
                 "/api-models/delete": self.server.delete_api_model,
                 "/api-models/test": self.server.probe_api_model,
                 "/api-models/discover": self.server.discover_api_models,
+                "/settings": self.server.save_installation_settings,
             }
             if request.path in api_model_actions:
                 return self.send(api_model_actions[request.path](body))
+            # Staged uploads belong to no job until one takes them.
+            if request.path == "/uploads/note":
+                return self.send({"upload": self.server._uploads().note(body.get("title"), body.get("text"))})
+            if request.path == "/uploads/discard":
+                return self.send({"discarded": self.server._uploads().discard(body.get("token"))})
+            if request.path == "/batch-related-works/add":
+                return self.send(self.server.add_batch_related_works(body.get("uploads"), folder_batch or "",
+                                                                     run_id))
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
             if request.path == "/direct-batch":
                 started = self.server.start_direct_batch(body, run_id)
                 return self.send({
                     "batchId": "__root__",
+                    # The folder batch's ID, which names its shared related works.
+                    "folderBatch": getattr(started, "folder_batch", ""),
                     "startedJobs": [app.state["runId"] for app in started],
+                    "queuedJobs": [app.state["runId"] for app in started if app.state.get("phase") == "prepared"],
+                    "notice": getattr(started, "notice", ""),
                     "jobs": self.server.job_list(),
                 })
             if request.path == "/resume":
@@ -6049,6 +9929,20 @@ class Handler(BaseHTTPRequestHandler):
                 app.set_author_time_limit(body.get("hours"))
             elif request.path == "/steer-author":
                 app.steer_author(body.get("instruction"))
+            elif request.path == "/answer-author-question":
+                app.answer_author_question(body.get("questionId"), body.get("answers"))
+            elif request.path == "/dismiss-author-question":
+                app.dismiss_author_question(body.get("questionId"))
+            elif request.path == "/ask-author":
+                app.ask_author(body.get("text"))
+            elif request.path == "/author-summary":
+                app.request_author_summary()
+            elif request.path == "/stop-author-reply":
+                app.stop_author_reply(body.get("id"))
+            elif request.path == "/related-works/add":
+                app.add_related_works(body.get("uploads"), self.server._uploads())
+            elif request.path == "/dismiss-convention-warning":
+                app.dismiss_convention_warning(body.get("time"))
             elif request.path == "/stop":
                 app.stop()
             elif request.path == "/pause":

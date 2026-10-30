@@ -1,11 +1,14 @@
 """Saved batch views remain bounded, read-only, and confined to their folders."""
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import batches
+from ui import related_works
 from ui import server
 from ui import retrieval
 
@@ -136,12 +139,10 @@ class BatchCatalogTests(unittest.TestCase):
         external = self.root.parent / 'secret.txt'
         external.write_text('not a run artifact')
         (self.old / 'final.tex').symlink_to(external)
-        (self.old / 'PROVED.md').symlink_to(external)
         self.assertNotIn('linked-batch', {row['id'] for row in self.catalog.list_batches()})
         self.assertEqual(len(self.catalog.jobs('search-v2')), 1)
         with self.assertRaises(ValueError):
             self.catalog.artifact('search-v2', 'same-job', 'final.tex')
-        self.assertEqual(self.catalog.memory('search-v2', 'same-job', 'PROVED.md')['status'], 'missing')
         with self.assertRaises(ValueError):
             batches.BatchCatalog(self.root / 'linked-batch')
 
@@ -174,24 +175,6 @@ class BatchCatalogTests(unittest.TestCase):
         for job_id in ('../same-job', '..', '/tmp', 'other\\job', ''):
             with self.subTest(job=job_id), self.assertRaises(ValueError):
                 self.catalog.state('search-v2', job_id)
-        with self.assertRaises(ValueError):
-            self.catalog.memory('search-v2', 'same-job', '../draft.md')
-
-    def test_memory_and_approach_graph_read_only_allowlist(self):
-        folder = self.old / 'APPROACHES'
-        folder.mkdir()
-        (folder / 'index.md').write_text('# Saved approaches')
-        (folder / 'A001-first.md').write_text('# A001 First plan\nStatus: ACTIVE\n\n## Context and objective\nTry this.')
-        (folder / 'secret.txt').write_text('Not a displayed memory artifact')
-        first = self.catalog.memory('search-v2', 'same-job', 'APPROACHES')
-        self.assertEqual(first['name'], 'APPROACHES/index.md')
-        again = self.catalog.memory('search-v2', 'same-job', first['name'], first['version'])
-        self.assertTrue(again['unchanged'])
-        graph = self.catalog.approach_graph('search-v2', 'same-job')
-        self.assertEqual(graph['indexFile'], 'APPROACHES/index.md')
-        self.assertEqual([row['id'] for row in graph['nodes']], ['A001'])
-        self.assertEqual(graph['nodes'][0]['title'], 'First plan')
-        self.assertEqual(len(graph['files']), 2)
 
     def test_responses_downloads_and_invalid_requests(self):
         (self.old / 'final.tex').write_text('saved TeX')
@@ -204,7 +187,9 @@ class BatchCatalogTests(unittest.TestCase):
         value, kind, headers = self.catalog.response('/jobs', 'search-v2')
         self.assertEqual(kind, 'application/json')
         self.assertEqual(value['jobs'][0]['resultKind'], 'final')
-        for path, query in (('/missing', {}), ('/state', {'after': 'wrong'})):
+        # Saved research files are not served: /memory and /approach-graph are unknown requests too.
+        for path, query in (('/missing', {}), ('/memory', {'file': 'PROVED.md'}), ('/approach-graph', {}),
+                            ('/state', {'after': 'wrong'})):
             with self.assertRaises(ValueError):
                 self.catalog.response(path, 'search-v2', 'same-job', query)
 
@@ -253,6 +238,76 @@ class BatchCatalogTests(unittest.TestCase):
                     self.assertEqual(entry['retrieval']['mode'], expected)
                     self.assertEqual(entry['retrievalCutoffUtc'], cutoff)
                     self.assertEqual(entry['retrieval']['cutoffExclusiveUtc'], cutoff)
+
+    def test_a_queued_job_holding_only_controller_notes_is_still_prepared(self):
+        notes = [{'kind': 'status', 'stage': server.RELATED_WORKS_STAGE, 'label': 'Related works added',
+                  'text': 'Added paper.txt (15 B) to the author\'s related-works folder.'},
+                 {'kind': 'status', 'stage': 'solve', 'node': 'author', 'label': 'Total time limit set',
+                  'text': 'The total workflow time limit is now 2 hours.'}]
+        trace = self.current / 'transcript.jsonl'
+        trace.write_text(''.join(json.dumps(row) + '\n' for row in notes))
+        self.assertEqual(self.catalog.jobs('search-v4')[0]['phase'], 'prepared')
+        self.assertEqual(self.catalog.state('search-v4', 'current-job')['phase'], 'prepared')
+        # Any workflow record means it started.
+        with trace.open('a') as stream:
+            stream.write(json.dumps({'kind': 'request', 'stage': 'solve', 'label': 'Exact solve input'}) + '\n')
+        self.assertEqual(self.catalog.jobs('search-v4')[0]['phase'], 'done')
+
+    def test_a_saved_job_lists_its_conversation_and_related_works_without_actions(self):
+        self.write_json(self.old / 'pause.json', {'status': 'paused', 'stage': 'solve', 'node': 'author',
+                                                'pauseCause': 'time-limit', 'elapsedSeconds': 7200})
+        controller = server.controller_directory(self.old)
+        controller.mkdir(parents=True)
+        item = {'id': 'c_0123456789', 'kind': 'summary', 'origin': 'time-limit', 'text': '', 'status': 'answered',
+                'createdAt': '2026-10-27T09:00:00+00:00', 'dueAt': 0, 'startedAt': '', 'finishedAt': '',
+                'attempts': 1, 'reply': 'Lemma 1 holds.', 'error': '', 'notice': [], 'compacted': False}
+        self.write_json(controller / server.CONVERSATION_FILENAME, {'schemaVersion': 1, 'items': [
+            item, {**item, 'id': 'c_0123456780', 'kind': 'message', 'origin': 'user', 'text': 'Why?',
+                   'status': 'running', 'reply': ''}]})
+        stage = related_works.UploadStage(self.root.parent / 'uploads')
+        token = stage.receive('A paper.txt', io.BytesIO(b'Lemma 1 holds.\n'), 15)['token']
+        related_works.install(self.old, controller, [token], stage, run_id=self.old.name)
+        # Its last records are the conversation's: the job is still paused at the author's solve step.
+        trace = [{'kind': 'workflow_paused', 'stage': 'solve', 'node': 'author', 'time': '2026-10-27T08:59:00Z'},
+                 {'kind': 'status', 'stage': 'conversation', 'node': 'author', 'conversationId': 'c_0123456789',
+                  'label': 'Progress summary queued', 'time': '2026-10-27T09:00:00Z'}]
+        (self.old / 'transcript.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in trace))
+        with patch.object(server, 'App', side_effect=AssertionError('App created')):
+            state = self.catalog.state('search-v2', 'same-job')
+        self.assertEqual((state['phase'], state['stage'], state['activeNode']), ('paused', 'solve', 'author'))
+        reason = 'Saved batch — viewing does not resume or change this job.'
+        conversation = state['conversation']
+        self.assertEqual((conversation['available'], conversation['reason'], conversation['busy']),
+                         (False, reason, False))
+        # Nothing continues a reply in a saved batch: one that was being written shows as stopped.
+        self.assertEqual([(entry['id'], entry['status']) for entry in conversation['items']],
+                         [('c_0123456789', 'answered'), ('c_0123456780', 'stopped')])
+        works = state['relatedWorks']
+        self.assertEqual((works['available'], works['reason'], works['count']), (False, reason, 1))
+        self.assertEqual([(entry['name'], entry['originalName'], entry['sizeText']) for entry in works['items']],
+                         [('A-paper.txt', 'A paper.txt', '15 B')])
+        # A run without them lists none.
+        empty = self.catalog.state('__root__', 'same-job')
+        self.assertEqual((empty['conversation']['items'], empty['relatedWorks']['count']), ([], 0))
+
+    def test_a_saved_conversation_too_large_to_read_is_named_not_hidden(self):
+        controller = server.controller_directory(self.old)
+        controller.mkdir(parents=True)
+        item = {'id': 'c_0123456789', 'kind': 'summary', 'origin': 'time-limit', 'text': '', 'status': 'answered',
+                'createdAt': '2026-10-27T09:00:00+00:00', 'dueAt': 0, 'startedAt': '', 'finishedAt': '',
+                'attempts': 1, 'reply': 'Lemma 1 holds. ' * 100, 'error': '', 'notice': [], 'compacted': False}
+        path = controller / server.CONVERSATION_FILENAME
+        self.write_json(path, {'schemaVersion': 1, 'items': [item]})
+        size = path.stat().st_size
+        with patch.object(batches, 'MAX_CONTROLLER_BYTES', size - 1):
+            conversation = self.catalog.state('search-v2', 'same-job')['conversation']
+        self.assertEqual(conversation['items'], [])
+        self.assertEqual(conversation['notice'], f'The saved conversation is too large to show here '
+                                                 f'({size / 1048576:.1f} MB). See {path}.')
+        with patch.object(batches, 'MAX_CONTROLLER_BYTES', size):
+            conversation = self.catalog.state('search-v2', 'same-job')['conversation']
+        self.assertEqual(([entry['id'] for entry in conversation['items']], 'notice' in conversation),
+                         (['c_0123456789'], False))
 
 
 if __name__ == '__main__':

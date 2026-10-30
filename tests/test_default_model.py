@@ -15,6 +15,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import providers
 from ui import cli, review, server
@@ -111,10 +112,10 @@ class RuntimeDefaultTests(unittest.TestCase):
                 # Same order as the shared menu, and the default is valid whichever model is picked.
                 self.assertEqual(list(efforts), [e for e in runtime.EFFORTS if e in efforts])
                 self.assertIn(EFFORT, efforts)
-        for model in (MODEL, "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra"):
-            self.assertIn("ultra", runtime.MODEL_EFFORTS[model])
-        for model in ("gpt-6-luna", "gpt-5.6-luna"):
+        # Ultra is no longer offered by any model: a saved ultra runs as max.
+        for model in runtime.MODEL_EFFORTS:
             self.assertNotIn("ultra", runtime.MODEL_EFFORTS[model])
+            self.assertEqual(runtime.effective_effort(model, "ultra"), "max")
 
     def test_structured_requests_launch_codex_with_the_default_model_and_effort(self):
         def launch():
@@ -336,9 +337,9 @@ class BrowserDefaultTests(unittest.TestCase):
     def test_labels_no_longer_make_stale_claims(self):
         page = menus()
         labels = {value: label for value, _, label in page.options["authorEffort"]}
-        # The catalog calls ultra "Maximum reasoning with automatic task delegation".
-        self.assertEqual(labels["ultra"], "Ultra — Max with task delegation")
-        self.assertNotIn("highest", labels["ultra"])
+        # Ultra is no longer offered: subagents follow the run's own settings.
+        self.assertNotIn("ultra", labels)
+        self.assertEqual(labels["max"], "Max — default")
         speed = {value: label for value, _, label in page.options["speedMode"]}
         self.assertIn("up to 2×", speed["fast"])
         self.assertNotIn("1.5", speed["fast"])
@@ -362,9 +363,11 @@ class BrowserDefaultTests(unittest.TestCase):
 
     def test_fallbacks_for_a_state_without_settings_match_the_python_defaults(self):
         source = (server.UI / "app.js").read_text(encoding="utf-8")
-        models = re.findall(r'state\.(?:review|author|critic|writer)Model \|\| "([^"]+)"', source)
+        # The composer reads its settings from `source` (the state, or a rerun's job settings).
+        models = re.findall(r'(?:state|source)\.(?:review|author|critic|writer)Model \|\| "([^"]+)"', source)
         efforts = re.findall(
-            r'state\.(?:review|author|critic|writer)Effort \|\| (?:state\.reasoningEffort \|\| )?"([^"]+)"',
+            r'(?:state|source)\.(?:review|author|critic|writer)Effort \|\| '
+            r'(?:(?:state|source)\.reasoningEffort \|\| )?"([^"]+)"',
             source,
         )
         self.assertEqual(models, [MODEL] * 8)
@@ -405,7 +408,7 @@ ui.criticModel.value = 'gpt-6-astra';
 ui.writerModel.value = 'gpt-5.6-terra';
 updateModelSummary();
 assert.match(text(),
-  /6 Luna\\/High review · 6 Sol\\/Ultra author · Astra\\/Max critic · 5\\.6 Terra\\/Max writer$/);
+  /6 Luna\\/High review · 6 Sol\\/Max author · Astra\\/Max critic · 5\\.6 Terra\\/Max writer$/);
 
 // Fast is a Codex CLI service tier: a Claude CLI (or API) model in the mix runs at standard speed.
 ui.writerModel.value = 'claude-opus-5-5'; ui.writerEffort.value = 'max';
@@ -468,46 +471,46 @@ const select = (values, value) => {
   values.forEach((item) => menu.add(new Option(item, item)));
   return menu;
 };
-const everyEffort = ['ultra', 'max', 'xhigh', 'high', 'medium', 'low'];
+const everyEffort = ['max', 'xhigh', 'high', 'medium', 'low'];
 let state = {workflow: {settings: {model_efforts: {
-  'gpt-6.1-sol': everyEffort, 'gpt-6-luna': everyEffort.slice(1), 'claude-opus-5-5': everyEffort.slice(1),
+  'gpt-6.1-sol': everyEffort, 'gpt-6-luna': everyEffort, 'claude-opus-5-5': everyEffort,
+  'gpt-6-mini': everyEffort.slice(1),
 }}}};
 const ui = {
-  authorModel: select(['gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5'], 'gpt-6.1-sol'),
-  authorEffort: select(everyEffort, 'ultra'),
+  authorModel: select(['gpt-6.1-sol', 'gpt-6-luna', 'claude-opus-5-5', 'gpt-6-mini'], 'gpt-6.1-sol'),
+  authorEffort: select(everyEffort, 'max'),
 };
 const disabled = () => ui.authorEffort.options.filter((option) => option.disabled).map((option) => option.value);
 `;
 const checks = `
-// A model that supports Ultra keeps every level.
+// Every offered model lists every level.
 syncEffortChoices('author');
 assert.deepEqual(disabled(), []);
-assert.equal(ui.authorEffort.value, 'ultra');
-
-// Luna does not list Ultra: it is disabled and a chosen Ultra moves to Max.
+assert.equal(ui.authorEffort.value, 'max');
 ui.authorModel.value = 'gpt-6-luna';
 syncEffortChoices('author');
-assert.deepEqual(disabled(), ['ultra']);
+assert.deepEqual(disabled(), []);
+
+// A saved Ultra, no longer offered, runs as Max.
+ui.authorEffort.value = 'ultra';
+syncEffortChoices('author');
 assert.equal(ui.authorEffort.value, 'max');
 
-// Switching back re-enables Ultra without silently re-selecting it.
+// A model that lacks a level disables it, and a chosen one moves to the nearest lower level.
+ui.authorModel.value = 'gpt-6-mini';
+syncEffortChoices('author');
+assert.deepEqual(disabled(), ['max']);
+assert.equal(ui.authorEffort.value, 'xhigh');
 ui.authorModel.value = 'gpt-6.1-sol';
 syncEffortChoices('author');
 assert.deepEqual(disabled(), []);
-assert.equal(ui.authorEffort.value, 'max');
-
-// A Claude CLI model does not list Ultra either: a chosen Ultra runs as Max, the nearest lower level.
-ui.authorEffort.value = 'ultra';
-ui.authorModel.value = 'claude-opus-5-5';
-syncEffortChoices('author');
-assert.deepEqual(disabled(), ['ultra']);
-assert.equal(ui.authorEffort.value, 'max');
+assert.equal(ui.authorEffort.value, 'xhigh');
 
 // Unknown models are never filtered.
-ui.authorModel.value = 'something-new'; ui.authorEffort.value = 'ultra';
+ui.authorModel.value = 'something-new'; ui.authorEffort.value = 'high';
 syncEffortChoices('author');
 assert.deepEqual(disabled(), []);
-assert.equal(ui.authorEffort.value, 'ultra');
+assert.equal(ui.authorEffort.value, 'high');
 
 // Without published support data nothing changes.
 state = {};
@@ -609,7 +612,7 @@ function load() {
     const document = {activeElement: null};
     const show = (element, visible) => element.hidden = !visible;
     const retainTrace = (entries) => entries;
-    const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {}, renderClock = () => {}, renderBatchNavigation = () => {};
+    const ingest = () => {}, renderWorkflow = () => {}, renderClock = () => {}, renderBatchNavigation = () => {};
     const appendFormattedText = () => {};
     const syncPrompts = () => {}, checkEdited = () => {}, refresh = () => {};
     const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
@@ -639,21 +642,18 @@ const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {sta
   }
   assert.match(summary(ui), /^Standard speed · Concise activity log · 6\.1 Sol\/Max review/);
 
-  // 2. Picking 6 Luna while Ultra is selected disables Ultra, moves the effort to Max, and updates the footer.
-  ui.authorEffort.value = 'ultra';
+  // 2. Picking 6 Luna keeps the chosen level (every model lists every level) and updates the footer.
+  ui.authorEffort.value = 'xhigh';
   ui.authorEffort.onchange();
-  assert.match(summary(ui), /6\.1 Sol\/Ultra author/);
+  assert.match(summary(ui), /6\.1 Sol\/Extra high author/);
   ui.authorModel.value = 'gpt-6-luna';
   ui.authorModel.onchange();
-  assert.deepEqual(disabled(ui, 'author'), ['ultra']);
-  assert.equal(ui.authorEffort.value, 'max');
-  assert.match(summary(ui), /6 Luna\/Max author/);
-  ui.authorModel.value = 'gpt-6-sol';
-  ui.authorModel.onchange();
   assert.deepEqual(disabled(ui, 'author'), []);
+  assert.equal(ui.authorEffort.value, 'xhigh');
+  assert.match(summary(ui), /6 Luna\/Extra high author/);
 }
 
-// 3. A saved job keeps its older model visible, and Luna's unsupported Ultra is corrected.
+// 3. A saved job keeps its older model visible, and a saved Ultra (no longer offered) shows as Max.
 {
   const {ui, api} = load();
   const job = {...saved, reviewModel: 'gpt-5.6-terra', reviewEffort: 'ultra', authorModel: 'gpt-6-luna',
@@ -667,10 +667,10 @@ const saved = {...fixture.empty, phase: 'reviewed', runId: 'run-1', review: {sta
   assert.equal(ui.reviewModel.value, 'gpt-5.6-terra');
   assert.equal(ui.reviewModel.options.filter((option) => /older/.test(option.text)).length, 1);
   assert.equal(ui.authorEffort.value, 'max');
-  assert.equal(ui.reviewEffort.value, 'ultra');
+  assert.equal(ui.reviewEffort.value, 'max');
   assert.equal(ui.writerEffort.value, 'high');
   assert.match(summary(ui),
-    /5\.6 Terra\/Ultra review · 6 Luna\/Max author · 5\.6 Terra\/Ultra critic · 6\.1 Sol\/High writer$/);
+    /5\.6 Terra\/Max review · 6 Luna\/Max author · 5\.6 Terra\/Max critic · 6\.1 Sol\/High writer$/);
 
   // Rendering the same job again must not add a second stand-in option.
   api.setPending(true);

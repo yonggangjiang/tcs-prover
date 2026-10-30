@@ -8,8 +8,12 @@ import threading
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import cli, server
 
+
+# The checkpoint file of the critics' reports that older versions saved; nothing reads it any more.
+CRITIC_AUDITS_FILENAME = "critic-audits.json"
 
 class OperationalContinuationTests(unittest.TestCase):
     def setUp(self):
@@ -36,36 +40,47 @@ class OperationalContinuationTests(unittest.TestCase):
         self.assertFalse((destination / "continuation-memory").exists())
         self.assertEqual((self.source / "APPROACHES.md").read_text(), "Author-managed notes.")
 
+    def saved_critic_reports(self):
+        """Completed critic reports an older version saved: the legacy run-folder copy and the controller's."""
+
+        controller = server.controller_directory(self.source)
+        controller.mkdir(parents=True, exist_ok=True)
+        for folder in (self.source, controller):
+            (folder / CRITIC_AUDITS_FILENAME).write_text('{"saved": "reports"}')
+        (self.source / "fresh-critic-audits").write_text("Legacy marker.")
+
     def test_critic_preserves_operational_input_before_launch(self):
+        self.saved_critic_reports()
         app = server.App(runs=self.runs)
 
         def launch(statement, solution):
             self.assertEqual((statement, solution), (self.statement, "The proposed proof."))
             self.assert_no_memory_copy(app.run_dir)
             self.assertEqual((app.run_dir / server.runtime.SAVED_CANDIDATE_FILENAME).read_text(), solution + "\n")
-            self.assertFalse((app.run_dir / server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME).exists())
+            # Another run's critic reports are never copied: the new run's critics start afresh.
+            for folder in (app.run_dir, server.controller_directory(app.run_dir)):
+                self.assertFalse((folder / CRITIC_AUDITS_FILENAME).exists())
+                self.assertFalse((folder / "fresh-critic-audits").exists())
             self.assertEqual(app.state["goalWorkspace"], str(self.source.resolve()))
             return object(), object()
 
-        with mock.patch.object(server, "critic_uses_parallel_audits", return_value=False):
-            with mock.patch.object(app, "_launch_critic_resume_locked", side_effect=launch) as launched:
-                app.start_critic_resume(self.statement, "The proposed proof.", source_run=self.source,
-                                        audit_checkpoint='{"saved": "audit"}')
+        with mock.patch.object(app, "_launch_critic_resume_locked", side_effect=launch) as launched:
+            app.start_critic_resume(self.statement, "The proposed proof.", source_run=self.source)
         launched.assert_called_once()
 
-    def test_single_call_critic_ignores_legacy_audit_checkpoints(self):
+    def test_saved_critic_reports_are_neither_read_nor_listed_as_checkpoints(self):
         (self.source / server.runtime.SAVED_CANDIDATE_FILENAME).write_text("Complete proof.")
-        (self.source / server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME).write_text("obsolete data")
+        self.saved_critic_reports()
         original_read = server.read_utf8
         def read(path, purpose):
-            self.assertNotEqual(Path(path).name, server.runtime.CRITIC_AUDIT_CHECKPOINT_FILENAME)
+            self.assertNotEqual(Path(path).name, CRITIC_AUDITS_FILENAME)
             return original_read(path, purpose)
-        with mock.patch.object(server, "critic_uses_parallel_audits", return_value=False):
-            with mock.patch.object(server, "read_utf8", side_effect=read):
-                with mock.patch.object(server, "valid_saved_audit_reports") as audits:
-                    checkpoints = server.saved_run_checkpoints(self.source)
-            self.assertEqual([item["id"] for item in checkpoints], ["candidate"])
-            audits.assert_not_called()
+        with mock.patch.object(server, "read_utf8", side_effect=read):
+            checkpoints = server.saved_run_checkpoints(self.source)
+            source = server.saved_critic_source(self.source)
+        self.assertEqual([item["id"] for item in checkpoints], ["candidate"])
+        self.assertEqual(checkpoints[0]["resumeLabel"], "Continue at critic")
+        self.assertNotIn("audit_checkpoint", source)
 
     def test_final_input_requires_approval_for_unchanged_and_edited_passes(self):
         for fixed, approved in ((None, False), (None, True), (False, False), (True, False), (False, True), (True, True)):
@@ -153,17 +168,19 @@ class OperationalContinuationTests(unittest.TestCase):
 
     def test_saved_research_uses_saved_budget_and_explicit_overrides(self):
         (self.source / server.JOB_SETTINGS_FILENAME).write_text(
-            json.dumps({"thinkingHours": 4.25, "criticRounds": 7}), encoding="utf-8",
+            json.dumps({"thinkingHours": 4.25, "criticRounds": 7, "criticCount": 6}), encoding="utf-8",
         )
         manager = self.manager()
         with mock.patch.object(server.App, "_launch_solver_locked", return_value=(object(), object())):
             default = manager.start_saved_research_job(self.source)
             default.state["phase"] = "done"
-            changed = manager.start_saved_research_job(self.source, {"thinkingHours": 2.5})
+            changed = manager.start_saved_research_job(self.source, {"thinkingHours": 2.5, "criticCount": 2})
         self.assertEqual(default.state["thinkingHours"], 4.25)
         self.assertEqual(default.state["criticRounds"], 7)
+        self.assertEqual(default.state["criticCount"], 6)
         self.assertEqual(changed.state["thinkingHours"], 2.5)
         self.assertEqual(changed.state["criticRounds"], 7)
+        self.assertEqual(changed.state["criticCount"], 2)
 
 
     def test_saved_research_cannot_duplicate_an_active_source_job(self):
@@ -220,14 +237,14 @@ class OperationalContinuationTests(unittest.TestCase):
         manager.serve_forever.side_effect = KeyboardInterrupt
         arguments = [
             "tcs-prover", "--resume-research", str(self.source), "--no-browser",
-            "--thinking-hours=5", "--criticRounds", "9",
+            "--thinking-hours=5", "--criticRounds", "9", "-criticCount", "4",
         ]
         with mock.patch.object(cli.sys, "argv", arguments):
             with mock.patch.object(cli, "Server", return_value=manager):
                 with mock.patch.object(cli.sys, "stdout", io.StringIO()):
                     self.assertEqual(cli.main(), 0)
         manager.start_saved_research_job.assert_called_once_with(
-            self.source.resolve(), {"thinkingHours": 5.0, "criticRounds": 9},
+            self.source.resolve(), {"thinkingHours": 5.0, "criticRounds": 9, "criticCount": 4},
         )
 
 

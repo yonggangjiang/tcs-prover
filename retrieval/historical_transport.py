@@ -3,12 +3,15 @@
 Provider bodies and exception text never enter errors or audit events. A bounded
 daemon worker pool covers DNS as well as socket I/O; a blocked OS resolver cannot
 keep an MCP operation alive past its deadline or create unlimited new workers.
+Time spent waiting for a shared pacing slot extends an operation's budget, up to
+its hard limit, so other jobs' traffic does not use up a call's network time.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import errno
 import http.client
@@ -31,7 +34,7 @@ ALLOWED_NETWORK_HOSTS = frozenset({
     'export.arxiv.org', 'api.crossref.org',
 })
 MAX_BYTES = 4 * 1024 * 1024
-RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+RETRY_STATUSES = frozenset({408, 429, *range(500, 600)})
 FAILURE_KINDS = frozenset({'dns', 'timeout', 'connection', 'protocol', 'tls', 'other'})
 
 
@@ -39,7 +42,7 @@ class HistoricalSearchError(RuntimeError):
     """Static controller-written message, with sanitized classification fields."""
 
     def __init__(self, message, *, code='retrieval_rejected', retryable=False,
-                 operational=False, status=None, host=None, failure_kind=None):
+                 operational=False, status=None, host=None, failure_kind=None, retry_at=None):
         super().__init__(message)
         self.code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,64}', code) else 'retrieval_rejected'
         self.retryable = bool(retryable)
@@ -47,6 +50,61 @@ class HistoricalSearchError(RuntimeError):
         self.status = status if type(status) is int and 100 <= status <= 599 else None
         self.host = host if host in ALLOWED_NETWORK_HOSTS else None
         self.failure_kind = failure_kind if isinstance(failure_kind, str) and failure_kind in FAILURE_KINDS else None
+        # Wall-clock seconds after which the same request may succeed.
+        self.retry_at = retry_at if type(retry_at) in (int, float) and math.isfinite(retry_at) else None
+
+
+def clock_text(wall_seconds):
+    """A retry time the model can act on, in UTC to the second."""
+    return datetime.fromtimestamp(wall_seconds, timezone.utc).strftime('%H:%M:%S UTC')
+
+
+class Budget:
+    """A network deadline that pacing waits extend, never past its hard limit.
+
+    While a request ``waiting()`` for a shared slot, the deadline moves with
+    the clock; afterwards the waited time stays credited. A nested budget
+    passes this on, so the enclosing MCP call's reply deadline moves with it.
+    """
+
+    def __init__(self, deadline, limit=None, *, clock=time.monotonic, parent=None):
+        self.deadline = float(deadline)
+        self.limit = self.deadline if limit is None else max(self.deadline, float(limit))
+        self.clock, self.parent = clock, parent
+        self._waits, self._wait_started = 0, None
+        self._lock = threading.Lock()
+
+    def current(self):
+        value = self.deadline
+        if self._wait_started is not None:
+            value += max(0.0, self.clock() - self._wait_started)
+        value = min(value, self.limit)
+        return value if self.parent is None else min(value, self.parent.current())
+
+    def hard(self):
+        return self.limit if self.parent is None else min(self.limit, self.parent.hard())
+
+    def remaining(self):
+        return self.current() - self.clock()
+
+    @contextmanager
+    def waiting(self):
+        with self._lock:
+            self._waits += 1
+            if self._waits == 1:
+                self._wait_started = self.clock()
+        try:
+            if self.parent is None:
+                yield
+            else:
+                with self.parent.waiting():
+                    yield
+        finally:
+            with self._lock:
+                self._waits -= 1
+                if not self._waits:
+                    started, self._wait_started = self._wait_started, None
+                    self.deadline = min(self.deadline + max(0.0, self.clock() - started), self.limit)
 
 
 @dataclass(frozen=True)
@@ -110,24 +168,30 @@ class RestrictedHttpClient:
         self._workers = threading.BoundedSemaphore(2)
 
     @contextmanager
-    def operation(self, timeout_seconds=300):
+    def operation(self, timeout_seconds=300, *, limit_seconds=None, budget=None):
+        """Bound network work; ``limit_seconds`` lets pacing waits extend it that far.
+
+        ``budget`` is an enclosing Budget (an MCP call's) that receives the credits.
+        """
         if (type(timeout_seconds) not in (int, float)
-                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+                or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+                or (limit_seconds is not None and (type(limit_seconds) not in (int, float)
+                                                   or not math.isfinite(limit_seconds)))):
             raise HistoricalSearchError('Historical retrieval deadline is invalid.',
                                         code='deadline_exceeded', operational=True)
-        deadline = self.clock() + timeout_seconds
-        previous = self._deadline.get()
-        if previous is not None:
-            deadline = min(previous, deadline)
-        token = self._deadline.set(deadline)
+        now = self.clock()
+        parent = self._deadline.get() or budget
+        current = Budget(now + timeout_seconds, None if limit_seconds is None else now + limit_seconds,
+                         clock=self.clock, parent=parent)
+        token = self._deadline.set(current)
         try:
-            self._remaining(deadline)
+            self._remaining(current)
             yield self
         finally:
             self._deadline.reset(token)
 
-    def _remaining(self, deadline, host=None):
-        remaining = deadline - self.clock()
+    def _remaining(self, budget, host=None):
+        remaining = budget.remaining()
         if remaining <= 0:
             raise HistoricalSearchError('Historical retrieval deadline was exhausted.',
                                         code='deadline_exceeded', operational=True, host=host)
@@ -181,20 +245,20 @@ class RestrictedHttpClient:
             operational=status in RETRY_STATUSES or status in (202, 401, 403),
             status=status, host=host)
 
-    def _request(self, url, host, headers, deadline):
+    def _request(self, url, host, headers, budget):
         response = None
         try:
-            self._remaining(deadline, host)
+            self._remaining(budget, host)
             addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-            self._remaining(deadline, host)
+            self._remaining(budget, host)
             if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
                 raise HistoricalSearchError('Historical retrieval resolved to a forbidden address.',
                                             code='destination_rejected', host=host)
             request_headers = {'User-Agent': 'tcs-prover-historical/1.0', 'Accept-Encoding': 'identity'}
             request_headers.update(headers or {})
             request = Request(url, headers=request_headers)
-            response = self.opener.open(request, timeout=min(self.timeout, self._remaining(deadline, host)))
-            self._remaining(deadline, host)
+            response = self.opener.open(request, timeout=min(self.timeout, self._remaining(budget, host)))
+            self._remaining(budget, host)
             status = response.status
             if response.geturl() != url:
                 raise HistoricalSearchError('Historical retrieval response destination changed.',
@@ -209,13 +273,13 @@ class RestrictedHttpClient:
             chunks, length = [], 0
             reader = getattr(response, 'read1', response.read)
             while True:
-                remaining = self._remaining(deadline, host)
+                remaining = self._remaining(budget, host)
                 raw = getattr(getattr(response, 'fp', None), 'raw', None)
                 connection_socket = getattr(raw, '_sock', None)
                 if connection_socket is not None:
                     connection_socket.settimeout(min(self.timeout, remaining))
                 chunk = reader(min(64 * 1024, MAX_BYTES + 1 - length))
-                self._remaining(deadline, host)
+                self._remaining(budget, host)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -244,12 +308,16 @@ class RestrictedHttpClient:
             if response is not None:
                 response.close()
 
-    def _attempt(self, url, host, headers, attempt, deadline):
+    def _attempt(self, url, host, headers, attempt, budget):
         try:
-            slot = self.coordinator.slot(host, deadline=deadline) if self.coordinator else nullcontext()
-            with slot:
+            # Waiting for a shared slot (other jobs' requests ahead in line,
+            # provider pacing) may last until the hard limit and is credited back.
+            slot = self.coordinator.slot(host, deadline=budget.hard()) if self.coordinator else nullcontext()
+            with ExitStack() as held:
+                with budget.waiting():
+                    held.enter_context(slot)
                 try:
-                    return _Outcome(response=self._request(url, host, headers, deadline))
+                    return _Outcome(response=self._request(url, host, headers, budget))
                 except _HttpFailure as failure:
                     backoff = min(10.0, 5.0 * 2 ** (attempt - 1))
                     delay = max(backoff, failure.retry_after or 0.0) if failure.error.retryable else 0.0
@@ -259,17 +327,22 @@ class RestrictedHttpClient:
                     provider_busy = failure.error.status in (429, 503)
                     if self.coordinator and (provider_busy or failure.retry_after is not None):
                         shared_delay = max(backoff if provider_busy else 0.0, failure.retry_after or 0.0)
-                        self.coordinator.defer(host, shared_delay, deadline=deadline)
+                        self.coordinator.defer(host, shared_delay, deadline=budget.hard())
                     return _Outcome(error=failure.error, delay=delay)
         except HistoricalSearchError as error:
             return _Outcome(error=error)
         except RateLimitError as error:
+            if error.code == 'provider_cooldown' and getattr(error, 'retry_at', None) is not None:
+                return _Outcome(error=HistoricalSearchError(
+                    f'Requests to {host} are paused at the provider\'s request until {clock_text(error.retry_at)}; '
+                    'try again after then.', code='provider_cooldown', operational=True, host=host,
+                    retry_at=error.retry_at))
             code = error.code if error.code in ('deadline_exceeded', 'rate_limit_state', 'rate_limit_policy') else 'rate_limit_state'
             return _Outcome(error=HistoricalSearchError('Historical retrieval coordination failed.',
                             code=code, operational=True, host=host))
 
-    def _bounded_attempt(self, url, host, headers, attempt, deadline):
-        remaining = self._remaining(deadline, host)
+    def _bounded_attempt(self, url, host, headers, attempt, budget):
+        remaining = self._remaining(budget, host)
         if not self._workers.acquire(timeout=remaining):
             raise HistoricalSearchError('Historical retrieval workers remain occupied.',
                                         code='deadline_exceeded', operational=True, host=host)
@@ -277,7 +350,7 @@ class RestrictedHttpClient:
 
         def run():
             try:
-                outcomes.put(self._attempt(url, host, headers, attempt, deadline))
+                outcomes.put(self._attempt(url, host, headers, attempt, budget))
             except Exception:
                 outcomes.put(_Outcome(error=HistoricalSearchError(
                     'Historical retrieval transport could not complete.',
@@ -291,24 +364,26 @@ class RestrictedHttpClient:
             self._workers.release()
             raise HistoricalSearchError('Historical retrieval worker could not start.',
                                         code='transport_internal', operational=True, host=host) from None
-        try:
-            result = outcomes.get(timeout=self._remaining(deadline, host))
-        except queue.Empty:
-            raise HistoricalSearchError('Historical retrieval deadline was exhausted.',
-                                        code='deadline_exceeded', operational=True, host=host) from None
-        self._remaining(deadline, host)
+        while True:
+            # The worker's slot wait can extend the budget: look again often.
+            try:
+                result = outcomes.get(timeout=min(self._remaining(budget, host), 0.25))
+                break
+            except queue.Empty:
+                continue
+        self._remaining(budget, host)
         return result
 
     def get(self, url, headers=None):
         if self._deadline.get() is None:
             with self.operation():
                 return self.get(url, headers=headers)
-        host, deadline = self._host(url), self._deadline.get()
+        host, budget = self._host(url), self._deadline.get()
         for attempt in range(1, self.retries + 2):
-            self._remaining(deadline, host)
+            self._remaining(budget, host)
             self._emit('http_attempt', host=host, attempt=attempt)
             try:
-                outcome = self._bounded_attempt(url, host, headers, attempt, deadline)
+                outcome = self._bounded_attempt(url, host, headers, attempt, budget)
             except HistoricalSearchError as error:
                 outcome = _Outcome(error=error)
             if outcome.error is None:
@@ -322,8 +397,11 @@ class RestrictedHttpClient:
             self._emit('http_retry', host=host, attempt=attempt, code=error.code,
                        status=error.status, retryable=True, delay_seconds=outcome.delay,
                        failure_kind=error.failure_kind)
-            if outcome.delay >= self._remaining(deadline, host):
-                raise HistoricalSearchError('Historical retrieval cooldown exceeds the operation deadline.',
-                                            code='deadline_exceeded', operational=True, host=host)
+            if outcome.delay >= self._remaining(budget, host):
+                retry_at = self.wall_clock() + outcome.delay
+                raise HistoricalSearchError(
+                    f'{host} asked to wait until {clock_text(retry_at)}, after this request\'s deadline; '
+                    'try again after then.', code='deadline_exceeded', operational=True, host=host,
+                    retry_at=retry_at)
             self.sleeper(outcome.delay)
         raise AssertionError('Unreachable historical transport state.')

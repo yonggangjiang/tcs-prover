@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import audit_historical_trajectory as auditor
 
 
@@ -135,6 +136,32 @@ class HistoricalTrajectoryAuditTests(TrajectoryAuditFixture):
         self.assertEqual(report['counts']['pending_calls'], 0)
         self.assertEqual(report['counts']['error_calls'], 0)
         self.assertEqual(len(report['sources']), 1)
+
+    def test_related_works_and_messages_the_user_supplied_are_listed_separately(self):
+        work = {'name': 'paper.pdf', 'originalName': 'Paper.pdf', 'kind': 'file', 'size': 1200,
+                'sha256': 'b' * 64, 'textName': 'paper.pdf.txt', 'textSize': 300, 'textSha256': 'c' * 64,
+                'addedAt': '2026-10-16T08:59:00Z', 'addedIn': 'start', 'batch': ''}
+        self.broker_records[1:1] = [
+            {**broker_event('related_works_added', relatedWorks=[work, 'not a record']), 'source': 'controller'},
+            {**broker_event('author_message_sent', conversationId='c1', conversationKind='question',
+                            text='What does the summary mean?', textChars=27, textSha256=digest('What does the summary mean?'),
+                            notice=''), 'source': 'controller'},
+        ]
+        report = self.audit()
+        self.assertTrue(report['passed'], report['issues'])
+        self.assertEqual(report['user_supplied']['related_works'], [{**work, 'line': 2}])
+        [message] = report['user_supplied']['messages']
+        self.assertEqual((message['conversationId'], message['text'], message['line']),
+                         ('c1', 'What does the summary mean?', 3))
+        self.assertEqual(report['counts']['matched_documents'], 1)
+
+    def test_a_supplied_record_with_another_cutoff_is_an_issue_not_a_listing(self):
+        self.broker_records.append({**broker_event('related_works_added', relatedWorks=[{'name': 'x.txt'}]),
+                                    'cutoff': '2026-10-05T00:37:13Z', 'source': 'controller'})
+        report = self.audit()
+        self.assertFalse(report['passed'])
+        self.assertIn('cutoff_mismatch', [issue['code'] for issue in report['issues']])
+        self.assertEqual(report['user_supplied']['related_works'], [])
 
     def test_empty_success_is_valid_and_has_no_retrieved_documents(self):
         self.trajectory_records = [tool_event(documents=[])]

@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_transport as ht
 from retrieval.historical_rate_limit import RateLimitError
 

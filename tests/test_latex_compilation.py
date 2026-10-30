@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 
 
@@ -41,7 +42,9 @@ class LatexCompilationTests(unittest.TestCase):
         def model(prompt, schema, stage, **settings):
             calls.append(prompt)
             if len(calls) > 1:
-                self.assertIn(candidates[len(calls) - 2], prompt)
+                # The repair edits its own copy of the failed source, which the prompt does not repeat.
+                self.assertEqual(settings["edit_file"].initial, candidates[len(calls) - 2])
+                self.assertNotIn(candidates[len(calls) - 2], prompt)
                 self.assertIn("Undefined control sequence", prompt)
                 self.assertIn("smallest necessary", prompt)
                 self.assertEqual(settings["model"], "gpt-5.6-sol")
@@ -66,37 +69,72 @@ class LatexCompilationTests(unittest.TestCase):
         self.assertEqual([kind for kind, _ in self.events].count("final_result"), 1)
 
     def test_missing_tool_preserves_source_without_repair_requests(self):
+        # A missing tool is waited for, checked every minute, and never sent to a repair (I-068).
         for missing in ("latexmk", "pdflatex"):
-            with self.subTest(missing=missing), patch.object(runtime.shutil, "which", side_effect=lambda name: None if name == missing else "/tools/" + name):
-                calls = []
+            with self.subTest(missing=missing):
+                self.events.clear()
+                for name in ("final.tex", "final.pdf", "latex-source.tex"):
+                    (self.directory / name).unlink(missing_ok=True)
+                calls, waits, installed = [], [], []
+
+                def which(name, path=None):
+                    return None if name == missing and not installed else "/tools/" + name
+
+                def sleep(seconds, cancel=None):
+                    self.assertEqual((self.directory / "latex-source.tex").read_text(), LATEX)
+                    self.assertFalse((self.directory / "final.tex").exists())
+                    self.assertFalse(any(kind == "final_result" for kind, _ in self.events))
+                    waits.append(seconds)
+                    if sum(waits) >= 120:
+                        installed.append(True)
 
                 def model(*args, **kwargs):
                     calls.append(1)
                     return {"latex": LATEX}, ""
 
-                with self.assertRaisesRegex(runtime.Error, "Install latexmk"):
+                def command(argv, **kwargs):
+                    (self.directory / "final.pdf").write_bytes(b"%PDF-1.4\nPDF bytes\n%%EOF")
+                    return subprocess.CompletedProcess(argv, 0, "Output written on final.pdf")
+
+                with patch.object(runtime.shutil, "which", side_effect=which), \
+                        patch.object(runtime, "_retry_sleep", side_effect=sleep), \
+                        patch.object(runtime, "_run_bounded", side_effect=command):
                     self.execute(model)
                 self.assertEqual(len(calls), 1)
-                self.assertEqual((self.directory / "latex-source.tex").read_text(), LATEX)
-                self.assertFalse((self.directory / "final.tex").exists())
-                self.assertFalse((self.directory / "final.pdf").exists())
-                self.assertFalse(any(kind == "final_result" for kind, _ in self.events))
+                notices = [fields for kind, fields in self.events
+                           if kind == "status" and fields.get("label") == runtime.COMMAND_RETRY_LABEL and "retryAt" in fields]
+                self.assertEqual(len(notices), 2)
+                self.assertIn(f"Command unavailable: {missing}", notices[0]["text"])
+                self.assertTrue(any(kind == "diagnostic" and fields.get("label") == "Compiler tools not found"
+                                    for kind, fields in self.events))
+                self.assertEqual((self.directory / "final.tex").read_text(), LATEX)
+                self.assertTrue((self.directory / "final.pdf").is_file())
 
-    def test_failed_compile_removes_partial_pdf_and_obeys_workflow_budget(self):
-        remaining = [60]
+    def test_failed_compile_removes_partial_pdf_and_the_time_limit_never_cuts_off_latex(self):
+        timeouts = []
 
         def command(argv, **kwargs):
-            self.assertLessEqual(kwargs["timeout"], 60)
-            (self.directory / "final.pdf").write_bytes(b"partial PDF")
-            remaining[0] = 0
-            return subprocess.CompletedProcess(argv, 1, "Compilation error")
+            timeouts.append(kwargs["timeout"])
+            if len(timeouts) == 1:
+                (self.directory / "final.pdf").write_bytes(b"partial PDF")
+                return subprocess.CompletedProcess(argv, 1, "Compilation error")
+            # The failed attempt's partial PDF was removed and its output logged.
+            self.assertFalse((self.directory / "final.pdf").exists())
+            self.assertFalse((self.directory / "final.tex").exists())
+            self.assertIn("Compilation error", (self.directory / "latex-compile.log").read_text())
+            (self.directory / "final.pdf").write_bytes(b"%PDF-1.4\nPDF bytes\n%%EOF")
+            return subprocess.CompletedProcess(argv, 0, "Built")
 
-        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime, "_run_bounded", side_effect=command), patch.object(runtime, "workflow_remaining", side_effect=lambda options: remaining[0]):
-            with self.assertRaisesRegex(runtime.Error, "time limit"):
-                self.execute(lambda *args, **kwargs: ({"latex": BROKEN}, ""))
-        self.assertFalse((self.directory / "final.pdf").exists())
-        self.assertFalse((self.directory / "final.tex").exists())
-        self.assertIn("Compilation error", (self.directory / "latex-compile.log").read_text())
+        def model(*args, **kwargs):
+            return {"latex": BROKEN if not timeouts else LATEX}, ""
+
+        # The time limit ran out long ago: it stops only the author, never a LaTeX step.
+        with patch.object(runtime.shutil, "which", return_value="/tools/compiler"), patch.object(runtime, "_run_bounded", side_effect=command):
+            state = self.execute(model, thinking_hours=1, elapsed_seconds=7200)
+        limit = runtime.builtin_workflow("clean_up")["nodes"]["latex_compile"]["command"]["timeout"]
+        self.assertEqual(timeouts, [limit, limit])
+        self.assertEqual(state["output"], LATEX)
+        self.assertEqual((self.directory / "final.tex").read_text(), LATEX)
 
     def test_command_node_runs_without_a_prompt_or_model_credentials(self):
         workflow = {"prompts": {}, "nodes": {"build": {

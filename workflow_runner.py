@@ -3,6 +3,8 @@
 
 import argparse
 import ast
+import copy as _copy
+import difflib
 import errno
 import functools
 import hashlib
@@ -10,10 +12,12 @@ import json
 import math
 import os
 import operator
+import queue
 import random
 import re
 import shutil
 import signal
+import stat
 import string
 import subprocess
 import sys
@@ -23,9 +27,8 @@ import threading
 import time
 import uuid
 from retrieval import runtime as retrieval_runtime
-from runner import claude_cli, proof_handoff, providers
+from runner import claude_cli, confinement, proof_handoff, providers
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -58,16 +61,30 @@ LEGACY_MODELS = providers.LEGACY_CODEX_MODELS
 MODELS = OFFERED_MODELS + LEGACY_MODELS
 MODEL, EFFORT = "gpt-6.1-sol", "max"
 EFFORTS = providers.CODEX_EFFORTS
+# Efforts no longer offered, still accepted from saved jobs, scripts and flags (see chosen_effort()).
+RETIRED_EFFORTS = providers.RETIRED_EFFORTS
+RETIRED_EFFORT_NOTE = "Ultra is no longer offered; this run uses Max."
 # Efforts each built-in model lists. Codex does not validate or clamp efforts
 # locally, so the UI offers only these; effective_effort() maps the rest.
 MODEL_EFFORTS = {model: providers.efforts_for(model) for model in MODELS}
 SPEEDS, DEFAULT_SPEED = ("standard", "fast"), "standard"
 AUTHOR_MODEL = CRITIC_MODEL = WRITER_MODEL = MODEL
 MAX_CRITIC_ROUNDS = 100
-MAX_AUTHOR_HOURS = 168
-DEFAULT_AUTHOR_HOURS = MAX_AUTHOR_HOURS
+# Independent critics per critic round: the subagents the critic starts (see critic_count()).
+MAX_CRITIC_COUNT = 10
+# Subagents the proof author may start at a time (the run's Author subagents setting; 0: none).
+MAX_AUTHOR_SUBAGENTS = 10
+# The total time limit has no upper bound, and 0 (unlimited) is the default.
+MAX_AUTHOR_HOURS = None
+DEFAULT_AUTHOR_HOURS = 0
 STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
 _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
+# Lifecycle prompts a goal node may also bind: the short prompt of a reopened
+# conversation, the paused author's conversation turns (--converse), the
+# block of the first prompt that points to related works and the note that
+# tells a resumed author why the controller refused its last submission.
+_GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "related_works", "handoff_refused",
+                            "subagents")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 
 
@@ -102,9 +119,19 @@ REDACTED_ENVIRONMENT = (*SECRET_ENVIRONMENT, "ANTHROPIC_API_KEY", "ANTHROPIC_AUT
 # told apart from ordinary words, and rewriting those would corrupt records.
 MIN_RECORD_SECRET_CHARS = 8
 
-# The Codex permission profile that hides TCS Prover's private state from
-# sandboxed commands (see private_permissions()).
+# The Codex permission profile that confines a run's model processes to their
+# own folder and private temp folder (see private_permissions()).
 PRIVATE_PERMISSIONS = "tcs_prover_private"
+
+# Files the controller writes into the run folder and the live author may only
+# read (the controller also keeps its own copies outside the run folder), and
+# the related works the user supplied (see confinement.PROTECTED_ENTRIES).
+CONTROLLER_FILES = confinement.CONTROLLER_FILES
+
+# Proof snapshots in the temp folder: the newest are kept for diagnosis, older
+# ones are removed once they are a day old (see run_structured_attempt()).
+SNAPSHOT_PREFIX = "tcs-proof-review-"
+SNAPSHOTS_KEPT = 50
 
 HISTORICAL_CODEX_ONLY = "Web cutoff timestamps require Codex CLI models for every proof role."
 
@@ -124,14 +151,54 @@ RETRY_POLL_SECONDS = 0.5
 
 RETRY_LABEL = "Retrying model call"
 
-# One structured attempt's timeout. Each consecutive timed-out attempt of the
-# same call doubles the next one (up to the cap and the remaining budget), so
-# an answer that needs longer still arrives.
-STRUCTURED_TIMEOUT_SECONDS = 900
-MAX_ATTEMPT_TIMEOUT_SECONDS = 24 * 3600
+# A structured attempt is stopped only after its CLI has written nothing for
+# this long (every output line counts, subagent messages included), never
+# while it works: exec-mode calls cannot be probed, and a false stop costs a
+# working attempt. The stopped attempt is retried like any other failure.
+STRUCTURED_STALL_SECONDS = 3600
+
+# After a CLI has ended, its output is read this much longer; a process it
+# started that still holds the output open is not waited for.
+CLI_OUTPUT_GRACE_SECONDS = 5
+
+# Each failed structured attempt's full provider messages and CLI stderr
+# (keys removed) are appended to this file in the run folder; a stderr longer
+# than twice STDERR_LOG_LINES keeps its first and its newest lines.
+MODEL_FAILURE_LOG = "model-failures.log"
+STDERR_LOG_LINES = 5000
+
+# So many identical failures to start a CLI in a row are shown as "Codex CLI
+# missing or incompatible" (the retries continue).
+CLI_PROBLEM_REPEATS = 3
+
+# The CLI check at a runner's start (`--version`, no model call) waits this long,
+# and remembers each CLI's path and version in this run-folder file.
+CLI_CHECK_SECONDS = 20
+CLI_VERSIONS_FILENAME = "cli-versions.json"
 
 # Removing one persisted structured session after its call never takes longer.
 SESSION_CLEANUP_SECONDS = 30
+
+# A paused or time-limited author may finish its current step this long after
+# the interrupt before its CLI is stopped.
+INTERRUPT_GRACE_SECONDS = 30
+
+# Author liveness: after this long without any event while a turn runs, the
+# CLI is asked a cheap question; no answer within AUTHOR_PROBE_SECONDS ends
+# the attempt as a failed model call (the retry resumes the same thread).
+AUTHOR_INACTIVITY_SECONDS = 30 * 60
+AUTHOR_PROBE_SECONDS = 60
+# A Codex turn that ended with the goal still open, followed by no new turn
+# for this long, is continued with the continuation prompt.
+AUTHOR_CONTINUE_SECONDS = 60
+# The app-server answers every request within this long, or the attempt fails.
+RPC_RESPONSE_SECONDS = 600
+# This many identical refusals to reopen a saved Codex conversation (not a
+# provider failure) continue the work in a new conversation.
+AUTHOR_RESUME_REFUSALS = 3
+# A live instruction the CLI did not accept is offered again at the next
+# turn, or after this long.
+STEER_RETRY_SECONDS = 60
 
 # Provider messages for a conversation that no longer fits the model's context.
 CONTEXT_WINDOW_MARKERS = (
@@ -174,11 +241,28 @@ AUTHOR_RETRY_NOTE = (
     "The previous turn ended early because of a model-call failure. Nothing about the task "
     "has changed. Continue the same work from where you left off in this conversation."
 )
+# A conversation turn of the paused author (run_author_conversation): the note
+# that asks again for a reply a model-call failure cut off, the labels of its
+# request and reply records by request kind, and the longest message or notice.
+CONVERSATION_RETRY_NOTE = (
+    "RETRY AFTER A MODEL-CALL FAILURE\n"
+    "Your previous reply was cut off by a model-call failure. Write that reply again, in full."
+)
+CONVERSATION_LABELS = {"summary": ("Progress summary requested", "Progress summary"),
+                       "message": ("Message to the paused author", "Author reply")}
+CONVERSATION_MAX_CHARS = 12000
+# A live run's conversation turn is read-only and has no subagents (Codex: a
+# read-only permission profile with multi_agent off; Claude: Read and the run's
+# search tools). False gives it the author's own tools instead. Web-cutoff runs
+# always use the author's audited launch.
+CONVERSATION_READ_ONLY = True
 
-# Appended to the reason of an author pause that no automatic retry can fix.
+# Appended to the pause reason of a Codex author whose saved thread ID is
+# missing. (A thread that Codex no longer has continues in a new conversation
+# by itself.)
 UNAVAILABLE_THREAD_HINT = (
-    " Codex no longer has this conversation, so automatic retry is off. Choose Continue proof "
-    "author to continue the saved work in a new conversation."
+    " A retry would lack the ID too, so automatic retry is off. Choose Continue proof author to "
+    "continue the saved work in a new conversation."
 )
 SAFETY_STOP_HINT = " Automatic retry is off; check the setup, then choose Resume."
 
@@ -198,15 +282,27 @@ RETRY_EXCERPT_CHARS = 3000
 
 STRUCTURED_HEARTBEAT_SECONDS = 30
 
-CRITIC_AUDIT_TIMEOUT_SECONDS = 1800
+# A critic result records whether the coordinator changed the submitted proof
+# and the unified diff of its changes (see _proof_change). A longer diff is
+# saved whole in the folder the critic_diff_dir option names (the run's
+# controller folder) and the result says so; without that option it stays in
+# the result. It is never shortened.
+PROOF_DIFF_INLINE_CHARS = 200_000
 
-CRITIC_COORDINATOR_TIMEOUT_SECONDS = 1800
+# The saved input of a later visit of a step (node_input, workflow_paused)
+# records under this state key which visit it is, and the instruction of a
+# verify-only visit: {node, visit[, verify]}. A run resumed at that step
+# continues the same visit, so its round and its verify instruction stay the same.
+# The step's "Workflow step: <node>" status names the same visit and verify
+# instruction, so a controller that kept only its transcript rebuilds it.
+STEP_VISIT_KEY = "stepVisit"
 
-CRITIC_AUDIT_CHECKPOINT_FILENAME = "critic-audits.json"
-
-CRITIC_AUDIT_RECOVERY_DISABLED_FILENAME = "fresh-critic-audits"
-
-CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION = 1
+# The progress of a call's subagents, from its Codex event stream (see SubagentProgress): the status labels
+# the job page and its workflow rail read. Each record also has auditCount (the subagents the call may start).
+SUBAGENTS_REQUESTED_LABEL = "{count} independent critic{s} requested"
+SUBAGENT_STARTED_LABEL = "Independent critic {index} started"
+SUBAGENT_FINISHED_LABEL = "Independent critic {index} finished"
+SUBAGENTS_WAITING_LABEL = "Waiting for the independent critics"
 
 SAVED_CANDIDATE_FILENAME = "saved-candidate.md"
 
@@ -226,8 +322,8 @@ class Error(RuntimeError):
 class FinalError(Error):
     """A failure that no retry can fix, so it is never retried automatically.
 
-    A structured call ends the run with it (as before automatic retries); an
-    author pauses with it as its reason.
+    A structured or command step pauses with it and waits for the user's
+    Resume (see _execute); an author pauses with it as its reason.
     """
 
 
@@ -249,6 +345,14 @@ class SafetyStop(FinalError):
 
 class CLIUnavailable(Error):
     """The model's CLI is not on PATH, for example while it updates itself; a later attempt can find it."""
+
+
+class ToolRuntimeUnavailable(Error):
+    """Codex reported that its code-mode tool runtime is unavailable; the session never continues after it.
+
+    A live run's retry starts Codex with the classic shell tool instead; a
+    web-cutoff run, which needs the audited tool set, checks again every minute.
+    """
 
 
 class WorkflowPaused(Error):
@@ -303,15 +407,130 @@ class ConversationUnavailable(Error):
     """The CLI no longer has the conversation a retry tried to resume."""
 
 
+class SavedConversationGone(FinalError):
+    """A paused author has no saved conversation to reopen for a conversation turn, or the CLI lost it.
+
+    A conversation turn never starts or replaces a conversation, so no retry helps.
+    """
+
+
+class ConversationAttemptFailed(Error):
+    """One attempt of a paused author's conversation turn failed on a model call.
+
+    ``retry`` tells the next attempt how to continue: whether the message was
+    ``delivered``, whether the model produced ``output``, the failed empty
+    turn to remove first (``rewind``: a Codex turn ID, or the Claude message
+    to resume at) and whether Codex needs its ``classic`` shell tool.
+    """
+
+    def __init__(self, message, *, retry=None):
+        super().__init__(message)
+        self.retry = {"delivered": False, "output": False, "rewind": None, "classic": False, **(retry or {})}
+
+
+class ConversationRefused(ConversationAttemptFailed):
+    """The CLI refused to reopen the saved author conversation (not a provider failure); ``refusal`` says how."""
+
+    def __init__(self, refusal, *, retry=None):
+        super().__init__(refusal, retry=retry)
+        self.refusal = refusal
+
+
 class RetryCancelled(Error):
     """A sibling request ended the workflow step while this one waited to retry."""
+
+
+class RPCError(Error):
+    """The Codex app-server answered a request with a JSON-RPC error; `code` and `payload` keep its details."""
+
+    def __init__(self, message, *, code=None, payload=None):
+        super().__init__(message)
+        self.code, self.payload = code, payload
+
+
+class HandoffRefused(Error):
+    """The controller cannot hand the author's submission to the next step.
+
+    The workflow pauses at the author as it was before the submission, and the
+    author is resumed automatically, whatever the reason (a proof too large for
+    the critic included); its handoff_refused prompt, when the workflow binds
+    one, tells it the reason. A candidate supplied without the author stage
+    cannot change, so that pause waits for the user.
+    """
+
+
+class ModelUnavailable(ConfigurationError):
+    """The provider says the model does not exist or that this account cannot use it."""
+
+
+class RequestRejected(ConfigurationError):
+    """An API model's endpoint refuses the request as invalid (HTTP 400): its settings do not fit the endpoint."""
+
+
+# How the job page and the controller recognize these settings problems in a
+# failure message (they lead the messages of the two errors above).
+MODEL_UNAVAILABLE_LABEL = "Model unavailable"
+REQUEST_REJECTED_LABEL = "Request rejected by the API endpoint"
+
+# Provider words for a model that does not exist or that this account cannot use.
+_MODEL_UNAVAILABLE = re.compile(
+    r"model[_ ]not[_ ]found|unrecognized[_ ]model|issue with the selected model|"
+    r"\bmodel\b[^\n]{0,160}?\bdoes not exist|do(?:es)? not have access to (?:the |this )?model|"
+    r"(?:is not|isn't|not) (?:available|supported) (?:for|to|on|with|when using) (?:your|this|a) "
+    r"(?:account|plan|organi[sz]ation|subscription|chatgpt account|api key)", re.IGNORECASE)
+# Words of a passing condition, which keep a failure retried whatever else it says.
+_PASSING_CONDITION = re.compile(r"capacity|overload|high demand|temporar|\b429\b|rate ?limit|\b5\d\d\b",
+                                re.IGNORECASE)
+# An endpoint that refuses the request itself as malformed for it.
+_REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b",
+                               re.IGNORECASE)
+
+
+def settings_failure(error, model=None):
+    """A failed model call that only a change of settings can fix, as the error that says so; else None.
+
+    No retry fixes a model that does not exist or that this account cannot
+    use (ModelUnavailable), an API model's endpoint that refuses the request
+    as invalid (RequestRejected; a conversation that is too long is not
+    that), or private TCS Prover state that cannot be used (a ProviderError).
+    These end a structured call and pause an author with a message saying
+    what to change; every other failure keeps being retried.
+    """
+
+    if isinstance(error, (FinalError, WorkflowPaused, RetryCancelled, InvalidAnswer, SubagentFailure,
+                          providers.StoreUnavailable)):
+        return None
+    if isinstance(error, providers.ProviderError):
+        return ConfigurationError(str(error))
+    if not isinstance(error, (Error, OSError)):
+        return None
+    text = redact(str(error))
+    if _context_window_failure(text) or _PASSING_CONDITION.search(text):
+        return None
+    try:
+        label = providers.model_label(model) if model else "the selected model"
+        api = bool(model) and providers.provider_kind(model) == providers.API
+    except providers.ProviderError:
+        return None  # Its settings cannot be read now: retried like any failure.
+    reason = _failure_reason(text) or text
+    if _MODEL_UNAVAILABLE.search(text):
+        fix = ("check its API connection under Models & API (Load models lists the models its key can use)" if api
+               else "check that the model exists and that your login may use it")
+        return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
+                                f"A retry cannot fix this: {fix}.")
+    if api and _REJECTED_REQUEST.search(text):
+        return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
+                               f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
+                               "under Models & API (or the endpoint); a job waiting for it continues once its "
+                               "settings change.")
+    return None
 
 
 def retryable_failure(error):
     """Whether a failed model-call attempt can succeed when it is tried again.
 
     Provider and transport failures (a CLI that failed, crashed or could not
-    start, an error or failed-turn event, a timed-out attempt, a conversation
+    start, an error or failed-turn event, a stalled attempt, a conversation
     the CLI no longer has), unacceptable answers (InvalidAnswer) and answers
     given after failed subagent calls (SubagentFailure) are retried.
     Configuration errors, workflow-rule errors and safety refusals
@@ -350,15 +569,49 @@ def critic_limit(value):
     return value
 
 
+def critic_count(value):
+    """Require a small positive number of independent critics (the subagents of the critic)."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+        if not isinstance(value, str) and value != parsed:
+            raise ValueError
+        value = parsed
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise Error("The number of independent critics must be an integer.") from exc
+    if not 1 <= value <= MAX_CRITIC_COUNT:
+        raise Error(f"Choose 1 to {MAX_CRITIC_COUNT} independent critics.")
+    return value
+
+
+def author_subagents(value):
+    """Require 0 (no subagent tool) to MAX_AUTHOR_SUBAGENTS subagents for the proof author."""
+
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+        if not isinstance(value, str) and value != parsed:
+            raise ValueError
+        value = parsed
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise Error("The number of author subagents must be an integer.") from exc
+    if not 0 <= value <= MAX_AUTHOR_SUBAGENTS:
+        raise Error(f"Choose 0 to {MAX_AUTHOR_SUBAGENTS} author subagents.")
+    return value
+
+
 def author_hours(value):
-    """Accept zero for unlimited, or a finite limit of at most one week."""
+    """Accept zero for unlimited, or any finite positive limit."""
 
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise Error("The total workflow time limit must be a number of hours.") from exc
-    if not math.isfinite(value) or not 0 <= value <= MAX_AUTHOR_HOURS:
-        raise Error(f"Choose 0 for unlimited, or at most {MAX_AUTHOR_HOURS} hours.")
+    if not math.isfinite(value) or value < 0:
+        raise Error("Choose 0 for unlimited, or a positive number of hours.")
     return value
 
 
@@ -391,9 +644,17 @@ def controlled_author_hours(path, current):
 
 
 def chosen_model(value):
-    """Require a built-in model, an older Codex id, or a configured API model."""
+    """Require a built-in model, an older Codex id, or a configured API model.
 
-    if isinstance(value, str) and providers.is_known(value):
+    An API model store that cannot be read right now is a model-call failure
+    (retried), never an unknown model.
+    """
+
+    try:
+        known = isinstance(value, str) and providers.is_known(value)
+    except providers.StoreUnavailable as exc:
+        raise Error(str(exc)) from exc
+    if known:
         return value
     if providers.replacement_for_removed(value):
         raise Error("DeepSeek is no longer supported; choose another model, for example gpt-6.1-sol.")
@@ -421,11 +682,31 @@ def model_argument(value):
 
 
 def chosen_effort(value):
-    """Require one supported Codex reasoning effort."""
+    """Require one supported Codex reasoning effort, or a retired one (Ultra), which runs as its replacement."""
 
-    if value not in EFFORTS:
+    if value not in EFFORTS and value not in RETIRED_EFFORTS:
         raise Error("Choose a valid reasoning effort.")
     return value
+
+
+def effort_argument(value):
+    """Validate a reasoning effort given on the command line (the retired Ultra is accepted, not offered)."""
+
+    try:
+        return chosen_effort(value)
+    except Error as exc:
+        raise argparse.ArgumentTypeError(f"{exc} Choose one of: {', '.join(EFFORTS)}.") from exc
+
+
+EFFORT_METAVAR = "{" + ",".join(EFFORTS) + "}"
+
+
+def note_retired_efforts(efforts):
+    """Say once that a retired effort (Ultra) runs as Max; ``efforts`` are the run's chosen efforts."""
+
+    if any(effort in RETIRED_EFFORTS for effort in efforts):
+        emit("status", "workflow", label="Ultra is no longer offered", text=RETIRED_EFFORT_NOTE,
+             retiredEffort="ultra", replacementEffort=RETIRED_EFFORTS["ultra"])
 
 
 def chosen_speed(value):
@@ -453,6 +734,10 @@ def context_cache_arguments():
     ]
 
 
+# The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces.
+PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "convention": "convention_critic", "final": "final"}
+
+
 def prompt_file(path, default):
     """Read an optional per-job prompt, or use the built-in default."""
 
@@ -469,8 +754,16 @@ def codex():
 
 
 _ISOLATED_CODEX = {}
+# Calls on several threads check a binary once, one at a time.
+_ISOLATED_CODEX_LOCK = threading.Lock()
 
 CODEX_HOME_PROBE_SECONDS = 30
+# The first start in a new private home may take longer while Codex prepares it.
+CODEX_HOME_FIRST_PROBE_SECONDS = 120
+
+
+class _ProbeFailed(Error):
+    """A CODEX_HOME probe gave no definite answer (a timeout, a failed start, no or a malformed reply)."""
 
 
 def _codex_candidates():
@@ -492,17 +785,27 @@ def _codex_candidates():
 
 
 def _reported_codex_home(executable, environment):
-    """Ask an app-server which CODEX_HOME it uses (an initialize handshake, no model request)."""
+    """Ask an app-server which CODEX_HOME it uses (an initialize handshake, no model request).
 
+    Return the reported home, or None when the reply names none. A probe
+    without a definite answer raises _ProbeFailed with the reason and the
+    end of its error output.
+    """
+
+    try:
+        first = not any(Path(environment["CODEX_HOME"]).iterdir())
+    except OSError:
+        first = True
+    limit = CODEX_HOME_FIRST_PROBE_SECONDS if first else CODEX_HOME_PROBE_SECONDS
     try:
         process = subprocess.Popen(
             [executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             env=environment, cwd=environment["CODEX_HOME"],
         )
-    except OSError:
-        return None
-    reply = {}
+    except OSError as exc:
+        raise _ProbeFailed(f"it could not be started ({exc})") from exc
+    reply, errors = {}, deque(maxlen=6)
 
     def read():
         try:
@@ -512,25 +815,53 @@ def _reported_codex_home(executable, environment):
             }}) + "\n")
             process.stdin.flush()
             for line in process.stdout:
-                message = json.loads(line)
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    message = None
+                if not isinstance(message, dict):
+                    if line.strip():  # A launcher's own output, not a protocol message.
+                        emit("diagnostic", "model", text="Skipped a line of the CODEX_HOME check that is not a "
+                                                         f"protocol message: {_clipped(redact(line.strip()), 300)}")
+                    continue
                 if message.get("id") == 1:
-                    reply.update(message.get("result") or {})
+                    reply["answer"] = message
                     return
         except (OSError, ValueError):
             pass
 
+    def drain():
+        try:
+            for line in process.stderr:
+                if line.strip():
+                    errors.append(_clipped(redact(line.strip()), 300))
+        except (OSError, ValueError):
+            pass
+
     reader = threading.Thread(target=read, daemon=True)
+    drainer = threading.Thread(target=drain, daemon=True)
     reader.start()
-    reader.join(CODEX_HOME_PROBE_SECONDS)
+    drainer.start()
+    reader.join(limit)
+    timed_out = reader.is_alive()
     stop_process(process)
     reader.join(timeout=1)
-    for stream in (process.stdin, process.stdout):
+    drainer.join(timeout=1)
+    for stream in (process.stdin, process.stdout, process.stderr):
         try:
             stream.close()
         except OSError:
             pass
-    home = reply.get("codexHome")
-    return Path(home).resolve() if isinstance(home, str) and home else None
+    detail = f" Its error output: {' | '.join(errors)}" if errors else ""
+    answer = reply.get("answer")
+    if answer is None:
+        raise _ProbeFailed((f"it did not answer within {_duration_text(limit)}" if timed_out
+                            else f"it ended without answering (exit code {process.returncode})") + "." + detail)
+    result = answer.get("result")
+    home = result.get("codexHome") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or not (home is None or isinstance(home, str) and home):
+        raise _ProbeFailed(f"its answer was malformed: {_clipped(redact(json.dumps(answer)), 300)}." + detail)
+    return Path(home).resolve() if home else None
 
 
 def api_codex_executable(environment):
@@ -539,19 +870,40 @@ def api_codex_executable(environment):
     Some installations wrap codex in a launcher that resets CODEX_HOME, which
     would hand the user's ChatGPT login and connectors to a third-party model.
     Each candidate reports its home through an initialize handshake; the first
-    one that uses the private home runs the API model, and none means refusal.
+    one that uses the private home runs the API model, and only definite
+    refusals of every candidate mean refusal (SafetyStop). Only definite
+    answers are remembered, per binary version (size and modification time).
+    A probe without one (a timeout, a failed start, no or a malformed reply)
+    fails the attempt with a retryable error, so the next retry asks again.
     """
 
     home = Path(environment["CODEX_HOME"]).resolve()
     # The probe needs only CODEX_HOME. A launcher may start the user's own
     # Codex configuration, which must never receive the key.
     probe = {name: value for name, value in environment.items() if name not in SECRET_ENVIRONMENT}
-    for candidate in _codex_candidates():
-        key = (candidate, str(home))
-        if key not in _ISOLATED_CODEX:
-            _ISOLATED_CODEX[key] = _reported_codex_home(candidate, probe) == home
-        if _ISOLATED_CODEX[key]:
+    candidates = _codex_candidates()
+    if not candidates:
+        raise CLIUnavailable("Codex CLI is not installed or is not on PATH.")
+    unknown = []
+    for candidate in candidates:
+        try:
+            info = os.stat(candidate)
+            key = (candidate, str(home), info.st_size, info.st_mtime_ns)
+        except OSError:
+            key = (candidate, str(home))
+        with _ISOLATED_CODEX_LOCK:
+            if key not in _ISOLATED_CODEX:
+                try:
+                    _ISOLATED_CODEX[key] = _reported_codex_home(candidate, probe) == home
+                except _ProbeFailed as exc:
+                    unknown.append(f"the codex at {candidate}: {str(exc).rstrip('.')}")
+                    continue
+            isolated = _ISOLATED_CODEX[key]
+        if isolated:
             return candidate
+    if unknown:
+        raise Error("API models through Codex need a Codex CLI that honors CODEX_HOME, and TCS Prover could "
+                    f"not check {'; '.join(unknown)}. The check is repeated at the next retry.")
     raise SafetyStop(
         "API models through Codex need a Codex CLI that honors CODEX_HOME, but the codex "
         "found on PATH replaces it (for example a launcher script). Put the native Codex "
@@ -624,7 +976,11 @@ def api_codex_home(workspace=None):
     try:
         root = providers.private_directory(providers.state_directory())
         return providers.private_directory(root / providers.CODEX_HOMES / key)
-    except (OSError, providers.ProviderError) as exc:
+    except providers.ProviderError as exc:
+        # The folder is not one TCS Prover may use: only the user can fix that.
+        raise ConfigurationError(f"Cannot prepare the private Codex home for API models: {exc}") from exc
+    except OSError as exc:
+        # A full disk or a busy file system: tried again like any failed call.
         raise Error(f"Cannot prepare the private Codex home for API models: {exc}") from exc
 
 
@@ -662,17 +1018,23 @@ def retrieval_policy(workspace=None, features=()):
             raise retrieval_runtime.RetrievalPolicyError("Historical workflow features are limited to the audited default tool set.")
         retrieval_runtime.search_mode(workspace, policy=policy)
         return policy
+    except retrieval_runtime.SettingsUnavailable as exc:
+        # A momentary read error of the saved settings: retried like a failed model call.
+        raise Error(str(exc)) from exc
     except retrieval_runtime.RetrievalPolicyError as exc:
         raise ConfigurationError(str(exc)) from exc
 
 
-def retrieval_environment(policy, role, model=None, inherited=None):
+def retrieval_environment(policy, role, model=None, inherited=None, agent_limits=None):
+    """The child environment of one Codex process; a web-cutoff process's is checked first (its subagent
+    limits, agent_limits(), included)."""
     try:
         if policy and model is not None and model_provider(model) != OPENAI_PROVIDER:
             raise retrieval_runtime.RetrievalPolicyError(HISTORICAL_CODEX_ONLY)
         return retrieval_runtime.preflight(
             policy, role, retrieval_runtime.codex_executable(policy) if policy else "",
             environment(model) if inherited is None else inherited,
+            **({"agent_limits": agent_limits} if agent_limits else {}),
         )
     except retrieval_runtime.RetrievalPolicyError as exc:
         raise ConfigurationError(str(exc)) from exc
@@ -731,15 +1093,38 @@ def configure_standard_streams():
 
 
 def stop_process(process):
-    """Stop a child promptly, escalating only when termination is ignored."""
+    """Stop a child and every process it started, escalating only when termination is ignored.
+
+    The child is frozen while everything it started is killed (parents before
+    children, as _stop_command_tree does), so no helper outlives it holding
+    its pipes; then it gets SIGTERM and five seconds to exit before its
+    remaining tree is killed. Windows ends the tree at once.
+    """
 
     if process.poll() is not None:
         return
+    if os.name == "nt":
+        _stop_command_tree(process)
+        process.wait()
+        return
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            # Frozen, the child starts nothing new while its descendants are listed.
+            process.send_signal(signal.SIGSTOP)
+            _stop_descendants(pid)
+        except OSError:
+            pass
+        finally:
+            try:
+                process.send_signal(signal.SIGCONT)
+            except OSError:
+                pass
     process.terminate()
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        process.kill()
+        _stop_command_tree(process)
         process.wait()
 
 
@@ -778,7 +1163,11 @@ def public_event(value):
 
 
 class StructuredAttemptTimeout(Error):
-    """One bounded structured request stopped waiting for its provider."""
+    """The watchdog stopped one structured attempt.
+
+    ``seconds`` is the inactivity limit of an attempt whose CLI wrote nothing
+    for that long; None for an attempt that reached the workflow deadline.
+    """
 
     def __init__(self, message, seconds=None):
         super().__init__(message)
@@ -809,7 +1198,7 @@ def _duration_text(seconds):
 
 # Who makes the model call of each built-in stage, in the words the job page uses.
 _STAGE_ROLES = {"review": "statement reviewer", "solve": "proof author", "repair": "proof author",
-                "critic": "critic", "final": "LaTeX editor"}
+                "conversation": "proof author", "critic": "critic", "final": "LaTeX editor"}
 
 
 def _call_name(stage):
@@ -829,7 +1218,7 @@ class RetryClock:
     """The retry waits of one workflow run, kept out of its time budget.
 
     The budget pauses only while every model call in progress waits to retry
-    (a parallel request that still runs keeps it going). Each change is
+    (another request that still runs keeps it going). Each change is
     reported as budgetClock "paused"/"running" on a status event, so the
     controller leaves the same intervals out of the job's active time.
     """
@@ -920,16 +1309,35 @@ _FAILURE_PATTERNS = (
 )
 
 
+# Lines that never state the cause: those the runner adds to a CLI's failure
+# text, and an argument parser's usage hints.
+_NO_CAUSE_LINE = re.compile(r"(?:(?:Codex|Claude) exited with code -?\d+|API status \d+|Claude reported [\w-]+|"
+                            r"Codex app-server stopped unexpectedly)\.|Usage: .*|For more information, try .*")
+
+
 def _failure_reason(text, limit=300):
-    """The provider's own message, without the runner's prefix, on one short line."""
+    """The provider's own message on one short line: the line that names the cause, else the newest one.
+
+    The runner's prefix and the lines it adds itself (an exit code, an API
+    status) are left out, so a cause such as a usage limit that the CLI
+    reported after a generic error is the one shown. Without such a line, a
+    CLI's own error line comes before its newest line.
+    """
 
     lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    value = lines[0] if lines else ""
-    value = re.sub(r"^(?:(?:Codex|Claude) [\w-]+ failed|(?:Claude )?[Aa]uthor turn failed|Author stopped|"
-                   r"Could not resume the saved (?:Codex|Claude) conversation; no replacement was started\.)\s*:?\s*",
-                   "", value).strip()
-    if not value and len(lines) > 1:
-        value = lines[1]
+    if lines:
+        lines[0] = re.sub(r"^(?:(?:Codex|Claude) [\w-]+ failed|(?:Claude )?[Aa]uthor turn failed|"
+                          r"(?:Author|Claude) reply turn failed|Author stopped|"
+                          r"Could not resume the saved (?:Codex|Claude) conversation; no replacement was started\.)"
+                          r"\s*:?\s*", "", lines[0]).strip()
+    lines = [line for line in lines if line]
+    candidates = [line for line in lines if not _NO_CAUSE_LINE.fullmatch(line)] or lines
+    lowered = str(text or "").lower()
+    cause = next((pattern for pattern, _ in _FAILURE_PATTERNS if re.search(pattern, lowered)), None)
+    value = next((line for line in candidates if cause and re.search(cause, line.lower())), None)
+    if value is None:
+        value = next((line for line in reversed(candidates) if re.match(r"(?:error|fatal)\b", line, re.IGNORECASE)
+                      or _CLI_PROBLEM_TEXT.search(line.lower())), candidates[-1] if candidates else "")
     return _clipped(value, limit)
 
 
@@ -960,11 +1368,36 @@ def describe_failure(error):
     if isinstance(error, SubagentFailure):
         message = next((message for message in error.failures.values() if str(message or "").strip()), "")
         return error.plain, _failure_reason(redact(message))
+    if isinstance(error, StructuredAttemptTimeout):
+        # The watchdog's own words; no provider message to quote.
+        return (f"no output for {_duration_text(error.seconds)}" if error.seconds
+                else "the workflow time limit was reached"), ""
     text = redact(str(error) or type(error).__name__)
     reason = _failure_reason(text)
-    if isinstance(error, StructuredAttemptTimeout) and error.seconds:
-        return f"no final answer within {_duration_text(error.seconds)}", reason
     return _plain_failure(text) or reason or type(error).__name__, reason
+
+
+# How a CLI that cannot start, or that rejects how it was started, says so
+# (shells, and the clap and commander argument parsers of Codex and Claude).
+_CLI_PROBLEM_TEXT = re.compile(r"not installed or is not on path|command not found|exited with code 127|"
+                               r"unexpected argument|unrecognized (?:option|argument|subcommand)|unknown option|"
+                               r"invalid value .{0,80} for '--")
+
+
+def _cli_problem(error):
+    """ "Codex" or "Claude" when a failed attempt could not start that CLI, else "".
+
+    The transports mark a CLI that ended without writing any output
+    (``cli_problem``); other failures are recognized by their wording.
+    """
+
+    named = getattr(error, "cli_problem", "")
+    text = str(error).lower()
+    if not named and not isinstance(error, CLIUnavailable) and not _CLI_PROBLEM_TEXT.search(text):
+        return ""
+    if _plain_failure(text) not in ("", "the CLI is not available", "the CLI stopped unexpectedly"):
+        return ""  # The CLI ran and reported a provider failure, such as a login or a usage limit.
+    return named or ("Claude" if "claude" in text else "Codex")
 
 
 def _retry_jitter(seconds):
@@ -990,46 +1423,57 @@ def _span_text(seconds):
 
 
 def wait_before_retry(options, stage, attempt, error, *, cancel=None, node=None, thread_id=None,
-                      activity=None, since=None, timeouts=0, next_timeout=None):
+                      activity=None, since=None, record=None):
     """Wait MODEL_RETRY_SECONDS (plus a few seconds of jitter) before attempt `attempt` of a failed model call.
 
-    The job stays running and a status event says why, how long the call has
-    been failing (`since`, a time.time() value) and, after timed-out
-    attempts, how long the next attempt may run. The wait does not consume
-    the workflow time budget (RetryClock). It ends at once on Stop
-    (KeyboardInterrupt) or when a sibling request cancels the step; the pause
-    file pauses the workflow, and a time limit lowered meanwhile ends it.
+    The job stays running and a status event says why and how long the call
+    has been failing (`since`, a time.time() value); a CLI that failed to
+    start in the same way CLI_PROBLEM_REPEATS times in a row is named as
+    missing or incompatible. The wait does not consume the workflow time
+    budget (RetryClock). It ends at once on Stop (KeyboardInterrupt) or when
+    a sibling request cancels the step; the pause file pauses the workflow,
+    and a time limit lowered meanwhile ends it. `record` holds more fields of
+    its status events (a conversation turn's conversationId).
     """
 
     plain, reason = describe_failure(error)
     nominal = max(0.0, float(MODEL_RETRY_SECONDS))
     seconds = nominal + _retry_jitter(nominal)
     clock = retry_clock(options)
-    where = {**({"node": node} if node else {}), **({"activityLabel": activity} if activity else {})}
+    where = {**({"node": node} if node else {}), **({"activityLabel": activity} if activity else {}),
+             **(record or {})}
     label = f"{activity} · {RETRY_LABEL}" if activity else RETRY_LABEL
     invalid = isinstance(error, InvalidAnswer)
     subagents = isinstance(error, SubagentFailure)
+    # Identical failures to start one CLI, each at most a few minutes after the one before.
+    cli, now = _cli_problem(error), _now()
+    streaks = options.setdefault("_cli_problems", {}) if options is not None else {}
+    key = (stage, node or "", activity or "")
+    previous = streaks.get(key)
+    repeats = (previous[1] + 1 if cli and previous and previous[0] == (cli, reason)
+               and now - previous[2] <= 5 * max(nominal, 60) else 1 if cli else 0)
+    streaks[key] = ((cli, reason), repeats, now)
+    missing = repeats >= CLI_PROBLEM_REPEATS
+    if missing:
+        plain = f"{cli} CLI missing or incompatible"
     details = [f"attempt {attempt}"]
     spent = max(0.0, _wall_clock() - since) if since is not None else 0.0
     if spent >= 60:
         details.append(f"retrying for {_span_text(spent)}")
-    if timeouts and next_timeout:
-        details.append((f"{timeouts} timeouts in a row; " if timeouts > 1 else "")
-                       + f"the next attempt may run {_span_text(next_timeout)}")
     text = (f"The model's answer could not be accepted ({plain})" if invalid
             else f"The answer was set aside because {plain}" if subagents
+            else plain if missing
             else f"Model call failed ({plain})") + f" — retrying in {_duration_text(nominal)} ({', '.join(details)})."
     if reason and reason != plain:
-        text += f" {'Detail' if invalid else 'Provider message'}: {reason}"
+        text += f" {'Detail' if invalid else 'CLI message' if missing else 'Provider message'}: {reason}"
     said = _explanation_excerpt(getattr(error, "raw", "")) if invalid else ""
     if said:
         text += f" The model said: {said}"
     change = clock.wait_started()
     emit("status", stage, label=label, text=text, retryAttempt=attempt, retryInSeconds=nominal,
          retryAt=_wall_clock() + seconds, failure=plain, failureReason=reason,
-         failureKind="invalid_answer" if invalid else "subagent" if subagents
+         failureKind="invalid_answer" if invalid else "subagent" if subagents else "cli" if missing
          else "timeout" if isinstance(error, StructuredAttemptTimeout) else "model_call", **({"retryingSeconds": round(spent)} if since is not None else {}),
-         **({"consecutiveTimeouts": timeouts, "nextAttemptTimeout": next_timeout} if timeouts and next_timeout else {}),
          **({"budgetClock": change} if change else {}), **where)
     pause_file = (options or {}).get("goal_pause_file")
     finished = False
@@ -1058,23 +1502,36 @@ def wait_before_retry(options, stage, attempt, error, *, cancel=None, node=None,
 
 
 def pending_author_steer(path, delivered_id=None):
-    """Read one new controller-authored live instruction, if available."""
+    """The next controller-authored live instruction to deliver, as (id, instruction), or None.
+
+    The controller appends every instruction to one queue file,
+    {"queue": [{"id", "instruction", "createdAt"}, ...]} (an older file holding
+    one {"id", "instruction"} object is a queue of one). Instructions are
+    delivered one at a time and in order: ``delivered_id`` is the newest one
+    the conversation accepted, so the entry after it comes next, or the first
+    entry when it is no longer queued (the controller drops accepted ones).
+    """
 
     if not path:
         return None
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
-        command_id = str(value["id"]).strip()
-        instruction = str(value["instruction"]).strip()
-    except (OSError, UnicodeError, KeyError, TypeError, ValueError,
-            json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return None
-    if (
-        not command_id or command_id == delivered_id or not instruction
-        or "\0" in instruction or len(instruction) > AUTHOR_STEER_MAX_CHARS
-    ):
-        return None
-    return command_id, instruction
+    entries = value["queue"] if isinstance(value, dict) and isinstance(value.get("queue"), list) else [value]
+    commands = []
+    for entry in entries:
+        try:
+            command_id = str(entry["id"]).strip()
+            instruction = str(entry["instruction"]).strip()
+        except (KeyError, TypeError, IndexError):
+            continue
+        if command_id and instruction and "\0" not in instruction and len(instruction) <= AUTHOR_STEER_MAX_CHARS:
+            commands.append((command_id, instruction))
+    identities = [command[0] for command in commands]
+    if delivered_id in identities:
+        commands = commands[identities.index(delivered_id) + 1:]
+    return commands[0] if commands else None
 
 def model_provider(model):
     """Return the provider id of one supported model (see OPENAI_PROVIDER)."""
@@ -1094,6 +1551,17 @@ def toml_string(value):
 
     return json.dumps(str(value), ensure_ascii=False).replace("\x7f", "\\u007f")
 
+def codex_home_folder(environment=None):
+    """The CODEX_HOME of a Codex process started with ``environment`` (None: this process's): its CODEX_HOME
+    variable, else ~/.codex."""
+
+    environment = os.environ if environment is None else environment
+    user_home = Path(environment.get("HOME") or Path.home())
+    configured_home = environment.get("CODEX_HOME")
+    if configured_home == "~" or (configured_home or "").startswith("~/"):
+        return user_home / configured_home[2:]
+    return Path(configured_home).expanduser() if configured_home else user_home / ".codex"
+
 def inherited_openai_base_url_arguments(overrides=None, environment=None):
     """Inherit only the built-in OpenAI URL while ignoring other user settings."""
     selected = dict(overrides or {})
@@ -1109,12 +1577,7 @@ def inherited_openai_base_url_arguments(overrides=None, environment=None):
     effective = {**os.environ, **(environment or {})}
     if effective.get("OPENAI_BASE_URL", "").strip() or tomllib is None:
         return []
-    user_home = Path(effective.get("HOME") or Path.home())
-    configured_home = effective.get("CODEX_HOME")
-    if configured_home == "~" or (configured_home or "").startswith("~/"):
-        home = user_home / configured_home[2:]
-    else:
-        home = Path(configured_home).expanduser() if configured_home else user_home / ".codex"
+    home = codex_home_folder(effective)
     try:
         with (home / "config.toml").open("rb") as stream:
             value = tomllib.load(stream).get("openai_base_url")
@@ -1141,7 +1604,14 @@ def provider_arguments(model):
     # with Codex 0.160). The provider authenticates only with the variable
     # below; requires_openai_auth=false keeps any OpenAI login out of
     # its requests.
+    # The context window the user set for this endpoint (Codex otherwise assumes
+    # a fallback for a model it does not know), compacted early enough to leave
+    # room for the max output. Codex 0.160 has no setting for the output limit.
+    window, output = entry.get("contextWindow"), entry.get("maxOutputTokens")
+    limits = ["-c", f"model_context_window={int(window)}",
+              "-c", f"model_auto_compact_token_limit={int((window - (output or 0)) * 0.8)}"] if window else []
     return [
+        *limits,
         "-c", f'model_provider="{API_PROVIDER}"',
         "-c", f'model_providers.{API_PROVIDER}.name="TCS Prover"',
         "-c", f"model_providers.{API_PROVIDER}.base_url={toml_string(entry['baseUrl'].rstrip('/'))}",
@@ -1159,47 +1629,106 @@ def provider_arguments(model):
     ]
 
 
-def private_permissions(base, model, workspace_write=None):
-    """A Codex permission profile: the built-in `base` without TCS Prover's private state.
+def live_network(workspace=None, policy=None):
+    """Whether the model processes of a run reach the internet: only in a live run (search mode "live").
 
-    Codex's read-only and workspace sandboxes let commands read every file the
-    user can, including the API model store. This profile keeps the built-in
-    sandbox and denies the private paths, and for API models also the user's
-    CLI logins (`model` None is treated as a native model).
-    Verified with Codex 0.160's macOS Seatbelt sandbox: other
-    platforms return None and keep the legacy sandbox modes (see README).
-
-    A derived ":workspace" profile keeps neither the read-only .codex, .agents,
-    .git and .aws folders of the workspace (a run folder under /tmp or $TMPDIR
-    could then plant a .codex/config.toml whose commands Codex starts outside
-    the sandbox on resume) nor the user's [sandbox_workspace_write] settings,
-    which the legacy workspace-write sandbox applied. Both are restored here;
-    `workspace_write` is that table as Codex's config/read reports it.
+    Network follows the search mode and nothing else, as native search does
+    for the same ``workspace`` (the author's run folder; None, the current
+    folder, for a structured call): a web-cutoff run, with a historical
+    ``policy`` or "disabled" (training knowledge only), keeps every process
+    offline, whatever the user's Codex settings say.
     """
 
-    if sys.platform != "darwin":
+    if policy:
+        return False
+    try:
+        return retrieval_runtime.search_mode(workspace) == "live"
+    except retrieval_runtime.SettingsUnavailable as exc:
+        # A momentary read error of the saved settings: retried like a failed model call.
+        raise Error(str(exc)) from exc
+    except retrieval_runtime.RetrievalPolicyError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def legacy_network_arguments(live):
+    """The network setting of Codex's legacy workspace-write mode, where private_permissions() is None.
+
+    It follows live_network(), not the user's [sandbox_workspace_write]
+    settings. The legacy read-only mode of `codex exec` has no network
+    setting (Codex 0.160: no [sandbox_read_only] key, no flag): a read-only
+    structured call (the statement reviewer, an independent critic, the
+    final verification) stays offline there. The app-server's read-only
+    mode has one, which a conversation turn sets (legacy_read_only_policy()).
+    """
+
+    return ["-c", f"sandbox_workspace_write.network_access={str(bool(live)).lower()}"]
+
+
+def legacy_read_only_policy(live):
+    """The sandbox policy of a conversation turn in Codex's legacy read-only mode, where private_permissions() is None.
+
+    Codex 0.160's app-server takes it as turn/start's "sandboxPolicy" (for
+    that turn and the later ones of the same app-server), and its read-only
+    policy has a network switch, which follows live_network(): the paused
+    author's replies and its time-limit summary reach the internet in a live
+    run there too. Verified with Codex 0.160 (command/exec, and turns against
+    a local mock model): networkAccess true reaches a public host and still
+    writes nothing, false or no policy reaches none, and the author's next
+    thread/resume ("workspace-write", in a new app-server) writes again.
+    """
+
+    return {"type": "readOnly", "networkAccess": bool(live)}
+
+
+def private_permissions(base, model, *, codex_home=None, live=False):
+    """The Codex permission profile that confines one model process of a run (macOS); None elsewhere.
+
+    `base` ":workspace" lets commands write the workspace (the author, a
+    structured call that edits a file), ":read-only" only read it (other
+    structured calls, the paused author's conversation turns). Commands can
+    read the system runtime (":minimal"), the toolchains that exist
+    (confinement.TOOLCHAIN_FOLDERS), Codex's own programs and the
+    apply_patch helpers of `codex_home`, and write the private temp folder
+    that the process's TMPDIR names (confinement.temp_environment()). Nothing
+    else: no other run, the checkout, the home folder, /tmp, /var/tmp or the
+    shared $TMPDIR. TCS Prover's private state, and for API models the
+    user's CLI logins, stay denied (`model` None is a native model). The
+    controller's files in the workspace and Codex's project folders (.codex,
+    .agents, .git, .aws) stay read-only, so a run folder cannot plant a
+    .codex/config.toml whose commands Codex starts outside the sandbox.
+
+    In a live run (``live``, see live_network()) commands of either base
+    reach the internet; the user's [sandbox_workspace_write] settings never
+    apply. Codex's network access also lets commands connect to localhost
+    and to any Unix socket, even one in a denied folder, and they can list
+    the sockets of the user's other processes (lsof): the variables that
+    name the user's agents are left out (confinement.AGENT_VARIABLES), but
+    their sockets stay reachable (the README says so). Verified with Codex
+    0.160's macOS Seatbelt sandbox: other platforms return None and keep the
+    legacy sandbox modes (legacy_network_arguments(),
+    legacy_read_only_policy(), README).
+    """
+
+    if not confinement.supported():
         return None
-    paths = providers.private_paths()
-    if model is not None and model_provider(model) == API_PROVIDER:
-        paths += providers.user_login_files()
-    denied = list(dict.fromkeys(paths))
-    profile = {"extends": base, "filesystem": {str(path): "deny" for path in denied}}
-    if base != ":workspace":
-        return profile
-    filesystem = profile["filesystem"]
-    filesystem[":workspace_roots"] = {
-        ".": "write", **{name: "read" for name in retrieval_runtime.PROTECTED_DIRECTORIES}}
-    legacy = workspace_write if isinstance(workspace_write, dict) else {}
-    for root in legacy.get("writable_roots") or ():
-        resolved = Path(os.path.realpath(root)) if isinstance(root, str) and os.path.isabs(root) else None
-        # A writable root never reopens private state (a deny entry stays more specific).
-        if resolved and not any(resolved == path or path in resolved.parents for path in denied):
-            filesystem.setdefault(root, "write")
-    if legacy.get("exclude_slash_tmp") is True:
-        filesystem[":slash_tmp"] = "read"
-    if legacy.get("exclude_tmpdir_env_var") is True:
-        filesystem[":tmpdir"] = "read"
-    if legacy.get("network_access") is True:
+    api = model is not None and model_provider(model) == API_PROVIDER
+    paths = providers.private_paths() + (providers.user_login_files() if api else [])
+    # The apply_patch helpers Codex links into $CODEX_HOME/tmp/arg0; a native model's
+    # launcher may also use the default home.
+    homes = [Path(codex_home)] if codex_home else []
+    if not api:
+        homes.append(Path.home() / ".codex")
+    filesystem = {
+        ":minimal": "read", ":slash_tmp": "deny", "/private/var/tmp": "deny", ":tmpdir": "write",
+        **{str(path): "read" for path in (*confinement.toolchain_folders(), *confinement.codex_packages())},
+        **{os.path.join(os.path.realpath(home), "tmp", "arg0"): "read" for home in homes},
+        **{str(path): "deny" for path in dict.fromkeys(paths)},
+        # The controller's files in the run folder stay read-only.
+        ":workspace_roots": {".": "write" if base == ":workspace" else "read",
+                             **{name: "read" for name in confinement.PROTECTED_ENTRIES}},
+    }
+    profile = {"filesystem": filesystem}
+    if live:
         profile["network"] = {"enabled": True}
     return profile
 
@@ -1212,17 +1741,57 @@ def _toml_inline(value):
     return str(value).lower() if isinstance(value, bool) else toml_string(value)
 
 
-def private_permission_arguments(base, model):
-    """Flags selecting private_permissions() for `codex exec`; empty where unsupported."""
+def private_permission_arguments(base, model, *, codex_home=None, profile=None, live=False):
+    """Flags that define and select private_permissions() (or `profile`); empty where unsupported."""
 
-    profile = private_permissions(base, model)
+    profile = private_permissions(base, model, codex_home=codex_home, live=live) if profile is None else profile
     if profile is None:
         return []
     return [
         "-c", f'default_permissions="{PRIVATE_PERMISSIONS}"',
-        "-c", f"permissions.{PRIVATE_PERMISSIONS}.extends={toml_string(base)}",
         "-c", f"permissions.{PRIVATE_PERMISSIONS}.filesystem={_toml_inline(profile['filesystem'])}",
+        *(["-c", f"permissions.{PRIVATE_PERMISSIONS}.network={_toml_inline(profile['network'])}"]
+          if profile.get("network") else []),
     ]
+
+
+@contextmanager
+def _confined_call(writable, model, environment, policy, workspace):
+    """The sandbox flags and environment of one `codex exec`, with a fresh private temp folder.
+
+    Yields (flags, environment). On macOS the confined profile and a new
+    owner-only temp folder outside the call's workspace, removed when the call
+    ends; elsewhere the legacy sandbox mode. Either way the call reaches the
+    internet in a live run only (live_network(), as its native search), and
+    its environment names neither of the user's SSH and GPG agents
+    (confinement.AGENT_VARIABLES). A web-cutoff call (``policy``) keeps its
+    audited profile and the private temp folder of its verified environment
+    (retrieval_runtime.preflight()), which it removes too.
+    """
+
+    if policy:
+        try:
+            yield retrieval_runtime.temp_arguments(policy, environment), environment
+        finally:
+            retrieval_runtime.remove_private_temp(policy, environment)
+        return
+    live = live_network()
+    flags = private_permission_arguments(
+        ":workspace" if writable else ":read-only", model, codex_home=(environment or {}).get("CODEX_HOME"),
+        live=live)
+    if not flags:
+        legacy = ["-s", "workspace-write", *legacy_network_arguments(live)] if writable else ["-s", "read-only"]
+        # With network access a command could use the agents, as with the confined profile.
+        yield legacy, confinement.without_agents(environment if environment is not None else os.environ)
+        return
+    try:
+        temp = confinement.fresh_folder(confinement.CALL_TEMP_PREFIX, workspace=workspace)
+    except (confinement.ConfinementError, OSError) as exc:
+        raise Error(f"Cannot prepare the private temp folder of this call: {exc}") from exc
+    try:
+        yield flags, confinement.confined_environment(environment if environment is not None else os.environ, temp)
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
 
 def require_model_credentials(model):
     """Fail before launching a CLI that is missing or a key that was never saved."""
@@ -1327,6 +1896,16 @@ def decoded_json_object(raw):
         return objects[-1]
     raise Error("The model returned malformed structured JSON.")
 
+
+def _holds_json_object(raw):
+    """Whether one model response holds a complete JSON object (see decoded_json_object)."""
+
+    try:
+        decoded_json_object(raw)
+    except Error:
+        return False
+    return True
+
 def validate_json_schema(value, schema, path="$"):
     """Validate model output against the same JSON Schema accepted by workflows."""
     error = next(validator_for(schema)(schema).iter_errors(value), None)
@@ -1344,12 +1923,81 @@ def output_schema_arguments(model, schema_path):
         return []
     return ["--output-schema", str(schema_path)]
 
-def structured_tool_arguments(stage, features=(), policy=None):
-    """Apply the run's search mode; keep other optional tools controlled by YAML."""
+# The delegation hint of a Codex process that may start subagents (multi_agent_mode_hint_text, see
+# retrieval_runtime.agent_limits()); its root agent and its subagents read it. The node's prompt states the
+# same number.
+SUBAGENT_HINT = ("Multi-agent delegation is allowed for this task: the root agent may start up to {count} independent "
+                 "subagent{s} at a time without asking the user. Subagents do not start subagents of their own.")
+
+
+# Codex 0.160's multi-agent version of each model (`codex debug models`, checked with its binary against a local
+# stand-in for the model API, no model): version 2 for its built-in models (GPT 6.x, GPT 5.6 Sol and Terra),
+# version 1 for models without catalog metadata (API models). GPT 5.6 Luna is listed as version 1 but gets no
+# subagent tool with the multi_agent feature (only with multi_agent_v2, which TCS Prover leaves off), so its
+# critic reviews alone and its author has no subagents; the run says so (note_no_subagent_tool()).
+NO_SUBAGENT_TOOL_MODELS = ("gpt-5.6-luna",)
+
+
+def multi_agent_version(model):
+    """Codex's multi-agent version of ``model``: 2, 1, or 0 for one that gets no subagent tool; None for a model
+    that runs through Claude Code."""
+
+    model = chosen_model(model)
+    if providers.harness(model) != providers.CODEX:
+        return None
+    if model in NO_SUBAGENT_TOOL_MODELS:
+        return 0
+    return 1 if providers.provider_kind(model) == providers.API else 2
+
+
+def note_unobservable_subagents(stage, model, count, policy):
+    """Say that a web-cutoff call shows its subagents of multi-agent version 2 only waiting (see SubagentProgress)."""
+
+    if not count or not policy or multi_agent_version(model) != 2:
+        return
+    emit("status", stage, label="Independent critics not observable", subagentsObservable=False,
+         text="A web-cutoff run keeps no saved session of the critic, and for this model Codex's event stream "
+              "shows only that the critic waits for its independent critics: when each one starts and finishes, "
+              "and whether one of their model calls failed, is not known, so the critic's answer is used as given.")
+
+
+def note_no_subagent_tool(stage, model, count):
+    """Say that ``model`` works without the ``count`` subagents its setting allows, when Codex gives it none."""
+
+    if not count or multi_agent_version(model) != 0:
+        return
+    s = "" if count == 1 else "s"
+    who = (f"the critic reviews alone, without its {count} independent critic{s}" if stage == "critic"
+           else f"the author works without the {count} subagent{s} that Author subagents allows" if stage == "solve"
+           else f"this step works without the {count} subagent{s} it may start")
+    emit("status", stage, label="No subagents with this model", noSubagentTool=True, subagentCount=count,
+         text=f"{providers.model_label(chosen_model(model))} gets no subagent tool from Codex, so {who}. "
+              "Choose another model to have them.")
+
+
+def subagent_limits(features, subagents):
+    """The Codex settings that bound one process's subagents (retrieval_runtime.agent_limits()).
+
+    A process without the multi_agent feature gets none: Codex 0.160 still lists its collaboration tools to
+    models of multi-agent version 2 with multi_agent off, so a session limit of one thread (the root) refuses
+    every spawn. With multi_agent, ``subagents`` (1 or more) is the most that may run at once, which the hint
+    states too; None keeps Codex's own limits (a node that declares no number).
+    """
+    if "multi_agent" not in features:
+        return retrieval_runtime.agent_limits(0)
+    if subagents is None:
+        return {}
+    return retrieval_runtime.agent_limits(subagents, SUBAGENT_HINT.format(count=subagents,
+                                                                           s="" if subagents == 1 else "s"))
+
+
+def structured_tool_arguments(stage, features=(), policy=None, subagents=None):
+    """Apply the run's search mode; keep other optional tools controlled by YAML, with their subagent limits."""
     return [
         *retrieval_runtime.native_search_arguments(policy=policy),
         "-c", "features.view_image=false",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
+        *retrieval_runtime.agent_limit_arguments(subagent_limits(features, subagents)),
     ]
 
 
@@ -1429,6 +2077,52 @@ def _context_window_failure(error):
     return any(marker in text for marker in CONTEXT_WINDOW_MARKERS)
 
 
+class SubagentProgress:
+    """The status records that show a structured call's subagents at work (see SUBAGENTS_REQUESTED_LABEL).
+
+    The transports report what their event streams show (StructuredConversation.subagent()):
+    - Claude: each Task (or Agent) tool call starts one subagent, and its tool result ends it;
+    - Codex, models with multi-agent version 1 (such as API models): a spawn_agent item names each new
+      subagent thread, and the agents_states of later collab items say when one completed or failed;
+    - Codex, models with multi-agent version 2 (GPT 6.x, GPT 5.6 Sol and Terra): `codex exec --json` reports
+      no item for spawn_agent, only wait_agent calls (collab items "wait" naming no thread; verified with
+      Codex 0.160); each subagent's start, end and failure are read from the call's saved session
+      (CodexRollout). A web-cutoff call saves no session, so there only "Waiting for the independent
+      critics" is observable (see note_unobservable_subagents()).
+    Every attempt starts its subagents anew, and so its numbering.
+    """
+
+    def __init__(self, stage, count):
+        self.stage, self.count = stage, count
+        self.started, self.finished, self.waited = [], set(), False
+
+    def _emit(self, label, **fields):
+        # Root statuses of the step (no activity label), which the job page keeps for its progress line.
+        emit("status", self.stage, label=label, subagentProgress=True, auditCount=self.count, **fields)
+
+    def start_attempt(self, attempt):
+        self.started, self.finished, self.waited = [], set(), False
+        self._emit(SUBAGENTS_REQUESTED_LABEL.format(count=self.count, s="" if self.count == 1 else "s"),
+                   attempt=attempt, text=f"The critic may start up to {self.count} independent "
+                                         f"subagent{'' if self.count == 1 else 's'} at a time.")
+
+    def subagent(self, identity, status):
+        identity = str(identity)
+        if status == "started" and identity not in self.started:
+            self.started.append(identity)
+            self._emit(SUBAGENT_STARTED_LABEL.format(index=len(self.started)), auditIndex=len(self.started))
+        elif status in ("completed", "failed") and identity in self.started and identity not in self.finished:
+            self.finished.add(identity)
+            index = self.started.index(identity) + 1
+            self._emit(SUBAGENT_FINISHED_LABEL.format(index=index), auditIndex=index,
+                       **({"failed": True} if status == "failed" else {}))
+
+    def waiting(self):
+        if not self.waited:
+            self.waited = True
+            self._emit(SUBAGENTS_WAITING_LABEL, waiting=True)
+
+
 class StructuredConversation:
     """The CLI conversations of one structured call, kept across all of its retries.
 
@@ -1465,6 +2159,11 @@ class StructuredConversation:
         self.output = False
         # The subagents that failed in the current attempt: {subagent: provider message}.
         self.subagent_failures = {}
+        # The call's SubagentProgress, when it may start subagents.
+        self.progress = None
+        # The current attempt's full provider messages and CLI stderr, keys removed
+        # ({"provider": text, "stderr": text}), for the run's MODEL_FAILURE_LOG.
+        self.detail = {}
         self.workspace = None
         self._sessions = []  # [session id, deleter] in creation order
         self._lock = threading.Lock()
@@ -1484,10 +2183,11 @@ class StructuredConversation:
 
     def start_attempt(self):
         self.session_id, self.confirmed, self.output = None, False, False
-        self.subagent_failures = {}
+        self.subagent_failures, self.detail = {}, {}
 
     def subagent(self, identity, status, message=""):
-        """A transport saw subagent ``identity`` fail ("failed", with the provider's message) or finish ("completed").
+        """A transport saw subagent ``identity`` start ("started"), fail ("failed", with the provider's message)
+        or finish ("completed"), or the call wait for its subagents ("waiting", no identity).
 
         A subagent that failed and then finished (the model continued it) no
         longer counts as failed.
@@ -1498,6 +2198,11 @@ class StructuredConversation:
                 self.subagent_failures[str(identity)] = str(message or "")
             elif status == "completed":
                 self.subagent_failures.pop(str(identity), None)
+        if self.progress is not None:
+            if status == "waiting":
+                self.progress.waiting()
+            else:
+                self.progress.subagent(identity, status)
 
     def created(self, session_id, deleter):
         """A transport persisted ``session_id``; ``deleter(session_id)`` removes it again (see discard)."""
@@ -1545,7 +2250,7 @@ class StructuredConversation:
             failed, reasons = _subagent_summary(failure.failures)
             return SUBAGENT_RETRY_NOTE.format(failed=failed, reasons=f" ({reasons})" if reasons else "")
         if isinstance(failure, StructuredAttemptTimeout) and failure.seconds:
-            cause = f"was stopped after {_duration_text(failure.seconds)}"
+            cause = f"was stopped after {_duration_text(failure.seconds)} without activity"
         else:
             cause = "ended early because of a model-call failure"
         note = STRUCTURED_RETRY_NOTE.format(cause=cause)
@@ -1587,36 +2292,185 @@ class StructuredConversation:
                                             f"call: {', '.join(left)}.")
 
 
-class RequestMonitor:
-    """Watchdog, liveness heartbeat and stderr tail of one structured CLI request.
+# Codex 0.160 saves each persisted session in $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<session id>.jsonl
+# (checked with its binary against a local stand-in for the model API, no model). For the root agent of a model
+# of multi-agent version 2, which `codex exec --json` shows only waiting, that file has what the stream lacks:
+# - each subagent's start and end: event_msg item_completed records of a SubAgentActivity item, kind "started"
+#   or "completed", with agent_thread_id and agent_path;
+# - each subagent's last message to the root: a response_item agent_message from its agent_path to "/root",
+#   "Message Type: FINAL_ANSWER ... Payload:\n<report>", whose report is "Agent errored: <provider message>
+#   \n\nThis agent's turn failed. ..." when its model call failed (no SubAgentActivity "completed" follows).
+# A fork's file holds only the fork's own records (it names the session it forked).
+ROLLOUT_POLL_SECONDS = 2
+SUBAGENT_ERRORED_PREFIX = "Agent errored:"
 
-    Shared by the Codex and Claude transports: start() arms the timeout and the
-    heartbeat after the prompt was written; close() always stops the process.
+
+class CodexRollout:
+    """Follows the saved session of one persisted Codex call for what its subagents do (see ROLLOUT_POLL_SECONDS).
+
+    read() reports each new complete record to ``conversation.subagent()``;
+    follow() reads every ROLLOUT_POLL_SECONDS in a thread until stop(),
+    which reads once more and says whether the file was found.
     """
 
-    def __init__(self, process, stage, model, effort, *, timeout, activity_label, cli="Codex", redact=None):
+    def __init__(self, home, session_id, conversation):
+        self.home, self.session_id, self.conversation = Path(home), session_id, conversation
+        self.path, self.offset, self.partial = None, 0, b""
+        self.threads = {}  # agent path -> thread id
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def _find(self, everywhere):
+        sessions = self.home / "sessions"
+        pattern = f"rollout-*-{self.session_id}.jsonl"
+        try:
+            # Its day folder is the local date it started: today's, or yesterday's just after midnight.
+            for day in dict.fromkeys(time.strftime("%Y/%m/%d", time.localtime(time.time() - shift))
+                                     for shift in (0, 86400)):
+                found = sorted((sessions / day).glob(pattern))
+                if found:
+                    return found[0]
+            return next(iter(sorted(sessions.glob(f"*/*/*/{pattern}"))), None) if everywhere else None
+        except OSError:
+            return None
+
+    def read(self, everywhere=False):
+        """Report the records written since the last read; whether the file was found."""
+
+        with self._lock:
+            if self.path is None:
+                self.path = self._find(everywhere)
+                if self.path is None:
+                    return False
+            try:
+                with open(self.path, "rb") as stream:
+                    stream.seek(self.offset)
+                    data = stream.read()
+            except OSError:
+                return True
+            self.offset += len(data)
+            lines = (self.partial + data).split(b"\n")
+            self.partial = lines.pop()
+            for line in lines:
+                self._record(line)
+            return True
+
+    def _record(self, line):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return
+        payload = record.get("payload") if isinstance(record, dict) else None
+        if not isinstance(payload, dict):
+            return
+        item = payload.get("item")
+        if (record.get("type") == "event_msg" and payload.get("type") == "item_completed" and isinstance(item, dict)
+                and item.get("type") == "SubAgentActivity"):
+            thread, path, kind = item.get("agent_thread_id"), item.get("agent_path"), item.get("kind")
+            if not isinstance(thread, str) or not thread:
+                return
+            if isinstance(path, str):
+                self.threads[path] = thread
+            if kind in ("started", "completed"):
+                self.conversation.subagent(thread, kind)
+        elif (record.get("type") == "response_item" and payload.get("type") == "agent_message"
+              and payload.get("recipient") == "/root" and isinstance(payload.get("author"), str)):
+            text = "".join(part["text"] for part in payload.get("content") or ()
+                           if isinstance(part, dict) and isinstance(part.get("text"), str))
+            if not text.startswith("Message Type: FINAL_ANSWER"):
+                return
+            report = text.partition("\nPayload:\n")[2]
+            identity = self.threads.get(payload["author"], payload["author"])
+            if report.startswith(SUBAGENT_ERRORED_PREFIX):
+                message = report[len(SUBAGENT_ERRORED_PREFIX):].split("\n\nThis agent's turn failed")[0].strip()
+                self.conversation.subagent(identity, "failed", message)
+            else:
+                self.conversation.subagent(identity, "completed")
+
+    def follow(self):
+        def poll():
+            while not self._stop.wait(ROLLOUT_POLL_SECONDS):
+                self.read()
+
+        self._thread = threading.Thread(target=poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return self.read(everywhere=True)
+
+
+# Codex 0.160's longest wait of a root agent for its subagents (wait_agent's timeout_ms: at most 3,600,000 ms for
+# both multi-agent versions). `codex exec --json` writes nothing while it waits, so while a wait is open the
+# stall watchdog allows this much more silence.
+CODEX_LONGEST_WAIT_SECONDS = 3600
+
+
+class RequestMonitor:
+    """Stall watchdog, liveness heartbeat and output readers of one structured CLI request.
+
+    Shared by the Codex and Claude transports. start() arms the watchdog and
+    the heartbeat before the prompt is written, so a CLI that never reads a
+    long prompt is stopped too. Every line the CLI writes counts as activity:
+    the watchdog stops the CLI only after `timeout` seconds without any
+    (STRUCTURED_STALL_SECONDS by default), CODEX_LONGEST_WAIT_SECONDS more
+    while its root agent waits for its subagents (waiting()), or after
+    `deadline` seconds (the workflow time limit). lines() yields the CLI's
+    output without waiting for a process it started that keeps the output
+    open after it ended; close() always stops the CLI and everything it
+    started.
+    """
+
+    def __init__(self, process, stage, model, effort, *, timeout, activity_label, cli="Codex", redact=None,
+                 deadline=None):
         self.process, self.stage, self.model, self.effort = process, stage, model, effort
-        self.timeout = None if timeout is None else float(timeout)
+        self.timeout = float(STRUCTURED_STALL_SECONDS if timeout is None else timeout)
+        self.deadline = None if deadline is None else float(deadline)
         self.activity_label, self.cli = activity_label, cli
         self.redact = redact or (lambda value: value)
         self.timed_out = threading.Event()
+        # The watchdog stopped the CLI because it wrote nothing for `quiet_seconds` (else: the deadline).
+        self.stalled = False
+        self.quiet_seconds = self.timeout
+        # The root agent's open waits for its subagents (their item ids).
+        self._waits = set()
+        # Whether the CLI wrote any output line at all (none: it failed to start).
+        self.output_seen = False
         self.stderr_lines = deque(maxlen=50)
+        # All of stderr for the failure log: the first lines, then the newest (see stderr_text()).
+        self._stderr_head, self._stderr_omitted = [], 0
+        self._stderr_tail = deque(maxlen=STDERR_LOG_LINES)
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._started_at = time.monotonic()
+        self._started_at = self._active_at = time.monotonic()
         self._progress = {"lastEventAt": self._started_at, "eventCount": 0, "contentEventCount": 0}
-        self._watchdog = (threading.Timer(self.timeout, self._enforce_timeout)
-                          if self.timeout is not None else None)
-        if self._watchdog is not None:
-            self._watchdog.daemon = True
+        self._lines = queue.Queue()
+        self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._heartbeat = threading.Thread(target=self._relay_heartbeat, daemon=True)
-        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
-        self._stderr_reader.start()
+        self._readers = (threading.Thread(target=self._read_stdout, daemon=True),
+                         threading.Thread(target=self._read_stderr, daemon=True))
+        for reader in self._readers:
+            reader.start()
 
-    def _enforce_timeout(self):
-        if self.process.poll() is None:
-            self.timed_out.set()
-            stop_process(self.process)
+    def _watch(self):
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                limit = self.timeout + (CODEX_LONGEST_WAIT_SECONDS if self._waits else 0)
+                quiet = limit - (now - self._active_at)
+            left = math.inf if self.deadline is None else self._started_at + self.deadline - now
+            if min(quiet, left) <= 0:
+                if self.process.poll() is None:
+                    self.stalled = left > 0
+                    self.quiet_seconds = limit
+                    self.timed_out.set()
+                    stop_process(self.process)
+                return
+            if self._stop.wait(min(quiet, left)):
+                return
 
     def _relay_heartbeat(self):
         while not self._stop.wait(STRUCTURED_HEARTBEAT_SECONDS):
@@ -1625,6 +2479,7 @@ class RequestMonitor:
                 quiet = now - self._progress["lastEventAt"]
                 count = self._progress["eventCount"]
                 content_count = self._progress["contentEventCount"]
+                retrying = self._progress.get("retrying")
             elapsed = now - self._started_at
             label = self.activity_label or f"{self.stage.title()} model request"
             alive = self.process.poll() is None
@@ -1638,9 +2493,10 @@ class RequestMonitor:
                     f"{count} public lifecycle event"
                     f"{'s' if count != 1 else ''} and {content_count} "
                     f"content event{'s' if content_count != 1 else ''}; "
-                    f"last public event {quiet:.0f}s ago. If content is "
-                    "still zero, the selected provider may be computing "
-                    "or queued server-side; its API does not expose which."
+                    f"last public event {quiet:.0f}s ago. "
+                    + (f"The CLI is retrying the provider request itself: {retrying}." if retrying else
+                       "If content is still zero, the selected provider may be computing "
+                       "or queued server-side; its API does not expose which.")
                 ),
                 heartbeat=True, elapsedSeconds=round(elapsed, 1),
                 quietSeconds=round(quiet, 1), publicEventCount=count,
@@ -1650,11 +2506,94 @@ class RequestMonitor:
                 reasoningEffort=self.effort,
             )
 
+    def _read_stdout(self):
+        try:
+            for line in self.process.stdout:
+                now = time.monotonic()
+                with self._lock:
+                    self._active_at = now
+                if not self._stop.is_set():  # After close() nobody reads them.
+                    self._lines.put((now, line))
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._lines.put(None)
+            _close_quietly(self.process.stdout)
+
     def _read_stderr(self):
-        for stderr_line in self.process.stderr:
-            value = stderr_line.strip()
-            if value:
-                self.stderr_lines.append(self.redact(value))
+        try:
+            for stderr_line in self.process.stderr:
+                value = stderr_line.strip()
+                if not value:
+                    continue
+                value = self.redact(value)
+                with self._lock:
+                    self.stderr_lines.append(value)
+                    if len(self._stderr_head) < STDERR_LOG_LINES:
+                        self._stderr_head.append(value)
+                        continue
+                    if len(self._stderr_tail) == self._stderr_tail.maxlen:
+                        self._stderr_omitted += 1  # Its oldest line drops out.
+                    self._stderr_tail.append(value)
+        except (OSError, ValueError):
+            pass
+        finally:
+            _close_quietly(self.process.stderr)
+
+    def lines(self):
+        """The CLI's output lines, until its output ends or CLI_OUTPUT_GRACE_SECONDS after the CLI ended."""
+
+        ended = None
+        while True:
+            try:
+                item = self._lines.get(timeout=0.2)
+            except queue.Empty:
+                item = False
+            if item is None:
+                return
+            if ended is None and self.process.poll() is not None:
+                ended = time.monotonic()
+            if item is False:
+                if ended is not None and time.monotonic() - ended >= CLI_OUTPUT_GRACE_SECONDS:
+                    return  # A process the CLI started still holds its output open.
+                continue
+            read_at, line = item
+            if ended is not None and read_at - ended > CLI_OUTPUT_GRACE_SECONDS:
+                return
+            self.output_seen = True
+            yield line
+
+    def stderr_text(self):
+        """All of the CLI's stderr (keys removed); a very long one keeps its first and newest lines."""
+
+        with self._lock:
+            omitted = [f"[{self._stderr_omitted} more lines omitted]"] if self._stderr_omitted else []
+            return "\n".join((*self._stderr_head, *omitted, *self._stderr_tail))
+
+    def stopped(self, stage):
+        """The StructuredAttemptTimeout of an attempt the watchdog stopped, else None."""
+
+        if not self.timed_out.is_set():
+            return None
+        if not self.stalled:
+            return StructuredAttemptTimeout(f"The {stage} model call reached the workflow time limit.")
+        return StructuredAttemptTimeout(f"The {stage} model wrote no output for {_duration_text(self.quiet_seconds)}; "
+                                        "the attempt was stopped.", self.quiet_seconds)
+
+    def waiting(self, item, open_):
+        """The root agent started (``open_``) or ended its wait ``item`` for its subagents."""
+
+        with self._lock:
+            if open_:
+                self._waits.add(item)
+            else:
+                self._waits.discard(item)
+
+    def retrying(self, text):
+        """The CLI reported that it waits to retry its provider request (``text``), or None once it moved on."""
+
+        with self._lock:
+            self._progress["retrying"] = text
 
     def send_input(self, prompt):
         """Write the whole prompt and end input; a CLI that already exited reports why below."""
@@ -1671,8 +2610,11 @@ class RequestMonitor:
                 raise
 
     def start(self):
-        if self._watchdog is not None:
-            self._watchdog.start()
+        """Arm the watchdog and the heartbeat; call it before send_input()."""
+
+        with self._lock:
+            self._started_at = self._active_at = time.monotonic()
+        self._watchdog.start()
         self._heartbeat.start()
 
     def observed(self, content):
@@ -1684,15 +2626,19 @@ class RequestMonitor:
 
     def close(self):
         self._stop.set()
-        if self._watchdog is not None:
-            self._watchdog.cancel()
         stop_process(self.process)
-        self._stderr_reader.join(timeout=1)
-        for stream in (self.process.stdout, self.process.stderr):
-            try:
-                stream.close()
-            except (AttributeError, OSError):
-                pass
+        # Each reader closes its stream when the stream ends. One that a process
+        # the CLI started still holds open is left to its reader: closing it here
+        # would wait for that process.
+        for reader in self._readers:
+            reader.join(timeout=1)
+
+
+def _close_quietly(stream):
+    try:
+        stream.close()
+    except (AttributeError, OSError, ValueError):
+        pass
 
 
 def _snapshot_intact(workspace, input_files):
@@ -1711,6 +2657,16 @@ def _snapshot_intact(workspace, input_files):
     return True
 
 
+def _prune_snapshots():
+    """Keep the newest SNAPSHOTS_KEPT proof snapshots, and any younger than a day.
+
+    A call reuses its snapshot for every retry and refreshes its time, so a
+    call still running keeps it; one removed anyway is written again.
+    """
+
+    retrieval_runtime.prune_folders(tempfile.gettempdir(), SNAPSHOT_PREFIX + "*", SNAPSHOTS_KEPT)
+
+
 def _write_snapshot(workspace, input_files):
     """Write the captured files read-only into an empty workspace; a partial snapshot is removed."""
 
@@ -1726,17 +2682,202 @@ def _write_snapshot(workspace, input_files):
     return workspace
 
 
+# The largest text a model may leave in a file it edits (see EditableFile).
+MAX_EDIT_FILE_BYTES = 16 * 1024 * 1024
+
+PROOF_FILES_NOTE = (
+    "\n\n{title}:\nYour working directory contains proof.md ({proof}), statement.md (the exact task), and "
+    "manifest.json (content hashes and provenance). Read both files completely; use successive ranges if tool "
+    "output is truncated.{agents} Review only this snapshot. Do not resolve links into the author's workspace."
+)
+# Added to PROOF_FILES_NOTE for a call that may start subagents (its multi_agent feature).
+PROOF_FILES_AGENTS_NOTE = " Give independent subagents these same files and working directory."
+EDIT_FILE_NOTE = (
+    "\n\nEDITING {name}:\n{start}Write all changes to {name} in place, in small steps, so that it holds the "
+    "complete final text when you answer; never replace it with a file pointer.{unchanged}{agents} Do not copy "
+    "its text into your JSON answer."
+)
+INLINE_EDIT_NOTE = (
+    "\n\nCOMPLETE TEXT IN THE ANSWER:\nThis run cannot give you a writable {name}. Return the complete final "
+    "text of {name} in the {field} field of your JSON answer, never a file pointer."
+)
+
+
+class EditableFile:
+    """The file one structured call edits in place (a node's `edit`): its name, result field and initial text.
+
+    The model edits a writable copy in its own workspace in small steps and
+    answers with a short status, so no answer has to hold a whole proof or
+    document; structured() reads the copy back into ``text`` after each
+    answer. Historical (web-cutoff) runs give structured roles no writable
+    workspace: there the answer carries the complete text in ``field``.
+    """
+
+    def __init__(self, name, field, initial=None, readonly=False):
+        self.name, self.field, self.initial = name, field, initial
+        # A read-only visit (verify) keeps the initial text whatever its answer says.
+        self.readonly = readonly
+        self.text = initial if readonly else None
+        # The file's bytes (None: absent) when the attempt behind the conversation's base ended.
+        self.base = None
+
+
+def _with_field(schema, field):
+    """A response schema that also requires the string `field`."""
+
+    return {**schema, "properties": {**schema.get("properties", {}), field: {"type": "string"}},
+            "required": list(dict.fromkeys([*schema.get("required", []), field]))}
+
+
+def _workspace_note(input_files, edit_file, inline, schema_value, features):
+    """What a structured call's working directory holds and how its edited file comes back."""
+
+    note = ""
+    writable = edit_file is not None and not inline
+    if input_files is not None:
+        in_bundle = writable and edit_file.name == "proof.md"
+        note += PROOF_FILES_NOTE.format(title="PROOF FILES" if in_bundle else "READ-ONLY PROOF FILES",
+                                        proof="a writable copy of the exact candidate" if in_bundle
+                                        else "the exact candidate",
+                                        agents=PROOF_FILES_AGENTS_NOTE if "multi_agent" in features else "")
+        if edit_file is None and "solution" in (schema_value.get("properties") or {}):
+            note += " Return the complete proof text in solution, never a file pointer."
+    if edit_file is None:
+        return note
+    readable = edit_file.name in dict(input_files or ())
+    if inline:
+        note += INLINE_EDIT_NOTE.format(name=edit_file.name, field=edit_file.field)
+        if not readable and edit_file.initial is not None:
+            note += f"\n\nCURRENT {edit_file.name}:\n{edit_file.initial}"
+        return note
+    start = ("" if readable else f"Create {edit_file.name} in your working directory; it does not exist yet. "
+             if edit_file.initial is None else f"Your working directory contains a writable copy of {edit_file.name}. ")
+    return note + EDIT_FILE_NOTE.format(
+        name=edit_file.name, start=start,
+        unchanged=" Leave it unchanged if nothing needs to change." if edit_file.initial is not None else "",
+        agents=" Only you edit it; subagents only read it." if "multi_agent" in features else "")
+
+
+def _snapshot_ready(stage, workspace, input_files, writable=False, features=()):
+    if "multi_agent" in features:
+        text = ("The critic and its subagents can read statement.md, and the critic edits its own copy of proof.md."
+                if writable else
+                "The critic and its subagents can read proof.md and statement.md in their read-only workspace.")
+    else:
+        text = ("The critic can read statement.md and edits its own copy of proof.md." if writable else
+                "The critic can read proof.md and statement.md in its read-only workspace.")
+    emit("status", stage, label="Proof snapshot ready", text=text,
+         snapshotWorkspace=str(workspace), snapshotManifest=json.loads(dict(input_files)["manifest.json"]))
+
+
+def _place_edit_file(workspace, name, data):
+    """Put exactly `data` (None: nothing) where an earlier attempt may have left its edits."""
+
+    path = Path(workspace) / name
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+    if data is not None:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+
+
+def _edit_file_bytes(workspace, name):
+    """The bytes of a regular edited file, or None when it is missing, a link or something else."""
+
+    try:
+        descriptor = os.open(Path(workspace) / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_EDIT_FILE_BYTES:
+            return None
+        return stream.read()
+
+
+def _edit_workspace(conversation, input_files, edit_file, stage, features=()):
+    """The writable workspace of one attempt: the read-only inputs and the edited file.
+
+    A forked conversation continues with the file as the attempt behind its
+    base left it; a new conversation starts from the initial text, so no
+    conversation ever sees edits it did not make. Files that vanished (a
+    temp-folder cleaner) are written again, and a conversation that used them
+    starts over.
+    """
+
+    readonly = tuple((name, value) for name, value in input_files or () if name != edit_file.name)
+    workspace = conversation.workspace
+    if workspace is not None and not _snapshot_intact(workspace, readonly):
+        conversation.workspace = workspace = None
+        emit("diagnostic", stage, text="The working files of this call disappeared or changed; writing them again "
+                                      "and starting a new conversation from the exact input.")
+        resumed = conversation.resume
+        conversation.forget()
+        if resumed:
+            raise ConversationUnavailable("The working files that the saved conversation used are gone.")
+    if workspace is None:
+        prefix = "tcs-proof-review-" if input_files is not None else "tcs-edit-"
+        workspace = conversation.workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix=prefix)), readonly)
+        if input_files is not None:
+            _snapshot_ready(stage, workspace, input_files, writable=True, features=features)
+    _place_edit_file(workspace, edit_file.name, edit_file.base if conversation.resume else
+                     None if edit_file.initial is None else edit_file.initial.encode("utf-8"))
+    return workspace
+
+
+def _read_edited_file(workspace, name):
+    """The text a model left in its writable copy; InvalidAnswer says in plain words what is wrong with it."""
+
+    try:
+        if workspace is None or Path(workspace).is_symlink():
+            raise FileNotFoundError(name)
+        descriptor = os.open(Path(workspace) / name,
+                             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        raise InvalidAnswer(f"{name} does not exist; it must hold the complete final text") from None
+    except OSError as exc:
+        raise InvalidAnswer(f"{name} must be a regular file, not a link or folder", detail=str(exc)) from exc
+    with os.fdopen(descriptor, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise InvalidAnswer(f"{name} must be a regular file, not a link or folder")
+        data = stream.read(MAX_EDIT_FILE_BYTES + 1)
+    if len(data) > MAX_EDIT_FILE_BYTES:
+        raise InvalidAnswer(f"{name} is larger than {MAX_EDIT_FILE_BYTES // (1024 * 1024)} MiB")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidAnswer(f"{name} is not UTF-8 text", detail=str(exc)) from exc
+    if "\0" in text:
+        raise InvalidAnswer(f"{name} contains NUL characters")
+    if not text.strip():
+        raise InvalidAnswer(f"{name} is empty; it must hold the complete final text")
+    return text
+
+
 def run_structured_attempt(
     prompt, schema_value, stage, model, effort, speed, summary,
-    timeout=None, activity_label=None, features=(), input_files=None, conversation=None,
+    timeout=None, activity_label=None, features=(), input_files=None, conversation=None, deadline=None,
+    edit_file=None, subagents=None,
 ):
     """Run one structured CLI process (Codex or Claude) and return its final text.
 
-    With a StructuredConversation the session persists and, when the
-    conversation says so, this attempt forks its base (see structured()).
+    The CLI is stopped after `timeout` seconds without output (None:
+    STRUCTURED_STALL_SECONDS) or after `deadline` seconds (the workflow time
+    limit; None: none). With a StructuredConversation the session persists
+    and, when the conversation says so, this attempt forks its base (see
+    structured()). With an `edit_file` the attempt runs in the writable
+    workspace that structured() prepared (see _edit_workspace). With the
+    multi_agent feature, ``subagents`` is the most subagents Codex lets the
+    call run at once (see subagent_limits()); Claude has no such setting.
     """
 
     policy = retrieval_policy(features=features)
+    limits = subagent_limits(features, subagents)
     claude = providers.harness(chosen_model(model)) == providers.CLAUDE
     if claude and policy:
         raise ConfigurationError(HISTORICAL_CODEX_ONLY)
@@ -1744,46 +2885,51 @@ def run_structured_attempt(
         # Historical sessions stay ephemeral; every retry re-runs the saved input.
         conversation.resumable = False
         conversation.forget()
+    if edit_file is not None and (policy or conversation is None or conversation.workspace is None):
+        # Web-cutoff runs never get a writable workspace (the answer carries the text there).
+        raise ConfigurationError("A writable file needs the workspace that structured() prepares.")
 
     def claude_request(workspace):
         # Claude reads files with its Read tool; the snapshot's shell_tool is Codex plumbing.
         return claude_cli.run_structured(
             prompt, schema_value, stage, model, effort, summary, timeout=timeout,
-            activity_label=activity_label, features=features, workspace=workspace,
+            activity_label=activity_label, workspace=workspace,
+            features=(*features, "file_edit") if edit_file is not None else features,
             environment=environment(model), runtime=sys.modules[__name__],
             **({"conversation": conversation} if conversation is not None else {}),
+            **({"deadline": deadline} if deadline is not None else {}),
         )
 
-    if input_files is not None:
+    if input_files is not None or edit_file is not None:
         # The tuple holds captured text, never paths to mutable author files.
-        if (not isinstance(input_files, tuple) or len(input_files) != 3
+        if input_files is not None and (
+                not isinstance(input_files, tuple) or len(input_files) != 3
                 or {name for name, _ in input_files} != {"proof.md", "statement.md", "manifest.json"}
                 or not all(isinstance(value, str) for _, value in input_files)):
             raise ConfigurationError("Invalid proof snapshot bundle.")
         snapshot_features = tuple(dict.fromkeys((*features, "shell_tool")))
 
-        def snapshot_ready(workspace):
-            emit("status", stage, label="Proof snapshot ready",
-                 text="The critic and its subagents can read proof.md and statement.md in their read-only workspace.",
-                 snapshotWorkspace=str(workspace), snapshotManifest=json.loads(dict(input_files)["manifest.json"]))
-
         def review(snapshot_policy, workspace):
-            environment_value = None if claude else retrieval_environment(snapshot_policy, "critic", model)
+            environment_value = None if claude else retrieval_environment(snapshot_policy, "critic", model,
+                                                                          agent_limits=limits)
             if claude:
                 return claude_request(workspace)
             return _run_structured_process(
                 prompt, schema_value, stage, model, effort, speed, summary,
                 timeout=timeout, activity_label=activity_label, features=snapshot_features,
                 policy=snapshot_policy, child_environment=environment_value, workspace=workspace,
-                conversation=conversation,
+                conversation=conversation, deadline=deadline, writable=edit_file is not None,
+                subagents=subagents,
             )
 
+        if edit_file is not None:
+            return review(None, conversation.workspace)
         if policy:
             try:
                 with retrieval_runtime.critic_session(policy) as snapshot_policy:
                     workspace = _write_snapshot(retrieval_runtime.role_workspace(snapshot_policy, "critic"),
                                                 input_files)
-                    snapshot_ready(workspace)
+                    _snapshot_ready(stage, workspace, input_files, features=features)
                     return review(snapshot_policy, workspace)
             except retrieval_runtime.RetrievalPolicyError as exc:
                 raise ConfigurationError(str(exc)) from exc
@@ -1791,6 +2937,11 @@ def run_structured_attempt(
         # Every attempt of one call reviews the same snapshot, where a forked
         # session finds the files it already read.
         workspace = conversation.workspace if conversation is not None else None
+        if workspace is not None:
+            try:
+                os.utime(workspace)  # In use: retention keeps it (see _prune_snapshots()).
+            except OSError:
+                pass
         if workspace is not None and not _snapshot_intact(workspace, input_files):
             # A temp-folder cleaner (or anything else) removed or changed the
             # snapshot: write it again, and never let a conversation continue
@@ -1803,20 +2954,21 @@ def run_structured_attempt(
                 raise ConversationUnavailable("The proof snapshot that the saved conversation read is gone.")
             conversation.forget()
         if workspace is None:
-            workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix="tcs-proof-review-")), input_files)
-            snapshot_ready(workspace)
+            _prune_snapshots()
+            workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX)), input_files)
+            _snapshot_ready(stage, workspace, input_files, features=features)
             if conversation is not None:
                 conversation.workspace = workspace
         return review(None, workspace)
     if claude:
         return claude_request(structured_workspace())
-    child_environment = retrieval_environment(policy, "structured", model)
+    child_environment = retrieval_environment(policy, "structured", model, agent_limits=limits)
     workspace = retrieval_runtime.role_workspace(policy, "structured") if policy else structured_workspace()
     return _run_structured_process(
         prompt, schema_value, stage, model, effort, speed, summary,
         timeout=timeout, activity_label=activity_label, features=features,
         policy=policy, child_environment=child_environment, workspace=workspace,
-        conversation=conversation,
+        conversation=conversation, deadline=deadline, subagents=subagents,
     )
 
 
@@ -1848,9 +3000,9 @@ def _codex_session_id(value):
 
 def _run_structured_process(
     prompt, schema_value, stage, model, effort, speed, summary,
-    *, timeout, activity_label, features, policy, child_environment, workspace, conversation=None,
+    *, timeout, activity_label, features, policy, child_environment, workspace, conversation=None, deadline=None,
+    writable=False, subagents=None,
 ):
-    timeout = None if timeout is None else float(timeout)
     # Verified with Codex 0.160: without --ephemeral `codex exec` persists the
     # session and reports its id (thread.started); `codex exec fork <id> -`
     # accepts the same root flags (model, effort, features, -C, sandbox or
@@ -1860,18 +3012,25 @@ def _run_structured_process(
     # =false keeps these sessions out of Codex's memory of the user's own work.
     persistent = conversation is not None and conversation.resumable and not policy
     fork = conversation.fork_from if persistent and conversation.fork_from else None
-    with tempfile.TemporaryDirectory() as folder:
+    # The call's private temp folder first: a web-cutoff call's came with its environment.
+    with _confined_call(writable, model, child_environment, policy, workspace) as (sandbox, process_environment), \
+            tempfile.TemporaryDirectory() as folder:
         folder = Path(folder)
         schema = folder / "schema.json"
         answer = folder / "answer.json"
         schema.write_text(json.dumps(schema_value), encoding="utf-8")
         schema_arguments = output_schema_arguments(model, schema)
-        if policy:
-            executable = retrieval_runtime.codex_executable(policy)
-        elif model_provider(model) == API_PROVIDER:
-            executable = api_codex_executable(child_environment)
-        else:
-            executable = codex()
+        try:
+            if policy:
+                executable = retrieval_runtime.codex_executable(policy)
+            elif model_provider(model) == API_PROVIDER:
+                executable = api_codex_executable(child_environment)
+            else:
+                executable = codex()
+            tool_arguments = structured_tool_arguments(stage, features, policy, subagents)
+        except retrieval_runtime.RetrievalPolicyError as exc:
+            # The run's policy, its native binary or its search settings changed since this call checked them.
+            raise ConfigurationError(str(exc)) from exc
         command = [
             executable,
             *(["--strict-config"] if policy else []),
@@ -1883,29 +3042,35 @@ def _run_structured_process(
             *speed_arguments(speed, model), *context_cache_arguments(),
             *(["-c", "memories.generate_memories=false"] if persistent else []),
             "-c", f'model_reasoning_summary="{summary}"',
-            *structured_tool_arguments(stage, features, policy),
+            *tool_arguments,
             *[argument for feature in features for argument in ("--enable", feature)],
-            # "-s read-only" would override the profile that hides private state.
-            "-C", str(workspace),
-            *([] if policy else private_permission_arguments(":read-only", model) or ["-s", "read-only"]),
+            # "-s read-only" would override the confined profile. A call that edits a
+            # file writes only its own temporary workspace (see _edit_workspace).
+            "-C", str(workspace), *sandbox,
             "-a", "never", "exec", *(["fork"] if fork else []),
             "--json", *([] if persistent else ["--ephemeral"]), "--skip-git-repo-check",
             *([] if policy else ["--ignore-user-config"]), *schema_arguments, "-o", str(answer),
             *([fork] if fork else []), "-",
         ]
-        process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace", env=child_environment,
-        )
-        monitor = RequestMonitor(process, stage, model, effort, timeout=timeout,
-                                 activity_label=activity_label)
-        provider_errors = deque(maxlen=10)
-        started = False
         try:
-            monitor.send_input(prompt)
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                errors="replace", env=process_environment,
+            )
+        except OSError as exc:
+            exc.cli_problem = "Codex"  # The CLI could not be started at all.
+            raise
+        monitor = RequestMonitor(process, stage, model, effort, timeout=timeout, deadline=deadline,
+                                 activity_label=activity_label)
+        provider_errors = []
+        started = False
+        # The saved session of a call with subagents, which alone shows those of multi-agent version 2.
+        rollout, rollout_found = None, True
+        try:
             monitor.start()
-            for line in process.stdout:
+            monitor.send_input(prompt)
+            for line in monitor.lines():
                 try:
                     raw_event = json.loads(line)
                     if not isinstance(raw_event, dict):
@@ -1917,19 +3082,36 @@ def _run_structured_process(
                         if _codex_session_id(thread):
                             conversation.session_id, conversation.confirmed = thread.lower(), True
                             conversation.created(thread.lower(), _codex_session_deleter(executable, child_environment))
+                            if subagents and "multi_agent" in features and rollout is None:
+                                rollout = CodexRollout(codex_home_folder(process_environment), thread.lower(),
+                                                       conversation)
+                                rollout.follow()
                     elif (persistent and isinstance(kind, str) and kind.startswith("item.")
                           and isinstance(raw_event.get("item"), dict)
-                          and raw_event["item"].get("type") not in {None, "error"}):
+                          and raw_event["item"].get("type") not in (None, "error")):
                         # The model worked in this session: a retry continues from it.
                         conversation.output = True
                     item = raw_event.get("item")
+                    if (isinstance(item, dict) and item.get("type") == "collab_tool_call" and item.get("tool") == "wait"
+                            and kind in ("item.started", "item.completed")):
+                        # Codex writes nothing while the root agent waits for its subagents.
+                        monitor.waiting(str(item.get("id")), kind == "item.started")
                     if (conversation is not None and isinstance(item, dict) and item.get("type") == "collab_tool_call"
                             and isinstance(item.get("agents_states"), dict)):
-                        # Codex 0.160 reports each subagent's state ({status, message})
-                        # on the spawn_agent, send_input, wait and close_agent calls.
+                        # Codex 0.160 reports each subagent's state ({status, message}) on the
+                        # spawn_agent, send_input, wait and close_agent calls of multi-agent version 1;
+                        # version 2 reports only its wait_agent calls ("wait", naming no thread), and its
+                        # subagents only in the saved session (CodexRollout).
+                        receivers = item.get("receiver_thread_ids")
+                        if (item.get("tool") == "spawn_agent" and item.get("status") == "completed"
+                                and isinstance(receivers, list)):
+                            for thread in receivers:
+                                conversation.subagent(thread, "started")
+                        elif item.get("tool") == "wait" and kind == "item.started":
+                            conversation.subagent(None, "waiting")
                         for thread, state in item["agents_states"].items():
                             status = state.get("status") if isinstance(state, dict) else None
-                            if status in {"errored", "completed"}:
+                            if status in ("errored", "completed"):
                                 conversation.subagent(thread, "failed" if status == "errored" else "completed",
                                                       state.get("message") if status == "errored" else "")
                     if kind == "error":
@@ -1948,7 +3130,8 @@ def _run_structured_process(
                             provider_errors.append(message.strip())
                     event = public_event(raw_event)
                     if event is not None:
-                        event_name = event.get("method") or event.get("type") or ""
+                        # A malformed event may name its type with a number or a list.
+                        event_name = str(event.get("method") or event.get("type") or "")
                         content_event = event_name.startswith("item/") or (
                             event_name.startswith("item.")
                             or event_name.startswith("item_")
@@ -1968,31 +3151,36 @@ def _run_structured_process(
             code = process.wait()
         finally:
             monitor.close()
-        if monitor.timed_out.is_set():
-            raise StructuredAttemptTimeout(
-                f"The {stage} model did not respond within {monitor.timeout:g} seconds.", monitor.timeout,
-            )
-        if code:
-            detail = "\n".join((*provider_errors, *monitor.stderr_lines)).strip()
-            detail = _clipped(redact(detail), 8000)
+            if rollout is not None:
+                rollout_found = rollout.stop()
+        if not rollout_found and multi_agent_version(model) == 2:
+            emit("diagnostic", stage, activityLabel=activity_label or "",
+                 text="Codex's saved session of this attempt could not be read, so whether one of its independent "
+                      "critics' model calls failed is not known for this attempt.")
+        # Codex writes the answer file; replace undecodable bytes so a damaged
+        # answer is retried as an unusable answer, not a crash.
+        output = answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
+        if conversation is not None:
+            conversation.detail = {"provider": redact("\n".join(provider_errors)),
+                                   "stderr": redact(monitor.stderr_text())}
+        stopped = monitor.stopped(stage)
+        if stopped is not None:
+            raise stopped
+        # A turn that failed without a usable answer is a provider failure, also when Codex exits 0.
+        if code or (provider_errors and not _holds_json_object(output)):
+            detail = _clip_middle(redact("\n".join((*provider_errors, *monitor.stderr_lines)).strip()), 8000)
             if fork and not started:
                 # The fork never started (Codex no longer has the saved session,
                 # or this CLI cannot fork it): nothing ran.
                 raise ConversationUnavailable(f"Codex could not continue the saved {stage} conversation: {detail}")
-            raise Error(
+            failure = Error(
                 f"Codex {stage} failed: {detail}"
                 if detail else f"Codex {stage} failed without diagnostics."
             )
-        # Codex writes the answer file; replace undecodable bytes so a damaged
-        # answer is retried as an unusable answer, not a crash.
-        return answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
-
-def critic_audit_assignment_sha256(statement, solution, model, effort, instructions, config=None, identity=None):
-    """Fingerprint the exact request inputs, model, settings, and parallel items."""
-    config = _parallel_definition(config)
-    identity = ({"statement": text(statement), "solution": text(solution), "instructions": text(instructions)} if identity is None else identity)
-    assignment = {**identity, "model": chosen_model(model), "reasoningEffort": effective_effort(model, effort), config.get("checkpoint", {}).get("item_key", "items"): config["items"]}
-    return _sha256(json.dumps(assignment, ensure_ascii=False, sort_keys=True))
+            if not monitor.output_seen:
+                failure.cli_problem = "Codex"  # It ended without any output: it could not start.
+            raise failure
+        return output
 
 def save_final_input(statement, solution, directory=None):
     """Atomically preserve the exact clean proof sent to the LaTeX editor."""
@@ -2008,123 +3196,6 @@ def save_final_input(statement, solution, directory=None):
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
     return path
-
-def load_critic_audit_checkpoint(
-    statement, solution, model, effort, instructions, directory=None, config=None, identity=None,
-):
-    """Restore only completed audits for this exact proof and configuration."""
-
-    config = _parallel_definition(config)
-    stage = config.get("stage", "critic")
-
-    path = Path(directory or Path.cwd()) / config["checkpoint"]["file"]
-    empty = [None] * len(config["items"])
-    expected = critic_audit_assignment_sha256(
-        statement, solution, model, effort, instructions, config=config, identity=identity,
-    )
-    candidates = [path]
-    # A user may resume the original proof job instead of the latest failed
-    # critic job. Exact fingerprints make it safe to recover paid audits from
-    # sibling run folders without relying on the selected source folder.
-    runs_directory = path.parent.parent
-    recovery_disabled = (
-        path.parent / config["checkpoint"].get("disabled", "fresh-critic-audits")
-    ).is_file()
-    if (
-        not recovery_disabled
-        and runs_directory.name == "runs"
-        and runs_directory.is_dir()
-    ):
-        siblings = sorted(
-            (
-                item for item in runs_directory.glob(
-                    f"*/{config['checkpoint']['file']}"
-                )
-                if item != path
-            ),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
-        candidates.extend(siblings)
-
-    restored = list(empty)
-    primary_problem = None
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        try:
-            value = json.loads(candidate.read_text(encoding="utf-8"))
-            reports = value.get("reports") if isinstance(value, dict) else None
-            if (
-                not isinstance(value, dict)
-                or value.get("schemaVersion")
-                != CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION
-                or value.get("assignmentSha256") != expected
-                or not isinstance(reports, list)
-                or len(reports) != len(config["items"])
-            ):
-                raise ValueError("checkpoint belongs to another proof or setting")
-            added = 0
-            for index, report in enumerate(reports):
-                if report is None or restored[index] is not None:
-                    continue
-                validate_json_schema(report, config["schema"])
-                report = dict(report)
-                if config.get("item_field"):
-                    report[config["item_field"]] = config["items"][index]
-                restored[index] = report
-                added += 1
-            if added and candidate != path:
-                emit(
-                    "status", stage,
-                    label="Prior exact-proof audits found",
-                    text=(
-                        f"Recovered {added} completed independent audit"
-                        f"{'s' if added != 1 else ''} from prior job "
-                        f"{candidate.parent.name}."
-                    ),
-                    checkpoint=True, checkpointSource=candidate.parent.name,
-                    recoveredAuditCount=added,
-                )
-            if all(report is not None for report in restored):
-                break
-        except (
-            OSError, UnicodeError, json.JSONDecodeError, ValueError, Error,
-        ) as exc:
-            if candidate == path:
-                primary_problem = exc
-    if primary_problem is not None and not any(restored):
-        emit(
-            "diagnostic", stage,
-            text=(
-                "Ignored incompatible critic audit checkpoint: "
-                f"{primary_problem}"
-            ),
-        )
-    return restored
-
-def save_critic_audit_checkpoint(
-    reports, statement, solution, model, effort, instructions, directory=None, config=None, identity=None,
-):
-    """Atomically preserve every completed independent auditor result."""
-
-    config = _parallel_definition(config)
-    stage = config.get("stage", "critic")
-
-    value = {
-        "schemaVersion": CRITIC_AUDIT_CHECKPOINT_SCHEMA_VERSION,
-        "assignmentSha256": critic_audit_assignment_sha256(
-            statement, solution, model, effort, instructions, config=config, identity=identity,
-        ),
-        "model": chosen_model(model),
-        "reasoningEffort": effective_effort(model, effort),
-        "reports": reports,
-    }
-    _private_atomic_write(
-        Path(directory or Path.cwd()) / config["checkpoint"]["file"],
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
-
 
 def _schema_problem(value, schema):
     """Say in plain words why a structured answer does not match its response schema."""
@@ -2183,39 +3254,79 @@ def _attempt_timeout(timeout, options):
     return remaining if timeout is None else min(float(timeout), remaining)
 
 
-def _grown_timeout(timeout, timeouts):
-    """The call's timeout doubled once for each consecutive timed-out attempt (capped)."""
+_FAILURE_LOG_LOCK = threading.Lock()
 
-    if timeout is None:
-        return None
-    return min(float(timeout) * 2 ** min(int(timeouts), 20), max(float(timeout), MAX_ATTEMPT_TIMEOUT_SECONDS))
+
+def _append_failure_log(path, text):
+    """Append to the run's failure log, never through a link, a FIFO or a second hard link; whether it was written.
+
+    The sandboxed author can write the run folder, so it could leave any of
+    them where the log belongs.
+    """
+
+    import stat
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | nofollow
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not nofollow and os.path.islink(path):
+            return False
+        with _FAILURE_LOG_LOCK:
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    return False
+                data = text.encode("utf-8")
+                while data:
+                    data = data[os.write(descriptor, data):]
+            finally:
+                os.close(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def structured(
     prompt, schema_value, stage, model=MODEL, effort=EFFORT,
     speed=DEFAULT_SPEED, summary=DEFAULT_REASONING_SUMMARY,
     timeout=None, attempts=None,
-    request_label=None, activity_label=None, features=(), input_files=None,
-    validate=None, options=None, cancel=None,
+    request_label=None, activity_label=None, features=(), input_files=None, edit_file=None,
+    validate=None, options=None, cancel=None, candidate_text=True, subagents=None,
 ):
     """Run one read-only structured model call, retrying every failure a retry can fix until it succeeds.
 
+    An ``edit_file`` (EditableFile) is the one file the call may change: the
+    model edits a writable copy in its workspace and its text, read back after
+    each answer, is checked in the same retry loop (a missing or empty file is
+    an unacceptable answer).
+
     This is the one retry loop of every structured role. A failed attempt
-    (provider or transport error, CLI crash, non-zero exit or missing CLI, a
-    timed-out attempt, an empty, unparsable or schema-invalid answer, an
-    answer that ``validate`` rejects with InvalidAnswer, or any answer given
-    after some of the call's subagents failed) is retried after
-    MODEL_RETRY_SECONDS, with no attempt limit (``attempts`` caps it only for
-    direct callers that ask). Configuration errors, workflow-rule errors,
-    safety refusals and harness errors are raised at once (see
-    retryable_failure). A retry continues the call's conversation with a
-    short note, or re-runs the exact saved input when it cannot (see
-    StructuredConversation); after consecutive timeouts each attempt may run
-    twice as long as the one before. With workflow ``options`` no attempt
-    starts after the workflow deadline, the waits do not consume the time
-    budget, and the pause file is honoured; Stop interrupts a wait at once,
-    and ``cancel`` ends one for a sibling parallel request. The CLI sessions
-    the call persisted are deleted when it ends.
+    (provider or transport error, CLI crash, non-zero exit or missing CLI, an
+    attempt stopped because its CLI wrote nothing for ``timeout`` seconds
+    (STRUCTURED_STALL_SECONDS by default; a working attempt is never
+    stopped), an empty, unparsable or schema-invalid answer, an answer that
+    ``validate`` rejects with InvalidAnswer, or any answer given after some
+    of the call's subagents failed) is retried after MODEL_RETRY_SECONDS,
+    with no attempt limit (``attempts`` caps it only for direct callers that
+    ask). Configuration errors, workflow-rule errors, safety refusals and
+    harness errors are raised at once (see retryable_failure). A retry
+    continues the call's conversation with a short note, or re-runs the
+    exact saved input when it cannot (see StructuredConversation). With
+    workflow ``options`` no attempt starts after the workflow deadline or
+    outlives it, the waits do not consume the time budget, the pause file
+    is honoured, and each failed attempt's full provider messages and CLI
+    stderr are appended to the ``failure_log`` file; Stop interrupts a wait
+    at once, and ``cancel`` ends one for a sibling request (an
+    attempt that fails once ``cancel`` is set ends the call with
+    RetryCancelled, without a log entry, a diagnostic or a wait). The CLI
+    sessions the call persisted are deleted when it ends. The first request
+    record carries the reviewed proof (candidateText) unless
+    ``candidate_text`` is False, and the diagnostics of a call with an
+    activity label name it. With the multi_agent feature, ``subagents`` is
+    the most subagents the call may run at once (subagent_limits()); its
+    attempts report their subagents' progress (SubagentProgress).
     """
 
     policy = retrieval_policy(features=features)
@@ -2227,16 +3338,11 @@ def structured(
         require_model_credentials(model)
     except CLIUnavailable:
         pass  # A CLI updating itself is back soon: every attempt looks for it again.
-    if input_files is not None:
-        prompt += (
-            "\n\nREAD-ONLY PROOF FILES:\n"
-            "Your working directory contains proof.md (the exact candidate), "
-            "statement.md (the exact task), and manifest.json (content hashes and provenance). "
-            "Read both files completely; use successive ranges if tool output is truncated. "
-            "Give independent subagents these same files and working directory. "
-            "Review only this snapshot. Do not resolve links into the author's workspace. "
-            "Return the complete proof text in solution, never a file pointer."
-        )
+    # Web-cutoff runs give structured roles no writable workspace: the answer carries the edited text.
+    inline = edit_file is not None and policy is not None
+    if inline:
+        schema_value = _with_field(schema_value, edit_file.field)
+    prompt += _workspace_note(input_files, edit_file, inline, schema_value, features)
     prompt = structured_prompt_for_model(prompt, schema_value, model)
     if attempts is not None:
         try:
@@ -2249,8 +3355,40 @@ def structured(
             raise Error("Structured attempts must be a positive integer.")
     conversation = StructuredConversation(resumable=policy is None)
     activity = activity_label or request_label
+    if subagents and "multi_agent" in features:
+        conversation.progress = SubagentProgress(stage, subagents)
+        note_no_subagent_tool(stage, model, subagents)
+        note_unobservable_subagents(stage, model, subagents, policy)
     logged = {}  # request text -> the attempt that logged it in full
-    failure, attempt, timeouts, failing_since = None, 0, 0, None
+    failure, attempt, failing_since = None, 0, None
+    stall = STRUCTURED_STALL_SECONDS if timeout is None else float(timeout)
+    failure_log = (options or {}).get("failure_log")
+    entry = {}  # The newest full entry of this call in the failure log: its body and attempt.
+
+    def log_failure(exc):
+        """Append the attempt's full failure to the run's failure log; the log's name, or "" if nothing was written."""
+
+        if not failure_log:
+            return ""
+        detail = conversation.detail
+        parts = [f"Provider messages:\n{detail['provider']}" if detail.get("provider") else "",
+                 f"CLI stderr:\n{detail['stderr']}" if detail.get("stderr") else ""]
+        if isinstance(exc, SubagentFailure):
+            parts.append("Subagent errors:\n" + "\n".join(
+                f"{name}: {redact(message)}" for name, message in exc.failures.items()))
+        if isinstance(exc, InvalidAnswer) and not any(parts):
+            return ""  # The diagnostic already says everything.
+        body = "\n".join(part for part in (redact(str(exc) or type(exc).__name__), *parts) if part)
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(_wall_clock()))
+        header = f"{when} · {_call_name(stage)}{f' ({activity})' if activity else ''} · attempt {attempt}"
+        same = entry.get("body") == body
+        text = (f"{header} failed the same way as attempt {entry['attempt']}.\n\n" if same
+                else f"{header} failed:\n{body}\n\n")
+        if not _append_failure_log(failure_log, text):
+            return ""
+        if not same:
+            entry.update(body=body, attempt=attempt)
+        return Path(failure_log).name
 
     def request(text):
         retry = attempt > 1
@@ -2265,17 +3403,27 @@ def structured(
             serviceTier=speed, responseSchema=schema_value,
             **({"conversation": "continued" if conversation.resume else "new"} if retry else {}),
             **({"sameInputAsAttempt": repeated} if repeated else {}),
+            # The reviewed proof is a file, not part of the request text.
+            **({"candidateText": dict(input_files)["proof.md"]}
+               if input_files is not None and candidate_text and not retry else {}),
         )
         logged.setdefault(text, attempt)
 
     def attempt_once(text):
         request(text)
         conversation.start_attempt()
+        if conversation.progress is not None:
+            conversation.progress.start_attempt(attempt)
+        if edit_file is not None and not inline:
+            edit_file.text = None
+            _edit_workspace(conversation, input_files, edit_file, stage, features)
         return run_structured_attempt(
             text, schema_value, stage, model, effort, speed, summary,
-            timeout=attempt_timeout, activity_label=activity, features=features,
+            timeout=stall, activity_label=activity, features=features,
             **({"input_files": input_files} if input_files is not None else {}),
-            conversation=conversation,
+            **({"edit_file": edit_file} if edit_file is not None and not inline else {}),
+            **({"subagents": subagents} if subagents is not None else {}),
+            conversation=conversation, deadline=attempt_deadline,
         )
 
     def run(text):
@@ -2283,6 +3431,8 @@ def structured(
         try:
             return attempt_once(text)
         except ConversationUnavailable as exc:
+            if cancel is not None and cancel.is_set():
+                raise RetryCancelled("Another request of this step ended it before this attempt started.") from exc
             # Nothing ran: re-run the exact saved input in a new conversation now.
             attempt += 1
             emit("status", stage, label=f"{activity} · {RETRY_LABEL}" if activity else RETRY_LABEL,
@@ -2300,7 +3450,7 @@ def structured(
                 if cancel is not None and cancel.is_set():
                     raise RetryCancelled("Another request of this step ended it before this attempt started.")
                 # No attempt starts after the workflow deadline, and none outlives it.
-                attempt_timeout = _attempt_timeout(_grown_timeout(timeout, timeouts), options)
+                attempt_deadline = _attempt_timeout(None, options)
                 raw = ""
                 try:
                     raw = run(conversation.request(prompt, schema_value, failure))
@@ -2308,62 +3458,119 @@ def structured(
                         # An answer after failed subagent calls rests on an
                         # incomplete review: never use it, run them again.
                         raise SubagentFailure(conversation.subagent_failures)
-                    return _accepted_answer(raw, schema_value, validate), raw
+                    value = _accepted_answer(raw, schema_value)
+                    if edit_file is not None and not inline:
+                        edit_file.text = _read_edited_file(conversation.workspace, edit_file.name)
+                    return (validate(value, raw) if validate is not None else value), raw
                 except Exception as exc:
+                    settings = settings_failure(exc, model)
+                    if settings is not None:
+                        raise settings from exc
                     if not retryable_failure(exc):
                         raise  # A retry cannot fix it (see retryable_failure).
+                    if cancel is not None and cancel.is_set():
+                        # The step ended meanwhile (Stop ended this attempt, or another request ended the
+                        # step): nothing is retried, so the failure is not logged or announced as one.
+                        raise RetryCancelled("Another request of this step ended it while this one ran.") from exc
                     failure = exc
                     if isinstance(exc, InvalidAnswer):
                         exc.raw = raw
                     conversation.finish_attempt(exc)
-                    timeouts = timeouts + 1 if isinstance(exc, StructuredAttemptTimeout) else 0
+                    if (edit_file is not None and not inline and conversation.base
+                            and conversation.base == conversation.session_id):
+                        # A retry continues this attempt's conversation, and so its file.
+                        edit_file.base = _edit_file_bytes(conversation.workspace, edit_file.name)
                     failing_since = failing_since or _wall_clock()
+                    logged_to = log_failure(exc)
+                    full = f" Full details: {logged_to} in the run folder." if logged_to else ""
+                    # A call with an activity label (such as the critic coordinator) is named.
+                    where = f"{activity}, attempt {attempt}" if activity else f"attempt {attempt}"
+                    named = {"activityLabel": activity} if activity else {}
                     if isinstance(exc, InvalidAnswer):
                         emit("diagnostic", stage, rawResponse=(raw or "")[:STRUCTURED_RETRY_OUTPUT_CHARS],
-                             attempt=attempt,
-                             text=(f"The answer to {_call_name(stage)} (attempt {attempt}) could not be accepted: "
+                             attempt=attempt, **named,
+                             text=(f"The answer to {_call_name(stage)} ({where}) could not be accepted: "
                                    f"{exc.problem}." + (f" Rule: {exc.rule}." if exc.rule else "")
-                                   + (f" {_clipped(redact(exc.detail), 1600)}" if exc.detail else "")))
+                                   + (f" {_clip_middle(redact(exc.detail).strip(), 1600)}" if exc.detail else "")
+                                   + full))
                     elif isinstance(exc, SubagentFailure):
                         messages = "; ".join(dict.fromkeys(
                             _failure_reason(redact(message), 400) for message in exc.failures.values()
                             if str(message or "").strip()))
                         emit("diagnostic", stage, rawResponse=(raw or "")[:STRUCTURED_RETRY_OUTPUT_CHARS],
-                             attempt=attempt,
-                             text=(f"The answer to {_call_name(stage)} (attempt {attempt}) was set aside because "
+                             attempt=attempt, **named,
+                             text=(f"The answer to {_call_name(stage)} ({where}) was set aside because "
                                    f"{exc.plain}; the retry runs the failed subagents again."
-                                   + (f" Subagent errors: {messages}" if messages else "")))
+                                   + (f" Subagent errors: {messages}" if messages else "") + full))
                     else:
-                        emit("diagnostic", stage, attempt=attempt, text=(
-                            f"{_call_name(stage)[0].upper()}{_call_name(stage)[1:]} (attempt {attempt}) failed: "
-                            f"{_clipped(redact(str(exc) or type(exc).__name__), 2000)}"))
+                        emit("diagnostic", stage, attempt=attempt, **named, text=(
+                            f"{_call_name(stage)[0].upper()}{_call_name(stage)[1:]} ({where}) failed: "
+                            f"{_clip_middle(redact(str(exc) or type(exc).__name__).strip(), 2000)}{full}"))
                     if attempts is not None and attempt >= attempts:
                         raise
                 wait_before_retry(options, stage, attempt + 1, failure, cancel=cancel, activity=activity,
-                                  since=failing_since, timeouts=timeouts,
-                                  next_timeout=_grown_timeout(timeout, timeouts) if timeouts else None)
+                                  since=failing_since)
         finally:
             # The persisted CLI sessions served only this call.
             conversation.discard()
 
 
 class RPC:
-    """Send the few JSON-RPC messages needed by Goal mode."""
+    """Send the few JSON-RPC messages needed by Goal mode.
 
-    def __init__(self, process, record=None):
+    Requests the app-server sends to this unattended client (approvals, user
+    input, MCP elicitations, ...) are answered at once, with a decline or a
+    JSON-RPC error, so the turn continues. ``pending_call`` names the call
+    waiting for its answer, which the goal session's watcher bounds;
+    ``notice`` (set by the session) receives one diagnostic sentence per
+    answered request kind and per error reply, and ``stderr_log`` receives the
+    whole redacted stderr of the app-server.
+    """
+
+    skipped = 0  # Output lines that were not protocol messages (see wire()).
+
+    # The answers an unattended client gives; other requests get a JSON-RPC error.
+    DECLINED = {
+        "item/commandExecution/requestApproval": {"decision": "decline"},
+        "item/fileChange/requestApproval": {"decision": "decline"},
+        "execCommandApproval": {"decision": "denied"},
+        "applyPatchApproval": {"decision": "denied"},
+        "mcpServer/elicitation/request": {"action": "decline"},
+    }
+
+    def __init__(self, process, record=None, stderr_log=None):
         self.process, self.record = process, record
         self.number, self.waiting = 0, deque()
         self.write_lock = threading.Lock()
         self.stderr_tail = deque(maxlen=12)
         self.stderr_reader = None
+        self.pending_call = None
+        self.notice = None
+        self.answered = set()
         if getattr(process, "stderr", None) is not None:
             def drain_errors():
-                for line in process.stderr:
-                    # Startup diagnostics must not publish environment credentials
-                    # or an API model's key.
-                    value = redact(line.strip())
-                    if value:
-                        self.stderr_tail.append(value[:800])
+                log = _open_private_log(stderr_log) if stderr_log else None
+                try:
+                    if log is not None:
+                        log.write(f"--- Codex app-server started {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+                        log.flush()
+                    for line in process.stderr:
+                        # Startup diagnostics must not publish environment credentials
+                        # or an API model's key.
+                        value = redact(line.strip())
+                        if value:
+                            self.stderr_tail.append(value[:800])
+                            if log is not None:
+                                log.write(value + "\n")
+                                log.flush()
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    if log is not None:
+                        try:
+                            log.close()
+                        except OSError:
+                            pass
             self.stderr_reader = threading.Thread(target=drain_errors, daemon=True)
             self.stderr_reader.start()
 
@@ -2373,21 +3580,53 @@ class RPC:
             self.process.stdin.write(json.dumps(message) + "\n")
             self.process.stdin.flush()
 
-    def wire(self):
-        """Read one new message from Codex."""
+    def answer(self, message):
+        """Answer one request of the app-server: this client is unattended and asks nobody."""
 
-        line = self.process.stdout.readline()
-        if not line:
-            if self.stderr_reader:
-                self.stderr_reader.join(timeout=0.2)
-            detail = "\n".join(self.stderr_tail)
-            raise Error("Codex app-server stopped unexpectedly." + ("\n" + detail if detail else ""))
+        method = str(message.get("method"))
+        result = self.DECLINED.get(method)
+        reply = {"id": message["id"]}
+        if result is not None:
+            reply["result"] = result
+        else:
+            reply["error"] = {"code": -32601, "message": f"TCS Prover runs unattended and cannot answer {method}."}
         try:
-            message = json.loads(line)
-        except ValueError as exc:
-            raise Error(f"Codex app-server sent a malformed message: {_clipped(redact(line.strip()), 300)}") from exc
-        if not isinstance(message, dict):
-            raise Error("Codex app-server sent a malformed message.")
+            self.send(reply)
+        except (OSError, ValueError):
+            pass  # The app-server is gone; reading reports it.
+        if self.notice is not None and method not in self.answered:
+            self.answered.add(method)
+            self.notice(f"Codex asked for {method}; TCS Prover runs unattended, so it "
+                        f"{'declined' if result is not None else 'answered that it cannot reply'}, "
+                        "and the turn continues.")
+
+    def wire(self):
+        """Read one new message from Codex.
+
+        A line that is not a JSON object (for example a launcher's own
+        output) is skipped with a diagnostic. The end of the output, also
+        after a partial line of a crashing app-server, reports its stderr tail.
+        """
+
+        while True:
+            line = self.process.stdout.readline()
+            try:
+                message = json.loads(line) if line.strip() else None
+            except ValueError:
+                message = None
+            if isinstance(message, dict):
+                break
+            if not line.endswith("\n"):
+                if self.stderr_reader:
+                    self.stderr_reader.join(timeout=0.2)
+                detail = "\n".join(self.stderr_tail)
+                raise Error("Codex app-server stopped unexpectedly." + ("\n" + detail if detail else ""))
+            if line.strip():
+                self.skipped += 1
+                if self.skipped <= 3:
+                    emit("diagnostic", "model", text="Skipped a line of Codex app-server output that is not a "
+                         "protocol message" + (" (later ones are skipped silently)" if self.skipped == 3 else "")
+                         + f": {_clipped(redact(line.strip()), 300)}")
         if self.record:
             self.record(message)
         # This is a runtime warning, not model-authored text. Continuing after
@@ -2395,21 +3634,27 @@ class RPC:
         # every functions.exec call fails, including historical retrieval.
         if (message.get("method") == "warning"
                 and "code mode is unavailable" in str((message.get("params") or {}).get("message", "")).lower()):
-            raise SafetyStop("Required model tool runtime is unavailable: " + message["params"]["message"])
-        # This small noninteractive client cannot answer server-side questions.
+            raise ToolRuntimeUnavailable("Required model tool runtime is unavailable: " + message["params"]["message"])
         if "id" in message and "method" in message:
-            raise SafetyStop(f"Interactive Codex request is unsupported: {message['method']}.")
+            self.answer(message)
         return message
 
     def read(self):
         return self.waiting.popleft() if self.waiting else self.wire()
 
-    def request(self, method, params):
-        """Send one numbered request and return its identifier."""
+    def request(self, method, params, before_send=None):
+        """Send one numbered request and return its identifier.
+
+        ``before_send(identifier)`` runs under the write lock before the
+        request is written, so an answer can never arrive before its caller
+        has recorded the request.
+        """
 
         with self.write_lock:
             self.number += 1
             request = self.number
+            if before_send is not None:
+                before_send(request)
             self.process.stdin.write(json.dumps({
                 "id": request, "method": method, "params": params,
             }) + "\n")
@@ -2418,17 +3663,310 @@ class RPC:
 
     def call(self, method, params):
         request = self.request(method, params)
-        while True:
-            message = self.wire()
-            if message.get("id") == request and "method" not in message:
-                if "error" in message:
-                    raise Error(f"{method} failed: {message['error']}")
-                return message.get("result", {})
-            self.waiting.append(message)
+        self.pending_call = (method, time.monotonic())
+        try:
+            while True:
+                message = self.wire()
+                if message.get("id") == request and "method" not in message:
+                    if "error" in message:
+                        error = message["error"]
+                        code = error.get("code") if isinstance(error, dict) else None
+                        if self.notice is not None:
+                            self.notice(f"Codex answered {method} with JSON-RPC error {code}: "
+                                        f"{_clipped(json.dumps(error, ensure_ascii=False), 600)}")
+                        raise RPCError(f"{method} failed: {_provider_message(error) or 'no reason given'}",
+                                       code=code, payload=error)
+                    return message.get("result", {})
+                self.waiting.append(message)
+        finally:
+            self.pending_call = None
+
+
+def _open_private_log(path):
+    """Open an owner-only append log for one writer; None when a link, FIFO or other non-file is in the way."""
+
+    try:
+        if not getattr(os, "O_NOFOLLOW", 0) and os.path.islink(path):
+            return None
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0), 0o600)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        # A second hard link could name a file outside the run folder.
+        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            return os.fdopen(descriptor, "a", encoding="utf-8")
+    except OSError:
+        pass
+    os.close(descriptor)
+    return None
+
+
+def _author_sandbox(runtime, options, *, directory, policy, model, read_only=False):
+    """The confined profile of an author's app-server: {"base", "temp"}, or None where Codex keeps its legacy sandbox.
+
+    ``temp`` is the run's private temp folder, which the controller names
+    with the ``run_tmp_dir`` option (runs/.controller/<run>/tmp); the runner
+    creates it owner-only when missing and refuses a link. Without the
+    option (tests, direct CLI use) each runner process uses a fresh folder.
+    A folder that cannot be prepared fails the attempt, which is retried: the
+    author never starts without its sandbox.
+    """
+
+    permissions = None if policy else getattr(runtime, "private_permissions", None)
+    base = ":read-only" if read_only else ":workspace"
+    if permissions is None or permissions(base, model) is None:
+        return None
+    try:
+        temp = (confinement.private_folder(options["run_tmp_dir"], directory) if options.get("run_tmp_dir")
+                else confinement.runner_folder(directory))
+    except (confinement.ConfinementError, OSError, TypeError, ValueError) as exc:
+        raise runtime.Error(f"Cannot prepare the run's private temp folder, so the author does not start: {exc}") from exc
+    return {"base": base, "temp": temp}
+
+
+def author_confinement_check(rpc, *, sandbox, directory, emit):
+    """Before the author's first turn, prove through its app-server that its profile confines it (no model).
+
+    See confinement.startup_check(). A check that cannot run or does not
+    hold fails the attempt with a retryable Error: the author is never
+    started without its sandbox, and the run tries again after the usual wait.
+    """
+
+    writable = sandbox["base"] == ":workspace"
+    try:
+        confinement.startup_check(lambda params: rpc.call("command/exec", params), workspace=directory,
+                                  temp=sandbox["temp"], writable=writable, profile=PRIVATE_PERMISSIONS)
+    except confinement.ConfinementError as exc:
+        raise Error(f"The sandbox check before the author's turn failed: {exc}. The author is not started "
+                    "without its sandbox.") from exc
+    except (Error, OSError) as exc:
+        if isinstance(exc, FinalError):
+            raise
+        raise Error(f"The sandbox check before the author's turn could not run ({exc}). The author is not started "
+                    "without its sandbox.") from exc
+    emit("status", label="Sandbox checked",
+         text=f"A check command in the author's sandbox could {'read and write' if writable else 'read'} the run's "
+              f"folder and write its private temp folder {sandbox['temp']}, and could not read outside them.")
+
+
+def _user_extensions_off(config):
+    """Thread settings that turn off the MCP servers, plugins and apps of Codex's effective settings `config`.
+
+    They run outside the sandbox. Each is turned off by name (verified with
+    Codex 0.160: an empty mcp_servers table leaves them on).
+    """
+
+    def names(key):
+        table = config.get(key)
+        return [name for name in table if isinstance(name, str) and name] if isinstance(table, dict) else []
+
+    off = {"apps": {"_default": {"enabled": False},
+                    **{name: {"enabled": False} for name in names("apps") if name != "_default"}}}
+    for key in ("mcp_servers", "plugins"):
+        if names(key):
+            off[key] = {name: {"enabled": False} for name in names(key)}
+    return off
+
+
+def _author_app_server(runtime, *, directory, policy, role, model, settings, features, classic, sandbox=None):
+    """The command line of an author's Codex app-server: (argv, child environment, whether it runs an API model).
+
+    With a ``sandbox`` (_author_sandbox()) the app-server runs with the
+    private temp folder's environment and defines the confined profile, so
+    the startup check can run a command in it (author_confinement_check());
+    in a live run that profile reaches the internet (live_network()), as
+    Codex's legacy sandbox does elsewhere (legacy_network_arguments()).
+    Either way the environment lacks the variables that name the user's SSH
+    and GPG agents (with network access the author could connect to them). A
+    web-cutoff author gets the private temp folder of its verified
+    environment instead (retrieval_runtime.preflight()); the caller removes
+    it when the process ends (retrieval_runtime.remove_private_temp()). Its
+    subagent limits (subagent_limits(), from ``features`` and
+    settings["subagents"]) are session flags, which a web-cutoff run's
+    checks verify exactly.
+    """
+
+    limits = subagent_limits(features, settings.get("subagents"))
+    child_environment = retrieval_environment(policy, role, model, inherited=runtime.environment(model),
+                                              agent_limits=limits)
+    try:
+        api_model = (child_environment is not None and hasattr(runtime, "api_codex_home")
+                     and runtime.model_provider(model) == getattr(runtime, "API_PROVIDER", None))
+        if api_model:
+            # An API-model thread lives in the private home of its workspace,
+            # so a later run can resume it (never the user's CODEX_HOME).
+            child_environment["CODEX_HOME"] = str(runtime.api_codex_home(directory))
+        live = live_network(directory, policy)
+        if sandbox is not None:
+            child_environment = confinement.confined_environment(child_environment, sandbox["temp"])
+            temp_environment = confinement.temp_environment(sandbox["temp"])
+            confined = [*private_permission_arguments(sandbox["base"], model, profile=runtime.private_permissions(
+                sandbox["base"], model, codex_home=child_environment.get("CODEX_HOME"), live=live)),
+                # Also for a user's shell_environment_policy that passes on only some variables (inherit = "core").
+                *[part for name, value in temp_environment.items()
+                  for part in ("-c", f"shell_environment_policy.set.{name}={toml_string(value)}")]]
+        elif policy:
+            confined = retrieval_runtime.temp_arguments(policy, child_environment)
+        else:
+            child_environment = confinement.without_agents(
+                child_environment if child_environment is not None else os.environ)
+            confined = legacy_network_arguments(live)
+        argv = [
+            retrieval_runtime.codex_executable(policy) if policy
+            else runtime.api_codex_executable(child_environment) if api_model else runtime.codex(),
+            *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
+            *retrieval_runtime.native_search_arguments(directory, policy=policy),
+            *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
+            *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
+            *runtime.context_cache_arguments(), *confined, *retrieval_runtime.agent_limit_arguments(limits),
+            *[argument for feature in features for argument in ("--enable", feature)],
+            *(["--disable", "code_mode", "--enable", "shell_tool"] if classic else []),
+        ]
+    except BaseException:
+        # No process will use this web-cutoff author's private temp folder.
+        retrieval_runtime.remove_private_temp(policy, child_environment)
+        raise
+    return argv, child_environment, api_model
+
+
+def _initialize_author_rpc(runtime, rpc, *, policy, role, child_environment, api_model, agent_limits=None):
+    """The handshake of an author's app-server; a web-cutoff run verifies its isolation (with the subagent
+    limits of its session flags, ``agent_limits``) before any thread."""
+
+    initialized = rpc.call("initialize", {
+        "clientInfo": {"name": "tcs_prover", "title": "TCS Prover", "version": "1"},
+        "capabilities": {"experimentalApi": True},
+    })
+    if api_model and Path(str((initialized or {}).get("codexHome") or "")).resolve() != Path(
+            child_environment["CODEX_HOME"]).resolve():
+        raise SafetyStop("Codex did not use the private home of this API model; refusing to continue.")
+    rpc.send({"method": "initialized", "params": {}})
+    if policy:
+        retrieval_runtime.verify_rpc(rpc, policy, role, child_environment, allow_runtime_overrides=True,
+                                     **({"agent_limits": agent_limits} if agent_limits else {}))
+
+
+def _author_thread_options(runtime, rpc, *, directory, policy, role, model, settings, summary, features, classic,
+                           emit, read_only=False, environment=None):
+    """The options with which an author starts or resumes its thread.
+
+    ``environment`` is the environment of the author's app-server
+    (_author_app_server()). A web-cutoff run uses its historical profile,
+    with the TMPDIR and TMPPREFIX of that environment's private temp folder
+    in its shell environment (retrieval_runtime.temp_overrides()), as the
+    app-server's session flags have them: a thread's
+    shell_environment_policy replaces the app-server's, so without them the
+    thread's commands got neither (verified with Codex 0.160 at thread/start
+    and at thread/resume in a new app-server).
+    Otherwise the author works in the confined profile
+    (private_permissions() for the environment's CODEX_HOME, where Codex
+    supports one; the legacy workspace-write sandbox elsewhere, whose network
+    setting the app-server's flags carry), or, with ``read_only`` (a
+    conversation turn), in its read-only form (elsewhere the legacy
+    read-only sandbox, whose network setting the turn carries,
+    legacy_read_only_policy()); either form reaches the internet in a live
+    run (live_network()). The user's MCP servers, plugins and apps, read
+    from Codex's effective settings, and view_image are turned off; settings
+    that cannot be read fail the attempt, which is retried. The thread has
+    the subagent limits of its app-server (subagent_limits()).
+    """
+
+    limits = subagent_limits(features, settings.get("subagents"))
+
+    thread_options = {
+        "model": getattr(runtime, "wire_model", lambda value: value)(model),
+        "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
+        "sandbox": "workspace-write", "approvalPolicy": "never",
+        "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
+            **retrieval_runtime.native_search_configuration(directory, policy=policy),
+            "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
+                         **{feature: True for feature in features},
+                         **({"code_mode": False, "shell_tool": True} if classic else {})}},
+    }
+    if hasattr(runtime, "model_provider"):
+        thread_options["modelProvider"] = runtime.model_provider(model)
+    if policy:
+        thread_options.pop("sandbox")
+        thread_options["permissions"] = retrieval_runtime.PROFILE
+        locked = retrieval_runtime.configuration(policy, role)
+        locked_features = locked.pop("features")
+        # The commands' private temp folder, as verify_rpc() found it in the app-server's settings.
+        temp_variables = retrieval_runtime.temp_overrides(policy, environment).get(
+            "shell_environment_policy", {}).get("set")
+        if temp_variables:
+            locked["shell_environment_policy"]["set"].update(temp_variables)
+        thread_options["config"].update(locked)
+        thread_options["config"]["features"].update(locked_features)
+        # The Author subagents setting decides, as for the app-server (--disable multi_agent for none): the
+        # generated table turns multi_agent on for every role.
+        thread_options["config"]["features"]["multi_agent"] = "multi_agent" in features
+        thread_options["config"] = retrieval_runtime._merged(thread_options["config"], limits)
+        return thread_options
+    try:
+        effective = rpc.call("config/read", {"cwd": str(directory)})
+    except runtime.Error as exc:
+        if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+            raise
+        raise runtime.Error(f"Could not read Codex's settings, which the author needs in order to turn off your MCP "
+                            f"servers, plugins and apps; trying again: {exc}") from exc
+    effective = effective.get("config") if isinstance(effective, dict) else None
+    effective = effective if isinstance(effective, dict) else {}
+    # The user's MCP servers, plugins and apps run outside the sandbox: a live author gets none of them.
+    thread_options["config"].update(_user_extensions_off(effective))
+    thread_options["config"]["features"].update(apps=False, plugins=False, view_image=False)
+    # The confined profile where Codex supports one, selected exactly as the historical profile is; none of
+    # the user's [sandbox_workspace_write] settings carries over: network follows the run's search mode.
+    permissions = getattr(runtime, "private_permissions", None)
+    base = ":read-only" if read_only else ":workspace"
+    private = permissions(base, model, codex_home=(environment or {}).get("CODEX_HOME"),
+                          live=live_network(directory)) if permissions else None
+    if private is not None:
+        thread_options.pop("sandbox")
+        thread_options["permissions"] = PRIVATE_PERMISSIONS
+        thread_options["config"].update(default_permissions=PRIVATE_PERMISSIONS,
+                                        permissions={PRIVATE_PERMISSIONS: private})
+    elif read_only:
+        thread_options["sandbox"] = "read-only"
+    thread_options["config"] = retrieval_runtime._merged(thread_options["config"], limits)
+    return thread_options
+
+
+def asks_user(item):
+    """Whether an agent message is a question to the user, never an answer of its turn.
+
+    Codex's request_user_input_async tool delivers it at once ("delivery":
+    "async") with its "questions", in the phase "final_answer"; the model
+    keeps working, and an answer reaches it as a live instruction.
+    """
+
+    return isinstance(item, dict) and (item.get("delivery") == "async" or bool(item.get("questions")))
+
+
+def _root_message(message, thread):
+    """Whether an app-server message belongs to the root thread `thread`, not to a subagent's thread."""
+
+    params = message.get("params") or {}
+    owners = [params.get("threadId")]
+    for key in ("goal", "turn", "item"):
+        value = params.get(key)
+        if isinstance(value, dict):
+            owners.append(value.get("threadId"))
+    if isinstance(params.get("thread"), dict):
+        owners.append(params["thread"].get("id"))
+    owners = [owner for owner in owners if owner is not None]
+    scoped = message.get("method") in {
+        "turn/started", "turn/completed", "item/completed",
+        "thread/goal/updated", "thread/tokenUsage/updated",
+    }
+    return (bool(owners) or not scoped) and all(owner == thread for owner in owners)
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction=""):
+                 node_name="author", stages=None, initial_instruction="", handoff_note=""):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
     Yield its final answer only after goal completion; accept follow-up feedback
@@ -2442,9 +3980,28 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     failed before the model produced anything, that turn's id (``rewind``):
     the session reverts it (thread/revert, verified with Codex 0.160) before
     sending its instruction again, so failed attempts add nothing to the
-    thread. Failures a retry cannot fix carry no ``retry``: a thread Codex
-    no longer has or a missing thread id (session_unavailable), and safety
-    refusals (safety_stop), which the controller never resumes by itself.
+    thread. Failures a retry cannot fix carry no ``retry``: a missing thread
+    id (session_unavailable) and safety refusals (safety_stop), which the
+    controller never resumes by itself.
+
+    A saved thread Codex no longer has (or refuses to reopen
+    AUTHOR_RESUME_REFUSALS times in a row) and a conversation that outgrew
+    the model's context continue in a new conversation of the same run,
+    announced as "Conversation replaced": its first instruction is the resume
+    prompt plus any open critic feedback. A thread that is reopened receives
+    the short "reopen" prompt (when the workflow defines one) instead of the
+    full resume prompt, unless the ``goal_reanchor`` option says that a
+    conversation turn of the paused author compacted its context; critic
+    feedback it already received (``author_repair_delivered``) is not sent
+    again. ``handoff_note``, the controller's note on a submission it could not
+    hand to the critic, follows any critic feedback in the first instruction,
+    also in a new conversation, until the author submits again.
+
+    A watcher keeps the session live: a request Codex leaves unanswered for
+    RPC_RESPONSE_SECONDS, or a running turn with no event for
+    AUTHOR_INACTIVITY_SECONDS followed by an unanswered check, ends the
+    attempt as a failed model call; a turn that ends with the goal still open
+    and no new turn within AUTHOR_CONTINUE_SECONDS is continued.
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     policy = retrieval_policy(directory, features)
@@ -2469,8 +4026,16 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     settings["effort"] = runtime.effective_effort(model, settings["effort"])
     settings["speed"] = runtime.effective_speed(model, settings["speed"])
     summary = settings["summary"] = runtime.reasoning_summary(model, settings["summary"])
+    grace = getattr(runtime, "INTERRUPT_GRACE_SECONDS", INTERRUPT_GRACE_SECONDS)
+    inactivity = getattr(runtime, "AUTHOR_INACTIVITY_SECONDS", AUTHOR_INACTIVITY_SECONDS)
+    probe_limit = getattr(runtime, "AUTHOR_PROBE_SECONDS", AUTHOR_PROBE_SECONDS)
+    continue_after = getattr(runtime, "AUTHOR_CONTINUE_SECONDS", AUTHOR_CONTINUE_SECONDS)
+    response_limit = getattr(runtime, "RPC_RESPONSE_SECONDS", RPC_RESPONSE_SECONDS)
+    steer_retry = getattr(runtime, "STEER_RETRY_SECONDS", STEER_RETRY_SECONDS)
+    # A live run whose code-mode tool runtime was unavailable uses the classic shell tool.
+    classic = bool(continued.get("classic_shell")) and not policy
     thread = None
-    rpc = process = None
+    rpc = process = child_environment = None
     stop = threading.Event()
     expired = threading.Event()
     pausing = threading.Event()
@@ -2479,53 +4044,126 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # carried our latest instruction; "output" says whether the model produced
     # anything in the latest turn and "steered" whether a live instruction or
     # re-anchor joined it. Only an empty, unsteered turn of our own instruction
-    # is ever reverted.
+    # is ever reverted. "idle_since" is when the latest turn ended while the
+    # goal stayed open.
     state = {"turn": None, "active": True, "steer": options.get("author_steer_delivered"),
              "instruction": None, "delivered": False, "turn_id": None, "instruction_turn": None,
-             "output": False, "steered": False, "rewound": False, "delivered_once": False}
+             "output": False, "steered": False, "rewound": False, "delivered_once": False,
+             "idle_since": None}
     attempt = continued.get("attempt") if isinstance(continued.get("attempt"), int) else None
     pending_steers = {}
+    # Live instructions Codex did not accept: offered again at the next turn or later.
+    held, told = {}, set()
     pending_compaction = continued.get("pending_compaction") or None
     seen_compactions = set()
     goal = {}
     pause_reason = ""
     last_usage = {}
+    # The time of the newest message from Codex, and a cheap request that checks it still answers.
+    activity = {"last": time.monotonic()}
+    probe = {"at": None}
+    stalled = {"reason": None}
     # Failures that a retry of the same resume cannot fix.
-    final = {"reason": None}
+    final = {"reason": None, "refusal": None}
 
     def is_root(message):
-        params = message.get("params") or {}
-        owners = [params.get("threadId")]
-        for key in ("goal", "turn", "item"):
-            value = params.get(key)
-            if isinstance(value, dict):
-                owners.append(value.get("threadId"))
-        if isinstance(params.get("thread"), dict):
-            owners.append(params["thread"].get("id"))
-        owners = [owner for owner in owners if owner is not None]
-        scoped = message.get("method") in {
-            "turn/started", "turn/completed", "item/completed",
-            "thread/goal/updated", "thread/tokenUsage/updated",
-        }
-        return (bool(owners) or not scoped) and all(owner == thread for owner in owners)
+        return _root_message(message, thread)
 
     def record(message):
+        activity["last"] = time.monotonic()
         event = runtime.public_event(message)
         if event is not None:
             emit("codex_event", event=event, root=is_root(event))
 
+    def pending_repair():
+        """The critic feedback this conversation must receive once: a repair of this session, else the recovery."""
+
+        return render("repair") if stage == stages["resume"] else str(values.get("instruction") or "")
+
+    def replacement_instruction():
+        """The first instruction of a new conversation that continues one Codex cannot continue."""
+
+        repair = pending_repair()
+        return render("resume") + ("\n\n" + repair if repair else "") + ("\n\n" + handoff_note if handoff_note else "")
+
+    def received(repair):
+        """Whether the reopened thread already received this critic feedback (the controller recorded it)."""
+
+        delivered = options.get("author_repair_delivered")
+        return (isinstance(delivered, dict) and delivered.get("thread") == thread
+                and delivered.get("digest") == _repair_digest(repair))
+
+    def hold(identity, why):
+        held[identity] = (state["turn"], time.monotonic() + steer_retry)
+        if identity not in told:
+            told.add(identity)
+            emit("diagnostic", text=f"{why}; it is offered again when the next turn starts or in "
+                                    f"{_span_text(steer_retry)}.", threadId=thread)
+
+    def held_back(identity):
+        turn, until = held.get(identity, (None, None))
+        if until is None:
+            return False
+        if state["turn"] != turn or time.monotonic() >= until:
+            held.pop(identity, None)
+            return False
+        return True
+
     def steer(instruction, identity, compaction=False):
-        request = rpc.request("turn/steer", {
-            "threadId": thread, "expectedTurnId": state["turn"],
-            "input": [{"type": "text", "text": instruction}],
-        })
-        pending_steers[request] = (identity, instruction, compaction)
+        entry = (identity, instruction, compaction)
+        sent = []
+
+        def register(request):
+            # Recorded before the request is written: Codex may answer at once.
+            sent.append(request)
+            pending_steers[request] = entry
+
+        try:
+            rpc.request("turn/steer", {
+                "threadId": thread, "expectedTurnId": state["turn"],
+                "input": [{"type": "text", "text": instruction}],
+            }, register)
+        except BaseException:
+            for request in sent:
+                pending_steers.pop(request, None)
+            raise
         if compaction:
             state["steered"] = True
         # The controller recognizes a restored instruction by its command id.
         emit("request", label="Author context re-anchor after compaction" if compaction
              else "Live author instruction sent", text=instruction, threadId=thread,
              **({} if compaction else {"steerId": identity}))
+
+    def check(kind):
+        probe["at"] = time.monotonic()  # Before sending: the answer may arrive at once.
+        try:
+            rpc.request("thread/goal/get", {"threadId": thread})
+        except (runtime.Error, OSError) as exc:
+            return f"Codex stopped responding: a check could not be sent ({exc})."
+        if kind == "quiet":
+            emit("diagnostic", text=f"No author event for {_span_text(inactivity)}; checking that Codex still "
+                                    "answers.", threadId=thread)
+        return None
+
+    def liveness(now):
+        """Why this attempt must end because Codex stopped answering, or None; asks a cheap question first."""
+
+        call = getattr(rpc, "pending_call", None)
+        if call and now - call[1] >= response_limit:
+            return f"Codex stopped responding: no answer to {call[0]} within {_span_text(response_limit)}."
+        if probe["at"] is not None:
+            if activity["last"] >= probe["at"]:
+                probe["at"] = None  # Codex answered, or worked: the attempt continues.
+            elif now - probe["at"] >= probe_limit:
+                return (f"Codex stopped responding: no event for {_span_text(now - activity['last'])} and no "
+                        f"answer to a check within {_span_text(probe_limit)}.")
+            return None
+        if state["turn"] and now - activity["last"] >= inactivity:
+            return check("quiet")
+        if not state["turn"] and state["idle_since"] is not None and now - state["idle_since"] >= continue_after:
+            # Its answer wakes the session, which then continues the open goal.
+            return check("idle")
+        return None
 
     def watch():
         pause_started = None
@@ -2540,9 +4178,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     try:
                         rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         rpc.request("turn/interrupt", {"threadId": thread, "turnId": interrupted_turn})
+                        emit("status", label="Author stopping", threadId=thread,
+                             text=f"Pause requested: the author may finish its current step for up to "
+                                  f"{_span_text(grace)} before it is stopped.")
                     except (runtime.Error, OSError) as exc:
                         emit("diagnostic", text=f"Could not interrupt the author: {exc}")
-                if time.monotonic() - pause_started >= getattr(runtime, "INTERRUPT_GRACE_SECONDS", 5):
+                if time.monotonic() - pause_started >= grace:
                     emit("diagnostic", text="Codex did not acknowledge the pause; keeping its saved session and the last saved work.")
                     runtime.stop_process(process)
                     return
@@ -2556,24 +4197,38 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         if state["turn"]:
                             rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
+                            emit("status", label="Author stopping", threadId=thread,
+                                 text=f"The workflow time limit was reached: the author may finish its current "
+                                      f"step for up to {_span_text(grace)} before it is stopped.")
                 except (runtime.Error, OSError):
                     pass
-                if not stop.wait(getattr(runtime, "INTERRUPT_GRACE_SECONDS", 5)):
+                if not stop.wait(grace):
                     runtime.stop_process(process)
                 return
-            if state["active"] and state["turn"]:
+            if not state["active"]:
+                continue
+            stall = liveness(time.monotonic())
+            if stall:
+                stalled["reason"] = stall
+                emit("diagnostic", text=stall, threadId=thread)
+                runtime.stop_process(process)
+                return
+            if state["turn"]:
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
-                if command and not any(item[0] == command[0] for item in list(pending_steers.values())):
+                if (command and not held_back(command[0])
+                        and not any(item[0] == command[0] for item in list(pending_steers.values()))):
                     try:
                         steer(command[1], command[0])
                     except (runtime.Error, OSError) as exc:
-                        emit("diagnostic", text=f"Could not send live instruction: {exc}")
+                        hold(command[0], f"Could not send the live instruction ({exc})")
 
     def start_turn(instruction):
         # A retry re-sends this instruction unless the thread received it.
-        state.update(instruction=instruction, delivered=False, instruction_turn=None, output=False, steered=False)
+        state.update(instruction=instruction, delivered=False, instruction_turn=None, output=False, steered=False,
+                     idle_since=None)
         if policy:
-            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
+            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True,
+                                         agent_limits=subagent_limits(features, settings.get("subagents")))
         if pause_file and Path(pause_file).is_file():
             pausing.set()
             raise runtime.Error("Pause requested.")
@@ -2589,14 +4244,20 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         state["delivered"] = state["delivered_once"] = True
         state["turn"] = (result.get("turn") or {}).get("id")
         state["turn_id"] = state["instruction_turn"] = state["turn"]
+        repair = pending_repair()
+        if repair and repair in instruction:
+            # The controller sends this feedback to the same thread only once.
+            emit("status", label="Critic feedback delivered", threadId=thread, repairDelivered=_repair_digest(repair),
+                 text="The author's conversation has received the critic's feedback.")
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
         if not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
             rpc.call("thread/goal/set", {"threadId": thread, "status": "active"})
 
     def collect(item, answers):
+        # A question to the user is in the phase "final_answer" too, but the model keeps working after it.
         if (item.get("type") in {"agentMessage", "agent_message"}
-                and item.get("phase") in {None, "final_answer"}
+                and item.get("phase") in {None, "final_answer"} and not asks_user(item)
                 and isinstance(item.get("text"), str) and item["text"].strip()):
             answers.append(item["text"])
 
@@ -2610,99 +4271,62 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             final["reason"] = "missing thread id"
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation."
                                 + UNAVAILABLE_THREAD_HINT)
-        child_environment = retrieval_environment(policy, retrieval_role, model, inherited=runtime.environment(model))
-        api_model = (child_environment is not None and hasattr(runtime, "api_codex_home")
-                     and runtime.model_provider(model) == getattr(runtime, "API_PROVIDER", None))
-        if api_model:
-            # An API-model thread lives in the private home of its workspace,
-            # so a later run can resume it (never the user's CODEX_HOME).
-            child_environment["CODEX_HOME"] = str(runtime.api_codex_home(directory))
-        process = subprocess.Popen([
-            retrieval_runtime.codex_executable(policy) if policy
-            else runtime.api_codex_executable(child_environment) if api_model else runtime.codex(),
-            *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
-            *retrieval_runtime.native_search_arguments(directory, policy=policy),
-            *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
-            *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
-            *runtime.context_cache_arguments(),
-            *[argument for feature in features for argument in ("--enable", feature)],
-        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        sandbox = _author_sandbox(runtime, options, directory=directory, policy=policy, model=model)
+        argv, child_environment, api_model = _author_app_server(
+            runtime, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
+            features=features, classic=classic, sandbox=sandbox)
+        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
-        rpc = runtime.RPC(process, record)
+        # A web-cutoff author can read its run folder: it gets no new controller output there.
+        log = None if policy else options.get("goal_stderr_log")
+        rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
+        rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
-        initialized = rpc.call("initialize", {
-            "clientInfo": {"name": "tcs_prover", "title": "TCS Prover", "version": "1"},
-            "capabilities": {"experimentalApi": True},
-        })
-        if api_model and Path(str((initialized or {}).get("codexHome") or "")).resolve() != Path(
-                child_environment["CODEX_HOME"]).resolve():
-            raise SafetyStop("Codex did not use the private home of this API model; refusing to continue.")
-        rpc.send({"method": "initialized", "params": {}})
-        if policy:
-            retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True)
-        thread_options = {
-            "model": getattr(runtime, "wire_model", lambda value: value)(model),
-            "cwd": str(directory), "runtimeWorkspaceRoots": [str(directory)],
-            "sandbox": "workspace-write", "approvalPolicy": "never",
-            "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
-                **retrieval_runtime.native_search_configuration(directory, policy=policy),
-                "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
-                             **{feature: True for feature in features}}},
-        }
-        if hasattr(runtime, "model_provider"):
-            thread_options["modelProvider"] = runtime.model_provider(model)
-        if policy:
-            thread_options.pop("sandbox")
-            thread_options["permissions"] = retrieval_runtime.PROFILE
-            locked = retrieval_runtime.configuration(policy, retrieval_role)
-            locked_features = locked.pop("features")
-            thread_options["config"].update(locked)
-            thread_options["config"]["features"].update(locked_features)
-        else:
-            # The workspace-write sandbox, minus TCS Prover's private state,
-            # selected exactly as the historical profile is.
-            permissions = getattr(runtime, "private_permissions", None)
-            private = permissions(":workspace", model) if permissions else None
-            if private is not None:
-                # A profile ignores [sandbox_workspace_write] (network access,
-                # extra writable roots, /tmp exclusions), which the legacy
-                # sandbox applied: carry the effective settings over.
-                try:
-                    effective = rpc.call("config/read", {"cwd": str(directory)})
-                except runtime.Error as exc:
-                    effective = {}
-                    emit("diagnostic", text=f"Could not read Codex's [sandbox_workspace_write] settings; "
-                                            f"the author sandbox runs without them: {exc}")
-                effective = effective.get("config") if isinstance(effective, dict) else None
-                private = permissions(":workspace", model, effective.get("sandbox_workspace_write")
-                                      if isinstance(effective, dict) else None)
-                thread_options.pop("sandbox")
-                thread_options["permissions"] = PRIVATE_PERMISSIONS
-                thread_options["config"].update(default_permissions=PRIVATE_PERMISSIONS,
-                                                permissions={PRIVATE_PERMISSIONS: private})
+        _initialize_author_rpc(runtime, rpc, policy=policy, role=retrieval_role, child_environment=child_environment,
+                               api_model=api_model, agent_limits=subagent_limits(features, settings.get("subagents")))
+        thread_options = _author_thread_options(
+            runtime, rpc, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
+            summary=summary, features=features, classic=classic, emit=emit, environment=child_environment)
+        if sandbox is not None and hasattr(runtime, "author_confinement_check"):
+            runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
+        if classic:
+            emit("status", label="Classic shell tool",
+                 text="Codex's code-mode tool runtime was unavailable, so this attempt uses the classic shell tool.")
         resumed = False
+        replaced = ""
         if options.get("goal_thread_id"):
             try:
                 result = rpc.call("thread/resume", {**thread_options, "threadId": options["goal_thread_id"],
                                                     "excludeTurns": True})
                 resumed = True
             except runtime.Error as exc:
+                if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+                    raise  # Never mistaken for a missing conversation.
+                detail = _failure_reason(redact(str(exc)), 300)
                 gone = any(word in str(exc).lower() for word in MISSING_THREAD_MARKERS)
-                if options.get("goal_require_resume"):
-                    if gone:
-                        # Retrying the same resume cannot bring the thread back:
-                        # the job waits for the user's choice instead.
-                        final["reason"] = "thread unavailable"
-                    raise runtime.Error(f"Could not resume the saved Codex conversation; no replacement was started. {exc}"
-                                        + (UNAVAILABLE_THREAD_HINT if gone else "")) from exc
+                if not gone and isinstance(exc, RPCError) and not _plain_failure(str(exc)):
+                    # Codex answered with a refusal that is not a provider failure.
+                    previous = continued.get("refusal") if isinstance(continued.get("refusal"), dict) else {}
+                    count = previous.get("count", 0) + 1 if previous.get("text") == detail else 1
+                    final["refusal"] = {"text": detail, "count": count}
+                    gone = count >= getattr(runtime, "AUTHOR_RESUME_REFUSALS", AUTHOR_RESUME_REFUSALS)
                 if not gone:
+                    if options.get("goal_require_resume"):
+                        raise runtime.Error(f"Could not resume the saved Codex conversation; no replacement was started. {exc}") from exc
                     raise
-                emit("diagnostic", text=f"Saved thread unavailable; starting a new session with the supplied resume instructions: {exc}")
+                replaced = (f"Codex refused to reopen the saved conversation {final['refusal']['count']} times "
+                            f"({detail})" if final["refusal"] else f"Codex no longer has the saved conversation ({detail})")
+                final["refusal"] = None
         if not resumed:
             result = rpc.call("thread/start", {**thread_options, "ephemeral": False})
-        thread = result["thread"]["id"]
+        thread = result.get("thread") if isinstance(result, dict) else None
+        thread = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(thread, str) or not thread:
+            thread = None
+            raise runtime.Error(f"Codex answered {'thread/resume' if resumed else 'thread/start'} without a "
+                                "thread ID; the next attempt asks again.")
         if resumed and thread != options["goal_thread_id"]:
             raise SafetyStop("Codex returned a different thread ID; refusing to continue a replacement conversation.")
         rewind = continued.get("rewind") if resumed and isinstance(continued.get("rewind"), dict) else {}
@@ -2716,24 +4340,38 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                      text="The interrupted turn ended before the model produced anything; it was removed from the "
                           "conversation and its instruction is sent again.")
             except runtime.Error as exc:
+                if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+                    raise
                 emit("diagnostic", text=f"Could not remove the failed turn ({exc}); sending its instruction again.",
                      threadId=thread)
         saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed else {}
         goal = {"threadId": thread, "objective": saved_goal.get("objective") or render("goal")}
         emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
              text=f"Thread {thread}")
-        if continued.get("instruction"):
+        if replaced:
+            emit("status", label="Conversation replaced", threadId=thread, text=_replacement_notice(replaced))
+            instruction = replacement_instruction()
+        elif continued.get("instruction"):
             # A retry: the interrupted turn's instruction, or the retry note.
             instruction = continued["instruction"]
         else:
-            instruction = render("resume") if options.get("goal_resume") or options.get("goal_thread_id") else prompt
-            if initial_instruction:
+            # A thread that is reopened holds the task already: the short reopen prompt, unless a
+            # conversation turn compacted its context (goal_reanchor), which the full resume prompt restores.
+            instruction = (render("reopen") if resumed and "reopen" in prompts and not options.get("goal_reanchor")
+                           else render("resume") if options.get("goal_resume") or options.get("goal_thread_id")
+                           else prompt)
+            if initial_instruction and not (resumed and received(initial_instruction)):
                 instruction += "\n\n" + initial_instruction
+            if handoff_note:
+                instruction += "\n\n" + handoff_note
         start_turn(instruction)
         status, running, answers = None, True, []
         while True:
             if expired.is_set() or runtime.workflow_remaining(options) <= 0:
-                raise runtime.Error("Workflow time limit reached.")
+                expired.set()
+                if not running:
+                    raise runtime.Error("Workflow time limit reached.")
+                # The watcher interrupts the turn; it may end within the grace.
             message = rpc.read()
             params = message.get("params", {})
             if not is_root(message):
@@ -2742,9 +4380,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if request in pending_steers and "method" not in message:
                 identity, instruction, compaction = pending_steers.pop(request)
                 if "error" in message:
+                    reason = _provider_message(message["error"]) or "no reason given"
                     if compaction:
                         pending_compaction = instruction
-                    emit("diagnostic", text=f"Instruction raced with turn completion: {message['error']}")
+                        emit("diagnostic", text=f"Codex did not accept the context re-anchor ({reason}); it is sent "
+                                                "again when the next turn starts.")
+                    else:
+                        hold(identity, f"Codex did not accept the live instruction ({reason})")
                 elif not compaction:
                     state["steer"] = identity
                     state["steered"] = True
@@ -2757,7 +4399,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["output"] = True  # The model worked in this turn.
             if method == "turn/started":
                 running, answers = True, []
-                state["turn"] = turn.get("id")
+                state["turn"], state["idle_since"] = turn.get("id"), None
                 if state["turn"] and state["turn"] != state["turn_id"]:
                     if state["delivered"] and state["instruction_turn"] is None:
                         # Our instruction's turn, whose id turn/start did not report.
@@ -2794,11 +4436,22 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     collect(item, answers)
                 if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
                     pausing.set()
-                    raise runtime.Error("Author paused at the current turn boundary.")
+                    raise runtime.Error("Author paused; its current turn was interrupted."
+                                        if turn.get("status") == "interrupted"
+                                        else "Author paused at the current turn boundary.")
+                if expired.is_set():
+                    raise runtime.Error("Workflow time limit reached.")
                 if turn.get("status") in {"failed", "interrupted"}:
+                    _note_raw_error(emit, turn.get("error"))
                     raise runtime.Error(f"Author turn {turn['status']}: {_provider_message(turn.get('error')) or 'no complete result'}")
-            elif method == "error" and not params.get("willRetry", False):
-                raise runtime.Error(_provider_message(params.get("error")) or str(params))
+                state["idle_since"] = time.monotonic()
+            elif method == "error":
+                if not params.get("willRetry", False):
+                    _note_raw_error(emit, params.get("error"))
+                    raise runtime.Error(_provider_message(params.get("error")) or str(params))
+                # Codex retries this request itself; say so, as the wait can be long.
+                emit("status", label="Codex is reconnecting", text=_reconnect_text(params.get("error")),
+                     threadId=thread)
             if not running and pause_file and Path(pause_file).is_file():
                 pausing.set()
                 raise runtime.Error("Author paused at the current turn boundary.")
@@ -2812,6 +4465,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 rejection = yield {"outcome": "done", "output": solution}
                 if rejection is None:
                     return
+                handoff_note = ""  # This submission answered it.
                 values.update(rejection)
                 values["revision_number"] += 1
                 stage = stages["resume"]
@@ -2820,20 +4474,39 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             elif not running and status in {"blocked", "complete"}:
                 start_turn(render("continuation"))
                 status, running, answers = None, True, []
+            elif (not running and state["idle_since"] is not None
+                    and time.monotonic() - state["idle_since"] >= continue_after):
+                emit("status", label="Author continued", threadId=thread,
+                     text=f"The turn ended with the goal still open and Codex started no new turn within "
+                          f"{_span_text(continue_after)}; the continuation instruction was sent.")
+                start_turn(render("continuation"))
+                status, running, answers = None, True, []
     except Exception as exc:
+        # A stalled attempt reads as its stall, not as the stopped process it caused.
+        failure = runtime.Error(stalled["reason"]) if stalled["reason"] else exc
         if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
             pausing.set()
-            emit("status", label="Author paused", text=str(exc), threadId=thread)
+            emit("status", label="Author paused", text=str(failure), threadId=thread)
         else:
             pausing.set()
+            # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
+            failure = settings_failure(failure, model) or failure
             limited = expired.is_set() or runtime.workflow_remaining(options) <= 0
-            safety = isinstance(exc, (SafetyStop, retrieval_runtime.RetrievalPolicyError))
-            pause_reason = "Workflow time limit reached." if expired.is_set() else (str(exc) or type(exc).__name__)
+            safety = isinstance(failure, (SafetyStop, retrieval_runtime.RetrievalPolicyError))
+            pause_reason = "Workflow time limit reached." if expired.is_set() else (str(failure) or type(failure).__name__)
+            tools = isinstance(failure, ToolRuntimeUnavailable) and not limited
+            if tools:
+                pause_reason += (" Web-cutoff runs need it, so this needs attention (for example a Codex update that "
+                                 "has not finished); it is checked again every minute." if policy
+                                 else " It is checked again every minute." if classic
+                                 else " The next attempt starts Codex with the classic shell tool instead.")
             if safety and not limited:
                 final["safety"] = True
                 pause_reason = f"Stopped for safety: {pause_reason}{SAFETY_STOP_HINT}"
             emit("diagnostic", text=pause_reason, threadId=thread, **({"attempt": attempt} if attempt else {}))
-            if limited or final["reason"] or safety or not retryable_failure(exc):
+            if tools and policy:
+                emit("status", label="Author needs attention", text=pause_reason, threadId=thread, needsAttention=True)
+            if limited or final["reason"] or safety or not retryable_failure(failure):
                 emit("status", label="Author stopped for safety" if safety and not limited else "Author paused",
                      text=pause_reason, threadId=thread)
             else:
@@ -2844,7 +4517,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "instruction": state["instruction"], "delivered": state["delivered"],
                                   "output": state["output"], "rewound": state["rewound"],
                                   "rewind": {"turn": state["turn_id"]} if reverted else None,
-                                  "steer": state["steer"], "pending_compaction": pending_compaction}
+                                  "steer": state["steer"], "pending_compaction": pending_compaction,
+                                  "refusal": final["refusal"], "classic_shell": classic or (tools and not policy)}
+                if thread and _context_window_failure(failure):
+                    # The same conversation would fail again: continue in a new one.
+                    final["retry"].update(
+                        replace=f"The conversation no longer fits the model's context ({_failure_reason(redact(str(failure)), 300)})",
+                        instruction=replacement_instruction(), delivered=False, output=False, rewound=False,
+                        rewind=None, pending_compaction=None)
     finally:
         stop.set()
         if rpc and thread and state["active"]:
@@ -2858,23 +4538,319 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             cleanup.join(timeout=1)
         if process:
             runtime.stop_process(process)
+        # A web-cutoff author's private temp folder ends with its app-server.
+        retrieval_runtime.remove_private_temp(policy, child_environment)
     if pausing.is_set():
         raise WorkflowPaused(pause_reason or "Workflow paused.", reason=pause_reason, thread_id=thread,
                              retry=final.get("retry"), session_unavailable=bool(final["reason"]),
                              safety_stop=bool(final.get("safety")))
 
 
+def author_conversation(runtime, instruction, *, settings, options, features=(), conversation_id, label,
+                        attempt=1, rewind=None, classic=False):
+    """One conversation turn of the paused Codex author in its saved thread; return its reply.
+
+    It reopens the saved thread (it never starts or replaces one), sets its
+    goal paused (never active, and without an objective) and sends
+    ``instruction`` as exactly one turn, read until that turn ends; it never
+    steers. The workflow's time budget, checkpoint and state are untouched.
+    A live run's turn is read-only and has no subagents
+    (CONVERSATION_READ_ONLY); a web-cutoff run's uses the author's audited
+    launch and profile, verified at the handshake and again before the turn.
+    ``rewind`` names a failed empty turn to remove first (thread/revert);
+    ``classic`` starts a live run's Codex with the classic shell tool. Every
+    record has stage "conversation", node "author" and the conversationId.
+
+    Return {"reply", "threadId", "compacted"}. A missing or gone saved thread
+    raises SavedConversationGone, and safety and settings refusals are
+    FinalErrors too. A refusal to reopen the thread raises
+    ConversationRefused, and any other failed attempt
+    ConversationAttemptFailed, whose ``retry`` says how the next attempt
+    continues (see run_author_conversation).
+    """
+
+    directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
+
+    def emit(kind, **fields):
+        runtime.emit(kind, "conversation", node="author", conversationId=conversation_id, **fields)
+
+    saved = options.get("goal_thread_id")
+    saved = str(saved).strip() if saved is not None else ""
+    if not saved:
+        raise SavedConversationGone("The author has not started its conversation yet.")
+    policy = retrieval_policy(directory, features)
+    restricted = not policy and getattr(runtime, "CONVERSATION_READ_ONLY", True)
+    launch_features = () if restricted else tuple(features)
+    classic = bool(classic) and not policy
+    settings = dict(settings)
+    model = settings["model"]
+    settings["effort"] = runtime.effective_effort(model, settings["effort"])
+    settings["speed"] = runtime.effective_speed(model, settings["speed"])
+    summary = settings["summary"] = runtime.reasoning_summary(model, settings["summary"])
+    inactivity = getattr(runtime, "AUTHOR_INACTIVITY_SECONDS", AUTHOR_INACTIVITY_SECONDS)
+    probe_limit = getattr(runtime, "AUTHOR_PROBE_SECONDS", AUTHOR_PROBE_SECONDS)
+    response_limit = getattr(runtime, "RPC_RESPONSE_SECONDS", RPC_RESPONSE_SECONDS)
+    thread = rpc = process = child_environment = None
+    stop = threading.Event()
+    # "running" while the turn runs; "turn" is its id, "delivered" whether Codex
+    # accepted it and "output" whether the model produced anything in it.
+    state = {"running": False, "turn": None, "delivered": False, "output": False}
+    activity = {"last": time.monotonic()}
+    probe = {"at": None}
+    stalled = {"reason": None}
+
+    def record(message):
+        activity["last"] = time.monotonic()
+        event = runtime.public_event(message)
+        if event is not None:
+            emit("codex_event", event=event, root=_root_message(event, thread))
+
+    def stall(reason):
+        stalled["reason"] = reason
+        emit("diagnostic", text=reason, threadId=thread)
+        runtime.stop_process(process)
+
+    def watch():
+        while not stop.wait(1):
+            now = time.monotonic()
+            call = getattr(rpc, "pending_call", None)
+            if call and now - call[1] >= response_limit:
+                return stall(f"Codex stopped responding: no answer to {call[0]} within {_span_text(response_limit)}.")
+            if probe["at"] is not None:
+                if activity["last"] >= probe["at"]:
+                    probe["at"] = None  # Codex answered, or worked: the turn continues.
+                elif now - probe["at"] >= probe_limit:
+                    return stall(f"Codex stopped responding: no event for {_span_text(now - activity['last'])} and "
+                                 f"no answer to a check within {_span_text(probe_limit)}.")
+                continue
+            if state["running"] and now - activity["last"] >= inactivity:
+                probe["at"] = now  # Before sending: the answer may arrive at once.
+                try:
+                    rpc.request("thread/goal/get", {"threadId": thread})
+                except (runtime.Error, OSError) as exc:
+                    return stall(f"Codex stopped responding: a check could not be sent ({exc}).")
+                emit("diagnostic", text=f"No author event for {_span_text(inactivity)}; checking that Codex still "
+                                        "answers.", threadId=thread)
+
+    def collect(item, texts, answers, questions):
+        if (item.get("type") in {"agentMessage", "agent_message"}
+                and isinstance(item.get("text"), str) and item["text"].strip()):
+            # A question to the user is no reply; only a turn with no other text shows it.
+            if asks_user(item):
+                questions.append(item["text"])
+                return
+            texts.append(item["text"])
+            if item.get("phase") in {None, "final_answer"}:
+                answers.append(item["text"])
+
+    try:
+        sandbox = _author_sandbox(runtime, options, directory=directory, policy=policy, model=model,
+                                  read_only=restricted)
+        argv, child_environment, api_model = _author_app_server(
+            runtime, directory=directory, policy=policy, role="author", model=model, settings=settings,
+            features=launch_features, classic=classic, sandbox=sandbox)
+        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
+            env=child_environment)
+        # A web-cutoff author can read its run folder: it gets no new controller output there.
+        log = None if policy else options.get("goal_stderr_log")
+        rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
+        if hasattr(rpc, "notice"):
+            rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        _initialize_author_rpc(runtime, rpc, policy=policy, role="author", child_environment=child_environment,
+                               api_model=api_model,
+                               agent_limits=subagent_limits(launch_features, settings.get("subagents")))
+        thread_options = _author_thread_options(
+            runtime, rpc, directory=directory, policy=policy, role="author", model=model, settings=settings,
+            summary=summary, features=launch_features, classic=classic, emit=emit, read_only=restricted,
+            environment=child_environment)
+        # Codex's legacy read-only sandbox (no confined profile) gets its network setting with the turn.
+        turn_sandbox = ({"sandboxPolicy": legacy_read_only_policy(live_network(directory))}
+                        if thread_options.get("sandbox") == "read-only" else {})
+        if sandbox is not None and hasattr(runtime, "author_confinement_check"):
+            runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
+        try:
+            result = rpc.call("thread/resume", {**thread_options, "threadId": saved, "excludeTurns": True})
+        except runtime.Error as exc:
+            if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+                raise  # Never mistaken for a missing conversation.
+            detail = _failure_reason(redact(str(exc)), 300)
+            if any(word in str(exc).lower() for word in MISSING_THREAD_MARKERS):
+                raise SavedConversationGone(f"Codex no longer has the saved author conversation ({detail}).") from exc
+            if isinstance(exc, RPCError) and not _plain_failure(str(exc)):
+                # Codex answered with a refusal that is not a provider failure.
+                raise ConversationRefused(detail) from exc
+            raise
+        reopened = result.get("thread") if isinstance(result, dict) else None
+        reopened = reopened.get("id") if isinstance(reopened, dict) else None
+        if not isinstance(reopened, str) or not reopened:
+            raise runtime.Error("Codex answered thread/resume without a thread ID; the next attempt asks again.")
+        if reopened != saved:
+            raise SafetyStop("Codex returned a different thread ID; refusing to continue a replacement conversation.")
+        thread = reopened
+        emit("status", label="Conversation reopened", threadId=thread, text=f"Thread {thread}")
+        if isinstance(rewind, str) and rewind:
+            # The failed attempt's turn ended before the model produced anything: remove it, so the
+            # message is sent again instead of piling up.
+            try:
+                rpc.call("thread/revert", {"threadId": thread, "beforeTurnId": rewind})
+                emit("status", label="Failed turn removed", threadId=thread,
+                     text="The failed reply turn ended before the model produced anything; it was removed and the "
+                          "message is sent again.")
+            except runtime.Error as exc:
+                if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+                    raise
+                emit("diagnostic", text=f"Could not remove the failed turn ({exc}); sending the message again.",
+                     threadId=thread)
+        try:
+            # The goal stays paused: Codex answers this one turn and never continues the proof by itself.
+            rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
+        except (runtime.Error, OSError) as exc:
+            if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
+                raise
+            emit("diagnostic", text=f"Could not confirm that the goal is paused: {exc}", threadId=thread)
+        if policy:
+            retrieval_runtime.verify_rpc(rpc, policy, "author", child_environment, allow_runtime_overrides=True,
+                                         agent_limits=subagent_limits(launch_features, settings.get("subagents")))
+        emit("request", label=label, text=instruction, threadId=thread, model=model,
+             reasoningEffort=settings["effort"], reasoningSummary=summary,
+             **({"attempt": attempt} if attempt > 1 else {}))
+        result = rpc.call("turn/start", {"threadId": thread, "cwd": str(directory),
+                                         "input": [{"type": "text", "text": instruction}], "summary": summary,
+                                         **turn_sandbox})
+        state["delivered"] = state["running"] = True
+        state["turn"] = (result.get("turn") or {}).get("id") if isinstance(result, dict) else None
+        texts, answers, questions, compacted = [], [], [], False
+        while True:
+            message = rpc.read()
+            if not _root_message(message, thread):
+                continue
+            method, params = message.get("method"), message.get("params") or {}
+            if method in {"item/started", "item/completed"}:
+                item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                if item.get("type") not in {None, "userMessage", "user_message"}:
+                    state["output"] = True  # The model worked in this turn.
+            if method == "turn/started":
+                state["turn"] = state["turn"] or (params.get("turn") or {}).get("id")
+            elif method == "item/completed":
+                item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                collect(item, texts, answers, questions)
+                # The reply needs no re-anchor; the next Resume sends the full resume prompt (goal_reanchor).
+                compacted = compacted or item.get("type") == "contextCompaction"
+            elif method == "turn/completed":
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                if state["turn"] and turn.get("id") and turn["id"] != state["turn"]:
+                    continue  # Not this turn.
+                state["running"] = False
+                for item in turn.get("items") or []:
+                    if isinstance(item, dict):
+                        collect(item, texts, answers, questions)
+                if turn.get("status") in {"failed", "interrupted"}:
+                    _note_raw_error(emit, turn.get("error"))
+                    raise runtime.Error(f"Author reply turn {turn['status']}: "
+                                        f"{_provider_message(turn.get('error')) or 'no complete result'}")
+                break
+            elif method == "error":
+                if not params.get("willRetry", False):
+                    _note_raw_error(emit, params.get("error"))
+                    raise runtime.Error(_provider_message(params.get("error")) or str(params))
+                # Codex retries this request itself; say so, as the wait can be long.
+                emit("status", label="Codex is reconnecting", text=_reconnect_text(params.get("error")),
+                     threadId=thread)
+        reply = answers[-1] if answers else texts[-1] if texts else questions[-1] if questions else ""
+        if not reply.strip():
+            raise runtime.Error("The author's turn ended without a reply.")
+        return {"reply": reply, "threadId": thread, "compacted": compacted}
+    except (FinalError, retrieval_runtime.RetrievalPolicyError, ConversationAttemptFailed):
+        raise
+    except (runtime.Error, Error, OSError) as exc:
+        # A stalled attempt reads as its stall, not as the stopped process it caused.
+        message = stalled["reason"] or str(exc) or type(exc).__name__
+        raise ConversationAttemptFailed(message, retry={
+            "delivered": state["delivered"], "output": state["output"],
+            "rewind": state["turn"] if state["delivered"] and not state["output"] else None,
+            "classic": isinstance(exc, ToolRuntimeUnavailable)}) from exc
+    finally:
+        stop.set()
+        if rpc is not None and thread:
+            def pause():
+                try:
+                    rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
+                except (runtime.Error, OSError, ValueError):
+                    pass
+            cleanup = threading.Thread(target=pause, daemon=True)
+            cleanup.start()
+            cleanup.join(timeout=1)
+        if process is not None:
+            runtime.stop_process(process)
+        # A web-cutoff reply's private temp folder ends with its app-server.
+        retrieval_runtime.remove_private_temp(policy, child_environment)
+
+
+def _replacement_notice(reason):
+    """The "Conversation replaced" status: why, and what the new conversation keeps."""
+
+    return (f"{str(reason).rstrip('.')}. The author continues in a new conversation in this run, starting from the "
+            "resume prompt, its working directory, any open critic feedback and any note on why its last submission "
+            "was refused; the critic rounds and the time budget are kept.")
+
+
+def _repair_digest(text):
+    """The fingerprint by which a goal session recognizes critic feedback its thread already received."""
+
+    return _sha256(normalized_text(text))
+
+
+def _note_raw_error(emit, error):
+    """Keep the raw payload of a provider error that has no message of its own as a diagnostic."""
+
+    if isinstance(error, dict) and not (isinstance(error.get("message"), str) and error["message"].strip()):
+        emit("diagnostic", text=f"Codex reported the failure as: {_clipped(json.dumps(error, ensure_ascii=False), 600)}")
+
+
+def _reconnect_text(error):
+    """"Codex is reconnecting (2/5)…" with the provider's message, for an error Codex retries itself."""
+
+    message = _provider_message(error)
+    count = re.search(r"(\d+)\s*/\s*(\d+)", message)
+    detail = re.sub(r"^\s*reconnecting\W*(?:\d+\s*/\s*\d+)?\W*", "", message, flags=re.IGNORECASE).strip(" ()")
+    text = f"Codex is reconnecting ({count.group(1)}/{count.group(2)})…" if count else "Codex is retrying the request…"
+    return text + (f" Provider message: {_clipped(detail, 300)}" if detail else "") + (
+        " TCS Prover's own retry follows only if Codex gives up.")
+
+
 def _provider_message(error):
-    """The readable message of a provider error that Codex reports as text or as an object."""
+    """The readable message of a provider error that Codex reports as text or as an object.
+
+    An object without a message is described by its codexErrorInfo, for
+    example "usage limit exceeded" or "response stream disconnected (HTTP 503)".
+    """
 
     if isinstance(error, dict):
         message = error.get("message")
-        text = message.strip() if isinstance(message, str) and message.strip() else json.dumps(error, ensure_ascii=False)
+        text = (message.strip() if isinstance(message, str) and message.strip()
+                else _error_info_text(error.get("codexErrorInfo", error.get("codex_error_info")))
+                or json.dumps(error, ensure_ascii=False))
         details = error.get("additionalDetails") or error.get("additional_details")
         if isinstance(details, str) and details.strip() and details.strip() not in text:
             text += f" ({details.strip()})"
         return text
     return str(error).strip() if error else ""
+
+
+def _error_info_text(info):
+    """Plain words for a codexErrorInfo: "usageLimitExceeded", or {"responseStreamDisconnected": {...}}."""
+
+    if isinstance(info, dict) and len(info) == 1:
+        (name, value), = info.items()
+        words = _error_info_text(name)
+        status = value.get("httpStatusCode") if isinstance(value, dict) else None
+        return words + (f" (HTTP {status})" if words and isinstance(status, int) and not isinstance(status, bool) else "")
+    if isinstance(info, str) and info.strip():
+        return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", info.strip()).replace("_", " ").lower()
+    return ""
 
 
 def _sha256(value):
@@ -2903,6 +4879,31 @@ def _clipped(value, limit=1600):
     return value[:max(0, limit - len(suffix))].rstrip() + suffix
 
 
+def _sync_file(descriptor):
+    """Flush one file to the disk itself: F_FULLFSYNC on macOS, where fsync() stops at the drive's cache."""
+
+    try:
+        import fcntl
+        fcntl.fcntl(descriptor, fcntl.F_FULLFSYNC)
+    except (ImportError, AttributeError, OSError):
+        os.fsync(descriptor)
+
+
+def _sync_folder(folder):
+    """Make a rename into `folder` durable where the platform can sync a folder."""
+
+    try:
+        descriptor = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _private_atomic_write(path, content, *, staging_directory=None):
     """Atomically replace one private run-local UTF-8 state file."""
 
@@ -2929,7 +4930,11 @@ def _private_atomic_write(path, content, *, staging_directory=None):
             except (AttributeError, OSError):
                 pass  # mkstemp already created the file owner-only.
             stream.write(content)
+            # A power loss must not leave an empty checkpoint in place of the previous one.
+            stream.flush()
+            _sync_file(stream.fileno())
         temporary.replace(path)
+        _sync_folder(path.parent)
     finally:
         if temporary is not None and temporary.exists():
             try:
@@ -2964,6 +4969,92 @@ def _get(mapping, key, default=None):
     return mapping.get(key, default)
 
 
+class _RuleProblem(ValueError):
+    """A rule function found the answer unacceptable; its message says why, for the model's retry."""
+
+
+# What JSON escapes leave of a LaTeX command whose backslash was not doubled:
+# a backspace (\begin), a form feed (\frac), a lone carriage return (\right),
+# or a tab or line break before the rest of \textbf or \newline.
+_LATEX_ESCAPE_DAMAGE = re.compile(
+    r"[\x08\x0c]|\r(?!\n)"
+    r"|\t(?=(?:ext(?:bf|it|rm|tt|sf|sc|sl|up|md|normal|width|height|style|color)|heta|imes|ilde|riangle|itle"
+    r"|ableofcontents|oday|hanks|hispagestyle|frac|herefore|iny|op|au|o)(?![A-Za-z])|ext\{)"
+    r"|\n(?=(?:ew(?:line|command|theorem|page|environment|block|counter|length)|oindent|abla|otin|onumber"
+    r"|olimits|ormalsize|atural|obreak|opagebreak|ocite|oexpand|umberwithin)(?![A-Za-z]))")
+_LATEX_ESCAPES = {"\x08": ("a backspace", "b"), "\x0c": ("a form feed", "f"), "\r": ("a carriage return", "r"),
+                  "\t": ("a tab", "t"), "\n": ("a line break", "n")}
+# A comment standing in for omitted text: "% ... rest unchanged ...".
+_LATEX_ELISION = re.compile(r"\b(?:unchanged|omitted|elided|as before|same as (?:before|above)|rest of|remainder"
+                            r"|truncated|abbreviated|for brevity|snip)\b", re.IGNORECASE)
+_THEOREM_ENVIRONMENTS = {"theorem", "lemma", "proposition", "corollary", "claim", "definition", "remark", "example",
+                         "conjecture", "fact", "observation", "proof", "assumption", "notation", "problem",
+                         "question", "exercise", "construction", "hypothesis", "property", "algorithm"}
+
+
+def _latex_elisions(text):
+    return [comment.strip() for comment in re.findall(r"(?<!\\)%(.*)", text)
+            if re.search(r"\.\.\.|…|[\[(]", comment) and _LATEX_ELISION.search(comment)]
+
+
+def _latex_intact(text, source=""):
+    """Whether a LaTeX answer keeps its commands; _RuleProblem says what is wrong.
+
+    It rejects characters that JSON escapes made of commands (I-029) and
+    comments in place of text (I-051) that `source`, the answer's input, does
+    not have already.
+    """
+
+    if not isinstance(text, str) or not isinstance(source, str):
+        raise ValueError("latex_intact() requires text")
+    examples = []
+    for match in _LATEX_ESCAPE_DAMAGE.finditer(text):
+        what, letter = _LATEX_ESCAPES[match.group()]
+        rest = re.match(r"[A-Za-z]*", text[match.end():]).group()
+        if match.group() + rest not in source:
+            examples.append(f'{what} before "{rest}" where \\{letter}{rest} was meant' if rest else what)
+        if len(examples) == 3:
+            break
+    if examples:
+        raise _RuleProblem(f"the latex field has characters that JSON escapes made of LaTeX commands "
+                           f"({'; '.join(examples)}): write each LaTeX backslash as two backslashes in the JSON string")
+    elided = [comment for comment in _latex_elisions(text) if comment not in _latex_elisions(source)]
+    if elided:
+        raise _RuleProblem(f'the latex field has a comment in place of text ("% {_clipped(elided[0], 120)}"): '
+                           "return the complete document")
+    return True
+
+
+def _latex_kept(text, reference=""):
+    """latex_intact() against `reference`, the editor's version, which must also keep its content.
+
+    A repair may lose at most a tenth of the editor's text (and 500
+    characters), of its theorem-like environments and of its labels (I-051).
+    Commented-out text still counts as kept.
+    """
+
+    _latex_intact(text, reference)
+    if not reference.strip():
+        return True
+    lost = []
+    size, kept = len(re.sub(r"\s+", "", reference)), len(re.sub(r"\s+", "", text))
+    if size - kept > max(0.1 * size, 500):
+        lost.append(f"it keeps {round(100 * kept / size)}% of the text")
+    names = _THEOREM_ENVIRONMENTS | set(re.findall(r"\\newtheorem\*?\{([^}]+)\}", reference))
+    environments = [len([name for name in re.findall(r"\\begin\{([^}*]+)\*?\}", value) if name in names])
+                    for value in (reference, text)]
+    if environments[0] - environments[1] > max(1, environments[0] // 10):
+        lost.append(f"{environments[0] - environments[1]} of its {environments[0]} theorem-like environments are missing")
+    labels = set(re.findall(r"\\label\{([^}]*)\}", reference))
+    missing = sorted(labels - set(re.findall(r"\\label\{([^}]*)\}", text)))
+    if len(missing) > max(1, len(labels) // 10):
+        lost.append(f"{len(missing)} of its {len(labels)} labels are missing, such as {', '.join(missing[:3])}")
+    if lost:
+        raise _RuleProblem(f"the latex field drops content of the editor's version ({'; '.join(lost)}): keep all of "
+                           "the document's content and fix only the compilation errors")
+    return True
+
+
 _EXPRESSION_FUNCTIONS = {
     "len": len, "str": str, "bool": bool, "int": int, "float": float,
     "all": all, "any": any, "strip": _strip, "text": _text,
@@ -2972,6 +5063,7 @@ _EXPRESSION_FUNCTIONS = {
     "is_list": lambda value: isinstance(value, list),
     "is_dict": lambda value: isinstance(value, dict),
     "get": _get, "normalized_text": normalized_text, "json": lambda value: json.dumps(value, ensure_ascii=False, indent=2),
+    "latex_intact": _latex_intact, "latex_kept": _latex_kept,
 }
 _EXPRESSION_BINARY = {
     ast.Add: operator.add, ast.Sub: operator.sub,
@@ -3185,7 +5277,31 @@ def _nonempty_field(node):
     return _result_field(node)
 
 
+def _changed_field(node):
+    """(X, True) for `normalized_text(result.X) != normalized_text(state.X)`, (X, False) for `==`, else None."""
+
+    if not (isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))):
+        return None
+    sides = [node.left, node.comparators[0]]
+    if not all(isinstance(side, ast.Call) and isinstance(side.func, ast.Name) and side.func.id == "normalized_text"
+               and len(side.args) == 1 and isinstance(side.args[0], ast.Attribute)
+               and isinstance(side.args[0].value, ast.Name) for side in sides):
+        return None
+    answer, saved = sides[0].args[0], sides[1].args[0]
+    if answer.value.id != "result" or saved.value.id != "state" or answer.attr != saved.attr:
+        return None
+    return answer.attr, isinstance(node.ops[0], ast.NotEq)
+
+
 def _requirement_phrase(node, schema):
+    if (isinstance(node, ast.IfExp) and isinstance(node.orelse, ast.Constant) and node.orelse.value is True
+            and _changed_field(node.test)):
+        # "the fixes field must not be empty when you changed the solution text": a rule only for an answer
+        # that changed (or kept) the text it reviewed (_accept_node_answer names an edited file instead).
+        when = _requirement_phrase(node.body, schema)
+        field, differs = _changed_field(node.test)
+        return (f"{when} when you changed the {field} text" if differs
+                else f"{when} when you left the {field} text unchanged") if when else None
     field = _nonempty_field(node)
     if field:
         return f"the {field} field must not be empty"
@@ -3423,48 +5539,23 @@ def _check_request_options(node):
             raise ValueError("Request timeout must be a positive finite number.")
 
 
-def _check_parallel(config, prompts):
-    allowed = {"run", "items", "prompt", "instructions", "inputs", "schema", "features", "output", "item_field", "checkpoint", "attempts", "provider_options", "role", "stage", "model", "effort"}
-    if not isinstance(config, dict) or config.get("run") != "structured" or set(config) - allowed or not isinstance(config.get("items"), list) or not config["items"]:
-        raise ValueError("Parallel requests need a nonempty items list and request definition.")
-    if not isinstance(config.get("schema"), dict):
-        raise ValueError("Parallel requests need response or schema.")
-    try:
-        validator_for(config["schema"]).check_schema(config["schema"])
-        json.dumps(config["items"])
-    except (TypeError, ValueError, SchemaError) as exc:
-        raise ValueError("Invalid parallel request schema or items.") from exc
-    if not isinstance(config.get("prompt"), str) or config["prompt"] not in prompts:
-        raise ValueError("Parallel requests need a named prompt.")
-    instructions = config.get("instructions", [])
-    if not isinstance(instructions, list) or not all(isinstance(name, str) and name in prompts for name in instructions):
-        raise ValueError("Parallel request instructions must name existing prompts.")
-    inputs = config.get("inputs", {})
-    if not isinstance(inputs, dict) or not all(isinstance(key, str) for key in inputs):
-        raise ValueError("Parallel inputs must be a named mapping.")
-    for expression in inputs.values():
-        check_expression(expression)
-    for key in ("output", "item_field", "role", "stage"):
-        if key in config and (not isinstance(config[key], str) or not config[key]):
-            raise ValueError(f"Parallel {key} must be a nonempty string.")
-    if not isinstance(config.get("features", []), list) or not all(isinstance(feature, str) for feature in config.get("features", [])):
-        raise ValueError("Parallel features must be strings.")
-    if "model" in config:
-        chosen_model(config["model"])
-    if "effort" in config:
-        chosen_effort(config["effort"])
-    _check_request_options(config)
-    if "checkpoint" in config:
-        checkpoint = config["checkpoint"]
-        if not isinstance(checkpoint, dict) or not {"file", "identity"} <= checkpoint.keys() or set(checkpoint) - {"file", "disabled", "identity", "item_key"}:
-            raise ValueError("A parallel checkpoint needs file and identity.")
-        for key in ("file", "disabled", "item_key"):
-            if key in checkpoint and (not isinstance(checkpoint[key], str) or not checkpoint[key]):
-                raise ValueError("Checkpoint names must be nonempty strings.")
-        if not isinstance(checkpoint["identity"], dict) or not all(isinstance(key, str) for key in checkpoint["identity"]):
-            raise ValueError("Checkpoint identity must be a named mapping.")
-        for expression in checkpoint["identity"].values():
-            check_expression(expression)
+def _check_subagents(config, name):
+    """Validate a node's subagent count: a number, or the option that sets it with its default and minimum.
+
+    Every count is 0 (no subagents) to MAX_CRITIC_COUNT; see subagent_count().
+    """
+
+    if isinstance(config, int) and not isinstance(config, bool):
+        config = {"default": config}
+    if (not isinstance(config, dict) or set(config) - {"option", "default", "minimum"} or "default" not in config
+            or ("option" in config and (not isinstance(config["option"], str) or not config["option"].isidentifier()))):
+        raise ValueError(f"Node {name} subagents need a number, or an option name with its default.")
+    minimum = config.get("minimum", 0)
+    for value in (config["default"], minimum):
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= MAX_CRITIC_COUNT:
+            raise ValueError(f"Node {name} subagents must be whole numbers from 0 to {MAX_CRITIC_COUNT}.")
+    if config["default"] < minimum:
+        raise ValueError(f"Node {name} subagents default to fewer than their minimum.")
 
 
 def _expand_node(node):
@@ -3508,12 +5599,6 @@ def _expand_node(node):
         node.setdefault("lifecycle", list(_GOAL_LIFECYCLE))
         node.setdefault("stages", dict(_GOAL_STAGES))
 
-    if "parallel" in node:
-        parallel = node["parallel"]
-        if not isinstance(parallel, dict):
-            raise ValueError("Parallel requests need a mapping.")
-        parallel.setdefault("run", "structured")
-        _expand_node(parallel)
 
 
 def load_workflow(path):
@@ -3522,7 +5607,9 @@ def load_workflow(path):
     try:
         workflow = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise ValueError(f"Cannot read workflow {path}: {exc}") from exc
+        mark = getattr(exc, "problem_mark", None)
+        where = f" (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
+        raise ValueError(f"Cannot read workflow {path}{where}: {exc}") from exc
     if not isinstance(workflow, dict) or set(workflow) != {"prompts", "nodes"}:
         raise ValueError("A workflow must contain only prompts and nodes.")
     prompts, nodes = workflow["prompts"], workflow["nodes"]
@@ -3539,8 +5626,8 @@ def load_workflow(path):
     shared = {"run", "role", "stage", "model", "effort", "prompt", "outcome", "next", "before", "after",
               "workflow_stage", "skip"}
     specific = {
-        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "parallel", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features"},
+        "structured": {"instructions", "inputs", "schema", "features", "require", "error", "subagents", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff", "edit"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features", "subagents"},
         "command": {"command", "require", "error"},
     }
     for name, node in nodes.items():
@@ -3573,6 +5660,8 @@ def load_workflow(path):
                 raise ValueError(f"Node {name} needs a nonempty {field}.")
         if "outcome" in node:
             check_expression(node["outcome"])
+        if "subagents" in node:
+            _check_subagents(node["subagents"], name)
         _check_actions(node.get("before", []))
         _check_actions(node.get("after", []))
         if kind == "structured":
@@ -3588,8 +5677,6 @@ def load_workflow(path):
                 raise ValueError("Result normalization must map field names to expressions.")
             for expression in normalized.values():
                 check_expression(expression)
-            if "parallel" in node:
-                _check_parallel(node["parallel"], prompts)
             if not isinstance(node.get("schema"), dict):
                 raise ValueError(f"Structured node {name} needs a response schema.")
             try:
@@ -3597,6 +5684,17 @@ def load_workflow(path):
                 validator_for(node["schema"]).check_schema(node["schema"])
             except (TypeError, ValueError, SchemaError) as exc:
                 raise ValueError(f"Invalid JSON schema in node {name}.") from exc
+            if "edit" in node:
+                # The file the model edits in place; its text becomes result.<field> (see EditableFile).
+                edit = node["edit"]
+                if (not isinstance(edit, dict) or not {"file", "field"} <= set(edit)
+                        or set(edit) - {"file", "field", "input"} or not isinstance(edit["file"], str)
+                        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", edit["file"])
+                        or not isinstance(edit["field"], str) or not edit["field"].isidentifier()
+                        or edit["field"] in (node["schema"].get("properties") or {})
+                        or ("input" in edit and edit["input"] not in (node.get("inputs") or {}))):
+                    raise ValueError(f"Node {name} edit needs a plain file name, a result field outside its "
+                                     "response, and optionally one of its inputs as the initial text.")
             for field in ("require", "features"):
                 if not isinstance(node.get(field, []), list) or not all(isinstance(item, str) for item in node.get(field, [])):
                     raise ValueError(f"Node {name} {field} must be a list of strings.")
@@ -3625,7 +5723,7 @@ def load_workflow(path):
             if isinstance(lifecycle, list) and all(isinstance(key, str) for key in lifecycle):
                 lifecycle = {key: key for key in lifecycle}
             required = set(_GOAL_LIFECYCLE)
-            if not isinstance(lifecycle, dict) or not required <= set(lifecycle) or set(lifecycle) - required - {"pause"} or not all(
+            if not isinstance(lifecycle, dict) or not required <= set(lifecycle) or set(lifecycle) - required - set(_GOAL_OPTIONAL_LIFECYCLE) or not all(
                 isinstance(ref, str) and ref in prompts for ref in lifecycle.values()
             ):
                 raise ValueError(f"Goal node {name} must bind its lifecycle prompts.")
@@ -3651,13 +5749,18 @@ def load_workflow(path):
             target = branch
             if isinstance(branch, dict):
                 if "repeat" in branch:
-                    if set(branch) - {"repeat", "option", "then", "after"} or "then" not in branch:
+                    if (set(branch) - {"repeat", "option", "then", "after", "verify"}
+                            or not {"then", "verify"} & set(branch)):
                         raise ValueError(f"Invalid repeat branch in node {name}.")
                     if type(branch["repeat"]) is not int or branch["repeat"] < 1:
                         raise ValueError(f"Invalid repeat limit in node {name}.")
                     if "option" in branch and not isinstance(branch["option"], str):
                         raise ValueError(f"Invalid repeat option in node {name}.")
-                    target = branch["then"]
+                    # At the limit, one verify-only visit with this extra instruction (see _execute).
+                    if "verify" in branch and (kind != "structured" or not isinstance(branch["verify"], str)
+                                               or branch["verify"] not in prompts):
+                        raise ValueError(f"Invalid verify prompt in node {name}.")
+                    target = branch.get("then", name)
                 else:
                     if set(branch) - {"to", "after"} or "to" not in branch:
                         raise ValueError(f"Invalid transition in node {name}.")
@@ -3668,10 +5771,80 @@ def load_workflow(path):
     return workflow
 
 
+# The last version of each built-in workflow that loaded, by path. An edit that
+# does not load falls back to it, with a warning (workflow_warnings()); the copy
+# of the bundled files beside the private state also serves a fresh start.
+_LAST_GOOD_WORKFLOWS = {}
+_WORKFLOW_WARNINGS = {}
+
+
+def _last_good_copy(path):
+    """The saved last-good copy of a bundled workflow file, or None for any other folder."""
+
+    path = Path(path)
+    if path.parent.resolve() != (ROOT / "workflows").resolve():
+        return None
+    return providers.state_directory() / providers.LAST_GOOD_WORKFLOWS / path.name
+
+
+def read_editable_yaml(path, parse):
+    """Parse an editable built-in YAML file, falling back to its last version that parsed.
+
+    Return (value, path of the text that was used).
+    """
+
+    path = Path(path)
+    key = str(path.resolve())
+    saved = _last_good_copy(path)
+    try:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Cannot read workflow {path}: {exc}") from exc
+        value = parse(path)
+    except ValueError as exc:
+        remembered = _LAST_GOOD_WORKFLOWS.get(key)
+        if remembered is None and saved is not None and saved.is_file():
+            try:
+                remembered = (parse(saved), saved.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                remembered = None
+        if remembered is None:
+            raise
+        _WORKFLOW_WARNINGS[path.name] = (f"{exc} TCS Prover uses the last version of {path.name} that could be "
+                                         "read until the file is fixed.")
+        return _copy.deepcopy(remembered[0]), saved if saved is not None and saved.is_file() else None
+    _WORKFLOW_WARNINGS.pop(path.name, None)
+    if _LAST_GOOD_WORKFLOWS.get(key, (None, None))[1] != text:
+        _LAST_GOOD_WORKFLOWS[key] = (_copy.deepcopy(value), text)
+        if saved is not None:
+            try:
+                if not saved.is_file() or saved.read_text(encoding="utf-8") != text:
+                    _private_atomic_write(saved, text)
+            except (OSError, UnicodeError, Error):
+                pass  # The copy only helps a later start; this load succeeded.
+    return value, path
+
+
+def workflow_warnings():
+    """Why a built-in workflow file currently runs from its last readable version, if it does."""
+
+    return " ".join(_WORKFLOW_WARNINGS[name] for name in sorted(_WORKFLOW_WARNINGS))
+
+
 def builtin_workflow(name):
     """Read current UI/convenience defaults without caching editable YAML."""
 
-    return load_workflow(WORKFLOWS / f"{name}.yaml")
+    return read_editable_yaml(WORKFLOWS / f"{name}.yaml", load_workflow)[0]
+
+
+def builtin_workflow_path(name):
+    """The file a launch of a built-in workflow reads: the live one, or its last readable copy."""
+
+    used = read_editable_yaml(WORKFLOWS / f"{name}.yaml", load_workflow)[1]
+    if used is None:
+        raise ValueError(_WORKFLOW_WARNINGS.get(f"{name}.yaml") or f"Cannot read workflow {name}.yaml.")
+    return used
 
 
 def __getattr__(name):
@@ -3679,12 +5852,55 @@ def __getattr__(name):
     # The generic execution path never needs to open either bundled YAML file.
     if name == "DEFAULT_CRITIC_ROUNDS":
         return builtin_workflow("author_critic")["nodes"]["critic"]["next"]["fixed"]["repeat"]
+    if name == "DEFAULT_CRITIC_COUNT":
+        # The critic's subagents: its node's number, or its option's default (see subagent_count).
+        return subagent_count(builtin_workflow("author_critic")["nodes"]["critic"], {})
+    if name == "DEFAULT_AUTHOR_SUBAGENTS":
+        return subagent_count(builtin_workflow("author_critic")["nodes"]["author"], {})
     if name == "FINAL_PROMPT":
         return builtin_workflow("clean_up")["prompts"]["final"]
-    if name in {"CRITIC_AUDIT_FOCI", "CRITIC_CHECK_SCHEMA"}:
-        config = _parallel_definition()
-        return tuple(config["items"]) if name == "CRITIC_AUDIT_FOCI" else config["schema"]
     raise AttributeError(name)
+
+
+# The run options that set a node's number of subagents, with the check that names their setting.
+SUBAGENT_OPTIONS = {"critic_count": critic_count, "author_subagents": author_subagents}
+
+
+def subagent_count(node, options):
+    """How many subagents a node's model may start at once: its `subagents` number, or the run option that sets
+    it (else its default); None for a node that declares none.
+
+    A known option is checked as its setting is (critic_count(), author_subagents()); every count lies
+    between the node's minimum and MAX_CRITIC_COUNT, else Error before any model starts.
+    """
+
+    config = node.get("subagents")
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        config = {"default": config}
+    option = config.get("option")
+    value = options.get(option, config["default"]) if option else config["default"]
+    if option in SUBAGENT_OPTIONS:
+        value = SUBAGENT_OPTIONS[option](value)
+    minimum = config.get("minimum", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= MAX_CRITIC_COUNT:
+        raise Error(f"Choose {minimum} to {MAX_CRITIC_COUNT} subagents.")
+    return value
+
+
+def node_features(node, options):
+    """A node's features and its number of subagents (subagent_count()).
+
+    A node that declares subagents gets the multi_agent feature exactly when that number is 1 or more: the
+    run's setting decides, not the node's feature list.
+    """
+
+    features = list(node.get("features", []))
+    count = subagent_count(node, options)
+    if count is not None:
+        features = [feature for feature in features if feature != "multi_agent"] + (["multi_agent"] if count else [])
+    return features, count
 
 
 def _settings(node, options):
@@ -3744,8 +5960,11 @@ def _node_prompt_names(node):
     names.update(lifecycle if isinstance(lifecycle, list) else lifecycle.values())
     if node.get("recovery"):
         names.add(node["recovery"]["prompt"])
-    if node.get("parallel"):
-        names.update(_node_prompt_names(node["parallel"]))
+    branches = node.get("next")
+    if isinstance(branches, dict):
+        # The instruction of a repeat branch's verify-only visit (see _execute).
+        names.update(branch["verify"] for branch in branches.values()
+                     if isinstance(branch, dict) and isinstance(branch.get("verify"), str))
     return names
 
 
@@ -3766,12 +5985,13 @@ def prepare(workflow, options):
             continue
         settings = _settings(node, options)
         require_model_credentials(settings["model"])
+        # The number of subagents the run's options give.
+        count = subagent_count(node, options)
         if node["run"] == "structured":
-            if "parallel" in node:
-                config = {key: node[key] for key in ("role", "stage", "model", "effort") if key in node}
-                config.update(node["parallel"])
-                require_model_credentials(_settings(config, options)["model"])
-                _template_parts(prompts[config["prompt"]], set(config.get("inputs", {})) | {"instructions"})
+            if count is not None:
+                # The instructions of a node with subagents are templates: {count} is that number.
+                for name in node.get("instructions", []):
+                    _template_parts(prompts[name], {"count"})
             reference = node["prompt"]
             references = [reference["then"], reference["else"]] if isinstance(reference, dict) else [reference]
             for reference in references:
@@ -3785,19 +6005,22 @@ def prepare(workflow, options):
             lifecycle = node["lifecycle"]
             if isinstance(lifecycle, list):
                 lifecycle = {key: key for key in lifecycle}
-            for reference in lifecycle.values():
-                _template_parts(prompts[reference], fields)
+            for key, reference in lifecycle.items():
+                # Only the paused author's conversation prompt quotes the user's message, the note on a
+                # refused submission its reason, and the subagents note their number (the controller
+                # renders these with nothing else).
+                _template_parts(prompts[reference], {"reason"} if key == "handoff_refused"
+                                else {"author_subagents"} if key == "subagents"
+                                else fields | {"message"} if key == "conversation" else fields)
     return prompts
 
 
-def _parallel_definition(config=None):
-    return builtin_workflow("author_critic")["nodes"]["critic"]["parallel"] if config is None else config
+def _instructions(node, prompts, values=None):
+    """A node's instructions, in order; with ``values`` (a node with subagents: {count}) each is rendered."""
 
-
-def _instructions(node, prompts):
     instructions = ""
     for name in node.get("instructions", []):
-        part = text(prompts[name])
+        part = text(prompts[name] if values is None else render_template(prompts[name], values))
         if part not in instructions:
             instructions = instructions + "\n\n" + part if instructions else part
     return instructions
@@ -3805,7 +6028,7 @@ def _instructions(node, prompts):
 
 def _request_prompt(node, prompts, context):
     values = {key: evaluate(expression, context) for key, expression in node.get("inputs", {}).items()}
-    values["instructions"] = _instructions(node, prompts)
+    values["instructions"] = _instructions(node, prompts, {"count": context["count"]} if "count" in context else None)
     reference = node["prompt"]
     if isinstance(reference, dict):
         reference = reference["then"] if evaluate(reference["when"], context) else reference["else"]
@@ -3819,6 +6042,12 @@ def _structured_options(node, options):
     settings["effort"] = effective_effort(settings["model"], settings["effort"])
     if "attempts" in node:
         settings["attempts"] = node["attempts"]
+        if not options.get("_attempts_noted"):
+            # Said once per workflow: the key is accepted for older workflows but has no effect.
+            options["_attempts_noted"] = True
+            emit("diagnostic", node.get("stage", "model"),
+                 text="This workflow sets attempts on a structured request. Workflow model calls ignore it: "
+                      "every failed attempt is retried each minute until the call succeeds.")
     return settings
 
 
@@ -3826,14 +6055,25 @@ def workflow_remaining(options):
     """One elapsed-time budget across proof search, verification, and final editing.
 
     Waits before a model-call retry are not elapsed work (see RetryClock).
+    The limit stops only the author: steps after a submission (options from
+    _after_submission) always finish, so an approved proof is never cut off.
+    Their time still counts toward the budget of later author rounds.
     """
     started = options.setdefault("_workflow_started", _now())
+    if options.get("_after_submission"):
+        return math.inf
     hours = controlled_author_hours(options.get("author_limit_file"),
                                    options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
     if hours == 0:
         return math.inf
     return max(0.0, hours * 3600 - options.get("elapsed_seconds", 0)
                - (_now() - started - retry_clock(options).excluded()))
+
+
+def _after_submission(options):
+    """The options of a step after the author's submission: the same run, without a deadline."""
+
+    return {**options, "_after_submission": True}
 
 
 def _bounded_request_settings(settings, options):
@@ -3843,83 +6083,27 @@ def _bounded_request_settings(settings, options):
     recomputes the remaining budget before each attempt. There is no internal
     attempt budget (a node's legacy `attempts` is ignored); every failure is
     retried after MODEL_RETRY_SECONDS, and those waits do not consume the budget.
+    A node's `timeout` (provider_options) is its inactivity limit: without one
+    an attempt is stopped only after STRUCTURED_STALL_SECONDS without output,
+    also when the budget is unlimited, and never while it works.
     """
     remaining = workflow_remaining(options)
     if remaining <= 0:
         raise Error("Workflow time limit reached; saved work remains resumable.")
     settings = {key: value for key, value in settings.items() if key != "attempts"}
-    # Every attempt has a timeout, even with an unlimited budget, so a hung
-    # request is noticed; consecutive timeouts double it (see structured()).
-    timeout = settings.get("timeout") or STRUCTURED_TIMEOUT_SECONDS
-    return {**settings, "timeout": timeout if math.isinf(remaining) else min(timeout, remaining),
-            "options": options}
+    return {**settings, "options": options}
 
 
-def _parallel_requests(config, prompts, state, options, visit, input_files=None):
-    """Run independent structured requests, restoring exact-input checkpoints."""
-    settings = _structured_options(config, options)
-    model, effort = settings["model"], settings["effort"]
-    stage = config.get("stage", "model")
-    context = {"state": state, "visit": visit, "instructions": _instructions(config, prompts)}
-    checkpoint = config.get("checkpoint")
-    identity = {key: evaluate(value, context) for key, value in checkpoint["identity"].items()} if checkpoint else None
-    reports = load_critic_audit_checkpoint("", "", model, effort, "", config=config, identity=identity) if checkpoint else [None] * len(config["items"])
-    restored = sum(report is not None for report in reports)
-    for index, report in enumerate(reports):
-        if report is not None:
-            emit("status", stage, label=f"Independent audit {index + 1} restored", text="Loaded this completed audit from the exact-proof checkpoint; no new provider request will be charged for it.", node=stage, auditIndex=index + 1, auditVerdict=report.get("verdict"), checkpoint=True)
-    emit("status", stage, label="Three independent audits started" if len(reports) == 3 else "Independent requests started", text=f"The controller restored {restored} completed audits and is launching {len(reports) - restored} explicit parallel model requests.", node=stage, auditCount=len(reports), restoredAuditCount=restored, launchedAuditCount=len(reports)-restored, reasoningEffort=effort, timeoutSeconds=settings.get("timeout"))
-    # Each request retries its own failures without a limit; a request that
-    # ends the step (pause, time limit, Stop) cancels the waits of the others.
-    cancel = threading.Event()
-
-    def run_one(index, item):
-        prompt = _request_prompt(config, prompts, {**context, "item": item})
-        report, _ = structured(prompt, config["schema"], stage, features=config.get("features", []), request_label=f"Independent critic audit {index + 1}", activity_label=f"Independent audit {index + 1}", cancel=cancel, **({"input_files": input_files} if input_files is not None else {}), **_bounded_request_settings(settings, options))
-        report = dict(report)
-        if config.get("item_field"):
-            report[config["item_field"]] = item
-        return report
-    failures = []
-    missing = [(index, item) for index, item in enumerate(config["items"]) if reports[index] is None]
-    with ThreadPoolExecutor(max_workers=max(1, len(missing))) as pool:
-        futures = {pool.submit(run_one, index, item): index for index, item in missing}
-        try:
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    reports[index] = future.result()
-                    if checkpoint:
-                        save_critic_audit_checkpoint(reports, "", "", model, effort, "", config=config, identity=identity)
-                    emit("status", stage, label=f"Independent audit {index + 1} complete", text=reports[index].get("report", ""), node=stage, auditIndex=index + 1, auditVerdict=reports[index].get("verdict"))
-                except Exception as exc:
-                    cancel.set()
-                    if not isinstance(exc, RetryCancelled):
-                        failures.append((index, exc))
-                        emit("diagnostic", stage, text=f"Independent audit {index + 1} failed: {exc}", node=stage, auditIndex=index + 1)
-        finally:
-            # Stop (KeyboardInterrupt) or any failure: no sibling keeps waiting to retry.
-            cancel.set()
-    if failures:
-        failures.sort(key=lambda failure: failure[0])
-        for _, exc in failures:
-            if isinstance(exc, WorkflowPaused):
-                raise exc
-        detail = "; ".join(f"audit {index + 1}: {exc}" for index, exc in failures)
-        raise Error("The controller could not complete all independent audits. " + detail)
-    return reports
-
-
-def _accept_node_answer(node, context, input_files, report, raw):
+def _accept_node_answer(node, context, input_files, report, raw, edited=None):
     """Apply a node's normalize, schema, proof-pointer and require checks to one answer.
 
     Runs inside structured()'s retry loop, so an unacceptable answer is
     retried with a plain explanation (InvalidAnswer) instead of failing the run.
+    The text of a node's edited file (``edited``, an EditableFile) becomes
+    the result field the node's `edit` names, so its rules and actions read
+    it like an answer field.
     """
     report = dict(report)
-    parallel = node.get("parallel")
-    if parallel and parallel.get("output"):
-        report[parallel["output"]] = context["parallel"]
     for key, expression in node.get("normalize", {}).items():
         try:
             report[key] = evaluate(expression, {**context, "result": report, "raw": raw})
@@ -3927,28 +6111,42 @@ def _accept_node_answer(node, context, input_files, report, raw):
             # The rule cannot handle a schema-valid answer: a workflow problem,
             # which no retry of the model call can fix.
             raise WorkflowDefinitionError(str(exc)) from exc
+    edit, schema = node.get("edit"), node["schema"]
+    from_file = (bool(edit) and edited is not None and edited.text is not None
+                 and (edited.readonly or edit["field"] not in report))
+    if edit:
+        if from_file:
+            report[edit["field"]] = edited.text
+            schema = _with_field(schema, edit["field"])
+        else:
+            # The text came with the answer: a web-cutoff answer, which structured() already
+            # checked against the full schema, or a stand-in for structured(). Only it is required.
+            schema = {**_with_field(schema, edit["field"]), "required": [edit["field"]]}
     try:
-        validate_json_schema(report, node["schema"])
+        validate_json_schema(report, schema)
     except Error as exc:
-        if node.get("normalize") or (parallel and parallel.get("output")):
+        if node.get("normalize"):
             # structured() already checked the answer against this schema:
-            # the node's own normalize or parallel output broke it.
+            # the node's own normalize broke it.
             raise WorkflowDefinitionError(str(exc)) from exc
-        raise InvalidAnswer(_schema_problem(report, node["schema"]) or str(exc), detail=str(exc)) from exc
+        raise InvalidAnswer(_schema_problem(report, schema) or str(exc), detail=str(exc)) from exc
     # A returned pointer would be resolved against the author's stale file or
     # accepted literally; stop before any action replaces the saved candidate.
     handoff = node.get("proof_handoff")
     returned = report.get(handoff["candidate"]) if handoff and input_files is not None else None
     captured = dict(input_files)["proof.md"] if isinstance(returned, str) else ""
+    subject = edit["file"] if from_file else f"the {handoff['candidate']} field" if handoff else ""
     if isinstance(returned, str) and not normalized_text(returned):
         # No proof at all (for example a critic whose subagents all failed).
-        raise InvalidAnswer(f"the {handoff['candidate']} field must not be empty",
+        raise InvalidAnswer(f"{subject} must not be empty",
                             message="The critic returned no proof text; the captured candidate was kept.")
     if isinstance(returned, str) and normalized_text(returned) != normalized_text(captured):
         # Marker lines kept verbatim from the captured proof are text of an
         # edited proof; only what the critic wrote itself can be a pointer.
+        # This includes the near-miss forms a pointer may take ("PROOF_FILE proof.md").
         marker = re.compile(r"^[ \t]*`?PROOF_FILE[ \t]*:")
-        inherited = {line.strip() for line in captured.splitlines() if marker.match(line)}
+        inherited = {line.strip() for line in captured.splitlines()
+                     if marker.match(line) or proof_handoff.MARKER_LINE.match(line)}
         remainder = "\n".join(line for line in returned.splitlines() if line.strip() not in inherited)
         try:
             pointer = (not normalized_text(remainder)
@@ -3958,13 +6156,20 @@ def _accept_node_answer(node, context, input_files, report, raw):
         if pointer:
             pointer = ("The critic returned a file pointer instead of the complete proof text; "
                        "the captured candidate was kept.")
-            raise InvalidAnswer(
-                f"the {handoff['candidate']} field must contain the complete proof text, not a file pointer",
-                detail=pointer, message=pointer)
+            raise InvalidAnswer(f"{subject} must contain the complete proof text, not a file pointer",
+                                detail=pointer, message=pointer)
     for condition in node.get("require", []):
         try:
             satisfied = evaluate(condition, {**context, "result": report, "raw": raw})
         except ValueError as exc:
+            if isinstance(exc.__cause__, _RuleProblem):
+                # The rule's function says what is wrong with the answer (latex_intact); for an
+                # edited file it names the file the model edits, not the field its text fills.
+                problem = str(exc.__cause__)
+                if from_file:
+                    problem = problem.replace(f"the {edit['field']} field", edit["file"])
+                raise InvalidAnswer(problem, rule=condition, detail=node.get("error", ""),
+                                    message=node.get("error") or f"Invalid model response: {problem}.") from exc
             if not isinstance(exc.__cause__, _EmptyText):
                 # The rule cannot be evaluated on a schema-valid answer (for
                 # example it names a field the schema lacks): a workflow
@@ -3973,16 +6178,52 @@ def _accept_node_answer(node, context, input_files, report, raw):
             satisfied = False  # text() of an empty field: the answer does not meet the rule.
         if not satisfied:
             problem = describe_requirement(condition, node["schema"], report)
+            if from_file:
+                # The model edits a file, not the field its text fills.
+                problem = problem.replace(f"the {edit['field']} text", edit["file"])
             raise InvalidAnswer(problem, rule=condition, detail=node.get("error", ""),
                                 message=node.get("error") or f"Invalid model response: {problem}.")
     return report
 
 
-def _prepare_node_files(node, state, visit, workspace=None, resolve_reference=True):
+def model_context_tokens(model):
+    """The context window of `model` in tokens when its settings record one (API models), else None."""
+
+    value = (providers.api_model(model) or {}).get("contextWindow") if providers.is_api_id(model) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _over_byte_limit(size, limit=proof_handoff.MAX_PROOF_BYTES):
+    """The one wording of a proof over the handoff byte limit, inline or as a file."""
+
+    return f"the proof is {size:,} bytes, more than the {limit:,} bytes ({limit / 1048576:g} MiB) the critic accepts"
+
+
+def candidate_size_problem(candidate, model=None):
+    """Why a submitted proof is too large to hand to the critic `model`, in plain words, or "".
+
+    The critic edits its copy in small steps, so no output limit applies to the
+    proof; it must still be able to read the whole proof at once.
+    """
+
+    size = len(candidate.encode("utf-8"))
+    if size > proof_handoff.MAX_PROOF_BYTES:
+        return _over_byte_limit(size)
+    window = model_context_tokens(model) if model else None
+    tokens = -(-size // 4)  # About four bytes of English or LaTeX per token.
+    if window and tokens > window:
+        return (f"the proof is about {tokens:,} tokens ({size:,} bytes), more than the {window:,}-token context "
+                f"window of {providers.model_label(model)}")
+    return ""
+
+
+def _prepare_node_files(node, state, visit, workspace=None, resolve_reference=True, model=None):
     """Resolve an explicitly submitted artifact before checkpoints and prompts.
 
     Only a node's first visit receives a submission; a repeated visit reviews
-    the previous answer as text, never the author's possibly stale file.
+    the previous answer as text, never the author's possibly stale file. A
+    submission that cannot be handed over raises HandoffRefused; with the
+    critic's `model` its size is checked too.
     """
     handoff = node.get("proof_handoff")
     if handoff is None:
@@ -3991,15 +6232,26 @@ def _prepare_node_files(node, state, visit, workspace=None, resolve_reference=Tr
     candidate, statement = state.get(candidate_key), state.get(statement_key)
     if not isinstance(candidate, str) or not isinstance(statement, str) or not statement.strip():
         raise Error("Proof handoff needs a candidate and the exact problem statement.")
+    captured = state.get("proof_handoff") if isinstance(state.get("proof_handoff"), dict) else {}
+    if (((captured.get("files") or {}).get("proof.md") or {}).get("sha256")
+            == hashlib.sha256(candidate.encode("utf-8")).hexdigest()):
+        # A step resumed from its checkpoint reviews the very text it captured before.
+        resolve_reference = False
     try:
         snapshot = (proof_handoff.resolve_author_proof(candidate, workspace or Path.cwd())
                     if resolve_reference else None)
+    except proof_handoff.ProofTooLarge as exc:
+        raise HandoffRefused("Cannot hand the submitted proof to the critic: "
+                             f"{_over_byte_limit(exc.size_bytes, exc.limit)}.") from exc
     except proof_handoff.ProofHandoffError as exc:
-        raise Error(f"Cannot hand the submitted proof to the critic: {exc}") from exc
+        raise HandoffRefused(f"Cannot hand the submitted proof to the critic: {exc}") from exc
     if snapshot is not None:
         candidate = snapshot.text
     if not candidate.strip():
-        raise Error("Cannot hand an empty proof to the critic.")
+        raise HandoffRefused("Cannot hand an empty proof to the critic.")
+    problem = candidate_size_problem(candidate, model) if resolve_reference else ""
+    if problem:
+        raise HandoffRefused(f"Cannot hand the submitted proof to the critic: {problem}.")
     source = {"kind": "file", **snapshot.receipt()} if snapshot else {"kind": "inline"}
     files = (("proof.md", candidate), ("statement.md", statement))
     manifest = {
@@ -4017,35 +6269,89 @@ def _prepare_node_files(node, state, visit, workspace=None, resolve_reference=Tr
     return (*files, ("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"))
 
 
-def _model_call(node, prompts, state, options, visit, input_files=None):
-    """Run a configured request, optionally collecting independent inputs first."""
+def _model_call(node, prompts, state, options, visit, input_files=None, verify=None):
+    """Run a configured request.
+
+    A node with `subagents` (see subagent_count()) runs one call that may
+    start that many subagents at once: its instructions read the number as
+    {count}, the CLI's own limits hold it (subagent_limits()), and the call
+    reports their progress (SubagentProgress). A node's `edit` file is
+    edited in place (see EditableFile); with a `proof_handoff`, the result
+    also records whether the proof changed and the diff (see _proof_change).
+    A `verify` visit (the prompt a repeat
+    branch names) adds that instruction to the node's own instructions only
+    and keeps the file read-only, so the visit can only confirm or reject its
+    text.
+    """
+    if verify:
+        node = {**node, "instructions": [*node.get("instructions", []), verify]}
     context = {"state": state, "visit": visit}
-    parallel = node.get("parallel")
-    if parallel:
-        config = {key: node[key] for key in ("role", "stage", "model", "effort") if key in node}
-        config.update(parallel)
-        context["parallel"] = options.get("parallel_results")
-        if context["parallel"] is None:
-            context["parallel"] = _parallel_requests(config, prompts, state, options, visit, input_files=input_files)
+    features, count = node_features(node, options)
+    if count is not None:
+        context["count"] = count
     prompt = _request_prompt(node, prompts, context)
     settings = _structured_options(node, options)
     settings.update({key: node[key] for key in ("request_label", "activity_label") if key in node})
+    edit, edited = node.get("edit"), None
+    if edit:
+        initial = (str(evaluate(node["inputs"][edit["input"]], context)) if "input" in edit
+                   else dict(input_files or ()).get(edit["file"]))
+        edited = EditableFile(edit["file"], edit["field"], initial, readonly=bool(verify))
 
     accepted = {}
 
     def accept(report, raw):
-        accepted["report"] = _accept_node_answer(node, context, input_files, report, raw)
+        accepted["report"] = _accept_node_answer(node, context, input_files, report, raw, edited)
         return accepted["report"]
 
     # The node's checks run inside the shared retry loop: an unacceptable
     # answer is retried with a plain explanation, never failing the run.
-    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=node.get("features", []),
+    report, raw = structured(prompt, node["schema"], node.get("stage", "model"), features=features,
                              validate=accept, **({"input_files": input_files} if input_files is not None else {}),
+                             **({"edit_file": edited} if edited is not None and not edited.readonly else {}),
+                             **({"subagents": count} if count else {}),
                              **_bounded_request_settings(settings, options))
     if accepted.get("report") is not report:
         # A replacement structured() (such as a test double) skipped the checks.
-        report = _accept_node_answer(node, context, input_files, report, raw)
+        report = _accept_node_answer(node, context, input_files, report, raw, edited)
+    if edited is not None and node.get("proof_handoff") and isinstance(report.get(edit["field"]), str):
+        report = {**report, **_proof_change(edited.initial, report[edit["field"]], options, visit,
+                                            node.get("stage", "model"))}
     return report, raw
+
+
+def _proof_change(before, after, options, visit, stage):
+    """Whether a reviewing call changed the submitted proof, and the unified diff of its changes.
+
+    The texts are compared as the critic's outcome compares them
+    (normalized_text): spacing at line ends and blank lines around the proof
+    are no change. The diff joins the result as `proofDiff`. A diff longer
+    than PROOF_DIFF_INLINE_CHARS is saved whole in the folder the
+    critic_diff_dir option names, and the result names that file and says why
+    (`proofDiffFile`, `proofDiffNote`); without the option, or when the file
+    cannot be written, the whole diff stays in the result.
+    """
+
+    before, after = normalized_text(before or ""), normalized_text(after)
+    if before == after:
+        return {"proofChanged": False, "proofDiff": ""}
+    diff = "\n".join(difflib.unified_diff(before.split("\n"), after.split("\n"), "submitted proof",
+                                          "coordinator's proof", lineterm=""))
+    change = {"proofChanged": True, "proofDiff": diff, "proofDiffLines": diff.count("\n") + 1}
+    folder = options.get("critic_diff_dir")
+    if len(diff) <= PROOF_DIFF_INLINE_CHARS or not folder:
+        return change
+    name = f"round-{visit}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(_wall_clock()))}-{uuid.uuid4().hex[:8]}.diff"
+    try:
+        _private_atomic_write(Path(folder) / name, diff + "\n")
+    except (OSError, UnicodeError, Error) as exc:
+        emit("diagnostic", stage, text=f"Could not save the {len(diff):,}-character diff of the coordinator's "
+                                       f"changes to a file ({exc}); the whole diff stays in the critic result.")
+        return change
+    return {**change, "proofDiff": "", "proofDiffFile": name, "proofDiffChars": len(diff),
+            "proofDiffNote": (f"The coordinator's changes are {change['proofDiffLines']:,} diff lines "
+                              f"({len(diff):,} characters), too long to show here. The whole diff is saved with "
+                              "this run's private controller files and can be downloaded.")}
 
 
 def _command_descendants(root):
@@ -4070,6 +6376,28 @@ def _command_descendants(root):
                 found.append(pid)
                 pending.append(pid)
     return found
+
+
+def _stop_descendants(root):
+    """Kill every descendant of a running POSIX process, which itself keeps running (see stop_process).
+
+    As in _stop_command_tree, parents are frozen before their children, and
+    the tree is listed again until nothing new appears, before anything dies.
+    """
+    frozen, pending = [], _command_descendants(root)
+    while pending and len(frozen) < 1000:
+        for pid in pending:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                pass
+        frozen.extend(pending)
+        pending = [pid for pid in _command_descendants(root) if pid not in frozen]
+    for pid in frozen:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _stop_command_tree(process):
@@ -4107,21 +6435,109 @@ def _stop_command_tree(process):
     process.kill()
 
 
-def _run_bounded(argv, *, timeout, **kwargs):
-    """Run one command; on timeout or interruption, stop everything it started."""
-    with subprocess.Popen(argv, **kwargs) as process:
+# A command's output is read as it arrives and only its head and its tail
+# (COMMAND_OUTPUT_KEEP characters each) are kept for its log; a command whose
+# output, or a file it is watched for (a TeX build's own log), grows past
+# COMMAND_OUTPUT_LIMIT is stopped like one that timed out.
+COMMAND_OUTPUT_KEEP = 1_000_000
+COMMAND_OUTPUT_LIMIT = 256 * 1024 * 1024
+# Of a longer output, the next step (a LaTeX repair) reads every TeX error and the end.
+COMMAND_OUTPUT_CHARS = 24000
+# A command that cannot run yet (missing tools, a start failure, an isolated
+# compiler that is not ready) is run again every MODEL_RETRY_SECONDS.
+COMMAND_RETRY_LABEL = "Retrying command"
+# A timed-out run is repeated with each longer limit before its node sees the timeout.
+COMMAND_TIMEOUT_RETRIES = (900, 1800)
+# The same failure (or the same input) this often ends a command loop that makes no progress.
+COMMAND_STALL_REPEATS = 3
+COMMAND_HISTORY = 20
+
+
+class _CommandOutput:
+    """A command's output as it arrives: the head and the tail are kept, the middle only counted."""
+
+    def __init__(self, keep=COMMAND_OUTPUT_KEEP):
+        self.keep, self.size, self.omitted = keep, 0, 0
+        self.head, self.tail, self.tail_size = [], deque(), 0
+        self.lock = threading.Lock()
+
+    def read(self, descriptor, encoding, errors):
         try:
-            output, _ = process.communicate(timeout=timeout)
+            with open(descriptor, encoding=encoding, errors=errors) as stream:
+                for line in iter(lambda: stream.readline(65536), ""):
+                    self.add(line)
+        except (OSError, ValueError):
+            pass  # The pipe closed under the reader; what arrived is kept.
+
+    def add(self, text):
+        with self.lock:
+            room = self.keep - self.size
+            self.size += len(text)
+            if room > 0:
+                self.head.append(text[:room])
+                text = text[room:]
+            if text:
+                self.tail.append(text)
+                self.tail_size += len(text)
+                while self.tail_size - len(self.tail[0]) >= self.keep:
+                    self.tail_size -= len(self.tail[0])
+                    self.omitted += len(self.tail.popleft())
+
+    def text(self):
+        with self.lock:
+            tail = "".join(self.tail)
+            cut = max(0, len(tail) - self.keep)
+            omitted = self.omitted + cut
+            return "".join(self.head) + (f"\n[{omitted} characters omitted]\n" if omitted else "") + tail[cut:]
+
+
+def _file_size(path):
+    try:
+        return os.lstat(path).st_size
+    except OSError:
+        return 0
+
+
+def _run_bounded(argv, *, timeout, watch=(), **kwargs):
+    """Run one command; on timeout or interruption, stop everything it started.
+
+    Its output is decoded and read as it arrives (_CommandOutput). A command
+    whose output, or one of the `watch` files, grows past COMMAND_OUTPUT_LIMIT
+    is stopped as well: TimeoutExpired with `runaway` saying why.
+    """
+    encoding, errors = kwargs.pop("encoding", None) or "utf-8", kwargs.pop("errors", None) or "replace"
+    kwargs.pop("text", None)
+    with subprocess.Popen(argv, **kwargs) as process:
+        output, reader = _CommandOutput(), None
+        deadline = time.monotonic() + timeout
+        try:
+            if process.stdout is not None:
+                # The reader owns a duplicate, so closing the pipe never waits for a read.
+                reader = threading.Thread(target=output.read, args=(os.dup(process.stdout.fileno()), encoding, errors),
+                                          daemon=True)
+                reader.start()
+            while reader is not None and reader.is_alive():
+                reader.join(min(1.0, max(0.0, deadline - time.monotonic())))
+                limit = f"more than {COMMAND_OUTPUT_LIMIT // 2 ** 20} MB"
+                runaway = (f"printed {limit} of output" if output.size > COMMAND_OUTPUT_LIMIT
+                           else next((f"wrote {limit} to {Path(path).name}" for path in watch
+                                      if _file_size(path) > COMMAND_OUTPUT_LIMIT), ""))
+                if runaway or (reader.is_alive() and time.monotonic() >= deadline):
+                    expired = subprocess.TimeoutExpired(argv, timeout)
+                    expired.runaway = runaway
+                    raise expired
+            try:
+                process.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                raise subprocess.TimeoutExpired(argv, timeout) from None
         except BaseException as exc:
             _stop_command_tree(process)
-            try:
-                output, _ = process.communicate(timeout=5)
-            except subprocess.TimeoutExpired as late:
-                output = late.stdout  # A detached process still holds the pipe.
+            if reader is not None:
+                reader.join(5)  # A detached process may still hold the pipe.
             if isinstance(exc, subprocess.TimeoutExpired):
-                exc.stdout = output
+                exc.stdout = output.text()
             raise
-        return subprocess.CompletedProcess(argv, process.returncode, output)
+        return subprocess.CompletedProcess(argv, process.returncode, output.text())
 
 
 # Files a TeX build reads back from its previous run (latexmk's records too).
@@ -4141,60 +6557,417 @@ def _tex_auxiliary_files(argv, directory):
     return [directory / f"{jobname}{suffix}" for suffix in TEX_AUXILIARY_SUFFIXES]
 
 
-def _run_command(config, context):
-    """Run a bounded argv command and check only its declared output files."""
+# Where TeX installs its programs, for a server whose PATH lacks them (one
+# started from Finder or launchd); the newest TeX Live year comes first.
+TEX_TOOL_FOLDERS = ("/Library/TeX/texbin", "/usr/local/texlive/*/bin/*", "~/Library/TinyTeX/bin/*",
+                    "~/.TinyTeX/bin/*", "/opt/homebrew/bin", "/usr/local/bin", "/usr/texbin")
+# A TeX error line: "./latex-source.tex:12: Undefined control sequence." (with
+# -file-line-error) or "! LaTeX Error: File `x.sty' not found.".
+_TEX_ERROR = re.compile(r"!\s|(?:\.{0,2}/)?[^\s:]+\.(?:tex|aux|sty|cls|bbl|toc|lof|lot|out|def|cfg|clo|fd|ltx|ind"
+                        r"|nav|snm|vrb):\d+: ")
+# A citation or reference that the last TeX pass left undefined.
+_TEX_UNDEFINED = re.compile(r"Warning: (Citation|Reference) [`']([^'\n]+)' on page \S+ undefined")
+
+
+def _find_tool(name):
+    """A command's executable on PATH, else in one of TEX_TOOL_FOLDERS, else None."""
+
+    found = shutil.which(name)
+    if found or os.sep in name:
+        return found
+    folders = []
+    for pattern in TEX_TOOL_FOLDERS:
+        pattern = os.path.expanduser(pattern)
+        base, wildcard, rest = pattern.partition("/*")
+        try:
+            folders += sorted((str(path) for path in Path(base).glob("*" + rest)), reverse=True) if wildcard else [base]
+        except OSError:
+            continue
+    return shutil.which(name, path=os.pathsep.join(folders))
+
+
+def _tex_errors(output, limit=100):
+    """Every TeX error of one compile in order, each with the context lines TeX prints after it."""
+
+    lines, blocks, index = output.splitlines(), [], 0
+    while index < len(lines) and len(blocks) < limit:
+        if not _TEX_ERROR.match(lines[index]):
+            index += 1
+            continue
+        block = [lines[index][:400]]
+        index += 1
+        while (index < len(lines) and len(block) < 7 and lines[index] and not _TEX_ERROR.match(lines[index])
+               and not lines[index].startswith("Latexmk:")):
+            block.append(lines[index][:400])
+            index += 1
+        blocks.append("\n".join(block))
+    return blocks
+
+
+def _tex_unresolved(log, keep=16 * 1024 * 1024):
+    """(names, found): the citations and references the last TeX pass left undefined, from the end of its log."""
+
+    try:
+        if log.is_symlink() or not log.is_file():
+            return [], False
+        descriptor = os.open(log, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            handle.seek(max(0, handle.seek(0, os.SEEK_END) - keep))
+            text = handle.read(keep).decode("utf-8", errors="replace")
+    except OSError:
+        return [], False
+    text = re.sub(r"(?m)^(.{79})\n", r"\1", text)  # TeX breaks log lines at 79 characters.
+    names = list(dict.fromkeys(f"{kind.lower()} {name}" for kind, name in _TEX_UNDEFINED.findall(text)))
+    return names, bool(names or re.search(r"There were undefined (?:references|citations)", text))
+
+
+def _command_excerpt(output, errors=(), limit=COMMAND_OUTPUT_CHARS):
+    """What the next step reads of an output: all of it when short, else every error and the end."""
+
+    if len(output) <= limit:
+        return output
+    tail = output[-(limit // 2 if errors else limit - 60):]
+    shown, size = [], 0
+    for block in errors:
+        if block in tail:
+            continue
+        if size + len(block) > limit // 2 - 60:
+            shown.append("[More errors omitted]")
+            break
+        shown.append(block)
+        size += len(block) + 2
+    before = output[:len(output) - len(tail)]
+    # The kept head and tail of a long output already mark the middle they omit.
+    omitted = len(before) + sum(int(count) - len(marker) for marker, count
+                                in re.findall(r"(\n\[(\d+) characters omitted\]\n)", before))
+    return "".join(f"{block}\n\n" for block in shown) + f"[{omitted} earlier characters omitted]\n{tail}"
+
+
+def _command_inputs(argv, directory):
+    """A digest of the files its command line names in the command's folder (a TeX build's source)."""
+
+    digest = hashlib.sha256()
+    for value in argv[1:]:
+        path = directory / value
+        try:
+            if not value.startswith("-") and Path(value).name == value and path.is_file() and not path.is_symlink():
+                digest.update(value.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+        except (OSError, ValueError):
+            continue
+    return digest.hexdigest()
+
+
+def _failure_signature(result, errors):
+    """A failed run's report without line numbers: the same one again means a repair made no progress."""
+
+    if result.get("timed_out"):
+        return "did not finish"
+    if result.get("unresolved"):
+        return "undefined " + ", ".join(result["unresolved"])
+    if errors:
+        lines = errors[0].splitlines()
+        context = next((line for line in lines[1:] if re.match(r"l\.\d+ ", line)), "")
+        return re.sub(r"(\.\w+:)\d+:", r"\1:", lines[0]) + " " + re.sub(r"^l\.\d+", "l.", context)
+    return str(result.get("diagnostic", ""))
+
+
+def _command_result(config, argv, directory, result, attempt=None):
+    """Complete a command result: its TeX errors and unresolved references, signature, excerpt and logs."""
+
+    result = {"diagnostic": "", "returncode": None, **result}
+    output = result.get("output") or ""
+    auxiliary = _tex_auxiliary_files(argv, directory)
+    errors = _tex_errors(output) if auxiliary else []
+    if result["status"] == "fail" and errors and not result.get("timed_out"):
+        # "Command exited with code 12: ./latex-source.tex:4: Undefined control sequence."
+        result["diagnostic"] = (f"{result['diagnostic'].rstrip('.')}: {errors[0].splitlines()[0]}"
+                                + (f" ({len(errors)} errors in all.)" if len(errors) > 1 else ""))
+    log = next((path for path in auxiliary if path.suffix == ".log"), None)
+    names, unresolved = _tex_unresolved(log) if result["status"] == "pass" and log is not None else ([], False)
+    if unresolved:
+        # The PDF stays: should repairs not resolve them, it is still the best result.
+        counts = [f"{count} {kind}{'s' if count != 1 else ''}" for kind, count in (
+            ("citation", sum(name.startswith("citation ") for name in names)),
+            ("reference", sum(name.startswith("reference ") for name in names))) if count]
+        result.update(status="fail", unresolved=names or ["references"], diagnostic=(
+            (f"The document compiled, but LaTeX left {' and '.join(counts)} undefined: {', '.join(names[:20])}."
+             if names else "The document compiled, but LaTeX reports undefined references.")
+            + " Give the references in an inline thebibliography environment (BibTeX and .bib files are not"
+              " available in every run), and give every \\ref and \\cite a \\label or \\bibitem in the document."))
+    if result["status"] == "fail":
+        result["signature"] = _failure_signature(result, errors)
+        result["input_sha256"] = _command_inputs(argv, directory)
+    if config.get("log"):
+        logs = [config["log"]]
+        if attempt is not None and result["status"] != "unavailable":
+            log_path = Path(config["log"])
+            logs.append(str(log_path.with_name(f"{log_path.stem}-{attempt}{log_path.suffix}")))
+        for name in logs:
+            try:
+                _private_atomic_write(directory / name, result["diagnostic"] + "\n\n" + output)
+            except OSError as exc:
+                # The run continues without this log.
+                result.setdefault("log_error", f"The command log {name} could not be written: {exc}")
+    result["output"] = _command_excerpt(output, errors)
+    return result
+
+
+def _run_command(config, context, attempt=None):
+    """Run a bounded argv command and check only its declared output files.
+
+    The status is pass, fail (with timed_out when it did not finish, and
+    runaway when it was stopped for printing without end), unavailable
+    (nothing ran: its tools are missing or, with transient, could not start;
+    under a web cutoff, the isolated compiler is not ready) or uncompiled (the
+    isolated compiler refuses the source). A TeX build (one with -jobname) also
+    fails when its log names unresolved citations or references (unresolved);
+    its outputs are then kept. output holds every TeX error and the end of a
+    long output; the log holds its head and tail and, given `attempt`, has a
+    copy for that attempt (latex-compile-3.log).
+    """
     policy = retrieval_policy()
     argv = [render_template(value, context) for value in config["argv"]]
     directory = (Path.cwd() / render_template(config.get("cwd", "."), context)).resolve()
+    outputs = [directory / name for name in config.get("produces", [])]
+    result = {"returncode": None, "output": ""}
     if policy is not None:
         from retrieval import isolated_compiler
         try:
-            return isolated_compiler.compile_command(policy, config, argv, directory)
+            result = isolated_compiler.compile_command(policy, config, argv, directory)
+        except isolated_compiler.CompilerNotReady as exc:
+            # Checked again before the next attempt; nothing ran (I-069).
+            result.update(status="unavailable", diagnostic=f"The isolated compiler is not ready: {exc}")
+        except isolated_compiler.CompilerRefusal as exc:
+            # Fail closed: no output of this or an earlier attempt is published (I-061).
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            result.update(status="uncompiled", diagnostic=f"The isolated compiler refused to compile: {exc}")
         except isolated_compiler.CompilerIsolationError as exc:
-            raise Error(str(exc)) from exc
+            # An unsupported command, platform or timeout: no retry can change it.
+            raise ConfigurationError(str(exc)) from exc
+        return _command_result(config, argv, directory, result, attempt)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    outputs = [directory / name for name in config.get("produces", [])]
     for path in outputs:
         path.unlink(missing_ok=True)
-    engine = shutil.which(argv[0])
-    missing = [name for name in config.get("requires", []) if shutil.which(name) is None]
-    code, output = None, ""
-    if engine is None or missing:
-        status, diagnostic = "unavailable", f"Command unavailable: {', '.join(([argv[0]] if engine is None else []) + missing)}."
+    tools = {name: _find_tool(name) for name in (argv[0], *config.get("requires", []))}
+    missing = [name for name, path in tools.items() if path is None]
+    if missing:
+        result.update(status="unavailable", diagnostic=f"Command unavailable: {', '.join(missing)} "
+                                                       "(not on PATH or in the standard TeX folders).")
     else:
         environment = {**os.environ, **{key: render_template(value, context) for key, value in config.get("env", {}).items()}}
+        # Tools found outside PATH bring their folders: latexmk starts pdflatex by name.
+        known = environment.get("PATH", "").split(os.pathsep)
+        extra = [folder for folder in dict.fromkeys(str(Path(path).parent) for path in tools.values())
+                 if folder not in known]
+        if extra:
+            environment["PATH"] = os.pathsep.join(filter(None, [environment.get("PATH", ""), *extra]))
         # Every attempt compiles from a clean slate, as the isolated compiler
         # does in its fresh folder; sources may still use files of this folder.
-        for path in _tex_auxiliary_files(argv, directory):
+        auxiliary = _tex_auxiliary_files(argv, directory)
+        for path in auxiliary:
             path.unlink(missing_ok=True)
         try:
-            result = _run_bounded([engine, *argv[1:]], cwd=directory, env=environment,
+            completed = _run_bounded([tools[argv[0]], *argv[1:]], cwd=directory, env=environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", timeout=config["timeout"],
+                watch=[path for path in auxiliary if path.suffix == ".log"],
                 **({"umask": 0o077} if os.name != "nt" else {}))
-            code, output = result.returncode, result.stdout or ""
+            code, output = completed.returncode, completed.stdout or ""
             produced = all(path.is_file() and path.stat().st_size > 0 for path in outputs)
-            status = "pass" if code == 0 and produced else "fail"
             diagnostic = f"Command exited with code {code}."
             if code == 0 and not produced:
                 diagnostic += " A declared output file is missing or empty."
+            result.update(status="pass" if code == 0 and produced else "fail", diagnostic=diagnostic,
+                          returncode=code, output=output)
         except subprocess.TimeoutExpired as exc:
-            status, diagnostic = "fail", f"Command exceeded {config['timeout']:g} seconds."
             output = exc.stdout or ""
             if isinstance(output, bytes):
                 output = output.decode("utf-8", errors="replace")
+            runaway = getattr(exc, "runaway", "")
+            result.update(status="fail", timed_out=True, output=output, diagnostic=(
+                f"Command {runaway} and was stopped." if runaway else f"Command exceeded {config['timeout']:g} seconds."))
+            if runaway:
+                result["runaway"] = True
         except OSError as exc:
-            status, diagnostic = "unavailable", f"Command could not run: {exc}"
-    if status != "pass":
+            # Only a missing, inaccessible or unrunnable tool means it is not installed (I-022).
+            result.update(status="unavailable", diagnostic=f"Command could not run: {exc}")
+            if exc.errno not in (errno.ENOENT, errno.EACCES, errno.ENOEXEC):
+                result["transient"] = True
+    if result["status"] != "pass":
         for path in outputs:
             path.unlink(missing_ok=True)
-    if config.get("log"):
-        _private_atomic_write(directory / config["log"], diagnostic + "\n\n" + output)
-    return {"status": status, "diagnostic": diagnostic, "returncode": code,
-            "output": output[-24000:]}
+    return _command_result(config, argv, directory, result, attempt)
 
 
-def _apply_actions(actions, context, stage, revision):
+def _wait_before_command_retry(options, stage, node, attempt, result, since):
+    """Wait MODEL_RETRY_SECONDS before running a command that could not run; no model is called.
+
+    The job stays running and a status event says why. The wait does not
+    consume the time budget (RetryClock); Stop ends it at once and the pause
+    file pauses the workflow.
+    """
+
+    nominal = max(0.0, float(MODEL_RETRY_SECONDS))
+    seconds = nominal + _retry_jitter(nominal)
+    clock = retry_clock(options)
+    details = [f"attempt {attempt}"]
+    spent = max(0.0, _wall_clock() - since)
+    if spent >= 60:
+        details.append(f"waiting for {_span_text(spent)}")
+    change = clock.wait_started()
+    emit("status", stage, label=COMMAND_RETRY_LABEL, node=node, retryAttempt=attempt, retryInSeconds=nominal,
+         retryAt=_wall_clock() + seconds, failure=str(result.get("diagnostic", "")), failureKind="command",
+         text=f"{result.get('diagnostic', '')} Trying again in {_duration_text(nominal)} ({', '.join(details)}).",
+         retryingSeconds=round(spent), **({"budgetClock": change} if change else {}))
+    pause_file = (options or {}).get("goal_pause_file")
+    finished = False
+    try:
+        waited = 0.0
+        while waited < seconds:
+            if pause_file and Path(pause_file).is_file():
+                raise WorkflowPaused("Paused while waiting to run the command again.")
+            step = min(RETRY_POLL_SECONDS, seconds - waited)
+            _retry_sleep(step)
+            waited += step
+        finished = True
+    finally:
+        change = clock.wait_ended()
+        if finished:
+            emit("status", stage, label=COMMAND_RETRY_LABEL, node=node, retryAttempt=attempt + 1,
+                 text=f"Running the command again now (attempt {attempt + 1}).",
+                 **({"budgetClock": change} if change else {}))
+        elif change:
+            _emit_budget_clock(stage, change)
+
+
+def _command_step(config, state, options, visit, name, stage, transitions):
+    """Run a command node until it has an outcome for the graph; no model is called meanwhile.
+
+    A command that cannot run (status unavailable) runs again every
+    MODEL_RETRY_SECONDS until it can, without a limit (see
+    _wait_before_command_retry). A timed-out run is repeated with each longer
+    limit of COMMAND_TIMEOUT_RETRIES first. The result counts the node's runs
+    (attempt) and keeps its recent failures (history): once the same failure
+    or the same input has failed COMMAND_STALL_REPEATS times, a TeX build
+    that only left references unresolved passes with its PDF, and a node with
+    an uncompiled transition takes it instead of repeating the loop.
+    """
+
+    previous = state.get(config["result"]) if isinstance(state.get(config["result"]), dict) else {}
+    attempt = previous.get("attempt") if type(previous.get("attempt")) is int else 0
+    # Only the failures of an unfinished loop count; one that ended leaves none to a later loop.
+    history = ([] if previous.get("status") in {"pass", "uncompiled"}
+               else [entry for entry in previous.get("history") or [] if isinstance(entry, dict)])
+    longer = [limit for limit in COMMAND_TIMEOUT_RETRIES if limit > config["timeout"]]
+    checks, since, announced, limits = 0, None, None, []
+    with retry_clock(options).call(stage):
+        while True:
+            if attempt and announced != attempt:
+                announced = attempt
+                emit("status", stage, label=f"Workflow step: {name}", node=name, visit=visit, attempt=attempt + 1,
+                     text=f"Attempt {attempt + 1} of this step.")
+            try:
+                result = _run_command(config, {"state": state, "visit": visit}, attempt=attempt + 1)
+            except OSError as exc:
+                # A full disk or a vanished folder passes like a missing tool.
+                result = {"status": "unavailable", "transient": True, "returncode": None, "output": "",
+                          "diagnostic": f"Command could not run: {exc}"}
+            if result.get("log_error"):
+                emit("diagnostic", stage, node=name, text=result["log_error"])
+            if result.get("status") == "unavailable":
+                checks += 1
+                since = since or _wall_clock()
+                _wait_before_command_retry(options, stage, name, checks, result, since)
+                continue
+            attempt += 1
+            checks, since = 0, None
+            if result.get("timed_out") and not result.get("runaway") and longer and workflow_remaining(options) > 0:
+                limits.append(config["timeout"])
+                config = {**config, "timeout": min(longer.pop(0), workflow_remaining(options))}
+                emit("status", stage, label=f"Workflow step: {name}", node=name, visit=visit, attempt=attempt + 1,
+                     text=f"Attempt {attempt} did not finish within {_span_text(limits[-1])}; attempt {attempt + 1} "
+                          f"may run {_span_text(config['timeout'])}.")
+                announced = attempt
+                continue
+            break
+    result = {**result, "attempt": attempt}
+    if result.get("timed_out") and limits:
+        result["diagnostic"] = (f"{result.get('diagnostic', '')} Earlier attempts stopped after "
+                                f"{' and '.join(map(_span_text, limits))}.")
+    if result.get("status") == "fail":
+        signature, source = result.get("signature") or result.get("diagnostic", ""), result.get("input_sha256")
+        repeats = 1 + max(sum(entry.get("signature") == signature for entry in history),
+                          sum(bool(source) and entry.get("input_sha256") == source for entry in history))
+        history = [*history, {"signature": signature, "input_sha256": source}][-COMMAND_HISTORY:]
+        if repeats >= COMMAND_STALL_REPEATS and result.get("unresolved"):
+            emit("diagnostic", stage, node=name, label="References left unresolved",
+                 text=f"{repeats} attempts left the same references undefined, so the PDF is used as it is. "
+                      f"{result.get('diagnostic', '')}")
+            result["status"] = "pass"
+        elif repeats >= COMMAND_STALL_REPEATS and "uncompiled" in transitions:
+            log = Path(config["log"]) if config.get("log") else None
+            result.update(status="uncompiled", diagnostic=(
+                f"{repeats} attempts failed the same way, so the step stopped repeating. Last attempt: "
+                f"{result.get('diagnostic', '')}"
+                + (f" The output of each attempt is in {log.stem}-N{log.suffix}." if log else "")))
+    result["history"] = history
+    return result
+
+
+STORAGE_RETRY_LABEL = "Retrying file write"
+
+
+def _storage_retry(operation, options, stage, what):
+    """Run one local file operation; an OS error (a full disk, an I/O error) is retried without a limit.
+
+    The step keeps its in-memory state and waits MODEL_RETRY_SECONDS between
+    attempts, outside the time budget. Stop ends a wait at once and the pause
+    file pauses the workflow at this step.
+    """
+
+    attempt, since = 1, None
+    clock = retry_clock(options)
+    pause_file = (options or {}).get("goal_pause_file")
+    with clock.call(stage):
+        while True:
+            try:
+                return operation()
+            except OSError as exc:
+                attempt += 1
+                since = since or _wall_clock()
+                spent = max(0.0, _wall_clock() - since)
+                cause = ("disk full" if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
+                         else exc.strerror or str(exc) or type(exc).__name__)
+                nominal = max(0.0, float(MODEL_RETRY_SECONDS))
+                seconds = nominal + _retry_jitter(nominal)
+                change = clock.wait_started()
+                emit("status", stage, label=STORAGE_RETRY_LABEL, failure=cause, failureKind="storage",
+                     retryAttempt=attempt, retryInSeconds=nominal, retryAt=_wall_clock() + seconds,
+                     text=f"Could not save {what} ({cause}) — retrying in {_duration_text(nominal)} (attempt {attempt}"
+                          + (f", retrying for {_span_text(spent)}" if spent >= 60 else "") + ").",
+                     **({"budgetClock": change} if change else {}))
+                finished = False
+                try:
+                    waited = 0.0
+                    while waited < seconds:
+                        if pause_file and Path(pause_file).is_file():
+                            raise WorkflowPaused("Paused while waiting to retry a file write.")
+                        step = min(RETRY_POLL_SECONDS, seconds - waited)
+                        _retry_sleep(step)
+                        waited += step
+                    finished = True
+                finally:
+                    change = clock.wait_ended()
+                    if finished:
+                        emit("status", stage, label=STORAGE_RETRY_LABEL, retryAttempt=attempt,
+                             text=f"Saving {what} again now (attempt {attempt}).",
+                             **({"budgetClock": change} if change else {}))
+                    elif change:
+                        _emit_budget_clock(stage, change)
+
+
+def _apply_actions(actions, context, stage, revision, options=None):
     state = context["state"]
     for action in actions:
         if "when" in action and not evaluate(action["when"], context):
@@ -4207,10 +6980,13 @@ def _apply_actions(actions, context, stage, revision):
         if "set" in action:
             state.update({key: evaluate(expression, context) for key, expression in action["set"].items()})
         if "write" in action:
-            _private_atomic_write(Path.cwd() / action["write"]["path"], evaluate(action["write"]["text"], context))
+            path, content = Path.cwd() / action["write"]["path"], evaluate(action["write"]["text"], context)
+            _storage_retry(lambda: _private_atomic_write(path, content), options, stage, action["write"]["path"])
         if "command" in action:
             config = action["command"]
             state[config["result"]] = _run_command(config, context)
+            if state[config["result"]].get("log_error"):
+                emit("diagnostic", stage, text=state[config["result"]]["log_error"])
         if "emit" in action:
             fields = {}
             for key, value in action["emit"].items():
@@ -4232,7 +7008,7 @@ def _complete_node(node, state, result, raw, visit, revision, options=None):
     if not isinstance(outcome, str) or outcome not in node["next"]:
         raise Error(f"Node returned an unknown outcome: {outcome!r}.")
     context["outcome"] = outcome
-    _apply_actions(node.get("after", []), context, node.get("stage", "model"), revision)
+    _apply_actions(node.get("after", []), context, node.get("stage", "model"), revision, options)
     state["outcome"] = outcome
     return context
 
@@ -4254,13 +7030,18 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     Whatever a later attempt fails to learn (for example its thread, when it
     fails before resuming) keeps its last known value, so no attempt ever
     starts a new conversation or drops an undelivered instruction. Without
-    any thread yet, the same first attempt runs again.
+    any thread yet, the same first attempt runs again. The one exception is a
+    conversation that cannot continue (``replace``, for example one that no
+    longer fits the model's context): the retries continue in a new
+    conversation, announced as "Conversation replaced", whose first
+    instruction the failed session prepared.
     """
 
     attempt = 1
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
-             "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None}
+             "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
+             "replace": None, "refusal": None, "classic_shell": False}
     failing_since = None
     with retry_clock(options).call(stage):
         while True:
@@ -4276,6 +7057,9 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 for key in ("thread", "stage", "values", "steer", "pending_compaction", "anchor"):
                     if retry.get(key):
                         known[key] = retry[key]
+                # Consecutive identical refusals to reopen the thread; any other outcome resets the count.
+                known["refusal"] = retry.get("refusal")
+                known["classic_shell"] = known["classic_shell"] or bool(retry.get("classic_shell"))
                 if retry.get("instruction"):
                     if retry.get("delivered"):
                         # The rewind (if any) removes this very turn; else the
@@ -4294,6 +7078,13 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                     emit("diagnostic", known["stage"], node=name,
                          text="The CLI could not reopen the conversation before the failed turn; the next retry "
                               "continues after it.")
+                if retry.get("replace"):
+                    known.update(thread=None, rewind=None, anchor=None, pending_compaction=None,
+                                 replace=retry["replace"], instruction=retry.get("instruction") or known["instruction"])
+                    emit("status", known["stage"], node=name, label="Conversation replaced",
+                         text=_replacement_notice(retry["replace"]))
+                elif retry.get("thread"):
+                    known["replace"] = None
                 thread = known["thread"]
                 wait_before_retry(options, known["stage"], attempt, Error(exc.reason or str(exc)),
                                   node=name, thread_id=thread, since=failing_since)
@@ -4304,10 +7095,11 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 continued = {"stage": known["stage"], "values": known["values"] or {},
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
-                             "attempt": attempt}
-                if rewind.get("fresh"):
-                    # The conversation's first turn produced nothing: a new
-                    # conversation with the same first instruction loses nothing.
+                             "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"]}
+                if rewind.get("fresh") or known["replace"]:
+                    # The conversation's first turn produced nothing (a new
+                    # conversation with the same first instruction loses
+                    # nothing), or the conversation cannot continue.
                     for key in ("goal_thread_id", "goal_resume", "goal_require_resume"):
                         session_options.pop(key, None)
                     known["thread"] = None
@@ -4324,27 +7116,80 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 step = next
 
 
+def _branch_targets(node):
+    """The nodes that one node's outcomes lead to."""
+
+    return {branch if isinstance(branch, str) else branch.get("to", branch.get("then"))
+            for branch in node["next"].values()}
+
+
+def _step_visit(state, node, visit, verify):
+    """Mark `state` as the input of this visit of step `node`; return it.
+
+    A later visit and a verify-only visit record which visit they are (see
+    STEP_VISIT_KEY), so a run resumed at `node` from this input continues
+    that visit; the input of a first visit records nothing.
+    """
+    if visit > 1 or verify:
+        state[STEP_VISIT_KEY] = {"node": node, "visit": visit, **({"verify": verify} if verify else {})}
+    return state
+
+
+def _resumed_visit(node, name, saved):
+    """How many visits of step `name` precede its resumed visit, and that visit's verify instruction.
+
+    Both come from the record its saved input carries (see _step_visit).
+    Anything else, such as no record, a record of another step or a verify
+    prompt that none of the step's repeat branches names, resumes the step
+    as its first visit.
+    """
+    if not isinstance(saved, dict) or saved.get("node") != name:
+        return 0, None
+    visit, verify = saved.get("visit"), saved.get("verify")
+    verifies = {branch["verify"] for branch in node["next"].values() if isinstance(branch, dict) and "verify" in branch}
+    if type(visit) is not int or visit < 1 or (verify is not None and verify not in verifies):
+        return 0, None
+    return visit - 1, verify
+
+
 def _execute(workflow, state, options, prompts):
     nodes = workflow["nodes"]
+    # The visit that the saved input of a resumed step records; no workflow expression reads it.
+    saved_visit = state.pop(STEP_VISIT_KEY, None)
     current, visits, revision = options.get("start_node", next(iter(nodes))), 0, 0
     if current not in nodes:
         raise ValueError(f"Unknown workflow entry node: {current!r}.")
     current = _selected_entry(nodes, current, options)
     if current == "end":
+        _capture_unreviewed_proof(workflow, state, options)
         return state
     sessions, revisions, launchers = {}, {}, {}
     options.setdefault("_workflow_started", _now())
     retry_clock(options)
+    # The time limit stops only the author: later steps always finish (see workflow_remaining). They
+    # share these options, so a note said once per workflow (see _structured_options) stays said once.
+    later_options = _after_submission(options)
+    # The previous step; the goal node whose result it handed on, with the state before that result;
+    # the exact input of the current step; and the instruction of a verify-only visit.
+    previous, submitted, entry, verify = None, None, None, None
+    if "start_node" in options:
+        # A resumed step continues as the visit it was: same round, verify instruction and critic checkpoint.
+        visits, verify = _resumed_visit(nodes[current], current, saved_visit)
     try:
         while current != "end":
             node = nodes[current]
+            goal = node["run"] == "goal"
+            node_options = options if goal else later_options
+            entry = None
+            visits += 1
             if options.get("goal_pause_file") and Path(options["goal_pause_file"]).is_file():
                 raise WorkflowPaused("Paused before the next workflow step.")
-            if workflow_remaining(options) <= 0:
+            if goal and workflow_remaining(options) <= 0:
                 raise Error("Workflow time limit reached.")
-            visits += 1
+            # The step record names its visit, and the instruction of a verify-only visit: the transcript
+            # keeps it (unlike node_input), so a restart continues an interrupted visit as itself.
             emit("status", node.get("stage", current), label=f"Workflow step: {current}",
-                 node=current, visit=visits)
+                 node=current, visit=visits, **({"verify": verify} if verify else {}))
             if (node.get("workflow_stage") == "writing" and node["run"] == "structured"
                     and "solution" in node.get("inputs", {})):
                 candidate = evaluate(node["inputs"]["solution"], {"state": state, "visit": visits})
@@ -4353,18 +7198,30 @@ def _execute(workflow, state, options, prompts):
                     save_final_input(statement, candidate)
                     emit("final_input", node.get("stage", current), node=current,
                          label="Exact writing input saved")
+            # Only the first visit after the author (or at the start) receives a submission.
+            submission = visits == 1 and (previous is None or nodes[previous]["run"] == "goal")
+            critic_model = _settings(node, options)["model"] if "proof_handoff" in node else None
             input_files = _prepare_node_files(node, state, visits, options.get("goal_cwd"),
-                                              resolve_reference=visits == 1)
-            _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision)
+                                              resolve_reference=submission, model=critic_model)
+            if not goal:
+                # A runner that ends during this step is resumed from this exact input, as this visit.
+                entry = _step_visit(_copy.deepcopy(state), current, visits, verify)
+                emit("node_input", node.get("stage", current), node=current, visit=visits, state=entry)
+            _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision,
+                           node_options)
             if node["run"] == "structured":
-                result, raw = _model_call(node, prompts, state, options, visits, input_files=input_files)
+                result, raw = _model_call(node, prompts, state, node_options, visits, input_files=input_files,
+                                          verify=verify)
             elif node["run"] == "command":
                 config = dict(node["command"])
-                config["timeout"] = min(config["timeout"], workflow_remaining(options))
-                result = _run_command(config, {"state": state, "visit": visits})
+                # The time limit stops only the author (I-044): node_options has no deadline, so a
+                # compilation is never cut short and a timed-out run is still repeated with longer limits.
+                result = _command_step(config, state, node_options, visits, current, node.get("stage", current),
+                                       node["next"])
                 state[config["result"]] = result
                 raw = result["output"]
             else:
+                submitted = (current, _copy.deepcopy(state))
                 context = {"state": state, "visit": visits}
                 revision = revisions.get(current, 0)
                 if current not in sessions:
@@ -4375,7 +7232,16 @@ def _execute(workflow, state, options, prompts):
                     lifecycle = node["lifecycle"]
                     if isinstance(lifecycle, list):
                         lifecycle = {key: key for key in lifecycle}
-                    session_prompts = {key: prompts[ref] for key, ref in lifecycle.items()}
+                    if options.get("related_works") and "related_works" in lifecycle:
+                        # The run has related works: the first prompt points to them, and
+                        # {original_prompt} carries the pointer into the later prompts.
+                        prompt += "\n\n" + prompts[lifecycle["related_works"]]
+                    features, count = node_features(node, options)
+                    if count and "subagents" in lifecycle:
+                        # The author may start subagents: the first prompt says how many, like the related
+                        # works, and {original_prompt} carries it into the later prompts.
+                        prompt += "\n\n" + render_template(prompts[lifecycle["subagents"]], {"author_subagents": count})
+                    session_prompts = {key: prompts[ref] for key, ref in lifecycle.items() if key != "subagents"}
                     directory = options.get("goal_cwd") or str(Path.cwd())
                     recovery = node.get("recovery")
                     instruction = ""
@@ -4386,6 +7252,10 @@ def _execute(workflow, state, options, prompts):
                             "instruction": "", "revision_number": 1, **feedback,
                         })
                     settings = _settings(node, options)
+                    if count is not None:
+                        # The most subagents at once (Codex's own limits, see subagent_limits()).
+                        settings["subagents"] = count
+                        note_no_subagent_tool(node.get("stage", "solve"), settings["model"], count)
                     # Claude models (and Anthropic-format API models) run the
                     # same goal protocol through the Claude CLI.
                     session_function = (claude_cli.goal_session
@@ -4393,10 +7263,17 @@ def _execute(workflow, state, options, prompts):
                                         else goal_session)
                     launch = functools.partial(
                         session_function, sys.modules[__name__], prompt, prompts=session_prompts,
-                        settings=settings, features=node.get("features", []),
+                        settings=settings, features=features,
                         stages=node.get("stages"), node_name=current,
                     )
                     launchers[current] = (launch, instruction)
+                    refused = state.get("handoff_refused")
+                    if "handoff_refused" in lifecycle and isinstance(refused, str) and refused.strip():
+                        # The controller refused the author's last submission: every attempt until the author
+                        # submits again says why, after any critic feedback (launchers keeps the launch
+                        # without the note for the revisions after that submission).
+                        launch = functools.partial(launch, handoff_note=render_template(
+                            prompts[lifecycle["handoff_refused"]], {"reason": refused}))
                     sessions[current] = launch(options=options, initial_instruction=instruction)
                     result = _goal_step(sessions, current, launch, instruction, options, next,
                                         node.get("stage", current))
@@ -4408,34 +7285,88 @@ def _execute(workflow, state, options, prompts):
                     result = _goal_step(sessions, current, launch, instruction, options,
                                         lambda session: session.send(feedback), node.get("stage", current))
                 raw = ""
-            context = _complete_node(node, state, result, raw, visits, revision, options)
+                # The author submitted again: the note on its refused submission is never sent again.
+                state.pop("handoff_refused", None)
+            context = _complete_node(node, state, result, raw, visits, revision, node_options)
             branch = node["next"][context["outcome"]]
             target = branch
             if isinstance(branch, dict):
                 if "repeat" in branch:
                     limit = options.get(branch.get("option"), branch["repeat"])
-                    target = branch["then"] if visits >= limit else current
-                    if visits >= limit:
+                    if visits < limit:
+                        target = current
+                    elif branch.get("verify") and not verify:
+                        # One more visit that can only confirm or reject the latest edits (see _model_call).
+                        target, verify = current, branch["verify"]
+                    elif "then" in branch:
+                        target = branch["then"]
                         context["limit"] = limit
-                        _apply_actions(branch.get("after", []), context, node.get("stage", current), revision)
+                        _apply_actions(branch.get("after", []), context, node.get("stage", current), revision,
+                                       node_options)
+                    else:
+                        raise WorkflowDefinitionError(f"The verify-only visit of {current} returned "
+                                                      f"{context['outcome']!r} again.")
                 else:
                     target = branch["to"]
-                    _apply_actions(branch.get("after", []), context, node.get("stage", current), revision)
+                    _apply_actions(branch.get("after", []), context, node.get("stage", current), revision,
+                                   node_options)
             if target != current:
-                visits = 0
-            current = _selected_entry(nodes, target, options)
+                visits, verify = 0, None
+            previous, current = current, _selected_entry(nodes, target, options)
+        if not state.get("failed"):
+            # Without the critic the author's submission is handed on here, so a
+            # refused one pauses at the author like a refused critic handoff (I-004).
+            _capture_unreviewed_proof(workflow, state, options)
         return state
     except Exception as exc:
-        if not isinstance(exc, WorkflowPaused) and node["run"] != "goal":
-            raise
+        explain, retry_off = True, False
+        if isinstance(exc, HandoffRefused):
+            # The author's submission cannot be handed on: the author continues, as it was before submitting.
+            if submitted is not None and submitted[0] == previous:
+                current = submitted[0]
+                state.clear()
+                state.update(submitted[1])
+            else:
+                author = next((name for name, item in nodes.items() if item["run"] == "goal"
+                               and current in _branch_targets(item)), None)
+                if author is not None and _stage_enabled(nodes[author], options):
+                    current = author
+                else:
+                    # A supplied candidate (no author stage) stays as it is: no retry can change it.
+                    retry_off = True
+            node, reason = nodes[current], str(exc)
+            if not retry_off and "handoff_refused" in node["lifecycle"]:
+                # Saved with the checkpoint: the resumed author is told why, until it submits again.
+                state["handoff_refused"] = reason
+        elif isinstance(exc, WorkflowPaused) or node["run"] == "goal":
+            explain = False  # The goal session or the pause request has said why.
+            reason = exc.reason if isinstance(exc, WorkflowPaused) else (str(exc) or type(exc).__name__)
+        else:
+            # A later step pauses and resumes there automatically, except after a
+            # configuration or safety error, which waits for the user's Resume.
+            reason = str(exc) or type(exc).__name__
+            retry_off = isinstance(exc, (FinalError, retrieval_runtime.RetrievalPolicyError))
+            if isinstance(exc, (SafetyStop, retrieval_runtime.RetrievalPolicyError)):
+                reason = f"Stopped for safety: {reason}"
+        if retry_off:
+            reason += SAFETY_STOP_HINT
+        if explain:
+            emit("diagnostic", node.get("stage", current), node=current, text=reason)
+        if node["run"] != "goal" and entry is not None:
+            # The step resumes from its exact input.
+            state.clear()
+            state.update(entry)
+        elif node["run"] != "goal":
+            # It paused before capturing its input (such as before the next step): it resumes as this visit.
+            _step_visit(state, current, visits, verify)
         state["paused"] = True
         state.pop("failed", None)
-        reason = exc.reason if isinstance(exc, WorkflowPaused) else (str(exc) or type(exc).__name__)
         thread_id = getattr(exc, "thread_id", None) or options.get("goal_thread_id")
         emit("workflow_paused", node.get("stage", current), node=current, state=state,
              reason=reason, threadId=thread_id,
              **({"sessionUnavailable": True} if getattr(exc, "session_unavailable", False) else {}),
-             **({"safetyStop": True} if getattr(exc, "safety_stop", False) else {}))
+             # No automatic retry can fix it (see App._configure_auto_resume).
+             **({"safetyStop": True} if getattr(exc, "safety_stop", False) or retry_off else {}))
         return state
     finally:
         for session in sessions.values():
@@ -4449,7 +7380,11 @@ def execute(path, state=None, *, options=None):
 
 
 def _capture_unreviewed_proof(workflow, state, options):
-    """A skipped critic must still pass complete author text to later stages."""
+    """A skipped critic must still pass complete author text to later stages.
+
+    A submission that cannot be read raises HandoffRefused, which pauses the
+    run at the author as it was before submitting (see _execute).
+    """
 
     stages = normalize_workflow_stages(options.get("workflow_stages"))
     if stages["critic"] or not any(node.get("workflow_stage") == "author" and _stage_enabled(node, options)
@@ -4461,14 +7396,16 @@ def _capture_unreviewed_proof(workflow, state, options):
             continue
         candidate = state.get(handoff["candidate"])
         if not isinstance(candidate, str) or not candidate.strip():
-            raise Error("The proof author returned no complete proof.")
+            raise HandoffRefused("The proof author returned no complete proof.")
         try:
             snapshot = proof_handoff.resolve_author_proof(candidate, options.get("goal_cwd") or Path.cwd())
         except proof_handoff.ProofHandoffError as exc:
-            raise Error(f"Cannot read the author's submitted proof: {exc}") from exc
+            raise HandoffRefused(f"Cannot read the author's submitted proof: {exc}") from exc
         if snapshot is not None:
             candidate = snapshot.text
         state[handoff["candidate"]] = state["output"] = candidate
+        # The critic and the convention critic share the submission: it is captured once.
+        return
 
 
 def _emit_selected_proof_result(prepared, state, options):
@@ -4486,8 +7423,26 @@ def _emit_selected_proof_result(prepared, state, options):
          label="Proof result", resultKind="proof", text=output, output=output)
 
 
+def _missing_command_tools(workflows, options=None):
+    """The executables that the workflows' selected command nodes need and cannot find (see _find_tool)."""
+
+    missing = []
+    for workflow in workflows:
+        for node in workflow["nodes"].values():
+            if node["run"] == "command" and _stage_enabled(node, options or {}):
+                for name in (node["command"]["argv"][0], *node["command"].get("requires", [])):
+                    if "{" not in name and name not in missing and _find_tool(name) is None:
+                        missing.append(name)
+    return missing
+
+
 def execute_workflows(paths, state, options=None):
-    """Validate once, then feed state through the graphs until one reports failure."""
+    """Validate once, then feed state through the graphs until one reports failure.
+
+    A start node is looked up in every graph: the chain starts in the first
+    graph that contains it (a LaTeX checkpoint resumes in clean_up.yaml), and
+    the graphs before it are skipped.
+    """
 
     options = {} if options is None else dict(options)
     normalize_workflow_stages(options.get("workflow_stages"))
@@ -4499,15 +7454,28 @@ def execute_workflows(paths, state, options=None):
     options.setdefault("_workflow_started", _now())
     # Every graph of the chain shares one budget, retry waits included.
     retry_clock(options)
+    workflows = [load_workflow(path) for path in paths]
+    first = 0
+    if "start_node" in options:
+        first = next((index for index, workflow in enumerate(workflows)
+                      if options["start_node"] in workflow["nodes"]), None)
+        if first is None:
+            raise ValueError(f"Unknown workflow entry node: {options['start_node']!r}.")
     prepared = []
-    for index, path in enumerate(paths):
-        workflow = load_workflow(path)
+    for index, workflow in enumerate(workflows[first:], first):
         local_options = dict(options)
-        if index:
+        if index != first:
             local_options.pop("start_node", None)
-        elif "start_node" in local_options and local_options["start_node"] not in workflow["nodes"]:
-            raise ValueError(f"Unknown workflow entry node: {local_options['start_node']!r}.")
         prepared.append((workflow, prepare(workflow, local_options), local_options))
+    # Missing LaTeX tools are reported at launch, not only once the proof is done
+    # (historical runs check their fixed toolchain when they are prepared); a
+    # run without its writing stage needs none.
+    missing = (_missing_command_tools((workflow for workflow, _, _ in prepared), options)
+               if retrieval_policy() is None else [])
+    if missing:
+        emit("diagnostic", "workflow", label="Compiler tools not found",
+             text=f"{', '.join(missing)} not found on PATH or in the standard TeX folders. The run continues; the "
+                  "step that needs them checks again every minute until they are installed.")
     # A state saved by workflow_paused still carries its control flags; they
     # describe the earlier run and must not end this one after its first graph.
     state.pop("paused", None)
@@ -4517,7 +7485,6 @@ def execute_workflows(paths, state, options=None):
         _execute(workflow, state, local_options, prompts)
         if state.get("failed") or state.get("paused"):
             break
-        _capture_unreviewed_proof(workflow, state, local_options)
     _emit_selected_proof_result(prepared, state, options)
     return state
 
@@ -4540,6 +7507,153 @@ def criticize(statement, solution, round_number, model=CRITIC_MODEL, effort=EFFO
     return _builtin_node("author_critic", "critic", {"statement": statement, "solution": solution}, options, round_number, prompts)
 
 
+_CONVERSATION_ID = re.compile(r"c_[0-9a-fA-F]{10}")
+
+
+def conversation_request(source):
+    """The stdin request of `--converse`, checked; any other input raises Error("Invalid conversation request.").
+
+    {"schemaVersion": 1, "id": "c_" and 10 hex digits, "kind": "summary" or
+    "message", "text": the message (1 to CONVERSATION_MAX_CHARS characters
+    after strip; empty for a summary), "notice": text put in front of it (at
+    most CONVERSATION_MAX_CHARS characters, often empty)}; no NUL anywhere.
+    """
+
+    try:
+        request = json.loads(source)
+    except (ValueError, RecursionError):
+        request = None
+    if not isinstance(request, dict):
+        raise Error("Invalid conversation request.")
+    version, identity, kind, message, notice = (request.get(key) for key in (
+        "schemaVersion", "id", "kind", "text", "notice"))
+    if not (type(version) is int and version == 1
+            and isinstance(identity, str) and _CONVERSATION_ID.fullmatch(identity)
+            and isinstance(kind, str) and kind in CONVERSATION_LABELS
+            and isinstance(message, str) and isinstance(notice, str)
+            and "\0" not in message and "\0" not in notice and len(notice) <= CONVERSATION_MAX_CHARS
+            and (0 < len(message.strip()) <= CONVERSATION_MAX_CHARS if kind == "message" else not message.strip())):
+        raise Error("Invalid conversation request.")
+    return {"schemaVersion": 1, "id": identity, "kind": kind, "text": message.strip(), "notice": notice.strip()}
+
+
+def run_author_conversation(workflow_path, options, request):
+    """One conversation turn of a paused proof author (`--converse`); return the exit code 0.
+
+    ``request`` comes from conversation_request(): a progress summary (the
+    YAML ``summary`` prompt) or a reply to the user's message (``conversation``),
+    led by its notice. Only the author node is prepared, so only its model and
+    credentials are checked, and the turn runs outside the time budget: the
+    time limit, live-instruction and pause files are dropped. The turn runs in
+    the author's saved conversation (author_conversation(), or
+    claude_cli.author_conversation() for Claude models) and every model-call
+    failure is retried after MODEL_RETRY_SECONDS without a limit, in the same
+    conversation: a message the model never received is sent again, one it
+    received and answered with nothing is removed and sent again, and a reply
+    that was cut off is asked for again (CONVERSATION_RETRY_NOTE). The waits
+    never enter the workflow's retry clock, so no "Workflow clock" record
+    appears. The turn ends with one record: conversation_reply {label,
+    conversationKind, text, threadId, compacted}, or, for a failure no retry
+    can fix (a conversation that is gone, or that Codex or Claude refused to
+    reopen AUTHOR_RESUME_REFUSALS times in a row; a safety stop; a settings or
+    workflow problem), the status "Author reply failed" {final, failure:
+    "unavailable", "safety" or "configuration", text}. Every record has stage
+    "conversation", node "author" and the request's conversationId.
+    """
+
+    kind, conversation_id = request["kind"], request["id"]
+    request_label, reply_label = CONVERSATION_LABELS[kind]
+    options = {**options, "workflow_stages": {"review": False, "author": True, "critic": False, "writing": False},
+               "thinking_hours": 0}
+    for name in ("author_limit_file", "author_steer_file", "goal_pause_file"):
+        options.pop(name, None)
+    record = {"node": "author", "conversationId": conversation_id}
+
+    def failed(text, failure):
+        emit("status", "conversation", label="Author reply failed", final=True, failure=failure, text=text,
+             **record)
+        return 0
+
+    def prepared():
+        """The turn's instruction, settings, session function and features: only the author is checked."""
+
+        workflow = load_workflow(workflow_path)
+        node = next((node for node in workflow["nodes"].values() if node["run"] == "goal"), None)
+        if node is None:
+            raise WorkflowDefinitionError("The workflow has no goal node for the proof author.")
+        prompts = prepare(workflow, options)
+        lifecycle = node["lifecycle"]
+        if isinstance(lifecycle, list):
+            lifecycle = {key: key for key in lifecycle}
+        key = "summary" if kind == "summary" else "conversation"
+        if key not in lifecycle:
+            raise WorkflowDefinitionError(f"The workflow's author node binds no {key} prompt.")
+        try:
+            body = render_template(prompts[lifecycle[key]], {"message": request["text"]} if key == "conversation"
+                                   else {})
+        except ValueError as exc:
+            raise WorkflowDefinitionError(str(exc)) from exc
+        instruction = f"{request['notice']}\n\n{body}" if request["notice"] else body
+        settings = _settings(node, options)
+        try:
+            claude = providers.harness(settings["model"]) == providers.CLAUDE
+        except providers.StoreUnavailable as exc:
+            raise Error(str(exc)) from exc  # Read again at the next attempt.
+        return {"instruction": instruction, "settings": settings, "features": list(node.get("features", [])),
+                "session": claude_cli.author_conversation if claude else author_conversation,
+                "cli": "Claude" if claude else "Codex"}
+
+    # The prepared turn; the instruction of the next attempt (the turn's own, or the retry note),
+    # the failed turn it removes first, and the refusal to reopen the conversation in a row.
+    turn, current, rewind, classic, refusal = None, None, None, False, (None, 0)
+    attempt, since = 1, None
+    while True:
+        try:
+            if turn is None:
+                turn = prepared()
+            result = turn["session"](
+                sys.modules[__name__], current or turn["instruction"], settings=turn["settings"], options=options,
+                features=turn["features"], conversation_id=conversation_id, label=request_label, attempt=attempt,
+                rewind=rewind, classic=classic)
+        except (FinalError, retrieval_runtime.RetrievalPolicyError) as exc:
+            failure = ("unavailable" if isinstance(exc, SavedConversationGone)
+                       else "safety" if isinstance(exc, (SafetyStop, retrieval_runtime.RetrievalPolicyError))
+                       else "configuration")
+            return failed(str(exc) or type(exc).__name__, failure)
+        except (Error, OSError) as exc:
+            # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
+            unusable = settings_failure(exc, turn["settings"]["model"] if turn else None)
+            if unusable is not None:
+                return failed(str(unusable), "configuration")
+            if isinstance(exc, ConversationRefused):
+                count = refusal[1] + 1 if refusal[0] == exc.refusal else 1
+                refusal = (exc.refusal, count)
+                if count >= AUTHOR_RESUME_REFUSALS:
+                    return failed(f"{turn['cli']} refused to reopen the saved author conversation {count} times: "
+                                  f"{exc.refusal}", "unavailable")
+            else:
+                refusal = (None, 0)  # Only identical refusals in a row count.
+            retry = exc.retry if isinstance(exc, ConversationAttemptFailed) else {}
+            if since is None or retry.get("output"):
+                since = _wall_clock()
+            if not retry.get("delivered"):
+                rewind = None  # The model never received it: the same instruction again.
+            elif not retry.get("output"):
+                rewind = retry.get("rewind")  # Received but answered with nothing: removed, then sent again.
+            else:
+                current, rewind = CONVERSATION_RETRY_NOTE, None  # A reply was cut off: asked for again.
+            classic = classic or bool(retry.get("classic"))
+            attempt += 1
+            wait_before_retry(options, "conversation", attempt, exc, node="author",
+                              thread_id=options.get("goal_thread_id"), since=since,
+                              record={"conversationId": conversation_id})
+        else:
+            emit("conversation_reply", "conversation", label=reply_label, conversationKind=kind,
+                 text=result["reply"], threadId=result["threadId"], compacted=bool(result.get("compacted")),
+                 **record)
+            return 0
+
+
 def main(argv=None):
     configure_standard_streams()
     # A runner killed before its cleanup may have left a key-bearing Claude
@@ -4554,10 +7668,17 @@ def main(argv=None):
     for role in ("author", "critic", "writer"):
         parser.add_argument(f"--{role}-model", type=model_argument, metavar="MODEL",
                             help=f"{role} model; same choices as --model")
-        parser.add_argument(f"--{role}-effort", choices=EFFORTS)
-    parser.add_argument("--reasoning-effort", dest="effort", choices=EFFORTS, default=EFFORT)
+        parser.add_argument(f"--{role}-effort", type=effort_argument, metavar=EFFORT_METAVAR)
+    parser.add_argument("--reasoning-effort", dest="effort", type=effort_argument, metavar=EFFORT_METAVAR,
+                        default=EFFORT)
     parser.add_argument("--speed", choices=SPEEDS, default=DEFAULT_SPEED)
     parser.add_argument("--critic-rounds", type=critic_limit)
+    parser.add_argument("--critic-count", type=critic_count,
+                        help=f"independent critics per critic round: the subagents the critic starts "
+                             f"(1 to {MAX_CRITIC_COUNT})")
+    parser.add_argument("--author-subagents", type=author_subagents,
+                        help=f"subagents the proof author may start at a time (0 to {MAX_AUTHOR_SUBAGENTS}; "
+                             "0, the default, gives it no subagent tool)")
     parser.add_argument("--thinking-hours", type=author_hours, default=DEFAULT_AUTHOR_HOURS)
     parser.add_argument("--elapsed-seconds", type=prior_elapsed_seconds, default=0)
     parser.add_argument("--author-limit-file")
@@ -4566,16 +7687,20 @@ def main(argv=None):
     parser.add_argument("--state-file", help="Read initial workflow state from a JSON object instead of stdin")
     parser.add_argument("--start-node", help="Enter the first workflow at this named node")
     parser.add_argument("--set", dest="settings", action="append", default=[], metavar="NAME=VALUE", help="override any named option; JSON values are accepted")
-    for role in ("author", "critic", "final"):
+    for role in PROMPT_FILE_OPTIONS:
         parser.add_argument(f"--{role}-prompt-file")
+    parser.add_argument("--converse", action="store_true",
+                        help="one conversation turn of the paused author of one workflow: a progress summary or a "
+                             "reply to the user's message; the JSON request is read from stdin")
     try:
         args = parser.parse_args(argv)
         options = {key: value for key, value in vars(args).items() if value is not None}
+        converse = options.pop("converse", False)
         options["prompts"] = {}
-        for role in ("author", "critic", "final"):
+        for role, name in PROMPT_FILE_OPTIONS.items():
             path = options.pop(f"{role}_prompt_file", None)
             if path:
-                options["prompts"][role] = prompt_file(path, None)
+                options["prompts"][name] = prompt_file(path, None)
         for setting in options.pop("settings"):
             key, separator, value = setting.partition("=")
             if not separator or not key:
@@ -4585,6 +7710,16 @@ def main(argv=None):
             except json.JSONDecodeError:
                 pass
             options[key] = value
+        for name in SUBAGENT_OPTIONS:
+            if name in options:
+                options[name] = SUBAGENT_OPTIONS[name](options[name])  # --set critic_count=N too.
+        # A saved job, script or flag may still say Ultra: it runs as Max, and the log says so once.
+        note_retired_efforts([options.get(name) for name in ("effort", "author_effort", "critic_effort",
+                                                              "writer_effort")])
+        if converse:
+            if len(args.workflows) != 1:
+                raise Error("--converse takes exactly one workflow.")
+            return run_author_conversation(args.workflows[0], options, conversation_request(sys.stdin.read()))
         if args.state_file:
             state = json.loads(Path(args.state_file).read_text(encoding="utf-8"))
             if not isinstance(state, dict):
@@ -4594,6 +7729,9 @@ def main(argv=None):
             if "\0" in source:
                 raise Error("Workflow input cannot contain NUL characters.")
             state = {"input": source, "statement": source, "source": source}
+        # The runner works in the run folder: failed model calls are logged there.
+        options.setdefault("failure_log", failure_log_path())
+        check_clis(_workflow_models(args.workflows, options))
         state = execute_workflows(args.workflows, state, options)
         if state.get("paused"):
             return 0
@@ -4607,6 +7745,112 @@ def main(argv=None):
     except (Error, ValueError, OSError, UnicodeError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"error: {redact(exc)}", file=sys.stderr)
         return 1
+    except Exception as exc:  # noqa: BLE001 - a harness bug still ends with one plain error line.
+        print(f"error: {_unexpected_failure(exc)}", file=sys.stderr)
+        return 1
+
+
+def _unexpected_failure(exc):
+    """One line naming an unexpected exception and where it was raised; its traceback becomes one diagnostic."""
+
+    import traceback
+
+    emit("diagnostic", "workflow", text="The workflow runner failed unexpectedly:\n"
+                                        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = f" in {frames[-1].name} ({Path(frames[-1].filename).name}:{frames[-1].lineno})" if frames else ""
+    message = " ".join(redact(exc).split())
+    return (f"The workflow runner failed unexpectedly ({type(exc).__name__}{where})"
+            + (f": {message}" if message else "."))
+
+
+def failure_log_path(directory=None):
+    """The MODEL_FAILURE_LOG of the run folder `directory` (the working directory by default)."""
+
+    return str(Path(directory or Path.cwd()) / MODEL_FAILURE_LOG)
+
+
+def _workflow_models(paths, options):
+    """Every model that the nodes of these workflows would use; an invalid workflow is reported later."""
+
+    models = []
+    for path in paths:
+        try:
+            nodes = load_workflow(path)["nodes"].values()
+            for node in nodes:
+                if node["run"] != "command":
+                    models.append(_settings(node, options)["model"])
+        except (Error, ValueError, KeyError, TypeError, OSError):
+            continue
+    return models
+
+
+def check_clis(models, directory=None):
+    """Name the path and version of each CLI these models need before any model call, and any that cannot run.
+
+    It runs `codex --version` or `claude --version` (no model call) and
+    remembers the answers in CLI_VERSIONS_FILENAME, so a CLI that changed
+    since the job last started is named too. Nothing waits: model calls
+    retry every minute until the CLI works. Web-cutoff runs check their
+    pinned binary in their own preflight instead. Where model processes
+    cannot be confined to their run (not macOS), a diagnostic says so.
+    """
+
+    directory = Path(directory or Path.cwd())
+    try:
+        if retrieval_runtime.policy_for_workspace(directory):
+            return
+    except (retrieval_runtime.RetrievalPolicyError, OSError, ValueError):
+        return  # The run's own checks report a broken policy.
+    if models and not confinement.supported():
+        # Said once per runner; the run continues with the legacy sandboxes (see README).
+        emit("diagnostic", "workflow", text=confinement.UNSUPPORTED_NOTICE)
+    names = []
+    for model in models:
+        try:
+            name = "Claude" if providers.harness(chosen_model(model)) == providers.CLAUDE else "Codex"
+        except (Error, ValueError, providers.ProviderError):
+            continue
+        if name not in names:
+            names.append(name)
+    found, problems = {}, []
+    for name in names:
+        try:
+            path = claude_cli.executable(sys.modules[__name__]) if name == "Claude" else codex()
+            result = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                    env=environment(), timeout=CLI_CHECK_SECONDS)
+        except (Error, OSError, subprocess.SubprocessError) as exc:
+            problems.append(f"{name} CLI missing or incompatible: {exc}")
+            continue
+        version = _clipped(" ".join(result.stdout.split()), 200)
+        if result.returncode or not version:
+            problems.append(f"{name} CLI missing or incompatible: `{Path(path).name} --version` exited with code "
+                            f"{result.returncode}" + (f" ({version})." if version else "."))
+            continue
+        found[name] = {"path": path, "version": version}
+    record = directory / CLI_VERSIONS_FILENAME
+    try:
+        previous = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        previous = {}
+    previous = previous if isinstance(previous, dict) else {}
+    if found:
+        emit("status", "workflow", label="CLI check", cliVersions=found,
+             text=" ".join(f"{name}: {item['version']} ({item['path']})." for name, item in found.items()))
+    for problem in problems:
+        emit("diagnostic", "workflow", text=f"{problem} Model calls retry every minute until it works.")
+    for name, item in found.items():
+        before = previous.get(name)
+        if isinstance(before, dict) and before != item:
+            emit("diagnostic", "workflow",
+                 text=f"The {name} CLI changed since this job last started: {before.get('version')} "
+                      f"({before.get('path')}) is now {item['version']} ({item['path']}).")
+    if any(previous.get(name) != item for name, item in found.items()):
+        try:
+            _private_atomic_write(record, json.dumps({**previous, **found}, indent=2, sort_keys=True) + "\n")
+        except (OSError, Error):
+            pass
 
 
 def _interrupt(signum, frame):

@@ -71,10 +71,12 @@ Promise.resolve(vm.runInNewContext(selected + '\n(async()=>{' + process.argv[2] 
 const first = describe({kind:'critic_result',round:1,time:'2026-10-16T13:00:00Z',report:{verdict:'reject',bugs:'Missing proof.'}});
 const second = describe({kind:'critic_result',round:1,time:'2026-10-16T13:15:00Z',report:{verdict:'pass'}});
 assert.notEqual(first.key,second.key);
-assert.equal(first.text,'Missing proof.');
+// The card states the outcome; its parts show the critical bugs (see criticRoundParts).
+assert.equal(first.text,'Rejected — returned to author.');
+assert.equal(first.critic.round.result.report.bugs,'Missing proof.');
 assert.match(second.text,/Pass — edits and next step not recorded/);
 assert.match(describe({kind:'critic_result',report:{}}).text,/No valid critic verdict/);
-assert.equal(describe({kind:'critic_result',report:{verdict:'REJECT',bugs:'Unresolved gap.'}}).text,'Unresolved gap.');
+assert.equal(describe({kind:'critic_result',report:{verdict:'REJECT',bugs:'Unresolved gap.'}}).text,'Rejected — returned to author.');
 state.trace = [
   {kind:'critic_result',time:'first',round:1,outcome:'fixed',report:{verdict:'pass'}},
   {kind:'status',node:'critic',label:'Workflow step: critic',visit:2},
@@ -98,6 +100,12 @@ assert(ui.retrievalCutoffUtc.disabled);
 assert.equal(proofJobSettings().retrievalMode,'live');
 assert.equal(proofJobSettings().retrievalCutoffUtc,'');
 assert(validateRetrievalSettings());
+assert.match(ui.retrievalSettingHelp.textContent,/native web search is enabled/);
+// -1 also keeps the models' shell commands offline.
+ui.retrievalMode.value = 'historical'; ui.retrievalCutoffUtc.value = '-1';
+renderRetrievalSettings();
+assert.equal(proofJobSettings().retrievalMode,'disabled');
+assert.match(ui.retrievalSettingHelp.textContent,/web-search tools are disabled, and the models' shell commands get no network access/);
 """)
 
     def test_missing_backend_capability_fails_closed_even_if_mode_was_manually_selected(self):
@@ -263,7 +271,9 @@ assert(ui.resultPanel.open);
         self.browser(r"""
 state.retrieval={mode:'historical',fixed:true,available:true,cutoffExclusiveUtc:'2026-10-02T14:13:12.000001Z',
  counts:{searches:5,opens:2,finds:3,successes:4,errors:1,pending:2,verifiedCandidates:19},limitation:'Coverage varies.'};
+ui.retrievalPanel.hidden=true; // as index.html starts it
 renderRetrievalOverview();
+assert(!ui.retrievalPanel.hidden);
 assert.equal(ui.retrievalCutoffValue.textContent,state.retrieval.cutoffExclusiveUtc);
 assert.equal(ui.retrievalStatus.textContent,'1 failed request in history');
 assert.equal(ui.retrievalCounts.children.length,7);
@@ -316,7 +326,9 @@ assert.match(ui.retrievalCountNote.textContent,/Audit log unavailable/);
     def test_legacy_fixed_policy_is_never_mislabeled_as_disabled_without_new_metadata(self):
         self.browser(r"""
 delete state.retrieval;state.retrievalPolicyPath='/controller/policy.json';
+ui.retrievalPanel.hidden=true; // as index.html starts it
 renderRunOverview();
+assert(!ui.retrievalPanel.hidden);
 assert.equal(ui.retrievalHeading.textContent,'Historical search');
 assert.equal(ui.retrievalStatus.textContent,'Status unavailable');
 assert.equal(ui.retrievalCutoffValue.textContent,'Not recorded');
@@ -328,6 +340,8 @@ assert.match(ui.runMetadata.children.flatMap(row=>row.children).map(item=>item.t
         self.browser(r"""
 state.retrieval={mode:'live'};
 renderRunOverview();
+// With the cutoff off there is no Research sources panel; Run settings records the search.
+assert(ui.retrievalPanel.hidden);
 assert.equal(ui.retrievalPanel.dataset.mode,'live');
 assert.equal(ui.retrievalHeading.textContent,'Unrestricted web search');
 assert.equal(ui.retrievalStatus.textContent,'Cutoff off');
@@ -335,15 +349,20 @@ assert(ui.retrievalCutoffDisplay.hidden);assert(ui.retrievalCounts.hidden);asser
 assert.match(ui.runMetadata.children.flatMap(row=>row.children).map(item=>item.textContent).join(' '),/Cutoff off.*unrestricted/);
 state.retrieval={mode:'disabled'};
 renderRunOverview();
+assert(!ui.retrievalPanel.hidden);
 assert.equal(ui.retrievalPanel.dataset.mode,'disabled');
 assert.equal(ui.retrievalHeading.textContent,'Web-search tools disabled');
 assert.equal(ui.retrievalStatus.textContent,'Cutoff on · -1');
 assert(!ui.retrievalCutoffDisplay.hidden);assert.equal(ui.retrievalCutoffValue.textContent,'-1');
 assert(ui.retrievalCounts.hidden);assert(ui.retrievalDetails.hidden);
 assert.match(ui.runMetadata.children.flatMap(row=>row.children).map(item=>item.textContent).join(' '),/-1.*web-search tools disabled/);
-assert.match(ui.retrievalDescription.textContent,/does not isolate ordinary shell network access/);
+assert.match(ui.retrievalDescription.textContent,/shell commands get no network access/);
 assert.match(retrievalSummary({runId:'native',retrievalMode:'live'}),/Cutoff off/);
 assert.match(retrievalSummary({runId:'old-main'}),/Cutoff off/);
+// An older run without a recorded mode searched without a cutoff: the panel hides again.
+delete state.retrieval;
+renderRunOverview();
+assert(ui.retrievalPanel.hidden);
 """)
 
 
@@ -352,12 +371,14 @@ class HistoricalMarkupTests(unittest.TestCase):
         class Markup(HTMLParser):
             def __init__(self):
                 super().__init__()
-                self.ids, self.labels = [], set()
+                self.ids, self.labels, self.hidden = [], set(), set()
 
             def handle_starttag(self, tag, attrs):
                 attrs = dict(attrs)
                 if 'id' in attrs:
                     self.ids.append(attrs['id'])
+                    if 'hidden' in attrs:
+                        self.hidden.add(attrs['id'])
                 if tag == 'label' and 'for' in attrs:
                     self.labels.add(attrs['for'])
 
@@ -369,6 +390,8 @@ class HistoricalMarkupTests(unittest.TestCase):
             self.assertIn(name, page.labels)
         self.assertIn('runOverview', page.ids)
         self.assertIn('retrievalPanel', page.ids)
+        # app.js shows it only with a web cutoff, so a job with the cutoff off never flashes it.
+        self.assertIn('retrievalPanel', page.hidden)
         self.assertIn('resultOutput', page.ids)
 
 

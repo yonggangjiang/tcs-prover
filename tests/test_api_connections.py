@@ -7,6 +7,7 @@ import json
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import claude_cli, providers
 from tests.test_api_model_discovery import ModelsEndpoint
@@ -190,9 +191,12 @@ class ConnectionEndpointTests(HttpCase):
         app = self.new_app()
         app.state.update(phase="paused", authorModel=selected, apiModels=server.api_model_snapshot([selected]))
         self.http.jobs[app.state["runId"]] = app
+        # The page refuses to remove a connection that a waiting job needs (see Server.delete_api_model),
+        # so it is removed outside the page, by hand or by an older version.
         status, result = self.call("/api-models/delete", {"id": connection["id"]})
-        self.assertEqual(status, 200)
-        self.assertIn("1 job", result["warning"])
+        self.assertEqual(status, 400)
+        self.assertIn("1 job waiting to start or resume", result["error"])
+        self.assertTrue(providers.delete_api_model(connection["id"]))
         self.assertFalse(providers.is_known(selected))
         status, result = self.save(label="Recreated connection")
         self.assertEqual(status, 200)
@@ -205,7 +209,8 @@ class ConnectionEndpointTests(HttpCase):
         app = self.new_app()
         app.state.update(phase="paused", authorModel=legacy["id"], apiModels=server.api_model_snapshot([legacy["id"]]))
         self.http.jobs[app.state["runId"]] = app
-        self.assertEqual(self.call("/api-models/delete", {"id": legacy["id"]})[0], 200)
+        # Removed outside the page (the page refuses it while a job waits for the model).
+        self.assertTrue(providers.delete_api_model(legacy["id"]))
         status, result = self.save(label="New local name")
         self.assertEqual(status, 200)
         self.assertEqual(result["connection"]["id"], legacy["id"])

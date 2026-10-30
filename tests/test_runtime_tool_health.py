@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from ui import server
 
@@ -70,8 +71,11 @@ class ToolHealthTests(unittest.TestCase):
 
             with patch.object(Path, 'replace', inspect_replacement):
                 app._save_job_settings({'goalThreadId': 'same-thread-resumed'})
-            self.assertEqual(len(staged_paths), 1)
-            self.assertFalse(staged_paths[0].exists())
+            # The controller's private copy, then the run folder's copy.
+            self.assertEqual(len(staged_paths), 2)
+            self.assertFalse(any(path.exists() for path in staged_paths))
+            controller = server.controller_directory(app.run_dir) / server.JOB_SETTINGS_FILENAME
+            self.assertEqual(json.loads(controller.read_text())['goalThreadId'], 'same-thread-resumed')
             if os.name != 'nt':
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
             self.assertEqual(json.loads(target.read_text())['goalThreadId'], 'same-thread-resumed')

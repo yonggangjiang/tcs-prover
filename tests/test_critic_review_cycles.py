@@ -84,7 +84,11 @@ assert.match(criticCycleOutcomeLabel(cycles[0]), /Pass with changes/);
 cycles = collectCriticReviewCycles([result('r1', 'pass', 'A', {outcome: 'fixed', transition: 'review_again'})]);
 assert.equal(cycles[0].outcome, 'pass_edited_continue');
 cycles = collectCriticReviewCycles([result('r1', 'pass', 'A', {outcome: 'fixed'}), step('critic', 2)]);
-assert.equal(cycles[0].outcome, 'pass_edited_continue');
+assert.equal(cycles[0].rounds[0].outcome, 'pass_edited_continue');
+// The next visit is the next round from its start; a finished job shows no empty round.
+assert.equal(cycles[0].outcome, 'pending');
+cycles = collectCriticReviewCycles([result('r1', 'pass', 'A', {outcome: 'fixed'}), step('critic', 2)], {phase: 'done'});
+assert.equal(cycles[0].outcome, 'pass_edited_continue'); assert.equal(cycles[0].rounds.length, 1);
 """)
 
     def test_unknown_pass_is_not_accepted_from_current_settings(self):
@@ -111,14 +115,53 @@ assert.equal(cycles[0].rounds[0].requests[1].text, q2.text);
 
     def test_interrupted_rounds_stay_in_same_cycle_on_critic_resume(self):
         self.check(r"""
-const cycles = collectCriticReviewCycles([author('a'), step('critic'), request('q1', 'A'),
+// The same visit resumed (Resume, a restart) continues its round: one round per visit, so every
+// place names a round by its visit. The interrupted input is an earlier attempt of that round.
+let cycles = collectCriticReviewCycles([author('a'), step('critic'), request('q1', 'A'),
  {kind: 'workflow_paused', node: 'critic'}, step('critic'), request('q2', 'A'), result('r1', 'pass', 'B'),
  step('critic', 2), request('q3', 'B')], {phase: 'running', activeNode: 'critic'});
-assert.equal(cycles.length, 1); assert.equal(cycles[0].rounds.length, 3);
-assert.deepEqual(cycles[0].rounds.map(r => r.outcome), ['interrupted', 'pass_edited_continue', 'pending']);
-assert.deepEqual(cycles[0].rounds.map(r => r.number), [1, 2, 3]);
-assert.deepEqual(cycles[0].rounds.map(r => r.roundNumber), [1, 1, 2]);
+assert.equal(cycles.length, 1); assert.equal(cycles[0].rounds.length, 2);
+assert.deepEqual(cycles[0].rounds.map(r => r.outcome), ['pass_edited_continue', 'pending']);
+assert.deepEqual(cycles[0].rounds.map(r => r.number), [1, 2]);
+assert.deepEqual(cycles[0].rounds.map(r => r.roundNumber), [1, 2]);
+assert.deepEqual(cycles[0].rounds.map(r => r.resumed), [true, false]);
+assert.deepEqual(cycles[0].rounds.map(r => criticRoundName(r)), ['Round 1 (resumed)', 'Round 2']);
+assert.deepEqual(cycles[0].rounds[0].requests.map(r => r.time), ['q1', 'q2']);
+assert.deepEqual(cycles[0].rounds[0].resumedInputs, [1]);
+// A later round resumed while its critics ran, and again after its coordinator was asked.
+cycles = collectCriticReviewCycles([author('a'), step('critic'), request('q1', 'A'), result('r1', 'pass', 'B',
+ {outcome: 'fixed'}), step('critic', 2), {kind: 'proof_handoff', round: 2, manifest: {visit: 2}},
+ request('a2', 'Unused', {label: 'Independent critic audit 1'}), {kind: 'workflow_paused', node: 'critic'},
+ step('critic', 2), {kind: 'proof_handoff', round: 2, manifest: {visit: 2}},
+ request('a2b', 'Unused', {label: 'Independent critic audit 3'}), request('q2', 'B'),
+ {kind: 'workflow_paused', node: 'critic'}, step('critic', 2), {kind: 'proof_handoff', round: 2, manifest: {visit: 2}},
+ request('q3', 'B'), request('q3r', 'Retry', {attempt: 2})], {phase: 'running', activeNode: 'critic'});
+assert.deepEqual(cycles[0].rounds.map(r => [r.number, r.roundNumber, r.outcome, r.resumed]),
+ [[1, 1, 'pass_edited_continue', false], [2, 2, 'pending', true]]);
+assert.deepEqual(cycles[0].rounds[1].requests.map(r => r.time), ['q2', 'q3', 'q3r']);
+assert.deepEqual(cycles[0].rounds[1].resumedInputs, [1]);
+// A runner that numbered a resumed visit from 1 again ran a new round.
+cycles = collectCriticReviewCycles([author('a'), step('critic'), request('q1', 'A'), result('r1', 'pass', 'B',
+ {outcome: 'fixed'}), step('critic', 2), request('q2', 'B'), {kind: 'workflow_paused', node: 'critic'},
+ step('critic'), request('q3', 'B')], {phase: 'running', activeNode: 'critic'});
+assert.deepEqual(cycles[0].rounds.map(r => [r.number, r.roundNumber, r.outcome]),
+ [[1, 1, 'pass_edited_continue'], [2, 2, 'interrupted'], [3, 1, 'pending']]);
 """)
+
+    def test_the_round_badge_names_the_final_check(self):
+        script = r"""
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+vm.runInNewContext(source.slice(source.indexOf('function roundBadgeText('), source.indexOf('let limitControlOpenedFor')) + `
+assert.equal(roundBadgeText({round: 2, criticRounds: 2}), 'Round 2 / 2');
+assert.equal(roundBadgeText({round: 3, criticRounds: 2}), 'Round 3 · final check');
+assert.equal(roundBadgeText({round: 2, criticRounds: 1}), 'Round 2 · final check');
+`, {assert});
+"""
+        source = Path(__file__).resolve().parents[1] / "ui" / "app.js"
+        completed = subprocess.run([shutil.which("node"), "-e", script, str(source)],
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_author_boundary_does_not_borrow_abandoned_input(self):
         self.check(r"""
@@ -149,6 +192,78 @@ const cycles = collectCriticReviewCycles([request('q0', 'Unrelated', {label:'Ind
 assert.equal(cycles.length, 1); assert.equal(cycles[0].rounds[0].requests.length, 1);
 assert(cycles[0].rounds[0].requests[0].text.includes(long));
 assert.equal(cycles[0].rounds[0].result.report.solution, long);
+""")
+
+    def test_parallel_critics_and_their_retries_are_not_rounds_of_their_own(self):
+        self.check(r"""
+const visit = (number, candidate, verdict, solution, outcome) => [
+ step('critic', number), {kind: 'proof_handoff', stage: 'critic', label: 'Submitted proof captured', round: number},
+ {kind: 'status', stage: 'critic', label: '3 independent critics started', auditCount: 3},
+ ...[1, 2, 3].map(index => request(`a${number}${index}`, 'Unused', {label: `Independent critic audit ${index}`})),
+ request(`a${number}2r`, 'Unused', {label: 'Independent critic audit 2 · retry', attempt: 2}),
+ ...[1, 2, 3].map(index => ({kind: 'status', stage: 'critic', label: `Independent audit ${index} complete`})),
+ request(`c${number}`, candidate, {label: 'Critic coordinator', candidateText: candidate}),
+ result(`r${number}`, verdict, solution, {round: number, outcome})];
+const cycles = collectCriticReviewCycles([author('a1'), ...visit(1, 'A', 'pass', 'A fixed', 'fixed'),
+ ...visit(2, 'A fixed', 'pass', 'A fixed', 'pass'), approved('Round 2 passed without edits.',
+ {acceptanceReason: 'clean_pass'}), step('latex_editor')]);
+assert.equal(cycles.length, 1);
+assert.deepEqual(cycles[0].rounds.map(round => round.requests.map(request => request.label)),
+ [['Critic coordinator'], ['Critic coordinator']]);
+assert.deepEqual(cycles[0].rounds.map(round => round.roundNumber), [1, 2]);
+assert.deepEqual(cycles[0].rounds.map(round => round.outcome), ['pass_edited_continue', 'pass_clean']);
+assert.equal(cycles[0].rounds[1].candidateText, 'A fixed');
+""")
+
+    def test_a_round_starts_with_its_critic_visit_while_the_critics_run(self):
+        self.check(r"""
+// A visit's critics run for most of its round before its coordinator's request is recorded.
+const critics = (tag, number) => [step('critic', number),
+ {kind: 'proof_handoff', stage: 'critic', label: 'Submitted proof captured', round: number, manifest: {visit: number}},
+ {kind: 'status', stage: 'critic', label: '3 independent critics started', auditCount: 3},
+ ...[1, 2, 3].map(index => request(`${tag}-audit${index}`, 'Unused', {label: `Independent critic audit ${index}`})),
+ request(`${tag}-audit2r`, 'Unused', {label: 'Independent critic audit 2 · retry', attempt: 2})];
+const coordinator = (tag, candidate) => request(`${tag}-coordinator`, candidate,
+ {label: 'Critic coordinator', candidateText: candidate});
+const live = {phase: 'running', activeNode: 'critic'};
+// Steps, handoffs and statuses are routine records that leave a long trace; requests and results stay.
+const lasting = trace => trace.filter(entry => !['status', 'proof_handoff'].includes(entry.kind));
+const keys = cycles => cycles.map(cycle => [cycle.key, ...cycle.rounds.map(round => round.key)]);
+const first = [author('a1'), ...critics('v1', 1), coordinator('v1', 'A'), result('r1', 'pass', 'A fixed', {outcome: 'fixed'})];
+for (const trace of [[...first, ...critics('v2', 2)], lasting([...first, ...critics('v2', 2)])]) {
+ const cycles = collectCriticReviewCycles(trace, live);
+ assert.equal(cycles.length, 1);
+ assert.deepEqual(cycles[0].rounds.map(round => round.outcome), ['pass_edited_continue', 'pending']);
+ assert.equal(cycles[0].rounds[1].requests.length, 0);
+}
+let cycles = collectCriticReviewCycles([...first, ...critics('v2', 2)], live);
+assert.equal(cycles[0].rounds[1].roundNumber, 2); assert.equal(cycles[0].rounds[1].handoff.round, 2);
+// The coordinator's request and its retry join the round its visit opened.
+const asked = [...first, ...critics('v2', 2), coordinator('v2', 'A fixed'),
+ request('v2-coordinator-retry', 'Retry', {label: 'Critic coordinator · retry', attempt: 2})];
+cycles = collectCriticReviewCycles(asked, live);
+assert.equal(cycles[0].rounds.length, 2);
+assert.deepEqual(cycles[0].rounds[1].requests.map(request => request.label), ['Critic coordinator', 'Critic coordinator · retry']);
+assert.equal(cycles[0].rounds[1].candidateText, 'A fixed');
+assert.deepEqual(keys(cycles), keys(collectCriticReviewCycles(lasting(asked), live)));
+// After a rejection, the repaired proof's first round is the next cycle while its critics run.
+const rejected = [...asked, result('r2', 'reject', 'A fixed', {round: 2, outcome: 'reject'}), step('author'),
+ request('repair', 'Unused', {stage: 'repair'}), author('a2')];
+for (const trace of [[...rejected, ...critics('v3', 1)], lasting([...rejected, ...critics('v3', 1)])]) {
+ cycles = collectCriticReviewCycles(trace, live);
+ assert.equal(cycles.length, 2); assert.equal(cycles[0].outcome, 'reject');
+ assert.deepEqual(cycles[1].rounds.map(round => round.outcome), ['pending']);
+}
+assert.equal(collectCriticReviewCycles([...rejected, ...critics('v3', 1)], live)[1].rounds[0].roundNumber, 1);
+// A visit that ended before its coordinator was asked leaves no round: on resume, or in a finished job.
+cycles = collectCriticReviewCycles([...first, ...critics('v2', 2), {kind: 'workflow_paused', node: 'critic'},
+ ...critics('v2b', 2), coordinator('v2b', 'A fixed')], live);
+assert.deepEqual(cycles[0].rounds.map(round => [round.number, round.outcome, round.requests.length]),
+ [[1, 'pass_edited_continue', 1], [2, 'pending', 1]]);
+cycles = collectCriticReviewCycles([...first, ...critics('v2', 2)], {phase: 'done'});
+assert.deepEqual(cycles[0].rounds.map(round => round.outcome), ['pass_edited_continue']);
+cycles = collectCriticReviewCycles([...rejected, ...critics('v3', 1)], {phase: 'done'});
+assert.equal(cycles.length, 1);
 """)
 
     def test_file_snapshot_suffix_is_not_part_of_proof(self):
@@ -205,6 +320,33 @@ assert.equal(criticRoundOutcomeLabel(), 'Verdict unavailable');
 assert.equal(criticCycleOutcomeLabel(), 'Verdict unavailable');
 assert.equal(criticCycleOutcomeLabel({outcome: 'pending'}), 'Awaiting decision');
 """)
+
+    def test_each_critic_round_keeps_its_own_critic_rows_in_the_activity_log(self):
+        script = r"""
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const model = source.slice(source.indexOf('// Group the recorded critic calls'),
+  source.indexOf('function renderCriticReviewHistory('));
+const describe = source.slice(source.indexOf('function describe(entry)'), source.indexOf('function cardIcon('));
+vm.runInNewContext(model + describe + `
+const status = (label, time, extra = {}) => ({kind: 'status', stage: 'critic', node: 'critic', label, time,
+  text: label, ...extra});
+const round = number => [status('3 independent critics started', number + ':00', {auditCount: 3}),
+  status('Independent audit 1 complete', number + ':01', {auditIndex: 1, auditVerdict: 'fail'}),
+  status('Independent audit 2 restored', number + ':02', {auditIndex: 2, checkpoint: true})];
+const keys = [round(1), round(2)].map(entries => entries.map(entry => describe(entry).key));
+// Round 2's rows are rows of their own: they never replace round 1's.
+assert.equal(new Set(keys.flat()).size, 6);
+// The same record again (a replayed trace) keeps its row, and other statuses still replace the last one.
+assert.equal(describe(round(1)[1]).key, keys[0][1]);
+const alive = time => describe(status('Critic 1 of 3 local request is alive', time)).key;
+assert.equal(alive('1:05'), alive('2:05'));
+`, {assert, state: {trace: []}});
+"""
+        source = Path(__file__).resolve().parents[1] / "ui" / "app.js"
+        completed = subprocess.run([shutil.which("node"), "-e", script, str(source)],
+                                   capture_output=True, text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_incremental_recovered_approval_refreshes_existing_timeline_card(self):
         script = r"""

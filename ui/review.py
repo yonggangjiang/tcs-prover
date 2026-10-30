@@ -1,7 +1,6 @@
 """Independent statement checking, including its isolated worker entry point."""
 
 import argparse
-import json
 import sys
 
 import workflow_runner as runtime
@@ -20,6 +19,7 @@ REVIEW_SCHEMA = {
 REVIEW_PROMPT = (
     'Read the current statement below carefully and produce a rigorous, self-contained problem statement without changing its intended claim. \n'
     'Do a initial scanning on corner cases, edge cases, counter examples to see if the statement is trivial or false. \n'
+    'Also try to guess what the user, as a conventional mathematician or theoretical computer science researcher, actually wants from this problem, and check whether the statement has loopholes that a proof could exploit to satisfy its letter without doing what the user wants (for example, a brute-force construction that stores all answers). If it does, close them in the way the user most likely intends, and explain each change in the notes.\n'
     'If you found the statement is trivial or false, first try to clear typos, fix any ambiguities, or add missing context or conventional assumptions to make the statement non-trivial. If you can fix it, explain the fix in the note, and return the final problem statement. Remember to check the problem statement again until it passed your audit. If you cannot fix it, explain why in the notes and return the version you think is the best possible statement.\n'
     'If the statement remains non-trivial and open after your scanning, then return a complete, rigorous, self-contained problem statement.\n'
     'The returned problem statement should use conventional notations and terminologies in TCS, especially asymptotic bounds notations, to avoid overly complex expressions and guarantee conciseness, while maintaining the rigour of the original statement. \n'
@@ -49,17 +49,20 @@ def review_prompt(draft, feedback="", instructions=REVIEW_PROMPT):
 def review(
     draft, feedback="", model=runtime.REVIEW_MODEL, effort=runtime.REVIEW_EFFORT,
     instructions=REVIEW_PROMPT, speed=runtime.DEFAULT_SPEED,
-    summary=runtime.DEFAULT_REASONING_SUMMARY, thinking_hours=None,
+    summary=runtime.DEFAULT_REASONING_SUMMARY, thinking_hours=None, failure_log=None,
 ):
     """Review with the user's chosen model.
 
     Like a workflow node, the review retries every failed attempt each
-    minute, each attempt has a timeout (doubled after consecutive
-    timeouts), and the job's total time limit (``thinking_hours``, 0 for
-    unlimited) bounds the whole review; retry waits do not count against it.
+    minute, an attempt is stopped only after its CLI wrote nothing for
+    STRUCTURED_STALL_SECONDS, and the job's total time limit
+    (``thinking_hours``, 0 for unlimited) bounds the whole review; retry
+    waits do not count against it. Failed attempts are logged in full to
+    ``failure_log`` when given.
     """
 
-    options = {"thinking_hours": runtime.DEFAULT_AUTHOR_HOURS if thinking_hours is None else thinking_hours}
+    options = {"thinking_hours": runtime.DEFAULT_AUTHOR_HOURS if thinking_hours is None else thinking_hours,
+               **({"failure_log": failure_log} if failure_log else {})}
 
     def empty_statement(notes):
         # Blame the reviewer, not the user's draft, and keep its notes.
@@ -86,7 +89,7 @@ def review(
         report, raw = runtime.structured(
             review_prompt(draft, feedback, instructions), REVIEW_SCHEMA, "review",
             model=model, effort=effort, speed=speed, summary=summary, validate=check,
-            timeout=runtime.STRUCTURED_TIMEOUT_SECONDS, options=options,
+            options=options,
         )
         statement = report["statement"].strip()
         notes = report["notes"].strip()
@@ -109,7 +112,8 @@ def review_worker_main(argv):
     parser = argparse.ArgumentParser(description="Internal statement-review worker")
     # Any id the registry knows: built-in, older Codex, or a configured api:<id>.
     parser.add_argument("--review-model", type=runtime.model_argument, default=runtime.REVIEW_MODEL)
-    parser.add_argument("--review-effort", choices=runtime.EFFORTS, default=runtime.REVIEW_EFFORT)
+    parser.add_argument("--review-effort", type=runtime.effort_argument, metavar=runtime.EFFORT_METAVAR,
+                        default=runtime.REVIEW_EFFORT)
     parser.add_argument("--speed", choices=runtime.SPEEDS, default=runtime.DEFAULT_SPEED)
     parser.add_argument("--reasoning-summary", choices=runtime.REASONING_SUMMARIES, default=runtime.DEFAULT_REASONING_SUMMARY)
     parser.add_argument("--review-prompt-file")
@@ -117,15 +121,20 @@ def review_worker_main(argv):
     args = parser.parse_args(argv)
     try:
         statement, _, feedback = sys.stdin.read().partition("\0")
+        # The worker runs in the job's run folder, like the workflow runner.
+        runtime.note_retired_efforts([args.review_effort])
+        runtime.check_clis([args.review_model])
         review(
             statement, feedback, args.review_model, args.review_effort,
             runtime.prompt_file(args.review_prompt_file, REVIEW_PROMPT),
             speed=args.speed, summary=args.reasoning_summary, thinking_hours=args.thinking_hours,
+            failure_log=runtime.failure_log_path(),
         )
         return 0
     except KeyboardInterrupt:
         print("\nStopped review.", file=sys.stderr)
         return 130
-    except (runtime.Error, OSError, UnicodeError, KeyError, json.JSONDecodeError) as exc:
+    except (runtime.Error, OSError, UnicodeError, KeyError, ValueError) as exc:
+        # ValueError covers settings problems (providers.ProviderError), reported like any other.
         print(f"error: {runtime.redact(exc)}", file=sys.stderr)
         return 1

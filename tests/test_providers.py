@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from runner import providers
 
 KEY = "sk-test-abcdefghijklmnop1234"
@@ -66,7 +67,8 @@ class RegistryTests(StoreCase):
         self.assertEqual(providers.effective_effort("gpt-6-luna", "ultra"), "max")
         self.assertEqual(providers.effective_effort("gpt-5.6-luna", "ultra"), "max")
         self.assertEqual(providers.effective_effort("claude-opus-5-5", "ultra"), "max")
-        self.assertEqual(providers.effective_effort("gpt-6.1-sol", "ultra"), "ultra")
+        # Ultra is retired: it runs as max on every model.
+        self.assertEqual(providers.effective_effort("gpt-6.1-sol", "ultra"), "max")
         api = self.save()["id"]
         self.assertEqual(providers.effective_effort(api, "ultra"), "max")
         for model in providers.offered_models():
@@ -220,7 +222,10 @@ class StoreTests(StoreCase):
     def test_damaged_store_is_ignored_by_readers_and_never_overwritten(self):
         self.store.parent.mkdir(parents=True)
         self.store.write_text('{"version": 1, "models": [{"apiKey": "' + KEY + '"')
-        self.assertEqual(providers.load_api_models(), [])
+        # A damaged store is reported, never read as "no models" (the menus keep the built-ins).
+        with self.assertRaises(providers.StoreUnavailable) as failure:
+            providers.load_api_models()
+        self.assertIn("damaged", str(failure.exception))
         self.assertEqual([row["id"] for row in providers.catalog()], list(providers.offered_models()))
         with self.assertRaises(providers.ProviderError) as failure:
             self.save()
@@ -305,7 +310,10 @@ class StoreTests(StoreCase):
         self.save()
         state = self.store.parent.resolve()
         self.assertEqual(providers.private_paths(), [self.store.resolve(), state / ".api-models-staging",
-                                                     state / "codex-homes", state / "claude-settings"])
+                                                     state / "codex-homes", state / "claude-settings",
+                                                     state / "claude-homes", state / "claude-transcripts",
+                                                     state / "sessions", state / "run-owners", state / "servers",
+                                                     state / "last-good-workflows", state / "settings.json"])
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex"), "CLAUDE_CONFIG_DIR": str(self.root / "c")}):
             self.assertEqual(providers.user_login_files(), [(self.root / "codex" / "auth.json").resolve(),
                                                             (self.root / "c" / ".credentials.json").resolve()])

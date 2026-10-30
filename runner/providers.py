@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import threading
 import unicodedata
@@ -28,7 +29,11 @@ OPENAI_FORMAT, ANTHROPIC_FORMAT = "openai", "anthropic"
 FORMATS = (OPENAI_FORMAT, ANTHROPIC_FORMAT)
 PROVIDER_LABELS = {CODEX: "Codex CLI", CLAUDE: "Claude CLI", API: "API"}
 
-CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Efforts no longer offered, and what they run as. Ultra was Max plus Codex's proactive
+# task delegation; subagents now follow the run's own settings (Author subagents,
+# Independent critics). A saved job, script or flag that says ultra runs as max.
+RETIRED_EFFORTS = {"ultra": "max"}
 # `claude --effort` levels; API models in either format offer the same five.
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 API_EFFORTS = {OPENAI_FORMAT: ("low", "medium", "high", "xhigh", "max"), ANTHROPIC_FORMAT: CLAUDE_EFFORTS}
@@ -39,7 +44,7 @@ BUILTIN_MODELS = (
     {"id": "gpt-6.1-sol", "label": "GPT 6.1 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-astra", "label": "GPT 6 Astra", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-sol", "label": "GPT 6 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
-    {"id": "gpt-6-luna", "label": "GPT 6 Luna", "provider": CODEX, "efforts": CODEX_EFFORTS[:-1]},
+    {"id": "gpt-6-luna", "label": "GPT 6 Luna", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "claude-fable-5-1", "label": "Claude Fable 5.1", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
     {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
     {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
@@ -51,7 +56,7 @@ LEGACY_CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
 _LEGACY_MODELS = (
     {"id": "gpt-5.6-sol", "label": "GPT 5.6 Sol (older)", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra (older)", "provider": CODEX, "efforts": CODEX_EFFORTS},
-    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna (older)", "provider": CODEX, "efforts": CODEX_EFFORTS[:-1]},
+    {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna (older)", "provider": CODEX, "efforts": CODEX_EFFORTS},
 )
 REMOVED_MODEL_REPLACEMENTS = {"deepseek-v4-pro": "gpt-6.1-sol", "deepseek/deepseek-v4-pro": "gpt-6.1-sol"}
 REMOVED_MODEL_WARNING = "DeepSeek is no longer supported; this role now uses GPT 6.1 Sol."
@@ -70,23 +75,50 @@ MAX_LABEL_CHARS = 200
 MAX_REQUEST_SOURCE_CHARS = 200
 MAX_KEY_CHARS = 4096
 MAX_TEST_MESSAGE_CHARS = 300
+# Optional token limits of an API connection's models, passed to their CLI (the
+# CLIs assume default windows for models they do not know).
+MAX_CONTEXT_WINDOW = 10_000_000
+MIN_CONTEXT_WINDOW = 1024
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE_ENV = "TCS_PROVER_API_MODELS"
 DEFAULT_STORE = ROOT / ".tcs-prover" / "api-models.json"
 STORE_VERSION = 2
 # Private folders beside the store: atomic-write staging, the Codex homes of
-# OpenAI-format API models, and the Claude --settings files that carry a key.
+# OpenAI-format API models, the Claude --settings files that carry a key, the
+# Claude configuration folders of Anthropic-format API models and the private
+# copies of Claude author conversations.
 STORE_STAGING = ".api-models-staging"
 CODEX_HOMES = "codex-homes"
 CLAUDE_SETTINGS = "claude-settings"
+CLAUDE_HOMES = "claude-homes"
+CLAUDE_TRANSCRIPTS = "claude-transcripts"
+# The browser session tokens of the web UI (ui.ownership.session_token).
+SESSIONS = "sessions"
+# Who holds each run and runs-folder lock (ui.ownership), the last readable copy
+# of each bundled workflow (workflow_runner.read_editable_yaml) and this
+# installation's settings (ui.server.save_installation_settings).
+RUN_OWNERS = "run-owners"
+SERVERS = "servers"
+LAST_GOOD_WORKFLOWS = "last-good-workflows"
+INSTALLATION_SETTINGS = "settings.json"
 _STORE_LOCK = threading.RLock()
 
 _BUILTIN = {row["id"]: row for row in (*BUILTIN_MODELS, *_LEGACY_MODELS)}
+# The last store this process read successfully, per store path: a read that
+# fails for a moment keeps the settings a running job already uses.
+_LAST_GOOD = {}
 
 
 class ProviderError(ValueError):
     """A model id or an API model setting is invalid; the message is safe to show."""
+
+
+class StoreUnavailable(ProviderError):
+    """The API model store exists but cannot be read or parsed right now.
+
+    It never means "no models": a check that meets it waits and reads again.
+    """
 
 
 def offered_models():
@@ -119,14 +151,19 @@ def state_directory():
 def private_paths():
     """Private state that no model sandbox may read or write, as resolved paths.
 
-    The key store and its staging folder, the private Codex homes and the
-    Claude settings folders. These entries rather than the whole state
+    The key store and its staging folder, the private Codex and Claude homes,
+    the Claude settings folders, the copies of Claude conversations, the
+    browser session tokens, the run and server lock records, the last
+    readable copies of the bundled workflows (a launch may run from one) and
+    the installation settings. These entries rather than the whole state
     folder: an overridden store path may share its folder with run folders.
     """
 
     state = state_directory()
     return [Path(os.path.realpath(path)) for path in (
-        store_path(), state / STORE_STAGING, state / CODEX_HOMES, state / CLAUDE_SETTINGS)]
+        store_path(), state / STORE_STAGING, state / CODEX_HOMES, state / CLAUDE_SETTINGS,
+        state / CLAUDE_HOMES, state / CLAUDE_TRANSCRIPTS, state / SESSIONS, state / RUN_OWNERS,
+        state / SERVERS, state / LAST_GOOD_WORKFLOWS, state / INSTALLATION_SETTINGS)]
 
 
 def user_login_files():
@@ -142,18 +179,44 @@ def user_login_files():
 
 
 def private_directory(path):
-    """Create an owner-only directory (and missing parents) for controller state."""
+    """Create an owner-only directory (and missing parents) for controller state.
+
+    A symbolic link is used only when it names a folder this user owns and
+    that is owner-only (0700, set here when possible); the resolved folder is
+    returned. Anything else is refused with a message that says what to fix.
+    """
 
     path = Path(path)
-    if path.is_symlink():
-        raise ProviderError("Private TCS Prover state cannot be a symbolic link.")
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.is_symlink():
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name != "nt":
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+        return path
+    try:
+        target = path.resolve(strict=True)
+        info = target.stat()
+    except (OSError, RuntimeError):
+        raise ProviderError(f"Private TCS Prover state {path} is a symbolic link to a folder that does not exist; "
+                            "create that folder or remove the link.") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ProviderError(f"Private TCS Prover state {path} links to {target}, which is not a folder.")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ProviderError(f"Private TCS Prover state {path} links to {target}, which belongs to another user; "
+                            "link it to a folder you own, or remove the link.")
     if os.name != "nt":
         try:
-            os.chmod(path, 0o700)
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                os.chmod(target, 0o700)
+                info = target.stat()
         except OSError:
             pass
-    return path
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise ProviderError(f"Private TCS Prover state {path} links to {target}, which others can open; "
+                                "make it owner-only (chmod 700).")
+    return target
 
 
 def _clean_text(value, label, limit, *, required=True):
@@ -270,6 +333,30 @@ def _model_name(value):
     return value
 
 
+def _token_limit(value, label):
+    """An optional token count: None when blank, else a whole number in range."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_CONTEXT_WINDOW:
+        raise ProviderError(f"Enter the {label} as a whole number of tokens, or leave it empty.")
+    return value
+
+
+def _token_limits(values, existing):
+    """The optional context window and max output of a connection's models (an absent field keeps the saved one)."""
+
+    window = _token_limit(values.get("contextWindow", existing.get("contextWindow")), "context window")
+    output = _token_limit(values.get("maxOutputTokens", existing.get("maxOutputTokens")), "max output")
+    if window is not None and window < MIN_CONTEXT_WINDOW:
+        raise ProviderError(f"The context window must be at least {MIN_CONTEXT_WINDOW:,} tokens.")
+    if window is not None and output is not None and output >= window:
+        raise ProviderError("The max output must be smaller than the context window.")
+    return {**({"contextWindow": window} if window else {}), **({"maxOutputTokens": output} if output else {})}
+
+
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -312,7 +399,8 @@ def _validated_connection(values, existing=None, *, require_key=True):
         key = ""
     else:
         key = _api_key(supplied_key)
-    return {"format": api_format, "baseUrl": base_url, "headerName": header, "requestSource": source, "apiKey": key}
+    return {"format": api_format, "baseUrl": base_url, "headerName": header, "requestSource": source, "apiKey": key,
+            **_token_limits(values, existing)}
 
 
 def _validated(values, existing=None, *, require_key=True):
@@ -329,8 +417,10 @@ def _validated(values, existing=None, *, require_key=True):
 def _stored(entry):
     """Validate one entry read from disk; reject anything a save could not produce."""
 
-    if not isinstance(entry, dict) or not is_api_id(entry.get("id")):
-        raise ProviderError("Invalid API model entry.")
+    if not isinstance(entry, dict):
+        raise ProviderError("The entry is not an object.")
+    if not is_api_id(entry.get("id")):
+        raise ProviderError("The entry has no valid id (api:<name>).")
     result = _validated(entry, require_key=False)
     result["id"] = entry["id"]
     # Version-one entries represented one model per key. Preserve their exact
@@ -399,57 +489,84 @@ def _last_test(value):
     }
 
 
-def _read_store(strict=False):
-    """Read the entries; lenient readers skip damage, writers refuse to overwrite it."""
+def _load_store():
+    """Read the store strictly: one [stored item, valid entry or None, problem] row per entry.
+
+    An absent store holds no connections. A store that exists but cannot be
+    read or parsed raises StoreUnavailable: it never reads as empty, so a read
+    error is never taken for a removed model. Invalid entries stay in the
+    rows (see invalid_api_models()) and every write keeps them unchanged, so
+    one bad entry blocks nothing else.
+    """
 
     path = store_path()
     try:
         if path.is_symlink():
-            raise ProviderError("The API model store cannot be a symbolic link.")
+            raise StoreUnavailable(f"The API model store {path} is a symbolic link; replace it with the file itself.")
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-    except ProviderError:
-        if strict:
-            raise
-        return []
     except (OSError, UnicodeError) as exc:
-        if strict:
-            raise ProviderError(f"Cannot read the API model store {path}.") from exc
-        return []
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+        raise StoreUnavailable(f"Cannot read the API model store {path} ({reason}).") from None
     try:
         value = json.loads(raw)
         if not isinstance(value, dict) or not isinstance(value.get("models"), list):
             raise ValueError
-    except ValueError:
-        if strict:
-            # The JSON error text could quote stored content, including a key.
-            raise ProviderError(f"The API model store {path} is damaged; fix or remove it.") from None
-        return []
-    entries, seen = [], set()
-    for entry in value["models"]:
+    except (ValueError, RecursionError):
+        # The JSON error text could quote stored content, including a key.
+        raise StoreUnavailable(f"The API model store {path} is damaged; fix or remove it.") from None
+    rows, seen = [], set()
+    for item in value["models"]:
         try:
-            entry = _stored(entry)
+            entry = _stored(item)
             if entry["id"] in seen:
-                raise ProviderError("Duplicate API model id.")
-        except ProviderError:
-            if strict:
-                raise ProviderError(f"The API model store {path} has an invalid entry; fix or remove it.") from None
+                raise ProviderError("Another entry has the same id.")
+        except ProviderError as exc:
+            rows.append([item, None, str(exc)])
             continue
         seen.add(entry["id"])
-        entries.append(entry)
+        rows.append([item, entry, ""])
     if os.name != "nt":
         try:
             if path.stat().st_mode & 0o077:
                 os.chmod(path, 0o600)
         except OSError:
             pass
-    return entries
+    return rows
 
 
-def _write_store(entries):
-    """Atomically replace the store with an owner-only file."""
+def _entries(cached=True):
+    """The valid entries (connections) of the store.
 
+    A store that cannot be read right now gives this process's last good
+    read, so a running job keeps its settings through a momentary error
+    (``cached=False`` reads strictly and raises StoreUnavailable instead).
+    """
+
+    key = str(store_path())
+    with _STORE_LOCK:
+        try:
+            entries = [entry for _, entry, _ in _load_store() if entry is not None]
+        except StoreUnavailable:
+            if cached and key in _LAST_GOOD:
+                return _LAST_GOOD[key]
+            raise
+        _LAST_GOOD[key] = entries
+        return entries
+
+
+def _row_id(row):
+    """The id a store row names (also an invalid entry's, when it has one)."""
+
+    item, entry, _ = row
+    return entry["id"] if entry is not None else item.get("id") if isinstance(item, dict) else None
+
+
+def _write_store(rows):
+    """Atomically replace the store with an owner-only file; invalid entries are written back unchanged."""
+
+    entries = [entry if entry is not None else item for item, entry, _ in rows]
     path = store_path()
     private_directory(path.parent)
     if path.is_symlink():
@@ -489,6 +606,7 @@ def public_api_model(entry):
         "lastTest": entry.get("lastTest"), "createdAt": entry.get("createdAt", ""),
         "updatedAt": entry.get("updatedAt", ""),
         "sourceId": entry.get("sourceId", entry["id"]), "sourceLabel": entry["label"],
+        "contextWindow": entry.get("contextWindow"), "maxOutputTokens": entry.get("maxOutputTokens"),
     }
 
 
@@ -498,31 +616,95 @@ def public_api_connection(entry):
     return {**public_api_model(entry), "models": _connection_models(entry)}
 
 
-def load_api_models():
-    """Every valid configured API model, without keys."""
+def _invalid_reference(index, item):
+    """A stable name for one invalid entry: its position and a digest of everything but its key."""
 
-    with _STORE_LOCK:
-        return [public_api_model(entry) for entry in _read_store()]
+    content = {key: value for key, value in item.items() if key != "apiKey"} if isinstance(item, dict) else item
+    digest = hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+    return f"invalid-{index}-{digest}"
+
+
+def _public_invalid(index, item, problem):
+    """Browser-safe view of an entry that cannot be used: what is readable of it, never its key or URL."""
+
+    item = item if isinstance(item, dict) else {}
+    text = {name: item[name].strip()[:80] for name in ("label", "model")
+            if isinstance(item.get(name), str) and item[name].strip()}
+    try:
+        host = (urlsplit(item["baseUrl"]).hostname or "").lower() if isinstance(item.get("baseUrl"), str) else ""
+    except ValueError:
+        host = ""
+    identity = item.get("id") if is_api_id(item.get("id")) else ""
+    return {"id": identity, "ref": _invalid_reference(index, item), "invalid": True, "problem": problem,
+            "label": text.get("label") or identity or f"Entry {index + 1}", "model": text.get("model", ""),
+            "format": item.get("format") if item.get("format") in FORMATS else "", "host": host[:200],
+            "hasKey": isinstance(item.get("apiKey"), str) and bool(item["apiKey"].strip())}
+
+
+def load_api_models():
+    """Every valid configured API model, without keys (StoreUnavailable when the store cannot be read)."""
+
+    return [public_api_model(entry) for entry in _entries()]
 
 
 def load_api_connections():
-    with _STORE_LOCK:
-        return [public_api_connection(entry) for entry in _read_store()]
+    """Every valid saved API connection with its model choices, without keys (StoreUnavailable as above)."""
+
+    return [public_api_connection(entry) for entry in _entries()]
 
 
-def api_connection(connection_id):
+def invalid_api_models():
+    """The store entries that cannot be used, with why, so that they can be repaired or removed."""
+
+    return store_listing()[1]
+
+
+def store_listing():
+    """The store as the settings page shows it, read strictly: (connections without keys, invalid entries)."""
+
     with _STORE_LOCK:
-        entry = next((entry for entry in _read_store() if entry["id"] == connection_id), None)
+        rows = _load_store()
+        _LAST_GOOD[str(store_path())] = [entry for _, entry, _ in rows if entry is not None]
+    return ([public_api_connection(entry) for _, entry, _ in rows if entry is not None],
+            [_public_invalid(index, item, problem) for index, (item, entry, problem) in enumerate(rows)
+             if entry is None])
+
+
+def check_private_state():
+    """'' when the private state folders can be created and written, else what to fix (checked at startup)."""
+
+    try:
+        state = private_directory(state_directory())
+        for name in (CODEX_HOMES, CLAUDE_SETTINGS, CLAUDE_HOMES, CLAUDE_TRANSCRIPTS, SESSIONS):
+            if (state / name).exists() or (state / name).is_symlink():
+                private_directory(state / name)
+        descriptor, probe = tempfile.mkstemp(dir=state, prefix=".probe-")
+        os.close(descriptor)
+        os.unlink(probe)
+    except ProviderError as exc:
+        return str(exc)
+    except OSError as exc:
+        return (f"The private TCS Prover state folder {state_directory()} cannot be used "
+                f"({exc.strerror or type(exc).__name__}).")
+    return ""
+
+
+def api_connection(connection_id, cached=True):
+    """One saved API connection without its key, or None (StoreUnavailable when the store cannot be read)."""
+
+    entry = next((entry for entry in _entries(cached) if entry["id"] == connection_id), None)
     return public_api_connection(entry) if entry else None
 
 
-def api_model(model_id):
-    """One configured API model without its key, or None."""
+def api_model(model_id, cached=True):
+    """One configured API model without its key, or None when the store has no such model.
+
+    A store that cannot be read raises StoreUnavailable (see _entries()).
+    """
 
     if not is_api_id(model_id):
         return None
-    with _STORE_LOCK:
-        entry = _resolve_api_model(_read_store(), model_id)
+    entry = _resolve_api_model(_entries(cached), model_id)
     return public_api_model(entry) if entry else None
 
 
@@ -531,8 +713,7 @@ def api_model_secret(model_id):
 
     if not is_api_id(model_id):
         return ""
-    with _STORE_LOCK:
-        entry = _resolve_api_model(_read_store(), model_id)
+    entry = _resolve_api_model(_entries(), model_id)
     return entry.get("apiKey", "") if entry else ""
 
 
@@ -550,30 +731,48 @@ def save_api_model(values, reserved=()):
     if requested not in (None, "") and not is_api_id(requested):
         raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
     with _STORE_LOCK:
-        entries = _read_store(strict=True)
+        rows = _load_store()
+        entries = [entry for _, entry, _ in rows if entry is not None]
         existing = next((entry for entry in entries if requested and entry["id"] == requested), None)
         entry = _validated(values, existing)
         entry.update(legacyModelId=True, availableModels=[{"id": entry["model"], "label": entry["model"]}])
         now = _now()
         if existing:
-            changed = any(existing[key] != entry[key]
-                          for key in ("format", "baseUrl", "requestSource", "model", "apiKey"))
+            # The Test sends the max output too, so a changed one needs a new test.
+            changed = any(existing.get(key) != entry.get(key)
+                          for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "maxOutputTokens"))
             entry.update(id=existing["id"], createdAt=existing.get("createdAt") or now, updatedAt=now,
                          lastTest=None if changed else existing.get("lastTest"))
-            entries = [entry if item["id"] == existing["id"] else item for item in entries]
         else:
             identity = requested
             if not identity:
                 taken = {item["id"] for item in entries} | set(reserved)
                 taken.update(row["modelId"] for item in entries for row in _connection_models(item))
+                taken.update(_row_id(row) for row in rows if row[1] is None)
                 base = new_api_id(values.get("label"), entry["model"])
                 identity, number = base, 2
                 while identity in taken:
                     identity, number = f"{base}-{number}", number + 1
             entry.update(id=identity, createdAt=now, updatedAt=now, lastTest=None)
-            entries.append(entry)
-        _write_store(entries)
+        _write_store(_with_entry(rows, entry))
         return public_api_model(entry)
+
+
+def _with_entry(rows, entry):
+    """The store rows with ``entry`` saved over the entry with its id, else added.
+
+    Without a valid entry of that id, the invalid entries naming it are
+    replaced: saving under an invalid entry's id repairs it in place.
+    """
+
+    valid = [index for index, row in enumerate(rows) if row[1] is not None and row[1]["id"] == entry["id"]]
+    invalid = [index for index, row in enumerate(rows) if row[1] is None and _row_id(row) == entry["id"]]
+    if valid:
+        return [[entry, entry, ""] if index == valid[0] else row for index, row in enumerate(rows)]
+    if invalid:
+        return [[entry, entry, ""] if index == invalid[0] else row for index, row in enumerate(rows)
+                if index == invalid[0] or index not in invalid]
+    return [*rows, [entry, entry, ""]]
 
 
 def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=None, expected=None):
@@ -587,8 +786,17 @@ def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=
     choices = _available_models(discovered_models)
     legacy_model = _model_name(legacy_model) if legacy_model is not None else None
     with _STORE_LOCK:
-        entries = _read_store(strict=True)
+        rows = _load_store()
+        entries = [entry for _, entry, _ in rows if entry is not None]
         existing = next((entry for entry in entries if entry["id"] == requested), None)
+        broken = next((row[0] for row in rows if row[1] is None and requested and _row_id(row) == requested), None)
+        if (existing is None and broken is not None and legacy_model is None
+                and broken.get("legacyModelId", True) is not False):
+            # Repairing a version-one entry keeps the model id that jobs recorded for it.
+            try:
+                legacy_model = _model_name(broken.get("model"))
+            except ProviderError:
+                legacy_model = None
         if expected is not None and (existing is None or any(
                 existing.get(key) != expected.get(key)
                 for key in ("format", "baseUrl", "requestSource", "apiKey", "label", "updatedAt"))):
@@ -602,6 +810,9 @@ def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=
         else:
             taken = {entry["id"] for entry in entries} | set(reserved)
             taken.update(row["modelId"] for entry in entries for row in _connection_models(entry))
+            if not requested:
+                # A requested id that only an invalid entry has repairs that entry.
+                taken.update(_row_id(row) for row in rows if row[1] is None)
             base = requested or API_ID_PREFIX + _slug(label)
             identity, number = base, 2
             while identity in taken:
@@ -613,8 +824,7 @@ def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=
                  "model": existing["model"] if existing else legacy_model or choices[0]["id"],
                  "createdAt": (existing or {}).get("createdAt") or now, "updatedAt": now,
                  "lastTest": None}
-        entries = [entry if row["id"] == identity else row for row in entries] if existing else [*entries, entry]
-        _write_store(entries)
+        _write_store(_with_entry(rows, entry))
         return public_api_connection(entry)
 
 
@@ -623,14 +833,14 @@ def refresh_api_connection(connection_id, expected, discovered_models):
 
     choices = _available_models(discovered_models)
     with _STORE_LOCK:
-        entries = _read_store(strict=True)
-        entry = next((entry for entry in entries if entry["id"] == connection_id), None)
+        rows = _load_store()
+        entry = next((entry for _, entry, _ in rows if entry is not None and entry["id"] == connection_id), None)
         fields = ("format", "baseUrl", "requestSource", "apiKey")
         if entry is None or any(entry[key] != expected[key] for key in fields):
             raise ProviderError("The API connection changed while loading models. Load its models again.")
         entry["availableModels"] = choices
         entry["updatedAt"] = _now()
-        _write_store(entries)
+        _write_store(rows)
         return public_api_connection(entry)
 
 
@@ -651,8 +861,7 @@ def validated_api_model(values, model_id=None):
 
     if model_id not in (None, "") and not is_api_id(model_id):
         raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
-    with _STORE_LOCK:
-        saved = _resolve_api_model(_read_store(), model_id) if model_id else None
+    saved = _resolve_api_model(_entries(cached=False), model_id) if model_id else None
     return _validated(values, saved), saved
 
 
@@ -665,20 +874,32 @@ def validated_api_connection(values, model_id=None):
 
     if model_id not in (None, "") and not is_api_id(model_id):
         raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
-    with _STORE_LOCK:
-        saved = next((entry for entry in _read_store() if model_id and entry["id"] == model_id), None)
+    saved = next((entry for entry in _entries(cached=False) if model_id and entry["id"] == model_id), None)
     if model_id and saved is None:
         raise ProviderError("That API model is not configured.")
     return _validated_connection(values, saved)
 
 
 def delete_api_model(model_id):
-    """Remove one API model; return whether it existed."""
+    """Remove one API connection (also an invalid entry with that id); return whether it existed."""
 
     with _STORE_LOCK:
-        entries = _read_store(strict=True)
-        remaining = [entry for entry in entries if entry["id"] != model_id]
-        if len(remaining) == len(entries):
+        rows = _load_store()
+        remaining = [row for row in rows if _row_id(row) != model_id]
+        if len(remaining) == len(rows):
+            return False
+        _write_store(remaining)
+        return True
+
+
+def delete_invalid_api_model(reference):
+    """Remove one invalid entry named by its reference (see invalid_api_models()); return whether it existed."""
+
+    with _STORE_LOCK:
+        rows = _load_store()
+        remaining = [row for index, row in enumerate(rows)
+                     if row[1] is not None or _invalid_reference(index, row[0]) != reference]
+        if len(remaining) == len(rows):
             return False
         _write_store(remaining)
         return True
@@ -690,13 +911,14 @@ def record_api_model_test(model_id, result):
     if not isinstance(result, dict):
         raise ProviderError("A test result must be an object.")
     with _STORE_LOCK:
-        entries = _read_store(strict=True)
+        rows = _load_store()
+        entries = [entry for _, entry, _ in rows if entry is not None]
         resolved = _resolve_api_model(entries, model_id)
         entry = next((entry for entry in entries if entry["id"] == (resolved or {}).get("sourceId", model_id)), None)
         if entry is None:
             raise ProviderError("Unknown API model.")
         entry["lastTest"] = _last_test({**result, "at": result.get("at") or _now()})
-        _write_store(entries)
+        _write_store(rows)
         return public_api_model(entry)
 
 
@@ -721,13 +943,19 @@ def _api_row(model, choice=None):
 
 
 def catalog(include_legacy=False):
-    """Menu rows: built-ins first, then configured API models. No secrets."""
+    """Menu rows: built-ins first, then configured API models. No secrets.
+
+    While the store cannot be read (and this process never read it), the
+    menus show the built-in models only; the API connection list says why.
+    """
 
     rows = [_builtin_row(row) for row in BUILTIN_MODELS]
     if include_legacy:
         rows += [_builtin_row(row) for row in _LEGACY_MODELS]
-    with _STORE_LOCK:
-        entries = _read_store()
+    try:
+        entries = _entries()
+    except StoreUnavailable:
+        entries = []
     for entry in entries:
         model = public_api_model(entry)
         choices = _connection_models(entry)
@@ -740,22 +968,28 @@ def catalog(include_legacy=False):
 def source_catalog():
     """Every selectable CLI or saved API-key source, without credentials."""
 
+    try:
+        connections = load_api_connections()
+    except StoreUnavailable:
+        connections = []  # As in catalog(): the built-in sources only.
     return [{"id": CODEX, "label": PROVIDER_LABELS[CODEX], "provider": CODEX},
             {"id": CLAUDE, "label": PROVIDER_LABELS[CLAUDE], "provider": CLAUDE},
             *[{"id": entry["id"], "label": entry["label"], "provider": API,
                "format": entry["format"], "host": entry["host"], "hasKey": entry["hasKey"], "keyHint": entry["keyHint"]}
-              for entry in load_api_connections()]]
+              for entry in connections]]
 
 
 def lookup(model_id):
-    """The catalog row of any accepted id (including older Codex ids), or None."""
+    """The catalog row of any accepted id (including older Codex ids), or None.
+
+    For an api:<id> model a store that cannot be read raises StoreUnavailable.
+    """
 
     if isinstance(model_id, str) and model_id in _BUILTIN:
         return _builtin_row(_BUILTIN[model_id])
     if not is_api_id(model_id):
         return None
-    with _STORE_LOCK:
-        entry = _resolve_api_model(_read_store(), model_id)
+    entry = _resolve_api_model(_entries(), model_id)
     if entry is None:
         return None
     choice = next((row for row in entry["availableModels"] if row["id"] == entry["model"]),
@@ -819,9 +1053,10 @@ def efforts_for(model_id):
 def effective_effort(model_id, effort):
     """Clamp a shared-menu effort to the highest level the model lists at or below it.
 
-    Ultra therefore runs as Max on Luna, Claude and API models.
+    A retired effort runs as its replacement first (Ultra as Max, see RETIRED_EFFORTS).
     """
 
+    effort = RETIRED_EFFORTS.get(effort, effort)
     if effort not in CODEX_EFFORTS:
         raise ProviderError("Choose a valid reasoning effort.")
     supported = efforts_for(model_id)

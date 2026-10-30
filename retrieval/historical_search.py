@@ -41,6 +41,7 @@ https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -54,6 +55,7 @@ from html.parser import HTMLParser
 import io
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -70,12 +72,21 @@ if __name__ == '__main__' and not __package__:
     # Codex launches the broker by path; import its siblings from the package.
     sys.path[0] = str(Path(__file__).resolve().parents[1])
 
-from retrieval.historical_transport import (ALLOWED_NETWORK_HOSTS, MAX_BYTES, HistoricalSearchError,
-                                            HttpResponse, NoRedirect, RestrictedHttpClient)
+from retrieval.historical_transport import (ALLOWED_NETWORK_HOSTS, MAX_BYTES, Budget, HistoricalSearchError,
+                                            HttpResponse, NoRedirect, RestrictedHttpClient, clock_text)
 
 UTC = timezone.utc
 MAX_PROTOCOL_LINE = 64 * 1024
 TEXT_MIMES = frozenset({'text/html', 'application/xhtml+xml', 'text/plain', 'application/pdf'})
+# Documents a limit keeps from being searched or read; reported by name, never as "no capture".
+LIMIT_CODES = frozenset({'document_too_large', 'pdf_limit'})
+DISCOVERY_CACHE_SECONDS = 900.0
+# A second discovery attempt within one call needs at least this much of its budget.
+DISCOVERY_RETRY_RESERVE_SECONDS = 60.0
+# The run's author model comes first, then the pinned model, then these.
+DISCOVERY_FALLBACK_MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+DISCOVERY_MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+UNAVAILABLE_MODEL_SECONDS = 3600.0
 LIMITATION = ('Historical-content approximation: current search ranking and any discovery model '
               'influence candidate selection; archive coverage and model knowledge differ from the original experiment.')
 
@@ -192,15 +203,32 @@ def pdf_supported() -> bool:
         return False
 
 
+class _FormLimitWatch(logging.Handler):
+    """Notice pypdf skipping form XObjects in this thread; it only logs a warning."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.thread, self.exceeded = threading.get_ident(), False
+
+    def emit(self, record):
+        if record.thread == self.thread and str(record.msg).startswith('Exceeded %(limit)d form XObject'):
+            self.exceeded = True
+
+
 def extract_pdf(body: bytes) -> tuple[str, str]:
     """Decode verified bytes only; never follow links, attachments, or PDF actions.
 
     Requires pypdf>=6.20.1,<7 for its public resource-limit configuration. Large,
     encrypted, image-only and malformed documents fail closed; no OCR fallback.
+    A document over a resource limit fails with code ``pdf_limit``, including
+    one whose embedded forms pypdf would otherwise skip without saying so.
     """
     if not pdf_supported():
         raise HistoricalSearchError('Verified PDF requires the optional pypdf>=6.20.1,<7 dependency.')
     from pypdf import PdfReader, apply_configuration
+    from pypdf.errors import LimitReachedError
+    watch = _FormLimitWatch()
+    logging.getLogger('pypdf').addHandler(watch)
     try:
         with apply_configuration(maximum_declared_stream_length=MAX_BYTES,
                                  array_based_stream_maximum_output_length=MAX_BYTES,
@@ -218,8 +246,11 @@ def extract_pdf(body: bytes) -> tuple[str, str]:
                                  xform_maximum_invocations_per_extraction=100,
                                  jbig2dec_binary=None, disable_legacy_handling=True):
             reader = PdfReader(io.BytesIO(body), strict=True)
-            if reader.is_encrypted or len(reader.pages) > 250:
+            if reader.is_encrypted:
                 raise HistoricalSearchError('Encrypted or oversized PDF cannot be extracted.')
+            if len(reader.pages) > 250:
+                raise HistoricalSearchError('The archived PDF has more than 250 pages, the extraction limit; '
+                                            'no text from it can be returned.', code='pdf_limit')
             # pypdf can decode malformed text maps into lone surrogates, which
             # no UTF-8 reply, digest or audit can carry. Offsets follow this text.
             title = well_formed_text(str(reader.metadata.title or '')) if reader.metadata else ''
@@ -229,18 +260,28 @@ def extract_pdf(body: bytes) -> tuple[str, str]:
                 contents = page.get_contents()
                 stream_bytes += len(contents.get_data()) if contents is not None else 0
                 if stream_bytes > MAX_BYTES * 4:
-                    raise HistoricalSearchError('PDF content exceeds the extraction resource limit.')
+                    raise HistoricalSearchError('The archived PDF\'s page content exceeds the 16 MiB extraction limit; '
+                                                'no text from it can be returned.', code='pdf_limit')
                 pages.append(well_formed_text(page.extract_text()))
+                if watch.exceeded:
+                    raise HistoricalSearchError('The archived PDF uses more embedded forms per page than the extraction '
+                                                'limit allows; its text cannot be returned completely.', code='pdf_limit')
                 if sum(len(item) for item in pages) > 1000000:
-                    raise HistoricalSearchError('PDF text exceeds the extraction resource limit.')
+                    raise HistoricalSearchError('The archived PDF has more than 1,000,000 characters of text, the '
+                                                'extraction limit; no text from it can be returned.', code='pdf_limit')
             content = '\n\n'.join(pages).strip()
             if not content:
                 raise HistoricalSearchError('Verified PDF has no extractable text; OCR is not enabled.')
             return title[:500], content
     except HistoricalSearchError:
         raise
+    except LimitReachedError:
+        raise HistoricalSearchError('The archived PDF exceeds an extraction resource limit; '
+                                    'no text from it can be returned.', code='pdf_limit') from None
     except Exception:
         raise HistoricalSearchError('Verified PDF extraction failed closed.') from None
+    finally:
+        logging.getLogger('pypdf').removeHandler(watch)
 
 
 def decode_verified_payload(body: bytes, content_encoding: str) -> bytes:
@@ -388,7 +429,16 @@ class Snapshot:
 
 
 class AuditLog:
+    """Append content-free records; a failed write is kept and retried every minute.
+
+    Records that wait keep their order: later ones queue behind them. Only a
+    backlog of MAX_PENDING records stops retrieval (audit_failure).
+    """
     _write_lock = threading.Lock()
+    _pending = {}
+    _flusher = None
+    RETRY_SECONDS = 60.0
+    MAX_PENDING = 10000
 
     def __init__(self, path: Path, cutoff: datetime, provider: str):
         self.path = path
@@ -396,31 +446,78 @@ class AuditLog:
         self.cutoff, self.provider = utc_text(cutoff), provider
         self.write('startup', status='ready')
 
+    @staticmethod
+    def _append(path, lines):
+        with path.open('a', encoding='utf-8', newline='\n') as stream:
+            stream.write(''.join(lines))
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    @classmethod
+    def flush_pending(cls):
+        """Write waiting records in order; True when none remain."""
+        with cls._write_lock:
+            for waiting in cls._pending.values():
+                if waiting['lines']:
+                    try:
+                        cls._append(waiting['path'], waiting['lines'])
+                    except OSError:
+                        continue
+                    waiting['lines'].clear()
+            return not any(waiting['lines'] for waiting in cls._pending.values())
+
+    @classmethod
+    def _retry_pending(cls):
+        while True:
+            time.sleep(cls.RETRY_SECONDS)
+            cls.flush_pending()
+            with cls._write_lock:
+                if not any(waiting['lines'] for waiting in cls._pending.values()):
+                    cls._flusher = None
+                    return
+
     def write(self, event: str, **fields):
         record = {'event': event, 'time': utc_text(datetime.now(UTC)), 'cutoff': self.cutoff,
                   'provider': self.provider, **fields}
         if self.operation_id is not None and 'operation_id' not in record:
             record['operation_id'] = self.operation_id
-        try:
-            with self._write_lock, self.path.open('a', encoding='utf-8', newline='\n') as stream:
-                stream.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + '\n')
-                stream.flush()
-                os.fsync(stream.fileno())
-        except OSError:
-            raise HistoricalSearchError('Audit logging failed; retrieval is disabled.',
-                                        code='audit_failure', operational=True) from None
+        line = json.dumps(record, sort_keys=True, ensure_ascii=False) + '\n'
+        with self._write_lock:
+            pending = AuditLog._pending.setdefault(str(self.path), {'path': self.path, 'lines': []})['lines']
+            if not pending:
+                try:
+                    self._append(self.path, [line])
+                    return
+                except OSError:
+                    pass
+            if len(pending) >= self.MAX_PENDING:
+                raise HistoricalSearchError('Audit logging failed for too long; retrieval is disabled.',
+                                            code='audit_failure', operational=True)
+            # A full disk or a briefly unwritable log must not disable retrieval:
+            # keep the record and write it, in order, once the log accepts it.
+            pending.append(line)
+            if AuditLog._flusher is None:
+                AuditLog._flusher = threading.Thread(target=AuditLog._retry_pending, name='historical-audit',
+                                                     daemon=True)
+                AuditLog._flusher.start()
+
+
+atexit.register(AuditLog.flush_pending)
 
 
 class WaybackProvider:
     def __init__(self, cutoff: datetime, token: str, client: RestrictedHttpClient, max_candidates: int):
         self.cutoff, self.token, self.client, self.max_candidates = cutoff, token, client, max_candidates
         self.cache: OrderedDict[tuple[str, str], Snapshot] = OrderedDict()
-        self.negative_cache: OrderedDict[tuple[str, str], float] = OrderedDict()
+        # Key -> (expiry, error to repeat): a missing capture or one over a limit.
+        self.negative_cache: OrderedDict[tuple[str, str], tuple] = OrderedDict()
         # Guards compound updates of the bounded in-memory caches, which calls
         # may share. Never held during network, extraction or persistent I/O.
         self.cache_lock = threading.Lock()
         self.persistent_cache = None
         self.audit = None
+        # Shared BackgroundRetries of the broker, when it has one (see main()).
+        self.retrier = None
 
     def share_memory_caches(self, source):
         """Reuse another call's bounded in-memory caches, never its request state.
@@ -431,8 +528,21 @@ class WaybackProvider:
         if type(source) is not type(self) or source.cutoff != self.cutoff:
             return
         self.cache_lock, self.cache, self.negative_cache = source.cache_lock, source.cache, source.negative_cache
-        if hasattr(source, 'discovery_cache'):
-            self.discovery_cache = source.discovery_cache
+        for name in ('discovery_cache', 'discovery_models', 'retrier'):
+            if hasattr(source, name):
+                setattr(self, name, getattr(source, name))
+
+    def _cache_miss(self, url, reason, quarantine=False):
+        """A cache problem is a miss: the archive is asked again and verified as usual."""
+        from retrieval.historical_cache import CacheError
+        if quarantine:
+            try:
+                self.persistent_cache.quarantine(url, reason)
+            except CacheError:
+                pass
+        if self.audit is not None:
+            self.audit('archive_cache_unavailable', url_sha256=sha256(url.encode()), reason=reason)
+        return None
 
     def _cached_capture(self, url):
         if self.persistent_cache is None:
@@ -456,9 +566,13 @@ class WaybackProvider:
         except HistoricalSearchError as error:
             if error.code == 'unusable_capture':
                 return None
-            raise HistoricalSearchError('Protected archive cache failed validation.', code='cache_invalid') from None
-        except (CacheError, ValueError, TypeError):
-            raise HistoricalSearchError('Protected archive cache failed validation.', code='cache_invalid') from None
+            # Never used: it is moved aside and the archive is asked again.
+            return self._cache_miss(url, 'invalid_entry', quarantine=True)
+        except CacheError as error:
+            return self._cache_miss(url, {'invalid': 'invalid_entry'}.get(error.kind, error.kind),
+                                    quarantine=error.kind == 'invalid')
+        except (ValueError, TypeError):
+            return self._cache_miss(url, 'invalid_entry', quarantine=True)
         if self.audit is not None:
             self.audit('archive_cache_hit', url_sha256=sha256(url.encode()),
                        capture=utc_text(capture_datetime(snapshot.capture)), body_sha256=snapshot.body_sha256)
@@ -491,9 +605,10 @@ class WaybackProvider:
         record = {**snapshot.__dict__, 'body': base64.b64encode(snapshot.body).decode('ascii')}
         try:
             self.persistent_cache.put(snapshot.url, record)
-        except CacheError:
-            raise HistoricalSearchError('Protected archive cache could not be updated.',
-                                        code='cache_unavailable', operational=True) from None
+        except CacheError as error:
+            # The verified capture is still returned; only its reuse is lost.
+            if self.audit is not None:
+                self.audit('archive_cache_write_failed', url_sha256=sha256(snapshot.url.encode()), reason=error.kind)
 
     @staticmethod
     def _json(response: HttpResponse, expected_url: str):
@@ -528,6 +643,42 @@ class WaybackProvider:
         return sorted(urls)
 
     def open(self, url: str) -> Snapshot:
+        """Return the newest verified capture, or say why none can be returned.
+
+        A transient archive failure is retried in the background (see
+        BackgroundRetries) and its message says when to ask again.
+        """
+        try:
+            return self._open_capture(url)
+        except HistoricalSearchError as error:
+            raise self._retry_later(error, url) from None
+
+    def _retry_later(self, error, url):
+        if (self.retrier is None or not error.operational
+                or error.code in ('audit_failure', 'provider_challenge', 'redirect_rejected', 'destination_rejected',
+                                  'rate_limit_policy', 'tls_rejected')):
+            return error
+        retry_at = self.retrier.schedule('archive', canonical_url(url), not_before=error.retry_at)
+        if retry_at is None:
+            return error
+        hint = (' The broker retries this archive request in the background.' if error.retry_at
+                else f' The broker retries this archive request in the background; try again after {clock_text(retry_at)}.')
+        return HistoricalSearchError(str(error) + hint, code=error.code, retryable=error.retryable,
+                                     operational=True, status=error.status, host=error.host,
+                                     failure_kind=error.failure_kind, retry_at=max(retry_at, error.retry_at or 0))
+
+    def retry_archive(self, url, timeout):
+        """One background attempt; True once the answer is final (cached, or definitive)."""
+        operation = (self.client.operation(timeout_seconds=timeout)
+                     if hasattr(self.client, 'operation') else nullcontext())
+        try:
+            with operation:
+                self._open_capture(url)
+        except HistoricalSearchError as error:
+            return not error.operational or error.code == 'audit_failure'
+        return True
+
+    def _open_capture(self, url: str) -> Snapshot:
         url = canonical_url(url)
         key = (utc_text(self.cutoff), url)
         with self.cache_lock:
@@ -555,8 +706,11 @@ class WaybackProvider:
                     self.cache.popitem(last=False)
             return cached
         with self.cache_lock:
-            absent = self.negative_cache.get(key, 0) > time.monotonic()
-        if absent:
+            absent = self.negative_cache.get(key)
+            absent = absent if absent is not None and absent[0] > time.monotonic() else None
+        if absent is not None:
+            if absent[1] is not None:
+                raise HistoricalSearchError(str(absent[1]), code=absent[1].code)
             raise HistoricalSearchError(
                 "No verifiable historical capture is available (short-lived cached absence).",
                 code="no_capture")
@@ -587,7 +741,7 @@ class WaybackProvider:
                     accepted.append(record)
             except HistoricalSearchError:
                 continue
-        last_operational_error = None
+        last_operational_error = last_limit_error = None
         unusable_digests = set()
         for record in sorted(accepted, key=lambda item: item['timestamp'], reverse=True):
             if record['digest'] in unusable_digests:
@@ -620,9 +774,15 @@ class WaybackProvider:
             except HistoricalSearchError as error:
                 if error.code == 'audit_failure':
                     raise
+                if error.code == 'response_too_large':
+                    error = HistoricalSearchError('The archived document is larger than the 4 MiB retrieval limit; '
+                                                  'no text from it can be returned.', code='document_too_large')
+                if error.code in LIMIT_CODES:
+                    # An older capture may be smaller: keep looking, then say so.
+                    last_limit_error = error
                 if error.operational:
                     last_operational_error = error
-                if error.code == 'deadline_exceeded':
+                if error.code in ('deadline_exceeded', 'provider_cooldown'):
                     break
                 continue
             self._store_capture(snapshot)
@@ -634,9 +794,11 @@ class WaybackProvider:
         if last_operational_error is not None:
             raise last_operational_error
         with self.cache_lock:
-            self.negative_cache[key] = time.monotonic() + 60
+            self.negative_cache[key] = (time.monotonic() + 60, last_limit_error)
             while len(self.negative_cache) > 64:
                 self.negative_cache.popitem(last=False)
+        if last_limit_error is not None:
+            raise last_limit_error
         raise HistoricalSearchError('No verifiable historical capture is available.', code='no_capture')
 
 
@@ -749,29 +911,135 @@ class ScholarlyWaybackProvider(WaybackProvider):
 
 
 class CodexWaybackProvider(WaybackProvider):
-    """Untrusted URL suggestions from a separate controller-owned search session."""
+    """Untrusted URL suggestions from a separate controller-owned search session.
 
-    def __init__(self, cutoff, client, max_candidates, settings, audit):
+    A failed discovery is tried once more within the call when its budget
+    allows, then every minute in the background (BackgroundRetries); complete
+    results stay in a short-lived cache for the next identical search. The
+    model is chosen per call: the run's Codex author model, then the pinned
+    model, then DISCOVERY_FALLBACK_MODELS, skipping models the account
+    recently could not use. The audit log records the model of every attempt.
+    """
+
+    def __init__(self, cutoff, client, max_candidates, settings, audit, workspace=None):
         super().__init__(cutoff, '', client, max_candidates)
         self.discovery_settings = dict(settings)
         self.audit = audit
         self.discovery_deadline = None
+        self.workspace = workspace
+        self.discovery_cache = OrderedDict()
+        self.discovery_models = {}
 
-    def candidates(self, query):
+    def _author_model(self):
+        """The run's current author model from its protected job settings, if valid."""
+        if not self.workspace:
+            return None
+        path = Path(self.workspace) / 'job-settings.json'
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                return None
+            model = json.loads(path.read_text(encoding='utf-8-sig')).get('authorModel')
+        except (OSError, ValueError, AttributeError):
+            return None
+        if (isinstance(model, str) and DISCOVERY_MODEL_NAME.fullmatch(model)
+                and not model.casefold().startswith('claude')):
+            return model
+        return None
+
+    def _discovery_model(self):
+        now = time.monotonic()
+        with self.cache_lock:
+            unavailable = {model for model, until in self.discovery_models.items() if until > now}
+        pinned = self.discovery_settings.get('model')
+        for model in dict.fromkeys((self._author_model(), pinned, *DISCOVERY_FALLBACK_MODELS)):
+            if isinstance(model, str) and DISCOVERY_MODEL_NAME.fullmatch(model) and model not in unavailable:
+                return model
+        return pinned
+
+    def _cached_discovery(self, key):
+        with self.cache_lock:
+            cached = self.discovery_cache.get(key)
+            if cached is not None and cached[0] > time.monotonic():
+                self.discovery_cache.move_to_end(key)
+                return list(cached[1])
+        return None
+
+    def _remember(self, key, urls):
+        with self.cache_lock:
+            self.discovery_cache[key] = (time.monotonic() + DISCOVERY_CACHE_SECONDS, tuple(urls))
+            while len(self.discovery_cache) > 64:
+                self.discovery_cache.popitem(last=False)
+
+    def _discover_once(self, query, deadline):
+        """One discovery attempt: (urls, None, None), or (None, failure code, binary message)."""
         from retrieval.historical_codex_discovery import DiscoveryError, discover
+        model = self._discovery_model()
         try:
             urls = discover(query, self.cutoff, self.max_candidates, self.discovery_settings,
-                            self.audit, deadline=self.discovery_deadline)
+                            self.audit, deadline=deadline, model=model)
         except HistoricalSearchError as error:
             if error.code == 'audit_failure':
                 raise
-            raise HistoricalSearchError('Independent Codex discovery failed; no live content or fallback is returned.',
-                                        code='discovery_unavailable', operational=True) from None
+            return None, 'discovery_unavailable', None
         except Exception as error:
-            code = ('discovery_timeout' if isinstance(error, DiscoveryError)
-                    and getattr(error, 'code', None) == 'discovery_timeout' else 'discovery_unavailable')
-            raise HistoricalSearchError('Independent Codex discovery failed; no live content or fallback is returned.',
-                                        code=code, operational=True) from None
+            code = getattr(error, 'code', None) if isinstance(error, DiscoveryError) else None
+            if code == 'discovery_model_unavailable':
+                with self.cache_lock:
+                    self.discovery_models[model] = time.monotonic() + UNAVAILABLE_MODEL_SECONDS
+                if self.audit is not None:
+                    self.audit('codex_discovery_model_unavailable', model=model)
+            if code == 'discovery_binary':
+                return None, code, str(error)
+            return None, 'discovery_timeout' if code == 'discovery_timeout' else 'discovery_unavailable', None
+        try:
+            return self._validated(urls), None, None
+        except HistoricalSearchError:
+            return None, 'discovery_unavailable', None
+
+    def retry_discovery(self, query):
+        """One background attempt; True once the result is cached or cannot come."""
+        key = sha256(query.encode('utf-8'))
+        if self._cached_discovery(key) is not None:
+            return True
+        try:
+            urls, code, _ = self._discover_once(query, time.monotonic() + self.discovery_settings['timeout_seconds'])
+        except HistoricalSearchError:
+            return False
+        if urls is not None:
+            self._remember(key, urls)
+            return True
+        return code == 'discovery_binary'
+
+    def candidates(self, query):
+        key = sha256(query.encode('utf-8'))
+        cached = self._cached_discovery(key)
+        if cached is not None:
+            if self.audit is not None:
+                self.audit('codex_discovery_cache_hit', query_sha256=key)
+            return cached
+        code = binary = None
+        for attempt in (1, 2):
+            if attempt == 2 and (self.discovery_deadline is not None and self.discovery_deadline
+                                 - time.monotonic() < DISCOVERY_RETRY_RESERVE_SECONDS):
+                break
+            urls, code, binary = self._discover_once(query, self.discovery_deadline)
+            if urls is not None:
+                self._remember(key, urls)
+                return urls
+            if code == 'discovery_binary':
+                break
+        message = 'Independent Codex discovery failed; no live content or fallback is returned.'
+        if code == 'discovery_binary':
+            raise HistoricalSearchError(binary, code='discovery_binary', operational=True)
+        retry_at = self.retrier.schedule('discovery', query) if self.retrier is not None else None
+        if retry_at is not None:
+            message += (' The broker retries this search in the background; repeat the same search after '
+                        f'{clock_text(retry_at)}.')
+        else:
+            message += f' Try the same search again after {clock_text(time.time() + 60)}.'
+        raise HistoricalSearchError(message, code=code, operational=True, retry_at=retry_at)
+
+    def _validated(self, urls):
         if not isinstance(urls, list) or len(urls) > self.max_candidates:
             raise HistoricalSearchError('Independent Codex discovery returned invalid URL candidates.',
                                         code='discovery_unavailable', operational=True)
@@ -898,6 +1166,81 @@ def bounded_int(policy: dict, name: str, default: int, low: int, high: int) -> i
     return value
 
 
+class BackgroundRetries:
+    """Retry failed discovery and archive requests every minute, for a while.
+
+    One daemon worker makes one attempt at a time, in a fresh engine from the
+    broker's factory that shares the in-memory caches: the next identical call
+    finds the result there (or in the persistent capture cache). A task ends on
+    success or a final answer, or WINDOW_SECONDS after its latest request; at
+    most MAX_TASKS wait, the oldest giving way to a new one.
+    """
+
+    INTERVAL_SECONDS = 60.0
+    WINDOW_SECONDS = 900.0
+    ATTEMPT_SECONDS = 120.0
+    MAX_TASKS = 8
+
+    def __init__(self, engine_factory):
+        self.engine_factory = engine_factory
+        self.tasks = OrderedDict()
+        self.lock = threading.Lock()
+        self.worker = None
+
+    def schedule(self, kind, value, not_before=None):
+        """Queue a retry and return the wall-clock time of its next attempt."""
+        now, wall = time.monotonic(), time.time()
+        delay = self.INTERVAL_SECONDS if not_before is None else max(self.INTERVAL_SECONDS, not_before - wall)
+        key = (kind, sha256(value.encode('utf-8')))
+        with self.lock:
+            task = self.tasks.get(key)
+            if task is None:
+                while len(self.tasks) >= self.MAX_TASKS:
+                    self.tasks.popitem(last=False)
+                task = self.tasks[key] = {'kind': kind, 'value': value, 'due': now + delay}
+            elif not_before is not None:
+                task['due'] = max(task['due'], now + max(0.0, not_before - wall))
+            task['expires'] = now + self.WINDOW_SECONDS
+            self.tasks.move_to_end(key)
+            if self.worker is None or not self.worker.is_alive():
+                self.worker = threading.Thread(target=self._run, name='historical-retries', daemon=True)
+                self.worker.start()
+            return wall + max(0.0, task['due'] - now)
+
+    def _run(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                for key in [key for key, task in self.tasks.items() if task['expires'] <= now]:
+                    del self.tasks[key]
+                if not self.tasks:
+                    self.worker = None
+                    return
+                key, task = min(self.tasks.items(), key=lambda item: item[1]['due'])
+                wait = task['due'] - now
+            if wait > 0:
+                time.sleep(min(wait, 1.0))
+                continue
+            try:
+                done = self._attempt(task)
+            except Exception:
+                done = False
+            with self.lock:
+                if done:
+                    self.tasks.pop(key, None)
+                elif key in self.tasks:
+                    self.tasks[key]['due'] = time.monotonic() + self.INTERVAL_SECONDS
+
+    def _attempt(self, task):
+        engine = self.engine_factory()
+        if isinstance(getattr(engine, 'audit', None), AuditLog):
+            engine.audit.operation_id = 'retry-' + uuid.uuid4().hex
+            engine.audit.write('background_retry', kind=task['kind'])
+        if task['kind'] == 'discovery':
+            return engine.provider.retry_discovery(task['value'])
+        return engine.provider.retry_archive(task['value'], min(engine.operation_timeout, self.ATTEMPT_SECONDS))
+
+
 class HistoricalSearchEngine:
     def __init__(self, policy_path: Path, cutoff: str, audit_log: Path,
                  expected_policy_sha256: str | None = None, client=None, environment=None):
@@ -913,7 +1256,8 @@ class HistoricalSearchEngine:
         if not isinstance(policy, dict) or policy.get('schema_version') != 1:
             raise HistoricalSearchError('Unsupported policy schema.')
         provider = policy.get('provider')
-        common = {'schema_version', 'provider', 'max_results', 'max_content_chars', 'deny_url_prefixes'}
+        common = {'schema_version', 'provider', 'max_results', 'max_content_chars', 'deny_url_prefixes',
+                  'open_default_chars'}
         network_options = {'max_candidates', 'request_timeout_seconds', 'operation_timeout_seconds',
                            'rate_limit_directory', 'solver_workspace'}
         specific = ({'credential_env'} | network_options if provider == 'brave_wayback'
@@ -926,6 +1270,10 @@ class HistoricalSearchEngine:
         # This legacy policy field limits search excerpts only. Direct document
         # reads and literal navigation expose the full verified extraction.
         self.max_content_chars = bounded_int(policy, 'max_content_chars', 20000, 100, 50000)
+        # Paged-navigation policies bound open() without a length to one page;
+        # older policies keep returning the whole remaining document.
+        self.open_default_chars = (bounded_int(policy, 'open_default_chars', 30000, 1000, 1000000)
+                                   if 'open_default_chars' in policy else None)
         denied = policy.get('deny_url_prefixes', [])
         if not isinstance(denied, list) or len(denied) > 100:
             raise HistoricalSearchError('Invalid URL exclusion policy.')
@@ -942,8 +1290,9 @@ class HistoricalSearchEngine:
                 if not all(isinstance(policy.get(key), str) for key in ('rate_limit_directory', 'solver_workspace')):
                     raise HistoricalSearchError('Shared pacing requires fixed controller and solver paths.')
                 try:
-                    coordinator = SharedHostLimiter(Path(policy['rate_limit_directory']),
-                                                    workspace_root=Path(policy['solver_workspace']))
+                    coordinator = SharedHostLimiter(
+                        Path(policy['rate_limit_directory']), workspace_root=Path(policy['solver_workspace']),
+                        on_quarantine=lambda reason: self.audit.write('pacing_state_quarantined', reason=reason))
                 except RateLimitError:
                     raise HistoricalSearchError('Shared historical request coordination is invalid.',
                                                 code='rate_limit_policy') from None
@@ -960,7 +1309,8 @@ class HistoricalSearchEngine:
                 self.provider = ScholarlyWaybackProvider(self.cutoff, self.client, candidates)
             elif provider == 'codex_wayback':
                 settings = codex_discovery_settings(policy.get('discovery'), policy['solver_workspace'])
-                self.provider = CodexWaybackProvider(self.cutoff, self.client, candidates, settings, self.audit.write)
+                self.provider = CodexWaybackProvider(self.cutoff, self.client, candidates, settings, self.audit.write,
+                                                     workspace=policy['solver_workspace'])
             else:
                 self.provider = DuckDuckGoWaybackProvider(self.cutoff, self.client, candidates)
             if coordinator is not None:
@@ -968,10 +1318,11 @@ class HistoricalSearchEngine:
                 try:
                     self.provider.persistent_cache = CaptureCache(
                         Path(policy['rate_limit_directory']) / 'captures',
-                        workspace_root=Path(policy['solver_workspace']))
+                        workspace_root=Path(policy['solver_workspace']),
+                        on_quarantine=lambda reason: self.audit.write('archive_cache_quarantined', reason=reason))
                 except CacheError:
-                    raise HistoricalSearchError('Protected archive cache configuration is invalid.',
-                                                code='cache_invalid') from None
+                    # Retrieval works without the shared cache: captures are fetched and verified again.
+                    self.audit.write('archive_cache_unavailable', reason='unavailable')
                 self.provider.audit = self.audit.write
         else:
             self.provider = SealedCorpusProvider(policy, self.cutoff)
@@ -979,7 +1330,8 @@ class HistoricalSearchEngine:
 
     def _operation(self):
         timeout = self.operation_timeout
-        deadline = getattr(self, 'request_deadline', None)
+        budget = getattr(self, 'request_budget', None)
+        deadline = budget.current() if budget is not None else getattr(self, 'request_deadline', None)
         if deadline is not None:
             timeout = min(timeout, deadline - time.monotonic())
             if timeout <= 0:
@@ -990,7 +1342,12 @@ class HistoricalSearchEngine:
             self.provider.discovery_deadline = (min(discovery_deadline, deadline)
                                                if deadline is not None else discovery_deadline)
         if self.client is not None and hasattr(self.client, 'operation'):
-            return self.client.operation(timeout_seconds=timeout)
+            if budget is None:
+                return self.client.operation(timeout_seconds=timeout)
+            # Waiting for shared archive pacing extends the network budget, up
+            # to the MCP call's hard limit, instead of using it up.
+            return self.client.operation(timeout_seconds=timeout, budget=budget,
+                                         limit_seconds=max(timeout, budget.hard() - time.monotonic()))
         return nullcontext()
 
     @staticmethod
@@ -1024,7 +1381,8 @@ class HistoricalSearchEngine:
         self.audit.write('search_requested', query_sha256=query_hash)
         terms = set(re.findall(r'\w+', query.casefold()))
         results = []
-        unavailable = 0
+        unavailable = limited = 0
+        retry_times = []
         try:
             candidates = self.provider.candidates(query)
             for url in candidates:
@@ -1039,8 +1397,11 @@ class HistoricalSearchEngine:
                     if error.code in ('audit_failure', 'cache_invalid'):
                         raise
                     unavailable += int(error.operational)
+                    limited += error.code in LIMIT_CODES
+                    if error.retry_at is not None:
+                        retry_times.append(error.retry_at)
                     self.audit.write('capture_rejected', url_sha256=sha256(url.encode()), **self._failure(error))
-                    if error.code == 'deadline_exceeded':
+                    if error.code in ('deadline_exceeded', 'provider_cooldown'):
                         break
                     continue
                 # A logging failure must abort the entire request, not turn a
@@ -1050,13 +1411,31 @@ class HistoricalSearchEngine:
                     results.append((score, result))
             results.sort(key=lambda item: (-item[0], item[1]['url']))
             selected = [item[1] for item in results[:self.max_results]]
+            omitted = len(results) - len(selected)
+            retry_hint = (f' The broker retries them in the background; repeat the same search after '
+                          f'{clock_text(max(retry_times))}.' if retry_times else '')
             if not selected and unavailable:
-                raise HistoricalSearchError('Archive services were unavailable for candidate documents; no verified result was returned.',
-                                            code='archive_unavailable', operational=True)
-            self.audit.write('search_completed', query_sha256=query_hash, returned=len(selected), unavailable_candidates=unavailable)
+                raise HistoricalSearchError('Archive services were unavailable for candidate documents; no verified result was returned.'
+                                            + retry_hint, code='archive_unavailable', operational=True,
+                                            retry_at=max(retry_times) if retry_times else None)
+            self.audit.write('search_completed', query_sha256=query_hash, returned=len(selected), unavailable_candidates=unavailable,
+                             limited_candidates=limited, omitted_results=omitted)
             response = {'cutoff': utc_text(self.cutoff), 'results': selected, 'limitation': LIMITATION}
+            notes = []
             if unavailable or getattr(self.provider, 'discovery_incomplete', False):
-                response.update(incomplete=True, warning='Some discovery or archive requests were unavailable; only verified results are shown.')
+                response['incomplete'] = True
+                notes.append('Some discovery or archive requests were unavailable; only verified results are shown.'
+                             + retry_hint)
+            if limited:
+                response['limited_candidates'] = limited
+                notes.append(f'{limited} candidate document{"s" if limited != 1 else ""} exceeded the archive size or '
+                             'PDF extraction limits and could not be searched.')
+            if omitted:
+                response['omitted_results'] = omitted
+                notes.append(f'{omitted} more verified result{"s" if omitted != 1 else ""} matched the query less closely '
+                             'and were left out; a more specific query can surface them.')
+            if notes:
+                response['warning'] = ' '.join(notes)
             return response
         except HistoricalSearchError as error:
             self.audit.write('search_failed', query_sha256=query_hash, **self._failure(error))
@@ -1085,15 +1464,19 @@ class HistoricalSearchEngine:
             return self._open(url, offset, length, sha256)
 
     def _open(self, url: str, offset=0, length=None, expected_sha256=None) -> dict:
+        default = getattr(self, 'open_default_chars', None)
         navigation_arguments('open', {'url': url, 'offset': offset,
                              **({'length': length} if length is not None else {}),
-                             **({'sha256': expected_sha256} if expected_sha256 is not None else {})})
+                             **({'sha256': expected_sha256} if expected_sha256 is not None else {})},
+                             default_page=default)
         url = self._check_url(url)
         url_hash = sha256(url.encode())
         self.audit.write('open_requested', url_sha256=url_hash, offset=offset, length=length)
         try:
             metadata, content = self._document(url, expected_sha256)
             self._offset(offset, len(content))
+            if length is None:
+                length = default
             page = content[offset:] if length is None else content[offset:offset + length]
             end = offset + len(page)
             more = end < len(content)
@@ -1153,7 +1536,7 @@ class HistoricalSearchEngine:
             raise
 
 
-def navigation_arguments(name, arguments):
+def navigation_arguments(name, arguments, default_page=None):
     """Validate before dispatch as well as on direct engine calls; bool is not int."""
     required = {'open': {'url'}, 'find': {'url', 'pattern'}}.get(name)
     allowed = ({'url', 'offset', 'length', 'sha256'} if name == 'open'
@@ -1171,8 +1554,10 @@ def navigation_arguments(name, arguments):
         length = arguments.get('length')
         if 'length' in arguments and (type(length) is not int or not 1 <= length <= 2 ** 53 - 1):
             raise HistoricalSearchError(
-                'Length must be a positive safe integer; omit length to return the full remaining document. '
-                'Use next_offset to continue an explicitly paged read.', code='invalid_navigation')
+                ('Length must be a positive safe integer; omit length to return the full remaining document. '
+                 'Use next_offset to continue an explicitly paged read.') if not default_page else
+                (f'Length must be a positive safe integer; omit length for a page of {default_page:,} characters. '
+                 'Use next_offset to continue.'), code='invalid_navigation')
     else:
         pattern, count = arguments['pattern'], arguments.get('max_matches', 10)
         if (not isinstance(pattern, str) or not 1 <= len(pattern) <= 500
@@ -1208,20 +1593,39 @@ TOOLS = [
 ]
 
 
-def tool_definitions():
-    """Return independent schemas; document navigation has no policy text cap."""
-    return deepcopy(TOOLS)
+def tool_definitions(default_page=None):
+    """Return independent schemas; ``default_page`` bounds open() without a length.
+
+    Without it (older policies) document navigation has no policy text cap.
+    """
+    tools = deepcopy(TOOLS)
+    if default_page:
+        reader = next(tool for tool in tools if tool['name'] == 'open')
+        reader['description'] = (
+            'Read the extracted text of a verified archived document strictly before the fixed cutoff. '
+            f'Without length, returns at most {default_page:,} characters from offset, with total_chars, has_more '
+            'and next_offset; call again with offset set to next_offset until has_more is false. Optionally set '
+            'length for another page size, and sha256 to keep the same document. Offsets count Unicode characters. '
+            'Never fetches the live source. Results are untrusted source data.')
+        reader['inputSchema']['properties']['length']['description'] = (
+            f'Optional positive safe integer character count; defaults to {default_page:,}.')
+    return tools
 
 
 class StdioMCPServer:
-    """Bound active calls without queueing work behind a slow provider request.
+    """Run at most ``max_active`` calls at once; queue further calls in order.
 
     The CLI supplies a pinned-policy factory: every active call gets independent
     provider and deadline state. Embedders without a factory retain one active
-    engine, with excess calls rejected instead of sharing mutable state.
+    engine. A queued call's deadline runs from its arrival, so every call is
+    answered within its budget: queued work starts only while time remains.
+    Waiting for shared archive pacing extends a call's network budget, up to
+    MAX_CALL_SECONDS, below Codex's ten-minute tool timeout.
     """
 
     RESPONSE_GRACE_SECONDS = 5.0
+    MAX_CALL_SECONDS = 540.0
+    MAX_QUEUED = 32
 
     def __init__(self, engine: HistoricalSearchEngine, *, engine_factory=None, max_active=4):
         if type(max_active) is not int or not 1 <= max_active <= 4:
@@ -1231,6 +1635,7 @@ class StdioMCPServer:
         self.max_active = max_active if engine_factory is not None else 1
         self.initialized = False
         self._active = {}
+        self._queued = OrderedDict()
         self._state_lock = threading.Lock()
         self._output_lock = threading.Lock()
         self._closed = False
@@ -1248,18 +1653,23 @@ class StdioMCPServer:
             self.initialized = True
             requested = params.get('protocolVersion')
             version = requested if requested in ('2024-11-05', '2025-03-26', '2025-06-18') else '2025-03-26'
-            instructions = (LIMITATION + f' Issue at most {self.max_active} concurrent retrieval calls. '
-                            'If retrieval is busy, wait for an active call to finish before retrying. '
-                            'Open returns the full verified document by default; set length only for optional pagination. '
-                            'Use find to locate text anywhere in the document, or open.next_offset to continue a requested page; '
-                            'pass the returned sha256 on later calls to keep the same archived document.')
+            default_page = getattr(self.engine, 'open_default_chars', None)
+            calls = f'{self.max_active} call' + ('s' if self.max_active != 1 else '')
+            instructions = (LIMITATION + f' Retrieval runs at most {calls} at once; further calls wait their turn '
+                            'and are still answered within the same deadline. '
+                            + ('Open returns the full verified document by default; set length only for optional pagination. '
+                               'Use find to locate text anywhere in the document, or open.next_offset to continue a requested page; '
+                               if not default_page else
+                               f'Open returns at most {default_page:,} characters per call; continue with open.next_offset '
+                               'until has_more is false, or use find to locate text anywhere in the document; ')
+                            + 'pass the returned sha256 on later calls to keep the same archived document.')
             return {**response, 'result': {'protocolVersion': version, 'capabilities': {'tools': {'listChanged': False}}, 'serverInfo': {'name': 'historical_search', 'version': '1.1.0'}, 'instructions': instructions}}
         if method == 'ping':
             return {**response, 'result': {}}
         if not self.initialized:
             return {**response, 'error': {'code': -32000, 'message': 'Initialize first.'}}
         if method == 'tools/list':
-            return {**response, 'result': {'tools': tool_definitions()}}
+            return {**response, 'result': {'tools': tool_definitions(getattr(self.engine, 'open_default_chars', None))}}
         if method != 'tools/call':
             return {**response, 'error': {'code': -32601, 'message': 'Method not found.'}}
         name, arguments = params.get('name'), params.get('arguments', {})
@@ -1268,7 +1678,7 @@ class StdioMCPServer:
                 if not isinstance(arguments, dict) or set(arguments) != {'query'} or not isinstance(arguments['query'], str):
                     raise HistoricalSearchError('Invalid search arguments.')
             else:
-                navigation_arguments(name, arguments)
+                navigation_arguments(name, arguments, getattr(self.engine, 'open_default_chars', None))
         except HistoricalSearchError as error:
             # These validation messages contain only controller text, never
             # submitted URLs, patterns or credentials.
@@ -1318,10 +1728,21 @@ class StdioMCPServer:
         except UnicodeError:
             self._emit(output_stream, self._tool_error(call['id'], 'Historical retrieval failed closed.'))
 
+    def _response_deadline(self, call):
+        return call['budget'].current() + self.RESPONSE_GRACE_SECONDS
+
     def _deadline(self, call, output_stream):
         with self._state_lock:
             if self._closed or call['cancelled'] or call['responded']:
                 return
+            remaining = self._response_deadline(call) - time.monotonic()
+            if remaining > 0.001:
+                # Shared pacing waits moved this call's budget later.
+                call['timer'] = threading.Timer(remaining, self._deadline, args=(call, output_stream))
+                call['timer'].daemon = True
+                call['timer'].start()
+                return
+            self._queued.pop(call['id'], None)
             response = self._tool_error(call['id'], 'Historical retrieval deadline was exhausted.')
             try:
                 self._audit('mcp_deadline', operation_id=call['operation_id'])
@@ -1343,6 +1764,7 @@ class StdioMCPServer:
                     return
             engine = self.engine_factory() if self.engine_factory is not None else self.engine
             engine.request_deadline = call['deadline']
+            engine.request_budget = call['budget']
             if isinstance(getattr(engine, 'audit', None), AuditLog):
                 engine.audit.operation_id = call['operation_id']
             with self._state_lock:
@@ -1358,7 +1780,7 @@ class StdioMCPServer:
                 call['timer'].cancel()
                 try:
                     if not self._closed and not call['cancelled'] and not call['responded']:
-                        if time.monotonic() >= call['response_deadline']:
+                        if time.monotonic() >= self._response_deadline(call):
                             response = self._tool_error(call['id'], 'Historical retrieval deadline was exhausted.')
                         try:
                             self._audit('mcp_response_ready', operation_id=call['operation_id'],
@@ -1371,6 +1793,28 @@ class StdioMCPServer:
                     self._closed = True
                 finally:
                     self._active.pop(call['id'], None)
+                    self._admit(output_stream)
+
+    def _start(self, call, output_stream):
+        """Run one accepted call now; the caller holds the state lock."""
+        call['thread'] = threading.Thread(target=self._run, args=(call, output_stream),
+                                           name='historical-mcp', daemon=True)
+        self._active[call['id']] = call
+        try:
+            call['thread'].start()
+        except Exception:
+            call['timer'].cancel()
+            self._active.pop(call['id'], None)
+            call['responded'] = True
+            self._emit(output_stream, self._tool_error(call['id'], 'Historical retrieval failed closed.'))
+
+    def _admit(self, output_stream):
+        """Start queued calls in arrival order while capacity and their time allow."""
+        while self._queued and len(self._active) < self.max_active and not self._closed:
+            _, call = self._queued.popitem(last=False)
+            if call['cancelled'] or call['responded'] or call['budget'].remaining() <= 0:
+                continue  # Its deadline reply (if any) comes from its own timer.
+            self._start(call, output_stream)
 
     def _dispatch(self, message, output_stream):
         request_id = message['id']
@@ -1379,43 +1823,47 @@ class StdioMCPServer:
                                       'error': {'code': -32600, 'message': 'Invalid request identifier.'}})
             return
         with self._state_lock:
-            if request_id in self._active:
+            if request_id in self._active or request_id in self._queued:
                 self._emit(output_stream, {'jsonrpc': '2.0', 'id': request_id,
                     'error': {'code': -32600, 'message': 'Request identifier is already active.'}})
                 return
-            if len(self._active) >= self.max_active:
+            tool = (message.get('params') or {}).get('name')
+            if len(self._active) >= self.max_active and len(self._queued) >= self.MAX_QUEUED:
                 response = self._tool_error(request_id,
-                    'Historical retrieval is busy. Wait for an active request to finish before retrying.')
+                    f'Historical retrieval already has {self.MAX_QUEUED} calls waiting. Wait for some of them '
+                    'to finish before retrying.')
                 try:
-                    self._audit('mcp_busy', active_calls=len(self._active))
+                    self._audit('mcp_busy', active_calls=len(self._active), queued_calls=len(self._queued),
+                                tool=tool if tool in ('search', 'open', 'find') else 'unknown')
                 except HistoricalSearchError:
                     response = self._tool_error(request_id, 'Historical retrieval audit failed closed.')
                 self._emit(output_stream, response)
                 return
             timeout = min(float(getattr(self.engine, 'operation_timeout', 300)), 300.0)
-            call = {'id': request_id, 'message': message, 'deadline': time.monotonic() + timeout,
-                    'operation_id': uuid.uuid4().hex, 'cancelled': False, 'responded': False}
-            # Provider I/O still stops at the original deadline. Allow bounded
-            # finalization of already verified partial evidence after it expires.
-            call['response_deadline'] = call['deadline'] + self.RESPONSE_GRACE_SECONDS
+            now = time.monotonic()
+            call = {'id': request_id, 'message': message, 'deadline': now + timeout,
+                    'operation_id': uuid.uuid4().hex, 'cancelled': False, 'responded': False,
+                    'budget': Budget(now + timeout, now + max(timeout, self.MAX_CALL_SECONDS))}
+            queued = len(self._active) >= self.max_active
             try:
-                self._audit('mcp_accepted', operation_id=call['operation_id'])
+                self._audit('mcp_accepted', operation_id=call['operation_id'], **({'queued': True} if queued else {}))
             except HistoricalSearchError:
                 self._emit(output_stream, self._tool_error(request_id, 'Historical retrieval audit failed closed.'))
                 return
-            call['timer'] = threading.Timer(max(0.0, call['response_deadline'] - time.monotonic()),
+            # Provider I/O still stops at the deadline. Allow bounded finalization
+            # of already verified partial evidence after it expires.
+            call['timer'] = threading.Timer(max(0.0, self._response_deadline(call) - time.monotonic()),
                                              self._deadline, args=(call, output_stream))
             call['timer'].daemon = True
-            call['thread'] = threading.Thread(target=self._run, args=(call, output_stream),
-                                               name='historical-mcp', daemon=True)
-            self._active[request_id] = call
             try:
                 call['timer'].start()
-                call['thread'].start()
             except Exception:
-                call['timer'].cancel()
-                self._active.pop(request_id, None)
                 self._emit(output_stream, self._tool_error(request_id, 'Historical retrieval failed closed.'))
+                return
+            if queued:
+                self._queued[request_id] = call
+            else:
+                self._start(call, output_stream)
 
     def _cancel(self, message):
         params = message.get('params', {})
@@ -1423,7 +1871,7 @@ class StdioMCPServer:
         if type(request_id) not in (int, str):
             return
         with self._state_lock:
-            call = self._active.get(request_id)
+            call = self._active.get(request_id) or self._queued.pop(request_id, None)
             if call is None or call['responded']:
                 return
             call['cancelled'] = True
@@ -1462,10 +1910,15 @@ class StdioMCPServer:
                 self._emit(output_stream, response)
         finally:
             with self._state_lock:
+                # The client left: calls that never started are dropped unanswered.
+                for call in self._queued.values():
+                    call['cancelled'] = True
+                    call['timer'].cancel()
+                self._queued.clear()
                 active = list(self._active.values())
             if clean_eof:
                 for call in active:
-                    call['thread'].join(timeout=max(0.0, call['response_deadline'] - time.monotonic()) + 0.1)
+                    call['thread'].join(timeout=max(0.0, self._response_deadline(call) - time.monotonic()) + 0.1)
             with self._state_lock:
                 self._closed = True
                 for call in self._active.values():
@@ -1503,6 +1956,8 @@ def main(argv=None) -> int:
                 if isinstance(created.provider, WaybackProvider):
                     created.provider.share_memory_caches(engine.provider)
                 return created
+            if isinstance(engine.provider, WaybackProvider):
+                engine.provider.retrier = BackgroundRetries(engine_factory)
             # MCP stdio is UTF-8 JSON-RPC regardless of the platform's default
             # pipe encoding (for example cp1252 on Windows).
             for stream, options in ((sys.stdin, {}), (sys.stdout, {'newline': '\n'})):

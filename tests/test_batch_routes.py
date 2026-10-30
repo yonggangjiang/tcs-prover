@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
 
 
@@ -24,7 +25,6 @@ def saved_run(root, batch, marker, run_id='same-job', *, final=True):
     (folder / 'transcript.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
     (folder / 'pause.json').write_text(json.dumps({'status': 'paused', 'stage': 'solve',
         'node': 'author', 'elapsedSeconds': 12, 'autoResumeAt': 1, 'pauseCause': 'rate_limit'}))
-    (folder / 'PROVED.md').write_text('Saved proof ' + marker)
     if final:
         (folder / 'final.tex').write_text('\\documentclass{article}\n% ' + marker + '\n')
         (folder / 'final.pdf').write_bytes(b'%PDF-1.4\n\x00\xff ' + marker.encode() + b'\n%%EOF\n')
@@ -100,17 +100,14 @@ class BatchRouteTests(unittest.TestCase):
                     self.assertTrue(state['readOnly'])
                     self.assertFalse(state['workerActive'])
 
-    def test_saved_artifacts_and_memory_come_only_from_selected_batch(self):
-        for batch, folder, marker in (('alpha', self.alpha, 'ALPHA'), ('beta', self.beta, 'BETA')):
+    def test_saved_artifacts_come_only_from_selected_batch(self):
+        for batch, folder in (('alpha', self.alpha), ('beta', self.beta)):
             query = urlencode({'batch': batch, 'job': 'same-job'})
             for route, filename in (('download-tex', 'final.tex'), ('download-pdf', 'final.pdf'),
                                     ('transcript', 'transcript.jsonl')):
                 with self.subTest(batch=batch, route=route):
                     self.assertEqual(self.request('/' + route + '?' + query),
                                      (200, (folder / filename).read_bytes()))
-            status, memory = self.request('/memory?' + query + '&file=PROVED.md')
-            self.assertEqual(status, 200)
-            self.assertEqual(memory['content'], 'Saved proof ' + marker)
         self.assertEqual(self.request('/download-tex?batch=beta&job=paused-job')[0], 404)
 
     def test_saved_gets_do_not_restore_jobs_write_checkpoints_or_start_workers(self):
@@ -120,9 +117,7 @@ class BatchRouteTests(unittest.TestCase):
                 patch.object(server.App, '_spawn_worker', side_effect=AssertionError('Worker started')), \
                 patch.object(server.subprocess, 'Popen', side_effect=AssertionError('Subprocess started')):
             for _ in range(2):
-                for path in ('/batches', '/jobs?batch=alpha', '/state?batch=alpha&job=paused-job',
-                             '/memory?batch=alpha&job=paused-job&file=PROVED.md',
-                             '/approach-graph?batch=alpha&job=paused-job'):
+                for path in ('/batches', '/jobs?batch=alpha', '/state?batch=alpha&job=paused-job'):
                     self.assertEqual(self.request(path)[0], 200, path)
         self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns)
                                   for path in (self.root / 'alpha').rglob('*') if path.is_file()})
@@ -174,11 +169,20 @@ class BatchRouteTests(unittest.TestCase):
             (self.alpha / filename).unlink()
             (self.alpha / filename).symlink_to(self.beta / filename)
             self.assertEqual(self.request('/' + route + '?batch=alpha&job=same-job')[0], 404)
-        (self.alpha / 'PROVED.md').unlink()
-        (self.alpha / 'PROVED.md').symlink_to(self.beta / 'PROVED.md')
-        status, value = self.request('/memory?batch=alpha&job=same-job&file=PROVED.md')
-        self.assertEqual(status, 200)
-        self.assertNotIn('content', value)
+
+    def test_research_file_routes_are_unknown_for_live_and_saved_jobs(self):
+        # The notebooks that older runs left in their folders are not served.
+        for folder in (self.direct, self.alpha):
+            (folder / 'PROVED.md').write_text('Saved proof')
+            (folder / 'APPROACHES').mkdir()
+            (folder / 'APPROACHES' / 'A001.md').write_text('# A001 Saved route')
+        for batch, unknown in (('', 'Not found.'), ('batch=alpha&', 'Unknown batch, job, or saved artifact.')):
+            self.assertEqual(self.request('/unknown?' + batch + 'job=same-job'), (404, {'error': unknown}))
+            for path in ('/memory?' + batch + 'job=same-job&file=PROVED.md',
+                         '/memory?' + batch + 'job=same-job&file=APPROACHES',
+                         '/approach-graph?' + batch + 'job=same-job'):
+                with self.subTest(path=path):
+                    self.assertEqual(self.request(path), (404, {'error': unknown}))
 
 
 if __name__ == '__main__':

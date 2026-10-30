@@ -49,8 +49,9 @@ def batch_plan(runs_root, control_root, problems=None):
     if not isinstance(recorded_runs, list) or [row.get('id') for row in recorded_runs] != selected_ids:
         raise ValueError('Prepared jobs do not match the recorded problem selection.')
     expected_folders = {'firstproof-b3-' + item.lower() for item in selected_ids}
+    # Hidden folders are the Web UI's own (runs/.controller, runs/.trash), never jobs.
     if any((path.is_dir() or path.is_symlink()) and path.name not in expected_folders
-           for path in runs_root.iterdir()):
+           and not path.name.startswith('.') for path in runs_root.iterdir()):
         raise ValueError('Unselected jobs exist in this runs root; use a fresh batch directory.')
     plans = []
     for item in manifest['runs']:
@@ -93,7 +94,7 @@ def batch_plan(runs_root, control_root, problems=None):
         defaults = preparation.empty_state()
         required = {key: defaults[key] for key in (
             'authorModel', 'criticModel', 'writerModel', 'authorEffort',
-            'criticEffort', 'writerEffort', 'criticRounds',
+            'criticEffort', 'writerEffort', 'criticRounds', 'criticCount',
         )}
         required.update(thinkingHours=0, speedMode='fast',
                         skipStatementReview=True, preparedRun=True)
@@ -177,7 +178,8 @@ def preflight_one(plan, auth_home):
         raise ValueError(f"{plan['runId']}: broker preflight failed.")
     executable = retrieval.codex_executable(policy)
     for role in ('author', 'structured'):
-        retrieval.preflight(policy, role, executable, dict(os.environ))
+        # No process follows this check: its private temp folder goes at once.
+        retrieval.remove_private_temp(policy, retrieval.preflight(policy, role, executable, dict(os.environ)))
     return {'id': plan['id'], 'runId': plan['runId'], 'inputSha256': preparation.sha(plan['folder'] / 'input.md'),
             'cutoffExclusiveUtc': policy['cutoffExclusiveUtc'], 'codex': executable,
             'rolesVerified': ['author', 'structured'], 'broker': broker_report}

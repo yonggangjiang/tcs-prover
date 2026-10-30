@@ -126,12 +126,19 @@
             </div>
             <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
           </div>
+          <!-- Jobs that need you (a CLI login, a usage limit, a rejected API key, a model or its settings,
+               a missing saved thread ID, a safety stop); app.js fills it from /batches. Jobs whose cause can
+               pass keep retrying meanwhile. -->
+          <section id="attentionBanner" class="attention-banner" aria-labelledby="attentionHeading" hidden>
+            <h2 id="attentionHeading" class="attention-heading">Needs your attention</h2>
+            <ul id="attentionList" class="attention-list" aria-live="polite"></ul>
+          </section>
           <!-- Totals across every batch; app.js fills them from /batches. -->
           <dl id="overviewStats" class="stat-strip" aria-label="Problems across all batches">
             <div class="stat tone-running"><dt>Running</dt><dd><strong data-stat="running">–</strong><span class="stat-note">working now</span></dd></div>
             <div class="stat tone-waiting"><dt>Needs you</dt><dd><strong data-stat="waiting">–</strong><span class="stat-note">approval or a start</span></dd></div>
             <div class="stat tone-paused"><dt>Paused</dt><dd><strong data-stat="paused">–</strong><span class="stat-note">saved, can resume</span></dd></div>
-            <div class="stat tone-done"><dt>Finished</dt><dd><strong data-stat="done">–</strong><span class="stat-note">every outcome</span></dd></div>
+            <div class="stat tone-done"><dt>Complete</dt><dd><strong data-stat="done">–</strong><span class="stat-note" data-stat-note="done">finished successfully</span></dd></div>
           </dl>
           <div class="section-head">
             <h2 class="section-title">Batches</h2>
@@ -193,6 +200,30 @@
               </div>
               <p id="workflowStageHelp" class="help">Click any stage to turn it on or off. Selected stages run from left to right.</p>
             </fieldset>
+            <!-- Related works for the proof author: each file uploads as soon as it is added (a note is
+                 staged the same way); Start workflow and Run a folder send what is listed here. -->
+            <div id="relatedWorksField" class="field related-works-field" role="group"
+              aria-labelledby="relatedWorksLabel" aria-describedby="relatedWorksHelp">
+              <label id="relatedWorksLabel" for="composerRelatedFiles">Related works <span>(optional)</span></label>
+              <ul id="composerRelatedList" class="related-works-list" aria-label="Related works to send" hidden></ul>
+              <div class="related-works-actions">
+                <button id="composerAddFilesButton" class="secondary compact" type="button">Add files…</button>
+                <button id="composerAddNoteButton" class="ghost compact" type="button" aria-expanded="false"
+                  aria-controls="composerNoteForm">Add a note</button>
+              </div>
+              <div id="composerNoteForm" class="related-note-form" hidden>
+                <label for="composerNoteTitle">Note title <span>(optional)</span></label>
+                <input id="composerNoteTitle" type="text" maxlength="200" autocomplete="off">
+                <label for="composerNoteText">Note</label>
+                <textarea id="composerNoteText" rows="4"></textarea>
+                <div class="related-note-actions">
+                  <button id="composerSaveNoteButton" class="secondary compact" type="button">Add note</button>
+                  <button id="composerCancelNoteButton" class="ghost compact" type="button">Cancel</button>
+                </div>
+              </div>
+              <p id="relatedWorksHelp" class="help"></p>
+              <input id="composerRelatedFiles" type="file" multiple hidden>
+            </div>
             <details class="advanced">
               <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>Advanced settings</summary>
               <div class="advanced-body">
@@ -217,7 +248,6 @@
                       </select>
                       <label class="effort-label" for="reviewEffort">3 · Reasoning</label>
                       <select id="reviewEffort">
-                        <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
                         <option value="xhigh">Extra high</option>
                         <option value="high">High</option>
@@ -244,13 +274,19 @@
                       </select>
                       <label class="effort-label" for="authorEffort">3 · Reasoning</label>
                       <select id="authorEffort">
-                        <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
                         <option value="xhigh">Extra high</option>
                         <option value="high">High</option>
                         <option value="medium">Medium</option>
                         <option value="low">Low</option>
                       </select>
+                      <label for="authorSubagents">4 · Subagents</label>
+                      <input id="authorSubagents" type="number" min="0" max="10" step="1" value="0"
+                        aria-describedby="authorSubagentsHelp">
+                      <p id="authorSubagentsHelp" class="help model-setting-help">
+                        How many subagents the author may start at a time, for example to try other approaches
+                        or check calculations (0-10). 0, the default, gives it none.
+                      </p>
                       <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
@@ -271,7 +307,6 @@
                       </select>
                       <label class="effort-label" for="criticEffort">3 · Reasoning</label>
                       <select id="criticEffort">
-                        <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
                         <option value="xhigh">Extra high</option>
                         <option value="high">High</option>
@@ -298,7 +333,6 @@
                       </select>
                       <label class="effort-label" for="writerEffort">3 · Reasoning</label>
                       <select id="writerEffort">
-                        <option value="ultra">Ultra — Max with task delegation</option>
                         <option value="max" selected>Max — default</option>
                         <option value="xhigh">Extra high</option>
                         <option value="high">High</option>
@@ -329,6 +363,7 @@
                       <span id="apiModelCount" class="chip">Loading…</span>
                     </div>
                     <p id="apiModelsStatus" class="api-models-status" role="status"></p>
+                    <p id="apiModelsProblem" class="api-models-problem" role="alert" hidden></p>
                     <ul id="apiModelList" class="api-model-list" aria-label="Saved API connections" hidden></ul>
                     <p id="apiModelEmpty" class="api-model-empty" hidden>No API connections yet.</p>
                     <div id="apiModelForm" class="api-model-form" role="group" aria-labelledby="apiModelFormHeading">
@@ -352,7 +387,7 @@
                       </div>
                       <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. Models load automatically when you save.</p>
                       <details class="api-optional-settings">
-                        <summary>Optional source and name</summary>
+                        <summary>Optional source, name and token limits</summary>
                         <div class="api-model-fields">
                           <div class="field">
                             <label for="apiModelRequestSource">Request source <span>(optional)</span></label>
@@ -365,7 +400,22 @@
                             <input id="apiModelName" type="text" autocomplete="off" placeholder="API host" aria-describedby="apiModelNameHelp">
                             <p id="apiModelNameHelp" class="help">A label inside TCS Prover; it is not sent to the router.</p>
                           </div>
+                          <div class="field">
+                            <label for="apiModelContextWindow">Context window <span>(optional)</span></label>
+                            <input id="apiModelContextWindow" type="number" min="1024" step="1" inputmode="numeric"
+                              autocomplete="off" placeholder="Tokens" aria-describedby="apiModelLimitsHelp">
+                          </div>
+                          <div class="field">
+                            <label for="apiModelMaxOutput">Max output <span>(optional)</span></label>
+                            <input id="apiModelMaxOutput" type="number" min="1" step="1" inputmode="numeric"
+                              autocomplete="off" placeholder="Tokens" aria-describedby="apiModelLimitsHelp">
+                          </div>
                         </div>
+                        <p id="apiModelLimitsHelp" class="help api-limits-help">The token limits of this connection's
+                          models, if the CLI cannot know them: runs pass them on, so the CLI keeps the conversation
+                          within the context window, compacting it early enough to leave room for the max output (the
+                          Claude CLI also asks for at most that much). They apply to every model of this connection;
+                          leave them empty to use the CLI's defaults.</p>
                       </details>
                       <p id="apiModelAuthHelp" class="help api-header-help">Authentication is automatic:
                         <code>Authorization: Bearer &lt;key&gt;</code> for OpenAI-compatible connections,
@@ -378,6 +428,29 @@
                       </div>
                     </div>
                   </div>
+                </fieldset>
+
+                <!-- Running jobs: this computer's limit on jobs that run at once (GET/POST /settings) and this
+                     browser's optional notifications; app.js reads both when these settings open. -->
+                <fieldset id="runningJobsSetting" class="settings-group jobs-group" aria-describedby="runningJobsHelp">
+                  <legend>Running jobs</legend>
+                  <div class="field">
+                    <label for="maxRunningJobs">Jobs that may run at once (0 = no limit)</label>
+                    <div class="jobs-limit">
+                      <input id="maxRunningJobs" type="number" min="0" max="1000" step="1" value="0" inputmode="numeric">
+                      <button id="saveRunningJobsButton" class="secondary" type="button">Save limit</button>
+                    </div>
+                  </div>
+                  <p id="runningJobsStatus" class="help jobs-status" role="status"></p>
+                  <p id="runningJobsHelp" class="help">All jobs share the rate and usage limits of the same CLI logins
+                    and API keys. The jobs of a folder run beyond this limit wait in a queue and start in order as
+                    running jobs finish or pause; automatic retries wait for a free slot too. TCS Prover starts queued
+                    jobs and retries at most one every 2 seconds. A job you start or resume yourself always starts.</p>
+                  <label class="toggle-line" for="attentionAlerts">
+                    <input id="attentionAlerts" type="checkbox" aria-describedby="attentionAlertsHelp">
+                    <span>Notify me in this browser when a job needs attention</span>
+                  </label>
+                  <p id="attentionAlertsHelp" class="help"></p>
                 </fieldset>
 
                 <section id="retrievalSetting" class="settings-group retrieval-setting" aria-labelledby="retrievalSettingHeading">
@@ -408,16 +481,27 @@
                       step="1" value="2" aria-describedby="roundHelp">
                     <p id="roundHelp" class="help">
                       Default 2. An unchanged PASS proceeds at once; an edited PASS repeats until
-                      the limit. Unfixable issues return to the author and reset the count.
+                      the limit, then a last review that cannot edit must pass the proof unchanged.
+                      Unfixable issues return to the author and reset the count.
+                    </p>
+                  </div>
+                  <div id="criticCountSetting" class="field">
+                    <label for="criticCount">Independent critics</label>
+                    <input id="criticCount" type="number" min="1" max="10"
+                      step="1" value="3" aria-describedby="criticCountHelp">
+                    <p id="criticCountHelp" class="help">
+                      How many independent critics the critic starts as its subagents on each proof version
+                      (1-10); it weighs their reports and makes the decision.
                     </p>
                   </div>
                   <div id="thinkingHoursSetting" class="field">
                     <label for="thinkingHours">Time limit in hours (0 = unlimited)</label>
-                    <input id="thinkingHours" type="number" min="0" max="168"
-                      step="0.25" value="168" aria-describedby="timeHelp">
+                    <input id="thinkingHours" type="number" min="0"
+                      step="0.25" value="0" aria-describedby="timeHelp">
                     <p id="timeHelp" class="help">
-                      Default 168 hours for the whole workflow. A continued run starts with a
-                      renewed time budget in the same workspace and saved session.
+                      0 means unlimited. A limit pauses the proof author, which then writes a progress
+                      summary; the critic and LaTeX steps always finish. You can change the limit while
+                      the job runs or is paused.
                     </p>
                   </div>
                   <div id="speedModeSetting" class="field">
@@ -468,8 +552,9 @@
           <p id="runFolderHelp" class="help folder-help">
             Run a folder starts one parallel job for each file directly inside the folder
             you choose, using the selected stages and settings above. Any file extension
-            is accepted. Hidden files and subfolders are ignored; empty and binary files are
-            skipped and listed.
+            is accepted. Hidden files and subfolders are ignored; empty, binary and oversized
+            (over 8 MB) files are skipped and listed. Jobs beyond the running-jobs limit wait
+            in a queue. Related works listed above are shared by every job of the folder run.
           </p>
           <input id="folderInput" type="file" webkitdirectory multiple hidden
             aria-label="Folder of statement files (any extension or none)">
@@ -484,6 +569,28 @@
               <p id="jobsCount" class="page-meta"></p>
             </div>
           </div>
+          <!-- Batch related works: each folder run keeps one store that every job of the run sees in
+               its related-works folder. app.js lists the stores named by the folderBatch of the /jobs
+               rows and reads each one from /batch-related-works; additions reach every job of that run. -->
+          <section id="batchRelatedWorks" class="batch-related-works card" aria-labelledby="batchRelatedWorksHeading" hidden>
+            <h2 id="batchRelatedWorksHeading" class="batch-related-heading">Batch related works</h2>
+            <p id="batchRelatedWorksHelp" class="help">Shared by every problem of a folder run, including queued ones.
+              Running and paused authors are told about new ones.</p>
+            <ul id="batchRelatedGroups" class="batch-related-groups"></ul>
+            <div id="batchNoteForm" class="related-note-form" hidden>
+              <p id="batchNoteTarget" class="help"></p>
+              <label for="batchNoteTitle">Note title <span>(optional)</span></label>
+              <input id="batchNoteTitle" type="text" maxlength="200" autocomplete="off">
+              <label for="batchNoteText">Note</label>
+              <textarea id="batchNoteText" rows="4"></textarea>
+              <div class="related-note-actions">
+                <button id="batchSaveNoteButton" class="secondary compact" type="button">Add note</button>
+                <button id="batchCancelNoteButton" class="ghost compact" type="button">Cancel</button>
+              </div>
+            </div>
+            <p id="batchRelatedStatus" class="help" role="status"></p>
+            <input id="batchRelatedFiles" type="file" multiple hidden aria-label="Related works for the folder run">
+          </section>
           <!-- Show one status at a time; app.js keeps the counts current. -->
           <div class="jobs-toolbar">
             <div id="jobsFilter" class="seg-filter" role="group" aria-label="Show problems">
@@ -520,8 +627,46 @@
             <h1 id="runProblemTitle" class="job-title"></h1>
             <p id="runNextStep" class="job-next" role="status"></p>
             <p id="runLatestAction" class="job-latest"></p>
+            <!-- Every pause at the author time limit and what followed it (state.timeLimitHistory). -->
+            <p id="runTimeLimitNote" class="job-note" hidden></p>
             <p id="runSettingsWarning" class="job-warning" role="status" hidden></p>
+            <p id="runAttention" class="job-warning job-attention-note" role="status" hidden></p>
           </header>
+
+          <!-- The convention critic's latest loophole warning (state.conventionWarning) until the user ignores it. -->
+          <section id="conventionWarning" class="convention-warning" aria-labelledby="conventionWarningTitle" role="status" hidden>
+            <h2 id="conventionWarningTitle">Convention critic: the proof may exploit a loophole in the problem statement</h2>
+            <p id="conventionWarningRound" class="convention-warning-meta"></p>
+            <h3>How it exploits the statement:</h3>
+            <p id="conventionWarningLoophole" class="convention-warning-text"></p>
+            <div class="convention-warning-suggestion">
+              <h3>Suggested statement:</h3>
+              <button id="conventionWarningCopy" class="ghost compact" type="button">Copy</button>
+            </div>
+            <pre id="conventionWarningStatement" class="convention-warning-statement"></pre>
+            <p class="convention-warning-note">Consider rerunning with a statement that says what you want. This is only a warning: the run continues as normal.</p>
+            <div class="convention-warning-actions">
+              <button id="conventionWarningRerun" class="secondary" type="button">Rerun with suggested statement</button>
+              <button id="conventionWarningIgnore" class="ghost" type="button">Ignore</button>
+            </div>
+          </section>
+
+          <!-- The running author's open question (app.js fills it from state.authorQuestion): one row per
+               question with its options and a field of its own, then Send and Dismiss. The hint shows only
+               for several questions, where one may be left unanswered. -->
+          <section id="authorQuestion" class="author-question card" aria-labelledby="authorQuestionHeading" hidden>
+            <div class="author-question-head">
+              <h2 id="authorQuestionHeading">The proof author asks</h2>
+              <p id="authorQuestionMeta" class="author-question-meta"></p>
+            </div>
+            <ol id="authorQuestionList" class="author-question-list"></ol>
+            <p id="authorQuestionSkipHint" class="help author-question-note" hidden>Click a selected option again to leave that question unanswered.</p>
+            <p id="authorQuestionNote" class="help author-question-note">The author keeps working while it waits; answering is optional.</p>
+            <div class="author-question-actions">
+              <button id="sendAuthorAnswerButton" class="primary compact" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 8h10M9 4.5 12.5 8 9 11.5"/></svg>Send</button>
+              <button id="dismissAuthorQuestionButton" class="ghost compact" type="button">Dismiss</button>
+            </div>
+          </section>
 
           <!-- Statement review: the decision first, the evidence beside it. -->
           <section id="reviewPanel" class="review-view card" aria-labelledby="reviewHeading" hidden>
@@ -568,30 +713,49 @@
                 <p id="runLabel" hidden>MODEL IS WORKING</p>
                 <h2 id="runTitle" tabindex="-1" aria-describedby="runDescription">Checking the statement…</h2>
                 <p id="runDescription" class="run-description"></p>
+                <!-- While the job works: when its last event arrived, or the model call that waits to retry. -->
+                <p id="runActivityAge" class="run-activity-age" hidden></p>
               </div>
               <div class="run-actions">
                 <button id="resumeButton" class="primary" type="button" hidden>Resume</button>
                 <button id="pauseButton" class="secondary" type="button" hidden>Pause</button>
                 <button id="downloadPdfButton" class="primary" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download PDF</button>
                 <button id="downloadTexButton" class="secondary" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download .tex</button>
+                <button id="downloadProofButton" class="secondary" type="button" hidden title="The proof as Markdown, as handed to Writing &amp; polishing"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download .md</button>
+                <button id="downloadSourceButton" class="secondary" type="button" hidden title="The LaTeX source so far (latex-source.tex)"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg>Download source</button>
                 <button id="stopButton" class="danger" type="button"><svg class="icon icon-fill" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>Stop</button>
                 <details id="authorTimeLimitControl" class="limit-control" hidden>
-                  <summary><span id="authorLimitSummary" class="author-limit-summary">Time limit: 168 hours</span>
+                  <summary><span id="authorLimitSummary" class="author-limit-summary">No time limit</span>
                     <span class="limit-change" aria-hidden="true">Change</span></summary>
                   <div class="limit-body">
                     <label for="authorLimitHours">New limit in hours (0 = unlimited)</label>
                     <input id="authorLimitHours" type="number" min="0"
-                      max="168" step="0.5" value="168" inputmode="decimal">
+                      step="0.5" value="0" inputmode="decimal">
                     <button id="setAuthorTimeLimitButton" class="secondary compact" type="button">Set limit</button>
+                    <p id="authorLimitHint" class="help limit-hint" aria-live="polite"></p>
                   </div>
                 </details>
               </div>
               <div id="jobRecovery" class="job-recovery" hidden></div>
+              <!-- The author conversation: every progress summary, message and reply of the run, oldest
+                   first (app.js fills it from state.conversation); the box below asks while paused. -->
+              <section id="authorConversation" class="author-conversation" aria-labelledby="authorConversationHeading" hidden>
+                <h3 id="authorConversationHeading">Author conversation</h3>
+                <p id="authorConversationNote" class="help"></p>
+                <button id="conversationSummaryLink" class="ghost compact conversation-jump" type="button" hidden>Go to
+                  the progress summary at the time limit</button>
+                <ol id="authorConversationList" class="conversation-list" aria-live="polite"></ol>
+              </section>
               <div id="authorSteerControl" class="author-steer-control" hidden>
-                <label for="authorSteerInstruction">Guide the running proof author</label>
-                <textarea id="authorSteerInstruction" rows="2" maxlength="12000"
+                <label id="authorSteerLabel" for="authorSteerInstruction">Guide the running proof author</label>
+                <textarea id="authorSteerInstruction" rows="2" data-max-chars="12000" aria-describedby="authorSteerCount"
                   placeholder="For example: try a potential-function argument before the case analysis."></textarea>
-                <button id="sendAuthorSteerButton" class="secondary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 8h10M9 4.5 12.5 8 9 11.5"/></svg>Send instruction now</button>
+                <div class="steer-buttons">
+                  <button id="sendAuthorSteerButton" class="secondary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 8h10M9 4.5 12.5 8 9 11.5"/></svg><span id="sendAuthorSteerText">Send instruction now</span></button>
+                  <button id="requestSummaryButton" class="ghost compact" type="button" hidden>Summarize progress</button>
+                  <button id="stopReplyButton" class="ghost compact" type="button" hidden>Stop reply</button>
+                </div>
+                <p id="authorSteerCount" class="help steer-count" aria-live="polite"></p>
               </div>
             </div>
 
@@ -600,54 +764,36 @@
               <pre id="runStatement" class="statement-copy"></pre>
             </details>
 
+            <!-- Related works: the files and notes in the author's related-works folder (app.js fills it
+                 from state.relatedWorks). Each file uploads in its own request; one step then adds them. -->
+            <details id="relatedWorksPanel" class="statement-panel card related-works-panel" hidden>
+              <summary id="relatedWorksHeading">Related works</summary>
+              <p id="relatedWorksNote" class="help"></p>
+              <ul id="relatedWorksList" class="related-works-list" aria-labelledby="relatedWorksHeading"></ul>
+              <p id="relatedWorksEmpty" class="help" hidden>No related works yet.</p>
+              <div id="relatedWorksActions" class="related-works-actions">
+                <button id="addRelatedFilesButton" class="secondary compact" type="button">Add files…</button>
+                <button id="addRelatedNoteButton" class="ghost compact" type="button" aria-expanded="false"
+                  aria-controls="relatedNoteForm">Add a note</button>
+              </div>
+              <div id="relatedNoteForm" class="related-note-form" hidden>
+                <label for="relatedNoteTitle">Note title <span>(optional)</span></label>
+                <input id="relatedNoteTitle" type="text" maxlength="200" autocomplete="off">
+                <label for="relatedNoteText">Note</label>
+                <textarea id="relatedNoteText" rows="4"></textarea>
+                <div class="related-note-actions">
+                  <button id="saveRelatedNoteButton" class="secondary compact" type="button">Add note</button>
+                  <button id="cancelRelatedNoteButton" class="ghost compact" type="button">Cancel</button>
+                </div>
+              </div>
+              <p id="relatedWorksStatus" class="help" role="status"></p>
+              <input id="relatedFilesInput" type="file" multiple hidden aria-label="Related works to add">
+            </details>
+
             <details id="resultPanel" class="run-result card" hidden>
               <summary id="resultHeading">Final answer</summary>
               <p id="resultDescription" class="help"></p>
               <pre id="resultOutput" class="statement-copy"></pre>
-            </details>
-
-            <details id="memoryPanel" class="memory-panel card" hidden>
-              <summary>
-                <span class="memory-mark" aria-hidden="true"><svg class="icon" viewBox="0 0 16 16" focusable="false"><circle cx="3.5" cy="8" r="1.75"/><circle cx="12.5" cy="3.75" r="1.75"/><circle cx="12.5" cy="12.25" r="1.75"/><path d="M5.25 7.4 10.75 4.4M5.25 8.6l5.5 3"/></svg></span>
-                <span><strong>Research files</strong><small>Approach graph, proved lemmas, and independent reports</small></span>
-                <span class="memory-chevron" aria-hidden="true">⌄</span>
-              </summary>
-              <div class="memory-tabs" role="tablist" aria-label="Research memory files">
-                <button id="memoryApproachesTab" type="button" role="tab" aria-selected="true"
-                  aria-controls="memoryDocument" data-memory="APPROACHES">Approach graph</button>
-                <button id="memoryLemmasTab" type="button" role="tab" aria-selected="false"
-                  aria-controls="memoryDocument" tabindex="-1" data-memory="PROVED.md">Proved lemmas</button>
-                <button id="memoryAuditTab" type="button" role="tab" aria-selected="false"
-                  aria-controls="memoryDocument" tabindex="-1" data-memory="AUDITS">Saved audits</button>
-                <button id="memoryAuditHistoryTab" type="button" role="tab" aria-selected="false"
-                  aria-controls="memoryDocument" tabindex="-1" data-memory="audit_history">Audit history</button>
-              </div>
-              <section id="approachGraph" class="approach-graph" aria-labelledby="approachGraphHeading" hidden>
-                <div class="approach-graph-heading">
-                  <div><h3 id="approachGraphHeading">How the approaches connect</h3>
-                    <p id="approachGraphSummary">Each node opens a saved approach. Arrows point from parent to child.</p></div>
-                  <button id="approachIndexButton" type="button" class="ghost compact" hidden>Read index</button>
-                </div>
-                <p id="approachGraphWarning" class="help graph-warning" role="status" hidden></p>
-                <div id="approachGraphViewport" class="approach-graph-viewport" tabindex="0" aria-label="Approach diagram. Scroll to explore; tab to focus nodes and Enter to read a file.">
-                  <div id="approachGraphCanvas" class="approach-graph-canvas"></div>
-                </div>
-                <div id="approachGraphInspector" class="approach-graph-inspector">Hover or focus a node for its result and dependencies. Select it to read the full record.</div>
-              </section>
-              <div id="memoryApproachPicker" class="memory-approach-picker" hidden>
-                <label for="memoryApproach">File</label>
-                <select id="memoryApproach" aria-controls="memoryDocument"></select>
-              </div>
-              <div class="memory-meta">
-                <code id="memoryFilename">APPROACHES</code>
-                <span id="memoryUpdated"></span>
-              </div>
-              <div id="memoryDocument" class="memory-document" role="tabpanel"
-                aria-labelledby="memoryApproachesTab" tabindex="0">
-                <p id="memoryMessage" class="memory-message">Open a file to read the author’s saved work.</p>
-                <div id="memoryContent" class="memory-content"></div>
-              </div>
-              <p class="memory-footer">Read-only · Refreshes automatically while open</p>
             </details>
 
             <section class="timeline-surface card" aria-labelledby="activityHeading">
@@ -665,6 +811,8 @@
                 </div>
               </div>
               <p id="traceNotice" class="help trace-notice" role="status" hidden></p>
+              <button id="downloadTranscriptButton" class="trace-download" type="button" hidden>Download the full
+                transcript (transcript.jsonl)</button>
               <ol id="timelineList" class="timeline" role="log"
                 aria-live="off" aria-relevant="additions text"></ol>
               <button id="jumpLatest" class="jump-latest secondary compact" type="button" hidden>
@@ -681,7 +829,8 @@
               <summary>Original statement</summary>
               <pre id="runOriginalStatement" class="statement-copy"></pre>
             </details>
-            <section id="retrievalPanel" class="retrieval-panel" aria-labelledby="retrievalHeading" tabindex="-1">
+            <!-- Research sources: only for a job with a web cutoff (-1 or a timestamp); app.js shows it. -->
+            <section id="retrievalPanel" class="retrieval-panel" aria-labelledby="retrievalHeading" tabindex="-1" hidden>
               <div class="retrieval-heading">
                 <div><p class="eyebrow">Research sources</p><h3 id="retrievalHeading">Web search</h3></div>
                 <span id="retrievalStatus" class="badge retrieval-badge"></span>
@@ -727,6 +876,7 @@
           <li><span class="legend-dot rejected">×</span>Rejected</li>
           <li><span class="legend-dot failed">!</span>Needs attention</li>
           <li><span class="legend-dot">3</span>Up next</li>
+          <li><span class="legend-dot disabled">–</span>Not selected</li>
         </ul>
       </aside>
     </div>
@@ -751,6 +901,8 @@
             aria-selected="false" aria-controls="promptPanel" data-prompt="author">Author</button>
           <button id="criticPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
             aria-selected="false" aria-controls="promptPanel" data-prompt="critic">Critic</button>
+          <button id="conventionPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
+            aria-selected="false" aria-controls="promptPanel" data-prompt="convention">Convention critic</button>
           <button id="finalPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
             aria-selected="false" aria-controls="promptPanel" data-prompt="final">Final writer</button>
         </div>

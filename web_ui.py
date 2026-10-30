@@ -44,7 +44,12 @@ def main():
             file=sys.stderr,
         )
         return 1
-    from ui.cli import main as run
+    try:
+        from ui.cli import main as run
+    except ValueError as exc:
+        # A workflow file that cannot be read (named with its line), and no earlier readable version.
+        print(f"Cannot start TCS Prover: {exc}", file=sys.stderr)
+        return 1
     return run()
 
 

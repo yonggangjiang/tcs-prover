@@ -476,6 +476,23 @@ class AppearanceStylesheetTests(unittest.TestCase):
                 self.assertEqual(self.rule(selector)["border-color"], "var(--field-line)")
         self.assertIn("var(--field-line)", self.rule(".segment input:checked + span")["box-shadow"])
 
+    def test_conversation_and_related_works_use_theme_tokens_only(self):
+        # The author conversation and the related-works lists are drawn from the theme tokens alone, so
+        # each of the four themes styles them in light and dark (forced colours use system colours).
+        new = (".author-conversation", ".conversation-", ".steer-buttons", ".limit-hint", ".related-work",
+               ".related-note", ".batch-related")
+        checked = 0
+        for selector, declarations in self.blocks:
+            if not any(name in selector for name in new):
+                continue
+            for name, value in declarations.items():
+                if name in ("color", "background", "box-shadow", "outline") or name.startswith("border"):
+                    checked += 1
+                    with self.subTest(selector=selector, property=name):
+                        self.assertNotRegex(value, r"#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\((?!var\()")
+                        self.assertNotRegex(value, r"\b(?:white|black|red|green|blue|gray|grey|silver|orange)\b")
+        self.assertGreater(checked, 15)
+
     def test_theme_cards_preview_each_theme_in_the_current_mode(self):
         selectors = [sel for sel, _ in self.blocks]
         for theme in THEMES:
@@ -484,6 +501,25 @@ class AppearanceStylesheetTests(unittest.TestCase):
                                     for sel in selectors))
                 self.assertTrue(any(f'[data-mode="dark"] .theme-swatch[data-swatch="{theme}"]' in sel
                                     for sel in selectors))
+
+    def test_a_long_stage_wraps_inside_its_pill_on_a_phone(self):
+        # At 320 px "Independent critic · paused · cycle 1 · round 2" is wider than the page.
+        css = re.sub(r"/\*.*?\*/", "", STYLES.read_text(encoding="utf-8"), flags=re.S)
+        phone = {}
+        for match in re.finditer(r"@media \(max-width: 599px\) \{", css):
+            depth, end = 1, match.end()
+            while depth:
+                depth += {"{": 1, "}": -1}.get(css[end], 0)
+                end += 1
+            for rule in re.finditer(r"([^{}]+)\{([^{}]*)\}", css[match.end():end - 1]):
+                phone[" ".join(rule.group(1).split())] = {
+                    name.strip(): " ".join(value.split())
+                    for name, value in (item.split(":", 1) for item in rule.group(2).split(";") if ":" in item)}
+        pill = phone[".run-facts dd.status-pill"]
+        self.assertEqual((pill["white-space"], pill["max-width"]), ("normal", "100%"))
+        self.assertEqual(phone[".run-facts > .fact-stage"]["max-width"], "100%")
+        # Wider pages keep it on one line.
+        self.assertEqual(self.rule(".batch-progress span, .job-status, .status-pill")["white-space"], "nowrap")
 
 
 if __name__ == "__main__":

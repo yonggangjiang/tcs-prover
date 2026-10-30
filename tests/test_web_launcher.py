@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import web_ui
 
 

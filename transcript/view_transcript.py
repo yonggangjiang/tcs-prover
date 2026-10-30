@@ -301,10 +301,25 @@ class TranscriptViewer:
                     "- Edited pass: the critic repaired the candidate; a fresh critic "
                     "rechecks it unless the round limit was reached."
                 )
+            if plain_text(report.get("fixes")) and report.get("proofChanged") is not False:
+                lines.extend(["", "Fixed:", plain_text(report["fixes"])])
             if plain_text(report.get("bugs")):
                 lines.extend(["", "Unresolved bugs:", plain_text(report["bugs"])])
             self._write(
                 record, f"{record.get('label') or 'CRITIC'} — {verdict}",
+                "\n".join(lines),
+            )
+            return
+
+        if kind == "convention_result":
+            # The convention critic's check of the accepted proof: shown to the user, never part of the route.
+            lines = [f"What the user most likely wants: {plain_text(record.get('intended'))}",
+                     f"How the proof relates to it: {plain_text(record.get('assessment'))}"]
+            if record.get("verdict") == "loophole":
+                lines.extend(["", "How it exploits the statement:", plain_text(record.get("loophole")),
+                              "", "Suggested statement:", plain_text(record.get("suggestedStatement"))])
+            self._write(
+                record, f"{record.get('label') or 'CONVENTION CRITIC'} — {str(record.get('verdict') or '').upper()}",
                 "\n".join(lines),
             )
             return
@@ -355,7 +370,9 @@ class TranscriptViewer:
             partial = self.partials.pop(("agent", item_id), None) or {}
             value = item.get("text") or partial.get("text", "")
             if plain_text(value):
-                phase = str(item.get("phase") or "").upper()
+                # A question to the user arrives as a "final_answer" while the model keeps working.
+                phase = ("QUESTION TO THE USER" if item.get("delivery") == "async"
+                         else str(item.get("phase") or "").upper())
                 self._write(record, phase or "MODEL MESSAGE", value, root=root)
             return
 
@@ -546,7 +563,8 @@ def ui_entry(record, offset):
         return entry("reasoning", "Reasoning summary", value) if value else None
     if name in COMPLETED_EVENTS and item_type in {"agentMessage", "agent_message"}:
         value = item.get("text") or ""
-        phase = str(item.get("phase") or "Model message").replace("_", " ").title()
+        phase = ("Question to the user" if item.get("delivery") == "async"
+                 else str(item.get("phase") or "Model message").replace("_", " ").title())
         return entry("message", phase, value) if value else None
     if item_type in TOOL_TYPES:
         status = str(item.get("status") or "").lower()

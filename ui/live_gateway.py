@@ -23,7 +23,21 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 HOST = '127.0.0.1'
 UI = Path(__file__).resolve().parent
 MAX_REQUEST_BYTES = 100_000
+# Every request that creates or starts a job may be this large, as on the controller.
 MAX_BATCH_BYTES = 8 * 1024 * 1024
+JOB_REQUEST_ROUTES = {'/review', '/direct', '/direct-batch', '/start-workflow', '/finalize', '/approve', '/solve',
+                      '/uploads/note'}
+# Related-work uploads go to the updated controller before any job takes them; a file is sent
+# as its raw bytes, at most MAX_UPLOAD_BYTES (ui.related_works.MAX_FILE_BYTES).
+UPLOAD_ROUTES = {'/uploads', '/uploads/note', '/uploads/discard'}
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+# A folder batch's shared related works (the batch parameter names a folder batch here).
+BATCH_WORKS_ROUTES = {'/batch-related-works', '/batch-related-works/add'}
+# Actions the earlier controller does not have.
+UPDATED_CONTROL_ROUTES = {'/related-works/add', '/ask-author', '/author-summary', '/stop-author-reply',
+                          '/answer-author-question', '/dismiss-author-question', '/dismiss-convention-warning'}
+LEGACY_UNSUPPORTED = 'This job belongs to the earlier controller, which does not support this action.'
+MAX_DISCARDED_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 GET_TIMEOUT_SECONDS = 15
 POST_TIMEOUT_SECONDS = 600
@@ -33,17 +47,16 @@ STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
           '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
           '/favicon.svg': ('favicon.svg', 'image/svg+xml')}
 GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
-              '/transcript': {'job'}, '/approach-graph': {'job'},
-              '/memory': {'job', 'file', 'version'},
-              '/download-tex': {'job'}, '/download-pdf': {'job'}}
+              '/transcript': {'job'}, '/download-proof': {'job'}, '/download-source': {'job'},
+              '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',
                   '/set-author-time-limit', '/steer-author',
-                  '/stop', '/pause', '/reset', '/clear-trace'}
+                  '/stop', '/pause', '/reset', '/clear-trace', *UPDATED_CONTROL_ROUTES}
 # API models belong to the updated controller's installation, not to a job:
 # GET lists them; the POST routes save, delete and test one.
-API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover'}
+API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover', '/settings'}
 
 
 class GatewayError(Exception):
@@ -81,7 +94,7 @@ class Upstream:
         except (OSError, KeyError, TypeError, ValueError):
             raise ValueError('Cannot read a valid loopback controller launch record.') from None
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, content_type='application/json'):
         # Historical job creation performs sandbox preflight before responding.
         # A short POST timeout can leave a started job behind an ambiguous error.
         timeout = (BATCH_TIMEOUT_SECONDS if method == 'POST' and path == '/direct-batch'
@@ -89,7 +102,7 @@ class Upstream:
         connection = http.client.HTTPConnection(HOST, self.port, timeout=timeout)
         headers = {'X-TCS-Prover-Token': self.token, 'Origin': self.origin}
         if body is not None:
-            headers['Content-Type'] = 'application/json'
+            headers['Content-Type'] = content_type
         try:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
@@ -122,6 +135,52 @@ class Upstream:
             return value
         except (KeyError, TypeError, ValueError):
             raise GatewayError('The local controller returned an invalid job list.') from None
+
+
+class LaunchRecordUpstream:
+    """The existing controller, read again from its launch record when it stops answering.
+
+    A restarted controller has a new token (and maybe a new port). A refused
+    request (403) ran nothing, so it is sent again to the new address once; a
+    lost POST is never repeated, but the next request uses the new address.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.upstream = Upstream.from_launch_status(self.path)
+
+    port = property(lambda self: self.upstream.port)
+    token = property(lambda self: self.upstream.token)
+    origin = property(lambda self: self.upstream.origin)
+
+    def __repr__(self):
+        return f'LaunchRecordUpstream(port={self.port})'
+
+    def _reload(self):
+        try:
+            fresh = Upstream.from_launch_status(self.path)
+        except ValueError:
+            return False
+        if fresh == self.upstream:
+            return False
+        self.upstream = fresh
+        return True
+
+    def request(self, method, path, body=None, content_type='application/json'):
+        # Only an upload names another content type.
+        extra = {} if content_type == 'application/json' else {'content_type': content_type}
+        try:
+            result = self.upstream.request(method, path, body, **extra)
+        except GatewayError:
+            if not self._reload() or method == 'POST':
+                raise
+            return self.upstream.request(method, path, body, **extra)
+        if result[0] == 403 and self._reload():
+            return self.upstream.request(method, path, body, **extra)
+        return result
+
+    def jobs(self):
+        return Upstream.jobs(self)
 
 
 def contains_policy_change(value):
@@ -189,6 +248,8 @@ class GatewayServer(ThreadingHTTPServer):
         return None
 
     def batch_cards(self):
+        from .batches import batch_counts
+
         cards = self.catalog.list_batches() if self.catalog else []
         legacy, current = self.legacy.jobs(), self.current.jobs()
         for ident, rows in ((self.legacy_batch, legacy['jobs']),
@@ -201,12 +262,8 @@ class GatewayServer(ThreadingHTTPServer):
                     continue
                 card = {'id': ident, 'name': ident, 'folder': ident}
                 cards.append(card)
-            counts = {}
-            for row in rows:
-                phase = row.get('phase') or 'unknown'
-                counts[phase] = counts.get(phase, 0) + 1
             starts = [row['startedAt'] for row in rows if row.get('startedAt')]
-            card.update(jobCount=len(rows), counts=counts, readOnly=False,
+            card.update(jobCount=len(rows), counts=batch_counts(rows), readOnly=False,
                         current=ident == self.legacy_batch,
                         startedAt=min(starts) if starts else card.get('startedAt', ''))
         cards.sort(key=lambda card: (bool(card.get('current')), card.get('startedAt') or ''), reverse=True)
@@ -297,8 +354,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return self.send((self.server.ui_directory / filename).read_bytes(), content_type=kind)
             if not self.authorized():
                 raise GatewayError('Open TCS Prover from its launch URL.', 403)
-            if path == '/api-models' and not query:
+            if path in {'/api-models', '/settings'} and not query:
                 return self.forward_api_models('GET', path)
+            if path == '/batch-related-works':
+                # Here ``batch`` names a folder batch, not a saved batch of runs.
+                if set(query) - {'job', 'batch'}:
+                    raise GatewayError('Not found.', 404)
+                upstream = self.batch_works_upstream(query)
+                return self.forward_raw('GET', self.request_path(path, query), upstream=upstream)
             if path not in GET_ROUTES or set(query) - (GET_ROUTES[path] | {'batch'}):
                 raise GatewayError('Not found.', 404)
             if path == '/batches':
@@ -343,11 +406,102 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError, TypeError, KeyError):
             self.send({'error': 'The local dashboard could not complete this request.'}, 502)
 
+    def discard_body(self, size):
+        """Read and drop a refused body, so the browser receives the reason, not a reset connection."""
+        self.close_connection = True
+        left = min(max(size, 0), MAX_DISCARDED_REQUEST_BYTES)
+        try:
+            self.connection.settimeout(1)
+            while left > 0:
+                chunk = self.rfile.read(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:
+            pass
+
+    def json_body(self, path):
+        """The raw bytes of a JSON-object request body, checked as the controller checks them."""
+        if self.headers.get_content_type() != 'application/json':
+            raise GatewayError('Expected a JSON request.', 400)
+        if self.headers.get('Transfer-Encoding'):
+            raise GatewayError('Transfer encoding is not supported.', 400)
+        try:
+            size = int(self.headers.get('Content-Length', '0'))
+        except ValueError:
+            raise GatewayError('Invalid request length.', 400) from None
+        limit = MAX_BATCH_BYTES if path in JOB_REQUEST_ROUTES else MAX_REQUEST_BYTES
+        if not 0 <= size <= limit:
+            self.discard_body(size)
+            raise GatewayError(f'This request is {size / 1048576:.1f} MB; the limit is {limit / 1048576:g} MB.', 413)
+        raw = self.rfile.read(size)
+        try:
+            body = json.loads(raw or b'{}')
+            if not isinstance(body, dict):
+                raise ValueError
+        except (ValueError, UnicodeError):
+            raise GatewayError('Expected a JSON object.', 400) from None
+        return raw or b'{}', body
+
+    def forward_raw(self, method, path, body=None, content_type='application/json', upstream=None):
+        """Pass one request to a controller (the updated one by default) and its answer back unchanged."""
+        extra = {} if content_type == 'application/json' else {'content_type': content_type}
+        status, kind, disposition, raw = (upstream or self.server.current).request(method, path, body, **extra)
+        self.send(raw, status, kind, disposition)
+
+    def forward_upload(self, path, query):
+        """A related-work upload belongs to no job yet: it goes to the updated controller."""
+        if path == '/uploads':
+            if set(query) != {'name'}:
+                raise GatewayError('Not found.', 404)
+            if self.headers.get('Transfer-Encoding'):
+                raise GatewayError('Transfer encoding is not supported.', 400)
+            length = self.headers.get('Content-Length')
+            if length is None or not length.strip().isdigit():
+                raise GatewayError("Send the file's size in its Content-Length.", 411)
+            size = int(length)
+            if self.headers.get_content_type() != 'application/octet-stream':
+                self.discard_body(size)
+                raise GatewayError("Send the file's bytes as application/octet-stream.", 400)
+            if size > MAX_UPLOAD_BYTES:
+                self.discard_body(size)
+                raise GatewayError(f'This file is {size / 1048576:.1f} MB; the limit is '
+                                   f'{MAX_UPLOAD_BYTES // 1048576} MB per file.', 413)
+            raw = self.rfile.read(size)
+            if len(raw) != size:
+                raise GatewayError('The upload ended before the whole file arrived; add the file again.', 400)
+            return self.forward_raw('POST', self.request_path(path, query), raw, 'application/octet-stream')
+        if query:
+            raise GatewayError('Not found.', 404)
+        raw, _ = self.json_body(path)
+        return self.forward_raw('POST', path, raw)
+
+    def batch_works_upstream(self, query):
+        """The controller of a folder batch's related works: the updated one, unless a named job is the earlier one's.
+
+        A page may also send its saved batch of runs as ``batch``; the named job then decides.
+        """
+        if query.get('batch') in {'__root__', self.server.legacy_batch, self.server.current_batch} - {None}:
+            del query['batch']
+        run_id = query.get('job', '')
+        if run_id and self.server.owner(run_id) is self.server.legacy:
+            raise GatewayError(LEGACY_UNSUPPORTED, 400)
+        return self.server.current
+
     def do_POST(self):
         try:
             if not self.authorized():
                 raise GatewayError('Unauthorized local request.', 403)
             path, query = self.parsed_request()
+            if path in UPLOAD_ROUTES:
+                return self.forward_upload(path, query)
+            if path in BATCH_WORKS_ROUTES:
+                # Here ``batch`` names a folder batch, not a saved batch of runs.
+                if path != '/batch-related-works/add' or set(query) - {'job', 'batch'}:
+                    raise GatewayError('Not found.', 404)
+                upstream = self.batch_works_upstream(query)
+                raw, _ = self.json_body(path)
+                return self.forward_raw('POST', self.request_path(path, query), raw, upstream=upstream)
             api_models = path in API_MODEL_ROUTES
             if api_models and query:
                 raise GatewayError('Not found.', 404)
@@ -357,26 +511,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             batch_upstream = self.server.batch_upstream(batch)
             if batch is not None and batch_upstream is None:
                 raise GatewayError('Saved batches are read-only.', 403)
-            if self.headers.get_content_type() != 'application/json':
-                raise GatewayError('Expected a JSON request.', 400)
-            if self.headers.get('Transfer-Encoding'):
-                raise GatewayError('Transfer encoding is not supported.', 400)
-            try:
-                size = int(self.headers.get('Content-Length', '0'))
-            except ValueError:
-                raise GatewayError('Invalid request length.', 400) from None
-            limit = MAX_BATCH_BYTES if path == '/direct-batch' else MAX_REQUEST_BYTES
-            if not 0 <= size <= limit:
-                raise GatewayError('Request is too large.', 413)
-            raw = self.rfile.read(size)
-            try:
-                body = json.loads(raw or b'{}')
-                if not isinstance(body, dict):
-                    raise ValueError
-            except (ValueError, UnicodeError):
-                raise GatewayError('Expected a JSON object.', 400) from None
+            raw, body = self.json_body(path)
             if api_models:
-                return self.forward_api_models('POST', path, raw or b'{}')
+                return self.forward_api_models('POST', path, raw)
             run_id = query.get('job', '')
             if run_id:
                 if batch_upstream:
@@ -388,6 +525,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if upstream is self.server.legacy:
                     if path in CREATE_ROUTES:
                         raise GatewayError('Start a new job from the home screen.', 400)
+                    if path in UPDATED_CONTROL_ROUTES:
+                        raise GatewayError(LEGACY_UNSUPPORTED, 400)
                     if contains_policy_change(body):
                         raise GatewayError('Existing historical retrieval settings are fixed.', 400)
             elif path in CREATE_ROUTES:
@@ -442,8 +581,10 @@ def main(argv=None):
     if (status_path == args.legacy_launch_status.resolve()
             or status_path.is_relative_to(legacy_runs) or status_path.is_relative_to(new_runs)):
         raise ValueError('Gateway status must be separate from existing status and solver runs.')
-    legacy = Upstream.from_launch_status(args.legacy_launch_status)
-    from .server import Server
+    # A restarted legacy controller is found again through its launch record.
+    legacy = LaunchRecordUpstream(args.legacy_launch_status)
+    from . import ownership
+    from .server import Server, raise_open_file_limit
     from .legacy_overview import augment_legacy
     from .batches import BatchCatalog
     # Preserve browser sessions when upgrading only this dashboard process.
@@ -452,7 +593,9 @@ def main(argv=None):
         previous = Upstream.from_launch_status(status_path)
         if previous.port == args.port:
             token = previous.token
-    current = Server((HOST, 0), runs=new_runs)
+    raise_open_file_limit()
+    ownership.ROLE = 'dashboard gateway'
+    current = Server((HOST, 0), runs=new_runs, single_instance=True)
     try:
         gateway = GatewayServer((HOST, args.port), legacy=legacy,
             current=Upstream(current.server_port, current.token),
@@ -465,6 +608,16 @@ def main(argv=None):
         raise
     worker = threading.Thread(target=current.serve_forever, daemon=True)
     worker.start()
+    # SIGTERM and SIGHUP close the gateway like Ctrl-C, which pauses the new controller's jobs.
+    import signal
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ('SIGTERM', 'SIGHUP'):
+        # A signal the launching shell ignores (nohup) stays ignored.
+        if hasattr(signal, name) and signal.getsignal(getattr(signal, name)) != signal.SIG_IGN:
+            signal.signal(getattr(signal, name), interrupt)
     try:
         # Validate reachability and disjoint ownership before advertising a URL.
         gateway.job_lists()
@@ -478,11 +631,19 @@ def main(argv=None):
         write_launch_status(status_path, record)
         print(f'Updated dashboard listening on {gateway.origin}', flush=True)
         gateway.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
         gateway.server_close()
-        current.shutdown()
-        current.server_close()
-        worker.join(timeout=5)
+        # Pause the new controller's authors (resumed at its next start) before it closes.
+        try:
+            current.stop_all()
+        except KeyboardInterrupt:
+            current.stop_all(wait=0)
+        finally:
+            current.shutdown()
+            current.server_close()
+            worker.join(timeout=5)
     return 0
 
 

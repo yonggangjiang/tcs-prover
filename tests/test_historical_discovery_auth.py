@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import historical_discovery_auth as auth
 
 

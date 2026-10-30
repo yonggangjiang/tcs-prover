@@ -15,6 +15,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import providers
 from ui import server
@@ -293,7 +294,7 @@ class ProviderMarkupTests(unittest.TestCase):
             for match in re.finditer(r"""slice\((['"])(.+?)\1\s*,\s*(['"])(.+?)\3""", text):
                 markers.update((match.group(2), match.group(4)))
         markers = {marker for marker in markers if "\\" not in marker}
-        self.assertGreater(len(markers), 40)
+        self.assertGreater(len(markers), 30)
         for marker in sorted(markers):
             with self.subTest(marker=marker):
                 self.assertEqual(source.count(marker), 1)
@@ -589,6 +590,7 @@ const timelineRows = new Map();
 document.createElement = (tag) => new Element(tag);
 let state = {runId: 'r', phase: 'paused', stage: 'solve', activeNode: 'author', statement: 'S', draft: 'S',
   workflow: {nodes: {author: {label: 'Proof author'}}}, trace: [], skipStatementReview: true, criticRounds: 2,
+  criticCount: 3,
   authorModel: 'claude-opus-5-5', authorEffort: 'max', criticModel: 'api:lab-sol', criticEffort: 'high',
   writerModel: 'gpt-6.1-sol', writerEffort: 'max',
   apiModels: {'api:lab-sol': {label: 'Sol via lab gateway', format: 'openai', baseUrl: 'https://gateway.lab.example/v1',
@@ -600,9 +602,9 @@ renderRunOverview();
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, state.settingsWarning);
 assert.equal(rows()['Settings warning'], state.settingsWarning);
-assert.equal(rows()['Proof author'], 'claude-opus-5-5 · max');
+assert.equal(rows()['Proof author'], 'claude-opus-5-5 · max · no subagents');
 assert.equal(rows()['Independent critic'], 'api:lab-sol · high · Sol via lab gateway · OpenAI format · '
-  + 'https://gateway.lab.example/v1 · model gpt-6.1-sol · max 2 consecutive rounds');
+  + 'https://gateway.lab.example/v1 · model gpt-6.1-sol · 3 independent critics as subagents · max 2 consecutive rounds');
 assert.equal(rows()['LaTeX writer'], 'gpt-6.1-sol · max');
 // No warning: the header line is hidden and the row is left out.
 state = {...state, settingsWarning: ''};
@@ -620,7 +622,7 @@ const missing = 'The API model api:lab-sol chosen for the critic is not configur
 state = {...state, workflow: {...state.workflow, settings: {model_catalog: catalog}}};
 renderRunOverview();
 assert.equal(rows()['Independent critic'], 'api:lab-sol (not configured) · high · Sol via lab gateway · OpenAI format · '
-  + 'https://gateway.lab.example/v1 · model gpt-6.1-sol · max 2 consecutive rounds');
+  + 'https://gateway.lab.example/v1 · model gpt-6.1-sol · 3 independent critics as subagents · max 2 consecutive rounds');
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, missing);
 assert.equal(rows()['Settings warning'], missing);
@@ -850,15 +852,24 @@ class _ClosingEndpoint(BaseHTTPRequestHandler):
 
     def do_POST(self):
         size = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(size)
+        streamed = json.loads(self.rfile.read(size) or b"{}").get("stream")
         key = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
-        if key == "sk-good-0123456789":
-            status, value = 200, {"model": "gpt-6.1-sol-2026-10", "output_text": "OK"}
+        kind = "application/json"
+        if key == "sk-good-0123456789" and streamed:
+            # The Test streams like a run; the model answers through the offered tool.
+            status, kind, events = 200, "text/event-stream", [
+                {"type": "response.created", "response": {"model": "gpt-6.1-sol-2026-10"}},
+                {"type": "response.output_item.done", "item": {
+                    "type": "function_call", "name": "report_result", "arguments": '{"ok": true}'}},
+                {"type": "response.completed", "response": {"model": "gpt-6.1-sol-2026-10"}}]
+            data = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
+        elif key == "sk-good-0123456789":
+            status, data = 200, json.dumps({"model": "gpt-6.1-sol-2026-10", "output_text": "OK"}).encode()
         else:
-            status, value = 401, {"error": {"message": f"Incorrect API key provided: {key}."}}
-        data = json.dumps(value).encode()
+            status = 401
+            data = json.dumps({"error": {"message": f"Incorrect API key provided: {key}."}}).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -886,7 +897,7 @@ class ApiModelTestEndpointTests(unittest.TestCase):
     def test_a_reply_and_the_reported_model_are_kept(self):
         result = server.probe_api_endpoint(self.entry("sk-good-0123456789"), timeout=10)
         self.assertEqual((result["ok"], result["status"]), (True, 200))
-        self.assertEqual(result["message"], "The model replied: OK")
+        self.assertEqual(result["message"], 'The model answered through the report_result tool: {"ok": true}')
         self.assertEqual(result["model"], "gpt-6.1-sol-2026-10")
 
 

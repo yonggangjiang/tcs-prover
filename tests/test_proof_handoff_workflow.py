@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
+from tests import critic_doubles
 from test_workflow_runner import workspace, review_report, ROOT
 
 
@@ -27,7 +29,8 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
             state = {"statement": "Prove the additive identity.", "solution": "PROOF_FILE: proof.md"}
 
             def review(prompt, schema, stage, **settings):
-                self.assertIn(proof, prompt)
+                # The critic reads proof.md; the proof is not repeated in its prompt.
+                self.assertNotIn(proof, prompt)
                 self.assertEqual((directory / "saved-candidate.md").read_text(), proof)
                 files = dict(settings["input_files"])
                 self.assertEqual(files["proof.md"], proof)
@@ -41,9 +44,9 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
                 report = review_report(proof)
                 return report, json.dumps(report)
 
-            with patch.object(runtime, "structured", side_effect=review) as model:
+            with patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(review)) as model:
                 result = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"], state, {"start_node": "critic"})
-            self.assertEqual(model.call_count, 1)
+            self.assertEqual([call.kwargs["request_label"] for call in model.call_args_list].count("Critic coordinator"), 1)
             self.assertEqual(result["output"], proof.strip())
 
     def test_rejection_returns_actual_proof_and_next_submission_is_fresh(self):
@@ -59,7 +62,7 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
                 reviewed.append(candidate)
                 report = review_report(candidate, "reject" if len(reviewed) == 1 else "pass")
                 return report, json.dumps(report)
-            with patch.object(runtime, "goal_session", side_effect=author), patch.object(runtime, "structured", side_effect=review):
+            with patch.object(runtime, "goal_session", side_effect=author), patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(review)):
                 result = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"], {"statement": "Task"})
             self.assertEqual(reviewed, ["Candidate one", "Candidate two with the gap repaired"])
             self.assertEqual(feedback[0]["solution"], "Candidate one")
@@ -74,7 +77,7 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
                 reviewed.append(dict(settings["input_files"])["proof.md"])
                 report = review_report("Critic corrected candidate")
                 return report, json.dumps(report)
-            with patch.object(runtime, "structured", side_effect=review):
+            with patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(review)):
                 runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"],
                     {"statement": "Task", "solution": "PROOF_FILE: proof.md"}, {"start_node": "critic"})
             self.assertEqual(reviewed, ["Original candidate", "Critic corrected candidate"])

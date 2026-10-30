@@ -9,8 +9,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui.batches import BatchCatalog
-from ui.live_gateway import GatewayError, GatewayServer, Upstream, validate_separate_runs
+from ui.live_gateway import GET_ROUTES, GatewayError, GatewayServer, Upstream, validate_separate_runs
 
 
 class FakeController(ThreadingHTTPServer):
@@ -20,6 +21,7 @@ class FakeController(ThreadingHTTPServer):
         self.token = 'private-controller-token-' + str(id(self))
         self.jobs = [{'runId': ident, 'startedAt': ident} for ident in run_ids]
         self.calls = []
+        self.content_types = []
         super().__init__(('127.0.0.1', 0), FakeHandler)
         self.origin = f'http://127.0.0.1:{self.server_port}'
 
@@ -45,6 +47,7 @@ class FakeHandler(BaseHTTPRequestHandler):
             return self.respond({'error': 'bad upstream authorization'}, 403)
         body = self.rfile.read(int(self.headers.get('Content-Length', '0'))) if method == 'POST' else b''
         self.server.calls.append((method, self.path, body))
+        self.server.content_types.append(self.headers.get('Content-Type'))
         if self.path == '/jobs':
             return self.respond({'jobs': list(self.server.jobs)})
         if self.path.startswith('/download-pdf'):
@@ -270,6 +273,69 @@ class GatewayTests(_ApiModelRoutes, _GatewayFixture):
                     self.assertIn('Refresh job status before retrying', str(caught.exception))
 
 
+class GatewayConversationAndRelatedWorksTests(_GatewayFixture):
+    def raw(self, path, data, content_type='application/octet-stream', headers=None):
+        connection = http.client.HTTPConnection('127.0.0.1', self.gateway.server_port, timeout=5)
+        try:
+            connection.request('POST', path, body=data, headers={
+                'Origin': self.gateway.origin, 'X-TCS-Prover-Token': self.gateway.token,
+                'Content-Type': content_type, **(headers or {})})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_uploads_reach_the_updated_controller_as_their_bytes(self):
+        status, value = self.raw('/uploads?name=a+paper.pdf', b'%PDF-1.4 bytes')
+        self.assertEqual((status, value['route']), (200, '/uploads?name=a+paper.pdf'))
+        self.assertEqual(self.current.calls[-1], ('POST', '/uploads?name=a+paper.pdf', b'%PDF-1.4 bytes'))
+        self.assertEqual(self.current.content_types[-1], 'application/octet-stream')
+        for path in ('/uploads', '/uploads?name=a&job=current', '/uploads?name=a&batch=new'):
+            self.assertEqual(self.raw(path, b'x')[0], 404)
+        status, value = self.raw('/uploads?name=a', b'x', content_type='application/json')
+        self.assertEqual((status, value['error']), (400, "Send the file's bytes as application/octet-stream."))
+        status, value = self.raw('/uploads?name=a', b'x', headers={'Transfer-Encoding': 'chunked'})
+        self.assertEqual((status, value['error']), (400, 'Transfer encoding is not supported.'))
+        # The body is read and dropped first, so the reason arrives instead of a reset connection.
+        status, value = self.raw('/uploads?name=a', b'x' * 10, headers={'Content-Length': str(65 * 1048576)})
+        self.assertEqual((status, value['error']), (413, 'This file is 65.0 MB; the limit is 64 MB per file.'))
+        note = {'title': 'Idea', 'text': 'x' * 200_000}  # Larger than an ordinary request.
+        status, value = self.request('/uploads/note', method='POST', body=note)
+        self.assertEqual((status, value['route']), (200, '/uploads/note'))
+        status, value = self.request('/uploads/discard', method='POST', body={'token': 't'})
+        self.assertEqual((status, value['route']), (200, '/uploads/discard'))
+        self.assertEqual(self.request('/uploads/discard?job=current', method='POST', body={})[0], 404)
+        self.assertEqual(self.request('/uploads/note', method='POST', body=note, authenticate=False)[0], 403)
+        self.assertFalse([call for call in self.legacy.calls if call[0] == 'POST'])
+
+    def test_the_new_job_actions_refuse_the_earlier_controllers_jobs(self):
+        for route in ('related-works/add', 'ask-author', 'author-summary', 'stop-author-reply'):
+            with self.subTest(route=route):
+                status, value = self.request(f'/{route}?job=legacy', method='POST', body={'text': 'Hi?'})
+                self.assertEqual((status, value['error']),
+                                 (400, 'This job belongs to the earlier controller, which does not support this '
+                                       'action.'))
+                status, value = self.request(f'/{route}?job=current', method='POST', body={'text': 'Hi?'})
+                self.assertEqual((status, value['route']), (200, f'/{route}?job=current'))
+        self.assertFalse([call for call in self.legacy.calls if call[0] == 'POST'])
+
+    def test_a_folder_batchs_related_works_live_on_the_updated_controller(self):
+        status, value = self.request('/batch-related-works?batch=b_0123456789')
+        self.assertEqual((status, value['route']), (200, '/batch-related-works?batch=b_0123456789'))
+        status, value = self.request('/batch-related-works/add?batch=b_0123456789', method='POST',
+                                     body={'uploads': ['t']})
+        self.assertEqual((status, value['route']), (200, '/batch-related-works/add?batch=b_0123456789'))
+        self.assertEqual(self.current.calls[-1][2], b'{"uploads": ["t"]}')
+        status, value = self.request('/batch-related-works/add?job=legacy', method='POST', body={'uploads': ['t']})
+        self.assertEqual(status, 400)
+        # A page's saved batch of runs is not a folder batch: the named job decides.
+        status, value = self.request('/batch-related-works?job=current&batch=__root__')
+        self.assertEqual((status, value['route']), (200, '/batch-related-works?job=current'))
+        self.assertEqual(self.request('/batch-related-works?batch=b_0123456789&file=x')[0], 404)
+        self.assertEqual(self.request('/batch-related-works?batch=b_0123456789', authenticate=False)[0], 403)
+        self.assertFalse([call for call in self.legacy.calls if call[0] == 'POST'])
+
+
 class GatewayBatchTests(_GatewayFixture):
     def gateway_options(self):
         self.runs = self.root / 'runs'
@@ -285,7 +351,6 @@ class GatewayBatchTests(_GatewayFixture):
                                                          'node': 'author', 'autoResumeAt': 1}))
             (folder / 'final.tex').write_text('% ' + marker + '\n')
             (folder / 'final.pdf').write_bytes(b'%PDF-1.4\n\x00\xff ' + marker.encode())
-            (folder / 'PROVED.md').write_text('Proof ' + marker)
             self.saved[batch] = folder
         for controller in (self.legacy, self.current):
             controller.jobs.append({'runId': 'same-job', 'startedAt': '2026-01-01T00:00:00Z',
@@ -363,7 +428,7 @@ class GatewayBatchTests(_GatewayFixture):
         self.assertFalse(any(method == 'POST' for method, _, _ in self.legacy.calls))
         self.assertEqual(self.current.calls, [])
 
-    def test_live_artifacts_and_memory_do_not_use_stale_catalog_files(self):
+    def test_live_artifacts_do_not_use_stale_catalog_files(self):
         for batch, controller, other in (('v4', self.legacy, self.current),
                                          ('new', self.current, self.legacy)):
             controller.calls.clear()
@@ -372,11 +437,20 @@ class GatewayBatchTests(_GatewayFixture):
                              (200, b'%PDF-TEST'))
             self.assertEqual(self.request('/transcript?batch=' + batch + '&job=same-job'),
                              (200, b'{"event":"test"}\n'))
-            status, value = self.request('/memory?batch=' + batch + '&job=same-job&file=PROVED.md&version=abc')
-            self.assertEqual(status, 200)
-            self.assertEqual(parse_qs(urlsplit(value['route']).query),
-                             {'job': ['same-job'], 'file': ['PROVED.md'], 'version': ['abc']})
             self.assertEqual(other.calls, [])
+
+    def test_research_file_routes_are_unknown_and_never_forwarded(self):
+        self.assertFalse({'/memory', '/approach-graph'} & GET_ROUTES.keys())
+        self.legacy.calls.clear()
+        self.current.calls.clear()
+        for query in ('job=current', 'batch=v4&job=same-job', 'batch=new&job=same-job',
+                      'batch=old-one&job=same-job'):
+            for path in ('/unknown?' + query, '/memory?' + query + '&file=PROVED.md',
+                         '/approach-graph?' + query):
+                with self.subTest(path=path):
+                    self.assertEqual(self.request(path), (404, {'error': 'Not found.'}))
+        self.assertEqual(self.legacy.calls, [])
+        self.assertEqual(self.current.calls, [])
 
     def test_saved_duplicate_ids_return_selected_bytes_without_upstream_requests(self):
         for batch in ('__root__', 'old-one', 'old-two'):
@@ -393,9 +467,6 @@ class GatewayBatchTests(_GatewayFixture):
                                     ('transcript', 'transcript.jsonl')):
                 self.assertEqual(self.request('/' + route + '?' + query),
                                  (200, (self.saved[batch] / filename).read_bytes()))
-            status, value = self.request('/memory?' + query + '&file=PROVED.md')
-            self.assertEqual(status, 200)
-            self.assertEqual(value['content'], (self.saved[batch] / 'PROVED.md').read_text())
         self.assertEqual(self.legacy.calls, [])
         self.assertEqual(self.current.calls, [])
 

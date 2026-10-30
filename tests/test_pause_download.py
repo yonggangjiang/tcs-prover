@@ -12,7 +12,11 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui import server
+
+# The notebook files of older runs: pausing and resuming leave them as they are.
+RESEARCH_MEMORY_FILES = ("INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md")
 
 
 class PauseDownloadTests(unittest.TestCase):
@@ -26,7 +30,7 @@ class PauseDownloadTests(unittest.TestCase):
         self.app._save("checked-statement.md", "# Checked statement\n\nExact statement\n")
         for role in ("author", "critic", "final"):
             self.app._save(f"prompts/{role}.txt", self.app.state[f"{role}Prompt"])
-        self.notes = {name: f"Original {name}\n" for name in server.RESEARCH_MEMORY_FILES}
+        self.notes = {name: f"Original {name}\n" for name in RESEARCH_MEMORY_FILES}
         for name, value in self.notes.items():
             self.app._save(name, value)
         self.app.state.update(phase="running", stage="repair", activeNode="author", round=2,
@@ -87,7 +91,7 @@ class PauseDownloadTests(unittest.TestCase):
         self.assertEqual(popen.call_count, 1)
         self.assertEqual(restored.state["runId"], self.run.name)
         self.assertEqual(restored.state["phase"], "running")
-        self.assertEqual(len(list(self.runs.iterdir())), 1)
+        self.assertEqual(len([path for path in self.runs.iterdir() if not path.name.startswith('.')]), 1)
         self.assertTrue(restored.trace_file.read_bytes().startswith(before))
         self.assertEqual({name: (self.run / name).read_text() for name in self.notes}, self.notes)
         with self.assertRaises(ValueError):
@@ -190,7 +194,7 @@ class PauseDownloadTests(unittest.TestCase):
         self.assertIn('goal_thread_id="saved-root"', command)
         self.assertIn("goal_require_resume=true", command)
         self.assertEqual(popen.call_args.kwargs["cwd"], self.run)
-        self.assertEqual(len(list(self.runs.iterdir())), 1)
+        self.assertEqual(len([path for path in self.runs.iterdir() if not path.name.startswith('.')]), 1)
         self.assertEqual(restored.state["error"], "")
 
     def test_automatic_author_pause_preserves_reason_state_and_thread_after_restart(self):
@@ -218,7 +222,7 @@ class PauseDownloadTests(unittest.TestCase):
                 self.assertEqual(restored.state["phase"], "paused")
                 self.assertEqual(restored.state["error"], reason)
                 self.assertEqual(restored.state["goalThreadId"], "native-paused-thread")
-                self.assertEqual(len(list(self.runs.iterdir())), 1)
+                self.assertEqual(len([path for path in self.runs.iterdir() if not path.name.startswith('.')]), 1)
 
     def test_unexpected_author_exit_automatically_creates_resumable_checkpoint(self):
         self.process.stdout = io.StringIO("error: Connection reset\n")
@@ -375,6 +379,7 @@ const state = {phase: 'running', problemMode: 'latex', activeNode: 'latex_repair
 const context = {ui, state, document: {createElement: () => new Element()}, nodeFromStage: () => 'latex_editor'};
 vm.createContext(context);
 vm.runInContext(source.slice(source.indexOf('// Group the recorded critic calls'), source.indexOf('function renderCriticReviewHistory()'))
+  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('))
   + source.slice(source.indexOf('function renderWorkflow()'), source.indexOf('function renderClock()')), context);
 const flattened = node => [node, ...node.children.flatMap(flattened)];
 for (const problemMode of ['latex', 'statement']) {
@@ -417,7 +422,7 @@ const document = {activeElement: null, body: {append() {}}, createElement() {
 }};
 const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
-const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
+const ingest = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 const jobPath = path => path + '?job=same-job', sessionToken = 'secret';
@@ -453,6 +458,22 @@ const checks = `
   assert.equal(ui.authorTimeLimitControl.hidden, false);
   assert.equal(ui.setAuthorTimeLimit.disabled, false);
   ui.resume.onclick(); assert.equal(clicked, '/resume');
+  // Paused with the conversation available, the box asks the paused author; Resume waits for a reply.
+  const conversation = {available: true, busy: false, readOnly: true, reason: '', items: []};
+  render({...running, phase: 'paused', conversation});
+  assert.equal(ui.authorSteerControl.hidden, false);
+  assert.equal(ui.authorSteerLabel.textContent, 'Ask the paused author');
+  assert.equal(ui.authorSteerInstruction.placeholder, 'For example: which step in the summary is the main obstacle?');
+  assert.equal(ui.sendAuthorSteerText.textContent, 'Send');
+  assert.equal(ui.sendAuthorSteer.disabled, false);
+  assert.equal(ui.requestSummary.hidden, false);
+  assert.equal(ui.stopReply.hidden, true);
+  assert.equal(ui.resume.disabled, false);
+  render({...running, phase: 'paused', conversation: {...conversation, busy: true}});
+  assert.equal(ui.resume.disabled, true);
+  assert.equal(ui.sendAuthorSteer.disabled, true);
+  assert.equal(ui.requestSummary.hidden, true);
+  assert.equal(ui.stopReply.hidden, false);
   render({...running, phase: 'paused', autoResumeAt: 2000000000, error: 'Connection lost'});
   assert.equal(ui.pause.hidden, false);
   assert.equal(ui.pause.textContent, 'Keep paused');

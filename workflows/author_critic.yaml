@@ -7,8 +7,10 @@ nodes:
     role: author
     stage: solve
     prompt: author
-    lifecycle: [goal, continuation, compaction, repair, resume]
-    features: [multi_agent]
+    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, related_works, handoff_refused, subagents]
+    # The run's Author subagents setting (0 to 10): with 1 or more the author gets the subagent tool, limited to that
+    # many at a time, and the subagents prompt; with 0 it has no subagent tool.
+    subagents: {option: author_subagents, default: 0, minimum: 0}
     task: state.statement
     marker: '[STATEMENT]'
     resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
@@ -18,8 +20,7 @@ nodes:
     - merge: result
     - set:
         solution: "result.output if outcome == 'done' else get(state, 'solution', '')"
-        failed: outcome == 'failure'
-    next: {done: critic, failure: end}
+    next: {done: critic}
 
   critic:
     run: structured
@@ -29,20 +30,27 @@ nodes:
     stage: critic
     prompt: critic_input
     instructions: critic
+    # One coordinator that starts the run's Independent critics setting (1 to 10) of fresh subagents: the CLI
+    # limits it to that many at a time, and {count} in its instructions says the same number.
     features: [multi_agent]
-    inputs: {statement: state.statement, solution: state.solution}
+    subagents: {option: critic_count, default: 3, minimum: 1}
+    inputs: {statement: state.statement}
+    request_label: Critic coordinator
+    activity_label: Critic coordinator
     proof_handoff: {candidate: solution, statement: statement}
-    response: {verdict: [pass, reject], solution: string, bugs: string}
+    edit: {file: proof.md, field: solution}
+    response: {verdict: [pass, reject], bugs: string, fixes: string}
     require:
     - bool(strip(result.solution))
     - "not strip(result.bugs) if result.verdict == 'pass' else bool(strip(result.bugs))"
+    - "bool(strip(result.fixes)) if normalized_text(result.solution) != normalized_text(state.solution) else True"
     outcome: "('reject' if stages.author else 'needs_revision') if result.verdict == 'reject' else ('pass' if normalized_text(result.solution) == normalized_text(state.solution) else 'fixed')"
     before:
     - write: {path: saved-candidate.md, text: state.solution}
     after:
     - set: {solution: strip(result.solution), report: result, round: visit}
-    - write: {path: saved-candidate.md, text: state.solution}
     - emit: {kind: critic_result, label: 'Critic round {visit}', report: '=result', round: '=visit', outcome: '=outcome', text: '{raw}'}
+    - write: {path: saved-candidate.md, text: state.solution}
     next:
       reject: author
       needs_revision:
@@ -51,17 +59,37 @@ nodes:
         - set: {failed: 'True', revisionRequired: 'True', output: state.solution}
         - emit: {kind: failure_result, label: Proof needs revision, resultKind: needs-revision, text: '=result.bugs', output: '=state.solution', bugs: '=result.bugs'}
       pass:
-        to: end
+        to: convention
         after:
         - set: {output: state.solution}
         - emit: {kind: status, label: Critic approved, acceptanceReason: clean_pass, round: '=visit', text: 'Round {visit} passed without edits.'}
       fixed:
         repeat: 2
         option: critic_rounds
-        then: end
-        after:
-        - set: {output: state.solution}
-        - emit: {kind: status, label: Critic approved, acceptanceReason: round_limit, round: '=visit', roundLimit: '=limit', text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
+        verify: critic_verify
+
+  # The convention critic: one read-only call on the proof the critic accepted, just before writing (or the end).
+  # Its verdict goes to the user; the run continues to writing or the end whatever it says.
+  convention:
+    run: structured
+    workflow_stage: critic
+    skip: end
+    role: critic
+    stage: critic
+    prompt: convention_critic
+    inputs: {statement: state.statement}
+    request_label: Convention critic
+    activity_label: Convention critic
+    proof_handoff: {candidate: solution, statement: statement}
+    response: {verdict: [faithful, loophole], intended: string, assessment: string, loophole: string, suggested_statement: string}
+    require:
+    - bool(strip(result.intended))
+    - bool(strip(result.assessment))
+    - "bool(strip(result.loophole)) if result.verdict == 'loophole' else not strip(result.loophole)"
+    - "bool(strip(result.suggested_statement)) if result.verdict == 'loophole' else not strip(result.suggested_statement)"
+    after:
+    - emit: {kind: convention_result, label: 'Convention critic · round {state.round}', round: '=state.round', verdict: '=result.verdict', intended: '=result.intended', assessment: '=result.assessment', loophole: '=result.loophole', suggestedStatement: '=result.suggested_statement'}
+    next: {done: end}
 prompts:
   # EDIT AUTHOR HERE: instructions for proving the exact statement.
   author: |-
@@ -83,9 +111,13 @@ prompts:
   continuation: >-
     Continue trying to prove the same statement in this conversation. Return a
     complete, rigorous solution only when the exact statement is resolved.
-  compaction: >-
-    Continue the same proof task using the conversation summary. Preserve the
-    exact assumptions and requested conclusion.
+  reopen: >-
+    Continue trying to prove the same statement in this conversation.
+  compaction: |-
+    Continue the same proof task using the conversation summary. Preserve the exact assumptions and requested conclusion.
+
+    ORIGINAL AUTHOR PROMPT:
+    {original_prompt}
   resume: |-
     Continue trying to prove the statement below, using any previous work in this conversation.
 
@@ -99,28 +131,57 @@ prompts:
 
     CRITIC BUGS:
     {bugs}
+  # Sent when the author resumes after the controller could not hand its last submission to the critic.
+  handoff_refused: |-
+    Your last submission was not handed to the critic, so it has not been reviewed:
+    {reason}
 
+    Fix this and submit the complete proof again.
+  # The paused author's conversation turns (workflow_runner.py --converse): a
+  # progress summary, and a reply to the user's message.
+  summary: >-
+    The proof work is paused. Write a progress summary for the user: what you
+    have proved so far, with precise statements, and where it is written; what
+    remains open or uncertain, and why; and what is currently achievable,
+    including the most promising next steps. Do not continue the proof work or
+    change any files in this turn.
+  conversation: |-
+    The proof work is paused. Reply to the user's message below. Do not continue the proof work or change any files in this turn; the work continues when the user resumes the run.
+
+    USER MESSAGE:
+    {message}
+  # Appended to the author's first prompt when the run has related works.
+  related_works: |-
+    RELATED WORKS:
+    The user has provided related works for this problem in the related-works folder of your working directory; related-works/INDEX.md lists them. Read what is relevant. The proof you submit must still be complete and self-contained; the critic does not see these files.
+  # Appended to the author's first prompt when the run allows the author subagents (Author subagents 1 or more).
+  subagents: |-
+    You may start up to {author_subagents} independent subagents at a time, for example to explore other approaches or to check calculations; you do not need to ask the user.
+
+  # EDIT CRITIC HERE: the critic's instructions. {count} is the run's Independent critics setting.
   critic: |-
-    Act as a rigorous proof critic. Spawn multiple fresh independent subagents to
-    aggressively find bugs in the exact statement and candidate proof. Give each
-    the complete statement and proof and a different auditing focus. They must
-    work independently, without communicating with one another, and report back
-    to you. Wait for their reports before making your decision.
+    Act as a rigorous proof critic. Spawn exactly {count} fresh independent subagent(s) to aggressively find bugs in the
+    exact statement and the candidate proof in proof.md. They must work independently, without communicating with one
+    another, and report back to you. Wait for all their reports before making your decision.
 
-    Check every claim and inference, including boundary cases, hidden assumptions,
-    circular reasoning, undefined terms or symbols, and omitted proof details.
-    Treat statements that hide an argument behind words such as "clearly",
-    "standard", or "similarly" as gaps when the necessary justification is absent.
-    Ask the subagents to identify exactly what definitions and omitted arguments
-    must be expanded to make the proof complete and rigorous.
+    Check every claim and inference, including boundary cases, hidden assumptions, circular reasoning, undefined terms
+    or symbols, and omitted proof details. Treat statements that hide an argument behind words such as "clearly",
+    "standard", or "similarly" as gaps when the necessary justification is absent. Ask the subagents to identify
+    exactly what definitions and omitted arguments must be expanded to make the proof complete and rigorous.
 
-    Examine their objections and try to fix every valid bug yourself, defining
-    missing terms and fully expanding omitted arguments. If any issue cannot be
-    rigorously fixed, return verdict=reject, every unresolved bug with its exact
-    location in bugs, and your best complete candidate after safe fixes in solution.
-    Otherwise return verdict=pass, an empty bugs string, and the complete corrected
-    proof in solution. If no edits are needed, copy the candidate proof verbatim.
-    Return only the requested JSON.
+    Examine their objections and decide which are valid. Try to fix every valid bug yourself by editing proof.md,
+    defining missing terms and fully expanding omitted arguments, and list each bug you fixed in fixes. Reject only
+    for a critical error that a subagent found and that you confirm but cannot rigorously fix: then keep the safe
+    fixes in proof.md and return verdict=reject with every unresolved bug and its exact location in bugs. Otherwise
+    return verdict=pass and an empty bugs string. If no edits are needed, leave proof.md unchanged and leave fixes
+    empty. Return only the requested JSON.
+
+  critic_verify: |-
+    FINAL VERIFICATION: this proof has reached the limit of edited critic rounds,
+    so this round cannot edit it; proof.md is read-only. Return verdict=pass with
+    an empty bugs string only if the proof is complete and rigorous exactly as
+    written. Otherwise return verdict=reject with every bug and its exact
+    location in bugs.
 
   critic_input: |
     CRITIC INSTRUCTIONS:
@@ -129,5 +190,23 @@ prompts:
     STATEMENT:
     {statement}
 
-    CANDIDATE SOLUTION:
-    {solution}
+  # The convention critic (the convention step): runs once on the accepted proof, before writing; its report is
+  # shown to the user and never changes the run's route.
+  convention_critic: |-
+    You are the convention critic. You run after the proof critics have accepted the proof, independently of them:
+    you do not judge whether the proof is correct, and you do not edit any file.
+
+    Examine the problem statement below and the proposed proof in proof.md. Try to guess what the user, as a
+    conventional mathematician or theoretical computer science researcher, actually wants from this problem. Then
+    decide whether the proof does what the user actually wants, or whether it is "cheating" by exploiting loopholes
+    in the problem description, such as a brute-force construction that stores all answers, so that it satisfies
+    the letter of the statement but not what the user meant.
+
+    Return verdict=loophole only if the proof very much exploits a loophole. Then explain in loophole how it exploits
+    the problem description, and give in suggested_statement a modified problem statement that fits what the user
+    needs, so that the user can rerun with it. Otherwise return verdict=faithful and leave loophole and
+    suggested_statement empty. In intended, say in a few sentences what the user most likely wants; in assessment,
+    say how the proof relates to that. Return only the requested JSON.
+
+    STATEMENT:
+    {statement}

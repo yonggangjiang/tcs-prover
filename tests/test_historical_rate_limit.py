@@ -9,7 +9,9 @@ import tempfile
 import time
 import unittest
 
-from retrieval.historical_rate_limit import MAX_SLEEP_SECONDS, RateLimitError, SharedHostLimiter
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+from retrieval.historical_rate_limit import (MAX_COOLDOWN_SECONDS, MAX_SLEEP_SECONDS, QUARANTINE, RateLimitError,
+                                             SharedHostLimiter)
 
 
 class FakeTime:
@@ -99,18 +101,20 @@ class SharedRateLimitTests(unittest.TestCase):
         with self.assertRaises(RateLimitError) as error:
             with shared.slot("export.arxiv.org", 101):
                 self.fail("A new request bypassed Retry-After.")
-        self.assertEqual(error.exception.code, "deadline_exceeded")
+        # The cooldown outlasts the deadline: it fails at once and says when.
+        self.assertEqual(error.exception.code, "provider_cooldown")
+        self.assertEqual(error.exception.retry_at, 1000 + MAX_COOLDOWN_SECONDS)
         state = json.loads((self.directory / "arxiv.json").read_text())
-        self.assertEqual(state["next_monotonic"], 86500)
-        self.assertEqual(state["next_wall"], 87400)
-        self.assertEqual(self.fake.clock(), 101)
+        self.assertEqual(state["next_monotonic"], 100 + MAX_COOLDOWN_SECONDS)
+        self.assertEqual(state["next_wall"], 1000 + MAX_COOLDOWN_SECONDS)
+        self.assertEqual(self.fake.clock(), 100)
 
     def test_defer_outside_slot_retains_maximum_existing_cooldown(self):
-        self.limiter.defer("api.crossref.org", 1200, deadline=101)
+        self.limiter.defer("api.crossref.org", 500, deadline=101)
         self.fake.sleep(10)
         self.new_limiter().defer("api.crossref.org", 1, deadline=111)
         state = json.loads((self.directory / "crossref.json").read_text())
-        self.assertEqual(state["next_monotonic"], 1300)
+        self.assertEqual(state["next_monotonic"], 600)
 
     def test_waiting_admission_reloads_cooldown_without_holding_timing_mutex(self):
         self.enter("web.archive.org")
@@ -128,8 +132,9 @@ class SharedRateLimitTests(unittest.TestCase):
         with self.assertRaises(RateLimitError) as error:
             self.enter("web.archive.org", limiter=waiting, duration=4)
         self.assertTrue(changed)
-        self.assertEqual(error.exception.code, "deadline_exceeded")
-        self.assertEqual(self.fake.clock(), 104)
+        # The new cooldown ends after the deadline: no sleeping until then.
+        self.assertEqual(error.exception.code, "provider_cooldown")
+        self.assertLess(self.fake.clock(), 104)
         state = json.loads((self.directory / "wayback.json").read_text())
         self.assertEqual(state["next_monotonic"], 110)
 
@@ -139,9 +144,9 @@ class SharedRateLimitTests(unittest.TestCase):
         self.assertEqual(self.enter("export.arxiv.org"), 103)
 
     def test_reboot_uses_remaining_wall_clock_cooldown(self):
-        self.limiter.defer("export.arxiv.org", 1200)
+        self.limiter.defer("export.arxiv.org", 500)
         self.fake.monotonic = 5
-        self.fake.wall += 1199
+        self.fake.wall += 499
         self.assertEqual(self.enter("export.arxiv.org"), 6)
 
     def test_deadline_and_cooldown_values_fail_closed(self):
@@ -195,7 +200,7 @@ class SharedRateLimitTests(unittest.TestCase):
             self.enter("export.arxiv.org")
         self.assertEqual(list(self.workspace.iterdir()), [])
 
-    def test_symlink_and_hardlink_state_files_are_rejected(self):
+    def test_symlink_and_hardlink_state_files_are_moved_aside_without_reading_or_modifying_target(self):
         outside = self.root / "private-source"
         outside.write_text("private-query-must-not-leak")
         outside.chmod(0o600)
@@ -208,24 +213,27 @@ class SharedRateLimitTests(unittest.TestCase):
                         os.link(outside, path)
                     else:
                         path.symlink_to(outside)
-                    with self.assertRaises(RateLimitError) as error:
-                        self.enter("export.arxiv.org")
-                    self.assertNotIn("private-query", str(error.exception))
+                    before = len(list((self.directory / QUARANTINE).iterdir())) if (self.directory / QUARANTINE).exists() else 0
+                    self.enter("export.arxiv.org", limiter=self.new_limiter(), duration=1000)
                     self.assertEqual(outside.read_text(), "private-query-must-not-leak")
-                    path.unlink()
+                    self.assertFalse(path.is_symlink())
+                    self.assertEqual(path.stat().st_nlink if path.exists() else 1, 1)
+                    self.assertEqual(len(list((self.directory / QUARANTINE).iterdir())), before + 1)
 
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
-    def test_group_writable_state_or_directory_is_rejected(self):
+    def test_group_writable_directory_is_tightened_and_state_never_trusted(self):
         self.directory.chmod(0o770)
-        with self.assertRaises(RateLimitError):
-            self.enter("export.arxiv.org")
-        self.directory.chmod(0o700)
-        state = self.write_state('{}')
+        self.enter("export.arxiv.org")
+        self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+        state = self.write_state(json.dumps({"version": 1, "next_wall": 0, "next_monotonic": 0,
+                                             "written_monotonic": 0}))
         state.chmod(0o660)
-        with self.assertRaises(RateLimitError):
-            self.enter("export.arxiv.org")
+        before = self.fake.clock()
+        started = self.enter("export.arxiv.org", duration=1000)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)  # Rewritten fresh, not trusted.
+        self.assertEqual(started, before + 3)
 
-    def test_malformed_or_oversized_timing_state_fails_closed(self):
+    def test_malformed_or_oversized_timing_state_is_moved_aside_and_pacing_restarts(self):
         valid = {"version": 1, "next_wall": 0, "next_monotonic": 0, "written_monotonic": 0}
         invalid = ["not json", "{}", "[]", json.dumps(valid) + " " * 4096]
         for key, value in [("version", True), ("next_wall", float("inf")),
@@ -236,10 +244,12 @@ class SharedRateLimitTests(unittest.TestCase):
         for content in invalid:
             with self.subTest(content=content[:100]):
                 self.write_state(content)
-                with self.assertRaises(RateLimitError) as error:
-                    self.enter("export.arxiv.org")
-                self.assertEqual(error.exception.code, "rate_limit_state")
-                self.assertNotIn("private", str(error.exception))
+                before = self.fake.clock()
+                # Corrupt timing never disables retrieval; it restarts one interval later.
+                self.assertEqual(self.enter("export.arxiv.org", duration=1000), before + 3)
+                state = json.loads((self.directory / "arxiv.json").read_text())
+                self.assertEqual(set(state), set(valid))
+        self.assertEqual(len(list((self.directory / QUARANTINE).iterdir())), len(invalid))
 
     def test_only_timestamp_metadata_is_stored_outside_workspace(self):
         self.enter("export.arxiv.org")
@@ -383,7 +393,9 @@ class CrossProcessRateLimitTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.3)
             self.event(events, "error")
         state = json.loads((self.directory / "wayback.json").read_text())
-        self.assertGreaterEqual(state["next_monotonic"], started + 86400)
+        # Recorded, and capped at the longest pause any provider signal is honoured for.
+        self.assertGreaterEqual(state["next_monotonic"], started + MAX_COOLDOWN_SECONDS)
+        self.assertLess(state["next_monotonic"], started + 86400)
 
 
 if __name__ == "__main__":

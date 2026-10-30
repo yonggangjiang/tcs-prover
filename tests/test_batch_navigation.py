@@ -15,7 +15,9 @@ class BatchNavigationTests(unittest.TestCase):
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const code = source.slice(source.indexOf('function request('), source.indexOf('function selectedProblemMode('));
+const code = source.slice(source.indexOf('function request('), source.indexOf('function selectedProblemMode('))
+  // The lists classify each job as the job page does (completedRunOutcome, jobTone).
+  + source.slice(source.indexOf('function completedRunLabel('), source.indexOf('function localDateTime('));
 class Element {
   constructor() { this.children=[]; this.dataset={}; this.hidden=false; this.textContent=''; this.classList={toggle(){}}; }
   append(...children) { this.children.push(...children); }
@@ -26,14 +28,13 @@ class Element {
 const ui = new Proxy({}, {get:(target,key)=>target[key] ||= new Element()});
 const setup = `
 let currentJob='', currentBatch='', composingProblem=false, batchCatalog=[], state={phase:'input'};
-let requests=Promise.resolve(), previousPhase='', timer, clock, jobsTimer, memoryRequest=0, memoryTimer, memoryJob=null;
+let requests=Promise.resolve(), previousPhase='', timer, clock, jobsTimer;
 const sessionToken='test-token', timelineRows=new Map(), detailRows=new Map();
 const location={pathname:'/'}, history={urls:[],pushState(a,b,url){this.urls.push(url);}};
 const clearTimeout=()=>{}, clearInterval=()=>{}, setTimeout=()=>1;
 const document={createElement:()=>new Element()};
 const window={open:(...args)=>opened.push(args)};
 const localDateTime=value=>value;
-const completedRunLabel=job=>job.resultKind==='final'?'Answer ready':'Incomplete';
 const confirm=()=>true, alert=()=>{};
 let refreshed=0;
 const refresh=async()=>{refreshed+=1;};

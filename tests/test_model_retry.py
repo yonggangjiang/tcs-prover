@@ -20,12 +20,15 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import claude_cli
+from tests import critic_doubles
 from ui import cli as terminal
 from ui import server
 
 import test_claude_cli as claude_test
+import test_goal_runtime as goal_test
 
 ROOT = Path(runtime.__file__).parent
 SCHEMA = {"type": "object", "properties": {"statement": {"type": "string"}, "notes": {"type": "string"}},
@@ -213,7 +216,7 @@ class StructuredRetryTests(RetryCase):
         timeouts = []
 
         def attempt(text, schema, stage, *args, **settings):
-            timeouts.append(settings["timeout"])
+            timeouts.append(settings["deadline"])
             self.clock.offset += 6  # Each failed attempt works for six seconds.
             raise runtime.Error("Codex review failed: stream disconnected before completion")
 
@@ -273,8 +276,9 @@ class StructuredRetryTests(RetryCase):
             forks.append((text, conversation.fork_from))
             number = len(forks)
             if number == 1:
-                sessions.open(conversation, "base-1", output=True)  # Worked for 15 min, then timed out.
-                raise runtime.StructuredAttemptTimeout("The review model did not respond within 900 seconds.", 900)
+                sessions.open(conversation, "base-1", output=True)  # Worked, then wrote nothing for 15 min.
+                raise runtime.StructuredAttemptTimeout(
+                    "The review model wrote no output for 15 min; the attempt was stopped.", 900)
             if number == 2:
                 sessions.open(conversation, "fork-2", output=False)  # At capacity before any output.
                 raise runtime.Error(f"Codex review failed: {CAPACITY}")
@@ -293,7 +297,8 @@ class StructuredRetryTests(RetryCase):
             result, _ = runtime.structured("Review S.", SCHEMA, "review", validate=nonempty)
         self.assertEqual(result["notes"], "fixed")
         self.assertEqual(forks[0], ("Review S.", None))
-        self.assertEqual(forks[1], (runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 15 min"), "base-1"))
+        self.assertEqual(forks[1], (runtime.STRUCTURED_RETRY_NOTE.format(
+            cause="was stopped after 15 min without activity"), "base-1"))
         # The fork that produced nothing was deleted; the next retry forks the same base
         # again with the same note (the model never saw the failed fork).
         self.assertEqual(forks[2], forks[1])
@@ -356,38 +361,37 @@ class StructuredRetryTests(RetryCase):
         self.assertEqual(forks[2], ("Review S.", None))
         self.assertEqual(self.notices()[-1]["failure"], "the conversation is too long for the model")
 
-    def test_consecutive_timeouts_double_the_next_attempt(self):
-        timeouts, outcomes = [], [
-            runtime.StructuredAttemptTimeout("slow", 900), runtime.StructuredAttemptTimeout("slow", 1800),
-            runtime.StructuredAttemptTimeout("slow", 3600), runtime.Error(f"Codex critic failed: {CAPACITY}"),
-            runtime.StructuredAttemptTimeout("slow", 900), VALID]
+    def test_stalled_attempts_keep_their_inactivity_limit_and_only_the_deadline_bounds_them(self):
+        limits, outcomes = [], [
+            runtime.StructuredAttemptTimeout("stalled", 900), runtime.StructuredAttemptTimeout("stalled", 900),
+            runtime.Error(f"Codex critic failed: {CAPACITY}"), runtime.StructuredAttemptTimeout("stalled", 900),
+            VALID]
 
-        def attempt(text, schema, stage, *args, timeout=None, **settings):
-            timeouts.append(timeout)
-            outcome = outcomes[len(timeouts) - 1]
+        def attempt(text, schema, stage, *args, timeout=None, deadline=None, **settings):
+            limits.append((timeout, deadline))
+            outcome = outcomes[len(limits) - 1]
             if isinstance(outcome, BaseException):
                 raise outcome
             return outcome
 
         with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
             runtime.structured("Review S.", SCHEMA, "critic", timeout=900, options={"thinking_hours": 0})
-        # Doubled after each consecutive timeout, back to 15 min after any other failure.
-        self.assertEqual(timeouts, [900, 1800, 3600, 7200, 900, 1800])
+        # No wall-clock limit and no doubling: the same inactivity limit, and no deadline when unlimited.
+        self.assertEqual(limits, [(900, None)] * 5)
         notices = [event["text"] for event in self.notices()]
-        self.assertTrue(notices[0].startswith("Model call failed (no final answer within 15 min) — retrying in 1 min "
-                                              "(attempt 2, the next attempt may run 30 min)."), notices[0])
-        self.assertIn("(attempt 3, retrying for 1 min, 2 timeouts in a row; the next attempt may run 60 min)",
-                      notices[1])
-        self.assertIn("3 timeouts in a row; the next attempt may run 2 h", notices[2])
-        self.assertNotIn("timeouts in a row", notices[3])
-        # A finite budget still caps each attempt by the time left.
-        timeouts.clear()
-        outcomes[:] = [runtime.StructuredAttemptTimeout("slow", 900), VALID]
+        self.assertTrue(notices[0].startswith("Model call failed (no output for 15 min) — retrying in 1 min "
+                                              "(attempt 2)."), notices[0])
+        self.assertFalse(any("next attempt" in notice or "in a row" in notice for notice in notices))
+        self.assertEqual(self.notices()[0]["failureKind"], "timeout")
+        # By default an attempt may be silent for STRUCTURED_STALL_SECONDS; a finite budget bounds each attempt.
+        limits.clear()
+        outcomes[:] = [runtime.StructuredAttemptTimeout("stalled", 3600), VALID]
         with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
-            runtime.structured("Review S.", SCHEMA, "critic", timeout=900,
+            runtime.structured("Review S.", SCHEMA, "critic",
                                options={"thinking_hours": 1, "elapsed_seconds": 3600 - 1000})
-        self.assertEqual(timeouts[0], 900)
-        self.assertLessEqual(timeouts[1], 1000)
+        self.assertEqual([limit for limit, _ in limits], [runtime.STRUCTURED_STALL_SECONDS] * 2)
+        self.assertEqual(runtime.STRUCTURED_STALL_SECONDS, 3600)
+        self.assertTrue(all(0 < deadline <= 1000 for _, deadline in limits))
 
     def test_failures_a_retry_cannot_fix_end_the_call_at_once(self):
         def bug(report, raw):
@@ -468,7 +472,8 @@ class RequirementTests(RetryCase):
         writer = runtime.builtin_workflow("clean_up")["nodes"]["latex_editor"]
         self.assertEqual([runtime.describe_requirement(rule, critic["schema"]) for rule in critic["require"]],
                          ["the solution field must not be empty",
-                          "the bugs field must be empty when verdict is pass and non-empty when verdict is reject"])
+                          "the bugs field must be empty when verdict is pass and non-empty when verdict is reject",
+                          "the fixes field must not be empty when you changed the solution text"])
         self.assertEqual(runtime.describe_requirement(writer["require"][0], writer["schema"]),
                          "the latex field must not be empty")
         for rule, words in (("text(result.note)", "the note field must not be empty"),
@@ -491,14 +496,15 @@ class RequirementTests(RetryCase):
                    "must be empty; if what you wrote in bugs still applies, the verdict should be reject)")
 
     def critic_node(self):
+        # The critic's verdict rule; its proof comes from the proof.md it edits.
         critic = runtime.builtin_workflow("author_critic")["nodes"]["critic"]
-        return {"run": "structured", "prompt": "ask", "stage": "critic", "require": critic["require"],
+        return {"run": "structured", "prompt": "ask", "stage": "critic", "require": critic["require"][1:2],
                 "schema": critic["schema"]}
 
     def test_a_reject_without_bugs_keeps_its_verdict_and_is_asked_for_the_bugs(self):
         sessions, texts = SessionRecorder(), []
-        answers = [{"verdict": "reject", "solution": "P", "bugs": ""},
-                   {"verdict": "reject", "solution": "P", "bugs": "Step 2 divides by zero."}]
+        answers = [{"verdict": "reject", "bugs": "", "fixes": ""},
+                   {"verdict": "reject", "bugs": "Step 2 divides by zero.", "fixes": ""}]
 
         def attempt(text, schema, stage, *args, conversation=None, **settings):
             texts.append(text)
@@ -513,32 +519,35 @@ class RequirementTests(RetryCase):
         self.assertNotIn("verdict should be pass", texts[1])
 
     def test_an_empty_critic_solution_is_retried_and_its_explanation_kept(self):
-        """The reported failure: a critic hit capacity and returned an empty solution."""
-        empty = {"verdict": "reject", "solution": "", "bugs": "Every audit subagent failed: model at capacity."}
-        passed = {"verdict": "pass", "solution": "The complete proof.", "bugs": ""}
+        """The reported failure: a critic hit capacity and left no proof (it emptied its proof.md)."""
+        empty = {"verdict": "reject", "bugs": "Every audit subagent failed: model at capacity.", "fixes": ""}
+        passed = {"verdict": "pass", "bugs": "", "fixes": ""}
         texts, sessions = [], SessionRecorder()
 
         def attempt(text, schema, stage, *args, conversation=None, **settings):
             texts.append(text)
             sessions.open(conversation, f"critic-{len(texts)}", output=True)
+            # The retry forks this conversation and finds the same workspace.
+            (Path(conversation.workspace) / "proof.md").write_text("" if len(texts) == 1 else "The complete proof.")
             return json.dumps(empty if len(texts) == 1 else passed)
 
         previous = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, previous)
-        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
+        with mock.patch.object(runtime, "run_structured_attempt",
+                               side_effect=critic_doubles.coordinator_attempts(attempt)):
             state = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"],
                                               {"statement": "Task", "solution": "The complete proof."},
                                               {"start_node": "critic"})
         self.assertEqual(state["output"], "The complete proof.")
         self.assertEqual(len(texts), 2)
-        self.assertIn("could not be accepted: the solution field must not be empty.", texts[1])
+        self.assertIn("could not be accepted: proof.md is empty; it must hold the complete final text.", texts[1])
         self.assertIn("Every audit subagent failed: model at capacity.", texts[1])
-        notice = self.notices()[0]
-        self.assertIn("(the solution field must not be empty)", notice["text"])
+        notice = self.notices("Critic coordinator · " + runtime.RETRY_LABEL)[0]
+        self.assertIn("(proof.md is empty; it must hold the complete final text)", notice["text"])
         self.assertIn("The model said: verdict: reject; bugs: Every audit subagent failed", notice["text"])
         diagnostic = next(event["text"] for event in self.events if event["kind"] == "diagnostic")
-        self.assertIn("could not be accepted: the solution field must not be empty.", diagnostic)
+        self.assertIn("could not be accepted: proof.md is empty; it must hold the complete final text.", diagnostic)
         self.assertFalse([event for event in self.events if "Invalid model response" in str(event.get("text"))])
         # The rejected answer never replaced the saved candidate.
         results = [event for event in self.events if event["kind"] == "critic_result"]
@@ -548,9 +557,9 @@ class RequirementTests(RetryCase):
     def test_a_reject_after_failed_subagents_never_reaches_the_author(self):
         """Only proof errors make a critic reject; failed subagent calls are retried instead."""
         proof = "The complete proof."
-        reject = {"verdict": "reject", "solution": proof,
-                  "bugs": "Review incomplete: every audit subagent failed (model at capacity)."}
-        passed = {"verdict": "pass", "solution": proof, "bugs": ""}
+        reject = {"verdict": "reject", "bugs": "Review incomplete: every audit subagent failed (model at capacity).",
+                  "fixes": ""}
+        passed = {"verdict": "pass", "bugs": "", "fixes": ""}
         texts, sessions = [], SessionRecorder()
 
         def attempt(text, schema, stage, *args, conversation=None, **settings):
@@ -566,7 +575,8 @@ class RequirementTests(RetryCase):
         previous = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, previous)
-        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
+        with mock.patch.object(runtime, "run_structured_attempt",
+                               side_effect=critic_doubles.coordinator_attempts(attempt)):
             state = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"],
                                               {"statement": "Task", "solution": proof}, {"start_node": "critic"})
         # The author (which this test cannot run) was never asked to repair anything.
@@ -622,31 +632,40 @@ class RequirementTests(RetryCase):
         self.assertEqual(self.clock.sleeps, [])
 
     def test_the_verdict_rule_and_a_file_pointer_are_retried(self):
-        answers = [{"verdict": "pass", "solution": "Proof.", "bugs": "A remaining gap."},
-                   {"verdict": "pass", "solution": "PROOF_FILE: proof.md", "bugs": ""},
-                   {"verdict": "pass", "solution": "Proof.", "bugs": ""}]
+        # Each answer, and what the critic leaves in its proof.md.
+        answers = [({"verdict": "pass", "bugs": "A remaining gap.", "fixes": ""}, "Proof."),
+                   ({"verdict": "pass", "bugs": "", "fixes": ""}, "PROOF_FILE: proof.md"),
+                   ({"verdict": "pass", "bugs": "", "fixes": ""}, "Proof.")]
         texts, sessions = [], SessionRecorder()
 
         def attempt(text, schema, stage, *args, conversation=None, **settings):
             texts.append(text)
             sessions.open(conversation, f"critic-{len(texts)}", output=True)
-            return json.dumps(answers[len(texts) - 1])
+            answer, proof = answers[len(texts) - 1]
+            (Path(conversation.workspace) / "proof.md").write_text(proof)
+            return json.dumps(answer)
 
         previous = Path.cwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, previous)
-        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
+        with mock.patch.object(runtime, "run_structured_attempt",
+                               side_effect=critic_doubles.coordinator_attempts(attempt)):
             state = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"],
                                               {"statement": "Task", "solution": "Proof."}, {"start_node": "critic"})
         self.assertEqual(state["output"], "Proof.")
         self.assertIn("the bugs field must be empty when verdict is pass and non-empty when verdict is reject "
                       "(your answer has verdict pass and a non-empty bugs field", texts[1])
-        self.assertIn("the solution field must contain the complete proof text, not a file pointer", texts[2])
+        self.assertIn("proof.md must contain the complete proof text, not a file pointer", texts[2])
 
     def test_an_empty_latex_document_is_retried(self):
         latex = r"\documentclass{article}\begin{document}x\end{document}"
-        with mock.patch.object(runtime, "run_structured_attempt",
-                               side_effect=['{"latex": "  "}', json.dumps({"latex": latex})]) as attempt, \
+
+        def write(text, schema, stage, *args, conversation=None, **settings):
+            # The editor writes latex-source.tex in its own workspace.
+            (Path(conversation.workspace) / "latex-source.tex").write_text("  " if attempt.call_count == 1 else latex)
+            return '{"summary": "Wrote the document."}'
+
+        with mock.patch.object(runtime, "run_structured_attempt", side_effect=write) as attempt, \
                 mock.patch.object(runtime, "_run_command", return_value={"status": "pass", "output": ""}):
             previous = Path.cwd()
             os.chdir(self.root)
@@ -654,7 +673,7 @@ class RequirementTests(RetryCase):
             state = runtime.execute_workflows([ROOT / "workflows/clean_up.yaml"], {"solution": "Proof."})
         self.assertEqual(state["output"], latex)
         self.assertEqual(attempt.call_count, 2)
-        self.assertIn("the latex field must not be empty", attempt.call_args_list[1].args[0])
+        self.assertIn("latex-source.tex is empty", attempt.call_args_list[1].args[0])
 
     def test_an_empty_reviewer_statement_is_retried_within_a_timeout_and_the_job_budget(self):
         from ui import review
@@ -663,57 +682,35 @@ class RequirementTests(RetryCase):
                 as attempt:
             self.assertEqual(review.review("Draft", thinking_hours=2), {"statement": "S.", "notes": "Fixed."})
         self.assertEqual(self.waits(), 60)
-        # Like a workflow node: each attempt has a timeout, and the job's limit bounds the review.
+        # Like a workflow node: each attempt is stopped only when its CLI stalls, and the job's limit bounds it.
         self.assertEqual([call.kwargs["timeout"] for call in attempt.call_args_list],
-                         [runtime.STRUCTURED_TIMEOUT_SECONDS] * 2)
+                         [runtime.STRUCTURED_STALL_SECONDS] * 2)
+        self.assertTrue(all(0 < call.kwargs["deadline"] <= 2 * 3600 for call in attempt.call_args_list))
         with mock.patch.object(runtime, "structured", return_value=({"statement": "S", "notes": ""}, "{}")) as call:
             review.review("Draft", thinking_hours=0)
         self.assertEqual(call.call_args.kwargs["options"], {"thinking_hours": 0})
-        self.assertEqual(call.call_args.kwargs["timeout"], runtime.STRUCTURED_TIMEOUT_SECONDS)
+        self.assertNotIn("timeout", call.call_args.kwargs)
 
 
-class ParallelRetryTests(RetryCase):
-    def test_independent_requests_retry_alone_and_a_stop_cancels_waiting_siblings(self):
-        config = {"run": "structured", "items": ["a", "b"], "prompt": "check", "stage": "critic",
-                  "schema": SCHEMA, "inputs": {"item": "item"}}
-        calls = {"a": 0, "b": 0}
+class CancelledRetryTests(RetryCase):
+    def test_an_attempt_that_fails_after_the_step_ended_is_neither_retried_nor_reported(self):
+        # The step ended while this request ran (its `cancel` was set), and its CLI then failed: the
+        # step is over, so nothing says the call failed or waits to retry it.
+        cancel, failure_log = threading.Event(), self.root / runtime.MODEL_FAILURE_LOG
 
         def attempt(text, schema, stage, *args, **settings):
-            item = text[-1]
-            calls[item] += 1
-            if item == "a" and calls[item] < 4:
-                raise runtime.Error(f"Codex critic failed: {CAPACITY}")
-            return '{"statement": "S", "notes": "%s"}' % item
+            cancel.set()
+            raise runtime.Error("Codex critic failed: KeyboardInterrupt")
 
-        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
-            reports = runtime._parallel_requests(config, {"check": "Check {item}"}, {}, {}, 1)
-        self.assertEqual([report["notes"] for report in reports], ["a", "b"])
-        self.assertEqual(calls, {"a": 4, "b": 1})
-        labels = {event["label"] for event in self.statuses("Independent audit 1 · " + runtime.RETRY_LABEL)}
-        self.assertEqual(labels, {"Independent audit 1 · " + runtime.RETRY_LABEL})
-
-        # A request that ends the step (here a pause) cancels the others' waits at once.
-        cancel_seen, waiting = threading.Event(), threading.Event()
-        attempts = {"a": 0}
-
-        def stop(text, schema, stage, *args, **settings):
-            if text.endswith("b"):
-                self.assertTrue(waiting.wait(5))  # Request a is waiting to retry.
-                raise runtime.WorkflowPaused("Paused before the next workflow step.")
-            attempts["a"] += 1
-            raise runtime.Error(f"Codex critic failed: {CAPACITY}")
-
-        def sleep(seconds, cancel=None):
-            waiting.set()
-            if cancel is not None and cancel.wait(5):
-                cancel_seen.set()
-
-        with mock.patch.object(runtime, "run_structured_attempt", side_effect=stop), \
-                mock.patch.object(runtime, "_retry_sleep", side_effect=guarded(sleep, limit=20)):
-            with self.assertRaises(runtime.WorkflowPaused):
-                runtime._parallel_requests(config, {"check": "Check {item}"}, {}, {}, 1)
-        self.assertTrue(cancel_seen.is_set())
-        self.assertEqual(attempts["a"], 1)
+        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt) as attempts:
+            with self.assertRaises(runtime.RetryCancelled):
+                runtime.structured("Check S.", SCHEMA, "critic", activity_label="Critic 1 of 3", cancel=cancel,
+                                   options={"failure_log": str(failure_log)})
+        self.assertEqual(attempts.call_count, 1)
+        self.assertEqual([event["text"] for event in self.events if event["kind"] == "diagnostic"], [])
+        self.assertEqual(self.notices("Critic 1 of 3 · " + runtime.RETRY_LABEL), [])
+        self.assertFalse(failure_log.exists())
+        self.assertEqual(self.waits(), 0)
 
 
 # The stand-in Codex CLI: `codex exec` and `codex exec fork <id> -` answer as
@@ -1026,16 +1023,17 @@ class CodexStructuredTests(RetryCase):
         self.assertEqual(self.deletes(), [])
         self.assertEqual(self.sessions(), {})
 
-    def test_a_timed_out_attempt_with_work_continues_with_a_longer_timeout(self):
+    def test_a_stalled_attempt_with_work_continues_its_conversation(self):
         self.script({"work": "Halfway.", "hang": 30}, {"answer": VALID})
         result, _ = runtime.structured("Review S.", SCHEMA, "critic", model="gpt-6.1-sol", timeout=1.5)
         self.assertEqual(result["notes"], "ok")
         execs = self.execs()
         self.assertEqual(self.tail(execs[1])[:1], ["fork"])
-        self.assertEqual(execs[1]["stdin"], runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 1.5 s"))
+        self.assertEqual(execs[1]["stdin"], runtime.STRUCTURED_RETRY_NOTE.format(
+            cause="was stopped after 1.5 s without activity"))
         notice = self.notices()[0]["text"]
-        self.assertTrue(notice.startswith("Model call failed (no final answer within 1.5 s) — retrying in 1 min "
-                                          "(attempt 2, the next attempt may run 3 s)."), notice)
+        self.assertTrue(notice.startswith("Model call failed (no output for 1.5 s) — retrying in 1 min "
+                                          "(attempt 2)."), notice)
 
     def test_an_answer_after_failed_subagents_is_set_aside_and_they_run_again(self):
         """The reported bug: subagents at capacity made the critic reject instead of retrying them."""
@@ -1104,7 +1102,7 @@ class CodexStructuredTests(RetryCase):
                                        features=("multi_agent",))
         self.assertEqual(result["notes"], "ok")
         execs = self.execs()
-        note = (runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 1.5 s") + "\n"
+        note = (runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 1.5 s without activity") + "\n"
                 + runtime.SUBAGENT_RERUN_NOTE.format(failed="1 subagent call", reasons=" (model at capacity)"))
         # Both forks of the same base carry the same note.
         self.assertEqual([entry["stdin"] for entry in execs[1:]], [note, note])
@@ -1215,7 +1213,7 @@ class ClaudeStructuredTests(claude_test.FakeClaudeCase):
         self.assertEqual(self.records("stdin")[-1]["text"], "Review.")
         self.assertEqual(sum(self.clock.sleeps), 60)
 
-    def test_a_timed_out_attempt_names_its_duration(self):
+    def test_a_stalled_attempt_names_its_inactivity(self):
         self.script([["init", {"emit": {"type": "assistant", "parent_tool_use_id": None, "uuid": "a1",
                                         "message": {"content": [{"type": "text", "text": "Halfway."}]}}},
                       {"hang": 30}],
@@ -1223,17 +1221,18 @@ class ClaudeStructuredTests(claude_test.FakeClaudeCase):
         result, _ = runtime.structured("Review.", SCHEMA, "critic", model="claude-opus-5-5", timeout=1.5)
         self.assertEqual(result["notes"], "ok")
         self.assertEqual(self.records("stdin")[1]["text"],
-                         runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 1.5 s"))
+                         runtime.STRUCTURED_RETRY_NOTE.format(cause="was stopped after 1.5 s without activity"))
         self.assertTrue(self.notices()[0]["text"].startswith(
-            "Model call failed (no final answer within 1.5 s) — retrying in 1 min (attempt 2, the next attempt "
-            "may run 3 s)."))
+            "Model call failed (no output for 1.5 s) — retrying in 1 min (attempt 2)."))
 
     def test_the_sessions_of_an_api_model_are_deleted_from_its_own_home(self):
         self.script([self.worked_then_failed(), ["init", {"structured": {"statement": "S", "notes": "ok"}}]])
         runtime.structured("Review.", SCHEMA, "review", model=self.api_model())
         starts = self.records("start")
-        self.assertNotIn("CLAUDE_CONFIG_DIR", starts[0]["env"])  # API models never see the login folder.
-        home = self.root / "home" / ".claude" / "projects"
+        # API models never see the login folder: they run in a private configuration folder.
+        private = claude_cli.claude_home(self.run_dir, runtime)
+        self.assertEqual({start["env"]["CLAUDE_CONFIG_DIR"] for start in starts}, {str(private)})
+        home = private / "projects"
         self.assertEqual(sorted(self.transcripts), sorted([starts[0]["argv"][1], starts[1]["argv"][4]]))
         self.assertEqual(list(home.rglob("*.jsonl")), [])
         self.assertEqual(list(home.iterdir()), [])  # The emptied project folder went too.
@@ -1472,7 +1471,8 @@ class AuthorRetryTests(RetryCase):
         self.addCleanup(os.chdir, previous)
         report = {"verdict": "pass", "solution": "Proof.", "bugs": ""}
         with mock.patch.object(runtime, "goal_session", side_effect=session), \
-                mock.patch.object(runtime, "structured", return_value=(report, json.dumps(report))):
+                mock.patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(
+                    lambda *args, **kwargs: (report, json.dumps(report)))):
             state = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"], {"statement": "Task"})
         self.assertEqual(state["output"], "Proof.")
         self.assertFalse(state.get("paused"))
@@ -1507,8 +1507,10 @@ class AppServer:
     def send(self, message):
         self.calls.append((message["method"], message.get("params")))
 
-    def request(self, method, params):
+    def request(self, method, params, before_send=None):
         self.calls.append((method, params))
+        if before_send is not None:
+            before_send(len(self.calls))
         return len(self.calls)
 
     def queue(self, method, thread, **params):
@@ -1522,6 +1524,8 @@ class AppServer:
             raise failure
         if method == "initialize":
             return {"codexHome": test.codex_home} if test.codex_home else {}
+        if method == "command/exec":
+            return goal_test.sandbox_check(params)  # A sandbox that holds (macOS).
         if method == "thread/start":
             thread = f"thread-{len(test.threads) + 1}"
             test.threads[thread] = []
@@ -1700,17 +1704,21 @@ class CodexAuthorTests(RetryCase):
         self.assertEqual(self.sent(third), [runtime.AUTHOR_RETRY_NOTE])
         self.assertEqual(list(self.threads), ["thread-1"])
 
-    def test_a_thread_codex_no_longer_has_waits_for_the_user(self):
-        self.scripts = [{"work": "w", "error": FAILURES[5]}]
+    def test_a_thread_codex_no_longer_has_continues_in_a_new_conversation(self):
+        self.scripts = [{"work": "w", "error": FAILURES[5]}, {"answer": "Full proof"}]
         self.failures[(2, "thread/resume")] = runtime.Error(
             "thread/resume failed: no rollout found for thread id thread-1")
-        with self.assertRaises(runtime.WorkflowPaused) as raised:
-            self.run_goal()
-        self.assertTrue(raised.exception.session_unavailable)
-        self.assertIsNone(raised.exception.retry)
-        self.assertIn("automatic retry is off", raised.exception.reason)
+        self.assertEqual(self.run_goal()["output"], "Full proof")
         self.assertEqual(len(self.servers), 2)
         self.assertEqual(self.waits(), 60)  # Only the wait before the attempt that found it gone.
+        second = self.servers[1]
+        self.assertIn("thread/start", self.names(second))
+        # The new conversation gets the full resume prompt, never the retry note.
+        self.assertEqual(self.sent(second), [f"Resume in {self.directory}.\nProve S exactly."])
+        replaced = [event for event in self.events if event.get("label") == "Conversation replaced"]
+        self.assertEqual(len(replaced), 1)
+        self.assertIn("no rollout found", replaced[0]["text"])
+        self.assertEqual(replaced[0]["threadId"], "thread-2")
 
     def test_a_missing_thread_id_waits_for_the_user(self):
         with self.assertRaises(runtime.WorkflowPaused) as raised:
@@ -1769,13 +1777,20 @@ class RPCTests(unittest.TestCase):
                                   stderr=None)
         return runtime.RPC(process)
 
-    def test_refusals_of_the_app_server_are_safety_stops_and_garbage_is_a_transport_error(self):
-        with self.assertRaises(runtime.SafetyStop):
+    def test_a_missing_tool_runtime_is_retried_requests_are_answered_and_garbage_is_a_transport_error(self):
+        # The session never continues after the warning, but a retry can succeed (I-024).
+        with self.assertRaises(runtime.ToolRuntimeUnavailable) as raised:
             self.rpc(json.dumps({"method": "warning", "params": {"message": "Code mode is unavailable here."}})).wire()
-        with self.assertRaises(runtime.SafetyStop):
-            self.rpc(json.dumps({"id": 7, "method": "item/commandExecution/requestApproval"})).wire()
-        with self.assertRaises(runtime.Error) as raised:
+        self.assertTrue(runtime.retryable_failure(raised.exception))
+        # A request of the app-server is declined, and the turn goes on (I-025).
+        rpc = self.rpc(json.dumps({"id": 7, "method": "item/commandExecution/requestApproval"}))
+        self.assertEqual(rpc.wire()["method"], "item/commandExecution/requestApproval")
+        self.assertEqual(json.loads(rpc.process.stdin.getvalue()), {"id": 7, "result": {"decision": "decline"}})
+        # A line that is not a protocol message is skipped; the end of the output is the transport error.
+        with mock.patch.object(runtime, "emit") as emit, self.assertRaises(runtime.Error) as raised:
             self.rpc("not json at all").wire()
+        self.assertIn("stopped unexpectedly", str(raised.exception))
+        self.assertIn("not json at all", emit.call_args.kwargs["text"])
         self.assertTrue(runtime.retryable_failure(raised.exception))
         self.assertTrue(runtime.retryable_failure(self.capture(self.rpc().wire)))
 
@@ -1922,37 +1937,53 @@ class ClaudeAuthorTests(claude_test.FakeClaudeCase):
         self.assertEqual([argv[:2] for argv in starts[1:]], [["--resume", session]] * 2)
         self.assertEqual(self.texts()[-1], runtime.AUTHOR_RETRY_NOTE)
 
-    def test_a_conversation_claude_no_longer_has_waits_for_the_user(self):
+    def test_a_conversation_claude_no_longer_has_continues_in_a_new_one_with_the_repair(self):
         worked = ["init", "echo", self.work("6a0b6a1e-2f6b-4fd0-8a77-2a4f3c1b9d01"),
                   {"result": {"is_error": True, "result": "API Error: 500", "api_error_status": 500}}]
-        self.script([worked], all_resumes_gone=True)
-        with self.assertRaises(runtime.WorkflowPaused) as raised:
-            self.run_goal()
-        self.assertTrue(raised.exception.session_unavailable)
-        self.assertIsNone(raised.exception.retry)
-        self.assertEqual(sum(self.clock.sleeps), 60)  # One retry found the conversation gone.
+        self.script([["init", "echo", claude_test.complete("First proof.")], worked,
+                     ["init", "echo", claude_test.complete("Repaired.")]], all_resumes_gone=True)
+        launch = self.launcher()
+        options = {"goal_cwd": str(self.run_dir)}
+        sessions = {"author": launch(options=options, initial_instruction="")}
+        self.addCleanup(lambda: sessions["author"].close())
+        self.assertEqual(next(sessions["author"])["output"], "First proof.")
+        feedback = {"bugs": "Step 2 divides by zero.", "round": 1, "solution": "First proof."}
+        result = runtime._goal_step(sessions, "author", launch, "", options,
+                                    lambda session: session.send(feedback), "repair")
+        self.assertEqual(result["output"], "Repaired.")
+        self.assertEqual(sum(self.clock.sleeps), 60)  # One retry found the conversation gone, then no wait.
+        starts = [row["argv"] for row in self.records("start")]
+        self.assertEqual([argv[0] for argv in starts], ["--session-id", "--resume", "--session-id"])
+        # The new conversation gets the resume prompt and the repair with the critic's report.
+        repair = self.texts()[1]
+        self.assertEqual(self.texts()[-1], f"{claude_test.PROMPTS['resume'].format(directory=self.run_dir, original_prompt='Prove S exactly.')}\n\n{repair}")
+        replaced = next(event for event in self.events if event.get("label") == "Conversation replaced")
+        self.assertEqual((replaced["stage"], replaced["replacedThreadId"]), ("repair", starts[0][1]))
+        self.assertIn("the critic's last report", replaced["text"])
 
-    def test_a_missing_session_id_waits_for_the_user(self):
-        with self.assertRaises(runtime.WorkflowPaused) as raised:
-            self.run_goal({"goal_require_resume": True, "goal_resume": True})
-        self.assertTrue(raised.exception.session_unavailable)
-        self.assertIsNone(raised.exception.retry)
-        self.assertEqual(self.records("start"), [])
+    def test_a_missing_session_id_continues_in_a_new_conversation(self):
+        self.script([["init", "echo", claude_test.complete("Done.")]])
+        self.assertEqual(self.run_goal({"goal_require_resume": True, "goal_resume": True})["output"], "Done.")
+        self.assertEqual([row["argv"][0] for row in self.records("start")], ["--session-id"])
+        self.assertIn("Conversation replaced", self.labels("status"))
         self.assertEqual(self.clock.sleeps, [])
 
-    def test_unexpected_tools_and_a_replaced_session_are_never_retried(self):
-        for name, init in (("unexpected tools", {"init": {"extra_tools": ["RemoteTrigger"]}}),
-                           ("replaced session", {"init": {"session_id": "11111111-2222-4333-8444-555555555555"}})):
+    def test_tools_that_disallowedtools_cannot_remove_and_a_replaced_new_session_are_never_retried(self):
+        for name, init, starts in (("unexpected tools", {"init": {"extra_tools": ["RemoteTrigger"]}}, 2),
+                                   ("replaced session", {"init": {"session_id": "11111111-2222-4333-8444-555555555555"}},
+                                    1)):
             with self.subTest(name):
                 self.log.unlink(missing_ok=True)
+                self.clock.sleeps.clear()
                 self.script([[init, "echo", claude_test.complete()]] * 3)
                 with self.assertRaises(runtime.WorkflowPaused) as raised:
                     self.run_goal()
                 self.assertTrue(raised.exception.safety_stop)
                 self.assertIsNone(raised.exception.retry)
                 self.assertTrue(raised.exception.reason.startswith("Stopped for safety: "))
-                self.assertEqual(len(self.records("start")), 1)  # Never relaunched.
-        self.assertEqual(self.clock.sleeps, [])
+                # A surprise tool is denied once (--disallowedTools); never relaunched after that.
+                self.assertEqual(len(self.records("start")), starts)
+                self.assertEqual(sum(self.clock.sleeps), 60 * (starts - 1))
 
     def test_a_resumed_conversation_this_process_never_read_is_rewound_from_its_transcript(self):
         # An earlier runner process completed a turn of session S.
@@ -1991,6 +2022,35 @@ class RetryClockTests(RetryCase):
             self.assertIsNone(clock.wait_ended())
         self.assertAlmostEqual(clock.excluded(), 45, delta=0.5)
         self.assertEqual([event for event in self.events if "budgetClock" in event], [])
+
+
+def critic_round_records(visit, count=3, retried=2):
+    """The runner's records of one critic round (a visit of the critic step): its proof
+    handoff, `count` independent critics (critic `retried` once) and the coordinator."""
+
+    return [
+        {"kind": "status", "stage": "critic", "node": "critic", "label": "Workflow step: critic", "visit": visit},
+        {"kind": "proof_handoff", "stage": "critic", "label": "Submitted proof captured", "round": visit,
+         "manifest": {"schemaVersion": 1, "visit": visit}},
+        {"kind": "status", "stage": "critic", "node": "critic", "label": f"{count} independent critics started",
+         "auditCount": count, "restoredAuditCount": 0, "launchedAuditCount": count},
+        *({"kind": "request", "stage": "critic", "label": f"Independent critic audit {index}", "attempt": 1,
+           "text": f"Critic {index} of {count}"} for index in range(1, count + 1)),
+        {"kind": "status", "stage": "critic", "label": f"Critic {retried} of {count} · {runtime.RETRY_LABEL}",
+         "activityLabel": f"Critic {retried} of {count}", "retryAttempt": 2,
+         "text": "Model call failed (rate limited) — retrying in 1 min (attempt 2)."},
+        {"kind": "request", "stage": "critic", "label": f"Independent critic audit {retried} · retry", "attempt": 2,
+         "text": f"Critic {retried} of {count}"},
+        *({"kind": "status", "stage": "critic", "node": "critic", "label": f"Independent audit {index} complete",
+           "auditIndex": index, "auditVerdict": "fail", "text": f"Report {index}."} for index in range(1, count + 1)),
+        {"kind": "request", "stage": "critic", "label": "Critic coordinator", "attempt": 1,
+         "text": "CRITIC 1 OF 3", "candidateText": "Proof."},
+        {"kind": "critic_result", "stage": "critic", "label": f"Critic round {visit}", "round": visit,
+         "outcome": "fixed", "report": {
+             "verdict": "pass", "bugs": "", "solution": "Edited proof.",
+             "checks": [{"focus": f"Focus {index}.", "verdict": "fail", "report": f"Report {index}."}
+                        for index in range(1, count + 1)]}},
+    ]
 
 
 class ServerRetryTests(unittest.TestCase):
@@ -2062,7 +2122,7 @@ class ServerRetryTests(unittest.TestCase):
         def between(index):
             seen[index] = (self.app.state.get("modelRetry"), self.app._retry_wait_started is not None)
 
-        self.run_reader([{**self.wait(activity="Independent audit 2"), "budgetClock": "paused"}], between)
+        self.run_reader([{**self.wait(activity="Critic 2 of 3"), "budgetClock": "paused"}], between)
         waiting, clock_paused = seen[0]
         self.assertEqual((waiting["attempt"], clock_paused), (2, True))
         self.assertTrue(waiting["text"].startswith("Model call failed (model at capacity)"))
@@ -2072,18 +2132,28 @@ class ServerRetryTests(unittest.TestCase):
         self.assertNotEqual(self.app.state["resumedAt"], "2026-10-23T10:00:00+00:00")
 
     def test_parallel_waits_are_followed_separately(self):
-        first, second = "Independent audit 1", "Independent audit 2"
+        first, second = "Critic 1 of 3", "Critic 2 of 3"
         self.app._follow_model_retry(self.wait(activity=first, retry_at=2_000_000_100.0))
         self.app._follow_model_retry(self.wait(activity=second, retry_at=2_000_000_200.0))
         self.assertEqual(self.app.state["modelRetry"]["retryAt"], 2_000_000_200.0)
-        # Audit 2 retries now; audit 1 still waits and stays shown.
+        # Critic 2 retries now; critic 1 still waits and stays shown.
         self.app._follow_model_retry(self.retrying(activity=second))
         self.assertEqual(self.app.state["modelRetry"]["retryAt"], 2_000_000_100.0)
         self.app._follow_model_retry(self.retrying(activity=first))
         self.assertIsNone(self.app.state["modelRetry"])
 
+    def test_a_critic_round_is_one_visit_not_one_per_request(self):
+        rounds = []
+        first, second = critic_round_records(1), critic_round_records(2, count=5)
+        self.run_reader([*first, *second], lambda index: rounds.append(self.app.state["round"]))
+        # The proof handoff starts each round; neither the critics, the coordinator nor
+        # their retries count another one (and round 1 never shows as round 2).
+        self.assertEqual(rounds, [0, *[1] * (len(first) - 1), 1, *[2] * (len(second) - 1)])
+        self.assertEqual(self.app.state["round"], 2)
+
     def test_retry_requests_are_not_new_critic_rounds(self):
-        self.run_reader([{"kind": "request", "stage": "critic", "label": "Exact critic input", "attempt": 1, "text": "x"},
+        self.run_reader([{"kind": "proof_handoff", "stage": "critic", "round": 1},
+                         {"kind": "request", "stage": "critic", "label": "Exact critic input", "attempt": 1, "text": "x"},
                          {"kind": "request", "stage": "critic", "label": "Exact critic retry", "attempt": 2, "text": "y"},
                          {"kind": "request", "stage": "critic", "label": "Exact critic retry", "attempt": 3, "text": "z"}])
         self.assertEqual(self.app.state["round"], 1)
@@ -2107,24 +2177,45 @@ class TerminalTests(unittest.TestCase):
         stream = io.StringIO()
         output = terminal.ConciseHeadlessOutput(stream, threading.Lock(), "p.md")
         records = [
-            {"kind": "request", "stage": "critic", "attempt": 1, "text": "x"},
+            *critic_round_records(1),
             {"kind": "status", "stage": "critic", "label": runtime.RETRY_LABEL,
              "text": "Model call failed (model at capacity) — retrying in 1 min (attempt 2)."},
-            {"kind": "request", "stage": "critic", "attempt": 2, "text": "y"},
-            {"kind": "status", "stage": "critic", "label": "Independent audit 2 · " + runtime.RETRY_LABEL,
-             "text": "Model call failed (rate limited) — retrying in 1 min (attempt 3)."},
+            {"kind": "request", "stage": "critic", "label": "Critic coordinator · retry", "attempt": 2, "text": "y"},
+            *critic_round_records(2, count=5, retried=4),
             {"kind": "status", "stage": "solve", "label": "Author stopped for safety", "text": "Stopped for safety: x"},
-            {"kind": "request", "stage": "critic", "attempt": 1, "text": "z"},
+            {"kind": "status", "stage": "solve", "node": "author", "label": "Workflow step: author", "visit": 1},
+            {"kind": "request", "stage": "repair", "label": "Exact solve input", "attempt": 1, "text": "Repair."},
+            # The repaired proof's review starts at round 1 again.
+            *critic_round_records(1, count=1, retried=1),
         ]
         for record in records:
             output.write(json.dumps(record) + "\n")
         self.assertEqual(stream.getvalue().splitlines(), [
             "[p.md] Current step: Independent critic (round 1)",
+            "[p.md] Critic 2 of 3 · Retrying model call: Model call failed (rate limited) — retrying in 1 min "
+            "(attempt 2).",
             "[p.md] Retrying model call: Model call failed (model at capacity) — retrying in 1 min (attempt 2).",
-            "[p.md] Independent audit 2 · Retrying model call: Model call failed (rate limited) — retrying in 1 min "
-            "(attempt 3).",
-            "[p.md] Author stopped for safety: Stopped for safety: x",
             "[p.md] Current step: Independent critic (round 2)",
+            "[p.md] Critic 4 of 5 · Retrying model call: Model call failed (rate limited) — retrying in 1 min "
+            "(attempt 2).",
+            "[p.md] Author stopped for safety: Stopped for safety: x",
+            "[p.md] Current step: Proof author (repairing critic objections)",
+            "[p.md] Current step: Independent critic (round 1)",
+            "[p.md] Critic 1 of 1 · Retrying model call: Model call failed (rate limited) — retrying in 1 min "
+            "(attempt 2).",
+        ])
+
+    def test_concise_output_without_step_records_counts_the_first_critic_request(self):
+        stream = io.StringIO()
+        output = terminal.ConciseHeadlessOutput(stream, threading.Lock(), "p.md")
+        for record in ({"kind": "request", "stage": "solve", "attempt": 1, "text": "Prove."},
+                       {"kind": "request", "stage": "critic", "attempt": 1, "text": "x"},
+                       {"kind": "request", "stage": "critic", "attempt": 2, "text": "y"},
+                       {"kind": "request", "stage": "critic", "label": "Critic coordinator", "attempt": 1}):
+            output.write(json.dumps(record) + "\n")
+        self.assertEqual(stream.getvalue().splitlines(), [
+            "[p.md] Current step: Proof author",
+            "[p.md] Current step: Independent critic (round 1)",
         ])
 
     def test_terminal_runs_resume_error_pauses_like_the_web_server(self):
@@ -2190,7 +2281,7 @@ const ui = new Proxy({}, {get(target, name) {return target[name] ||= {
 const document = {activeElement: null, body: {append() {}}, createElement() {return {click() {}, remove() {}};}};
 const show = (element, visible) => element.hidden = !visible;
 const retainTrace = entries => entries;
-const ingest = () => {}, syncMemoryPanel = () => {}, renderWorkflow = () => {};
+const ingest = () => {}, renderWorkflow = () => {};
 const renderClock = () => {}, renderBatchNavigation = () => {}, refresh = () => {};
 const setTimeout = () => 1, clearTimeout = () => {}, setInterval = () => 1, clearInterval = () => {};
 `;

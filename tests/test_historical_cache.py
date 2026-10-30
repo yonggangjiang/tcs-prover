@@ -11,7 +11,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from retrieval.historical_cache import CacheError, CaptureCache, MAX_BODY_BYTES, MAX_JSON_BYTES
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+from retrieval.historical_cache import CacheError, CaptureCache, MAX_BODY_BYTES, MAX_JSON_BYTES, QUARANTINE
 
 
 URL = "https://papers.example/archived-paper"
@@ -121,10 +122,14 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
         for text in invalid:
             with self.subTest(prefix=text[:50]):
                 self.entry_path().write_text(text)
-                with self.assertRaises(CacheError):
+                self.entry_path().chmod(0o600)
+                with self.assertRaises(CacheError) as error:
                     self.cache.get(URL)
-                with self.assertRaises(CacheError):
-                    self.cache.put(URL, record())
+                self.assertEqual(error.exception.kind, "invalid")
+                # A write never overwrites it in place: it is moved aside first.
+                self.cache.put(URL, record())
+                self.assertEqual(self.cache.get(URL), record())
+        self.assertEqual(len(list((self.directory / QUARANTINE).iterdir())), len(invalid))
 
     def test_hashed_filename_does_not_expose_url_or_enable_path_traversal(self):
         url = "https://papers.example/../../private?source=archive"
@@ -151,7 +156,7 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
             self.cache.get(URL)
         self.assertEqual(list(self.workspace.iterdir()), [])
 
-    def test_linked_lock_or_record_is_rejected_without_reading_or_modifying_target(self):
+    def test_linked_lock_or_record_is_moved_aside_without_reading_or_modifying_target(self):
         source = self.root / "private-source"
         source.write_text("private contents")
         source.chmod(0o600)
@@ -163,12 +168,17 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
                         os.link(source, path)
                     else:
                         path.symlink_to(source)
-                    with self.assertRaises(CacheError) as error:
+                    if path.name == ".cache.lock":
+                        # A linked lock name is replaced, never used or followed.
                         self.cache.get(URL)
-                    self.assertNotIn("private contents", str(error.exception))
-                    with self.assertRaises(CacheError):
-                        self.cache.put(URL, record())
+                    else:
+                        with self.assertRaises(CacheError) as error:
+                            self.cache.get(URL)
+                        self.assertNotIn("private contents", str(error.exception))
+                    self.cache.put(URL, record())
+                    self.assertEqual(self.cache.get(URL), record())
                     self.assertEqual(source.read_text(), "private contents")
+                    self.assertFalse(path.is_symlink())
                     path.unlink()
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX named pipes")
@@ -184,11 +194,15 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
         self.cache.put(URL, record())
         self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
         self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in self.directory.iterdir()))
+        # Readable by others: our own file and folder are tightened again.
         self.entry_path().chmod(0o644)
-        with self.assertRaises(CacheError):
-            self.cache.get(URL)
-        self.entry_path().chmod(0o600)
+        self.assertEqual(self.cache.get(URL), record())
+        self.assertEqual(stat.S_IMODE(self.entry_path().stat().st_mode), 0o600)
         self.directory.chmod(0o755)
+        self.assertEqual(self.cache.get(URL), record())
+        self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+        # Writable by others: the entry may be forged and is never used.
+        self.entry_path().chmod(0o666)
         with self.assertRaises(CacheError):
             self.cache.get(URL)
 
@@ -219,7 +233,7 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
         self.assertIsNone(self.cache.get(URL))
         self.assertEqual(self.reopen().get(URL + "/63"), record(URL + "/63"))
 
-    def test_interrupted_temporary_is_cleaned_under_lock_and_unknown_files_rejected(self):
+    def test_interrupted_temporary_is_cleaned_under_lock_and_unknown_files_moved_aside(self):
         temporary = self.directory / ".capture-abandoned.tmp"
         temporary.write_text("incomplete source bytes")
         temporary.chmod(0o600)
@@ -227,8 +241,10 @@ class CaptureCacheTests(CaptureCacheFixture, unittest.TestCase):
         self.assertFalse(temporary.exists())
         unexpected = self.directory / "unexpected.txt"
         unexpected.write_text("unexpected text")
-        with self.assertRaises(CacheError):
-            self.cache.put(URL, record())
+        self.cache.put(URL, record())
+        self.assertFalse(unexpected.exists())
+        (moved,) = (self.directory / QUARANTINE).iterdir()
+        self.assertEqual(moved.read_text(), "unexpected text")
 
 
 class MultiProcessCacheTests(CaptureCacheFixture, unittest.TestCase):

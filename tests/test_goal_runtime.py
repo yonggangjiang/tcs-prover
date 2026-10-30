@@ -1,13 +1,16 @@
 """Goal transport behavior with a scripted local RPC double; no model calls."""
 from collections import deque
 import io
+import json
 from pathlib import Path
+import re
 import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as module
 
 
@@ -44,6 +47,21 @@ def success(text="Full proof"):
     return [answer(text), goal("complete"), completed()]
 
 
+def sandbox_check(params, writable=True, **changes):
+    """The answer of a sandbox that holds to the author's startup check (workflow_runner.author_confinement_check).
+
+    ``writable`` says whether the run folder is writable (False for a conversation
+    turn); ``changes`` override single probes.
+    """
+
+    script = params["command"][-1]
+    nonce = re.search(r'"nonce":"([0-9a-f]{32})"', script).group(1)
+    allowed = {"workspaceRead": True, "tempWrite": True, "workspaceWrite": writable}
+    report = {"nonce": nonce, **{key: allowed.get(key, False) for key in re.findall(r"then (\w+)=true", script)},
+              **changes}
+    return {"exitCode": 0, "stdout": json.dumps(report), "stderr": ""}
+
+
 class TransportError(RuntimeError):
     pass
 
@@ -58,9 +76,11 @@ class RPC:
     def send(self, message):
         self.calls.append((message["method"], message.get("params")))
 
-    def request(self, method, params):
+    def request(self, method, params, before_send=None):
         self.calls.append((method, params))
         self.number += 1
+        if before_send is not None:
+            before_send(self.number)
         if method == "turn/steer":
             self.runtime.steered.set()
             self.messages.append({"id": self.number, "result": {}})
@@ -82,6 +102,8 @@ class RPC:
             return {"thread": {"id": "thread-1"}}
         if method == "thread/goal/get":
             return {"goal": self.runtime.saved_goal}
+        if method == "command/exec":
+            return sandbox_check(params, getattr(self.runtime, "sandbox_writable", True))
         if method == "turn/start":
             self.turns += 1
             self.messages.append(event("turn/started", turn={"id": f"turn-{self.turns}"}))
@@ -350,14 +372,22 @@ class GoalTests(unittest.TestCase):
             next(session2)
         self.assertFalse(any(m == "thread/start" for m, _ in runtime2.rpc.calls))
 
-    def test_paused_run_requires_its_original_thread_even_if_unavailable(self):
-        for error in ("thread not found", "Quota exceeded", "Network unavailable"):
+    def test_paused_run_keeps_its_original_thread_unless_codex_no_longer_has_it(self):
+        for error in ("Quota exceeded", "Network unavailable"):
             with self.subTest(error=error):
                 runtime, session = self.session(options={"goal_thread_id": "thread-1", "goal_require_resume": True})
                 runtime.resume_error = error
                 with self.assertRaisesRegex(module.WorkflowPaused, "no replacement was started"):
                     next(session)
                 self.assertFalse(any(m in {"thread/start", "turn/start"} for m, _ in runtime.rpc.calls))
+        # A thread Codex no longer has continues in a new conversation, with a visible notice (I-071).
+        runtime, session = self.session(options={"goal_thread_id": "thread-1", "goal_require_resume": True})
+        runtime.resume_error = "thread not found"
+        self.assertEqual(next(session)["outcome"], "done")
+        self.assertEqual(sum(m == "thread/start" for m, _ in runtime.rpc.calls), 1)
+        prompt = next(p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start")
+        self.assertEqual(prompt, PROMPTS["resume"].format(directory=self.directory, original_prompt=PROMPT))
+        self.assertTrue(any(e.get("label") == "Conversation replaced" for e in runtime.events))
 
     def test_strict_resume_without_thread_id_starts_no_process(self):
         _, session = self.session(options={"goal_require_resume": True})
@@ -539,6 +569,91 @@ class GoalTests(unittest.TestCase):
         self.assertEqual(runtime.stopped, [])
         session.close()
         self.assertTrue(runtime.stopped)
+
+    def test_goal_reanchor_sends_the_full_resume_prompt_to_a_reopened_thread(self):
+        """After a conversation turn compacted the context, a reopened thread gets the resume prompt, not reopen."""
+        prompts = {**PROMPTS, "reopen": "Continue the same goal in this conversation."}
+        resume = PROMPTS["resume"].format(directory=self.directory, original_prompt=PROMPT)
+        repair = "Revision 1; critic round 2: Gap in step 3\nCandidate: Proof"
+        received = {"thread": "thread-1", "digest": module._repair_digest(repair)}
+        for options, initial, expected in (
+                ({"goal_reanchor": True}, "", resume),
+                ({"goal_reanchor": True}, repair, resume + "\n\n" + repair),
+                # Feedback the thread already received is not sent again, as with the resume prompt today.
+                ({"goal_reanchor": True, "author_repair_delivered": received}, repair, resume),
+                ({}, "", prompts["reopen"])):
+            with self.subTest(options=options, initial=initial):
+                runtime = Runtime([success()])
+                session = module.goal_session(runtime, PROMPT, prompts=prompts, settings=SETTINGS,
+                                              initial_instruction=initial,
+                                              options={"goal_cwd": str(self.directory), "goal_thread_id": "thread-1",
+                                                       "goal_resume": True, "goal_require_resume": True, **options})
+                self.addCleanup(session.close)
+                self.assertEqual(next(session)["outcome"], "done")
+                sent = [p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start"]
+                self.assertEqual(sent, [expected])
+                self.assertFalse(any(m == "thread/start" for m, _ in runtime.rpc.calls))
+
+    def test_a_refused_submission_is_explained_after_any_critic_feedback_in_a_reopened_thread(self):
+        """The controller's note on a refused submission travels apart from the critic's feedback."""
+        prompts = {**PROMPTS, "reopen": "Continue the same goal in this conversation."}
+        note = "Your last submission was not handed to the critic: proof.md: file not found."
+        repair = "Revision 1; critic round 2: Gap in step 3\nCandidate: Proof"
+        received = {"thread": "thread-1", "digest": module._repair_digest(repair)}
+        for options, initial, expected in (
+                ({}, "", prompts["reopen"] + "\n\n" + note),
+                ({}, repair, prompts["reopen"] + "\n\n" + repair + "\n\n" + note),
+                # Feedback the thread already received is not sent again; the note still is.
+                ({"author_repair_delivered": received}, repair, prompts["reopen"] + "\n\n" + note),
+                ({"goal_reanchor": True}, repair, PROMPTS["resume"].format(
+                    directory=self.directory, original_prompt=PROMPT) + "\n\n" + repair + "\n\n" + note)):
+            with self.subTest(options=options, initial=initial):
+                runtime = Runtime([success()])
+                session = module.goal_session(runtime, PROMPT, prompts=prompts, settings=SETTINGS,
+                                              initial_instruction=initial, handoff_note=note,
+                                              options={"goal_cwd": str(self.directory), "goal_thread_id": "thread-1",
+                                                       "goal_resume": True, "goal_require_resume": True, **options})
+                self.addCleanup(session.close)
+                self.assertEqual(next(session)["outcome"], "done")
+                self.assertEqual([p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start"], [expected])
+                # Only the critic's feedback is recorded as delivered: the note is never taken for it.
+                delivered = [e["repairDelivered"] for e in runtime.events if e.get("label") == "Critic feedback delivered"]
+                self.assertEqual(delivered, [received["digest"]] if repair in expected else [])
+
+    def test_a_new_conversation_is_told_too_and_the_note_ends_with_the_next_submission(self):
+        note = "Your last submission was not handed to the critic: proof.md: file not found."
+        resume = PROMPTS["resume"].format(directory=self.directory, original_prompt=PROMPT)
+        # Codex no longer has the saved thread: the new conversation starts from the resume prompt and the note.
+        runtime, session = self.session([success(), success("Repaired proof")], handoff_note=note,
+                                        options={"goal_thread_id": "thread-1", "goal_require_resume": True})
+        runtime.resume_error = "thread not found"
+        self.assertEqual(next(session)["outcome"], "done")
+        replaced = next(e for e in runtime.events if e.get("label") == "Conversation replaced")
+        self.assertIn("starting from the resume prompt, its working directory, any open critic feedback and any "
+                      "note on why its last submission was refused;", replaced["text"])
+        # The repair after the next submission's rejection has the critic's feedback only.
+        self.assertEqual(session.send({"solution": "Safe fixes", "bugs": "Gap in step 2", "round": 3})["output"],
+                         "Repaired proof")
+        self.assertEqual([p["input"][0]["text"] for m, p in runtime.rpc.calls if m == "turn/start"],
+                         [resume + "\n\n" + note, "Revision 1; critic round 3: Gap in step 2\nCandidate: Safe fixes"])
+
+    def test_the_launch_helpers_build_exactly_what_the_author_session_uses(self):
+        runtime, session = self.session(options={"goal_thread_id": "thread-1"}, features=["multi_agent"])
+        self.assertEqual(next(session)["outcome"], "done")
+        argv, environment, api_model = module._author_app_server(
+            runtime, directory=str(self.directory), policy=None, role="author", model=SETTINGS["model"],
+            settings=SETTINGS, features=["multi_agent"], classic=False)
+        self.assertEqual(argv, self.spawn.call_args.args[0])
+        self.assertEqual((environment, api_model), (self.spawn.call_args.kwargs["env"], False))
+        resumed = next(p for m, p in runtime.rpc.calls if m == "thread/resume")
+        options = module._author_thread_options(
+            runtime, runtime.rpc, directory=str(self.directory), policy=None, role="author", model=SETTINGS["model"],
+            settings=SETTINGS, summary="concise", features=["multi_agent"], classic=False, emit=None)
+        self.assertEqual({**options, "threadId": "thread-1", "excludeTurns": True}, resumed)
+        self.assertTrue(module._root_message(event("turn/started", turn={"id": "turn-1"}), "thread-1"))
+        self.assertFalse(module._root_message(event("turn/started", turn={"id": "turn-1"}), "thread-2"))
+        self.assertTrue(module._root_message({"id": 3, "result": {}}, "thread-1"))
+        self.assertFalse(module._root_message({"method": "turn/completed", "params": {}}, "thread-1"))
 
     def test_original_prompt_crlf_and_whitespace_are_submitted_verbatim_on_resume(self):
         original = "\r\n Original π statement\r\n  Keep these spaces. \r\n\r\n"

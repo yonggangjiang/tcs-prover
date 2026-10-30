@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from experiments import prepare_firstproof
 from ui import server
 
@@ -41,7 +42,7 @@ class PreparationTests(unittest.TestCase):
             self.assertTrue(app.state['skipStatementReview'])
             self.assertEqual(app.state['speedMode'], 'fast')
             self.assertEqual(app.state['thinkingHours'], 0)
-            for key in ('authorModel', 'criticModel', 'writerModel', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'reasoningSummary'):
+            for key in ('authorModel', 'criticModel', 'writerModel', 'authorEffort', 'criticEffort', 'writerEffort', 'criticRounds', 'criticCount', 'reasoningSummary'):
                 self.assertEqual(app.state[key], default[key])
             expected = (prepare_firstproof.EXPERIMENT / 'inputs' / (row['id'] + '.md')).read_bytes()
             self.assertEqual((app.run_dir / 'input.md').read_bytes(), expected)

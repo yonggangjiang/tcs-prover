@@ -3,6 +3,7 @@ import itertools
 import json
 import unittest
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from tests import test_provider_ui as browser
 
 
@@ -47,6 +48,7 @@ for (const stages of combinations) {
   }
   assert.equal(ui.check.disabled,!Object.values(stages).some(Boolean));
   assert.equal(ui.criticRoundSetting.hidden,!stages.critic);
+  assert.equal(ui.criticCountSetting.hidden,!stages.critic);
   assert.equal(ui.thinkingHoursSetting.hidden,!stages.author);
   assert.equal(ui.problemLabel.textContent,!stages.author&&(stages.critic||stages.writing)
     ? 'Statement and existing work':'Problem statement');

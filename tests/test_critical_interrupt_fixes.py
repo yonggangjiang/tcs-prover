@@ -17,6 +17,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from retrieval import isolated_compiler as compiler
 from runner import providers
 from ui import server
@@ -75,6 +76,12 @@ class IsolatedTestCase(unittest.TestCase):
         return json.loads((app.run_dir / server.PAUSE_FILENAME).read_text(encoding="utf-8"))
 
     @staticmethod
+    def saved_checkpoint(app):
+        """The checkpoint the controller trusts: its own copy, outside the author's folder."""
+
+        return server.controller_directory(app.run_dir) / server.PAUSE_FILENAME
+
+    @staticmethod
     def diagnostics(app):
         return [entry.get("text", "") for entry in app.state["trace"] if entry.get("kind") == "diagnostic"]
 
@@ -109,7 +116,7 @@ class DamagedCheckpointRetryTests(IsolatedTestCase):
                 # The damaged job comes first, so its failure would end the pass.
                 http.jobs = {name: http.jobs[name] for name in (damaged.run_dir.name, healthy.run_dir.name)}
                 broken, waiting = http.jobs[damaged.run_dir.name], http.jobs[healthy.run_dir.name]
-                (damaged.run_dir / server.PAUSE_FILENAME).write_text(text, encoding="utf-8")
+                self.saved_checkpoint(damaged).write_text(text, encoding="utf-8")
                 with patch.object(waiting, "resume") as resumed, \
                         patch.object(server, "require_model_access"), \
                         patch.object(server.subprocess, "Popen") as popen:
@@ -131,31 +138,37 @@ class DamagedCheckpointRetryTests(IsolatedTestCase):
                     http._retry_paused_jobs(now=1_000 + 2 * WAIT)
                     self.assertEqual(broken.state["autoResumeAt"], 1_000 + 3 * WAIT)
                     popen.assert_not_called()
-                # A checkpoint damaged before a restart is handled the same way.
+                # A checkpoint damaged before a restart is rebuilt from the transcript (I-083),
+                # keeping its cause and retry time, so the retry resumes the saved conversation.
                 if label == "missing state":
                     restarted = server.Server((server.HOST, 0), runs=runs)
                     self.addCleanup(restarted.server_close)
                     again = restarted.jobs[damaged.run_dir.name]
+                    self.assertEqual(again.state["phase"], "paused")
+                    self.assertTrue(again.state["autoResumeAt"])
+                    self.assertIn("rebuilt", again.state["settingsWarning"])
+                    self.assertEqual(self.checkpoint(again)["pauseCause"], "error")
+                    self.assertTrue(server.complete_pause_checkpoint(self.checkpoint(again)))
                     with patch.object(restarted.jobs[healthy.run_dir.name], "resume"), \
+                            patch.object(again, "_spawn_worker"), \
                             patch.object(server, "require_model_access"), \
                             patch.object(server.subprocess, "Popen") as popen:
                         restarted._retry_paused_jobs(now=again.state["autoResumeAt"])
-                    popen.assert_not_called()
-                    self.assertEqual(again.state["phase"], "paused")
-                    self.assertTrue(again.state["autoResumeAt"])
+                    popen.assert_called_once()
+                    self.assertIn('goal_thread_id="saved-thread"', popen.call_args.args[0])
 
     def test_resume_refuses_a_damaged_checkpoint_before_changing_anything(self):
         app = self.error_paused_job(self.new_runs(), "Exact statement")
         settings = (app.run_dir / server.JOB_SETTINGS_FILENAME).read_bytes()
         for label, text in self.damages(app).items():
             with self.subTest(label):
-                (app.run_dir / server.PAUSE_FILENAME).write_text(text, encoding="utf-8")
+                self.saved_checkpoint(app).write_text(text, encoding="utf-8")
                 with patch.object(server, "require_model_access"), \
                         patch.object(server.subprocess, "Popen") as popen:
                     with self.assertRaisesRegex(ValueError, "pause.json"):
                         app.resume()
                 popen.assert_not_called()
-                self.assertEqual((app.run_dir / server.PAUSE_FILENAME).read_text(encoding="utf-8"), text)
+                self.assertEqual(self.saved_checkpoint(app).read_text(encoding="utf-8"), text)
                 self.assertEqual((app.run_dir / server.JOB_SETTINGS_FILENAME).read_bytes(), settings)
                 self.assertEqual((app.state["phase"], app.state["error"], app.state["autoResumeAt"]),
                                  ("paused", "Connection lost", 1_000 + WAIT))
@@ -190,7 +203,7 @@ class DamagedCheckpointRetryTests(IsolatedTestCase):
         http = server.Server((server.HOST, 0), runs=runs)
         self.addCleanup(http.server_close)
         http.jobs = {name: http.jobs[name] for name in (damaged.run_dir.name, healthy.run_dir.name)}
-        (damaged.run_dir / server.PAUSE_FILENAME).write_text("[]\n", encoding="utf-8")
+        self.saved_checkpoint(damaged).write_text("[]\n", encoding="utf-8")
         resumed = threading.Event()
         waiting = http.jobs[healthy.run_dir.name]
 
@@ -407,9 +420,11 @@ class CompilerCanaryTests(IsolatedTestCase):
             with self.subTest(label):
                 with patch.object(runtime, "retrieval_policy", return_value=self.policy), \
                         patch.object(compiler, "_run", side_effect=failure):
-                    with self.assertRaises(runtime.Error) as raised:
-                        runtime._run_command(self.CONFIG, {"state": {}})
-                self.assertNotIn("(deny default)", str(raised.exception))
+                    result = runtime._run_command(self.CONFIG, {"state": {}})
+                # I-069: the checks run again before the next attempt; nothing compiled.
+                self.assertEqual(result["status"], "unavailable")
+                self.assertIn("Compiler sandbox canaries ", result["diagnostic"])
+                self.assertNotIn("(deny default)", result["diagnostic"])
                 self.assertEqual(self.output.read_bytes(), b"existing output")
 
 
@@ -454,7 +469,7 @@ class DamagedCheckpointReaderTests(IsolatedTestCase):
             with self.subTest(label):
                 runs = self.new_runs()
                 app = self.error_paused_job(runs, "Damaged job")
-                (app.run_dir / server.PAUSE_FILENAME).write_text(text, encoding="utf-8")
+                self.saved_checkpoint(app).write_text(text, encoding="utf-8")
                 self.assertEqual(app.snapshot()["phase"], "paused")
                 http = server.Server((server.HOST, 0), runs=runs)
                 self.addCleanup(http.server_close)
@@ -466,19 +481,19 @@ class DamagedCheckpointReaderTests(IsolatedTestCase):
         for label, text in self.DAMAGES.items():
             with self.subTest(label):
                 app = self.error_paused_job(self.new_runs(), "Damaged job")
-                (app.run_dir / server.PAUSE_FILENAME).write_text(text, encoding="utf-8")
+                self.saved_checkpoint(app).write_text(text, encoding="utf-8")
                 app.pause()
                 self.assertEqual(app.state["autoResumeAt"], 0)
                 retry = Mock()
                 self.assertFalse(app.auto_resume_if_due(retry, now=10**9))
                 retry.assert_not_called()
                 # The damaged file is left as it was, for Resume to report.
-                self.assertEqual((app.run_dir / server.PAUSE_FILENAME).read_text(encoding="utf-8"), text)
+                self.assertEqual(self.saved_checkpoint(app).read_text(encoding="utf-8"), text)
 
     def test_the_output_reader_survives_a_damaged_checkpoint_while_pausing(self):
         app = self.error_paused_job(self.new_runs(), "Damaged job")
         app.state.update(phase="pausing")
-        (app.run_dir / server.PAUSE_FILENAME).write_text("[]\n", encoding="utf-8")
+        self.saved_checkpoint(app).write_text("[]\n", encoding="utf-8")
         token = app.active_token = app.worker_token = object()
         process = app.process = Mock(stdout=io.StringIO(json.dumps({
             "kind": "workflow_paused", "stage": "solve", "node": "author",
