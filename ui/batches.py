@@ -58,15 +58,15 @@ def _timestamp(value):
 def job_tone(job):
     """One job row's status, classified as jobTone and completedRunOutcome in app.js classify it.
 
-    "running", "paused", "queued" (waiting for a running slot), "waiting" (for the user), or a finished
-    job's tone: "done" for every successful outcome (counted under Complete), else "failed" or
-    "stopped" (both counted under Incomplete).
+    "running", "paused", "limit" (stopped at the author time limit: never counted as paused), "queued"
+    (waiting for a running slot), "waiting" (for the user), or a finished job's tone: "done" for every
+    successful outcome (counted under Complete), else "failed" or "stopped" (both counted under Incomplete).
     """
     phase = job.get('phase')
     if phase in {'reviewing', 'running', 'stopping', 'pausing'}:
         return 'running'
     if phase == 'paused':
-        return 'paused'
+        return 'limit' if job.get('pauseCause') == 'time-limit' else 'paused'
     if phase == 'prepared' and job.get('launchQueued'):
         return 'queued'
     if phase in {'reviewed', 'prepared'}:
@@ -86,12 +86,15 @@ def job_tone(job):
 def batch_counts(rows):
     """A batch card's counts, each job once: by phase, except that a finished job counts as "done" only
     for a successful outcome (the check mark) and as "incomplete" otherwise (failed, stopped or
-    interrupted), as the batch page's Complete and Incomplete filters count them."""
+    interrupted), as the batch page's Complete and Incomplete filters count them, and that a job stopped
+    at its time limit counts as "limit", not as "paused"."""
     counts = {}
     for row in rows:
         phase = row.get('phase') or 'unknown'
         if phase == 'done' and job_tone(row) != 'done':
             phase = 'incomplete'
+        elif job_tone(row) == 'limit':
+            phase = 'limit'
         counts[phase] = counts.get(phase, 0) + 1
     return counts
 
@@ -289,7 +292,7 @@ class BatchCatalog:
         for identity, directory in self._batches().items():
             jobs = self._runs(directory)
             started = [self._started_at(job, self._json(job, 'job-settings.json')) for job in jobs]
-            counts = {'running': 0, 'done': 0, 'paused': 0, 'prepared': 0, 'incomplete': 0,
+            counts = {'running': 0, 'done': 0, 'paused': 0, 'limit': 0, 'prepared': 0, 'incomplete': 0,
                       **batch_counts([self._summary(path) for path in jobs])}
             name = 'Original batch' if identity == ORIGINAL_BATCH else directory.name
             cards.append({'id': identity, 'name': name, 'label': name,

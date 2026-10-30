@@ -265,6 +265,35 @@ class TimeLimitTests(PausedAuthorCase):
         self.app.resume()
         self.assertEqual(self.app.state["phase"], "running")
 
+    def test_the_job_list_shows_a_stop_at_the_time_limit_apart_from_a_pause(self):
+        from ui import batches
+
+        self.time_limit_pause()
+        self.app.stop_author_reply()
+        manager = object.__new__(server.Server)
+        manager.runs, manager.jobs, manager.jobs_lock = self.runs, {self.run.name: self.app}, threading.RLock()
+        manager.fixed_app = False
+        [row] = manager.job_list()
+        # The list rows carry the cause, so the lists, filters and counts classify it as the job page does.
+        self.assertEqual((row["phase"], row["pauseCause"], batches.job_tone(row)), ("paused", "time-limit", "limit"))
+        self.assertEqual(batches.batch_counts([row]), {"limit": 1})
+        # Used up: the list offers no button; with more time it offers Continue, not Resume.
+        self.assertFalse(row["canContinueStopped"])
+        self.app.set_author_time_limit(3)
+        [row] = manager.job_list()
+        self.assertEqual((row["canContinueStopped"], row["continueStoppedLabel"]), (True, "Continue"))
+        # A pause by the user stays a pause, counted as paused, with Resume.
+        checkpoint = self.checkpoint()
+        checkpoint["pauseCause"] = "user"
+        self.app._save_pause(checkpoint)
+        [row] = manager.job_list()
+        self.assertEqual((row["pauseCause"], batches.job_tone(row), row["continueStoppedLabel"]),
+                         ("user", "paused", "Resume"))
+        self.assertEqual(batches.batch_counts([row]), {"paused": 1})
+        # A job that is not paused names no cause.
+        self.app.state["phase"] = "done"
+        self.assertEqual(manager.job_list()[0]["pauseCause"], "")
+
     def test_a_legacy_time_limit_pause_is_a_time_limit_pause_without_a_summary(self):
         self.error_pause()
         checkpoint = self.checkpoint()

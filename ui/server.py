@@ -8796,7 +8796,9 @@ class Server(ThreadingHTTPServer):
             return None
         if state.get("phase") == "paused" and not (
                 state.get("sessionUnavailable") and state.get("stage") in {"solve", "repair"}):
-            return {"action": "resume", "label": "Resume", "description": "Continue in the same run folder using the saved author session and notebooks."}
+            # A job stopped at its time limit (and since given more) continues; a paused one resumes.
+            return {"action": "resume", "label": "Continue" if state.get("pauseCause") == "time-limit" else "Resume",
+                    "description": "Continue in the same run folder using the saved author session and notebooks."}
         if state.get("phase") == "prepared":
             if state.get("launchHold"):
                 return None
@@ -9203,6 +9205,8 @@ class Server(ThreadingHTTPServer):
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
+            # Why a paused job paused: the lists show a stop at the time limit apart from a pause.
+            job["pauseCause"] = (state.get("pauseCause") or "") if state["phase"] == "paused" else ""
             # The folder batch whose related works the job shares ("" for a job started alone).
             job["folderBatch"] = state.get("folderBatch") or ""
             # Whether the paused author is writing a summary or reply (Resume waits for it).

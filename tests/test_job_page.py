@@ -19,7 +19,10 @@ class JobPageBrowserTests(unittest.TestCase):
         self.run_node(r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
-const renderer = source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'));
+const renderer = source.slice(source.indexOf('function render(next)'), source.indexOf('async function refresh()'))
+  // The status classification render() reads (a stop at the time limit).
+  + source.slice(source.indexOf('// A job the author time limit stopped'),
+    source.indexOf('// A time limit as the server writes it (hours_text)'));
 const setup = `
 let state = {}, previousPhase = 'reviewing', currentJob = 'job-1', reviewPending = false, timer, clock, polls = 0;
 const ui = new Proxy({}, {get(target, name) {return target[name] ||= {

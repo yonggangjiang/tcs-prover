@@ -484,11 +484,24 @@ state.phase = 'paused'; state.activeNode = 'author'; state.stage = 'solve';
 state.pauseCause = 'time-limit'; state.thinkingHours = 2;
 state.timeLimitHistory = [{event: 'reached', time: 't', hours: 0.003, elapsedSeconds: 13}];
 renderWorkflow();
-assert.match(text(row('author')), /Paused here Time limit reached \(0.003 hours\)/);
-assert(!/Paused here.*Paused /.test(text(row('author'))));
+// A stop at the time limit is no pause: "Stopped here", and it can continue.
+assert.match(text(row('author')), /Stopped here Time limit reached \(0.003 hours\); you can continue/);
+assert(!/Paused/.test(text(row('author'))));
+// Its step has the clock (drawn by the stylesheet) and its own mark, not the pause bars.
+assert.equal(row('author').className, 'workflow-node limit');
+assert.equal(row('author').querySelector('.node-dot').textContent, '');
+assert(row('author').querySelector('.node-position').className.split(' ').includes('limit'));
+// While the automatic progress summary is written, the mark says so (Continue waits for it).
+state.conversation = {items: [{kind: 'summary', origin: 'time-limit', status: 'running'}]};
+renderWorkflow();
+assert.match(text(row('author')), /Stopped here Time limit reached \(0.003 hours\) · writing progress summary/);
+delete state.conversation;
 state.pauseCause = 'user';
 renderWorkflow();
 assert.match(text(row('author')), /Paused here Paused by you/);
+assert.equal(row('author').className, 'workflow-node paused');
+assert.equal(row('author').querySelector('.node-dot').textContent, 'Ⅱ');
+assert(row('author').querySelector('.node-position').className.split(' ').includes('paused'));
 state.pauseCause = 'error'; state.error = 'The usage limit is reached.'; state.autoResumeAt = 2e9;
 renderWorkflow();
 assert.match(text(row('author')), /Paused here The usage limit is reached; it retries by itself at /);
@@ -496,7 +509,8 @@ assert.match(text(row('author')), /Paused here The usage limit is reached; it re
 state.readOnly = true; state.error = ''; state.autoResumeAt = 0;
 state.pauseCause = 'time-limit';
 renderWorkflow();
-assert.match(text(row('author')), /Paused here Time limit reached \(0.003 hours\)/);
+assert.match(text(row('author')), /Stopped here Time limit reached \(0.003 hours\) /);
+assert(!/continue|Paused/.test(text(row('author'))));
 state.pauseCause = '';
 renderWorkflow();
 assert.match(text(row('author')), /Paused here The work so far is saved/);

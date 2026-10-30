@@ -1049,8 +1049,10 @@ reviewer, Proof author, Independent critic, Convention critic, and Writing &
 polishing (LaTeX editor, Compile PDF). A stage not selected for the run is muted
 and says **Not selected for this run**, and the routes only it uses are muted
 too; the convention critic belongs to the critic stage. One mark shows where the
-run is: **Now** with the step that works, **Paused here** with the cause (the
-time limit, a pause by you, or an error and when it retries), **Waiting here** or
+run is: **Now** with the step that works, **Paused here** with the cause (a pause
+by you, a restart, or an error and when it retries), **Stopped here** at the time
+limit (*Time limit reached (29.8 hours); you can continue*, or *· writing progress
+summary* while that summary is written), **Waiting here** or
 **Starts here** before the run continues, and **Ended here** with the reason (for
 example *Accepted by the critic; writing not selected*, on the convention critic
 that checked the accepted proof last, *Stopped by you*, or the error). While the
@@ -1070,7 +1072,8 @@ job from before the convention critic it says *Not run (older job)*. The server 
 depend on the page's window of recent events. The mark is always on a selected
 step: a job prepared with only the critic starts at the critic, and a job stopped
 while its PDF compiled ended at **Compile PDF**. A paused job of a saved
-(read-only) batch states its cause too, and offers no Resume. While the job
+(read-only) batch, or one stopped at its time limit, states its cause too, and
+offers no Resume or Continue. While the job
 works, the status card also says when the last event arrived (*Last activity 2m
 05s ago*) and, while something waits to retry, what waits and since when it
 retries: a failed model call (*Waiting to retry a failed model call (retries
@@ -1097,7 +1100,13 @@ needs-revision jobs. The sidebar's batch counts, the overview's batch cards and
 its **Complete** total use the same classification (the server counts each
 batch's finished jobs as complete or incomplete): only complete jobs get the
 check mark and the green part of a batch's meter, and incomplete ones are
-counted with a cross.
+counted with a cross. A job stopped at its time limit is never shown or counted
+as paused: everywhere (the job header, the status in the top bar, the batch
+list with its own **Time limit** filter, the overview's **Time limit reached**
+total, the batch rows, the sidebar counts and the header lines, also for saved
+batches) it reads **Time limit reached**, with a clock, in a muted grey, and
+you can raise the limit and **Continue** it. **Paused** (with the pause bars)
+means a pause by you, a restart, an interruption or a pause after a failure.
 After a server interruption, an unfinished author is restored as **Paused** and
 continues its saved conversation in the same workspace, with its time budget,
 about a minute after the start; **Keep paused** cancels that, and **Resume**
@@ -1228,9 +1237,9 @@ The job page shows the limit beside **Stop** (**No time limit** or **Time limit:
 N hours**; a limit under 0.01 hours keeps its digits, such as 0.003 hours). **Run
 settings** state it too (for example *0.003 hours (11 s)*), with its history: the
 limit the job started with when it is known, every change with its time, every
-pause at the limit, the progress summary written there, and the Resume after it.
-Each pause at the limit also stays stated under the job title, also after the job
-finished, for example *Paused at the time limit (0.003 hours) at 01:09:29 ·
+stop at the limit, the progress summary written there, and the Continue after it.
+Each stop at the limit also stays stated under the job title, also after the job
+finished, for example *Stopped at the time limit (0.003 hours) at 01:09:29 ·
 progress summary written · resumed at 03:50:06 with no limit*. The server keeps
 this history with the job's settings and rebuilds it from the transcript after a
 restart. Open the control to change the limit while the job is reviewing, prepared,
@@ -1243,8 +1252,12 @@ author then stops at its next step (within the 30-second grace, or before its
 next turn while the critic or LaTeX steps run, which still finish) and the job
 pauses at the time limit.
 
-When the limit is reached, the job pauses (**Author stopping**, then **Time
-limit reached**) and never resumes by itself. The author then writes a progress
+When the limit is reached, the job stops (**Author stopping**, then **Time
+limit reached**) and never continues by itself. It is not shown as paused: its
+header reads *Proof author · time limit reached*, the process line *Stopped at
+the time limit · saved conversation* (*Time limit reached · writing progress
+summary* while the summary below is written), and the workflow sidebar
+**Stopped here**. The author then writes a progress
 summary in its own saved conversation (when that conversation can be reopened;
 otherwise the job page says why), without continuing the proof work: what
 it has proved, with precise statements and where they are written, what remains
@@ -1255,14 +1268,14 @@ at the time limit** above it scrolls back to that summary. A live run also saves
 newest one as `progress-summary.md` in its run folder (a web-cutoff run keeps it
 on the job page only). The time limit control opens by itself, once per run; if
 the critic rejected the latest proof and the author has not seen that report
-yet, the page says so, and the author receives it when the run resumes.
+yet, the page says so, and the author receives it when the run continues.
 
-To continue, raise the limit (or set 0 for no limit), then **Resume**: either
-**Set limit** first, or type the new limit and click **Resume**, which sets it
-first and resumes once the server has it. While less than a minute of the limit
-remains it is used up: **Resume** then opens the limit control with the reason
+To continue, raise the limit (or set 0 for no limit), then **Continue**: either
+**Set limit** first, or type the new limit and click **Continue**, which sets it
+first and continues once the server has it. While less than a minute of the limit
+remains it is used up: **Continue** then opens the limit control with the reason
 instead (the server refuses such a resume too), the header's time limit reads
-for example **2h · used up**, and the job list offers no Resume button for that
+for example **2h · used up**, and the job list offers no Continue button for that
 job, so open it to raise the limit. A terminal run that reaches its limit waits
 for the summary, prints it after `Progress summary:` (or why it could not be
 written, after `Progress summary failed:`), and ends as before with
@@ -1272,7 +1285,8 @@ conversation (exit status 1).
 ### Talking to a paused author
 
 While a run is paused at the proof author, the box under the job's status asks
-the paused author (**Ask the paused author**): **Send** sends a message of 1 to
+the paused author (**Ask the paused author**; **Ask the author** when it stopped at
+its time limit): **Send** sends a message of 1 to
 12,000 characters, and **Summarize progress** asks for a progress summary. The
 author answers in its own saved Codex thread or Claude session, so it remembers
 the exchange when the run resumes; the work itself continues only on **Resume**.

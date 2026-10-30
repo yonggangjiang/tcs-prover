@@ -361,9 +361,10 @@ const [entry] = ui.authorConversationList.children;
 assert.equal(entry.dataset.status, 'answered');
 assert.match(entry.children[0].textContent, /^Progress summary at the time limit · .+$/);
 assert.equal(entry.children[1].textContent, snapshot.conversation.items[0].reply);
-// The paused box asks the author; Resume waits for a higher limit.
+// The box asks the author stopped at its time limit; Continue waits for a higher limit.
 assert.equal(ui.authorSteerControl.hidden, false);
-assert.equal(ui.authorSteerLabel.textContent, 'Ask the paused author');
+assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
+assert.equal(ui.resume.textContent, 'Continue');
 assert.equal(ui.requestSummary.hidden, false);
 assert.equal(ui.resume.disabled, false);
 // The batch's related work, linked into this job, and where works for the whole folder run go.
@@ -388,7 +389,7 @@ assert.equal(ui.relatedWorksActions.hidden, false);
 currentJob = snapshot.runId;
 render(snapshot);
 assert.equal(ui.runTitle.textContent, 'Time limit reached');
-assert.match(ui.runDescription.textContent, /^The time limit is now 3 hours \(.+ left\)\. Resume to continue\.$/);
+assert.match(ui.runDescription.textContent, /^The time limit is now 3 hours \(.+ left\)\. Choose Continue to go on\.$/);
 assert.equal(ui.resume.disabled, true);
 assert.equal(ui.resume.title, 'The author is replying. Wait for the reply or stop it.');
 assert.equal(ui.stopReply.hidden, false);

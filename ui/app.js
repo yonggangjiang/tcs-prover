@@ -395,12 +395,13 @@ function renderBatches(batches) {
     copy.append(title, count);
     const progress = document.createElement("p"); progress.className = "batch-progress";
     // Work that needs the user comes first; transient phases count as running.
-    // Queued jobs are prepared jobs that wait for a running slot. Finished jobs count as complete
-    // ("done": a successful outcome) or incomplete, as the batch page's Complete and Incomplete filters do.
+    // Queued jobs are prepared jobs that wait for a running slot. Jobs stopped at their time limit
+    // ("limit") are counted apart from paused ones. Finished jobs count as complete ("done": a successful
+    // outcome) or incomplete, as the batch page's Complete and Incomplete filters do.
     const counts = batch.counts || {}, queued = Number(batch.queued || 0);
     for (const [key, label] of [["reviewed", "awaiting approval"], ["prepared", "ready to start"],
-      ["queued", "queued"], ["paused", "paused"], ["running", "running"], ["done", "complete"],
-      ["incomplete", "incomplete"]]) {
+      ["queued", "queued"], ["paused", "paused"], ["limit", "time limit reached"], ["running", "running"],
+      ["done", "complete"], ["incomplete", "incomplete"]]) {
       const value = key === "queued" ? queued : Number(counts[key] || 0) - (key === "prepared" ? queued : 0)
         + (key === "running" ? Number(counts.reviewing || 0) + Number(counts.pausing || 0) + Number(counts.stopping || 0) : 0);
       if (!value) continue;
@@ -673,13 +674,14 @@ function renderJobs(jobs) {
   ui.jobsList.replaceChildren();
   const tally = {};
   for (const job of jobs) {
+    // A job stopped at its time limit is counted apart from paused ones (see jobTone).
     const key = ["reviewing", "pausing", "stopping"].includes(job.phase) ? "running"
-      : job.phase === "prepared" && job.launchQueued ? "queued" : job.phase;
+      : job.phase === "prepared" && job.launchQueued ? "queued" : timeLimitStopped(job) ? "limit" : job.phase;
     tally[key] = (tally[key] || 0) + 1;
   }
   ui.jobsCount.textContent = [`${jobs.length} ${jobs.length === 1 ? "problem" : "problems"}`,
     ...[["reviewed", "awaiting approval"], ["prepared", "ready to start"], ["queued", "queued"], ["paused", "paused"],
-      ["running", "running"], ["done", "finished"]]
+      ["limit", "time limit reached"], ["running", "running"], ["done", "finished"]]
       .filter(([key]) => tally[key]).map(([key, label]) => `${tally[key]} ${label}`)].join(" · ");
   const stoppedStages = { review: "statement review", solve: "proof author", repair: "proof author",
     critic: "critic", final: "LaTeX editor", failure: "failure summary" };
@@ -704,7 +706,8 @@ function renderJobs(jobs) {
     status.className = `job-status ${job.phase} tone-${tone}`;
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
-      running: "Running", stopping: "Stopping", pausing: "Pausing", paused: "Paused", done: outcome,
+      running: "Running", stopping: "Stopping", pausing: "Pausing", done: outcome,
+      paused: timeLimitStopped(job) ? "Time limit reached" : "Paused",
       prepared: queued ? "Queued" : "Ready to start",
     };
     // A job that is stopping says so, as its page does, until it has stopped.
@@ -736,7 +739,8 @@ function renderJobs(jobs) {
     copy.append(times);
     if (job.phase === "running" && job.stageLabel && !job.launchHold) status.textContent = `Running · ${job.stageLabel}`;
     if (attention) status.textContent += ` · ${attention.title}`;
-    if (job.error && !job.manuallyStopped && job.error !== attention?.text) {
+    // A stop at the time limit is no failure: its status says it, without the checkpoint's error line.
+    if (job.error && !job.manuallyStopped && !timeLimitStopped(job) && job.error !== attention?.text) {
       const reason = document.createElement("small");
       reason.className = "job-error";
       reason.textContent = job.error;
@@ -1769,11 +1773,13 @@ function completedRunOutcome(job) {
 }
 
 // One status classification for every list, filter and count and for the job page: "running",
-// "paused", "queued" (waiting for a running slot, not for you), "waiting" (for you), or a finished
-// job's tone (see completedRunOutcome).
+// "paused" (by you, a restart, an interruption, a failure, ...), "limit" (stopped at the author time
+// limit: "Time limit reached", never counted as paused; raising the limit lets it continue), "queued"
+// (waiting for a running slot, not for you), "waiting" (for you), or a finished job's tone (see
+// completedRunOutcome).
 function jobTone(job) {
   if (["reviewing", "running", "stopping", "pausing"].includes(job.phase)) return "running";
-  if (job.phase === "paused") return "paused";
+  if (job.phase === "paused") return timeLimitStopped(job) ? "limit" : "paused";
   if (job.phase === "prepared" && job.launchQueued) return "queued";
   if (["reviewed", "prepared"].includes(job.phase)) return "waiting";
   if (job.phase !== "done") return job.manuallyStopped ? "stopped" : "failed";
@@ -1796,6 +1802,18 @@ function railNode(node, stages) {
 function retryWaitText(retry) {
   return retry?.kind === "command" ? "a command that could not run"
     : retry?.kind === "storage" ? "saving a file" : "a failed model call";
+}
+
+// A job the author time limit stopped (its checkpoint's pause cause): every list, count and the job
+// page say "Time limit reached", with a clock, and never call it paused (see jobTone).
+function timeLimitStopped(job) {
+  return job?.phase === "paused" && job.pauseCause === "time-limit";
+}
+
+// Whether the stopped author's automatic progress summary at the time limit is queued or being written.
+function limitSummaryWriting(job) {
+  return (Array.isArray(job?.conversation?.items) ? job.conversation.items : []).some((item) => item.kind === "summary"
+    && item.origin === "time-limit" && ["queued", "running"].includes(item.status));
 }
 
 // A time limit as the server writes it (hours_text): "1 hour", "1.5 hours", "1,000 hours"; a limit
@@ -1863,7 +1881,7 @@ function timeLimitHistoryLines(history = timeLimitHistory()) {
     ? [`${localDateTime(state.startedAt)} · Started with ${limitSettingText(history[0].hours)}`] : [];
   return [...start, ...history.map((item) => `${localDateTime(item.time)} · ${
     item.event === "set" ? `Changed to ${item.hours > 0 ? limitSettingText(item.hours) : "no time limit"}`
-    : item.event === "reached" ? `Paused at the time limit (${hoursText(item.hours)}) after `
+    : item.event === "reached" ? `Stopped at the time limit (${hoursText(item.hours)}) after `
       + `${spanText(item.elapsedSeconds)} of active work`
     : item.event === "summary" ? "Progress summary written"
     : `Resumed ${item.hours > 0 ? `with a limit of ${limitSettingText(item.hours)}` : "with no time limit"}`}`)];
@@ -1874,7 +1892,7 @@ function timeLimitHistoryLines(history = timeLimitHistory()) {
 function timeLimitPauseNotes(history = timeLimitHistory()) {
   const notes = [];
   for (const item of history) {
-    if (item.event === "reached") notes.push(`Paused at the time limit (${hoursText(item.hours)}) at ${clockText(item.time)}`);
+    if (item.event === "reached") notes.push(`Stopped at the time limit (${hoursText(item.hours)}) at ${clockText(item.time)}`);
     else if (notes.length && item.event === "summary") notes[notes.length - 1] += " · progress summary written";
     else if (notes.length && item.event === "resumed") {
       notes[notes.length - 1] += ` · resumed at ${clockText(item.time)} with `
@@ -1959,21 +1977,26 @@ function renderRunOverview() {
   ui.runProblemTitle.title = title;
   const reviewCycles = criticReviewModel().cycles;
   const latestCycle = reviewCycles.at(-1);
+  // A job stopped at its time limit is not paused: it says "time limit reached" (see jobTone).
+  const limitStop = timeLimitStopped(state);
   ui.runStage.textContent = state.phase === "reviewed" ? "Waiting for approval"
     : state.phase === "prepared" ? (state.launchHold ? "Awaiting review" : "Ready to start")
     : state.phase === "done" ? completedRunLabel(state)
     : `${state.workflow?.nodes?.[state.activeNode]?.label || state.stage || "Starting"}`
-      + (["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
+      + (limitStop ? " · time limit reached" : ["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
       + (state.activeNode === "critic" && latestCycle ? ` · cycle ${reviewCycles.length} · round ${criticRoundNumber(latestCycle)}` : "");
   const seconds = runElapsedSeconds(), hours = Number(state.thinkingHours ?? 0), limit = hours * 3600;
   ui.runActiveTime.textContent = durationText(seconds);
   ui.runBudget.textContent = hours === 0 ? "Unlimited" : state.timeLimitExhausted ? `${hours}h · used up`
     : `${hours}h · ${durationText(Math.max(0, limit - seconds))} left`;
+  const halted = limitStop ? "Stopped at the time limit" : "Paused";
   ui.runHealth.textContent = state.processAlive == null && state.workerActive == null ? "Unknown · telemetry unavailable"
-    : state.processAlive ? (state.phase === "paused" ? "Paused · author replying" : "Running")
+    // The automatic progress summary at the time limit, queued or being written.
+    : limitStop && limitSummaryWriting(state) && !state.readOnly ? "Time limit reached · writing progress summary"
+    : state.processAlive ? (state.phase === "paused" ? `${halted} · author replying` : "Running")
     : state.workerActive ? "Starting / closing"
     : state.runningElsewhere ? "Running in another process"
-    : state.phase === "paused" ? "Paused · saved conversation"
+    : state.phase === "paused" ? `${halted} · saved conversation`
     : ["reviewed", "prepared"].includes(state.phase) ? "Waiting for you" : "No active process";
   const nextSteps = {
     review: "After review, approve the checked statement to continue the selected stages.",
@@ -2956,6 +2979,8 @@ function renderWorkflow() {
     const unselected = offStage(name);
     const current = activeStep === name;
     const paused = current && ["paused", "pausing"].includes(state.phase);
+    // A stop at the time limit is no pause: its step gets the clock (see jobTone).
+    const limitStop = current && timeLimitStopped(state);
     const active = ["running", "reviewing", "stopping"].includes(state.phase) && current;
     const failed = state.phase === "done" && current
       && (state.error || name === "failure_summary");
@@ -2963,14 +2988,15 @@ function renderWorkflow() {
       ? verdict === "reject" ? "rejected" : criticApproved ? "complete"
         : latestCritic || seen.has(name) ? "reviewed" : ""
       : seen.has(name) ? "complete" : "";
-    const status = overrides.status ?? (paused ? "paused" : active ? "active" : failed ? "failed"
+    const status = overrides.status ?? (limitStop ? "limit" : paused ? "paused" : active ? "active" : failed ? "failed"
       : (unselected || name === "convention" && conventionPredatesJob) && !seen.has(name) ? "disabled" : settled);
     row.className = `workflow-node ${status}`;
     row.dataset.node = name;
     if (status === "active") row.setAttribute("aria-current", "step");
     const dot = document.createElement("span");
     dot.className = "node-dot";
-    dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ"
+    // The time limit's clock is drawn by the stylesheet.
+    dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ" : status === "limit" ? ""
       : status === "rejected" ? "×" : status === "reviewed" ? "·"
       : status === "complete" ? "✓" : status === "disabled" ? "–" : number;
     const copy = document.createElement("div");
@@ -2979,7 +3005,8 @@ function renderWorkflow() {
     title.textContent = item.label;
     copy.append(title);
     if (position?.node === name) {
-      // "Now", "Paused here", "Ended here" or where it waits, with the step or the reason.
+      // "Now", "Paused here", "Stopped here" (at the time limit), "Ended here" or where it waits, with the
+      // step or the reason.
       const mark = document.createElement("span"), tag = document.createElement("span");
       const reason = document.createElement("span");
       mark.className = `node-position ${position.kind}`;
@@ -3002,8 +3029,9 @@ function renderWorkflow() {
     };
     description.textContent = descriptions[name] || item.description;
     copy.append(description);
-    // The position mark says "Paused here" on the paused step.
-    let noteText = overrides.note || (paused && position?.node !== name ? "Paused" : "");
+    // The position mark says "Paused here" on the paused step ("Stopped here" at the time limit).
+    let noteText = overrides.note || (paused && position?.node !== name
+      ? (limitStop ? "Stopped at the time limit" : "Paused") : "");
     if (name === "author" && authorRepairing && current
         && ["running", "pausing", "paused", "stopping"].includes(state.phase)) {
       noteText = noteText ? `${noteText} · repairing critic objections` : "Repairing critic objections";
@@ -3176,7 +3204,8 @@ function renderWorkflow() {
 }
 
 // Where the run stands on the workflow rail: the step working now, the step it waits or is paused at,
-// or the step it ended at, with the reason in plain words. {node, kind, label, text}, or null.
+// the step the time limit stopped it at, or the step it ended at, with the reason in plain words.
+// {node, kind, label, text}, or null.
 function workflowPosition(stages, authorRepairing = false) {
   // Never a step this run did not select (see railNode).
   const current = railNode(state.activeNode, stages);
@@ -3186,6 +3215,7 @@ function workflowPosition(stages, authorRepairing = false) {
     const outcome = completedRunOutcome(state);
     return at(railNode(outcome.node, stages) || current, "ended", "Ended here", outcome.ended);
   }
+  if (timeLimitStopped(state)) return at(current, "limit", "Stopped here", pauseCauseText());
   if (state.phase === "paused") return at(current, "paused", "Paused here", pauseCauseText());
   if (["reviewing", "running", "stopping", "pausing"].includes(state.phase)) {
     const node = current || (state.phase === "reviewing" ? "statement_reviewer" : "");
@@ -3260,7 +3290,7 @@ function criticStepText() {
   return `${names} working${finished.length ? ` · ${finished.length} of ${of} finished${early}` : ""}`;
 }
 
-// Why a paused job stopped where it did, in plain words.
+// Why a paused job (or one stopped at its time limit) stopped where it did, in plain words.
 function pauseCauseText() {
   const retry = state.autoResumeAt > 0
     ? `; it retries by itself at ${new Date(state.autoResumeAt * 1000).toLocaleTimeString()}` : "";
@@ -3268,7 +3298,9 @@ function pauseCauseText() {
   if (state.pauseCause === "time-limit") {
     const reached = (Array.isArray(state.timeLimitHistory) ? state.timeLimitHistory : [])
       .findLast(item => item.event === "reached");
-    return `Time limit reached (${hoursText(Number(reached?.hours ?? state.thinkingHours ?? 0))})`;
+    // Continue waits for the automatic progress summary; a saved batch's job is read only.
+    return `Time limit reached (${hoursText(Number(reached?.hours ?? state.thinkingHours ?? 0))})`
+      + (state.readOnly ? "" : limitSummaryWriting(state) ? " · writing progress summary" : "; you can continue");
   }
   if (state.pauseCause === "user") return "Paused by you";
   if (state.pauseCause === "interrupted") return `The run process ended part-way${retry}`;
@@ -3328,7 +3360,8 @@ function renderAuthorLimitHint() {
   const below = hours > 0 && hours * 3600 <= active;
   const text = `Active time so far: ${durationText(active)}.`
     + (below && ["running", "pausing"].includes(state.phase) ? " A limit at or below this stops the author at its next step."
-      : below && state.phase === "paused" ? " Set more than this, or 0 for no limit, to resume." : "");
+      : below && state.phase === "paused"
+        ? ` Set more than this, or 0 for no limit, to ${state.pauseCause === "time-limit" ? "continue" : "resume"}.` : "");
   if (ui.authorLimitHint.textContent !== text) ui.authorLimitHint.textContent = text;
   ui.authorLimitHours.dataset.elapsed = String(Math.floor(active));
   ui.authorLimitHours.dataset.running = state.phase === "running" ? "1" : "";
@@ -3488,16 +3521,19 @@ function render(next) {
 
   const node = state.workflow?.nodes?.[state.activeNode] || {};
   const done = phase === "done";
+  // A stop at the time limit is not a pause: it says so everywhere, and a higher limit lets the author
+  // continue (see jobTone).
+  const timeLimitPause = timeLimitStopped(state);
   ui.liveDot.classList.toggle("active", working);
   ui.globalStatus.textContent = phase === "input" ? "Ready"
-    : phase === "prepared" ? "Ready to start" : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
+    : phase === "prepared" ? "Ready to start" : timeLimitPause ? "Time limit reached"
+    : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
     : phase === "reviewed" ? "Waiting for approval"
       : phase === "stopping" ? "Stopping"
         : done ? completedRunLabel(state) : (node.label || "Model is working");
-  ui.runLabel.textContent = phase === "prepared" ? "PREPARED RUN" : phase === "paused" ? "RUN PAUSED"
+  ui.runLabel.textContent = phase === "prepared" ? "PREPARED RUN" : timeLimitPause ? "TIME LIMIT REACHED"
+    : phase === "paused" ? "RUN PAUSED"
     : done ? completedRunLabel(state).toUpperCase() : (node.short_label || "MODEL");
-  // A pause at the time limit says so: only a higher limit lets the author continue.
-  const timeLimitPause = phase === "paused" && state.pauseCause === "time-limit";
   // A short status title; the error, when there is one, is the description below it.
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
     : phase === "prepared" ? "Prepared research workspace"
@@ -3544,7 +3580,7 @@ function render(next) {
   const canTalk = phase === "paused" && Boolean(conversation.available) && !state.readOnly;
 
   show(ui.authorSteerControl, authorRunning || canTalk);
-  renderAuthorSteerMode(canTalk);
+  renderAuthorSteerMode(canTalk && (timeLimitPause ? "limit" : "paused"));
   ui.sendAuthorSteer.disabled = !(authorRunning || (canTalk && !replying));
   show(ui.requestSummary, canTalk && !replying);
   show(ui.stopReply, replying && !state.readOnly);
@@ -3572,7 +3608,9 @@ function render(next) {
   ui.pause.title = retryPending ? "Cancel automatic retries"
     : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
-  ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run" : "Resume";
+  // After a stop at the time limit the work continues (raising the limit first); a pause resumes.
+  ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run"
+    : timeLimitPause ? "Continue" : "Resume";
   ui.resume.disabled = Boolean(state.launchHold) || replying;
   ui.resume.title = replying ? "The author is replying. Wait for the reply or stop it." : "";
   show(ui.downloadTex, Boolean(state.canDownloadTex));
@@ -3598,7 +3636,7 @@ function render(next) {
     ui.proposed.readOnly = true;
     // Saved batches cannot resume; do not promise an action that is not offered.
     if (phase === "paused") {
-      ui.runTitle.textContent = "Paused";
+      ui.runTitle.textContent = timeLimitPause ? "Time limit reached" : "Paused";
       ui.runDescription.textContent = state.error || "";
     }
     // Another process owns the run: say so instead of offering its controls.
@@ -3643,26 +3681,29 @@ function limitHoursText(hours) {
   return hoursText(hours);
 }
 
-// The now-card at a time-limit pause: why it stopped, any summary being written, and what to do.
+// The now-card at a time-limit pause (a stop at the time limit): why it stopped, any summary being written, and
+// what to do.
 function timeLimitDescription() {
   const hours = Number(state.thinkingHours ?? 0), active = runElapsedSeconds();
   const summarizing = (state.conversation?.items || [])
     .some((item) => item.kind === "summary" && ["queued", "running"].includes(item.status));
   const text = state.timeLimitExhausted
     ? `The proof author reached the time limit of ${limitHoursText(hours)} after ${durationText(active)} of active `
-      + `work and is paused.${summarizing ? " It is writing a progress summary below." : ""} Raise the time limit to continue.`
-    : hours === 0 ? "The time limit is now off. Resume to continue."
+      + `work and stopped.${summarizing ? " It is writing a progress summary below." : ""} Raise the time limit to continue.`
+    : hours === 0 ? "The time limit is now off. Choose Continue to go on."
     : `The time limit is now ${limitHoursText(hours)} (${durationText(Math.max(0, hours * 3600 - active))} left). `
-      + "Resume to continue.";
+      + "Choose Continue to go on.";
   return text + (state.criticFeedbackPending
-    ? " The critic rejected the latest proof; the author receives its report when the run resumes." : "");
+    ? " The critic rejected the latest proof; the author receives its report when the run continues." : "");
 }
 
-// The steer box guides the running author, or asks the paused one (texts change with the mode only).
+// The steer box guides the running author, or asks the paused one, or the one stopped at its time limit
+// ("paused", "limit"; false while it runs). The texts change with the mode only.
 function renderAuthorSteerMode(paused) {
   if (paused === authorSteerPaused) return;
   authorSteerPaused = paused;
-  ui.authorSteerLabel.textContent = paused ? "Ask the paused author" : "Guide the running proof author";
+  ui.authorSteerLabel.textContent = paused === "limit" ? "Ask the author" : paused ? "Ask the paused author"
+    : "Guide the running proof author";
   ui.authorSteerInstruction.placeholder = paused ? "For example: which step in the summary is the main obstacle?"
     : "For example: try a potential-function argument before the case analysis.";
   ui.sendAuthorSteerText.textContent = paused ? "Send" : "Send instruction now";
@@ -4807,7 +4848,7 @@ ui.resume.onclick = async () => {
     ui.authorTimeLimitControl.open = true;
     ui.authorLimitHours.focus();
     ui.notice.textContent = `The time limit is used up (${durationText(runElapsedSeconds())} of `
-      + `${limitHoursText(Number(state.thinkingHours ?? 0))}). Raise it, or set 0 for no limit, then resume.`;
+      + `${limitHoursText(Number(state.thinkingHours ?? 0))}). Raise it, or set 0 for no limit, then choose Continue.`;
     show(ui.notice, true);
     return;
   }
@@ -5900,6 +5941,7 @@ renderApiForm();
   }
   // Finished jobs count as complete ("done": a successful outcome, with the check mark) or
   // incomplete (failed, stopped or interrupted), as on the batch page; the server classifies them.
+  // Jobs stopped at their time limit ("limit", with the clock) are never counted as paused.
   function tally(batch) {
     const counts = batch.counts || {};
     const count = (key) => Number(counts[key] || 0);
@@ -5907,13 +5949,14 @@ renderApiForm();
       running: count("running") + count("reviewing") + count("pausing") + count("stopping"),
       waiting: count("reviewed") + count("prepared") - Number(batch.queued || 0),
       paused: count("paused"),
+      limit: count("limit"),
       done: count("done"),
       incomplete: count("incomplete"),
       total: Number(batch.jobCount || 0),
     };
   }
-  const toneWords = { running: "running", waiting: "need you", paused: "paused", done: "complete",
-    incomplete: "incomplete" };
+  const toneWords = { running: "running", waiting: "need you", paused: "paused", limit: "time limit reached",
+    done: "complete", incomplete: "incomplete" };
   const toneText = (key, count) => `${count} ${key === "waiting" && count === 1 ? "needs you" : toneWords[key]}`;
 
   function setText(node, text) {
@@ -5984,7 +6027,8 @@ renderApiForm();
         segment.style.flexGrow = String(counts[key]);
         meter.append(segment);
       }
-      const other = counts.total - counts.running - counts.waiting - counts.paused - counts.done - counts.incomplete;
+      const other = counts.total - counts.running - counts.waiting - counts.paused - counts.limit - counts.done
+        - counts.incomplete;
       if (other > 0) {
         const segment = element("i", "other");
         segment.style.flexGrow = String(other);
@@ -5999,7 +6043,7 @@ renderApiForm();
   }
 
   function renderTotals(batches) {
-    const sum = { running: 0, waiting: 0, paused: 0, done: 0, incomplete: 0, total: 0 };
+    const sum = { running: 0, waiting: 0, paused: 0, limit: 0, done: 0, incomplete: 0, total: 0 };
     for (const batch of batches) {
       const counts = tally(batch);
       for (const key of Object.keys(sum)) sum[key] += counts[key];
@@ -6012,7 +6056,7 @@ renderApiForm();
         .filter(Boolean).join(" · ")
       : "Local workbench · idle");
     shell.foot.dataset.state = sum.running ? "running" : sum.waiting ? "waiting" : "idle";
-    // Overview: the meta line and the four totals.
+    // Overview: the meta line and the five totals.
     const meta = [element("span", "", `${batches.length} ${batches.length === 1 ? "batch" : "batches"}`),
       element("span", "", `${sum.total} ${sum.total === 1 ? "problem" : "problems"}`)];
     for (const key of Object.keys(toneWords)) {
@@ -6023,7 +6067,7 @@ renderApiForm();
       shell.overviewMeta.dataset.key = metaKey;
       shell.overviewMeta.replaceChildren(...meta);
     }
-    for (const key of ["running", "waiting", "paused", "done"]) {
+    for (const key of ["running", "waiting", "paused", "limit", "done"]) {
       const value = shell.overviewStats.querySelector(`[data-stat="${key}"]`);
       if (!value) continue;
       setText(value, String(sum[key]));
@@ -6056,7 +6100,8 @@ renderApiForm();
   }
 
   // Batch page: show one status at a time; the counts follow the rows app.js renders.
-  const filterTones = { running: ["running"], waiting: ["waiting"], paused: ["paused"], done: ["done"], failed: ["failed", "stopped"] };
+  const filterTones = { running: ["running"], waiting: ["waiting"], paused: ["paused"], limit: ["limit"], done: ["done"],
+    failed: ["failed", "stopped"] };
   let filterBatch = null;
   function renderFilter() {
     if (filterBatch !== currentBatch) {

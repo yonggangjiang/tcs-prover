@@ -605,7 +605,9 @@ function load() {
   const slice = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
   const code = slice('function retrievalConfiguration(', 'function renderJobs(')
     + slice('function selectedWorkflowStages(', 'const promptLabels =')
-    + slice('function render(next)', 'async function refresh()');
+    + slice('function render(next)', 'async function refresh()')
+    // The status classification render() reads (a stop at the time limit).
+    + slice('// A job the author time limit stopped', '// A time limit as the server writes it (hours_text)');
   const handlers = slice('for (const role of ["review", "author", "critic", "writer"]) {', 'ui.speedMode.onchange');
   const setup = `
     let state = {workflow: null, trace: []}, previousPhase = '', currentJob = '', reviewPending = false, timer, clock;

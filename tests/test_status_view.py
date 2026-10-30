@@ -169,7 +169,9 @@ const finishedJobs = [
 const liveJobs = [
   [{phase: 'running'}, 'running'], [{phase: 'reviewing'}, 'running'], [{phase: 'pausing'}, 'running'],
   [{phase: 'stopping'}, 'running'], [{phase: 'stopping', manuallyStopped: true, stoppedStage: 'critic'}, 'running'],
-  [{phase: 'paused'}, 'paused'], [{phase: 'reviewed'}, 'waiting'],
+  [{phase: 'paused'}, 'paused'], [{phase: 'paused', pauseCause: 'user'}, 'paused'],
+  [{phase: 'paused', pauseCause: 'restart'}, 'paused'], [{phase: 'paused', pauseCause: 'time-limit'}, 'limit'],
+  [{phase: 'reviewed'}, 'waiting'],
   [{phase: 'prepared'}, 'waiting'], [{phase: 'prepared', launchQueued: true}, 'queued'],
 ];
 """
@@ -314,13 +316,13 @@ state = job({resultKind: 'final', canDownloadTex: true, thinkingHours: 0, starte
   workflowStages: stages(false, true, true, true), timeLimitHistory: history});
 renderRunOverview();
 assert.equal(ui.runTimeLimitNote.hidden, false);
-assert.equal(ui.runTimeLimitNote.textContent, 'Paused at the time limit (0.003 hours) at 00:09:29 · progress summary '
+assert.equal(ui.runTimeLimitNote.textContent, 'Stopped at the time limit (0.003 hours) at 00:09:29 · progress summary '
   + 'written · resumed at 02:50:06 with no limit');
 assert.equal(row('Author time limit'), 'No time limit');
 const local = value => localDateTime(value);
 assert.deepEqual(row('Time limit history').split('\n'), [
   `${local('2026-10-29T00:05:07+00:00')} · Started with 0.003 hours (11 s)`,
-  `${local('2026-10-29T00:09:29+00:00')} · Paused at the time limit (0.003 hours) after 13 s of active work`,
+  `${local('2026-10-29T00:09:29+00:00')} · Stopped at the time limit (0.003 hours) after 13 s of active work`,
   `${local('2026-10-29T02:48:54+00:00')} · Progress summary written`,
   `${local('2026-10-29T02:50:06+00:00')} · Changed to no time limit`,
   `${local('2026-10-29T02:50:06+00:00')} · Resumed with no time limit`,
@@ -330,8 +332,8 @@ state = job({phase: 'paused', thinkingHours: 0.003, timeLimitHistory: [...histor
   {event: 'reached', time: '2026-10-29T04:00:00+00:00', hours: 0.5, elapsedSeconds: 1800}]});
 renderRunOverview();
 assert.deepEqual(ui.runTimeLimitNote.textContent.split('\n'), [
-  'Paused at the time limit (0.003 hours) at 00:09:29 · progress summary written · resumed at 02:50:06 with no limit',
-  'Paused at the time limit (0.5 hours) at 04:00:00']);
+  'Stopped at the time limit (0.003 hours) at 00:09:29 · progress summary written · resumed at 02:50:06 with no limit',
+  'Stopped at the time limit (0.5 hours) at 04:00:00']);
 assert.equal(row('Author time limit'), '0.003 hours (11 s)');
 // Without a history the note is hidden and Run settings show only the limit; no author, no limit.
 state = job({phase: 'running', thinkingHours: 2, stage: 'solve', activeNode: 'author'});
@@ -623,7 +625,7 @@ const document = {createElement: tag => new Element(tag), createElementNS: (name
   createTextNode: value => Object.assign(new Element('#text'), {textContent: value})};
 const svgNS = 'http://www.w3.org/2000/svg', batchUrl = id => `/?batch=${id}`, liveWords = new Element('span');
 const stats = {};
-for (const key of ['running', 'waiting', 'paused', 'done']) {
+for (const key of ['running', 'waiting', 'paused', 'limit', 'done']) {
   const stat = new Element('div'), value = Object.assign(new Element('strong'), {closest: () => stat});
   stats[`[data-stat="${key}"]`] = value;
 }
@@ -646,7 +648,7 @@ const jobs = [...finishedJobs.map(([job]) => job), ...liveJobs.map(([job]) => jo
 console.log(JSON.stringify(jobs.map(job => [job, jobTone(job)])));
 """)
         classified = json.loads(result.stdout)
-        self.assertEqual(len(classified), 30)
+        self.assertEqual(len(classified), 33)
         for job, tone in classified:
             self.assertEqual(batches.job_tone(job), tone, job)
         # The batch counts hold each job once; a finished job is done (complete) or incomplete.
@@ -741,7 +743,8 @@ class BatchCardCountTests(NoModelCase):
             saved_job(root / "earlier" / name, files=files, records=[AUTHOR_STEP, *records])
         catalog = batches.BatchCatalog(root, current_root=root / "current")
         card = next(card for card in catalog.list_batches() if card["id"] == "earlier")
-        self.assertEqual(card["counts"], {"running": 0, "done": 1, "paused": 0, "prepared": 0, "incomplete": 2})
+        self.assertEqual(card["counts"], {"running": 0, "done": 1, "paused": 0, "limit": 0, "prepared": 0,
+                                          "incomplete": 2})
         jobs = {job["runId"]: job for job in catalog.jobs("earlier")}
         self.assertEqual({name: batches.job_tone(job) for name, job in jobs.items()},
                          {"ok": "done", "failed": "failed", "stopped": "stopped"})
@@ -848,13 +851,226 @@ class ReadOnlyPauseTests(unittest.TestCase):
 const paused = {runId: 'r', phase: 'paused', stage: 'solve', activeNode: 'author', trace: [], traceVersion: 0,
   traceFrom: 0, workflowStages: stages(false, true, true, true), readOnly: true, thinkingHours: 0.003,
   activeElapsedSeconds: 13};
-for (const fields of [{pauseCause: 'time-limit', timeLimitExhausted: true}, {pauseCause: 'user'}, {pauseCause: ''}]) {
+for (const [fields, title] of [[{pauseCause: 'time-limit', timeLimitExhausted: true}, 'Time limit reached'],
+  [{pauseCause: 'user'}, 'Paused'], [{pauseCause: ''}, 'Paused']]) {
   render({...paused, ...fields});
-  assert.equal(ui.runTitle.textContent, 'Paused');
+  assert.equal(ui.runTitle.textContent, title);
   assert.equal(ui.runDescription.textContent, '');
   assert.equal(ui.resume.hidden, true);
   assert.equal(ui.authorTimeLimitControl.hidden, true);
 }
+""")
+
+
+# The batch page's status filter, as the workbench shell renders its segments and counts.
+FILTER = [["  // Batch page: show one status at a time", "  function renderModelsMeta()"]]
+FILTER_SETUP = r"""
+class MutationObserver { observe() {} }
+const route = () => 'batch';
+let currentBatch = 'b';
+const ui = {jobsList: new Element('ol')};
+const buttons = ['all', 'running', 'waiting', 'paused', 'limit', 'done', 'failed'].map(key => {
+  const button = new Element('button'), count = new Element('span');
+  button.dataset.show = key;
+  count.className = 'seg-count';
+  button.append(count);
+  return button;
+});
+const shell = {filter: {querySelectorAll: () => buttons}, filterEmpty: new Element('p')};
+"""
+# A job stopped at its time limit, a user's pause and the pauses of a restart, an interruption and a failure.
+PAUSES = r"""
+const pauses = [['time-limit', 'limit'], ['user', 'paused'], ['restart', 'paused'], ['interrupted', 'paused'],
+  ['error', 'paused'], ['', 'paused']];
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
+class TimeLimitStatusTests(unittest.TestCase):
+    """A job stopped at its time limit reads "Time limit reached" (a clock) everywhere, never as paused."""
+
+    def test_the_classification_puts_a_stop_at_the_time_limit_apart_from_every_pause(self):
+        result = run_node(self, LISTS, LISTS_SETUP, PAUSES + r"""
+for (const [pauseCause, tone] of pauses) {
+  assert.equal(jobTone({phase: 'paused', pauseCause}), tone, pauseCause);
+  assert.equal(timeLimitStopped({phase: 'paused', pauseCause}), tone === 'limit', pauseCause);
+}
+// Only a paused job is stopped at its limit: while it pauses it still works, and a finished job is finished.
+assert.equal(jobTone({phase: 'pausing', pauseCause: 'time-limit'}), 'running');
+assert.equal(timeLimitStopped({phase: 'done', pauseCause: 'time-limit', resultKind: 'final'}), false);
+assert.equal(jobTone({phase: 'done', pauseCause: 'time-limit', resultKind: 'final'}), 'done');
+console.log(JSON.stringify(pauses.map(([pauseCause, tone]) => [{phase: 'paused', pauseCause}, tone])));
+""")
+        # The server classifies and counts the same way (the batch cards and the sidebar read its counts).
+        rows = []
+        for job, tone in json.loads(result.stdout):
+            self.assertEqual(batches.job_tone(job), tone, job)
+            rows.append(job)
+        self.assertEqual(batches.batch_counts(rows + [{"phase": "done", "resultKind": "final"}]),
+                         {"limit": 1, "paused": 5, "done": 1})
+
+    def test_the_batch_list_says_time_limit_reached_and_counts_it_apart(self):
+        run_node(self, LISTS, LISTS_SETUP, r"""
+renderJobs([
+  {runId: 'limit', title: 'L', phase: 'paused', pauseCause: 'time-limit', error: 'Workflow time limit reached.'},
+  {runId: 'user', title: 'U', phase: 'paused', pauseCause: 'user'},
+  {runId: 'restart', title: 'R', phase: 'paused', pauseCause: 'restart', error: 'The server closed.'},
+  {runId: 'done', title: 'D', phase: 'done', resultKind: 'final'}]);
+const [limit, user, restart] = ui.jobsList.children;
+const status = row => row.children[0].children[1];
+const errors = row => row.children[0].children.filter(child => child.className === 'job-error').map(text);
+assert.equal(status(limit).textContent, 'Time limit reached');
+assert.match(limit.className, /(^| )tone-limit( |$)/);
+assert.match(status(limit).className, /(^| )tone-limit( |$)/);
+assert.doesNotMatch(`${limit.className} ${status(limit).className}`, /tone-paused/);
+// A stop at the time limit is no failure: no red error line under it.
+assert.deepEqual(errors(limit), []);
+// Every other pause still reads Paused, with its reason.
+for (const row of [user, restart]) {
+  assert.equal(status(row).textContent, 'Paused');
+  assert.match(row.className, /(^| )tone-paused( |$)/);
+}
+assert.deepEqual(errors(restart), ['The server closed.']);
+assert.equal(ui.jobsCount.textContent, '4 problems · 2 paused · 1 time limit reached · 1 finished');
+// The overview's batch rows: problems by status, the time limit apart from the pauses.
+renderBatches([{id: 'b', label: 'B', readOnly: true, jobCount: 4, counts: {paused: 1, limit: 2, done: 1}}]);
+const progress = ui.batchesList.children[0].children[0].children[2];
+assert.deepEqual(progress.children.map(child => [child.className, child.textContent]),
+  [['paused', '1 paused'], ['limit', '2 time limit reached'], ['done', '1 complete']]);
+""")
+
+    def test_the_time_limit_filter_shows_and_counts_only_those_jobs(self):
+        run_node(self, FILTER, FILTER_SETUP, r"""
+for (const tone of ['limit', 'limit', 'paused', 'done', 'failed']) {
+  ui.jobsList.append(Object.assign(new Element('li'), {className: `job-card tone-${tone}`}));
+}
+ui.jobsList.dataset.signature = 'rows';
+renderFilter();
+const counts = () => buttons.map(button => [button.dataset.show, button.querySelector('.seg-count').textContent]);
+assert.deepEqual(counts(), [['all', '5'], ['running', '0'], ['waiting', '0'], ['paused', '1'], ['limit', '2'],
+  ['done', '1'], ['failed', '1']]);
+shell.filter.onclick({target: {closest: () => buttons[4]}});
+assert.equal(ui.jobsList.dataset.show, 'limit');
+assert.equal(buttons[4].getAttribute('aria-pressed'), 'true');
+assert.equal(buttons[3].getAttribute('aria-pressed'), 'false');
+assert.equal(shell.filterEmpty.hidden, true);
+""")
+        html = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<button type="button" class="seg" data-show="paused" aria-pressed="false">Paused <span '
+                      'class="seg-count" data-count="paused"></span></button>\n              <button type="button" '
+                      'class="seg" data-show="limit" aria-pressed="false">Time limit <span class="seg-count" '
+                      'data-count="limit"></span></button>', html)
+        css = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn('.jobs-list[data-show="limit"] > li:not(.tone-limit),', css)
+
+    def test_the_sidebar_and_the_overview_count_time_limit_reached_apart(self):
+        run_node(self, SIDEBAR, SIDEBAR_SETUP, r"""
+const batches = [{id: 'earlier', label: 'Earlier', readOnly: true, jobCount: 4, counts: {paused: 1, limit: 2, done: 1}},
+  {id: '__root__', label: 'Runs', current: true, jobCount: 3, counts: {running: 1, paused: 1, limit: 1}}];
+renderNavBatches(batches);
+const [saved, live] = shell.batches.children.map(item => item.children[0]);
+const part = (link, name) => link.children.find(child => child.className === name);
+const glyphs = link => part(link, 'nav-counts').children.filter(child => child.className.startsWith('nc '))
+  .map(child => [child.className, text(child)]);
+assert.deepEqual(glyphs(saved), [['nc paused', '1'], ['nc limit', '2'], ['nc done', '1']]);
+assert.deepEqual(part(saved, 'nav-meter').children.map(child => [child.className, child.style.flexGrow]),
+  [['paused', '1'], ['limit', '2'], ['done', '1']]);
+assert.equal(saved.dataset.tipMeta, 'Read-only · 4 problems · 1 paused · 2 time limit reached · 1 complete');
+assert.match(text(part(saved, 'visually-hidden')), /1 paused, 2 time limit reached, 1 complete$/);
+assert.deepEqual(glyphs(live), [['nc running', '1'], ['nc paused', '1'], ['nc limit', '1']]);
+renderTotals(batches);
+// The tiles: Paused counts only the pauses; Time limit reached has its own.
+assert.equal(stats['[data-stat="paused"]'].textContent, '2');
+assert.equal(stats['[data-stat="limit"]'].textContent, '3');
+assert.equal(stats['[data-stat="done"]'].textContent, '1');
+assert.deepEqual(shell.overviewMeta.children.map(child => [child.className, child.textContent]),
+  [['', '2 batches'], ['', '7 problems'], ['meta-running', '1 running'], ['meta-paused', '2 paused'],
+   ['meta-limit', '3 time limit reached'], ['meta-done', '1 complete']]);
+""")
+        html = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        tiles = ['<dt>Paused</dt><dd><strong data-stat="paused">–</strong><span class="stat-note">saved, can resume'
+                 '</span>', '<div class="stat tone-limit"><dt>Time limit reached</dt><dd><strong data-stat="limit">'
+                 '–</strong><span class="stat-note">can continue</span>', '<dt>Complete</dt>']
+        self.assertLess(html.index(tiles[0]), html.index(tiles[1]))
+        self.assertLess(html.index(tiles[1]), html.index(tiles[2]))
+        css = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
+        for rule in (".stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));",
+                     ".nc.limit { --tone: var(--stopped); }", ".batch-progress .limit, .tone-limit { --tone: "
+                     "var(--stopped); }", ".job[data-status=\"limit\"] { --status: var(--stopped); }",
+                     ".page-meta .meta-limit { color: var(--stopped); }"):
+            self.assertIn(rule, css)
+        # The clock is drawn with a border and gradients: the page's policy loads no data: images.
+        self.assertNotIn("data:image", css)
+
+    def test_the_job_header_says_time_limit_reached_and_a_pause_says_paused(self):
+        run_node(self, OVERVIEW, OVERVIEW_SETUP, r"""
+const author = {phase: 'paused', stage: 'solve', activeNode: 'author', workflow: {nodes: {author: {label: 'Proof author'}}},
+  processAlive: false, workerActive: false, thinkingHours: 29.8, activeElapsedSeconds: 107424, timeLimitExhausted: true,
+  pauseCause: 'time-limit'};
+state = job(author);
+renderRunOverview();
+assert.equal(ui.runOverview.dataset.status, 'limit');
+assert.equal(ui.runStage.textContent, 'Proof author · time limit reached');
+assert.equal(ui.runHealth.textContent, 'Stopped at the time limit · saved conversation');
+assert.equal(ui.runBudget.textContent, '29.8h · used up');
+// The automatic progress summary, queued or being written, is said; a reply to a message is the author replying.
+for (const status of ['queued', 'running']) {
+  state = job({...author, processAlive: status === 'running',
+    conversation: {items: [{kind: 'summary', origin: 'time-limit', status}]}});
+  renderRunOverview();
+  assert.equal(ui.runHealth.textContent, 'Time limit reached · writing progress summary');
+}
+state = job({...author, processAlive: true, conversation: {items: [
+  {kind: 'summary', origin: 'time-limit', status: 'answered'}, {kind: 'message', origin: 'user', status: 'running'}]}});
+renderRunOverview();
+assert.equal(ui.runHealth.textContent, 'Stopped at the time limit · author replying');
+// A saved (read-only) job writes nothing.
+state = job({...author, readOnly: true, conversation: {items: [{kind: 'summary', origin: 'time-limit', status: 'queued'}]}});
+renderRunOverview();
+assert.equal(ui.runHealth.textContent, 'Stopped at the time limit · saved conversation');
+// Every other pause reads Paused.
+for (const pauseCause of ['user', 'restart', 'interrupted', 'error', '']) {
+  state = job({...author, pauseCause, timeLimitExhausted: false});
+  renderRunOverview();
+  assert.equal(ui.runOverview.dataset.status, 'paused', pauseCause);
+  assert.equal(ui.runStage.textContent, 'Proof author · paused');
+  assert.equal(ui.runHealth.textContent, 'Paused · saved conversation');
+}
+""")
+
+    def test_the_pill_and_now_card_say_time_limit_reached_and_offer_continue(self):
+        run_node(self, RENDER, RENDER_SETUP, r"""
+const base = {runId: 'r', phase: 'paused', stage: 'solve', activeNode: 'author', trace: [], traceVersion: 0, traceFrom: 0,
+  workflowStages: stages(false, true, true, true), workflow: {nodes: {author: {label: 'Proof author'}}},
+  thinkingHours: 2, activeElapsedSeconds: 7230, conversation: {available: true, busy: false, items: []}};
+render({...base, pauseCause: 'time-limit', timeLimitExhausted: true});
+assert.equal(ui.globalStatus.textContent, 'Time limit reached');
+assert.equal(ui.runLabel.textContent, 'TIME LIMIT REACHED');
+assert.equal(ui.runTitle.textContent, 'Time limit reached');
+assert.equal(ui.runDescription.textContent, 'The proof author reached the time limit of 2 hours after 2h 0m of active '
+  + 'work and stopped. Raise the time limit to continue.');
+// It can still raise the limit and continue: the button reads Continue.
+assert.equal(ui.authorTimeLimitControl.hidden, false);
+assert.equal(ui.resume.hidden, false);
+assert.equal(ui.resume.textContent, 'Continue');
+assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
+// Raised, it still continues (not resumes).
+render({...base, pauseCause: 'time-limit', thinkingHours: 3, timeLimitExhausted: false});
+assert.equal(ui.globalStatus.textContent, 'Time limit reached');
+assert.equal(ui.resume.textContent, 'Continue');
+assert.match(ui.runDescription.textContent, /Choose Continue to go on\.$/);
+// A pause by you, a restart, an interruption or a failure: Paused, and Resume.
+for (const [index, pauseCause] of ['user', 'restart', 'interrupted', 'error', ''].entries()) {
+  render({...base, runId: `p${index}`, pauseCause});
+  assert.equal(ui.globalStatus.textContent, 'Paused', pauseCause);
+  assert.equal(ui.runLabel.textContent, 'RUN PAUSED');
+  assert.equal(ui.runTitle.textContent, 'Ready to resume');
+  assert.equal(ui.resume.textContent, 'Resume');
+  assert.equal(ui.authorSteerLabel.textContent, 'Ask the paused author');
+}
+// Back at the time limit, the box asks the author again.
+render({...base, pauseCause: 'time-limit', timeLimitExhausted: true});
+assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
 """)
 
 
@@ -876,6 +1092,11 @@ class SavedPauseCauseTests(NoModelCase):
         self.assertEqual({job["runId"]: job["pauseCause"] for job in catalog.jobs("earlier")},
                          {"job": "time-limit", "other": ""})
         self.assertFalse(catalog.state("earlier", "other")["timeLimitExhausted"])
+        # The saved batch classifies and counts it as the live one does: apart from the paused job.
+        self.assertEqual({job["runId"]: batches.job_tone(job) for job in catalog.jobs("earlier")},
+                         {"job": "limit", "other": "paused"})
+        card = next(card for card in catalog.list_batches() if card["id"] == "earlier")
+        self.assertEqual((card["counts"]["limit"], card["counts"]["paused"]), (1, 1))
 
 
 if __name__ == "__main__":

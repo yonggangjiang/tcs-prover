@@ -148,7 +148,7 @@ const base = {...author, pauseCause: 'time-limit', timeLimitExhausted: true,
 render(base);
 assert.equal(ui.runTitle.textContent, 'Time limit reached');
 assert.equal(ui.runDescription.textContent, 'The proof author reached the time limit of 2 hours after 2h 0m of '
-  + 'active work and is paused. It is writing a progress summary below. Raise the time limit to continue.');
+  + 'active work and stopped. It is writing a progress summary below. Raise the time limit to continue.');
 assert.equal(ui.authorTimeLimitControl.hidden, false);
 assert.equal(ui.authorTimeLimitControl.open, true);
 assert.equal(ui.authorLimitHours.value, '2');
@@ -160,13 +160,13 @@ assert.equal(ui.authorTimeLimitControl.open, false);
 render({...base, criticFeedbackPending: true, conversation: {...base.conversation, busy: false,
   items: [{...summary, status: 'answered', reply: 'Lemma 1 is proved in proof.md.'}]}});
 assert.equal(ui.runDescription.textContent, 'The proof author reached the time limit of 2 hours after 2h 0m of '
-  + 'active work and is paused. Raise the time limit to continue. The critic rejected the latest proof; the author '
-  + 'receives its report when the run resumes.');
-// A raised limit says what is left, and that Resume continues; 0 turns it off.
+  + 'active work and stopped. Raise the time limit to continue. The critic rejected the latest proof; the author '
+  + 'receives its report when the run continues.');
+// A raised limit says what is left, and that Continue goes on; 0 turns it off.
 render({...base, thinkingHours: 3, timeLimitExhausted: false, conversation: {...base.conversation, busy: false}});
-assert.equal(ui.runDescription.textContent, 'The time limit is now 3 hours (59m 30s left). Resume to continue.');
+assert.equal(ui.runDescription.textContent, 'The time limit is now 3 hours (59m 30s left). Choose Continue to go on.');
 render({...base, thinkingHours: 0, timeLimitExhausted: false, conversation: {...base.conversation, busy: false}});
-assert.equal(ui.runDescription.textContent, 'The time limit is now off. Resume to continue.');
+assert.equal(ui.runDescription.textContent, 'The time limit is now off. Choose Continue to go on.');
 render({...base, thinkingHours: 1, timeLimitExhausted: true, activeElapsedSeconds: 3600,
   conversation: {available: false, reason: 'x', items: []}});
 assert.match(ui.runDescription.textContent, /^The proof author reached the time limit of 1 hour after 1h 0m /);
@@ -378,7 +378,7 @@ assert.equal(ui.authorTimeLimitControl.open, true);
 assert.equal(ui.authorLimitHours.focused, true);
 assert.equal(ui.notice.hidden, false);
 assert.equal(ui.notice.textContent,
-  'The time limit is used up (2h 0m of 2 hours). Raise it, or set 0 for no limit, then resume.');
+  'The time limit is used up (2h 0m of 2 hours). Raise it, or set 0 for no limit, then choose Continue.');
 // A typed limit is set first; Resume follows once the job has it.
 ui.authorLimitHours.value = '3';
 afterAct = (path, body) => { if (path === '/set-author-time-limit') render({...paused, thinkingHours: body.hours,

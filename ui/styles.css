@@ -72,6 +72,11 @@
   --ease: cubic-bezier(0.23, 1, 0.32, 1);
   --fast: 140ms;
   --medium: 240ms;
+
+  /* The clock of a job stopped at its time limit: a glyph with a round border in its tone (currentColor)
+     takes these hands, at twelve and three, as its background (the page loads no images). */
+  --clock-hands: linear-gradient(currentColor, currentColor) 50% 20% / 1.5px 45% no-repeat,
+    linear-gradient(currentColor, currentColor) 72% 50% / 34% 1.5px no-repeat;
 }
 
 /* 1a. Type and shape per theme (the same in light and dark), and the colour of live work
@@ -908,12 +913,14 @@ kbd {
 .nc.running { --tone: var(--running); }
 .nc.waiting { --tone: var(--waiting); }
 .nc.paused { --tone: var(--paused); }
+.nc.limit { --tone: var(--stopped); }
 .nc.done { --tone: var(--done); }
 .nc.incomplete { --tone: var(--failed); }
-/* The same glyphs as the status labels: dot, diamond, pause bars, check, cross. */
+/* The same glyphs as the status labels: dot, diamond, pause bars, clock, check, cross. */
 .nc-glyph { flex: none; width: 6px; height: 6px; border-radius: 50%; color: var(--tone); background: currentColor; }
 .nc.waiting .nc-glyph { border-radius: 1px; transform: rotate(45deg) scale(0.9); }
 .nc.paused .nc-glyph { width: 6px; height: 7px; border-radius: 0; background: linear-gradient(90deg, currentColor 0 2px, transparent 2px 4px, currentColor 4px 6px); }
+.nc.limit .nc-glyph { width: 9px; height: 9px; border: 1.25px solid currentColor; background: var(--clock-hands); }
 .nc.done .nc-glyph { width: 7px; height: 4px; border: solid currentColor; border-width: 0 0 1.5px 1.5px; border-radius: 0; background: none; transform: translateY(-1px) rotate(-45deg); }
 .nc.incomplete .nc-glyph {
   width: 7px;
@@ -938,6 +945,7 @@ kbd {
 .nav-meter i.running { background: var(--running); }
 .nav-meter i.waiting { background: var(--waiting); }
 .nav-meter i.paused { background: var(--paused); }
+.nav-meter i.limit { background: rgb(var(--stopped-rgb) / 0.75); }
 .nav-meter i.done { background: rgb(var(--done-rgb) / 0.7); }
 .nav-meter i.incomplete { background: rgb(var(--failed-rgb) / 0.6); }
 
@@ -1116,6 +1124,13 @@ kbd {
     linear-gradient(-45deg, transparent 40%, var(--failed) 40% 60%, transparent 60%);
 }
 .app-shell:has(#runOverview[data-status="stopped"]:not([hidden])) .live-dot:not(.active) { border-radius: 2px; background: var(--stopped); }
+.app-shell:has(#runOverview[data-status="limit"]:not([hidden])) .live-dot:not(.active) {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid;
+  color: var(--stopped);
+  background: var(--clock-hands);
+}
 /* One slow, faint ring while the job works (off under reduced motion). */
 .live-dot.active::after {
   position: absolute;
@@ -1427,13 +1442,14 @@ kbd {
 .page-meta .meta-running { color: var(--running); }
 .page-meta .meta-waiting { color: var(--waiting); }
 .page-meta .meta-paused { color: var(--paused); }
+.page-meta .meta-limit { color: var(--stopped); }
 .page-meta .meta-done { color: var(--done); }
 .page-meta .meta-incomplete { color: var(--failed); }
 .page-lede { max-width: 68ch; margin-top: 8px; color: var(--ink-2); font-size: var(--text-base); line-height: 1.55; }
 .page-head > button { flex: none; }
 
-/* Overview: four totals, then the batches as a table. */
-.stat-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 0 0 var(--space-7); }
+/* Overview: five totals, then the batches as a table. */
+.stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 0 0 var(--space-7); }
 .stat {
   --tone: var(--stopped);
   position: relative;
@@ -1457,6 +1473,7 @@ kbd {
 .stat.tone-running { --tone: var(--running); }
 .stat.tone-waiting { --tone: var(--waiting); }
 .stat.tone-paused { --tone: var(--paused); }
+.stat.tone-limit { --tone: var(--stopped); }
 .stat.tone-done { --tone: var(--done); }
 .stat.zero::before { background: var(--ink-4); }
 .stat dt { color: var(--ink-2); font-size: var(--text-sm); font-weight: 600; }
@@ -1601,6 +1618,7 @@ kbd {
 }
 .batch-progress :is(.reviewed, .prepared), .tone-waiting { --tone: var(--waiting); }
 .batch-progress .paused, .tone-paused { --tone: var(--paused); }
+.batch-progress .limit, .tone-limit { --tone: var(--stopped); }
 .batch-progress .running, .tone-running { --tone: var(--running); }
 .batch-progress .done, .tone-done { --tone: var(--done); }
 .batch-progress .incomplete { --tone: var(--failed); }
@@ -1612,6 +1630,12 @@ kbd {
   height: 8px;
   border-radius: 0;
   background: linear-gradient(90deg, currentColor 0 2.5px, transparent 2.5px 4.5px, currentColor 4.5px 7px);
+}
+:is(.batch-progress .limit, .job-status.tone-limit)::before {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  background: var(--clock-hands);
 }
 :is(.batch-progress .done, .job-status.tone-done)::before {
   width: 8px;
@@ -1665,6 +1689,7 @@ kbd {
 .jobs-list[data-show="running"] > li:not(.tone-running),
 .jobs-list[data-show="waiting"] > li:not(.tone-waiting),
 .jobs-list[data-show="paused"] > li:not(.tone-paused),
+.jobs-list[data-show="limit"] > li:not(.tone-limit),
 .jobs-list[data-show="done"] > li:not(.tone-done),
 .jobs-list[data-show="failed"] > li:not(:is(.tone-failed, .tone-stopped)) { display: none; }
 .jobs-panel:has(.jobs-filter-empty:not([hidden])) .jobs-list { display: none; }
@@ -1713,7 +1738,7 @@ kbd {
   white-space: normal;
 }
 .job-status::before { align-self: flex-start; margin-top: 6px; }
-.job-status.tone-paused::before, .job-status.tone-failed::before { margin-top: 5px; }
+.job-status:is(.tone-paused, .tone-limit, .tone-failed)::before { margin-top: 5px; }
 .job-status.tone-done::before { margin-top: 7px; }
 .job-copy > strong {
   display: -webkit-box;
@@ -2047,6 +2072,7 @@ kbd {
 }
 .job[data-status="waiting"] { --status: var(--waiting); }
 .job[data-status="paused"] { --status: var(--paused); }
+.job[data-status="limit"] { --status: var(--stopped); }
 .job[data-status="done"] { --status: var(--done); }
 .job[data-status="failed"] { --status: var(--failed); }
 .job[data-status="stopped"] { --status: var(--stopped); }
@@ -2105,6 +2131,12 @@ kbd {
     linear-gradient(-45deg, transparent 40%, currentColor 40% 60%, transparent 60%);
 }
 .job[data-status="stopped"] .status-pill::before { border-radius: 2px; }
+.job[data-status="limit"] .status-pill::before {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  background: var(--clock-hands);
+}
 .round-badge { color: var(--ink); font-family: var(--font-mono); }
 /* Search-mode badges: neutral, with a small marker (teal = historical, grey = off). */
 .mode-badge { display: none; color: var(--ink); }
@@ -2134,12 +2166,12 @@ kbd {
   text-overflow: ellipsis;
 }
 .job:not([data-status="running"]) .job-latest { display: none; }
-/* Every pause at the time limit, one per line, kept after the job finished. */
+/* Every stop at the time limit, one per line, kept after the job finished; in the time limit's muted tone. */
 .job-note {
   max-width: 80ch;
   margin-top: 6px;
   padding-left: 10px;
-  border-left: 2px solid rgb(var(--paused-rgb) / 0.6);
+  border-left: 2px solid rgb(var(--stopped-rgb) / 0.6);
   color: var(--ink-2);
   font-size: var(--text-sm);
   white-space: pre-line;
@@ -2730,6 +2762,17 @@ kbd {
 }
 .workflow-node.failed .node-dot { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .workflow-node:is(.paused, .warning) .node-dot { border-color: rgb(var(--paused-rgb) / 0.7); color: var(--paused); }
+/* Stopped at the time limit: a muted ring around a clock. */
+.workflow-node.limit .node-dot { border-color: rgb(var(--stopped-rgb) / 0.7); color: var(--stopped); }
+:is(.workflow-node.limit .node-dot, .legend-dot.limit)::after {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  background: var(--clock-hands);
+  content: "";
+}
+.legend-dot.limit::after { width: 10px; height: 10px; }
 .workflow-node.rejected .node-dot { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .workflow-node.reviewed .node-dot { background: var(--tint-2); }
 .workflow-node.disabled { opacity: 0.62; }
@@ -2738,8 +2781,9 @@ kbd {
 .critic-pass-stem.not-selected { opacity: 0.4; }
 .workflow-loop.not-selected { background: none; box-shadow: inset 0 0 0 1px var(--line); }
 .workflow-loop.not-selected > .loop-title { color: var(--ink-3); }
-/* Where the run stands: one mark on one step, "Now", "Paused here", "Ended here" or where it
-   waits, then the step or the reason. The row's marker already carries the status colour. */
+/* Where the run stands: one mark on one step, "Now", "Paused here", "Stopped here" (at the time
+   limit), "Ended here" or where it waits, then the step or the reason. The row's marker already
+   carries the status colour. */
 .node-copy > .node-position { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin-top: 5px; }
 .node-position > span { display: inline; margin: 0; }
 .node-position .position-tag {
@@ -2755,16 +2799,17 @@ kbd {
   text-transform: var(--label-transform);
 }
 .node-position.paused .position-tag { border-color: rgb(var(--paused-rgb) / 0.6); background: rgb(var(--paused-rgb) / 0.1); }
+.node-position.limit .position-tag { border-color: rgb(var(--stopped-rgb) / 0.6); background: rgb(var(--stopped-rgb) / 0.1); }
 .node-position.waiting .position-tag { border-color: rgb(var(--waiting-rgb) / 0.6); background: rgb(var(--waiting-rgb) / 0.1); }
 .node-position.ended .position-tag { border-color: var(--line-strong); background: var(--tint-2); }
 .node-position .position-text { color: var(--ink); font-weight: 600; }
 .node-copy { min-width: 0; overflow-wrap: anywhere; }
 .node-copy strong { display: block; color: var(--ink); font-size: var(--text-sm); font-weight: 650; }
-.workflow-node:not(:is(.active, .complete, .paused, .failed, .warning, .rejected, .reviewed)) .node-copy strong { color: var(--ink-2); }
+.workflow-node:not(:is(.active, .complete, .paused, .limit, .failed, .warning, .rejected, .reviewed)) .node-copy strong { color: var(--ink-2); }
 .node-copy span { display: block; margin-top: 2px; font-size: var(--text-xs); line-height: 1.45; }
 /* Only the current step explains itself; the others show their status notes. */
 .node-copy > span:not([class]) { display: none; }
-.workflow-node:is(.active, .paused, .failed, .warning) > .node-copy > span:not([class]) { display: block; color: var(--ink-2); }
+.workflow-node:is(.active, .paused, .limit, .failed, .warning) > .node-copy > span:not([class]) { display: block; color: var(--ink-2); }
 /* Status notes and verdicts are words in ink; the marker beside them carries the colour. */
 .node-resume-note, .node-status { color: var(--ink-2); font-weight: 600; }
 .disabled .node-status, .reviewed .node-status, .node-review-count { color: var(--ink-2); }
@@ -2941,6 +2986,7 @@ kbd {
 .legend-dot.active { border-color: var(--live); background: var(--live); box-shadow: 0 0 0 3px rgb(var(--live-rgb) / 0.18); }
 .legend-dot.active::after { width: 6px; height: 6px; border-radius: 50%; background: var(--on-live); content: ""; }
 .legend-dot.paused { border-color: rgb(var(--paused-rgb) / 0.65); color: var(--paused); }
+.legend-dot.limit { border-color: rgb(var(--stopped-rgb) / 0.65); color: var(--stopped); }
 .legend-dot.rejected { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .legend-dot.failed { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .legend-dot.disabled { opacity: 0.62; }
@@ -3330,7 +3376,10 @@ kbd {
   [data-sidebar="rail"] .sidebar-foot:has(.foot-status[data-state="waiting"])::before { border-radius: 1.5px; background: var(--waiting); transform: rotate(45deg); }
 }
 @media (max-width: 1180px) {
-  .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* Five totals in two full rows: three, then two wider ones (as the phone filter sets its segments). */
+  .stat-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .stat { grid-column: span 2; }
+  .stat:nth-child(n + 4) { grid-column: span 3; }
 }
 @container main (max-width: 999px) {
   /* Below the work, the diagram keeps a readable width and the key sits in three columns. */
@@ -3441,16 +3490,16 @@ kbd {
   .work-pane { padding-top: var(--space-2); padding-bottom: var(--space-12); }
   .page-head { flex-direction: column; align-items: stretch; gap: var(--space-4); margin-bottom: var(--space-5); }
   .page-head > button { align-self: flex-start; }
-  .stat-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: var(--space-6); }
+  .stat-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; margin-bottom: var(--space-6); }
   .stat { padding: 11px 10px 10px; border-radius: var(--radius-md); }
   .stat::before { left: 10px; width: 18px; }
   .stat dt { overflow: hidden; font-size: var(--text-xs); white-space: nowrap; text-overflow: ellipsis; }
   .stat dd { margin-top: 6px; }
   .stat strong { font-size: 1.375rem; }
   .stat-note { display: none; }
-  /* The batch filter: its six segments in two rows of three, all in view. */
-  .seg-filter { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
-  .seg { justify-content: center; min-width: 0; padding-inline: 6px; white-space: nowrap; }
+  /* The batch filter: its seven segments wrap into full rows (four, then three on most phones), all in view. */
+  .seg-filter { display: flex; flex-wrap: wrap; width: 100%; }
+  .seg { flex: 1 1 auto; justify-content: center; min-width: 0; padding-inline: 6px; white-space: nowrap; }
   .advanced > summary::before { display: none; }
   .composer, .run-now, .review-view { padding: var(--space-4); }
   .model-grid, .field-grid, .api-model-fields { grid-template-columns: minmax(0, 1fr); }
@@ -3520,7 +3569,6 @@ kbd {
 }
 /* The narrowest phones (320px): the format segments share the row equally and wrap their words. */
 @media (max-width: 359px) {
-  .seg-filter { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .segment { flex: 1 1 0; min-width: 0; }
   .segment span { white-space: normal; }
   .composer { padding-inline: 14px; }
@@ -3578,7 +3626,7 @@ kbd {
 :root[data-theme="ink"] .page-head { padding-bottom: var(--space-5); border-bottom: 1px solid var(--line-strong); }
 :root[data-theme="ink"] .page-meta { color: var(--ink-2); }
 :root[data-theme="ink"] .page-meta::before { content: none; }
-:root[data-theme="ink"] .page-meta > :is(.meta-running, .meta-waiting, .meta-paused, .meta-done, .meta-incomplete) { color: var(--ink-2); }
+:root[data-theme="ink"] .page-meta > :is(.meta-running, .meta-waiting, .meta-paused, .meta-limit, .meta-done, .meta-incomplete) { color: var(--ink-2); }
 :root[data-theme="ink"] .table-head {
   padding-block: 9px 7px;
   border: 0;
@@ -3618,6 +3666,15 @@ kbd {
   border-radius: 0;
   background: linear-gradient(90deg, var(--tone) 0 2.5px, transparent 2.5px 4.5px, var(--tone) 4.5px 7px);
 }
+:root[data-theme="ink"] .stat.tone-limit::before {
+  top: 20px;
+  left: 17px;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--tone);
+  color: var(--tone);
+  background: var(--clock-hands);
+}
 :root[data-theme="ink"] .stat.tone-done::before {
   top: 22px;
   width: 8px;
@@ -3638,13 +3695,14 @@ kbd {
 /* The job's title block is ruled off like the pages' (the facts above, the next step below). */
 :root[data-theme="ink"] .job-header { padding-bottom: var(--space-4); border-bottom: 1px solid var(--line-strong); }
 /* Hue stays on the small status glyphs. The sidebar meters are set in ink, darker for work that
-   is more current (running, needs you, paused, complete, incomplete, then the rest; the counts above them
+   is more current (running, needs you, paused, time limit, complete, incomplete, then the rest; the counts above them
    carry the glyphs). The rules beside critic cycles, checkpoints and failure reasons are ink, and
    a warning's rule is the full ink; the words name the state. */
 :root[data-theme="ink"] .nav-meter i { background: rgb(var(--accent-rgb) / 0.12); }
 :root[data-theme="ink"] .nav-meter i.running { background: var(--ink); }
 :root[data-theme="ink"] .nav-meter i.waiting { background: rgb(var(--accent-rgb) / 0.66); }
 :root[data-theme="ink"] .nav-meter i.paused { background: rgb(var(--accent-rgb) / 0.42); }
+:root[data-theme="ink"] .nav-meter i.limit { background: rgb(var(--accent-rgb) / 0.32); }
 :root[data-theme="ink"] .nav-meter i.done { background: rgb(var(--accent-rgb) / 0.24); }
 :root[data-theme="ink"] .nav-meter i.incomplete { background: rgb(var(--accent-rgb) / 0.18); }
 :root[data-theme="ink"] :is(.critic-cycle, .checkpoint-row, .job-error) { box-shadow: inset 2px 0 0 var(--ink-3); }
@@ -3676,6 +3734,7 @@ kbd {
   :root[data-theme="ink"] .stat dt { padding-left: 11px; }
   :root[data-theme="ink"] .stat::before { top: 17px; left: 8px; width: 6px; height: 6px; }
   :root[data-theme="ink"] .stat.tone-paused::before { width: 7px; height: 7px; }
+  :root[data-theme="ink"] .stat.tone-limit::before { top: 16px; left: 7px; width: 9px; height: 9px; border-width: 1.25px; }
   :root[data-theme="ink"] .stat.tone-done::before { top: 18px; width: 7px; height: 4px; }
 }
 

@@ -138,6 +138,7 @@
             <div class="stat tone-running"><dt>Running</dt><dd><strong data-stat="running">–</strong><span class="stat-note">working now</span></dd></div>
             <div class="stat tone-waiting"><dt>Needs you</dt><dd><strong data-stat="waiting">–</strong><span class="stat-note">approval or a start</span></dd></div>
             <div class="stat tone-paused"><dt>Paused</dt><dd><strong data-stat="paused">–</strong><span class="stat-note">saved, can resume</span></dd></div>
+            <div class="stat tone-limit"><dt>Time limit reached</dt><dd><strong data-stat="limit">–</strong><span class="stat-note">can continue</span></dd></div>
             <div class="stat tone-done"><dt>Complete</dt><dd><strong data-stat="done">–</strong><span class="stat-note" data-stat-note="done">finished successfully</span></dd></div>
           </dl>
           <div class="section-head">
@@ -598,6 +599,7 @@
               <button type="button" class="seg" data-show="running" aria-pressed="false">Running <span class="seg-count" data-count="running"></span></button>
               <button type="button" class="seg" data-show="waiting" aria-pressed="false">Needs you <span class="seg-count" data-count="waiting"></span></button>
               <button type="button" class="seg" data-show="paused" aria-pressed="false">Paused <span class="seg-count" data-count="paused"></span></button>
+              <button type="button" class="seg" data-show="limit" aria-pressed="false">Time limit <span class="seg-count" data-count="limit"></span></button>
               <button type="button" class="seg" data-show="done" aria-pressed="false">Complete <span class="seg-count" data-count="done"></span></button>
               <button type="button" class="seg" data-show="failed" aria-pressed="false">Incomplete <span class="seg-count" data-count="failed"></span></button>
             </div>
@@ -873,6 +875,7 @@
           <li><span class="legend-dot complete">✓</span>Done</li>
           <li><span class="legend-dot active"></span>Working</li>
           <li><span class="legend-dot paused">Ⅱ</span>Paused</li>
+          <li><span class="legend-dot limit"></span>Time limit</li>
           <li><span class="legend-dot rejected">×</span>Rejected</li>
           <li><span class="legend-dot failed">!</span>Needs attention</li>
           <li><span class="legend-dot">3</span>Up next</li>
