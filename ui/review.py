@@ -123,7 +123,7 @@ def review_worker_main(argv):
         statement, _, feedback = sys.stdin.read().partition("\0")
         # The worker runs in the job's run folder, like the workflow runner.
         runtime.note_retired_efforts([args.review_effort])
-        runtime.check_clis([args.review_model])
+        runtime.check_clis([("review", args.review_model)])
         review(
             statement, feedback, args.review_model, args.review_effort,
             runtime.prompt_file(args.review_prompt_file, REVIEW_PROMPT),

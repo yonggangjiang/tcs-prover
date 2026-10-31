@@ -94,19 +94,32 @@ assignment, attempt history, and proved results across interruptions or context
 compaction. GPT-6.1 Sol with Max reasoning and Standard generation are the
 defaults for every role. Claude models, and API models served by your own
 OpenAI- or Anthropic-format endpoint, are additional options in the same model
-menus; see [Model providers](#model-providers).
+menus; see [Model providers](#model-providers). API models run through one of
+the same two programs (OpenAI-format through the Codex CLI, Anthropic-format
+through Claude Code, the Claude CLI), which must be installed but needs no
+login. A missing program never stops a start (a web-cutoff run is the
+exception: its checks before launch need the native Codex binary). The model
+call that needs the program says so in the activity log and is retried every
+minute, so the job continues by itself once the program is installed.
 
 
 ## Install and run
 
-Requires Python 3.11+, the Codex CLI, and a TeX distribution with `latexmk`
-and `pdflatex` available on `PATH` (for example, TeX Live, MacTeX, or MiKTeX).
-Install Codex CLI through this
-[official website](https://learn.chatgpt.com/docs/codex/cli). The Claude CLI is
-needed only for Claude models and Anthropic-format API models.
+Requires Python 3.11+, a TeX distribution with `latexmk` and `pdflatex`
+available on `PATH` (for example, TeX Live, MacTeX, or MiKTeX), and the
+programs your models run through:
+
+- the Codex CLI, from this
+  [official website](https://learn.chatgpt.com/docs/codex/cli), for the
+  built-in GPT models (the default) and OpenAI-format API models;
+- Claude Code (the Claude CLI) for Claude models and Anthropic-format API
+  models.
+
+`codex login` is needed only for the built-in GPT models, and a Claude login
+only for Claude models; API models need the program installed but no login.
 
 ```bash
-codex login
+codex login  # only for the built-in GPT models
 git clone https://github.com/yonggangjiang/tcs-prover.git
 cd tcs-prover
 python3.11 -m venv .venv
@@ -152,17 +165,24 @@ folders remain in their original locations.
 
 The Web UI opens locally with 6.1 Sol, Max, and Standard defaults for
 the reviewer, proof author, critic, and LaTeX writer. The provider setup below
-is needed only when you select Claude CLI or API models for one or more roles.
+is needed only when you select Claude CLI or API models for one or more roles:
+Claude models need Claude Code and a Claude login, and API models need a saved
+key and the program their format runs through, installed but with no login.
 
 ## Model providers
 
 Each role under **Advanced settings** selects a **Source**, then a **Model**,
 then its reasoning effort and other settings. Sources include **Codex CLI**,
 **Claude CLI**, and each saved API-key connection. The model menu shows only
-that source's models. Each model offers the reasoning levels it supports, and every launch or resume checks
-locally that the selected models can start: Claude models need `claude` on
-`PATH`, and API models need a saved key. `runner/providers.py` is the single
-registry of model ids, harnesses, and efforts.
+that source's models. Each model offers the reasoning levels it supports. A
+launch or resume checks only that each selected model is configured and, for an
+API model, has its saved key; a web-cutoff run also needs Codex CLI models for
+its proof roles and the native Codex binary (see [Web cutoff and removed
+models](#web-cutoff-and-removed-models)). No other installed program is checked
+there. A program that is not installed shows at the model call that needs it,
+which is retried every minute (see [Automatic retries](#automatic-retries)).
+`runner/providers.py` is the single registry of model ids, harnesses, and
+efforts.
 
 ### Codex CLI (default)
 
@@ -279,7 +299,9 @@ Removing a connection is blocked while a running job, or a job waiting to start
 or resume, uses one of its models: edit the connection instead, or delete that
 job first. Changing its format is blocked while jobs use it. Editing a tested
 setting marks the displayed result as out of date. Under each role menu a chip
-names its CLI or API format and host.
+names its CLI, or an API model's format, the program that runs it and its host
+(for example *API · Anthropic format via Claude Code · gateway.example.com*);
+it never checks whether that program is installed.
 
 A test of one model (`POST /api-models/test` with its `api:<id>` selection ID
 and wire `model`, or with unsaved settings) sends a request shaped like the ones
@@ -308,11 +330,20 @@ with a `--bare` start that reads no login and makes no request, and otherwise
 runs them in bare mode, where the author has only the sandboxed shell, Read, and
 Edit tools and the activity log says why. They show messages and tool activity
 but no reasoning summaries, because a gateway may return raw reasoning, which is
-never displayed. API models offer `low` through `max` and always run at standard
-speed. Terminal options accept each discovered model's stable `api:<id>`
-selection ID. A connection ID identifies the saved key rather than selecting a
-model. Older configurations keep their original `api:<id>` model selection as
-an alias, so existing jobs can continue.
+never displayed. Either program must be installed on this computer, but it needs
+no login: the connection's key is all it uses. When it is not installed, the job
+still starts, and each model call that needs it fails with a message in the
+activity log that names the program, the role and the model, for example
+*Claude Code is not installed or is not on PATH. The critic's model claude-gw-1
+(API connection “Anthropic gateway”) is Anthropic-format, and TCS Prover runs
+Anthropic-format models through Claude Code (no Claude login needed). Install
+Claude Code; the job retries every minute and continues by itself.* The call is
+retried every minute, in the same conversation, and the job continues by itself
+once the program is installed. API models offer `low` through `max` and always
+run at standard speed. Terminal options accept each discovered model's stable
+`api:<id>` selection ID. A connection ID identifies the saved key rather than
+selecting a model. Older configurations keep their original `api:<id>` model
+selection as an alias, so existing jobs can continue.
 
 The controller returns `model_sources` for source menus and `model_catalog` for
 model menus; each model row carries its `sourceId`, `sourceLabel`, and wire model
@@ -680,8 +711,8 @@ compilation repairs, parallel independent requests, and the replies of a paused
 author (see [Talking to a paused author](#talking-to-a-paused-author)). A failure is anything
 that interrupts a call: a provider error such as "model at capacity",
 overloaded, 429 or 5xx, a dropped stream, a CLI crash or non-zero exit (or a
-failed turn reported with exit code 0), a CLI that is missing for a moment
-(for example while it updates itself), a call whose CLI has stalled, a login
+failed turn reported with exit code 0), a CLI that is missing (not yet
+installed, or updating itself), a call whose CLI has stalled, a login
 or usage-limit error, and an answer that cannot be used (empty, not valid
 JSON, the wrong shape, or failing a workflow `require` rule, such as a critic
 that returns no proof). A structured call (reviewer, critic, LaTeX editor) is
@@ -700,23 +731,30 @@ provider messages and CLI error output, keys removed, are appended to
 `model-failures.log` in the run folder; the card names the file, and a failure
 that repeats the previous one exactly is logged in one line. The retry notice
 quotes the provider line that names the cause (else the CLI's own error line,
-or its newest line). At every start of the runner (a new job, Resume, or an
-automatic resume) TCS Prover runs `codex --version` or `claude --version` for
-the CLIs the job's models need (no model call) and names their path and
-version in the activity log; a missing or broken CLI, and one that changed
-since the job last started (`cli-versions.json` in the run folder remembers
-them), are named too. A CLI
+or its newest line). The message of a CLI that could not start is labelled *CLI
+message*, as no provider was reached, and the runner's own message about a CLI
+that is not installed is quoted whole. At every start of the runner (a new job,
+Resume, or an automatic resume) TCS Prover runs `codex --version` or
+`claude --version` for the CLIs that the models of the job's selected stages
+need (no model call), finding each as the model calls do, and names their path
+and version in the activity log. A CLI that is not installed is named with the
+role and model that need it and what to install; a broken one, and one that
+changed since the job last started (`cli-versions.json` in the run folder
+remembers them), are named too. Nothing waits for this check. A CLI
 that fails to start in the same way three times in a row is shown as "Codex CLI
 missing or incompatible" (or Claude's) while the retries continue, until it
 works again.
 
 Some causes need you although the job keeps retrying: an expired CLI login, a
-usage limit, or an API key the endpoint rejects. The Overview then lists the job
-under **Needs your attention** with what to do (for example *Codex login needed:
-Log in to the Codex CLI again (codex login)*), its card and its page say so, and
-the retries go on, so the job continues by itself once that is fixed. **Models &
-API → Running jobs** can also show a browser notification when a job first
-needs you, while TCS Prover is open in a tab.
+usage limit, an API key the endpoint rejects, or a program that is not installed
+(or does not start), named after the same failure three times in a row (also
+while a paused author's reply or progress summary waits for it). The
+Overview then lists the job under **Needs your attention** with what to do (for
+example *Codex login needed: Log in to the Codex CLI again (codex login)*, or
+*Claude Code not installed or not working* with the call's message), its card
+and its page say so, and the retries go on, so the job continues by itself once
+that is fixed. **Models & API → Running jobs** can also show a browser
+notification when a job first needs you, while TCS Prover is open in a tab.
 
 Failures that no retry can fix are not retried: a configuration error (for
 example a missing API key, or a Claude model in a web-cutoff run), a workflow
@@ -825,8 +863,9 @@ restarts and do not require an open browser tab. The paused job shows its next r
 automatic retries, and **Resume** retries immediately. User-requested pauses
 and stops, exhausted workflow time limits, safety stops and a Codex author
 whose saved thread ID is missing do not trigger this error retry, and
-neither does a model whose settings are incomplete (a CLI that is only missing
-for a moment is retried). Saved work and the original time budget are
+neither does a model whose settings are incomplete (a CLI that is not installed
+is no such setting: the resume goes ahead, and the model call that needs it says
+so and is retried every minute). Saved work and the original time budget are
 preserved.
 
 Work that a restart, crash or reboot interrupted continues the same way: an
@@ -1305,7 +1344,9 @@ is written, while the text box stays editable, and **Stop reply** cancels the
 reply that is queued or being written (the job stays paused). A model-call
 failure during a reply is retried every minute without limit in the same
 conversation, as for the author's work, and the card shows the reason and the
-next attempt; a runner that ends without a reply is started again after a
+next attempt (a program that is not installed is named there, and after the same
+failure three times in a row the Overview also lists the job under **Needs your
+attention**); a runner that ends without a reply is started again after a
 minute, and a reply that a restart interrupted is requested again when TCS
 Prover starts. A reply that cannot be written (the saved conversation is gone,
 Codex or Claude refused to reopen it three times in the same way, a safety stop,

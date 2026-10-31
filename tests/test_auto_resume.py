@@ -269,18 +269,18 @@ class AutoResumeTests(unittest.TestCase):
         restored = server.restore_saved_app(server.App(self.app.trace_file, self.runs))
         self.assertEqual((restored.state["autoResumeAt"], restored.state["safetyStop"]), (0, True))
 
-    def test_a_cli_that_is_updating_does_not_stop_automatic_resume(self):
+    def test_a_store_that_cannot_be_read_for_a_moment_does_not_stop_automatic_resume(self):
         self.fail()
-        updating = server.TransientLaunchError(
-            "Claude CLI is not installed or is not on PATH; install Claude Code to use Claude models.")
-        with patch.object(server, "require_model_access", side_effect=updating), \
+        unreadable = server.TransientLaunchError(
+            "Cannot read the API model store /state/api-models.json (Resource temporarily unavailable).")
+        with patch.object(server, "require_model_access", side_effect=unreadable), \
                 patch.object(server.subprocess, "Popen") as popen:
             self.assertTrue(self.app.auto_resume_if_due(self.app.resume, now=1_000 + WAIT))
         popen.assert_not_called()
         # The next try stays scheduled one minute later.
         self.assertEqual(self.app.state["autoResumeAt"], 1_000 + 2 * WAIT)
         trace = [entry.get("text", "") for entry in self.app.state["trace"]]
-        self.assertTrue(any(text.startswith("Automatic resume failed: Claude CLI is not installed")
+        self.assertTrue(any(text.startswith("Automatic resume failed: Cannot read the API model store")
                             and text.endswith("Retrying in 1 minute.") for text in trace), trace)
         self.assertFalse(any(text.startswith("Automatic resume stopped") for text in trace))
         # A missing API key waits for the settings: checked again every minute, said once, never launched.
@@ -297,11 +297,15 @@ class AutoResumeTests(unittest.TestCase):
                                  "checks again every 1 minute and continues by itself once they are fixed."])
         self.assertEqual(self.app.attention()["kind"], "settings")
 
-    def test_runtime_reports_a_missing_cli_as_transient_and_a_missing_key_as_settings(self):
-        with patch.object(server.runtime, "verify_model_credentials",
-                          side_effect=server.runtime.CLIUnavailable("Claude CLI is not installed.")):
-            with self.assertRaises(server.TransientLaunchError):
-                server.require_model_access(["claude-opus-5-5"])
+    def test_runtime_reports_an_unreadable_store_as_transient_and_a_missing_key_as_settings(self):
+        unreadable = server.providers.StoreUnavailable("Cannot read the API model store (Permission denied).")
+        with patch.object(server.runtime.providers, "is_known", side_effect=unreadable):
+            with self.assertRaises(server.TransientLaunchError) as raised:
+                server.require_model_access(["api:gateway"])
+        self.assertEqual(str(raised.exception), "Cannot read the API model store (Permission denied).")
+        # Installed CLIs are never checked: the model call that needs a missing one says so and retries.
+        with patch.object(server.runtime.shutil, "which", return_value=None):
+            server.require_model_access(["claude-opus-5-5", "gpt-6.1-sol"])
         with patch.object(server.runtime, "verify_model_credentials",
                           side_effect=server.runtime.ConfigurationError("Add an API key.")):
             with self.assertRaises(ValueError) as raised:

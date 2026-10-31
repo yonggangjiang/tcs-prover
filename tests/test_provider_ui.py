@@ -457,9 +457,9 @@ const disabledGroups = (role) => ui[role + 'Model'].children.filter((group) => g
 for (const [model, text, provider] of [
   ['gpt-6.1-sol', 'Codex CLI', 'codex'], ['claude-haiku-5-5', 'Claude CLI', 'claude'],
   ['gpt-5.6-terra', 'Codex CLI · older model', 'codex'],
-  ['api:lab-sol', 'API · OpenAI format · gateway.lab.example', 'api'],
+  ['api:lab-sol', 'API · OpenAI format via Codex CLI · gateway.lab.example', 'api'],
   ['api:gone', 'API · not configured', 'api'],
-  ['api:keyless', 'API · Anthropic format · llm.example.org · no key', 'api'],
+  ['api:keyless', 'API · Anthropic format via Claude Code · llm.example.org · no key', 'api'],
 ]) {
   const select = ui.authorModel;
   setChoiceForTest(select, model);
@@ -498,7 +498,7 @@ for (const role of ['author', 'critic', 'writer']) assert.deepEqual(disabledGrou
 assert.deepEqual(disabledGroups('review'), []);
 assert.equal(chip('author').textContent, 'Claude CLI · not with a web cutoff');
 assert.equal(chip('author').dataset.state, 'warning');
-assert.equal(chip('writer').textContent, 'API · OpenAI format · gateway.lab.example · not with a web cutoff');
+assert.equal(chip('writer').textContent, 'API · OpenAI format via Codex CLI · gateway.lab.example · not with a web cutoff');
 assert.equal(chip('critic').textContent, 'Codex CLI');
 assert.equal(chip('review').textContent, 'Claude CLI');
 assert.equal(ui.authorModel.value, 'claude-opus-5-5');

@@ -1709,7 +1709,10 @@ def unconfigured_job_model_error(model, role, snapshot):
 
 
 class TransientLaunchError(ValueError):
-    """A model cannot start right now for a reason that passes by itself (its CLI is updating)."""
+    """A model cannot start right now for a reason that passes by itself.
+
+    The API model store cannot be read for a moment.
+    """
 
 
 def require_known_models(models):
@@ -1729,13 +1732,11 @@ def require_known_models(models):
 
 
 def require_model_access(models):
-    """Check locally that each model can start: a saved API key, or the Claude CLI."""
+    """Check locally that each API model has its saved key; installed CLIs are never checked here."""
 
     try:
         for model in dict.fromkeys(models):
             runtime.verify_model_credentials(model)
-    except runtime.CLIUnavailable as exc:
-        raise TransientLaunchError(str(exc)) from exc
     except runtime.Error as exc:
         if isinstance(exc.__cause__, providers.StoreUnavailable):
             raise TransientLaunchError(str(exc)) from exc  # Unreadable for a moment, not removed.
@@ -2896,7 +2897,7 @@ class App:
             raise ValueError("The total workflow time limit must be a number.") from exc
         if not math.isfinite(thinking_hours) or thinking_hours < 0:
             raise ValueError("Choose 0 for unlimited, or a positive number of hours.")
-        # Web cutoff timestamps need Codex models: say so before any CLI check.
+        # Web cutoff timestamps need Codex models: say so before the key check.
         search_options = retrieval.validate_options(
             retrieval_mode, retrieval_cutoff_utc, models=selected_models)
         if search_options["retrievalMode"] == "historical" and (not stages["author"] or stages["review"]):
@@ -3768,7 +3769,7 @@ class App:
                 self._check_launch_models_locked(
                     checkpoint_roles(checkpoint["node"], saved_workflow_stages(self.state)))
             except TransientLaunchError:
-                pass  # For example a CLI updating itself: resume() reports it and the next try is reserved.
+                pass  # An API model store unreadable for a moment: resume() reports it and the next try is reserved.
             except ValueError as exc:
                 # A model that is not configured (removed, or without its key):
                 # checked again at every retry, resumed once it is configured again.
@@ -3835,9 +3836,10 @@ class App:
 
         Only causes you must fix: a login, a usage limit, a rejected API key, a
         model your account cannot use, an endpoint that refuses the requests, a
-        removed model, a Codex author whose saved thread ID is missing, or a
-        safety stop. Retries of the causes that can pass by themselves go on
-        meanwhile.
+        removed model, a CLI that is not installed or does not work (also one
+        that a paused author's reply waits for), a Codex author whose saved
+        thread ID is missing, or a safety stop. Retries of the causes that can
+        pass by themselves go on meanwhile.
         """
 
         state = self.state if state is None else state
@@ -3865,6 +3867,22 @@ class App:
             return {"kind": "conversation", "title": "Saved conversation ID missing", "text": error, "retrying": False}
         if phase == "paused" and state.get("safetyStop"):
             return {"kind": "safety", "title": "Stopped for safety", "text": error, "retrying": False}
+        waiting = retry if retry and phase in {"reviewing", "running"} else None
+        if phase == "paused":
+            # A paused author's reply (a message, Summary, or the summary at the time limit) runs in its own
+            # runner, whose retry waits are kept on its conversation item only (_read_conversation_output).
+            with self.lock:
+                waiting = next((dict(item["retry"]) for item in self._conversation
+                                if item["status"] == "running" and isinstance(item.get("retry"), dict)), None)
+        failure = str((waiting or {}).get("failure") or "")
+        if failure.endswith("CLI missing or incompatible"):
+            # Named after the same failure three times in a row (a CLI updating itself is back sooner);
+            # the retries go on meanwhile, and the call continues by itself once the CLI works.
+            program = runtime.CLI_PROGRAMS.get(failure.split(" ", 1)[0], "the CLI")
+            # A title, so no article: "Codex CLI not installed …", like "Claude Code not installed …".
+            program = program.removeprefix("the ")
+            return {"kind": "cli", "title": f"{program[0].upper()}{program[1:]} not installed or not working",
+                    "retrying": True, "text": str(waiting.get("text") or failure)}
         if cause not in {"authentication failed", "usage limit reached"}:
             return None
         model = state.get(f"{role}Model") or ""
@@ -4155,8 +4173,9 @@ class App:
     def _check_launch_models_locked(self, roles=("author", "critic", "writer")):
         """Recheck saved role models before a launch from an idle job.
 
-        API models, their keys and the Claude CLI can change while a job waits,
-        so fail with a clear message instead of a runner error.
+        API models and their keys can change while a job waits, so fail with a
+        clear message instead of a runner error. Installed CLIs are never
+        checked: a model call that needs a missing one says so and retries.
         """
 
         stages = saved_workflow_stages(self.state)
@@ -6013,7 +6032,8 @@ class App:
         self._settle_run_claim()  # Nothing more may start this run's runner by itself.
 
     def _delay_conversation_locked(self, item, now, error):
-        """Try a queued reply again after the usual wait (a CLI updating, a launch that failed)."""
+        """Try a queued reply again after the usual wait (an API model store that cannot be read for a moment,
+        a web-cutoff check, a launch that failed)."""
 
         item.update(dueAt=now + AUTO_RESUME_SECONDS, error=error)
         self._save_conversation_locked()
@@ -6168,7 +6188,10 @@ class App:
                             item = self._conversation_item_locked(item_id)
                             if item is not None and item["status"] == "running":
                                 if finite_seconds(retry_at):
-                                    item["retry"] = {"text": str(record.get("text") or ""), "retryAt": float(retry_at)}
+                                    # The failure names a CLI that keeps failing to start (see attention()).
+                                    failure = record.get("failure")
+                                    item["retry"] = {"text": str(record.get("text") or ""), "retryAt": float(retry_at),
+                                                     "failure": failure if isinstance(failure, str) else ""}
                                 else:
                                     item.pop("retry", None)
                     elif kind == "request":

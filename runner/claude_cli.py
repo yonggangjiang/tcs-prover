@@ -165,9 +165,25 @@ def executable(runtime):
     if path and os.name == "nt":
         path = native_windows_executable(path)
     if not path:
-        # Missing for a moment while Claude Code updates itself: a later attempt finds it.
+        # Not installed yet, or missing for a moment while Claude Code updates itself: a later attempt finds it.
         raise _failure(runtime, "CLIUnavailable")("Claude CLI is not installed or is not on PATH.")
     return path
+
+
+def located(runtime, model, stage=None):
+    """executable(), where a Claude CLI that is not installed fails with the runner's missing_cli().
+
+    That error names the role (``stage``) and the model that need the CLI; a
+    runtime without missing_cli() (a test double) gets executable()'s own error.
+    """
+
+    try:
+        return executable(runtime)
+    except _failure(runtime, "CLIUnavailable") as exc:
+        missing = getattr(runtime, "missing_cli", None)
+        if missing is None:
+            raise
+        raise missing("Claude", model, stage) from exc
 
 
 def native_windows_executable(path, search_path=None):
@@ -597,11 +613,15 @@ def _check_config_directory(executable_path, home, environment, model, effort, s
     return answer
 
 
-def api_configuration(model, effort, secret, folder, environment, runtime):
-    """The private configuration folder an API model's CLI runs in, or (None, why --bare is needed instead)."""
+def api_configuration(model, effort, secret, folder, environment, runtime, stage=None):
+    """The private configuration folder an API model's CLI runs in, or (None, why --bare is needed instead).
+
+    ``stage`` names the call's role if its CLI is not installed (see located()).
+    """
 
     home = claude_home(folder, runtime)
-    kept = keeps_config_directory(executable(runtime), home, child_environment(environment, effort, api=True, config=home),
+    kept = keeps_config_directory(located(runtime, model, stage), home,
+                                  child_environment(environment, effort, api=True, config=home),
                                   model, effort, secret, folder, runtime)
     if kept:
         return home, ""
@@ -970,7 +990,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     if secret and hasattr(runtime, "register_secret"):
         runtime.register_secret(secret)
     choice = {"live_search": search_is_live(None, runtime), "bash": sandbox_supported()}
-    home, reason = api_configuration(model, effort, secret, Path.cwd(), environment, runtime) if api else (None, "")
+    home, reason = (api_configuration(model, effort, secret, Path.cwd(), environment, runtime, stage) if api
+                    else (None, ""))
     bare = api and home is None
     tools, allowed = tool_permissions("structured", features, bare=bare, **choice)
     dropped = sorted(set(tool_permissions("structured", features, bare=False, **choice)[0]) - set(tools))
@@ -1001,7 +1022,7 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
             conversation.created(conversation.session_id, session_deleter(config_directory(child)))
     try:
         arguments = command_arguments(
-            executable(runtime), model, effort, tools, allowed, settings.path, bare=bare, denied=denied,
+            located(runtime, model, stage), model, effort, tools, allowed, settings.path, bare=bare, denied=denied,
             extra=["--json-schema", json.dumps(schema, ensure_ascii=False),
                    *(SUMMARY_DISPLAY if summaries else [])],
         )
@@ -1962,7 +1983,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             emit("diagnostic", text="The Claude Bash sandbox is unavailable on this platform, so the author works with file tools only.")
         choice = {"live_search": search_is_live(directory, runtime), "bash": bash}
         inherited = runtime.environment(model)
-        home, reason = (api_configuration(model, settings["effort"], secret, directory, inherited, runtime)
+        home, reason = (api_configuration(model, settings["effort"], secret, directory, inherited, runtime, "solve")
                         if api else (None, ""))
         bare = api and home is None
         tools, allowed = tool_permissions("author", features, bare=bare, **choice)
@@ -1988,7 +2009,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             emit("diagnostic", text=f"No private copy of the author conversation can be kept: {exc}")
         harness = private.write(HARNESS_FILE, GOAL_HARNESS_PROMPT.replace("[OBJECTIVE]", render("goal")))
         base_command = command_arguments(
-            executable(runtime), model, settings["effort"], tools, allowed, private.path, bare=bare, denied=denied,
+            located(runtime, model, "solve"), model, settings["effort"], tools, allowed, private.path, bare=bare,
+            denied=denied,
             extra=["--input-format", "stream-json", "--replay-user-messages",
                    *(SUMMARY_DISPLAY if summaries else []),
                    "--json-schema", json.dumps(GOAL_TURN_SCHEMA),
@@ -2432,7 +2454,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         live_search = search_is_live(directory, runtime)
         inherited = runtime.environment(model)
         # An API model reopens the conversation in the author's own configuration folder.
-        home, _ = (api_configuration(model, settings["effort"], secret, directory, inherited, runtime)
+        home, _ = (api_configuration(model, settings["effort"], secret, directory, inherited, runtime, "conversation")
                    if api else (None, ""))
         bare = api and home is None
         if getattr(runtime, "CONVERSATION_READ_ONLY", True):
@@ -2457,7 +2479,8 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             emit("diagnostic", text=f"No private copy of the author conversation can be kept: {exc}")
         harness = private.write(HARNESS_FILE, CONVERSATION_HARNESS_NOTE)
         base_command = command_arguments(
-            executable(runtime), model, settings["effort"], tools, allowed, private.path, bare=bare, denied=denied,
+            located(runtime, model, "conversation"), model, settings["effort"], tools, allowed, private.path,
+            bare=bare, denied=denied,
             extra=["--input-format", "stream-json", "--replay-user-messages",
                    *(SUMMARY_DISPLAY if summaries else []), "--append-system-prompt-file", str(harness)],
         )

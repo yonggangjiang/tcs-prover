@@ -436,14 +436,19 @@ class StructuredRetryTests(RetryCase):
                     runtime.structured("Review S.", SCHEMA, "review", model=model, effort="high")
         attempt.assert_not_called()
 
-    def test_a_cli_that_is_missing_for_a_moment_is_waited_for(self):
-        with mock.patch.object(runtime, "require_model_credentials",
-                               side_effect=runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH.")):
-            (result, _), calls = self.run_attempts([
-                runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH."),
-                runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH."), VALID])
+    def test_a_cli_that_is_missing_is_waited_for(self):
+        # Not installed yet, or updating itself: nothing checks for it before the call, which is retried.
+        missing = [runtime.missing_cli("Claude", "claude-opus-5-5", "review") for _ in range(2)]
+        (result, _), calls = self.run_attempts([*missing, VALID], model="claude-opus-5-5")
+        self.assertEqual(result, {"statement": "S", "notes": "ok"})
         self.assertEqual(len(calls), 3)
-        self.assertEqual([event["failure"] for event in self.notices()], ["the CLI is not available"] * 2)
+        notices = self.notices()
+        self.assertEqual([event["failure"] for event in notices], ["the CLI is not available"] * 2)
+        self.assertEqual(notices[0]["text"], (
+            "Model call failed (the CLI is not available) — retrying in 1 min (attempt 2). CLI message: Claude Code is "
+            "not installed or is not on PATH. The statement reviewer's model Claude Opus 5.5 runs through Claude Code "
+            "with your Claude login. Install it and log in (run claude, then /login); the job retries every minute and "
+            "continues by itself."))
 
     def test_a_cap_is_only_for_direct_callers_that_ask(self):
         with mock.patch.object(runtime, "run_structured_attempt",

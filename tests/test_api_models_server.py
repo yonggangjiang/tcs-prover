@@ -675,14 +675,16 @@ class LaunchValidationTests(StoreCase):
             self.options(author_model="api:keyless")
         self.assertEqual(str(failure.exception), "Add an API key for Keyless in Advanced settings → API connections.")
 
-    def test_claude_models_need_the_claude_cli(self):
+    def test_claude_models_launch_whether_or_not_the_claude_cli_is_installed(self):
         which = shutil.which
         missing = mock.patch.object(runtime.shutil, "which",
                                     side_effect=lambda name, *a, **k: None if name == "claude" else which(name, *a, **k))
-        with missing, self.assertRaises(ValueError) as failure:
-            self.options(writer_model="claude-sonnet-5-5")
-        self.assertEqual(str(failure.exception),
-                         "Claude CLI is not installed or is not on PATH; install Claude Code to use Claude models.")
+        # Installed software is never checked at a launch: the model call that needs it says so and retries.
+        with missing:
+            anthropic = self.openai_model(format="anthropic", baseUrl="https://gateway.example.com",
+                                          model="claude-gateway", apiKey=ANTHROPIC_KEY, label="Claude gateway")["id"]
+            options = self.options(writer_model="claude-sonnet-5-5", critic_model=anthropic)
+        self.assertEqual((options["writerModel"], options["criticModel"]), ("claude-sonnet-5-5", anthropic))
         present = mock.patch.object(runtime.shutil, "which",
                                     side_effect=lambda name, *a, **k: "/usr/local/bin/claude" if name == "claude"
                                     else which(name, *a, **k))
@@ -696,15 +698,12 @@ class LaunchValidationTests(StoreCase):
 
     def test_web_cutoff_timestamps_require_native_codex_models(self):
         api = self.openai_model()["id"]
-        which = shutil.which
-        no_claude = mock.patch.object(runtime.shutil, "which",
-                                      side_effect=lambda name, *a, **k: None if name == "claude" else which(name, *a, **k))
-        with mock.patch.object(retrieval.isolated_compiler, "supported", return_value=True), no_claude:
+        with mock.patch.object(retrieval.isolated_compiler, "supported", return_value=True):
             for role, model in (("author_model", "claude-haiku-5-5"), ("critic_model", api),
                                 ("writer_model", "claude-opus-5-5")):
                 with self.subTest(model=model), self.assertRaises(ValueError) as failure:
                     self.options(retrieval_mode="historical", retrieval_cutoff_utc=CUTOFF, **{role: model})
-                # Reported before any CLI or key check.
+                # Reported before the key check.
                 self.assertEqual(str(failure.exception), "Web cutoff timestamps require Codex CLI models for every proof role.")
                 self.assertEqual(str(failure.exception), runtime.HISTORICAL_CODEX_ONLY)
             with self.assertRaises(ValueError) as failure:
@@ -1073,11 +1072,8 @@ class CommandLineModelTests(StoreCase):
 
     def test_terminal_runs_accept_claude_and_api_models(self):
         api = self.openai_model()["id"]
-        which = shutil.which
-        with mock.patch.object(runtime.shutil, "which", side_effect=lambda name, *a, **k: "/usr/local/bin/claude"
-                               if name == "claude" else which(name, *a, **k)):
-            options = cli.direct_cli_options(author_model="claude-sonnet-5-5", critic_model=api,
-                                             writer_model="claude-haiku-5-5", reasoning_effort="ultra")
+        options = cli.direct_cli_options(author_model="claude-sonnet-5-5", critic_model=api,
+                                         writer_model="claude-haiku-5-5", reasoning_effort="ultra")
         self.assertEqual((options["author_model"], options["critic_model"], options["writer_model"]),
                          ("claude-sonnet-5-5", api, "claude-haiku-5-5"))
         # A retired Ultra is kept as given; the runner runs it as max and says so once.

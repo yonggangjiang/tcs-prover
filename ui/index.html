@@ -126,9 +126,9 @@
             </div>
             <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
           </div>
-          <!-- Jobs that need you (a CLI login, a usage limit, a rejected API key, a model or its settings,
-               a missing saved thread ID, a safety stop); app.js fills it from /batches. Jobs whose cause can
-               pass keep retrying meanwhile. -->
+          <!-- Jobs that need you (a CLI login, a usage limit, a rejected API key, a program to install, a model
+               or its settings, a missing saved thread ID, a safety stop); app.js fills it from /batches. Jobs
+               whose cause can pass keep retrying meanwhile. -->
           <section id="attentionBanner" class="attention-banner" aria-labelledby="attentionHeading" hidden>
             <h2 id="attentionHeading" class="attention-heading">Needs your attention</h2>
             <ul id="attentionList" class="attention-list" aria-live="polite"></ul>
@@ -386,7 +386,7 @@
                         <label class="segment"><input id="apiModelFormatOpenai" type="radio" name="apiModelFormat" value="openai" checked><span>OpenAI-compatible</span></label>
                         <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
                       </div>
-                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. Models load automatically when you save.</p>
+                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer, but needs no login. Models load automatically when you save.</p>
                       <details class="api-optional-settings">
                         <summary>Optional source, name and token limits</summary>
                         <div class="api-model-fields">

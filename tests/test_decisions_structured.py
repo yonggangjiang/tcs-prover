@@ -589,12 +589,16 @@ class CLICheckTests(unittest.TestCase):
 
     def test_a_missing_or_broken_cli_is_named_and_nothing_waits(self):
         os.environ["PATH"] = str(self.root / "state")  # No CLI here.
-        texts = [event["text"] for event in self.check() if event["kind"] == "diagnostic"]
+        # A missing CLI is named with the role and model that need it, and what to do.
+        texts = [event["text"] for event in self.check(("solve", "gpt-6.1-sol"), ("review", "claude-opus-5-5"))
+                 if event["kind"] == "diagnostic"]
         self.assertEqual(texts, [
-            "Codex CLI missing or incompatible: Codex CLI is not installed or is not on PATH. "
-            "Model calls retry every minute until it works.",
-            "Claude CLI missing or incompatible: Claude CLI is not installed or is not on PATH. "
-            "Model calls retry every minute until it works."])
+            "The Codex CLI is not installed or is not on PATH. The proof author's model GPT 6.1 Sol runs through the "
+            "Codex CLI with your ChatGPT login. Install it and run codex login; the job retries every minute and "
+            "continues by itself.",
+            "Claude Code is not installed or is not on PATH. The statement reviewer's model Claude Opus 5.5 runs "
+            "through Claude Code with your Claude login. Install it and log in (run claude, then /login); the job "
+            "retries every minute and continues by itself."])
         os.environ.update(PATH=str(self.bin), TCS_STAND_IN_VERSION_EXIT="127")
         texts = [event["text"] for event in self.check("gpt-6.1-sol") if event["kind"] == "diagnostic"]
         self.assertEqual(texts, ["Codex CLI missing or incompatible: `codex --version` exited with code 127 "
@@ -734,7 +738,8 @@ class MainTests(unittest.TestCase):
                     calls.append(("run", options["failure_log"])) or {"output": "done"})):
             code, _, _ = self.main()
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [("check", [runtime.MODEL, runtime.MODEL]),
+        # The (stage, model) of each model call of the selected stages (the LaTeX editor and its repair).
+        self.assertEqual(calls, [("check", [("final", runtime.MODEL), ("final", runtime.MODEL)]),
                                  ("run", str(self.root / runtime.MODEL_FAILURE_LOG))])
 
 

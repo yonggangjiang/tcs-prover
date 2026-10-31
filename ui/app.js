@@ -418,9 +418,9 @@ function renderBatches(batches) {
   renderBatchNavigation();
 }
 
-// Overview: the jobs that need you (a CLI login, a usage limit, a rejected API key, a model or
-// its settings, a missing saved thread ID, a safety stop). Jobs whose cause can pass
-// keep retrying meanwhile; each line says what to do.
+// Overview: the jobs that need you (a CLI login, a usage limit, a rejected API key, a program to
+// install, a model or its settings, a missing saved thread ID, a safety stop). Jobs whose cause can
+// pass keep retrying meanwhile; each line says what to do.
 function renderAttention(batches) {
   const items = batches.flatMap((batch) => batch.attention || []);
   show(ui.attentionBanner, items.length > 0);
@@ -1005,9 +1005,10 @@ function cutoffModelMessage(roles = cutoffBlockedRoles()) {
     + (listed ? ` Choose a Codex CLI model for the ${listed}.` : "");
 }
 
-// Under each role menu: the CLI that runs the chosen model, and an API model's format and
-// host. With a web cutoff the proof roles' Claude CLI and API groups are disabled, and a
-// chosen model that cannot run there is flagged (the choice itself is never changed).
+// Under each role menu: the CLI that runs the chosen model, and an API model's format, the program
+// that runs it (fixed by the format; nothing checks that it is installed) and host. With a web cutoff
+// the proof roles' Claude CLI and API groups are disabled, and a chosen model that cannot run there
+// is flagged (the choice itself is never changed).
 function renderModelChoices() {
   const cutoff = selectedRetrievalMode() === "historical";
   const catalog = state.workflow?.settings?.model_catalog;
@@ -1031,7 +1032,8 @@ function renderModelChoices() {
       text += " · not configured";
       warning = true;
     } else if (provider === "api") {
-      text += ` · ${row.format === "anthropic" ? "Anthropic" : "OpenAI"} format · ${row.host}`;
+      const format = row.format === "anthropic" ? "Anthropic format via Claude Code" : "OpenAI format via Codex CLI";
+      text += ` · ${format} · ${row.host}`;
       if (row.hasKey === false) {
         text += " · no key";
         warning = true;
@@ -5287,10 +5289,12 @@ const apiUi = {
 };
 const apiFormats = {
   openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1", key: "sk-…",
-    help: "Runs through the Codex CLI with the Responses API. Models load automatically when you save." },
+    help: "Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer, "
+      + "but needs no login. Models load automatically when you save." },
   anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com", key: "sk-ant-…",
-    help: "Runs through the Claude CLI in a private configuration folder, with subagents and web tools; a claude "
-      + "launcher that drops CLAUDE_CONFIG_DIR limits it to bare mode. Models load automatically when you save." },
+    help: "Runs through Claude Code in a private configuration folder, with subagents and web tools; a claude "
+      + "launcher that drops CLAUDE_CONFIG_DIR limits it to bare mode. Claude Code must be installed on this "
+      + "computer, but needs no login. Models load automatically when you save." },
 };
 const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic", writer: "LaTeX writer" };
 let apiModels = [], apiModelEditing = null, apiModelBusy = false;
@@ -6267,7 +6271,8 @@ function syncAttentionAlerts() {
   jobsUi.alertsHelp.textContent = !supported ? "This browser cannot show notifications; the Overview lists these jobs."
     : blocked ? "Notifications are blocked for this page in the browser's site settings; the Overview lists these jobs."
     : "While TCS Prover is open in a tab, a notification says when a job first needs you: a CLI login, a usage "
-      + "limit, a rejected API key, or a model or setting to fix. The Overview lists these jobs either way.";
+      + "limit, a rejected API key, a program to install, or a model or setting to fix. The Overview lists these "
+      + "jobs either way.";
 }
 
 // One notification per job and reason, when it first appears (not for those already listed when

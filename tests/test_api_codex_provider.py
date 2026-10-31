@@ -181,6 +181,8 @@ class EnvironmentTests(ApiCase):
 
     def test_credentials_are_required_before_launch(self):
         model = self.model()
+        anthropic = providers.save_api_model({"format": "anthropic", "baseUrl": "https://gateway.example.com",
+                                              "model": "claude-gateway", "apiKey": KEY, "label": "Claude gateway"})["id"]
         runtime.require_model_credentials(model)
         store = Path(os.environ[providers.STORE_ENV])
         value = json.loads(store.read_text())
@@ -188,9 +190,10 @@ class EnvironmentTests(ApiCase):
         store.write_text(json.dumps(value))
         with self.assertRaisesRegex(runtime.Error, "Add an API key for Team gateway"):
             runtime.require_model_credentials(model)
+        # Installed CLIs are never checked here: the call that needs a missing one says so and retries.
         with mock.patch.object(runtime.shutil, "which", return_value=None):
-            with self.assertRaisesRegex(runtime.Error, "Claude CLI is not installed"):
-                runtime.verify_model_credentials("claude-haiku-5-5")
+            for selected in ("claude-haiku-5-5", "gpt-6.1-sol", anthropic):
+                runtime.verify_model_credentials(selected)
         with self.assertRaisesRegex(runtime.Error, "Unknown model"):
             runtime.verify_model_credentials("api:deleted")
 

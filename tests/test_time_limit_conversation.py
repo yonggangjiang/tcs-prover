@@ -450,7 +450,7 @@ class ConversationLaunchTests(PausedAuthorCase):
         def output():
             yield json.dumps({"kind": "status", "stage": "conversation", "label": runtime.RETRY_LABEL,
                               "text": "Model call failed (rate limited) — retrying in 1 min.",
-                              "retryAt": 2_000.5}) + "\n"
+                              "retryAt": 2_000.5, "failure": "rate limited"}) + "\n"
             release.wait(5)  # The runner waits to retry.
             yield json.dumps({"kind": "conversation_reply", "text": "Because."}) + "\n"
 
@@ -466,8 +466,9 @@ class ConversationLaunchTests(PausedAuthorCase):
             if self.items()[-1].get("retry"):
                 break
             threading.Event().wait(0.01)
+        # The failure too: a CLI that keeps failing to start lists the job under Needs your attention.
         self.assertEqual(self.items()[-1]["retry"], {"text": "Model call failed (rate limited) — retrying in 1 min.",
-                                                     "retryAt": 2_000.5})
+                                                     "retryAt": 2_000.5, "failure": "rate limited"})
         self.assertTrue(self.app.snapshot()["conversation"]["busy"])
         # The in-memory wait is never saved.
         saved = json.loads((server.controller_directory(self.run) / server.CONVERSATION_FILENAME).read_text())
@@ -581,10 +582,10 @@ class ConversationRuleTests(PausedAuthorCase):
 
     def test_a_launch_problem_is_retried_after_a_minute(self):
         self.app.ask_author("Hello?")
-        with patch.object(server, "require_model_access",
-                          side_effect=server.TransientLaunchError("Codex is updating.")):
+        unreadable = "Cannot read the API model store (Resource temporarily unavailable)."
+        with patch.object(server, "require_model_access", side_effect=server.TransientLaunchError(unreadable)):
             self.assertTrue(self.app.start_conversation_if_due(now=1_000))
-        self.assertEqual((self.items()[-1]["dueAt"], self.items()[-1]["error"]), (1_000 + WAIT, "Codex is updating."))
+        self.assertEqual((self.items()[-1]["dueAt"], self.items()[-1]["error"]), (1_000 + WAIT, unreadable))
         with patch.object(server.subprocess, "Popen", side_effect=OSError("no such file")):
             self.assertTrue(self.app.start_conversation_if_due(now=1_000 + WAIT))
         item = self.items()[-1]

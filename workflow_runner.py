@@ -344,7 +344,7 @@ class SafetyStop(FinalError):
 
 
 class CLIUnavailable(Error):
-    """The model's CLI is not on PATH, for example while it updates itself; a later attempt can find it."""
+    """The model's CLI is not on PATH (not installed yet, or updating itself); a later attempt can find it."""
 
 
 class ToolRuntimeUnavailable(Error):
@@ -497,8 +497,11 @@ def settings_failure(error, model=None):
     what to change; every other failure keeps being retried.
     """
 
-    if isinstance(error, (FinalError, WorkflowPaused, RetryCancelled, InvalidAnswer, SubagentFailure,
-                          providers.StoreUnavailable)):
+    # A missing CLI's message (also inside a reply turn's ConversationAttemptFailed) names a model and its
+    # connection, which never make it a settings problem.
+    missing = isinstance(error, CLIUnavailable) or isinstance(getattr(error, "__cause__", None), CLIUnavailable)
+    if missing or isinstance(error, (FinalError, WorkflowPaused, RetryCancelled, InvalidAnswer, SubagentFailure,
+                                     providers.StoreUnavailable)):
         return None
     if isinstance(error, providers.ProviderError):
         return ConfigurationError(str(error))
@@ -742,6 +745,61 @@ def prompt_file(path, default):
     """Read an optional per-job prompt, or use the built-in default."""
 
     return Path(path).read_text(encoding="utf-8") if path else default
+
+
+# The program each CLI is, in the words of missing_cli_text().
+CLI_PROGRAMS = {"Codex": "the Codex CLI", "Claude": "Claude Code"}
+
+
+def missing_cli_text(cli, model=None, stage=None):
+    """Why a model call cannot start: its CLI is not installed, which role and model need it, and why.
+
+    The program comes first, before "is not installed or is not on PATH"
+    (the words _FAILURE_PATTERNS and _cli_problem() recognize). Building the
+    text never fails: a model whose settings cannot be read (an unreadable
+    API model store, for example) gets the short form, which names only the
+    program. A paused author's reply (stage "conversation") never moves its
+    job on, so its text says that the reply is retried, not the job.
+    """
+
+    program = CLI_PROGRAMS[cli]
+    lead = f"{program[0].upper()}{program[1:]} is not installed or is not on PATH."
+    retried = ("the author's reply is retried every minute and arrives by itself." if stage == "conversation"
+               else "the job retries every minute and continues by itself.")
+    role = _STAGE_ROLES.get(stage or "")
+    whose = f"The {role}'s model" if role else "This call's model"
+    login = "ChatGPT" if cli == "Codex" else "Claude"
+    try:
+        api = model is not None and providers.provider_kind(model) == providers.API
+        label = providers.model_label(model) if model is not None else ""
+        wire = providers.wire_model(model) if api else ""
+    except (providers.ProviderError, Error, ValueError, OSError):
+        api, label, wire = False, "", ""
+    if not label:
+        return f"{lead} Install {program}; {retried}"
+    if api:
+        kind = "OpenAI" if cli == "Codex" else "Anthropic"
+        return (f"{lead} {whose} {wire} (API connection “{label}”) is {kind}-format, and TCS Prover runs "
+                f"{kind}-format models through {program} (no {login} login needed). Install {program}; {retried}")
+    how = "run codex login" if cli == "Codex" else "log in (run claude, then /login)"
+    return f"{lead} {whose} {label} runs through {program} with your {login} login. Install it and {how}; {retried}"
+
+
+def missing_cli(cli, model=None, stage=None):
+    """The CLIUnavailable of a call whose CLI is not installed (see missing_cli_text); it is retried."""
+
+    error = CLIUnavailable(missing_cli_text(cli, model, stage))
+    error.cli_problem = cli
+    return error
+
+
+def located_cli(lookup, cli, model, stage=None):
+    """``lookup()``, the path of a CLI; one that is not installed fails with missing_cli()."""
+
+    try:
+        return lookup()
+    except CLIUnavailable as exc:
+        raise missing_cli(cli, model, stage) from exc
 
 
 def codex():
@@ -1293,9 +1351,10 @@ def retry_clock(options):
 
 # Plain words for the provider failures that interrupt runs most often.
 _FAILURE_PATTERNS = (
+    # The runner's own words for a CLI it cannot find; a model or connection name in them says nothing.
+    (r"not installed or is not on path", "the CLI is not available"),
     (r"context window|context_length_exceeded|context length|prompt is too long|maximum context|"
      r"input is too long|too many input tokens|exceeds the context", "the conversation is too long for the model"),
-    (r"not installed or is not on path", "the CLI is not available"),
     (r"capacity|overload|\b529\b|\b503\b|service unavailable", "model at capacity"),
     (r"usage ?limit|usagelimited|usage_limit|budgetlimited|insufficient_quota|quota", "usage limit reached"),
     (r"rate ?limit|\b429\b|too many requests", "rate limited"),
@@ -1373,7 +1432,8 @@ def describe_failure(error):
         return (f"no output for {_duration_text(error.seconds)}" if error.seconds
                 else "the workflow time limit was reached"), ""
     text = redact(str(error) or type(error).__name__)
-    reason = _failure_reason(text)
+    # A missing CLI's own text (missing_cli_text) is quoted whole: it names the role, the model and the program.
+    reason = _failure_reason(text, 600 if _cli_problem(error) else 300)
     return _plain_failure(text) or reason or type(error).__name__, reason
 
 
@@ -1382,6 +1442,10 @@ def describe_failure(error):
 _CLI_PROBLEM_TEXT = re.compile(r"not installed or is not on path|command not found|exited with code 127|"
                                r"unexpected argument|unrecognized (?:option|argument|subcommand)|unknown option|"
                                r"invalid value .{0,80} for '--")
+# The CLI a missing CLI's text names just before its phrase (missing_cli_text); the name of the call's
+# model or connection, later in the text, may name the other CLI.
+_MISSING_CLI_NAME = re.compile(r"\b(codex|claude)\b(?:(?!\b(?:codex|claude)\b)[^.])*?"
+                               r"is not installed or is not on path")
 
 
 def _cli_problem(error):
@@ -1397,7 +1461,8 @@ def _cli_problem(error):
         return ""
     if _plain_failure(text) not in ("", "the CLI is not available", "the CLI stopped unexpectedly"):
         return ""  # The CLI ran and reported a provider failure, such as a login or a usage limit.
-    return named or ("Claude" if "claude" in text else "Codex")
+    lead = _MISSING_CLI_NAME.search(text)
+    return named or (lead.group(1).capitalize() if lead else "Claude" if "claude" in text else "Codex")
 
 
 def _retry_jitter(seconds):
@@ -1465,7 +1530,8 @@ def wait_before_retry(options, stage, attempt, error, *, cancel=None, node=None,
             else plain if missing
             else f"Model call failed ({plain})") + f" — retrying in {_duration_text(nominal)} ({', '.join(details)})."
     if reason and reason != plain:
-        text += f" {'Detail' if invalid else 'CLI message' if missing else 'Provider message'}: {reason}"
+        # A CLI that could not start contacted no provider: its message is the CLI's (or the runner's) own.
+        text += f" {'Detail' if invalid else 'CLI message' if missing or cli else 'Provider message'}: {reason}"
     said = _explanation_excerpt(getattr(error, "raw", "")) if invalid else ""
     if said:
         text += f" The model said: {said}"
@@ -1794,14 +1860,15 @@ def _confined_call(writable, model, environment, policy, workspace):
         shutil.rmtree(temp, ignore_errors=True)
 
 def require_model_credentials(model):
-    """Fail before launching a CLI that is missing or a key that was never saved."""
+    """Fail before a model call whose API model has no saved key.
+
+    Installed CLIs are never checked here: the call that needs a missing one
+    fails with missing_cli() and is retried every minute.
+    """
 
     model = chosen_model(model)
     if providers.provider_kind(model) == providers.API and not providers.api_model_secret(model):
         raise ConfigurationError(f"Add an API key for {providers.model_label(model)} in Advanced settings → API connections.")
-    if providers.harness(model) == providers.CLAUDE and not shutil.which("claude"):
-        # Missing for a moment while Claude Code updates itself: a model call retries it.
-        raise CLIUnavailable("Claude CLI is not installed or is not on PATH; install Claude Code to use Claude models.")
 
 def verify_model_credentials(model):
     """Check locally that the selected model has its required credential."""
@@ -2073,6 +2140,8 @@ def _explanation_excerpt(raw, limit=400):
 def _context_window_failure(error):
     """Whether a provider rejected the conversation as longer than the model's context."""
 
+    if isinstance(error, CLIUnavailable):
+        return False  # Nothing was sent; its message may name a connection such as "1M context window".
     text = str(error or "").lower()
     return any(marker in text for marker in CONTEXT_WINDOW_MARKERS)
 
@@ -3024,9 +3093,9 @@ def _run_structured_process(
             if policy:
                 executable = retrieval_runtime.codex_executable(policy)
             elif model_provider(model) == API_PROVIDER:
-                executable = api_codex_executable(child_environment)
+                executable = located_cli(lambda: api_codex_executable(child_environment), "Codex", model, stage)
             else:
-                executable = codex()
+                executable = located_cli(codex, "Codex", model, stage)
             tool_arguments = structured_tool_arguments(stage, features, policy, subagents)
         except retrieval_runtime.RetrievalPolicyError as exc:
             # The run's policy, its native binary or its search settings changed since this call checked them.
@@ -3334,10 +3403,7 @@ def structured(
     effort = effective_effort(model, effort)
     speed = effective_speed(model, speed)
     summary = reasoning_summary(model, summary)
-    try:
-        require_model_credentials(model)
-    except CLIUnavailable:
-        pass  # A CLI updating itself is back soon: every attempt looks for it again.
+    require_model_credentials(model)
     # Web-cutoff runs give structured roles no writable workspace: the answer carries the edited text.
     inline = edit_file is not None and policy is not None
     if inline:
@@ -3772,7 +3838,8 @@ def _user_extensions_off(config):
     return off
 
 
-def _author_app_server(runtime, *, directory, policy, role, model, settings, features, classic, sandbox=None):
+def _author_app_server(runtime, *, directory, policy, role, model, settings, features, classic, sandbox=None,
+                       stage="solve"):
     """The command line of an author's Codex app-server: (argv, child environment, whether it runs an API model).
 
     With a ``sandbox`` (_author_sandbox()) the app-server runs with the
@@ -3787,7 +3854,9 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
     it when the process ends (retrieval_runtime.remove_private_temp()). Its
     subagent limits (subagent_limits(), from ``features`` and
     settings["subagents"]) are session flags, which a web-cutoff run's
-    checks verify exactly.
+    checks verify exactly. ``stage`` ("solve", or "conversation" for a reply
+    of the paused author) words the message of a Codex that is not installed
+    (missing_cli()).
     """
 
     limits = subagent_limits(features, settings.get("subagents"))
@@ -3817,7 +3886,8 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
             confined = legacy_network_arguments(live)
         argv = [
             retrieval_runtime.codex_executable(policy) if policy
-            else runtime.api_codex_executable(child_environment) if api_model else runtime.codex(),
+            else located_cli(lambda: runtime.api_codex_executable(child_environment) if api_model
+                             else runtime.codex(), "Codex", model, stage),
             *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
             *retrieval_runtime.native_search_arguments(directory, policy=policy),
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
@@ -4648,7 +4718,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                                   read_only=restricted)
         argv, child_environment, api_model = _author_app_server(
             runtime, directory=directory, policy=policy, role="author", model=model, settings=settings,
-            features=launch_features, classic=classic, sandbox=sandbox)
+            features=launch_features, classic=classic, sandbox=sandbox, stage="conversation")
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -7771,15 +7841,19 @@ def failure_log_path(directory=None):
 
 
 def _workflow_models(paths, options):
-    """Every model that the nodes of these workflows would use; an invalid workflow is reported later."""
+    """(stage, model) of every model call the selected stages of these workflows would make.
+
+    The nodes of stages that are switched off run nothing (as prepare()
+    checks them); an invalid workflow is reported later.
+    """
 
     models = []
     for path in paths:
         try:
             nodes = load_workflow(path)["nodes"].values()
             for node in nodes:
-                if node["run"] != "command":
-                    models.append(_settings(node, options)["model"])
+                if node["run"] != "command" and _stage_enabled(node, options):
+                    models.append((node.get("stage") or "", _settings(node, options)["model"]))
         except (Error, ValueError, KeyError, TypeError, OSError):
             continue
     return models
@@ -7788,12 +7862,15 @@ def _workflow_models(paths, options):
 def check_clis(models, directory=None):
     """Name the path and version of each CLI these models need before any model call, and any that cannot run.
 
-    It runs `codex --version` or `claude --version` (no model call) and
-    remembers the answers in CLI_VERSIONS_FILENAME, so a CLI that changed
-    since the job last started is named too. Nothing waits: model calls
-    retry every minute until the CLI works. Web-cutoff runs check their
-    pinned binary in their own preflight instead. Where model processes
-    cannot be confined to their run (not macOS), a diagnostic says so.
+    ``models`` are (stage, model) pairs (a bare model has no known role).
+    It finds each CLI as the model calls do and runs `codex --version` or
+    `claude --version` (no model call), and remembers the answers in
+    CLI_VERSIONS_FILENAME, so a CLI that changed since the job last started
+    is named too. A CLI that is not installed is named with the role and
+    model that need it (missing_cli_text). Nothing waits: model calls retry
+    every minute until the CLI works. Web-cutoff runs check their pinned
+    binary in their own preflight instead. Where model processes cannot be
+    confined to their run (not macOS), a diagnostic says so.
     """
 
     directory = Path(directory or Path.cwd())
@@ -7805,28 +7882,43 @@ def check_clis(models, directory=None):
     if models and not confinement.supported():
         # Said once per runner; the run continues with the legacy sandboxes (see README).
         emit("diagnostic", "workflow", text=confinement.UNSUPPORTED_NOTICE)
-    names = []
-    for model in models:
+    # CLI -> (stage, model, API model?) of the first model that needs it; a built-in Codex model
+    # first, as its calls look for Codex on PATH only.
+    needs = {}
+    for entry in models:
+        stage, model = entry if isinstance(entry, tuple) else ("", entry)
         try:
-            name = "Claude" if providers.harness(chosen_model(model)) == providers.CLAUDE else "Codex"
+            model = chosen_model(model)
+            name = "Claude" if providers.harness(model) == providers.CLAUDE else "Codex"
+            api = model_provider(model) == API_PROVIDER
         except (Error, ValueError, providers.ProviderError):
             continue
-        if name not in names:
-            names.append(name)
+        if name not in needs or (needs[name][2] and not api):
+            needs[name] = (stage, model, api)
     found, problems = {}, []
-    for name in names:
+    retried = "Model calls retry every minute until it works."
+    for name, (stage, model, api) in needs.items():
         try:
-            path = claude_cli.executable(sys.modules[__name__]) if name == "Claude" else codex()
+            if name == "Claude":
+                path = located_cli(lambda: claude_cli.executable(sys.modules[__name__]), name, model, stage)
+            elif api:
+                # The Codex an API model's calls run (api_codex_executable), without their CODEX_HOME check.
+                path = located_cli(lambda: next(iter(_codex_candidates()), None) or codex(), name, model, stage)
+            else:
+                path = located_cli(codex, name, model, stage)
             result = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                                     env=environment(), timeout=CLI_CHECK_SECONDS)
+        except CLIUnavailable as exc:
+            problems.append(str(exc))  # What to install, and that the job continues by itself.
+            continue
         except (Error, OSError, subprocess.SubprocessError) as exc:
-            problems.append(f"{name} CLI missing or incompatible: {exc}")
+            problems.append(f"{name} CLI missing or incompatible: {exc} {retried}")
             continue
         version = _clipped(" ".join(result.stdout.split()), 200)
         if result.returncode or not version:
             problems.append(f"{name} CLI missing or incompatible: `{Path(path).name} --version` exited with code "
-                            f"{result.returncode}" + (f" ({version})." if version else "."))
+                            f"{result.returncode}" + (f" ({version})." if version else ".") + f" {retried}")
             continue
         found[name] = {"path": path, "version": version}
     record = directory / CLI_VERSIONS_FILENAME
@@ -7839,7 +7931,7 @@ def check_clis(models, directory=None):
         emit("status", "workflow", label="CLI check", cliVersions=found,
              text=" ".join(f"{name}: {item['version']} ({item['path']})." for name, item in found.items()))
     for problem in problems:
-        emit("diagnostic", "workflow", text=f"{problem} Model calls retry every minute until it works.")
+        emit("diagnostic", "workflow", text=problem)
     for name, item in found.items():
         before = previous.get(name)
         if isinstance(before, dict) and before != item:

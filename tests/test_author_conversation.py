@@ -1167,20 +1167,35 @@ class ConversationRetryTests(unittest.TestCase):
                 failed, = self.records("status", "Author reply failed")
                 self.assertEqual((failed["failure"], failed["text"]), ("configuration", text))
 
-    def test_a_cli_missing_for_a_moment_is_waited_for(self):
+    def test_a_missing_cli_is_waited_for(self):
+        # Not installed yet, or updating itself: the turn that needs it fails, and the same turn is sent again.
+        turns = self.run_turn(FakeTurns([runtime.missing_cli("Codex", "gpt-6.1-sol", "conversation")]))
+        self.assertEqual([call["attempt"] for call in turns.calls], [1, 2])
+        self.assertEqual(turns.calls[1]["instruction"], turns.calls[0]["instruction"])
+        self.assertEqual(self.waits(), 60)
+        notice, = [event for event in self.records("status", runtime.RETRY_LABEL) if "retryAt" in event]
+        self.assertEqual(notice["failure"], "the CLI is not available")
+        self.assertIn("CLI message: The Codex CLI is not installed or is not on PATH. The proof author's model GPT 6.1 "
+                      "Sol runs through the Codex CLI", notice["text"])
+        self.assertTrue(self.records("conversation_reply"))
+
+    def test_a_store_that_cannot_be_read_while_the_reply_is_prepared_is_waited_for(self):
+        # The preparation reads the API model store (chosen_model): unreadable for a moment, it is prepared again.
         checked = []
 
         def check(model):
             checked.append(model)
-            if len(checked) == 1:  # Claude Code updates itself.
-                raise runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH.")
+            if len(checked) == 1:
+                raise runtime.Error("Cannot read the API model store (Resource temporarily unavailable).")
 
         runtime.require_model_credentials.side_effect = check
         turns = self.run_turn(FakeTurns([]))
         self.assertEqual((len(checked), len(turns.calls)), (2, 1))
         self.assertEqual(self.waits(), 60)
         notice, = [event for event in self.records("status", runtime.RETRY_LABEL) if "retryAt" in event]
-        self.assertEqual(notice["failure"], "the CLI is not available")
+        self.assertEqual(notice["text"], "Model call failed (Cannot read the API model store (Resource temporarily "
+                                         "unavailable).) — retrying in 1 min (attempt 2).")
+        self.assertFalse(self.records("status", "Author reply failed"))
         self.assertTrue(self.records("conversation_reply"))
 
     def test_stop_ends_a_wait_at_once(self):
