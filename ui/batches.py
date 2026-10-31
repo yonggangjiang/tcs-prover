@@ -467,7 +467,8 @@ class BatchCatalog:
 
     def state(self, batch_id, run_id, after=None):
         from .server import (RESUME_MARGIN_SECONDS, controller_note, empty_state, event_node, follow_time_limit,
-                             model_menu_settings, saved_api_models, saved_time_limit_history, workflow_graph)
+                             model_menu_settings, role_model_sources, saved_api_models, saved_time_limit_history,
+                             workflow_graph)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
@@ -520,6 +521,8 @@ class BatchCatalog:
         # graph constants never hold user data.
         graph = state['workflow']
         state['workflow'] = {**graph, 'settings': {**graph['settings'], **model_menu_settings()}}
+        # Run settings name each role's source as a live job's do (never a key or a full URL).
+        state['modelSources'] = role_model_sources(state, state['workflow']['settings']['model_catalog'])
         records, truncated, version = self._trace(directory)
         # The time limit's history: the job settings keep it whole; older jobs rebuild it from recent records.
         history = saved_time_limit_history(settings.get('timeLimitHistory'))

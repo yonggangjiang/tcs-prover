@@ -3172,7 +3172,7 @@ kbd {
 .api-test-result.stale strong { color: var(--ink-2); }
 /* The live regions stay rendered while empty (a screen reader then hears their first message),
    but take no room. */
-.api-models-status:empty, .api-test-result:empty {
+.api-models-status:empty, .api-test-result:empty, .api-saved-key:empty {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -3306,6 +3306,35 @@ kbd {
 .api-field-wide { grid-column: 1 / -1; }
 .api-model-form :is(input, select) { min-width: 0; font-family: var(--font-mono); font-size: var(--text-sm); }
 .api-key-help { font-size: var(--text-xs); }
+/* The key field. While a saved key is kept, its line takes the field's place: a sunken slot with
+   the last four characters and Replace key. A base URL on another server turns the line into a
+   note with Use saved URL above the shown field; after Replace key only the field shows. */
+.api-saved-key-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.api-saved-key-icon { display: none; color: var(--ink-3); }
+.api-saved-key-text { flex: 1 1 16rem; min-width: 0; color: var(--ink); font-size: var(--text-sm); line-height: 1.45; overflow-wrap: anywhere; }
+/* The live line and the sentence naming the other server read as one paragraph. */
+.api-saved-key, .api-saved-key-other { display: inline; margin: 0; }
+.api-saved-key code { color: var(--ink); font: 600 var(--text-sm)/1 var(--font-mono); }
+.api-key-help code { color: var(--ink); }
+.api-model-form[data-key-state="kept"] .api-saved-key-row {
+  min-height: 36px;
+  padding: 2px 2px 2px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+.api-model-form[data-key-state="kept"] .api-saved-key-icon { display: block; }
+.api-model-form[data-key-state="other-server"] .api-saved-key-row {
+  margin-bottom: 8px;
+  padding: 7px 7px 7px 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--tint);
+  box-shadow: inset 2px 0 0 var(--waiting);
+}
+.api-key-input-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.api-key-input-row input { flex: 1 1 14rem; }
+.api-saved-key-row button, .api-key-input-row button { flex: none; }
 /* Header help: code samples keep the 12px floor (no em-relative shrink). */
 .api-header-help { margin-top: var(--space-3); }
 .api-model-form-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-top: var(--space-4); }
@@ -3836,6 +3865,7 @@ kbd {
 .toggle-line input { flex: none; }
 :root[data-theme="ink"] :is(.attention-banner, .job-attention, .convention-warning) { box-shadow: inset 2px 0 0 var(--ink); }
 :root[data-theme="ink"] .api-models-problem { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] .api-model-form[data-key-state="other-server"] .api-saved-key-row { box-shadow: inset 2px 0 0 var(--ink); }
 
 /* 14. Author conversation and related works ---------------------------------- */
 /* The conversation sits in the now-card, after the recovery block and before the box that asks:

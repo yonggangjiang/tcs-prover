@@ -1791,6 +1791,143 @@ def saved_api_models(value):
     return snapshots
 
 
+# Run settings name each role's source: a built-in model by its source menu's name
+# (providers.PROVIDER_LABELS), an API model by its connection, format, host and the
+# program its format runs through.
+API_FORMAT_LABELS = {providers.OPENAI_FORMAT: "OpenAI format", providers.ANTHROPIC_FORMAT: "Anthropic format"}
+
+
+def _program_name(harness):
+    """A CLI as a sentence names it, from its source menu's name: "the Codex CLI", "the Claude CLI".
+
+    A product name that is not "… CLI" (Claude Code, say) takes no article.
+    """
+
+    label = providers.PROVIDER_LABELS[harness]
+    return f"the {label}" if label.endswith(" CLI") else label
+
+
+# One name per program: a role's source and the program an API model runs through both take
+# it from providers.PROVIDER_LABELS, so renaming a program there renames it everywhere here.
+SOURCE_PROGRAMS = {harness: _program_name(harness) for harness in (providers.CODEX, providers.CLAUDE)}
+SOURCE_UNREADABLE = "connection list cannot be read now"
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _endpoint(base_url):
+    """Where a base URL sends requests, to compare two: (scheme, host, port, path), or None.
+
+    The port is the scheme's default when the URL names none, and the path
+    has no trailing slash.
+    """
+
+    try:
+        parts = urlsplit(base_url) if isinstance(base_url, str) else None
+        if parts is None or not parts.hostname:
+            return None
+        scheme = parts.scheme.lower()
+        return scheme, parts.hostname.lower()[:253], parts.port or DEFAULT_PORTS.get(scheme), parts.path.rstrip("/")
+    except ValueError:
+        return None
+
+
+def _address(endpoint):
+    """An _endpoint() as Run settings show it: its host, with the port unless it is the scheme's default.
+
+    '' for None. Never the URL or its path, which could hold more.
+    """
+
+    if endpoint is None:
+        return ""
+    scheme, host, port, _ = endpoint
+    if port is None or port == DEFAULT_PORTS.get(scheme):
+        return host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _api_source(model, row, record, unreadable, base_url=None):
+    """The source of one API model id: its connection now (``base_url`` its base URL), or as the job recorded it."""
+
+    entry = {"model": model, "kind": providers.API}
+    if row is not None:
+        now = _endpoint(base_url)
+        entry.update(configured=True, label=row["label"], wireModel=row["wireModel"], connection=row["sourceLabel"],
+                     format=row["format"], host=_address(now) if now else row["host"])
+        # A model call already under way keeps the endpoint and model it started with; the job's next
+        # model call uses the connection as it is now. So an edit since the job started (its format,
+        # host, port, path or model) also names what the job started with, though never its path.
+        if record and (record["format"] != row["format"] or record["model"] != row["wireModel"]
+                       or (now is not None and _endpoint(record["baseUrl"]) != now)):
+            entry["recorded"] = {"format": record["format"], "formatLabel": API_FORMAT_LABELS[record["format"]],
+                                 "host": _address(_endpoint(record["baseUrl"])), "wireModel": record["model"]}
+    else:
+        # Removed, or unknown for now: an unreadable connection list is never a removed connection.
+        entry["configured"] = None if unreadable else False
+        if unreadable:
+            entry["reason"] = SOURCE_UNREADABLE
+        if record:
+            entry.update(label=record["model"], wireModel=record["model"], connection=record["sourceLabel"],
+                         format=record["format"], host=_address(_endpoint(record["baseUrl"])))
+    if "format" in entry:
+        harness = providers.harness_for_format(entry["format"])
+        entry.update(formatLabel=API_FORMAT_LABELS[entry["format"]], runsThrough=harness,
+                     runsThroughLabel=SOURCE_PROGRAMS[harness])
+    return entry
+
+
+def role_model_sources(state, catalog):
+    """Where each role's model runs, for Run settings: {role: entry} for every role in ROLES.
+
+    Read from the role's model id, this response's catalog rows and the job's
+    record of its API models. That record lives in job-settings.json, which
+    the author's workspace can write: it is display text only and never
+    routes anything. No entry holds a key or a full URL. An id the catalog
+    does not list is looked up once: an older Codex id or an API selection id
+    outside the menus still resolves. A connection list that cannot be read
+    now (the catalog then lists the built-in models only) gives an API model
+    ``configured: None``, never a removed connection. The saved connections'
+    base URLs, which the catalog leaves out, are read once, to name an API
+    model's port and to compare its endpoint with the job's record.
+    """
+
+    rows = {row["id"]: row for row in catalog or () if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    records = saved_api_models(state.get("apiModels"))
+    found, unreadable = {}, set()
+    base_urls = None
+    sources = {}
+    for role in ROLES:
+        model = state.get(f"{role}Model")
+        model = model if isinstance(model, str) else ""
+        row = rows.get(model)
+        if row is None and model not in found:
+            try:
+                found[model] = providers.lookup(model)
+            except providers.StoreUnavailable:
+                found[model] = None
+                unreadable.add(model)
+        row = row or found.get(model)
+        if providers.is_api_id(model):
+            if row is not None and base_urls is None:
+                try:
+                    base_urls = {item["id"]: item["baseUrl"] for item in providers.load_api_models()}
+                except providers.StoreUnavailable:
+                    base_urls = {}  # Then the catalog's host is shown, and the endpoints are not compared.
+            base_url = base_urls.get(row.get("sourceId")) if row is not None else None
+            sources[role] = _api_source(model, row, records.get(model), model in unreadable, base_url)
+        elif row is not None:
+            kind = row["provider"]
+            sources[role] = {"model": model, "kind": kind, "label": row["label"], "source": row["providerLabel"],
+                             "runsThrough": kind, "runsThroughLabel": SOURCE_PROGRAMS[kind],
+                             "older": row.get("legacy") is True}
+        elif providers.replacement_for_removed(model):
+            replacement = providers.replacement_for_removed(model)
+            sources[role] = {"model": model, "kind": "removed", "replacement": replacement,
+                             "replacementLabel": providers.model_label(replacement)}
+        else:
+            sources[role] = {"model": model, "kind": "unknown"}
+    return sources
+
+
 def _api_connection_headers(entry):
     """Automatic protocol authentication and source for tests and model discovery."""
 
@@ -2730,6 +2867,8 @@ class App:
             state["workflow"] = {
                 **graph, "settings": {**graph["settings"], "prompts": prompts, **model_menu_settings()},
             }
+            # Run settings: where each role's model runs, from this response's catalog.
+            state["modelSources"] = role_model_sources(state, state["workflow"]["settings"]["model_catalog"])
             state["checkpoints"] = [dict(item, resumable=False) if not saved_workflow_stages(state)["critic"]
                                     else item for item in self._checkpoint_cache]
             state["canDownloadTex"] = bool(
@@ -9398,7 +9537,7 @@ class Server(ThreadingHTTPServer):
 
     def save_api_model(self, body):
         """Create or update one API model; an empty apiKey keeps the saved key
-        while the format and base URL stay the same.
+        while the base URL stays on the server it was saved for.
 
         A new model with exactly the settings a job recorded for a removed API
         model gets that model's id back, whatever its display name, so the job
@@ -9438,10 +9577,16 @@ class Server(ThreadingHTTPServer):
         return {"model": model, **self.api_model_listing()}
 
     def save_api_connection(self, body):
-        """Discover and save one key once; role menus select its models later."""
+        """Discover and save one key once; role menus select its models later.
+
+        An empty apiKey keeps the saved key while the base URL stays on its
+        server, also when repairing an entry that cannot be used.
+        """
 
         requested = body.get("id") or None
         saved = providers.api_connection(requested) if requested else None
+        repairing = saved is None and requested and any(
+            entry["id"] == requested for entry in providers.invalid_api_models())
         expected = ({**providers.validated_api_connection({}, requested),
                      "label": saved["label"], "updatedAt": saved["updatedAt"]} if saved else None)
         with self.jobs_lock:
@@ -9449,7 +9594,7 @@ class Server(ThreadingHTTPServer):
                     and any(self._api_model_jobs(requested))):
                 raise ValueError("The API format decides which CLI runs these models, so it cannot change while "
                                  "jobs use this connection. Add a new API connection for the other format.")
-        entry = providers.validated_api_connection(body, requested if saved else None)
+        entry = providers.validated_api_connection(body, requested if saved or repairing else None)
         discovery = discover_api_models(entry)
         if not discovery["ok"]:
             raise ValueError(discovery["message"] or "No models are available for this API key.")
@@ -9527,7 +9672,8 @@ class Server(ThreadingHTTPServer):
         fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "apiKey") if key in body}
         entry = providers.validated_api_connection(fields, requested)
         result = discover_api_models(entry)
-        if requested and result["ok"]:
+        # Only a usable saved connection takes the list (not an entry being repaired).
+        if requested and result["ok"] and providers.api_connection(requested, cached=False) is not None:
             current = providers.validated_api_connection({}, requested)
             if all(current[key] == entry[key] for key in ("format", "baseUrl", "requestSource", "apiKey")):
                 result["connection"] = providers.refresh_api_connection(requested, entry, result["models"])
@@ -9540,9 +9686,10 @@ class Server(ThreadingHTTPServer):
         """Test a saved API model ({id}) or unsaved form fields with one request.
 
         Form fields with the id of a saved model fill gaps from that model; an
-        empty key is filled in only while the format and base URL
-        are the saved ones, so the saved key never goes to another destination.
-        Only a test of exactly the saved settings is recorded as its last test.
+        empty key is filled in only while the base URL stays on the server the
+        key was saved for (another path or format keeps it), so the saved key
+        never goes to another server. Only a test of exactly the saved settings
+        is recorded as its last test.
         """
 
         requested = body.get("id") or None
@@ -9551,7 +9698,8 @@ class Server(ThreadingHTTPServer):
             entry = providers.validated_api_connection(fields, requested)
             result = discover_api_models(entry)
             result["recorded"] = False
-            if requested:
+            # An entry being repaired has no saved settings to record a test on.
+            if requested and providers.api_connection(requested, cached=False) is not None:
                 current = providers.validated_api_connection({}, requested)
                 if all(current[key] == entry[key] for key in ("format", "baseUrl", "requestSource", "apiKey")):
                     connection = providers.record_api_model_test(requested, {
@@ -9908,7 +10056,13 @@ class Handler(BaseHTTPRequestHandler):
                 "/settings": self.server.save_installation_settings,
             }
             if request.path in api_model_actions:
-                return self.send(api_model_actions[request.path](body))
+                try:
+                    result = api_model_actions[request.path](body)
+                except providers.KeyRequired as exc:
+                    # The settings need the API key (none was sent, and no saved key may go to their
+                    # server): keyRequired makes the page show its key field.
+                    return self.send({"error": str(exc), "keyRequired": True}, status=400)
+                return self.send(result)
             # Staged uploads belong to no job until one takes them.
             if request.path == "/uploads/note":
                 return self.send({"upload": self.server._uploads().note(body.get("title"), body.get("text"))})

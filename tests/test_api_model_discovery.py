@@ -89,15 +89,29 @@ class ModelDiscoveryTests(HttpCase):
                          (before["id"], before["model"], before["lastTest"]))
         self.assertEqual([row["id"] for row in providers.api_connection(saved["id"])["models"]], ["gpt-a", "gpt-z"])
 
-    def test_saved_key_cannot_be_sent_to_an_edited_destination(self):
+    def test_saved_key_is_sent_only_to_the_server_it_was_saved_for(self):
         saved = self.saved()
-        for change in ({"baseUrl": self.endpoint.base + "/other"}, {"baseUrl": "https://other.example/v1"},
-                       {"format": "anthropic"}):
+        port = self.endpoint.http.server_port
+        # Another host (also another name for this one) or another port is another server.
+        for change, message in (({"baseUrl": "https://other.example/v1"}, "Enter the API key for other.example:"),
+                                ({"baseUrl": "http://127.0.0.1:1/v1"}, "Enter the API key for 127.0.0.1:1:"),
+                                ({"baseUrl": f"http://localhost:{port}/v1"}, f"Enter the API key for localhost:{port}:")):
             with self.subTest(change=change):
                 status, result = self.discover({"id": saved["id"], "apiKey": "", **change})
                 self.assertEqual(status, 400)
-                self.assertIn("Enter the API key again", result["error"])
+                self.assertIn(message, result["error"])
         self.assertEqual(self.endpoint.requests, [])
+        # Another path or format on the saved server keeps the key.
+        for change, path, header in (({"baseUrl": self.endpoint.base + "/other"}, "/other/models", "authorization"),
+                                     ({"format": "anthropic"}, "/v1/models", "x-api-key")):
+            with self.subTest(change=change):
+                self.endpoint.requests.clear()
+                status, result = self.discover({"id": saved["id"], "apiKey": "", **change})
+                self.assertEqual((status, result["ok"]), (200, True))
+                request = self.endpoint.requests[0]
+                self.assertEqual(urlsplit(request["path"]).path, path)
+                self.assertEqual(request["headers"][header].removeprefix("Bearer "), KEY)
+        self.endpoint.requests.clear()
         # Source changes keep the saved key; legacy authentication overrides are ignored.
         status, result = self.discover({"id": saved["id"], "headerName": "X-Gateway-Key",
                                        "requestSource": "Zephy-TCS-Prover"})

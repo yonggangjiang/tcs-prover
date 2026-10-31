@@ -156,22 +156,26 @@ assert.match(ui.runHealth.textContent, /^Running$/);
 assert.equal(ui.resultPanel.hidden, true);
 assert(ui.runMetadata.children.some(row => row.children[1].textContent.includes('gpt-6.1-sol')));
 const settingsRow = label => ui.runMetadata.children.find(row => row.children[0].textContent === label).children[1].textContent;
-assert.equal(settingsRow('Independent critic'), 'gpt-6-astra · high · 3 independent critics as subagents · max 2 consecutive rounds');
+// A role's row: its model, effort and settings, then on a second line where the model runs. This state has no
+// catalog and no source entries (an older controller): the built-in ids still name their CLI.
+const roleLines = label => settingsRow(label).split(String.fromCharCode(10));
+assert.deepEqual(roleLines('Independent critic'), ['gpt-6-astra · high · 3 independent critics as subagents · max 2 consecutive rounds',
+  "Source: Codex CLI · this computer's Codex login"]);
 state.criticCount = 1;
 renderRunOverview();
-assert.equal(settingsRow('Independent critic'), 'gpt-6-astra · high · 1 independent critic as a subagent · max 2 consecutive rounds');
+assert.equal(roleLines('Independent critic')[0], 'gpt-6-astra · high · 1 independent critic as a subagent · max 2 consecutive rounds');
 // An older job that did not record its number of critics is not credited with any.
 state.criticCount = 3; state.criticCountRecorded = false;
 renderRunOverview();
-assert.equal(settingsRow('Independent critic'), 'gpt-6-astra · high · max 2 consecutive rounds');
+assert.equal(roleLines('Independent critic')[0], 'gpt-6-astra · high · max 2 consecutive rounds');
 delete state.criticCountRecorded;
 // A job from before the Author subagents setting: its critic ran its independent critics itself, and its author
 // is not described with the setting.
-assert.equal(settingsRow('Proof author'), 'gpt-6.1-sol · max · no subagents');
+assert.deepEqual(roleLines('Proof author'), ['gpt-6.1-sol · max · no subagents', "Source: Codex CLI · this computer's Codex login"]);
 state.authorSubagentsRecorded = false;
 renderRunOverview();
-assert.equal(settingsRow('Independent critic'), 'gpt-6-astra · high · 3 independent critics · max 2 consecutive rounds');
-assert.equal(settingsRow('Proof author'), 'gpt-6.1-sol · max');
+assert.equal(roleLines('Independent critic')[0], 'gpt-6-astra · high · 3 independent critics · max 2 consecutive rounds');
+assert.equal(roleLines('Proof author')[0], 'gpt-6.1-sol · max');
 delete state.authorSubagentsRecorded;
 state.processAlive = false; state.workerActive = false;
 renderRunOverview(); assert.match(ui.runHealth.textContent, /No active process/);

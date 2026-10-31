@@ -1906,23 +1906,109 @@ function timeLimitPauseNotes(history = timeLimitHistory()) {
 
 // An API model id that the server's current catalog no longer lists. /state rebuilds the catalog
 // on every poll, so a model removed while this page is open shows up here at once (the server
-// states it in settingsWarning only when it loads the job). Without a catalog (an older
-// server), nothing is claimed.
+// states it in settingsWarning only when it loads the job). The server's source entry decides
+// when it sent one: an id it resolved outside the menus is configured, and a connection list it
+// could not read is never taken for a removed model. Without a catalog (an older server),
+// nothing is claimed.
 function unconfiguredApiModel(model) {
+  const source = Object.values(state.modelSources || {}).find((entry) => entry?.kind === "api" && entry.model === model);
+  if (source) return source.configured === false;
   const catalog = state.workflow?.settings?.model_catalog;
   return Array.isArray(catalog) && String(model || "").startsWith("api:")
     && !catalog.some((row) => row.id === model);
 }
 
-// One role's saved model id and effort; an API model adds the endpoint the job recorded
-// (state.apiModels holds that key-free snapshot, kept even after the model is removed).
-function modelRecord(model, effort) {
-  const api = state.apiModels?.[model];
-  const endpoint = api ? ` · ${api.label} · ${api.format === "anthropic" ? "Anthropic" : "OpenAI"} format`
-    + ` · ${api.baseUrl} · model ${api.model}` : "";
+// Where one role's model runs, for Run settings: the server's entry (state.modelSources, which
+// never holds a key or a full URL). An older controller reached through the live gateway sends
+// none; then the same facts come from the catalog and the job's key-free record of its API models
+// (state.apiModels, kept after a connection is removed). Kinds: codex, claude, api, removed (a
+// model TCS Prover no longer supports) and unknown. An API entry's configured is true, false
+// (removed) or null (the connection list cannot be read now); without a catalog to tell, it is
+// left out. The catalog names no port or path, so without the server's entry the line names no
+// port, and only an edit of a connection's format, host or model is seen.
+function roleModelSource(role, model) {
+  const entry = state.modelSources?.[role];
+  if (entry && typeof entry === "object" && entry.model === model) return entry;
+  model = String(model || "");
+  const catalog = state.workflow?.settings?.model_catalog, listed = Array.isArray(catalog);
+  const row = listed ? catalog.find((item) => item.id === model) : undefined;
+  // As modelProvider(): the catalog decides, else the built-in ids' fixed pattern.
+  const kind = row?.provider || (model.startsWith("api:") ? "api" : /^gpt-/.test(model) ? "codex"
+    : /^claude-/.test(model) ? "claude" : "unknown");
+  if (kind === "codex" || kind === "claude") {
+    return { model, kind, label: row?.label, source: row?.providerLabel, older: kind === "codex" && listed && !row };
+  }
+  if (kind !== "api") return { model, kind };
+  // The host of a recorded base URL as the catalog names hosts (Python's urlsplit().hostname: after
+  // any user@, an IPv6 address without its brackets, lowercase), never the URL itself (display only).
+  const host = (url) => {
+    const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(String(url || ""))?.[1] || "";
+    const address = authority.slice(authority.lastIndexOf("@") + 1);
+    const bracket = address.indexOf("[");
+    return (bracket >= 0 ? address.slice(bracket + 1).split("]")[0] : address.split(":")[0]).toLowerCase();
+  };
+  const saved = state.apiModels?.[model];
+  const record = saved && typeof saved === "object" && ["openai", "anthropic"].includes(saved.format) ? saved : null;
+  if (row) {
+    const source = { model, kind, configured: true, label: row.label, wireModel: row.wireModel, connection: row.sourceLabel,
+      format: row.format, host: row.host };
+    if (record && (record.format !== row.format || host(record.baseUrl) !== row.host
+      || (row.wireModel !== undefined && record.model !== row.wireModel))) {
+      source.recorded = { format: record.format, host: host(record.baseUrl), wireModel: record.model };
+    }
+    return source;
+  }
+  return { model, kind, ...(listed ? { configured: false } : {}),
+    ...(record ? { label: record.model, wireModel: record.model, connection: record.sourceLabel || record.label,
+      format: record.format, host: host(record.baseUrl) } : {}) };
+}
+
+// One role's two Run settings lines: its model and effort, then where it runs. A built-in model
+// runs through its CLI with this computer's login; an API model through the program its format
+// needs (OpenAI format the Codex CLI, Anthropic format the Claude CLI), each program under the one
+// name its source menu gives it. A removed or unreadable connection shows what the job recorded.
+// One edited since the job started also names the host, format and model it started with, which a
+// model call already under way keeps using (the job's next model call uses the edited connection);
+// when those read the same (another base URL path), the line says only that it was edited.
+function roleModelText(role, model, effort) {
+  const source = roleModelSource(role, model);
   // A saved job or a script may still say ultra, which is no longer offered and runs as max.
   const level = effort === "ultra" ? "max (Ultra is no longer offered)" : effort;
-  return `${model}${unconfiguredApiModel(model) ? " (not configured)" : ""} · ${level}${endpoint}`;
+  const formatName = (format) => format === "anthropic" ? "Anthropic format" : "OpenAI format";
+  // The source menus' names (the server's providers.PROVIDER_LABELS), for an older controller.
+  const cliName = { codex: "Codex CLI", claude: "Claude CLI" };
+  const edited = (was) => {
+    if (was.host === source.host && was.format === source.format && was.wireModel === source.wireModel) {
+      return "edited since this job started";
+    }
+    const how = [was.formatLabel || formatName(was.format), was.wireModel ? `model ${was.wireModel}` : ""]
+      .filter(Boolean).join(", ");
+    return `this job started with ${was.host ? `${was.host} (${how})` : how}`;
+  };
+  let where;
+  if (source.kind === "codex" || source.kind === "claude") {
+    const codex = source.kind === "codex";
+    where = `${source.source || cliName[source.kind]} · this computer's ${codex ? "Codex" : "Claude"} login`
+      + (source.older ? " · older model" : "");
+  } else if (source.kind === "api") {
+    const unreadable = source.reason || "connection list cannot be read now";
+    if (!source.format) {
+      where = source.configured === false ? "API connection not configured"
+        : source.configured === null ? `API connection · ${unreadable}` : "API connection";
+    } else {
+      const program = source.runsThroughLabel || `the ${cliName[source.format === "anthropic" ? "claude" : "codex"]}`;
+      where = [source.connection ? `API connection “${source.connection}”` : "API connection",
+        source.configured === false ? "not configured now; as this job recorded it"
+          : source.configured === null ? `${unreadable}; as this job recorded it`
+          : source.configured === true ? "" : "as this job recorded it",
+        source.formatLabel || formatName(source.format), source.host, `runs through ${program}`,
+        source.recorded ? edited(source.recorded) : ""].filter(Boolean).join(" · ");
+    }
+    where += ` · id ${source.model}`;
+  } else {
+    where = source.kind === "removed" ? "no longer supported" : "unknown model";
+  }
+  return [`${source.label || model || "Unknown model"} · ${level}`, `Source: ${where}`];
 }
 
 // A saved job cannot change its models, so a removed API model it needs must be added again:
@@ -2063,30 +2149,36 @@ function renderRunOverview() {
   const changed = Boolean(original && original.trim() !== statement.trim());
   show(ui.originalStatementDetails, changed);
   if (ui.runOriginalStatement.textContent !== (original || "")) ui.runOriginalStatement.textContent = original || "";
+  // A role's row: its model and effort, then its own settings, then where the model runs (the critic's
+  // source covers the convention critic too).
+  const roleRow = (role, model, effort, extras = "") => {
+    const [modelLine, sourceLine] = roleModelText(role, model, effort);
+    return `${modelLine}${extras}\n${sourceLine}`;
+  };
   const metadata = [
     ["Run", state.runId || "—"], ["Started", localDateTime(state.startedAt)],
     ["Last event", localDateTime(state.lastActivityAt)],
     ["Finished", state.phase === "done" ? localDateTime(state.finishedAt) : "Not finished"],
     ...(state.sourceFile ? [["Input file", state.sourceFile]] : []),
-    ["Statement reviewer", stages.review ? modelRecord(state.reviewModel, state.reviewEffort || state.reasoningEffort) : "Off"],
-    ["Proof author", stages.author ? modelRecord(state.authorModel, state.authorEffort || state.reasoningEffort)
+    ["Statement reviewer", stages.review ? roleRow("review", state.reviewModel, state.reviewEffort || state.reasoningEffort) : "Off"],
+    ["Proof author", stages.author ? roleRow("author", state.authorModel, state.authorEffort || state.reasoningEffort,
       // An older job, from before the Author subagents setting, is not described with it.
-      + (state.authorSubagentsRecorded === false ? ""
+      state.authorSubagentsRecorded === false ? ""
         : Number.isInteger(state.authorSubagents) && state.authorSubagents > 0
           ? ` · up to ${state.authorSubagents} subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
           : " · no subagents") : "Off"],
     // The limit now, and every change of it and pause at it (the server's records).
     ["Author time limit", stages.author ? limitSettingText(Number(state.thinkingHours ?? 0)) : "Off"],
     ...(timeLimitHistory().length ? [["Time limit history", timeLimitHistoryLines().join("\n")]] : []),
-    ["Independent critic", stages.critic ? `${modelRecord(state.criticModel, state.criticEffort || state.reasoningEffort)}`
+    ["Independent critic", stages.critic ? roleRow("critic", state.criticModel, state.criticEffort || state.reasoningEffort,
       // An older job that did not record its number of critics may never have run them, and one from before
       // the Author subagents setting ran them itself, not as the critic's subagents.
-      + (Number.isInteger(state.criticCount) && state.criticCountRecorded !== false
+      (Number.isInteger(state.criticCount) && state.criticCountRecorded !== false
         ? ` · ${state.criticCount} independent critic${state.criticCount === 1 ? "" : "s"}`
           + (state.authorSubagentsRecorded === false ? "" : state.criticCount === 1 ? " as a subagent" : " as subagents")
         : "")
-      + ` · max ${state.criticRounds} consecutive rounds` : "Off"],
-    ["LaTeX writer", stages.writing ? modelRecord(state.writerModel, state.writerEffort || state.reasoningEffort) : "Off"],
+      + ` · max ${state.criticRounds} consecutive rounds`) : "Off"],
+    ["LaTeX writer", stages.writing ? roleRow("writer", state.writerModel, state.writerEffort || state.reasoningEffort) : "Off"],
     ...(settingsWarning ? [["Settings warning", settingsWarning]] : []),
     ["Generation", state.speedMode || "standard"], ["Activity summaries", state.reasoningSummary || "concise"],
     ["Web search", retrievalSummary(state)],
@@ -5276,14 +5368,17 @@ ui.batchCancelNote.onclick = () => setNoteForm(ui.batchNoteForm, null, false);
 ui.authorLimitHours.addEventListener("input", renderAuthorLimitHint);
 
 // API models (Advanced settings → API connections): one saved key exposes its model catalog.
-// Keys travel only in POST bodies and are never returned by the controller.
+// Keys travel only in POST bodies and are never returned by the controller: of a saved key the
+// page gets at most its last four characters (keyHint), which is all it ever shows.
 const apiUi = {
   group: $("apiModels"), heading: $("apiModelsHeading"), count: $("apiModelCount"),
   status: $("apiModelsStatus"), list: $("apiModelList"), empty: $("apiModelEmpty"),
   form: $("apiModelForm"), formHeading: $("apiModelFormHeading"), formatHelp: $("apiModelFormatHelp"),
   formats: [$("apiModelFormatOpenai"), $("apiModelFormatAnthropic")],
   baseUrl: $("apiModelBaseUrl"), requestSource: $("apiModelRequestSource"), key: $("apiModelKey"),
-  keyHelp: $("apiModelKeyHelp"), label: $("apiModelName"), result: $("apiModelTestResult"),
+  keyHelp: $("apiModelKeyHelp"), savedKey: $("apiModelSavedKey"), otherServer: $("apiModelOtherServer"),
+  replaceKey: $("apiModelReplaceKey"), keepKey: $("apiModelKeepKey"), useSavedUrl: $("apiModelUseSavedUrl"),
+  label: $("apiModelName"), result: $("apiModelTestResult"),
   contextWindow: $("apiModelContextWindow"), maxOutput: $("apiModelMaxOutput"), problem: $("apiModelsProblem"),
   cancel: $("apiModelCancelButton"), test: $("apiModelTestButton"), save: $("apiModelSaveButton"),
 };
@@ -5298,6 +5393,8 @@ const apiFormats = {
 };
 const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic", writer: "LaTeX writer" };
 let apiModels = [], apiModelEditing = null, apiModelBusy = false;
+// Replace key was chosen: the key field is shown and its new key replaces the saved one.
+let apiKeyReplacing = false;
 let apiModelsUnavailable = false, apiModelsLoaded = false;
 let apiFormEdits = 0, apiSaveEdits = 0, apiShownTest = null;
 // Entries of the store that cannot be used (listed to repair or remove), and why the store or TCS
@@ -5317,7 +5414,11 @@ async function apiModelRequest(path, body) {
     apiModelsUnavailable = true;
     throw new Error("This TCS Prover server cannot manage API connections. Restart TCS Prover to update it.");
   }
-  if (!response.ok) throw new Error(data.error || `The request failed (HTTP ${response.status}).`);
+  // keyRequired: the controller asks for the API key, as it keeps none for these settings.
+  if (!response.ok) {
+    throw Object.assign(new Error(data.error || `The request failed (HTTP ${response.status}).`),
+      { keyRequired: data.keyRequired === true });
+  }
   return data;
 }
 
@@ -5444,8 +5545,8 @@ function apiLimitsText(connection) {
     .filter(Boolean).join(" · ");
 }
 // An entry of the store that cannot be used (edited by hand, or saved by another version): what is
-// readable of it (never its key or URL) and why, with Repair (the form, which saves it under its
-// id) and Remove.
+// readable of it (never its key or its URL's path) and why, with Repair (the form, which saves it
+// under its id) and Remove.
 function apiInvalidRow(entry) {
   const item = apiElement("li", "api-model-row invalid");
   const glyph = apiElement("span", "api-model-glyph", "!");
@@ -5470,12 +5571,70 @@ function apiInvalidRow(entry) {
 }
 
 function selectedApiFormat() { return apiUi.formats.find((input) => input.checked)?.value || "openai"; }
-function apiKeyRequired() {
-  return !apiModelEditing || selectedApiFormat() !== apiModelEditing.format
-    || apiUi.baseUrl.value.trim().replace(/\/+$/, "") !== apiModelEditing.baseUrl;
+// A saved key the form keeps: the edited connection's, or the one an entry to repair still holds
+// (the controller sends that entry a keyHint only when a repair can keep its key).
+function apiSavedKey() {
+  const editing = apiModelEditing;
+  return Boolean(editing && (editing.repair ? editing.keyHint : editing.hasKey));
+}
+// "…abcd": the last four characters of the saved key, or "" (the controller sends none of a
+// key under 12 characters).
+function apiKeyHint() {
+  const hint = String(apiModelEditing?.keyHint || "");
+  return hint.length > 1 ? hint : "";
+}
+// A base URL as the browser reads it, or null when the controller refuses it whatever the key: a URL
+// the browser cannot read, plain http to another computer (only localhost may use it), spaces,
+// backslashes, characters other than printable ASCII, a query, a fragment or credentials. Such a URL
+// never asks for the key: the controller names what is wrong with it first.
+const apiLocalHosts = ["localhost", "127.0.0.1", "[::1]"];
+function apiServerUrl(value) {
+  const text = String(value || "").trim();
+  if (/[\s\\?#]|[^\x20-\x7e]/.test(text)) return null;
+  try {
+    const url = new URL(text);
+    const scheme = url.protocol === "https:" || (url.protocol === "http:" && apiLocalHosts.includes(url.hostname));
+    return scheme && !url.username && !url.password ? url : null;
+  } catch { return null; }
+}
+// The server a saved key may go to: the edited connection's base URL, or the origin (scheme, host and
+// port) the controller sends for an entry to repair whose key it keeps.
+function apiSavedServer() {
+  const editing = apiModelEditing;
+  return apiServerUrl(editing.repair ? editing.origin : editing.baseUrl);
+}
+// A saved key is sent only to the server it was saved for (scheme, host and port, as the controller
+// compares them): the URL the base URL field now names when that is another server, else null.
+// Another path or format stays on the server.
+function apiOtherServer() {
+  const typed = apiServerUrl(apiUi.baseUrl.value);
+  if (!apiSavedKey() || !typed) return null;
+  return apiSavedServer()?.origin === typed.origin ? null : typed;
+}
+// The key field is hidden while the saved key is kept, and disabled so that no password manager
+// fills it in; it shows when adding, after Replace key, or when the base URL names another server.
+function apiKeyState() {
+  const editing = apiModelEditing, saved = apiSavedKey(), other = apiOtherServer();
+  const shown = !saved || apiKeyReplacing || Boolean(other);
+  return { saved, other, shown, required: !editing || (editing.repair && !saved) || (saved && shown) };
+}
+function apiKeyRequired() { return apiKeyState().required; }
+// How the different-server note names the saved server and the new one: by host (with a port other
+// than the default), or with the scheme when that is all that differs.
+function apiServerNames(other) {
+  const saved = apiSavedServer();
+  return !saved ? ["the saved URL", other.host]
+    : saved.host === other.host ? [saved.origin, other.origin] : [saved.host, other.host];
+}
+// Set a line's content (text, and the key hint as code) only when its text changes: the saved-key
+// line is a live region, which a screen reader announces at every change.
+function setApiLine(element, parts) {
+  const text = parts.map((part) => typeof part === "string" ? part : part.textContent).join("");
+  if (element.textContent !== text) element.replaceChildren(...parts);
 }
 function renderApiForm() {
-  const format = apiFormats[selectedApiFormat()], editing = apiModelEditing, required = apiKeyRequired();
+  const format = apiFormats[selectedApiFormat()], editing = apiModelEditing, key = apiKeyState();
+  const hint = apiKeyHint();
   apiUi.formHeading.textContent = editing ? `${editing.repair ? "Repair" : "Edit"} ${editing.label}` : "Add an API connection";
   apiUi.form.classList.toggle("editing", Boolean(editing));
   if (!apiModelBusy) {
@@ -5485,37 +5644,81 @@ function renderApiForm() {
   show(apiUi.cancel, Boolean(editing));
   apiUi.formatHelp.textContent = format.help;
   apiUi.baseUrl.placeholder = format.baseUrl;
-  apiUi.key.required = required;
-  apiUi.key.placeholder = !editing ? format.key : required ? "Enter the key again" : `Saved key ${editing.keyHint || ""}`.trim();
-  apiUi.keyHelp.textContent = !editing ? "Stored only on this computer and never shown again."
-    : editing.repair ? "Enter the API key again to repair this entry."
-    : required ? "Enter the API key again: a saved key is sent only to the format and base URL it was saved with."
-    : "Leave blank to keep the saved key; a new key replaces it.";
+  show(apiUi.key, key.shown);
+  apiUi.key.disabled = !key.shown;
+  apiUi.key.required = key.required;
+  apiUi.key.placeholder = format.key;
+  show(apiUi.replaceKey, key.saved && !key.shown);
+  show(apiUi.keepKey, key.saved && apiKeyReplacing && !key.other);
+  show(apiUi.useSavedUrl, Boolean(key.other) && !editing.repair);
+  apiUi.form.dataset.keyState = !key.saved ? "" : key.other ? "other-server" : key.shown ? "replace" : "kept";
+  // The live region says only what happens to the saved key (kept, or sent only to its server); the
+  // sentence that names the server typed in the base URL follows outside it, so that a screen reader
+  // announces a change of state, not every keystroke.
+  const hintCode = hint ? [" ", apiElement("code", "", hint)] : [];
+  let line = [], next = "";
+  if (key.other) {
+    const [saved, other] = apiServerNames(key.other);
+    line = ["The saved key", ...hintCode, ` is sent only to ${saved}.`];
+    next = `Enter the key for ${other}, ${editing.repair ? `or use a base URL on ${saved}.` : "or use the saved URL."}`;
+  } else if (key.saved && !key.shown) {
+    line = ["Saved key", ...hintCode, ", kept when you save"];
+  }
+  setApiLine(apiUi.savedKey, line);
+  setApiLine(apiUi.otherServer, next ? [next] : []);
+  if (key.saved && apiKeyReplacing && !key.other) {
+    apiUi.keyHelp.replaceChildren("The new key replaces ", hint ? apiElement("code", "", hint) : "the saved key",
+      " when you save.");
+  } else {
+    apiUi.keyHelp.textContent = editing?.repair && !key.saved ? "Enter the API key again to repair this entry."
+      : editing && !editing.repair && !key.saved ? "No key is saved for this connection; enter one to use it."
+      : "Stored only on this computer and never shown again.";
+  }
 }
 function resetApiForm() {
   apiFormEdits += 1;
   apiSaveEdits += 1;
   apiModelEditing = null;
+  apiKeyReplacing = false;
   for (const field of [apiUi.baseUrl, apiUi.key, apiUi.requestSource, apiUi.label, apiUi.contextWindow, apiUi.maxOutput]) {
     field.value = "";
   }
   renderApiForm();
 }
+function apiMissingKeyText(key) {
+  if (!apiModelEditing) return "Enter the API key.";
+  if (key.other) {
+    const other = apiServerNames(key.other)[1];
+    return `Enter the API key for ${other}${apiModelEditing.repair ? "" : ", or use the saved URL"}.`;
+  }
+  return apiKeyReplacing ? "Enter the new API key, or choose Keep saved key." : "Enter the API key to repair this entry.";
+}
 function apiFormValues() {
-  const values = { format: selectedApiFormat(), baseUrl: apiUi.baseUrl.value.trim(), apiKey: apiUi.key.value.trim(),
+  const key = apiKeyState(), apiKey = apiUi.key.value.trim();
+  const values = { format: selectedApiFormat(), baseUrl: apiUi.baseUrl.value.trim(),
     requestSource: apiUi.requestSource.value.trim(), label: apiUi.label.value.trim() };
+  // A key goes only from the shown field (adding, Replace key, another server); without one the
+  // controller keeps the saved key.
+  if (key.shown && apiKey) values.apiKey = apiKey;
   // Token limits go when given, or empty to clear the ones the edited connection has.
-  for (const [field, key] of [[apiUi.contextWindow, "contextWindow"], [apiUi.maxOutput, "maxOutputTokens"]]) {
+  for (const [field, name] of [[apiUi.contextWindow, "contextWindow"], [apiUi.maxOutput, "maxOutputTokens"]]) {
     const value = field.value.trim();
-    if (value || apiModelEditing?.[key]) values[key] = value;
+    if (value || apiModelEditing?.[name]) values[name] = value;
   }
   const missing = !values.baseUrl ? [apiUi.baseUrl, "Enter the base URL."]
-    : !values.apiKey && apiKeyRequired() ? [apiUi.key, apiModelEditing ? "Enter the API key again for the new connection." : "Enter the API key."] : null;
+    : !values.apiKey && key.required ? [apiUi.key, apiMissingKeyText(key)] : null;
   if (missing) {
     showApiResult("error", "", missing[1]); missing[0].focus(); return null;
   }
   if (apiModelEditing) values.id = apiModelEditing.id;
   return values;
+}
+// The controller asked for the key (keyRequired): it keeps none for the settings sent, for example
+// because another tab removed the connection or moved it to another server. The key field shows,
+// required and focused, as after Replace key.
+function askApiKey() {
+  if (apiSavedKey()) apiKeyReplacing = true;
+  renderApiForm(); apiUi.key.focus();
 }
 
 async function testApiForm() {
@@ -5525,14 +5728,15 @@ async function testApiForm() {
   const edits = apiFormEdits;
   setApiBusy(true, apiUi.test, "Testing…");
   showApiResult("pending", "Checking connection…", "Loading the models available to this key.");
-  let result, failure = "";
+  let result, failure = "", keyRequired = false;
   try {
     result = await apiModelRequest("/api-models/test", values);
     if (result.connection) apiModels = apiModels.map((item) => item.id === result.connection.id ? result.connection : item);
   }
-  catch (error) { failure = error.message; }
+  catch (error) { failure = error.message; keyRequired = Boolean(error.keyRequired); }
   setApiBusy(false); renderApiForm(); renderApiModels(); restoreApiFocus(apiUi.test);
   if (edits !== apiFormEdits) return showApiResult("stale", "Connection details changed", "Test this connection again.");
+  if (keyRequired) askApiKey();
   showApiResult(result?.ok ? "ok" : "error", result ? apiTestText(result) : "Connection failed",
     result?.ok ? result.message : failure);
   apiShownTest = { ok: result?.ok };
@@ -5544,14 +5748,15 @@ async function saveApiModel() {
   const editing = Boolean(apiModelEditing), edits = apiSaveEdits;
   setApiBusy(true, apiUi.save, "Loading models and saving…");
   showApiResult("pending", "Loading models and saving…");
-  let saved, failure = "";
+  let saved, failure = "", keyRequired = false;
   try {
     const data = await apiModelRequest("/api-models", values);
     saved = data.connection || data.model;
     if (edits === apiSaveEdits) resetApiForm();
     adoptApiModels(data);
-  } catch (error) { failure = error.message; }
+  } catch (error) { failure = error.message; keyRequired = Boolean(error.keyRequired); }
   setApiBusy(false); renderApiForm(); restoreApiFocus(apiUi.save);
+  if (keyRequired) askApiKey();
   showApiResult(saved ? "ok" : "error", saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
     saved ? "Choose this key under Source in any role, then choose a model." : failure);
 }
@@ -5587,19 +5792,25 @@ async function removeApiModel(connection, button) {
   if (removed) apiUi.heading.focus();
   showApiStatus(message, warning);
 }
-// Repair an entry that cannot be used: the form holds what is readable of it, and the key must be
-// entered again. Saved under the entry's id, the repaired connection replaces it (jobs that named
-// its models find them again); an entry without a usable id is saved as a new connection.
+// Repair an entry that cannot be used: the form holds what is readable of it (never its URL's
+// path). A key it still holds is kept on the server it was saved for (the entry then has a keyHint,
+// and the origin of that server); otherwise the key must be entered again. Saved under the entry's
+// id, the repaired connection replaces it (jobs that named its models find them again); an entry
+// without a usable id is saved as a new connection.
 function repairApiModel(entry) {
   apiFormEdits += 1;
   apiSaveEdits += 1;
-  apiModelEditing = entry.id ? { id: entry.id, label: entry.label, format: entry.format, repair: true } : null;
+  apiModelEditing = entry.id ? { id: entry.id, label: entry.label, format: entry.format, repair: true,
+    host: entry.host || "", origin: entry.origin || "", hasKey: Boolean(entry.hasKey), keyHint: entry.keyHint || "" } : null;
+  apiKeyReplacing = false;
   const format = apiFormats[entry.format] ? entry.format : selectedApiFormat();
   for (const input of apiUi.formats) input.checked = input.value === format;
   for (const field of [apiUi.baseUrl, apiUi.key, apiUi.requestSource, apiUi.contextWindow, apiUi.maxOutput]) field.value = "";
   apiUi.label.value = entry.id && entry.label !== entry.id ? entry.label : "";
-  showApiResult("", "", `Enter the base URL${entry.host ? ` (it was saved for ${entry.host})` : ""} and the API key, `
-    + "then save.");
+  // Where it was saved: the server its key is kept for (with a port other than the default), else its host.
+  const server = (apiModelEditing && apiSavedServer()?.host) || entry.host;
+  showApiResult("", "", `Enter the base URL${server ? ` (it was saved for ${server})` : ""}`
+    + `${apiSavedKey() ? "" : " and the API key"}, then save.`);
   renderApiForm(); renderApiModels(); apiUi.baseUrl.focus();
 }
 async function removeInvalidApiModel(entry, button) {
@@ -5616,10 +5827,13 @@ async function removeInvalidApiModel(entry, button) {
   if (!warning) apiUi.heading.focus();
   showApiStatus(message, warning);
 }
+// Edit a saved connection: the form holds its settings, and its saved key is kept (never shown)
+// unless Replace key is chosen or the base URL names another server.
 function editApiModel(connection) {
   apiFormEdits += 1;
   apiSaveEdits += 1;
   apiModelEditing = connection;
+  apiKeyReplacing = false;
   for (const input of apiUi.formats) input.checked = input.value === connection.format;
   apiUi.baseUrl.value = connection.baseUrl;
   apiUi.key.value = "";
@@ -5634,6 +5848,27 @@ apiUi.baseUrl.oninput = () => { noteApiFormEdit(); renderApiForm(); };
 apiUi.key.oninput = apiUi.requestSource.oninput = noteApiFormEdit;
 // The Test lists the models; the display name and the token limits only matter when saving.
 apiUi.label.oninput = apiUi.contextWindow.oninput = apiUi.maxOutput.oninput = () => { apiSaveEdits += 1; };
+// Replace key shows the empty key field; Keep saved key hides it again (and drops what was typed);
+// Use saved URL puts the edited connection's base URL back, so the saved key applies again.
+apiUi.replaceKey.onclick = () => {
+  apiKeyReplacing = true;
+  apiSaveEdits += 1;
+  apiUi.key.value = "";
+  renderApiForm(); apiUi.key.focus();
+};
+apiUi.keepKey.onclick = () => {
+  const typed = apiUi.key.value.trim();
+  apiKeyReplacing = false;
+  apiUi.key.value = "";
+  if (typed) noteApiFormEdit(); else apiSaveEdits += 1;
+  renderApiForm(); apiUi.replaceKey.focus();
+};
+apiUi.useSavedUrl.onclick = () => {
+  if (!apiModelEditing?.baseUrl) return;
+  apiUi.baseUrl.value = apiModelEditing.baseUrl;
+  if (!apiKeyReplacing) apiUi.key.value = "";
+  noteApiFormEdit(); renderApiForm(); apiUi.baseUrl.focus();
+};
 apiUi.test.onclick = testApiForm;
 apiUi.save.onclick = saveApiModel;
 apiUi.cancel.onclick = () => { resetApiForm(); clearApiResult(); renderApiModels(); apiUi.baseUrl.focus(); };

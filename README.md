@@ -263,7 +263,7 @@ connection does not ask you to choose or type a model ID.
 | --- | --- |
 | Format | **OpenAI** (Responses API) or **Anthropic** (Messages API). |
 | Base URL | For example `https://api.openai.com/v1` or `https://api.anthropic.com`. HTTPS is required except for `localhost`; credentials, query strings, and fragments are rejected. So that the host shown and tested is the host the CLIs contact, the URL must be plain ASCII (an international domain name in its `xn--` form) without backslashes, a percent-encoded host, an IPv4 address other than four decimal numbers, or `.`/`..` path segments. |
-| API key | Stored only on this computer and never shown again. Editing a connection with an empty key keeps the saved key while the format and base URL stay the same; changing either requires entering the key again. |
+| API key | Stored only on this computer and never shown again; the form shows **Saved key …abcd** (the last four characters, as API dashboards show them; nothing of a key shorter than 12 characters). Editing a connection keeps its saved key unless you choose **Replace key**. A saved key is sent only to the server it was saved for: a base URL on another host or port asks for that server's key (or **Use saved URL** puts the saved one back); another path or format keeps it. |
 | Request source | Optional client name sent as the `User-Agent` header, so routers that log it can identify your requests. Use up to 200 printable ASCII characters; the default is `TCS-Prover`. |
 | Display name | Optional local source label; the default is the endpoint's host. It is not sent to the API or used as the request source. |
 | Context window | Optional: the context window in tokens (at least 1,024) of this connection's models, for models the CLI does not know. Runs pass it to the CLI, which then keeps the conversation within it, compacting it in time. It applies to every model of the connection. |
@@ -292,16 +292,34 @@ uses `<base URL>/models` (OpenAI) or `<base URL without /v1>/v1/models`
 one 30-second deadline, follows no redirect, and shows the HTTP status, latency,
 and the provider's message with the key removed. Testing unchanged saved
 settings records the result on that connection. **Edit** fills the form with
-its saved settings but never its key. **Remove** deletes the connection, key,
-and model choices; new role menus return to the default model, while saved jobs
-retain their selected IDs and show a warning until the connection is restored.
+its saved settings; its key stays saved and is never shown. **Remove** deletes
+the connection, key, and model choices; new role menus return to the default
+model, while saved jobs retain their selected IDs and show a warning until the
+connection is restored.
 Removing a connection is blocked while a running job, or a job waiting to start
 or resume, uses one of its models: edit the connection instead, or delete that
 job first. Changing its format is blocked while jobs use it. Editing a tested
 setting marks the displayed result as out of date. Under each role menu a chip
 names its CLI, or an API model's format, the program that runs it and its host
 (for example *API · Anthropic format via Claude Code · gateway.example.com*);
-it never checks whether that program is installed.
+it never checks whether that program is installed. The **Run settings** panel
+on the job page names each role's source too, on a line under its model: Codex
+CLI or Claude CLI (this computer's login), or the API connection with its
+format, host (and port, unless it is the default for http or https) and the
+program it runs through (OpenAI format through the Codex CLI, Anthropic format
+through the Claude CLI), for example *Source: API connection “Lab gateway” ·
+OpenAI format · gateway.example.com · runs through the Codex CLI · id
+api:lab-gateway*. The critic's source also covers the convention critic. A
+removed connection shows what the job recorded, marked *not configured now*.
+One edited since the job started (its format, host, port, path or model) also
+names the host, format and model the job started with, for example *this job
+started with localhost:8000 (OpenAI format, model gpt-6.1-sol)*, or says
+*edited since this job started* when those read the same (another base URL
+path, say). A model call already under way keeps using what it started with;
+the job's next model call uses the edited connection. While the connection
+list cannot be read, the line says so and never calls the connection removed.
+The line never shows a key, a base URL path or a full base URL, and nothing new
+is stored.
 
 A test of one model (`POST /api-models/test` with its `api:<id>` selection ID
 and wire `model`, or with unsaved settings) sends a request shaped like the ones
@@ -370,7 +388,8 @@ An entry of the store that TCS Prover cannot use (edited by hand, or saved by
 another version) is listed under API connections with the reason, **Repair**
 (the form, which saves it under its id, so jobs that name its models find them
 again) and **Remove**; the other connections keep working and can still be
-saved. A store that
+saved. Repairing keeps a key the entry still holds, as long as the entry's
+saved base URL can be read and the new one stays on its server. A store that
 cannot be read (a damaged file, or one another program is writing) is reported
 instead of being shown as empty: running jobs keep the settings they read last,
 and waiting jobs try again every minute. At startup the server also checks the
@@ -387,7 +406,10 @@ Linux and Windows the Codex sandboxes keep Codex's default read access to your
 files, so a Codex role's shell there could read the key store; there, store API
 keys only if the models you run with Codex CLI may see them. Each job records
 the non-secret settings of its API models under `apiModels` in
-`job-settings.json`. A connection used by a running job, or by a job waiting to
+`job-settings.json`; the **Run settings** panel reads that record to show a
+removed or edited connection as the job recorded it. The proof author can write
+its run folder, so the record is display text only and never chooses where a
+model call goes. A connection used by a running job, or by a job waiting to
 start or resume, cannot be removed, and its format cannot change while jobs use
 it. A saved job keeps its selected model. If its connection is missing anyway
 (removed by an older version, or from the store by hand), a waiting job checks

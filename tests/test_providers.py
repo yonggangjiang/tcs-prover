@@ -95,6 +95,10 @@ class RegistryTests(StoreCase):
                 self.assertEqual(providers.enforces_output_schema(model), schema)
         self.assertEqual(providers.wire_model(openai), "gpt-x")
         self.assertEqual(providers.wire_model("claude-opus-5-5"), "claude-opus-5-5")
+        # One rule for the CLI an API format runs through, used by harness() and by Run settings.
+        self.assertEqual([providers.harness_for_format(fmt) for fmt in providers.FORMATS], ["codex", "claude"])
+        with self.assertRaises(providers.ProviderError):
+            providers.harness_for_format("gemini")
 
     def test_known_ids_and_removed_deepseek_routes(self):
         for model in (*providers.offered_models(), *providers.LEGACY_CODEX_MODELS):
@@ -262,17 +266,32 @@ class StoreTests(StoreCase):
             self.save()
         self.assertEqual(target.read_text(), '{"version": 1, "models": []}')
 
-    def test_a_saved_key_is_reused_only_for_the_destination_it_was_saved_for(self):
+    def test_a_saved_key_is_reused_only_for_the_server_it_was_saved_for(self):
         model = self.save(headerName="X-Gateway-Key")
-        for change in ({"baseUrl": "https://attacker.example/v1"}, {"baseUrl": "https://api.example.com/v2"},
-                       {"baseUrl": "https://api.example.com:8443/v1"},
+        # Another path, the host in capitals, the default port written out, a trailing slash and another
+        # format all stay on the saved key's server: an empty key keeps the saved one.
+        for change in ({"baseUrl": "https://api.example.com/v2"}, {"baseUrl": "https://API.Example.COM/v1"},
+                       {"baseUrl": "https://api.example.com:443/v1"}, {"baseUrl": "https://api.example.com/v1/"},
                        {"format": "anthropic"}):
-            with self.subTest(change=change):
+            with self.subTest(keeps=change):
+                entry, _ = providers.validated_api_model({**change, "apiKey": ""}, model["id"])
+                self.assertEqual(entry["apiKey"], KEY)
+                self.assertEqual(providers.validated_api_connection(change, model["id"])["apiKey"], KEY)
+        # Another host or port is another server: the saved key never goes there.
+        for change, message in (
+                ({"baseUrl": "https://attacker.example/v1"}, "Enter the API key for attacker.example: a saved key "
+                 "is sent only to the server it was saved for (api.example.com)."),
+                ({"baseUrl": "https://api.example.com:8443/v1"}, "Enter the API key for api.example.com:8443: a "
+                 "saved key is sent only to the server it was saved for (api.example.com)."),
+                ({"baseUrl": "https://attacker.example/v1", "format": "anthropic"},
+                 "Enter the API key for attacker.example:")):
+            with self.subTest(refuses=change):
                 for attempt in (lambda: providers.validated_api_model({**change, "apiKey": ""}, model["id"]),
+                                lambda: providers.validated_api_connection(change, model["id"]),
                                 lambda: providers.save_api_model({"id": model["id"], **change})):
                     with self.assertRaises(providers.ProviderError) as failure:
                         attempt()
-                    self.assertIn("Enter the API key again", str(failure.exception))
+                    self.assertIn(message, str(failure.exception))
                     self.assertNotIn(KEY, str(failure.exception))
         self.assertEqual(providers.api_model(model["id"])["baseUrl"], "https://api.example.com/v1")
         # Authentication is chosen from the format, even for legacy form fields.
@@ -281,6 +300,176 @@ class StoreTests(StoreCase):
         entry, _ = providers.validated_api_model({"baseUrl": "https://attacker.example/v1", "apiKey": "typed-key-0123"},
                                                  model["id"])
         self.assertEqual(entry["apiKey"], "typed-key-0123")
+        # Saving another path and format on the same server keeps the key (sent with the new header).
+        saved = providers.save_api_model({"id": model["id"], "baseUrl": "https://API.example.com/v2/",
+                                          "format": "anthropic"})
+        self.assertEqual((saved["baseUrl"], saved["format"], saved["headerName"], saved["keyHint"]),
+                         ("https://API.example.com/v2", "anthropic", "x-api-key", "…1234"))
+        self.assertEqual(providers.api_model_secret(model["id"]), KEY)
+
+    def test_a_server_is_its_scheme_host_and_port_however_they_are_written(self):
+        same = (("https://API.example.com/v1", "https://api.example.com:443/v2/"),
+                ("http://localhost:8000/v1", "http://LOCALHOST:8000"),
+                ("http://127.0.0.1/v1", "http://127.0.0.1:80/v1"),
+                ("https://[2001:db8::1]/v1", "https://[2001:0DB8:0:0:0:0:0:1]:443/v2"))
+        for first, second in same:
+            with self.subTest(same=first):
+                self.assertEqual(providers._server(first), providers._server(second))
+                # The origin the page compares for a repair names the same server, never the path.
+                self.assertEqual(providers._origin(first), providers._origin(second))
+        for base, origin in (("https://API.example.com:443/v1/x", "https://api.example.com"),
+                             ("http://localhost:8000/v1", "http://localhost:8000"),
+                             ("https://[2001:0DB8::1]:8443/v1", "https://[2001:db8::1]:8443")):
+            with self.subTest(origin=base):
+                self.assertEqual(providers._origin(base), origin)
+        for first, second in (("https://api.example.com", "https://api.example.com:8443"),
+                              ("http://localhost:8000", "https://localhost:8000"),
+                              ("http://localhost", "https://localhost"),
+                              ("https://api.example.com", "https://api.example.com.")):
+            with self.subTest(other=second):
+                self.assertNotEqual(providers._server(first), providers._server(second))
+        # The scheme is named only when it is all that differs; a default port never is.
+        model = self.save(baseUrl="http://localhost:8000/v1")
+        for base, message in (("https://localhost:8000/v1", "Enter the API key for https://localhost:8000: a saved "
+                               "key is sent only to the server it was saved for (http://localhost:8000)."),
+                              ("http://[::1]:8000/v1", "Enter the API key for [::1]:8000:"),
+                              ("http://localhost/v1", "Enter the API key for localhost: a saved key is sent only "
+                               "to the server it was saved for (localhost:8000).")):
+            with self.subTest(base=base), self.assertRaises(providers.ProviderError) as failure:
+                providers.validated_api_connection({"baseUrl": base}, model["id"])
+            self.assertIn(message, str(failure.exception))
+
+    def test_a_connection_without_a_saved_key_moves_without_one(self):
+        model = self.save()
+        stored = json.loads(self.store.read_text())
+        stored["models"][0]["apiKey"] = ""
+        self.store.write_text(json.dumps(stored))
+        self.assertEqual((providers.api_model(model["id"])["hasKey"], providers.api_model(model["id"])["keyHint"]),
+                         (False, ""))
+        # No key to protect: another server is accepted, still without a key.
+        connection = providers.validated_api_connection({"baseUrl": "https://other.example/v1"}, model["id"])
+        self.assertEqual((connection["baseUrl"], connection["apiKey"]), ("https://other.example/v1", ""))
+
+    def test_repairing_an_entry_keeps_the_key_it_holds_for_its_server_only(self):
+        stored = {"version": 2, "models": [
+            # Unusable for a reason other than its URL or key: a repair can keep the key.
+            {"id": "api:broken", "format": "openai", "baseUrl": "https://Broken.example/v1", "model": "m",
+             "apiKey": f"Bearer {KEY}", "label": 5},
+            # Its URL cannot be read, so no server can be vouched for: the key must be entered again.
+            {"id": "api:lost", "format": "openai", "baseUrl": "https://lost.example/v1?key=1", "model": "m",
+             "apiKey": KEY},
+            {"id": "api:badkey", "format": "openai", "baseUrl": "https://bad.example/v1", "model": "m",
+             "apiKey": "two words", "label": 5},
+            {"id": "api:short", "format": "openai", "baseUrl": "https://short.example/v1", "model": "m",
+             "apiKey": "short-key", "label": 5}]}
+        self.store.parent.mkdir(parents=True)
+        self.store.write_text(json.dumps(stored))
+        listed = {row["id"]: row for row in providers.invalid_api_models()}
+        self.assertEqual({identity: (row["hasKey"], row["keyHint"]) for identity, row in listed.items()},
+                         {"api:broken": (True, "…1234"), "api:lost": (True, ""), "api:badkey": (True, ""),
+                          "api:short": (True, "…")})
+        self.assertNotIn(KEY, json.dumps(listed))
+        self.assertNotIn("baseUrl", listed["api:broken"])
+        # The server a repair keeps the key for, so that the page asks for the key as the server would.
+        self.assertEqual({identity: row["origin"] for identity, row in listed.items()},
+                         {"api:broken": "https://broken.example", "api:lost": "", "api:badkey": "",
+                          "api:short": "https://short.example"})
+        # Test and Load models reuse the key on the same server, as Save does.
+        connection = providers.validated_api_connection({"format": "anthropic", "baseUrl": "https://broken.example/v2"},
+                                                        "api:broken")
+        self.assertEqual((connection["apiKey"], connection["headerName"]), (KEY, "x-api-key"))
+        with self.assertRaises(providers.ProviderError) as failure:
+            providers.validated_api_connection({"format": "openai", "baseUrl": "https://other.example/v1"},
+                                               "api:broken")
+        self.assertEqual(str(failure.exception), "Enter the API key for other.example: a saved key is sent only to "
+                                                 "the server it was saved for (broken.example).")
+        for identity, base in (("api:lost", "https://lost.example/v1"), ("api:badkey", "https://bad.example/v1")):
+            with self.subTest(identity=identity), self.assertRaises(providers.ProviderError) as failure:
+                providers.validated_api_connection({"format": "openai", "baseUrl": base}, identity)
+            self.assertEqual(str(failure.exception), "Enter the API key.")
+        with self.assertRaises(providers.ProviderError):
+            providers.save_api_connection({"id": "api:broken", "format": "openai",
+                                           "baseUrl": "https://other.example/v1"}, [{"id": "m"}])
+        with self.assertRaises(providers.ProviderError):
+            providers.save_api_connection({"id": "api:lost", "format": "openai", "baseUrl": "https://lost.example/v1"},
+                                          [{"id": "m"}])
+        self.assertEqual(len(providers.invalid_api_models()), 4)
+        repaired = providers.save_api_connection({"id": "api:broken", "format": "openai",
+                                                  "baseUrl": "https://broken.example/v3", "label": "Repaired"},
+                                                 [{"id": "m"}])
+        self.assertEqual((repaired["id"], repaired["hasKey"], repaired["keyHint"], repaired["label"]),
+                         ("api:broken", True, "…1234", "Repaired"))
+        self.assertEqual(providers.api_model_secret("api:broken"), KEY)
+        self.assertEqual(sorted(row["id"] for row in providers.invalid_api_models()),
+                         ["api:badkey", "api:lost", "api:short"])
+        # A typed key always repairs, also on another server.
+        typed = providers.save_api_connection({"id": "api:lost", "format": "openai", "baseUrl": "https://new.example/v1",
+                                               "apiKey": "typed-key-56789"}, [{"id": "m"}])
+        self.assertEqual(typed["keyHint"], "…6789")
+
+    def test_only_the_entry_a_repair_replaces_offers_the_key_it_holds(self):
+        valid, copy, first, second, nameless = ("sk-valid-key-0000-VALD", "sk-copied-key-1111-COPY",
+                                                "sk-first-key-2222-FRST", "sk-second-key-3333-SCND",
+                                                "sk-no-id-key-4444-NOID")
+        stored = {"version": 2, "models": [
+            {"id": "api:main", "format": "openai", "baseUrl": "https://api.example.com/v1", "model": "m",
+             "apiKey": valid, "label": "Main"},
+            # The same id as a valid entry: saving under it edits that entry, with that entry's key.
+            {"id": "api:main", "format": "openai", "baseUrl": "https://api.example.com/v1", "model": "m",
+             "apiKey": copy, "label": "Old copy"},
+            # Two unusable entries with one id: a repair replaces the first and removes the second.
+            {"id": "api:twin", "format": "openai", "baseUrl": "https://Twin.example:8443/v1/private-path", "model": "m",
+             "apiKey": first, "label": 5},
+            {"id": "api:twin", "format": "openai", "baseUrl": "https://twin.example/v1", "model": "m",
+             "apiKey": second, "label": 5},
+            # Without a usable id a repair saves a new connection, which needs its key.
+            {"format": "openai", "baseUrl": "https://noid.example/v1", "model": "m", "apiKey": nameless}]}
+        self.store.parent.mkdir(parents=True)
+        self.store.write_text(json.dumps(stored))
+        listed = providers.invalid_api_models()
+        self.assertEqual([(row["id"], row["hasKey"], row["keyHint"], row["origin"]) for row in listed],
+                         [("api:main", True, "", ""), ("api:twin", True, "…FRST", "https://twin.example:8443"),
+                          ("api:twin", True, "", ""), ("", True, "", "")])
+        listing = json.dumps(providers.store_listing())
+        self.assertNotIn("private-path", listing)
+        for key in (valid, copy, first, second, nameless):
+            self.assertNotIn(key, listing)
+        # What the page offers is what the server keeps: api:main keeps the valid entry's key...
+        self.assertEqual(providers.validated_api_connection({"baseUrl": "https://api.example.com/v2"}, "api:main")
+                         ["apiKey"], valid)
+        # ...and repairing api:twin keeps its first entry's key, on that entry's server only.
+        with self.assertRaises(providers.KeyRequired):
+            providers.save_api_connection({"id": "api:twin", "format": "openai", "baseUrl": "https://twin.example/v1"},
+                                          [{"id": "m"}])
+        repaired = providers.save_api_connection({"id": "api:twin", "format": "openai",
+                                                  "baseUrl": "https://TWIN.example:8443/v2"}, [{"id": "m"}])
+        self.assertEqual(repaired["keyHint"], "…FRST")
+        self.assertEqual(providers.api_model_secret("api:twin"), first)
+        self.assertEqual([row["id"] for row in providers.invalid_api_models()], ["api:main", ""])
+
+    def test_only_a_refusal_that_asks_for_the_key_is_key_required(self):
+        model = self.save()
+        for name, attempt in (
+                ("another server", lambda: providers.validated_api_connection({"baseUrl": "https://other.example/v1"},
+                                                                              model["id"])),
+                ("another server, saved", lambda: providers.save_api_model({"id": model["id"],
+                                                                            "baseUrl": "https://other.example/v1"})),
+                ("no key", lambda: providers.validated_api_connection({"format": "openai",
+                                                                       "baseUrl": "https://new.example/v1"})),
+                ("Bearer alone", lambda: providers.validated_api_connection({"format": "openai", "apiKey": "Bearer ",
+                                                                             "baseUrl": "https://new.example/v1"}))):
+            with self.subTest(name), self.assertRaises(providers.KeyRequired) as failure:
+                attempt()
+            self.assertIsInstance(failure.exception, providers.ProviderError)
+        # A key that cannot be used, and a URL refused whatever the key, are other refusals.
+        for name, attempt in (
+                ("bad key", lambda: providers.validated_api_connection({"format": "openai", "apiKey": "two words",
+                                                                        "baseUrl": "https://new.example/v1"})),
+                ("plain http", lambda: providers.validated_api_connection({"baseUrl": "http://other.example/v1"},
+                                                                          model["id"]))):
+            with self.subTest(name), self.assertRaises(providers.ProviderError) as failure:
+                attempt()
+            self.assertNotIsInstance(failure.exception, providers.KeyRequired)
 
     def test_base_urls_that_url_parsers_read_differently_are_rejected(self):
         for base, message in (

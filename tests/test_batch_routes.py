@@ -1,6 +1,7 @@
 """Authenticated saved-batch browsing never restores or starts model workers."""
 import http.client
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -9,6 +10,8 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+import workflow_runner as runtime
+from runner import claude_cli, providers
 from ui import server
 
 
@@ -183,6 +186,87 @@ class BatchRouteTests(unittest.TestCase):
                          '/approach-graph?' + batch + 'job=same-job'):
                 with self.subTest(path=path):
                     self.assertEqual(self.request(path), (404, {'error': unknown}))
+
+
+
+class SavedRunSourceTests(unittest.TestCase):
+    """Run settings of a read-only saved job and of a restored paused job name each role's source."""
+
+    KEY = 'sk-tcs-batch-route-test-0123456789'
+    PLANTED = 'sk-ant-planted-in-job-settings-0123'
+    request = BatchRouteTests.request
+    stop = BatchRouteTests.stop
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base = Path(temporary.name).resolve()
+        self.root = base / 'runs'
+        # Nothing here may start a runner, a CLI or a model session.
+        for change in (patch.dict(os.environ, {providers.STORE_ENV: str(base / 'state' / 'api-models.json')}),
+                       *(patch.object(target, name, side_effect=AssertionError(name + ' reached'))
+                         for target, name in ((server.App, '_spawn_worker'), (server.subprocess, 'Popen'),
+                                              (runtime, 'goal_session'), (runtime, 'author_conversation'),
+                                              (claude_cli, 'goal_session'), (claude_cli, 'author_conversation')))):
+            change.start()
+            self.addCleanup(change.stop)
+        # The connection as it is now (another host than the jobs recorded); the Claude one was removed.
+        self.sol = providers.save_api_model({'format': 'openai', 'baseUrl': 'https://new-gateway.example/v1',
+                                             'model': 'gpt-6.1-sol', 'apiKey': self.KEY,
+                                             'label': 'Sol via lab gateway'})
+        settings = {
+            'skipStatementReview': False, 'reviewModel': 'api:claude-gateway', 'authorModel': 'claude-opus-5-5',
+            'criticModel': self.sol['id'], 'writerModel': 'gpt-5.6-sol', 'elapsedSeconds': 12,
+            # The author's workspace can write this record: a key planted in it never reaches the page.
+            'apiModels': {
+                'api:claude-gateway': {'label': 'Claude gateway', 'format': 'anthropic',
+                                       'baseUrl': 'https://claude.example.com', 'headerName': 'x-api-key',
+                                       'model': 'claude-gw', 'apiKey': self.PLANTED},
+                self.sol['id']: {'label': 'Sol via lab gateway', 'format': 'openai',
+                                 'baseUrl': 'https://gateway.lab.example/v1', 'headerName': 'Authorization',
+                                 'model': 'gpt-6.1-sol'}}}
+        for batch, run_id in (('alpha', 'saved-job'), ('__root__', 'restored-job')):
+            folder = self.root / batch / run_id if batch != '__root__' else self.root / run_id
+            folder.mkdir(parents=True)
+            (folder / 'job-settings.json').write_text(json.dumps(settings))
+            (folder / 'draft.md').write_text('# Draft problem\n\nStatement ' + run_id)
+            (folder / 'checked-statement.md').write_text('# Checked statement\n\nStatement ' + run_id)
+            (folder / 'transcript.jsonl').write_text(json.dumps(
+                {'kind': 'status', 'time': '2026-01-01T00:00:00Z', 'stage': 'solve', 'node': 'author',
+                 'label': 'Goal started', 'threadId': 'saved-thread'}) + '\n')
+            (folder / 'pause.json').write_text(json.dumps({'status': 'paused', 'stage': 'solve', 'node': 'author',
+                                                           'elapsedSeconds': 12, 'pauseCause': 'user',
+                                                           'goalThreadId': 'saved-thread'}))
+        self.http = server.Server((server.HOST, 0), runs=self.root)
+        self.thread = threading.Thread(target=self.http.serve_forever,
+                                       kwargs={'poll_interval': 0.01}, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop)
+
+    def test_read_only_saved_and_restored_paused_jobs_name_each_roles_source(self):
+        for query, read_only in (({'batch': 'alpha', 'job': 'saved-job'}, True), ({'job': 'restored-job'}, False)):
+            with self.subTest(**query):
+                status, state = self.request('/state?' + urlencode(query))
+                self.assertEqual(status, 200)
+                self.assertEqual((state['phase'], bool(state.get('readOnly'))), ('paused', read_only))
+                sources = state['modelSources']
+                self.assertEqual(sources['review'], {
+                    'model': 'api:claude-gateway', 'kind': 'api', 'configured': False, 'label': 'claude-gw',
+                    'wireModel': 'claude-gw', 'connection': 'Claude gateway', 'format': 'anthropic',
+                    'formatLabel': 'Anthropic format', 'host': 'claude.example.com', 'runsThrough': 'claude',
+                    'runsThroughLabel': 'the Claude CLI'})
+                # One name for the Claude program in the panel: the source menu's.
+                self.assertEqual({key: sources['author'][key] for key in ('kind', 'label', 'source', 'runsThroughLabel')},
+                                 {'kind': 'claude', 'label': 'Claude Opus 5.5', 'source': 'Claude CLI',
+                                  'runsThroughLabel': 'the Claude CLI'})
+                self.assertEqual({key: sources['critic'].get(key) for key in ('configured', 'host', 'recorded')},
+                                 {'configured': True, 'host': 'new-gateway.example',
+                                  'recorded': {'format': 'openai', 'formatLabel': 'OpenAI format',
+                                               'host': 'gateway.lab.example', 'wireModel': 'gpt-6.1-sol'}})
+                self.assertEqual((sources['writer']['kind'], sources['writer']['older']), ('codex', True))
+                text = json.dumps(state)
+                self.assertNotIn(self.KEY, text)
+                self.assertNotIn(self.PLANTED, text)
 
 
 if __name__ == '__main__':

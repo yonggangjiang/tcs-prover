@@ -353,8 +353,12 @@
 
                 <!-- API models: endpoints configured on this computer. app.js lists, tests, saves and removes
                      them; the key is sent once in a request body and never displayed again. The key field
-                     says autocomplete="new-password" so that no browser fills in a saved login password,
-                     and both role="status" lines stay rendered while empty (CSS collapses them). -->
+                     says autocomplete="new-password" so that no browser fills in a saved login password.
+                     Editing shows the saved key's line (its last four characters at most) instead of the
+                     field, which stays hidden and disabled until Replace key, or until the base URL names
+                     another server. That line is a live region; the sentence naming the server typed in the
+                     base URL follows it in apiModelOtherServer, which is not, so that typing is not announced.
+                     The role="status" lines stay rendered while empty (CSS collapses them). -->
                 <fieldset id="apiModelsSetting" class="settings-group providers-group" aria-describedby="providerHelp">
                   <legend>API connections</legend>
                   <p id="providerHelp" class="help">Save a URL and API key once. Each role can then choose this connection and one of its available models.</p>
@@ -375,10 +379,22 @@
                           <input id="apiModelBaseUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="off"
                             spellcheck="false" placeholder="https://api.openai.com/v1">
                         </div>
-                        <div class="field api-field-wide">
+                        <div class="field api-field-wide api-key-field">
                           <label for="apiModelKey">API key</label>
-                          <input id="apiModelKey" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"
-                            placeholder="sk-…" aria-describedby="apiModelKeyHelp" data-1p-ignore data-lpignore="true">
+                          <div class="api-saved-key-row">
+                            <svg class="icon api-saved-key-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="5.5" cy="10.5" r="3"/><path d="m7.6 8.4 5.9-5.9M11 5l1.75 1.75M9.5 6.5l1.25 1.25"/></svg>
+                            <div class="api-saved-key-text">
+                              <p id="apiModelSavedKey" class="api-saved-key" role="status"></p>
+                              <p id="apiModelOtherServer" class="api-saved-key-other"></p>
+                            </div>
+                            <button id="apiModelReplaceKey" class="secondary compact" type="button" hidden>Replace key</button>
+                            <button id="apiModelUseSavedUrl" class="secondary compact" type="button" hidden>Use saved URL</button>
+                          </div>
+                          <div class="api-key-input-row">
+                            <input id="apiModelKey" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false"
+                              placeholder="sk-…" aria-describedby="apiModelSavedKey apiModelOtherServer apiModelKeyHelp" data-1p-ignore data-lpignore="true">
+                            <button id="apiModelKeepKey" class="ghost compact" type="button" hidden>Keep saved key</button>
+                          </div>
                           <p id="apiModelKeyHelp" class="help api-key-help">Stored only on this computer and never shown again.</p>
                         </div>
                       </div>

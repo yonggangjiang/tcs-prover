@@ -28,6 +28,8 @@ CODEX, CLAUDE, API = "codex", "claude", "api"
 OPENAI_FORMAT, ANTHROPIC_FORMAT = "openai", "anthropic"
 FORMATS = (OPENAI_FORMAT, ANTHROPIC_FORMAT)
 PROVIDER_LABELS = {CODEX: "Codex CLI", CLAUDE: "Claude CLI", API: "API"}
+# The CLI each API wire format runs through (harness_for_format()).
+FORMAT_HARNESSES = {OPENAI_FORMAT: CODEX, ANTHROPIC_FORMAT: CLAUDE}
 
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Efforts no longer offered, and what they run as. Ultra was Max plus Codex's proactive
@@ -118,6 +120,14 @@ class StoreUnavailable(ProviderError):
     """The API model store exists but cannot be read or parsed right now.
 
     It never means "no models": a check that meets it waits and reads again.
+    """
+
+
+class KeyRequired(ProviderError):
+    """The settings need an API key: none was given, and no saved key may be sent to their server.
+
+    The controller marks this refusal (keyRequired), so that the page shows its key field: the
+    connection being edited may have been removed or moved to another server meanwhile.
     """
 
 
@@ -295,6 +305,56 @@ def _check_host(netloc, host):
             raise ProviderError("Write an IPv4 address as four decimal numbers, for example 127.0.0.1.")
 
 
+def _server(base_url):
+    """The server a valid base URL names, which decides where a saved key may go: (scheme, host, port).
+
+    The host is lower-case (an IP address in its shortest form) and an absent
+    port is the scheme's default, so https://API.example.com:443/v1 and
+    https://api.example.com/v2 name one server, as the browser's origin does.
+    """
+
+    parts = urlsplit(base_url)
+    scheme, host = parts.scheme.lower(), (parts.hostname or "").lower()
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError:
+        pass
+    return scheme, host, parts.port or (443 if scheme == "https" else 80)
+
+
+def _authority(server):
+    """A server's host as a URL writes it (see _server()): an IPv6 address in brackets, and a port other
+    than the scheme's default."""
+
+    scheme, host, port = server
+    host = f"[{host}]" if ":" in host else host
+    return host if port == (443 if scheme == "https" else 80) else f"{host}:{port}"
+
+
+def _server_names(server, other):
+    """How messages name ``server`` and ``other``: the host, with a port other than the default, and the
+    scheme too when that is all that tells them apart."""
+
+    first, second = _authority(server), _authority(other)
+    if first == second:
+        first, second = f"{server[0]}://{first}", f"{other[0]}://{second}"
+    return first, second
+
+
+def _origin(base_url):
+    """scheme://host[:port] of a valid base URL, never its path: the server a saved key may go to."""
+
+    server = _server(base_url)
+    return f"{server[0]}://{_authority(server)}"
+
+
+def _key_hint(key):
+    """What the page may show of a saved key: "…" and its last four characters when it has at least 12
+    (API dashboards show those too), else "…" alone, which only says that a key is saved."""
+
+    return ("…" + key[-4:]) if len(key) >= 12 else ("…" if key else "")
+
+
 def _request_source(value):
     value = _clean_text(value, "request source", MAX_REQUEST_SOURCE_CHARS, required=False)
     if not value.isascii():
@@ -317,7 +377,7 @@ def _api_key(value):
     if value[:7].lower() == "bearer ":
         value = value[7:].strip()
     if not value or value.lower() == "bearer":
-        raise ProviderError("Enter the API key.")
+        raise KeyRequired("Enter the API key.")
     if len(value) > MAX_KEY_CHARS:
         raise ProviderError(f"The API key is longer than {MAX_KEY_CHARS} characters.")
     if any(character.isspace() or unicodedata.category(character) == "Cc" for character in value):
@@ -372,7 +432,11 @@ def _slug(text):
 
 
 def _validated_connection(values, existing=None, *, require_key=True):
-    """Validate connection fields without needing a model from the endpoint yet."""
+    """Validate connection fields without needing a model from the endpoint yet.
+
+    With a saved entry, a blank or absent apiKey keeps its key while the base
+    URL stays on the server it was saved for (see _server()).
+    """
 
     if not isinstance(values, dict):
         raise ProviderError("API model settings must be an object.")
@@ -388,13 +452,15 @@ def _validated_connection(values, existing=None, *, require_key=True):
     supplied_key = values.get("apiKey")
     blank = supplied_key is None or (isinstance(supplied_key, str) and not supplied_key.strip())
     if existing and blank:
-        # An empty field keeps the saved key, but only for the destination it
-        # was saved for: otherwise anyone who can call the controller could
-        # send a key they never saw to a host and header of their choice.
-        if api_format != existing.get("format") or base_url != existing.get("baseUrl"):
-            raise ProviderError("Enter the API key again: a saved key is sent only to the format and base URL "
-                                "it was saved with.")
+        # An empty field keeps the saved key, but only for the server it was
+        # saved for: otherwise anyone who can call the controller could send a
+        # key they never saw to a host of their choice. Another path or format
+        # on that server keeps it.
         key = existing.get("apiKey", "")
+        if key and _server(base_url) != _server(existing["baseUrl"]):
+            new, old = _server_names(_server(base_url), _server(existing["baseUrl"]))
+            raise KeyRequired(f"Enter the API key for {new}: a saved key is sent only to the server it was "
+                              f"saved for ({old}).")
     elif blank and not require_key:
         key = ""
     else:
@@ -412,6 +478,23 @@ def _validated(values, existing=None, *, require_key=True):
     label = _clean_text(values.get("label", existing.get("label")), "label", MAX_LABEL_CHARS, required=False)
     host = (urlsplit(connection["baseUrl"]).hostname or "").lower()
     return {**connection, "label": label or f"{model} · {host}", "model": model}
+
+
+def _repair_source(item):
+    """What repairing an entry that cannot be used keeps: {baseUrl, apiKey}, or None.
+
+    Only a well-formed key saved with a well-formed base URL is kept, and
+    _validated_connection() sends it only to that URL's server.
+    """
+
+    if not isinstance(item, dict) or not isinstance(item.get("apiKey"), str):
+        return None
+    try:
+        key = _api_key(item["apiKey"])
+        base_url, _ = _base_url(item.get("baseUrl"))
+    except ProviderError:
+        return None
+    return {"baseUrl": base_url, "apiKey": key}
 
 
 def _stored(entry):
@@ -601,8 +684,7 @@ def public_api_model(entry):
         "id": entry["id"], "label": entry["label"], "format": entry["format"],
         "baseUrl": entry["baseUrl"], "host": (urlsplit(entry["baseUrl"]).hostname or "").lower(),
         "headerName": entry["headerName"], "requestSource": entry["requestSource"],
-        "model": entry["model"], "hasKey": bool(key),
-        "keyHint": ("…" + key[-4:]) if len(key) >= 12 else ("…" if key else ""),
+        "model": entry["model"], "hasKey": bool(key), "keyHint": _key_hint(key),
         "lastTest": entry.get("lastTest"), "createdAt": entry.get("createdAt", ""),
         "updatedAt": entry.get("updatedAt", ""),
         "sourceId": entry.get("sourceId", entry["id"]), "sourceLabel": entry["label"],
@@ -624,10 +706,34 @@ def _invalid_reference(index, item):
     return f"invalid-{index}-{digest}"
 
 
-def _public_invalid(index, item, problem):
-    """Browser-safe view of an entry that cannot be used: what is readable of it, never its key or URL."""
+def _repaired_rows(rows):
+    """The indexes of the invalid rows that a repair under their id replaces, and so keeps the key of.
+
+    That is the first invalid row of each id that no valid entry has, as save_api_connection()
+    and _with_entry() take it. Saving under the id of a valid entry edits that entry (with its
+    own key), and a later invalid row of an id is only removed by the repair.
+    """
+
+    valid = {entry["id"] for _, entry, _ in rows if entry is not None}
+    first = {}
+    for index, row in enumerate(rows):
+        identity = _row_id(row)
+        if row[1] is None and is_api_id(identity) and identity not in valid:
+            first.setdefault(identity, index)
+    return set(first.values())
+
+
+def _public_invalid(index, item, problem, repaired=False):
+    """Browser-safe view of an entry that cannot be used: what is readable of it, never its key or its URL's path.
+
+    For the entry a repair replaces (``repaired``, see _repaired_rows()), keyHint shows the key the
+    repair keeps on the same server (see _repair_source()), as public_api_model() does, and origin
+    names that server (scheme://host[:port], never the path), so that the page asks for the key
+    exactly when the controller would. Both are empty when a repair needs the key again.
+    """
 
     item = item if isinstance(item, dict) else {}
+    source = _repair_source(item) if repaired else None
     text = {name: item[name].strip()[:80] for name in ("label", "model")
             if isinstance(item.get(name), str) and item[name].strip()}
     try:
@@ -638,7 +744,9 @@ def _public_invalid(index, item, problem):
     return {"id": identity, "ref": _invalid_reference(index, item), "invalid": True, "problem": problem,
             "label": text.get("label") or identity or f"Entry {index + 1}", "model": text.get("model", ""),
             "format": item.get("format") if item.get("format") in FORMATS else "", "host": host[:200],
-            "hasKey": isinstance(item.get("apiKey"), str) and bool(item["apiKey"].strip())}
+            "hasKey": isinstance(item.get("apiKey"), str) and bool(item["apiKey"].strip()),
+            "keyHint": _key_hint(source["apiKey"]) if source else "",
+            "origin": _origin(source["baseUrl"]) if source else ""}
 
 
 def load_api_models():
@@ -665,9 +773,10 @@ def store_listing():
     with _STORE_LOCK:
         rows = _load_store()
         _LAST_GOOD[str(store_path())] = [entry for _, entry, _ in rows if entry is not None]
+    repaired = _repaired_rows(rows)
     return ([public_api_connection(entry) for _, entry, _ in rows if entry is not None],
-            [_public_invalid(index, item, problem) for index, (item, entry, problem) in enumerate(rows)
-             if entry is None])
+            [_public_invalid(index, item, problem, index in repaired)
+             for index, (item, entry, problem) in enumerate(rows) if entry is None])
 
 
 def check_private_state():
@@ -722,7 +831,8 @@ def save_api_model(values, reserved=()):
 
     Without an id a new `api:<slug>` id is chosen, never one in `reserved`;
     an unknown explicit id is created as given. On update an empty or absent
-    apiKey keeps the saved key while the format and base URL stay the same.
+    apiKey keeps the saved key while the base URL stays on the server it was
+    saved for (scheme, host and port); another path or format keeps it too.
     """
 
     if not isinstance(values, dict):
@@ -801,7 +911,8 @@ def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=
                 existing.get(key) != expected.get(key)
                 for key in ("format", "baseUrl", "requestSource", "apiKey", "label", "updatedAt"))):
             raise ProviderError("The API connection changed while loading models. Save it again with the current settings.")
-        connection = _validated_connection(values, existing)
+        # Repairing an entry keeps the key it still holds, for the server it was saved for.
+        connection = _validated_connection(values, existing or _repair_source(broken))
         label = _clean_text(values.get("label", (existing or {}).get("label")), "label", MAX_LABEL_CHARS,
                             required=False) or (urlsplit(connection["baseUrl"]).hostname or "API key")
         now = _now()
@@ -854,7 +965,7 @@ def validated_api_model(values, model_id=None):
     """Check settings exactly as save_api_model() would, without saving them.
 
     With the id of a saved model, absent fields come from that model, and an
-    empty apiKey too while the destination (format and base URL) is unchanged.
+    empty apiKey too while the base URL stays on the server it was saved for.
     Returns (entry, saved): the complete settings and the saved
     entry (None when unsaved). Both include the key: keep them on the server.
     """
@@ -866,9 +977,11 @@ def validated_api_model(values, model_id=None):
 
 
 def validated_api_connection(values, model_id=None):
-    """Validate discovery settings, reusing a saved key only for its saved destination.
+    """Validate discovery settings, reusing a saved key only for the server it was saved for.
 
     No model is required before fetching the provider's available model list.
+    The id of an entry that cannot be used reuses the key it holds as a repair
+    would (see save_api_connection()), so Test works while repairing it.
     The result contains the key and must stay on the server.
     """
 
@@ -876,7 +989,11 @@ def validated_api_connection(values, model_id=None):
         raise ProviderError("API model ids look like api:<name> (lowercase letters, digits, '.', '_' or '-').")
     saved = next((entry for entry in _entries(cached=False) if model_id and entry["id"] == model_id), None)
     if model_id and saved is None:
-        raise ProviderError("That API model is not configured.")
+        with _STORE_LOCK:
+            broken = next((row[0] for row in _load_store() if row[1] is None and _row_id(row) == model_id), None)
+        if broken is None:
+            raise ProviderError("That API model is not configured.")
+        return _validated_connection(values, _repair_source(broken))
     return _validated_connection(values, saved)
 
 
@@ -1024,13 +1141,21 @@ def api_format(model_id):
     return model["format"] if model else None
 
 
+def harness_for_format(fmt):
+    """The CLI that runs API models of one wire format: OpenAI format Codex, Anthropic format Claude."""
+
+    if fmt not in FORMAT_HARNESSES:
+        raise ProviderError(f"Unknown API format {str(fmt)[:40]!r}.")
+    return FORMAT_HARNESSES[fmt]
+
+
 def harness(model_id):
-    """The CLI that runs a model: OpenAI-format endpoints use Codex, Anthropic-format Claude."""
+    """The CLI that runs a model: built-in models their own, API models their format's (harness_for_format)."""
 
     builtin, model = _required(model_id)
     if builtin:
         return builtin["provider"]
-    return CODEX if model["format"] == OPENAI_FORMAT else CLAUDE
+    return harness_for_format(model["format"])
 
 
 def wire_model(model_id):

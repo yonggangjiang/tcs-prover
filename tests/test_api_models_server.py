@@ -23,7 +23,7 @@ from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
-from runner import providers
+from runner import claude_cli, providers
 from ui import batches, cli, retrieval, review, server
 
 KEY = "sk-tcs-server-test-0123456789"
@@ -90,6 +90,15 @@ class MockEndpoint:
                     return self.reply(401, {"type": "error", "error": {
                         "type": "authentication_error", "message": f"invalid x-api-key {offered}"}})
                 return self.reply(404, {"error": {"message": "no such route"}})
+
+            def do_GET(self):
+                # Model discovery (Load models, Save connection, Test without a model).
+                headers = {name.lower(): value for name, value in self.headers.items()}
+                endpoint.requests.append({"path": self.path, "headers": headers, "body": None})
+                offered = headers.get("x-api-key") or headers.get("authorization", "").removeprefix("Bearer ")
+                if self.path.split("?")[0].endswith("/models") and offered in (KEY, ANTHROPIC_KEY):
+                    return self.reply(200, {"data": [{"id": "gpt-gateway"}], "has_more": False})
+                return self.reply(401, {"error": {"message": f"Incorrect API key provided: {offered}"}})
 
             def events(self, events):
                 raw = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
@@ -252,6 +261,8 @@ class ApiModelEndpointTests(HttpCase):
                 status, value = self.call("/api-models", {"apiKey": KEY, **body})
                 self.assertEqual(status, 400)
                 self.assertIn(message, value["error"])
+                # Only the refusal that asks for the key makes the page show its key field.
+                self.assertEqual(value.get("keyRequired", False), message == "Enter the API key.")
         self.assertFalse(self.store.exists())
 
     def test_endpoints_require_the_session_token(self):
@@ -296,13 +307,10 @@ class ApiModelEndpointTests(HttpCase):
         # Other edits stay possible, and a finished job no longer pins the format.
         self.assertEqual(self.call("/api-models", {"id": model["id"], "label": "Edited", "model": "gpt-gateway"})[0], 200)
         app.state["phase"] = "done"
-        status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic"})
-        # A new format is a new destination: the saved key is not reused for it.
-        self.assertEqual(status, 400)
-        self.assertIn("Enter the API key again", value["error"])
-        status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic", "apiKey": KEY,
-                                                  "model": "gpt-gateway"})
+        # A new format on the same server keeps the saved key, now sent with the format's header.
+        status, value = self.call("/api-models", {"id": model["id"], "format": "anthropic", "model": "gpt-gateway"})
         self.assertEqual((status, value["model"]["format"], value["model"]["headerName"]), (200, "anthropic", "x-api-key"))
+        self.assertEqual(providers.api_model_secret(model["id"]), KEY)
 
     def removed_model_job(self, label="Lab Sol", phase="paused"):
         """A waiting job whose critic used an API model that is then removed."""
@@ -422,6 +430,158 @@ class CatalogTests(HttpCase):
         self.assertIn(model["id"], state["workflow"]["settings"]["model_efforts"])
         # The shared graph constant itself never gains user data.
         self.assertNotIn("model_catalog", server.PUBLIC_GRAPH["settings"])
+
+
+class ModelSourceTests(HttpCase):
+    """Run settings name where each role's model runs: /state's modelSources, never a key or a full URL."""
+
+    NEW_KEY = "sk-tcs-server-test-new-host-4242"
+
+    def setUp(self):
+        super().setUp()
+        # Nothing here may start a runner, a CLI or a model session.
+        for target, name in ((server.App, "_spawn_worker"), (server.subprocess, "Popen"), (runtime, "goal_session"),
+                             (runtime, "author_conversation"), (claude_cli, "goal_session"),
+                             (claude_cli, "author_conversation")):
+            stub = mock.patch.object(target, name, side_effect=AssertionError(f"{name} reached"))
+            stub.start()
+            self.addCleanup(stub.stop)
+        self.sol = self.openai_model(label="Sol via lab gateway", baseUrl="https://gateway.lab.example/v1",
+                                     model="gpt-6.1-sol")
+        self.claude = providers.save_api_model({"format": "anthropic", "baseUrl": "https://claude.example.com",
+                                                "model": "claude-gw", "apiKey": ANTHROPIC_KEY,
+                                                "label": "Claude gateway"})
+
+    def job(self, **models):
+        """A paused job with these role models, recording its API models as a launch does."""
+
+        app = self.new_app()
+        app.state.update(phase="paused", stage="solve", activeNode="author", **models)
+        app.state["apiModels"] = server.api_model_snapshot(models.values())
+        self.http.jobs[app.state["runId"]] = app
+        return app
+
+    def sources(self, app):
+        status, state = self.call(f"/state?job={app.state['runId']}")
+        self.assertEqual(status, 200)
+        self.assertNotIn(self.NEW_KEY, json.dumps(state))
+        # Hosts only: no base URL, whole or in part.
+        self.assertNotIn("://", json.dumps(state["modelSources"]))
+        self.assertNotIn("/v1", json.dumps(state["modelSources"]))
+        return state["modelSources"]
+
+    def test_state_names_each_roles_source_without_keys(self):
+        app = self.job(reviewModel=self.claude["id"], authorModel="claude-opus-5-5", criticModel=self.sol["id"],
+                       writerModel="gpt-5.6-sol")
+        # Each program under the one name its source menu gives it, also where an API model runs through it.
+        self.assertEqual(self.sources(app), {
+            "review": {"model": self.claude["id"], "kind": "api", "configured": True, "label": "claude-gw",
+                       "wireModel": "claude-gw", "connection": "Claude gateway", "format": "anthropic",
+                       "formatLabel": "Anthropic format", "host": "claude.example.com", "runsThrough": "claude",
+                       "runsThroughLabel": "the Claude CLI"},
+            "author": {"model": "claude-opus-5-5", "kind": "claude", "label": "Claude Opus 5.5", "source": "Claude CLI",
+                       "runsThrough": "claude", "runsThroughLabel": "the Claude CLI", "older": False},
+            "critic": {"model": self.sol["id"], "kind": "api", "configured": True, "label": "gpt-6.1-sol",
+                       "wireModel": "gpt-6.1-sol", "connection": "Sol via lab gateway", "format": "openai",
+                       "formatLabel": "OpenAI format", "host": "gateway.lab.example", "runsThrough": "codex",
+                       "runsThroughLabel": "the Codex CLI"},
+            "writer": {"model": "gpt-5.6-sol", "kind": "codex", "label": "GPT 5.6 Sol (older)", "source": "Codex CLI",
+                       "runsThrough": "codex", "runsThroughLabel": "the Codex CLI", "older": True},
+        })
+        # Both names come from the source menus' labels, so renaming a program there renames it here too.
+        self.assertEqual(server.SOURCE_PROGRAMS, {kind: f"the {providers.PROVIDER_LABELS[kind]}"
+                                                  for kind in (providers.CODEX, providers.CLAUDE)})
+        with mock.patch.dict(providers.PROVIDER_LABELS, {providers.CLAUDE: "Claude Code"}):
+            self.assertEqual(server._program_name(providers.CLAUDE), "Claude Code")
+        snapshot = json.dumps(app.snapshot())
+        for secret in (KEY, ANTHROPIC_KEY):
+            self.assertNotIn(secret, snapshot)
+
+    def test_removed_and_edited_connections_show_the_recorded_source(self):
+        app = self.job(reviewModel=self.claude["id"], criticModel=self.sol["id"])
+        # Edited since the job started: another host, saved with a newly typed key. A model call already
+        # under way keeps the endpoint it started with (the job's next one uses the edited connection),
+        # so both are named.
+        providers.save_api_model({"id": self.sol["id"], "format": "openai", "baseUrl": "https://new-gateway.example/v1",
+                                  "model": "gpt-6.1-sol", "apiKey": self.NEW_KEY, "label": "Sol via lab gateway"})
+        sources = self.sources(app)
+        self.assertEqual({key: sources["critic"].get(key) for key in ("configured", "host", "recorded")},
+                         {"configured": True, "host": "new-gateway.example",
+                          "recorded": {"format": "openai", "formatLabel": "OpenAI format", "host": "gateway.lab.example",
+                                       "wireModel": "gpt-6.1-sol"}})
+        self.assertNotIn("recorded", sources["review"])
+        # Removed: the line shows what the job recorded, marked as not configured now.
+        self.assertTrue(providers.delete_api_model(self.claude["id"]))
+        self.assertEqual(self.sources(app)["review"], {
+            "model": self.claude["id"], "kind": "api", "configured": False, "label": "claude-gw", "wireModel": "claude-gw",
+            "connection": "Claude gateway", "format": "anthropic", "formatLabel": "Anthropic format",
+            "host": "claude.example.com", "runsThrough": "claude", "runsThroughLabel": "the Claude CLI"})
+        # Nothing recorded: only the id.
+        app.state["apiModels"] = {}
+        self.assertEqual(self.sources(app)["review"], {"model": self.claude["id"], "kind": "api", "configured": False})
+        # Added again: configured, and nothing recorded to compare.
+        self.claude = providers.save_api_model({"id": self.claude["id"], "format": "anthropic",
+                                                "baseUrl": "https://claude.example.com", "model": "claude-gw",
+                                                "apiKey": ANTHROPIC_KEY, "label": "Claude gateway"})
+        self.assertIs(self.sources(app)["review"]["configured"], True)
+
+    def test_an_edit_that_keeps_the_host_still_names_what_the_job_started_with(self):
+        local = self.openai_model(label="Local", baseUrl="http://localhost:8000/v1", model="gpt-6.1-sol")
+        app = self.job(criticModel=local["id"], writerModel=self.sol["id"])
+
+        def edit(model_id, **values):
+            # Saved from the page while the paused job uses it (only another format is refused then); the
+            # key stays while the base URL does.
+            entry = providers.api_model(model_id)
+            status, reply = self.call("/api-models", {
+                **{key: entry[key] for key in ("id", "format", "baseUrl", "model", "label")}, "apiKey": "", **values})
+            self.assertEqual(status, 200, reply)
+
+        def critic():
+            sources = self.sources(app)
+            self.assertNotIn("/v2", json.dumps(sources))  # Never a path.
+            return {key: sources["critic"].get(key) for key in ("label", "wireModel", "host", "recorded")}
+
+        # Unchanged: the host with the port its base URL names, and nothing recorded to name.
+        self.assertEqual(critic(), {"label": "gpt-6.1-sol", "wireModel": "gpt-6.1-sol", "host": "localhost:8000",
+                                    "recorded": None})
+        started = {"format": "openai", "formatLabel": "OpenAI format", "host": "localhost:8000", "wireModel": "gpt-6.1-sol"}
+        # Another port only, with a newly typed key: the model call under way keeps port 8000.
+        edit(local["id"], baseUrl="http://localhost:9000/v1", apiKey=self.NEW_KEY)
+        self.assertEqual(critic(), {"label": "gpt-6.1-sol", "wireModel": "gpt-6.1-sol", "host": "localhost:9000",
+                                    "recorded": started})
+        # Another path only: the host, port, format and model read the same, and it is still an edit.
+        edit(local["id"], baseUrl="http://localhost:8000/v2", apiKey=self.NEW_KEY)
+        self.assertEqual(critic(), {"label": "gpt-6.1-sol", "wireModel": "gpt-6.1-sol", "host": "localhost:8000",
+                                    "recorded": started})
+        # Another wire model under the same id: the first line names the model the next call uses, the
+        # record the one the job started with.
+        edit(local["id"], baseUrl="http://localhost:8000/v1", apiKey=self.NEW_KEY)
+        edit(local["id"], model="gpt-7-sol")
+        self.assertEqual(critic(), {"label": "gpt-7-sol", "wireModel": "gpt-7-sol", "host": "localhost:8000",
+                                    "recorded": started})
+        # The same endpoint written with its default port, or the hostname in capitals, is no edit.
+        edit(self.sol["id"], baseUrl="https://Gateway.Lab.Example:443/v1", apiKey=KEY)
+        sources = self.sources(app)
+        self.assertEqual(sources["writer"]["host"], "gateway.lab.example")
+        self.assertNotIn("recorded", sources["writer"])
+
+    def test_an_unreadable_connection_list_is_never_reported_as_removed(self):
+        app = self.job(criticModel=self.sol["id"], writerModel="gpt-6.1-sol")
+        self.store.write_text("{damaged", encoding="utf-8")
+        # Without an earlier good read in this process, the catalog lists the built-in models only.
+        with mock.patch.dict(providers._LAST_GOOD, clear=True):
+            sources = self.sources(app)
+        self.assertEqual({key: sources["critic"].get(key) for key in ("configured", "reason", "connection", "host")},
+                         {"configured": None, "reason": "connection list cannot be read now",
+                          "connection": "Sol via lab gateway", "host": "gateway.lab.example"})
+        self.assertEqual(sources["writer"]["kind"], "codex")
+        # A removed model and an unknown id are named as such.
+        app.state.update(authorModel="deepseek-v4-pro", reviewModel="no-such-model")
+        sources = self.sources(app)
+        self.assertEqual(sources["author"], {"model": "deepseek-v4-pro", "kind": "removed", "replacement": "gpt-6.1-sol",
+                                             "replacementLabel": "GPT 6.1 Sol"})
+        self.assertEqual(sources["review"], {"model": "no-such-model", "kind": "unknown"})
 
 
 class ProbeTests(HttpCase):
@@ -574,24 +734,126 @@ class ProbeTests(HttpCase):
         attacker = MockEndpoint()
         self.addCleanup(attacker.close)
         model = self.saved()
+        # Another port on the same host is another server: the saved key never goes there.
+        refusal = (f"Enter the API key for 127.0.0.1:{attacker.httpd.server_port}: a saved key is sent only to the "
+                   f"server it was saved for (127.0.0.1:{self.endpoint.httpd.server_port}).")
         for change in ({"baseUrl": attacker.base + "/v1", "headerName": "X-Leak"},
-                       {"baseUrl": attacker.base + "/v1"}, {"format": "anthropic"}):
+                       {"baseUrl": attacker.base + "/v1"}, {"baseUrl": attacker.base + "/v1", "format": "anthropic"}):
             with self.subTest(change=change):
                 status, value = self.call("/api-models/test", {"id": model["id"], **change})
-                self.assertEqual(status, 400)
-                self.assertIn("Enter the API key again", value["error"])
+                self.assertEqual((status, value), (400, {"error": refusal, "keyRequired": True}))
                 # Saving the same change cannot move the saved key either.
                 status, value = self.call("/api-models", {"id": model["id"], **change})
-                self.assertEqual(status, 400)
-                self.assertIn("Enter the API key again", value["error"])
+                self.assertEqual((status, value), (400, {"error": refusal, "keyRequired": True}))
         self.assertEqual((attacker.requests, self.endpoint.requests), ([], []))
         self.assertEqual(providers.api_model(model["id"])["baseUrl"], self.endpoint.base + "/v1")
         self.assertEqual(providers.api_model_secret(model["id"]), KEY)
+        # Another path or format on the saved server keeps the key: only that server receives it.
+        status, result = self.call("/api-models/test", {"id": model["id"], "baseUrl": self.endpoint.base + "/proxy/v1"})
+        self.assertEqual((status, result["ok"], result["recorded"]), (200, True, False))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/proxy/v1/responses")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["authorization"], f"Bearer {KEY}")
+        status, result = self.call("/api-models/test", {"id": model["id"], "format": "anthropic"})
+        self.assertEqual((status, result["status"], result["recorded"]), (200, 401, False))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/v1/messages")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["x-api-key"], KEY)
+        self.assertEqual(attacker.requests, [])
         # With the key typed again, the edited endpoint is tested (and saved) normally.
         status, result = self.call("/api-models/test", {"id": model["id"], "baseUrl": attacker.base + "/v1",
                                                         "apiKey": KEY})
         self.assertEqual((status, result["ok"], result["recorded"]), (200, True, False))
         self.assertEqual(attacker.requests[0]["headers"]["authorization"], f"Bearer {KEY}")
+
+    def test_editing_a_connection_keeps_its_key_for_another_path_or_format_on_its_server(self):
+        other = MockEndpoint()
+        self.addCleanup(other.close)
+        connection = providers.save_api_connection({"format": "openai", "baseUrl": self.endpoint.base + "/v1",
+                                                    "apiKey": KEY, "label": "Local"}, [{"id": "gpt-gateway"}])
+        # Load models with another path: the discovery request on the saved server carries the saved key.
+        status, result = self.call("/api-models/discover", {"id": connection["id"], "format": "openai",
+                                                            "baseUrl": self.endpoint.base + "/proxy/v1/"})
+        self.assertEqual((status, result["ok"]), (200, True))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/proxy/v1/models")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["authorization"], f"Bearer {KEY}")
+        # Saving the edit (no key typed) keeps the key with the new path, then with the other format.
+        status, value = self.call("/api-models", {"id": connection["id"], "format": "openai", "label": "Local",
+                                                  "baseUrl": self.endpoint.base + "/proxy/v1/"})
+        self.assertEqual((status, value["connection"]["baseUrl"]), (200, self.endpoint.base + "/proxy/v1"))
+        self.assertEqual(value["connection"]["keyHint"], "…" + KEY[-4:])
+        status, value = self.call("/api-models", {"id": connection["id"], "format": "anthropic", "label": "Local",
+                                                  "baseUrl": self.endpoint.base + "/proxy/v1"})
+        self.assertEqual((status, value["connection"]["format"]), (200, "anthropic"))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/proxy/v1/models")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["x-api-key"], KEY)
+        self.assertEqual(providers.validated_api_connection({}, connection["id"])["apiKey"], KEY)
+        self.assertEqual(other.requests, [])
+
+    def test_repairing_an_entry_reuses_its_key_on_the_same_server_only(self):
+        other = MockEndpoint()
+        self.addCleanup(other.close)
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+        self.store.write_text(json.dumps({"version": 2, "models": [
+            {"id": "api:broken", "format": "openai", "baseUrl": self.endpoint.base + "/v1", "model": "gpt-gateway",
+             "apiKey": KEY, "label": 5}]}))
+        status, listing = self.call("/api-models")
+        [entry] = listing["invalid"]
+        self.assertEqual((entry["id"], entry["hasKey"], entry["keyHint"]), ("api:broken", True, "…" + KEY[-4:]))
+        # Of its URL the page gets the server the key is kept for (the origin), never the path.
+        self.assertNotIn("baseUrl", entry)
+        self.assertEqual(entry["origin"], self.endpoint.base)
+        # Another server is refused before anything is sent.
+        status, value = self.call("/api-models", {"id": "api:broken", "format": "openai", "baseUrl": other.base + "/v1"})
+        self.assertEqual(status, 400)
+        self.assertIn("a saved key is sent only to the server it was saved for", value["error"])
+        # Test while repairing uses the key on its server; there is no saved connection to record it on.
+        status, result = self.call("/api-models/test", {"id": "api:broken", "format": "openai",
+                                                        "baseUrl": self.endpoint.base + "/v2"})
+        self.assertEqual((status, result["ok"], result["recorded"]), (200, True, False))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/v2/models")
+        # Saved on the same server without a key, the repaired connection keeps it.
+        status, value = self.call("/api-models", {"id": "api:broken", "format": "openai", "label": "Repaired",
+                                                  "baseUrl": self.endpoint.base + "/v1"})
+        self.assertEqual(status, 200)
+        self.assertEqual((value["connection"]["id"], value["connection"]["label"], value["connection"]["keyHint"],
+                          value["invalid"]), ("api:broken", "Repaired", "…" + KEY[-4:], []))
+        self.assertEqual(providers.validated_api_connection({}, "api:broken")["apiKey"], KEY)
+        self.assertTrue(all(request["headers"]["authorization"] == f"Bearer {KEY}" for request in self.endpoint.requests))
+        self.assertEqual(other.requests, [])
+
+    def test_loading_models_while_repairing_an_entry_lists_them_and_changes_nothing(self):
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+        self.store.write_text(json.dumps({"version": 2, "models": [
+            {"id": "api:broken", "format": "openai", "baseUrl": self.endpoint.base + "/v1", "model": "gpt-gateway",
+             "apiKey": KEY, "label": 5}]}))
+        before = self.store.read_bytes()
+        # The models load with the key the entry holds, on its server; the entry is not saved by this.
+        status, result = self.call("/api-models/discover", {"id": "api:broken", "format": "openai",
+                                                            "baseUrl": self.endpoint.base + "/v2"})
+        self.assertEqual((status, result["ok"], [row["id"] for row in result["models"]]), (200, True, ["gpt-gateway"]))
+        self.assertEqual(self.endpoint.requests[-1]["path"], "/v2/models")
+        self.assertEqual(self.endpoint.requests[-1]["headers"]["authorization"], f"Bearer {KEY}")
+        self.assertNotIn("connection", result)
+        self.assertNotIn("apiKey", json.dumps(result))
+        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual([entry["id"] for entry in providers.invalid_api_models()], ["api:broken"])
+
+    def test_a_refusal_that_asks_for_the_key_is_marked_for_the_page(self):
+        connection = providers.save_api_connection({"format": "openai", "baseUrl": self.endpoint.base + "/v1",
+                                                    "apiKey": KEY, "label": "Local"}, [{"id": "gpt-gateway"}])
+        form = {"id": connection["id"], "format": "openai", "baseUrl": self.endpoint.base + "/v1", "label": "Local"}
+        # Another tab removed the connection: saving the edit without a key asks for the key.
+        self.assertEqual(self.call("/api-models/delete", {"id": connection["id"]})[0], 200)
+        status, value = self.call("/api-models", form)
+        self.assertEqual((status, value), (400, {"error": "Enter the API key.", "keyRequired": True}))
+        # A refusal for another reason is not marked: a URL refused whatever the key, a key that cannot be used.
+        for change, message in (({"baseUrl": "http://gateway.example.com/v1"}, "plain http is allowed only for localhost"),
+                                ({"apiKey": "two words"}, "cannot contain spaces")):
+            with self.subTest(change=change):
+                status, value = self.call("/api-models", {**form, **change})
+                self.assertEqual(status, 400)
+                self.assertIn(message, value["error"])
+                self.assertNotIn("keyRequired", value)
+        self.assertEqual(self.endpoint.requests, [])
 
     def test_editing_a_saved_model_tests_with_its_saved_key(self):
         model = self.saved()
