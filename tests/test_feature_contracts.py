@@ -361,11 +361,16 @@ const [entry] = ui.authorConversationList.children;
 assert.equal(entry.dataset.status, 'answered');
 assert.match(entry.children[0].textContent, /^Progress summary at the time limit · .+$/);
 assert.equal(entry.children[1].textContent, snapshot.conversation.items[0].reply);
-// The box asks the author stopped at its time limit; Continue waits for a higher limit.
+// The chat asks the author stopped at its time limit (the server's mode); Continue waits for a higher limit.
+assert.equal(snapshot.conversation.mode, 'paused');
 assert.equal(ui.authorSteerControl.hidden, false);
-assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
+// The time limit stopped it: the box never calls it paused.
+assert.equal(ui.authorSteerInstruction.placeholder, 'Ask the author a question.');
+assert.equal(ui.sendAuthorSteer.disabled, false);
+assert.equal(ui.authorConversationNote.textContent, snapshot.conversation.note);
 assert.equal(ui.resume.textContent, 'Continue');
-assert.equal(ui.requestSummary.hidden, false);
+assert.deepEqual([ui.requestSummary.hidden, ui.requestSummary.disabled, ui.requestSummary.textContent],
+  [false, false, 'Summarize progress']);
 assert.equal(ui.resume.disabled, false);
 // The batch's related work, linked into this job, and where works for the whole folder run go.
 assert.equal(ui.relatedWorksPanel.hidden, false);
@@ -393,8 +398,11 @@ assert.match(ui.runDescription.textContent, /^The time limit is now 3 hours \(.+
 assert.equal(ui.resume.disabled, true);
 assert.equal(ui.resume.title, 'The author is replying. Wait for the reply or stop it.');
 assert.equal(ui.stopReply.hidden, false);
-assert.equal(ui.requestSummary.hidden, true);
+// One reply at a time: the summary button and Send wait, and say why.
+assert.deepEqual([ui.requestSummary.hidden, ui.requestSummary.disabled], [false, true]);
+assert.equal(ui.requestSummary.title, 'The author is replying. Wait for the reply or stop it.');
 assert.equal(ui.sendAuthorSteer.disabled, true);
+assert.equal(ui.sendAuthorSteer.title, 'The author is replying. Wait for the reply or stop it.');
 const items = ui.authorConversationList.children;
 assert.equal(items.length, 2);
 assert.equal(items[1].dataset.status, 'queued');

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
+from runner import claude_cli
 from tests import critic_doubles
 from test_workflow_runner import workspace, review_report, ROOT
 
@@ -68,6 +69,44 @@ class ProofHandoffWorkflowTests(unittest.TestCase):
             self.assertEqual(feedback[0]["solution"], "Candidate one")
             self.assertEqual(feedback[0]["bugs"], "A gap remains.")
             self.assertEqual(result["output"], reviewed[-1])
+
+    def test_where_proof_files_cannot_be_read_a_pointer_is_refused_plainly_and_a_reply_is_reviewed(self):
+        proof = "Every case follows from the lemma. " * 60  # Longer than a pointer-sized message.
+        with workspace() as directory, \
+                patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=False), \
+                patch.object(claude_cli, "goal_session", side_effect=AssertionError("Claude session started")):
+            (directory / "proof.md").write_text("A proof file this computer cannot hand over")
+            launches = []
+
+            def pointer(module, prompt, **kwargs):
+                launches.append(prompt)
+                yield {"outcome": "done", "output": "PROOF_FILE: proof.md"}
+
+            with patch.object(runtime, "goal_session", side_effect=pointer), \
+                    patch.object(runtime, "structured") as model:
+                state = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"], {"statement": "Task"})
+            model.assert_not_called()
+            self.assertTrue(state["paused"])
+            self.assertEqual(state["handoff_refused"], "Cannot hand the submitted proof to the critic: "
+                                                       + runtime.proof_handoff.NO_FILE_HANDOFF)
+            self.assertTrue(launches[0].endswith("\n\n" + runtime.INLINE_PROOF_NOTE))
+            reviewed = []
+
+            def review(prompt, schema, stage, **settings):
+                files = dict(settings["input_files"])
+                reviewed.append((files["proof.md"], json.loads(files["manifest.json"])["source"]["kind"]))
+                report = review_report(files["proof.md"])
+                return report, json.dumps(report)
+
+            def reply(module, prompt, **kwargs):
+                yield {"outcome": "done", "output": proof + "\nPROOF_FILE: proof.md"}
+
+            with patch.object(runtime, "goal_session", side_effect=reply), \
+                    patch.object(runtime, "structured", side_effect=critic_doubles.coordinator(review)):
+                result = runtime.execute_workflows([ROOT / "workflows/author_critic.yaml"], {"statement": "Task"})
+            # The proof in the reply is reviewed, its leftover PROOF_FILE line dropped.
+            self.assertEqual(reviewed, [(proof + "\n", "inline")])
+            self.assertEqual(result["output"], proof.strip())
 
     def test_critic_edits_are_reviewed_without_reloading_stale_author_file(self):
         with workspace() as directory:

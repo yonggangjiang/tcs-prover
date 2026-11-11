@@ -1,5 +1,6 @@
 """New web jobs use current YAML, never remembered browser or server defaults."""
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,7 +12,8 @@ from unittest.mock import patch
 import yaml
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
-from ui import server
+from runner import providers
+from ui import presets, server
 
 # The notebook files of older runs: only the author ever wrote them, never the controller.
 RESEARCH_MEMORY_FILES = ("INITIAL_PROMPT.md", "APPROACHES.md", "PROVED.md", "audit.md")
@@ -241,6 +243,31 @@ Promise.resolve(vm.runInNewContext(setup + functions + checks, {assert}))
             text=True, capture_output=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+
+class SavedSettingsPromptTests(unittest.TestCase):
+    """Saved New problem settings never hold prompts: every new job starts from the workflow files."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        store = patch.dict(os.environ, {providers.STORE_ENV: str(Path(folder.name) / "api-models.json")})
+        store.start()
+        self.addCleanup(store.stop)
+
+    def test_saving_with_edited_prompts_stores_none(self):
+        edited = "Deliberate per-job instructions. [STATEMENT]"
+        presets.save("Edited prompts", {**presets.builtin_settings(), "promptOverrides": {"author": edited},
+                                        "authorPrompt": edited, "criticPrompt": edited, "finalPrompt": edited},
+                     make_default=True)
+        text = presets.path().read_text(encoding="utf-8")
+        self.assertNotIn("Deliberate", text)
+        self.assertNotIn("Prompt", text)
+        [saved] = presets.listing()["presets"]
+        self.assertEqual(set(saved["settings"]), set(presets.SETTINGS))
+        # A new problem opened with these settings as the default still offers the workflow files' prompts.
+        self.assertEqual(server.empty_state()["authorPrompt"], server.default_prompts()["author"])
 
 
 if __name__ == "__main__":

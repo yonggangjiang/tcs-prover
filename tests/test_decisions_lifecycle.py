@@ -232,10 +232,12 @@ class RestartTests(IsolatedCase):
         self.assertEqual(again.state["autoResumeAt"], 0)
         other = self.author_job("Stopped job")
         self.records(other, {"kind": "request", "stage": "solve", "node": "author", "label": "Exact solve input"})
-        with patch.object(server, "stop_process_tree"):
+        with patch.object(server, "stop_process_tree"), patch.object(server.App, "_watch_author_pause"):
             other.stop()
+        # A Stop works like the time limit: it stays stopped in place, and a restart never resumes it.
         stopped = self.restored(other)
-        self.assertEqual((stopped.state["phase"], stopped.state["autoResumeAt"]), ("done", 0))
+        self.assertEqual((stopped.state["phase"], stopped.state["autoResumeAt"]), ("paused", 0))
+        self.assertEqual(self.checkpoint(stopped)["pauseCause"], "stopped")
 
     def test_older_interrupted_checkpoints_also_continue(self):
         app = self.author_job()
@@ -799,9 +801,19 @@ class ReaderTests(IsolatedCase):
         dead.join()
         app._worker_thread = (token, dead)
         with patch.object(server, "stop_process_tree"):
-            app.stop()
-        self.assertEqual((app.state["phase"], app.state["error"]), ("done", "Stopped."))
+            app.stop(at_once=True)
+        # Stopped in place: the job is paused at its author with the cause "stopped".
+        self.assertEqual((app.state["phase"], self.checkpoint(app)["pauseCause"]), ("paused", "stopped"))
         self.assertIsNone(app.worker_token)
+        first = self.author_job("First stop")
+        token = first.worker_token = first.active_token = object()
+        first._worker_thread = (token, dead)
+        first.process = Mock(pid=None)
+        first.process.wait.return_value = 0
+        with patch.object(server.time, "sleep"), patch.object(server.App, "_watch_author_pause"):
+            first.stop()
+            first._settle_pause_without_reader(token)
+        self.assertEqual((first.state["phase"], self.checkpoint(first)["pauseCause"]), ("paused", "stopped"))
         paused = self.author_job("Paused job")
         token = paused.worker_token = paused.active_token = object()
         paused._worker_thread = (token, dead)
@@ -1150,14 +1162,16 @@ class TerminalTests(IsolatedCase):
         def pause(app):
             app.state.update(phase="pausing")  # The author does not answer before the second Ctrl-C.
 
-        def stop(app):
-            app.state.update(phase="done", error="Stopped.", manuallyStopped=True)
+        def stop(app, at_once=False):
+            app.state.update(phase="paused")
 
         with patch.object(server.App, "pause", autospec=True, side_effect=pause), \
                 patch.object(server.App, "stop", autospec=True, side_effect=stop) as stopped:
             code, errors = self.run_headless(start, interrupts={1, 2})
         self.assertEqual(code, 130)
         stopped.assert_called()
+        # At once: a working author keeps its saved conversation, and the job stays stopped in place.
+        self.assertEqual(stopped.call_args.kwargs, {"at_once": True})
         self.assertIn("All active proofs stopped.", errors)
 
     def test_a_stop_that_cannot_be_recorded_still_ends_the_runner(self):

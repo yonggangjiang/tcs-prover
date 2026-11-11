@@ -57,6 +57,19 @@ class BatchCatalogTests(unittest.TestCase):
         self.assertEqual(lookup['search-v2']['folder'], 'runs/search-v2')
         self.assertTrue(all(row['jobCount'] == 1 for row in cards))
 
+    def test_the_server_lists_the_root_runs_itself_and_a_saved_runs_batch_setting_is_ignored(self):
+        # The server's own /batches lists its live jobs: the catalog leaves the root runs out for it.
+        self.assertEqual({row['id'] for row in self.catalog.list_batches(include_root=False)},
+                         {'search-v2', 'search-v4'})
+        # A saved batch is the folder its runs are in, whatever batch made with New batch a run names.
+        self.write_json(self.old / 'job-settings.json', {'sourceFile': 'P02.md', 'batch': 'batch_0123456789'})
+        self.assertEqual([(job['runId'], job['sourceFile']) for job in self.catalog.jobs('search-v2')],
+                         [('same-job', 'P02.md')])
+        lookup = {row['id']: row for row in self.catalog.list_batches()}
+        self.assertEqual((lookup['search-v2']['jobCount'], lookup['search-v2']['label']), (1, 'search-v2'))
+        self.assertNotIn('batch_0123456789', lookup)
+        self.assertEqual(self.catalog.state('search-v2', 'same-job')['batchId'], 'search-v2')
+
     def test_catalog_does_not_read_transcripts_or_instantiate_apps(self):
         for directory in (self.original, self.old, self.current):
             (directory / 'transcript.jsonl').write_text('{"kind":"status"}\n')

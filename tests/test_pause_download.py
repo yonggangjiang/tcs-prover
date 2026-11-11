@@ -236,16 +236,20 @@ class PauseDownloadTests(unittest.TestCase):
         self.assertEqual(checkpoint["stage"], "repair")
 
     def test_automatic_pause_does_not_override_manual_stop(self):
-        self.app.stop()
+        # Stop works like the time limit: a failure while the author stops still settles as stopped, which
+        # waits for Continue and is never retried by itself.
+        with patch.object(server.App, "_watch_author_pause"):
+            self.app.stop()
         self.process.stdout = io.StringIO(json.dumps({
             "kind": "workflow_paused", "stage": "solve", "node": "author",
             "state": {"statement": "Exact statement"}, "reason": "Connection lost",
             "threadId": "saved-root",
         }) + "\n")
         self.app._read_output(self.process, self.token)
-        self.assertEqual(self.app.state["phase"], "done")
-        self.assertEqual(self.app.state["error"], "Stopped.")
-        self.assertFalse((self.run / server.PAUSE_FILENAME).exists())
+        self.assertEqual((self.app.state["phase"], self.app.state["autoResumeAt"]), ("paused", 0))
+        checkpoint = json.loads((server.controller_directory(self.run) / server.PAUSE_FILENAME).read_text())
+        self.assertEqual((checkpoint["pauseCause"], checkpoint["autoResumeAt"]), ("stopped", 0))
+        self.assertEqual(self.app.snapshot()["pauseCause"], "stopped")
 
     def test_critic_failure_does_not_become_an_author_pause(self):
         self.app.state.update(stage="critic", activeNode="critic")
@@ -449,30 +453,37 @@ const checks = `
   assert.equal(ui.pause.hidden, true);
   assert.equal(ui.resume.hidden, true);
   assert.equal(ui.stop.hidden, false);
+  // While the author pauses, Stop stops it at once.
+  assert.equal(ui.stopText.textContent, 'Stop now');
   render({...running, phase: 'paused'});
   assert.equal(ui.run.hidden, false);
   assert.equal(ui.resume.hidden, false);
   assert.equal(ui.stop.hidden, true);
   assert.equal(ui.pause.hidden, true);
-  assert.equal(ui.authorSteerControl.hidden, true);
+  // The chat's box stays; Send is off until the server says the author can be asked.
+  assert.equal(ui.authorSteerControl.hidden, false);
+  assert.equal(ui.sendAuthorSteer.disabled, true);
   assert.equal(ui.authorTimeLimitControl.hidden, false);
   assert.equal(ui.setAuthorTimeLimit.disabled, false);
   ui.resume.onclick(); assert.equal(clicked, '/resume');
-  // Paused with the conversation available, the box asks the paused author; Resume waits for a reply.
-  const conversation = {available: true, busy: false, readOnly: true, reason: '', items: []};
+  // Paused at the author, Send asks the paused author; Resume waits for a reply.
+  const conversation = {available: true, busy: false, readOnly: true, reason: '', items: [], mode: 'paused',
+    note: 'The author answers in its saved conversation.', summary: 'now', summaryNote: ''};
   render({...running, phase: 'paused', conversation});
   assert.equal(ui.authorSteerControl.hidden, false);
-  assert.equal(ui.authorSteerLabel.textContent, 'Ask the paused author');
-  assert.equal(ui.authorSteerInstruction.placeholder, 'For example: which step in the summary is the main obstacle?');
-  assert.equal(ui.sendAuthorSteerText.textContent, 'Send');
+  assert.equal(ui.authorSteerInstruction.placeholder, 'Ask the author a question.');
   assert.equal(ui.sendAuthorSteer.disabled, false);
   assert.equal(ui.requestSummary.hidden, false);
+  assert.equal(ui.requestSummary.disabled, false);
+  assert.equal(ui.requestSummary.textContent, 'Summarize progress');
   assert.equal(ui.stopReply.hidden, true);
   assert.equal(ui.resume.disabled, false);
-  render({...running, phase: 'paused', conversation: {...conversation, busy: true}});
+  render({...running, phase: 'paused', conversation: {...conversation, busy: true, mode: 'busy', summary: 'off',
+    summaryNote: 'The author is replying. Wait for the reply or stop it.'}});
   assert.equal(ui.resume.disabled, true);
   assert.equal(ui.sendAuthorSteer.disabled, true);
-  assert.equal(ui.requestSummary.hidden, true);
+  assert.equal(ui.requestSummary.disabled, true);
+  assert.equal(ui.requestSummary.title, 'The author is replying. Wait for the reply or stop it.');
   assert.equal(ui.stopReply.hidden, false);
   render({...running, phase: 'paused', autoResumeAt: 2000000000, error: 'Connection lost'});
   assert.equal(ui.pause.hidden, false);

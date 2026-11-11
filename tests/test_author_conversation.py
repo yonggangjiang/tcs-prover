@@ -97,6 +97,11 @@ class ConversationPromptTests(unittest.TestCase):
     """The YAML prompts of a conversation turn, their validation and the related-works block (§2.1, §2.2, §6)."""
 
     def setUp(self):
+        # The exact prompts do not depend on the computer: the tests of the note for a computer that cannot
+        # read proof files (Windows) switch it on themselves.
+        handoff = mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True)
+        handoff.start()
+        self.addCleanup(handoff.stop)
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.directory = Path(folder.name).resolve()
@@ -112,7 +117,7 @@ class ConversationPromptTests(unittest.TestCase):
         workflow = runtime.load_workflow(WORKFLOW)
         self.assertEqual(workflow["nodes"]["author"]["lifecycle"],
                          ["goal", "continuation", "compaction", "repair", "resume", "reopen",
-                          "summary", "conversation", "related_works", "handoff_refused", "subagents"])
+                          "summary", "conversation", "chat", "related_works", "handoff_refused", "subagents"])
         prompts = workflow["prompts"]
         self.assertEqual((prompts["summary"], prompts["conversation"], prompts["related_works"]),
                          (SUMMARY_TEXT, CONVERSATION_TEXT, RELATED_WORKS_TEXT))
@@ -160,6 +165,31 @@ class ConversationPromptTests(unittest.TestCase):
                   "revision_number": 0, "instruction": ""}
         with self.assertRaisesRegex(ValueError, "message"):
             runtime.render_template(CONVERSATION_TEXT, values)
+
+    def test_only_the_chat_prompt_names_its_answer_file_and_it_quotes_the_message_literally(self):
+        def prepared(change):
+            workflow = runtime.load_workflow(self.custom(change))
+            with mock.patch.object(runtime, "require_model_credentials"):
+                return runtime.prepare(workflow, {})
+
+        # The approved chat framing (round 4, A4), character for character.
+        approved = ("[MESSAGE FROM THE USER]\n{message}\n\nIf this message asks you a question or asks for "
+                    "information, answer it for the user: write your answer, addressed to the user, to the file "
+                    "{answer_file}, then continue your proof work. If it only gives an instruction, follow it; no "
+                    "answer file is needed.")
+        self.assertEqual(prepared(lambda definition: None)["chat"], approved)
+        for name in ("conversation", "summary", "reopen", "repair", "resume"):
+            with self.subTest(prompt=name), self.assertRaisesRegex(ValueError, "Unknown prompt input: 'answer_file'"):
+                prepared(lambda definition: definition["prompts"].update({name: "Write to {answer_file}."}))
+        # The chat framing has only the message and its answer file.
+        with self.assertRaisesRegex(ValueError, "Unknown prompt input: 'solution'"):
+            prepared(lambda definition: definition["prompts"].update(chat="{message} {answer_file} {solution}"))
+        # The user's braces are text: the framing never reads them as fields.
+        framed = runtime.render_template(approved, {"message": "Is {x} = {y}? {{escaped}}",
+                                                    "answer_file": "chat/answer-c_0123456789.md"})
+        self.assertTrue(framed.startswith("[MESSAGE FROM THE USER]\nIs {x} = {y}? {{escaped}}\n\n"))
+        self.assertIn("to the file chat/answer-c_0123456789.md, then continue", framed)
+        self.assertEqual(len(framed) - len("Is {x} = {y}? {{escaped}}"), 294)
 
     def run_author(self, options, prompts=None, workspace=None):
         """_execute with the author stage only and a stub goal session; return the session's prompt and options."""
@@ -210,6 +240,47 @@ class ConversationPromptTests(unittest.TestCase):
         with mock.patch.object(runtime, "load_workflow", return_value=workflow_without):
             prompt, _ = self.run_author({"related_works": True}, prompts)
         self.assertNotIn("RELATED WORKS", prompt)
+
+    def test_where_proof_files_cannot_be_read_the_author_is_asked_for_the_proof_in_its_reply(self):
+        workflow = runtime.load_workflow(WORKFLOW)
+        plain = workflow["prompts"]["author"].replace("[STATEMENT]", "Exact statement S.", 1)
+        note = "\n\n" + runtime.INLINE_PROOF_NOTE
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=False):
+            prompt, kwargs = self.run_author({"related_works": True})
+        # Last in the first prompt, which {original_prompt} carries into the resume and compaction prompts.
+        self.assertEqual(prompt, plain + "\n\n" + RELATED_WORKS_TEXT + note)
+        for name, text in kwargs["prompts"].items():
+            with self.subTest(prompt=name):
+                self.assertEqual(text, workflow["prompts"][name] + (note if name in ("continuation", "repair") else ""))
+        self.assertIn(runtime.INLINE_PROOF_NOTE,
+                      runtime.render_template(kwargs["prompts"]["resume"], {"original_prompt": prompt}))
+        # Where the file can be read, nothing is added.
+        prompt, kwargs = self.run_author({"related_works": True})
+        self.assertEqual(prompt, plain + "\n\n" + RELATED_WORKS_TEXT)
+        self.assertEqual(kwargs["prompts"], {name: workflow["prompts"][name] for name in kwargs["prompts"]})
+
+    def test_where_proof_files_cannot_be_read_the_recovered_critic_feedback_asks_for_the_reply_too(self):
+        workflow = runtime.load_workflow(WORKFLOW)
+        state = {"statement": "Exact statement S.", "report": {"verdict": "reject", "bugs": "Gap in step 2."},
+                 "solution": "Old proof.", "round": 1}
+        for supported in (True, False):
+            calls = []
+
+            def session(*args, **kwargs):
+                calls.append((args, kwargs))
+                yield {"outcome": "done", "output": "A complete inline proof."}
+
+            claude = AssertionError("Claude session started")
+            with self.subTest(file_handoff=supported), \
+                    mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=supported), \
+                    mock.patch.object(runtime, "goal_session", side_effect=session), \
+                    mock.patch.object(claude_cli, "goal_session", side_effect=claude), mock.patch.object(runtime, "emit"):
+                runtime._execute(workflow, dict(state), {"workflow_stages": AUTHOR_ONLY,
+                                                          "goal_cwd": str(self.directory)}, workflow["prompts"])
+                (args, kwargs), = calls
+                template = workflow["prompts"]["repair"] + ("" if supported else "\n\n" + runtime.INLINE_PROOF_NOTE)
+                self.assertEqual(kwargs["initial_instruction"], runtime.render_template(
+                    template, {"solution": "Old proof.", "bugs": "Gap in step 2."}))
 
     def test_the_recovery_and_resume_prompts_carry_the_block_and_the_saved_prompt_file_is_untouched(self):
         saved = self.directory / "prompts" / "author.txt"
@@ -881,7 +952,7 @@ class ClaudeConversationTests(claude_test.FakeClaudeCase):
         with self.assertRaises(runtime.ConversationAttemptFailed) as raised:
             self.converse()
         self.assertNotIsInstance(raised.exception, runtime.ConversationRefused)
-        self.assertIn("Claude CLI stopped unexpectedly.", str(raised.exception))
+        self.assertIn("Claude Code stopped unexpectedly.", str(raised.exception))
 
     def test_a_failed_turn_after_the_message_arrived_rewinds_to_the_last_answer(self):
         anchor = str(uuid.uuid4())
@@ -952,7 +1023,7 @@ class ClaudeConversationTests(claude_test.FakeClaudeCase):
                 self.converse()
         self.assertRegex(str(raised.exception), r"^Claude stopped responding: no event for \d+ s and no answer to "
                                                 r"a check within \d+ s\.$")
-        self.assertIn("No author event for 0 s; checking that the Claude CLI still answers.",
+        self.assertIn("No author event for 0 s; checking that Claude Code still answers.",
                       [event.get("text") for event in self.events if event["kind"] == "diagnostic"])
         self.assertTrue(raised.exception.retry["delivered"])
 

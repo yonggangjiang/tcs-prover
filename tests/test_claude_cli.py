@@ -489,7 +489,8 @@ class StructuredTests(FakeClaudeCase):
         self.assertEqual(sandbox["network"], {"allowedDomains": ["*"], "strictAllowlist": True})
         # The store, its staging folder, the private Codex and Claude homes, every
         # settings folder (other runs' too), the conversation copies, the session tokens,
-        # the lock records, the workflow copies and the installation settings are hidden from Bash.
+        # the lock records, the workflow copies, the installation settings and the saved New problem
+        # settings (with their lock file) are hidden from Bash.
         hidden = [str(path) for path in providers.private_paths()]
         # On macOS Bash reads only its working directory, its private temp folder (CLAUDE_CODE_TMPDIR,
         # removed with the settings) and the system; it writes only those two.
@@ -509,7 +510,8 @@ class StructuredTests(FakeClaudeCase):
                                   str(state / "codex-homes"), str(state / "claude-settings"),
                                   str(state / "claude-homes"), str(state / "claude-transcripts"),
                                   str(state / "sessions"), str(state / "run-owners"), str(state / "servers"),
-                                  str(state / "last-good-workflows"), str(state / "settings.json")])
+                                  str(state / "last-good-workflows"), str(state / "settings.json"),
+                                  str(state / "new-problem-presets.json"), str(state / "new-problem-presets.lock")])
         self.assertIn(str(Path(start["settings_path"]).parent.parent.resolve()), hidden)
         self.assertEqual((start["settings_mode"], start["settings_dir_mode"]), ("0o600", "0o700"))
         self.assertNotIn("env", start["settings"])
@@ -913,6 +915,34 @@ class GoalTests(FakeClaudeCase):
         self.assertEqual(turn[-1]["params"]["turn"]["status"], "interrupted")
         self.assertPrivateFilesRemoved()
 
+    def test_a_stop_interrupts_the_turn_says_so_and_keeps_the_session(self):
+        pause = self.run_dir / "pause-request.json"
+        self.script([["init", "echo", {"write": {"path": str(pause), "text": json.dumps({"cause": "stopped"})}},
+                      {"wait_interrupt": 10}]])
+        session = self.goal()
+        with self.assertRaises(runtime.WorkflowPaused):
+            next(session)
+        stopping = [event for event in self.events if event.get("label") == "Author stopping"]
+        self.assertEqual(stopping[0]["text"], claude_cli.STOP_REQUESTED_TEXT.format(
+            grace=runtime._span_text(runtime.INTERRUPT_GRACE_SECONDS)))
+        self.assertTrue(stopping[0]["text"].startswith("Stop requested: the author may finish its current step"))
+        stopped = [event for event in self.events if event.get("label") == "Author stopped"]
+        self.assertEqual([event["text"] for event in stopped], [claude_cli.AUTHOR_STOPPED_TEXT])
+        self.assertFalse([event for event in self.events if event.get("label") == "Author paused"])
+        self.assertPrivateFilesRemoved()
+
+    def test_a_pause_request_names_a_stop_only_when_it_says_so(self):
+        pause = self.run_dir / "pause-request.json"
+        for text, cause in (('{"cause": "stopped"}', "stopped"), ("{}", "pause"), ('{"cause": "user"}', "pause"),
+                            ("{", "pause"), ("[1]", "pause"), ("", "pause")):
+            with self.subTest(text=text):
+                pause.write_text(text, encoding="utf-8")
+                self.assertEqual(claude_cli.pause_request_cause(pause), cause)
+        self.assertEqual(claude_cli.pause_request_cause(self.run_dir / "missing.json"), "pause")
+        self.assertIs(runtime.pause_request_cause, claude_cli.pause_request_cause)
+        self.assertEqual((runtime.STOP_REQUESTED_TEXT, runtime.AUTHOR_STOPPED_TEXT),
+                         (claude_cli.STOP_REQUESTED_TEXT, claude_cli.AUTHOR_STOPPED_TEXT))
+
     def test_pause_without_acknowledgement_stops_the_cli_after_the_grace_period(self):
         pause = self.run_dir / "pause-request.json"
         self.script([["init", "echo", {"touch": str(pause)}, {"hang": 30}]])
@@ -1130,7 +1160,7 @@ class GoalTests(FakeClaudeCase):
         resume = PROMPTS["resume"].format(directory=self.run_dir, original_prompt="Prove S exactly.")
         self.assertEqual(self.texts()[-1], f"{resume}\n\n{repair}")
         self.assertIn("Conversation replaced", self.labels("status"))
-        self.assertIn("The Claude CLI exited between turns; resuming its saved session.",
+        self.assertIn("Claude Code exited between turns; resuming its saved session.",
                       [event.get("text") for event in self.events if event["kind"] == "diagnostic"])
 
     def test_a_cli_that_ends_as_the_next_turn_is_written_is_resumed_with_that_turn(self):
@@ -1163,7 +1193,7 @@ class GoalTests(FakeClaudeCase):
         repaired = session.send({"solution": "First proof", "bugs": "Lemma 2 fails.", "round": 1})
         self.assertEqual(repaired["output"], "Repaired proof")
         self.assertEqual(["--resume" in start["argv"] for start in self.records("start")], [False, True])
-        self.assertIn("The Claude CLI exited between turns; resuming its saved session.",
+        self.assertIn("Claude Code exited between turns; resuming its saved session.",
                       [event.get("text") for event in self.events if event["kind"] == "diagnostic"])
         # The unread turn is closed as interrupted; its resent copy runs.
         self.assertEqual(self.turns(), [("started", 1), ("completed", 1), ("started", 2), ("interrupted", 2),
@@ -1248,7 +1278,7 @@ class GoalTests(FakeClaudeCase):
         self.script([["init", "echo", {"stderr": "fatal: crashed"}, {"exit": 3}]])
         with self.assertRaises(runtime.WorkflowPaused) as paused:
             next(self.goal())
-        self.assertIn("Claude CLI stopped unexpectedly.", paused.exception.reason)
+        self.assertIn("Claude Code stopped unexpectedly.", paused.exception.reason)
         self.assertIn("fatal: crashed", paused.exception.reason)
 
     def test_pause_before_start_launches_nothing(self):
@@ -1372,6 +1402,22 @@ class GoalTests(FakeClaudeCase):
                 mock.patch.object(runtime, "goal_session", side_effect=AssertionError("Codex session started")):
             state = runtime._execute(workflow, {"input": "x"}, {"author_model": "claude-sonnet-5-5"}, workflow["prompts"])
         self.assertEqual((state["output"], calls), ("Complete", ["claude-sonnet-5-5"]))
+
+    def test_where_proof_files_cannot_be_read_the_claude_author_is_asked_for_the_proof_in_its_reply(self):
+        """The real Claude goal session behind _execute, with the built-in prompts, on a computer that cannot
+        read proof files (Windows): its first prompt and each continuation end with the note."""
+        workflow = runtime.builtin_workflow("author_critic")
+        prompts = workflow["prompts"]
+        note = "\n\n" + runtime.INLINE_PROOF_NOTE
+        self.script([["init", "echo", in_progress()], ["init", "echo", complete("A complete inline proof.")]])
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=False), \
+                mock.patch.object(runtime, "goal_session", side_effect=AssertionError("Codex session started")):
+            state = runtime._execute(workflow, {"statement": "Exact statement S."}, {
+                "author_model": "claude-opus-5-5", "goal_cwd": str(self.run_dir),
+                "workflow_stages": {"review": False, "author": True, "critic": False, "writing": False}}, prompts)
+        first = prompts["author"].replace("[STATEMENT]", "Exact statement S.", 1)
+        self.assertEqual(self.texts(), [first + note, prompts["continuation"] + note])
+        self.assertEqual(state["output"], "A complete inline proof.")
 
     def test_the_workflow_tells_a_resumed_claude_author_why_its_last_submission_was_refused(self):
         """The real Claude goal session behind _execute, with the built-in prompts."""

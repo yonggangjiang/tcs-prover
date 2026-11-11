@@ -240,10 +240,9 @@ class FolderBatchTests(unittest.TestCase):
         self.assertEqual(len(self.launches), 4)
 
 
-@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
-class FolderBatchBrowserTests(unittest.TestCase):
-    def test_folder_filtering_confirmation_and_request_body(self):
-        script = r"""
+# The folder run's part of the page, with its surroundings stubbed: `confirm` records each question and
+# `request` each request. EXTRA adds more of the page's surroundings.
+FOLDER_PAGE = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
 const slice = (start, end) => source.slice(source.indexOf(start), source.indexOf(end));
@@ -280,7 +279,15 @@ const batchUrl = id => '/?batch=' + id;
 const history = {pushState() {}};
 const file = (path, content) => ({name: path.split('/').at(-1), webkitRelativePath: path,
   size: content.length, text: async () => content});
+EXTRA
 `;
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
+class FolderBatchBrowserTests(unittest.TestCase):
+    def test_folder_filtering_confirmation_and_request_body(self):
+        script = FOLDER_PAGE.replace("EXTRA", "") + r"""
 const checks = `
 (async () => {
   const folder = [
@@ -380,6 +387,82 @@ Promise.resolve(vm.runInNewContext(setup + code + checks, {assert, TextEncoder})
             text=True, capture_output=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_folder_run_names_and_joins_the_batch_of_the_new_problem_page(self):
+        script = FOLDER_PAGE.replace("EXTRA", r"""
+const batchOptions = () => ({create: true});
+let target = {id: 'batch_00000000a1', label: 'Graph coloring'};
+const composerTarget = () => target;
+""") + r"""
+const checks = `
+(async () => {
+  const folder = [file('statements/a.md', 'Prove A.'), file('statements/b.md', 'Prove B.')];
+  await startFolderBatch(folder);
+  assert.match(questions[0], /\\n\\nFolder: statements\\nBatch: Graph coloring\\nEach job uses the selected stages\\./);
+  assert.equal(sent[0].path, '/direct-batch?batch=batch_00000000a1');
+  // From the default batch: the question says so, and the request names no batch.
+  target = {id: '', label: 'Default batch'};
+  composingProblem = true;
+  await startFolderBatch(folder);
+  assert.match(questions[1], /\\nFolder: statements\\nBatch: Default batch\\n/);
+  assert.equal(sent[1].path, '/direct-batch');
+})();
+`;
+Promise.resolve(vm.runInNewContext(setup + code + checks, {assert, TextEncoder}))
+  .catch(error => {console.error(error); process.exitCode = 1;});
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(server.UI / "app.js")],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_batch_deleted_elsewhere_takes_no_job_and_a_refusal_rereads_the_list(self):
+        script = FOLDER_PAGE.replace("EXTRA", r"""
+const batchOptions = () => ({create: true});
+const composerTarget = () => ({id: 'batch_00000000d4', label: 'Soon gone'});
+let gone = true, reloads = 0;
+const composerBatchGone = () => gone;
+const reloadComposerBatches = () => { reloads += 1; };
+const jobPath = path => path + (currentBatch ? '?batch=' + currentBatch : '');
+""") + r"""
+const checks = `
+(async () => {
+  currentBatch = 'batch_00000000d4';
+  const folder = [file('statements/a.md', 'Prove A.'), file('statements/b.md', 'Prove B.')];
+  // The page already knows its batch is gone (deleted in another tab): no question names it, nothing is sent.
+  await startFolderBatch(folder);
+  assert.equal(questions.length, 0);
+  assert.equal(sent.length, 0);
+  assert.equal(ui.notice.hidden, false);
+  assert.equal(ui.notice.textContent, 'That batch no longer exists.');
+  // Refused by the server before the page knew: the page reads its list of batches again, and its note
+  // then says that the batch is gone.
+  gone = false;
+  failure = 'That batch no longer exists.';
+  await startFolderBatch(folder);
+  assert.equal(questions.length, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(reloads, 1);
+  assert.equal(ui.notice.textContent, 'That batch no longer exists.');
+  // Start workflow, refused the same way, does the same.
+  await startReview('Prove C.');
+  assert.equal(sent.at(-1).path, '/start-workflow?batch=batch_00000000d4');
+  assert.equal(reloads, 2);
+  assert.equal(ui.notice.textContent, 'That batch no longer exists.');
+  finish();
+})();
+`;
+Promise.resolve(vm.runInNewContext(setup + code + checks, {assert, TextEncoder,
+  finish: () => process.stdout.write('The checks finished.')}))
+  .catch(error => {console.error(error); process.exitCode = 1;});
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script, str(server.UI / "app.js")],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, 'The checks finished.', result.stderr)
 
     def test_home_page_markup_offers_folder_controls(self):
         page = (server.UI / "index.html").read_text(encoding="utf-8")

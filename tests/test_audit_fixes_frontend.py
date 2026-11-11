@@ -257,10 +257,10 @@ assert.equal(ui.notice.textContent, 'No statements were found directly inside ph
     def test_create_errors_scroll_the_notice_into_view(self):
         self.run_app(COMPOSER, COMPOSER_SETUP, r"""
 const start = startReview('Prove S.');
-sent[0].reject(new Error('Claude CLI is not installed or is not on PATH.'));
+sent[0].reject(new Error('Claude Code is not installed or is not on PATH.'));
 await start;
 assert.equal(ui.notice.hidden, false);
-assert.equal(ui.notice.textContent, 'Claude CLI is not installed or is not on PATH.');
+assert.equal(ui.notice.textContent, 'Claude Code is not installed or is not on PATH.');
 assert.equal(ui.notice.scrolled, true);
 assert.notEqual(ui.notice.focused, true, 'an alert is announced, not focused');
 ui.notice.scrolled = false;

@@ -1,7 +1,7 @@
 """Model registry and the private store of user-configured API models.
 
 Every model runs through one of two proven agent harnesses: the Codex CLI or
-the Claude CLI. API models reuse those harnesses pointed at a user-specified
+Claude Code. API models reuse those harnesses pointed at a user-specified
 endpoint: OpenAI-format endpoints run through Codex with an isolated custom
 provider, Anthropic-format endpoints through Claude. This module is the single
 source of truth for accepted model ids, their harness and their efforts.
@@ -27,7 +27,9 @@ from urllib.parse import urlsplit
 CODEX, CLAUDE, API = "codex", "claude", "api"
 OPENAI_FORMAT, ANTHROPIC_FORMAT = "openai", "anthropic"
 FORMATS = (OPENAI_FORMAT, ANTHROPIC_FORMAT)
-PROVIDER_LABELS = {CODEX: "Codex CLI", CLAUDE: "Claude CLI", API: "API"}
+# The source menus' names. Every text that names one of the two programs uses the same name
+# (earlier versions called Claude Code "Claude CLI").
+PROVIDER_LABELS = {CODEX: "Codex CLI", CLAUDE: "Claude Code", API: "API"}
 # The CLI each API wire format runs through (harness_for_format()).
 FORMAT_HARNESSES = {OPENAI_FORMAT: CODEX, ANTHROPIC_FORMAT: CLAUDE}
 
@@ -104,6 +106,10 @@ RUN_OWNERS = "run-owners"
 SERVERS = "servers"
 LAST_GOOD_WORKFLOWS = "last-good-workflows"
 INSTALLATION_SETTINGS = "settings.json"
+# The saved New problem settings (ui.presets) and the file whose lock serializes their writes:
+# hidden like the rest, so that a model can never change the settings the next problem opens with.
+PRESETS = "new-problem-presets.json"
+PRESETS_LOCK = "new-problem-presets.lock"
 _STORE_LOCK = threading.RLock()
 
 _BUILTIN = {row["id"]: row for row in (*BUILTIN_MODELS, *_LEGACY_MODELS)}
@@ -164,20 +170,22 @@ def private_paths():
     The key store and its staging folder, the private Codex and Claude homes,
     the Claude settings folders, the copies of Claude conversations, the
     browser session tokens, the run and server lock records, the last
-    readable copies of the bundled workflows (a launch may run from one) and
-    the installation settings. These entries rather than the whole state
-    folder: an overridden store path may share its folder with run folders.
+    readable copies of the bundled workflows (a launch may run from one), the
+    installation settings and the saved New problem settings with their lock
+    file. These entries rather than the whole state folder: an overridden
+    store path may share its folder with run folders.
     """
 
     state = state_directory()
     return [Path(os.path.realpath(path)) for path in (
         store_path(), state / STORE_STAGING, state / CODEX_HOMES, state / CLAUDE_SETTINGS,
         state / CLAUDE_HOMES, state / CLAUDE_TRANSCRIPTS, state / SESSIONS, state / RUN_OWNERS,
-        state / SERVERS, state / LAST_GOOD_WORKFLOWS, state / INSTALLATION_SETTINGS)]
+        state / SERVERS, state / LAST_GOOD_WORKFLOWS, state / INSTALLATION_SETTINGS,
+        state / PRESETS, state / PRESETS_LOCK)]
 
 
 def user_login_files():
-    """This user's Codex and Claude CLI login files.
+    """This user's Codex CLI and Claude Code login files.
 
     Sandboxes of models served by a third-party endpoint may not read them,
     so a subscription login can never be echoed to that endpoint.

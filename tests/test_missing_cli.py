@@ -305,11 +305,16 @@ class ServerCase(NoCliCase):
         self.assertEqual(app.state["phase"], "paused")
 
     def stop_job(self, app):
+        """Stop works like the time limit: the author ends its step and the job stays stopped in place."""
+
         status, reply = self.call(f"/stop?job={app.state['runId']}", {})
         self.assertEqual(status, 200, reply)
-        if app.state["phase"] == "stopping":
+        if app.state["phase"] == "pausing":
+            self.settle(app, [{"kind": "workflow_paused", "stage": "solve", "node": "author",
+                               "state": {"statement": STATEMENT, "paused": True}, "reason": ""}])
+        elif app.state["phase"] == "stopping":
             self.settle(app, returncode=130)
-        self.assertEqual((app.state["phase"], app.state.get("manuallyStopped")), ("done", True))
+        self.assertEqual((app.state["phase"], app.snapshot()["pauseCause"]), ("paused", "stopped"))
 
     def tick(self, now=None):
         """One pass of the server's retry loop, free of the spacing between automatic starts."""
@@ -889,8 +894,9 @@ class MissingProgramMessageTests(NoCliCase):
         except runtime.ConversationAttemptFailed as wrapped:
             self.assertIsNone(runtime.settings_failure(wrapped, preview))
             self.assertEqual(runtime._cli_problem(wrapped), "Codex")
-        # The older texts keep naming their own program.
+        # The older texts keep naming their own program, also an earlier version's "Claude CLI".
         for text, name in (("Codex CLI is not installed or is not on PATH.", "Codex"),
+                           ("Claude Code is not installed or is not on PATH.", "Claude"),
                            ("Claude CLI is not installed or is not on PATH.", "Claude"),
                            ("Codex review failed: Claude Code is not installed or is not on PATH.", "Claude")):
             self.assertEqual(runtime._cli_problem(runtime.Error(text)), name, text)
@@ -932,13 +938,13 @@ class MissingProgramMessageTests(NoCliCase):
         self.assertEqual(str(raised.exception), runtime.missing_cli_text("Claude", self.anthropic, "review"))
         # A runtime without missing_cli (a test double) gets the lookup's own error.
         double = type("Runtime", (), {"Error": runtime.Error, "CLIUnavailable": runtime.CLIUnavailable})
-        with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Claude CLI is not installed or is not on PATH\.$"):
+        with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Claude Code is not installed or is not on PATH\.$"):
             claude_cli.located(double, self.anthropic, "review")
         self.assertEqual(runtime.located_cli(lambda: "/opt/codex", "Codex", "gpt-6.1-sol"), "/opt/codex")
         # The lookups themselves are unchanged (tests replace them with stand-ins).
         with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Codex CLI is not installed or is not on PATH\.$"):
             runtime.codex()
-        with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Claude CLI is not installed or is not on PATH\.$"):
+        with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Claude Code is not installed or is not on PATH\.$"):
             claude_cli.executable(runtime)
         with self.assertRaisesRegex(runtime.CLIUnavailable, r"^Codex CLI is not installed or is not on PATH\.$"):
             runtime.api_codex_executable({"CODEX_HOME": str(self.root)})
@@ -988,10 +994,10 @@ class RetryNoticeTests(NoCliCase):
             self.assertTrue(notice["text"].endswith(f" CLI message: {text}"), notice["text"])
             self.assertEqual(notice["failureReason"], text)
         self.assertEqual([notice["failure"] for notice in notices],
-                         ["the CLI is not available", "the CLI is not available", "Claude CLI missing or incompatible"])
+                         ["the CLI is not available", "the CLI is not available", "Claude Code missing or incompatible"])
 
     def test_a_cli_message_of_several_lines_is_quoted_by_its_error_line(self):
-        # Only the runner's own one-line text about a missing CLI is quoted whole (README, Automatic retries).
+        # Only the runner's own one-line text about a missing CLI is quoted whole (docs/retries.md, Diagnostics).
         error = runtime.Error("Codex critic failed: Codex exited with code 127.\n"
                               "/bin/sh: line 1: node: command not found\n"
                               "hint: the codex launcher needs Node.js 22 or later")
@@ -1112,7 +1118,7 @@ class StartupNoticeTests(NoCliCase):
                 mock.patch.object(runtime.subprocess, "run", return_value=answer):
             runtime.check_clis([("review", "claude-opus-5-5")], directory=self.run_dir)
         self.assertEqual([event["text"] for event in self.records("diagnostic")], [
-            "Claude CLI missing or incompatible: `claude --version` exited with code 127. Model calls retry every "
+            "Claude Code missing or incompatible: `claude --version` exited with code 127. Model calls retry every "
             "minute until it works."])
 
 
@@ -1124,17 +1130,26 @@ class AttentionTests(ServerCase):
         retry = {"stage": "critic", "retryAt": 2e9, "text": "Model call failed (the CLI is not available) — retrying."}
         state = {**app.state, "phase": "running", "stage": "critic", "criticModel": self.anthropic}
         self.assertIsNone(app.attention({**state, "modelRetry": {**retry, "failure": "the CLI is not available"}}))
-        for failure, phase, title in (("Claude CLI missing or incompatible", "running",
+        for failure, phase, title in (("Claude Code missing or incompatible", "running",
                                        "Claude Code not installed or not working"),
                                       ("Codex CLI missing or incompatible", "reviewing",
-                                       "Codex CLI not installed or not working")):
+                                       "Codex CLI not installed or not working"),
+                                      # An earlier version's words, from a saved job or a runner started before
+                                      # an update.
+                                      ("Claude CLI missing or incompatible", "running",
+                                       "Claude Code not installed or not working")):
             with self.subTest(failure=failure):
                 text = f"{failure} — retrying in 1 min (attempt 4). CLI message: …"
                 self.assertEqual(app.attention({**state, "phase": phase,
                                                 "modelRetry": {**retry, "failure": failure, "text": text}}),
                                  {"kind": "cli", "title": title, "retrying": True, "text": text})
         self.assertIsNone(app.attention({**state, "phase": "paused", "error": "Model call failed.", "modelRetry": {
-            **retry, "failure": "Claude CLI missing or incompatible"}}))
+            **retry, "failure": "Claude Code missing or incompatible"}}))
+        # Only these words name a program: not another program's, and not a failure that merely ends alike.
+        for failure in ("Claude Code CLI missing or incompatible", "Codex Code missing or incompatible",
+                        "Gemini CLI missing or incompatible", "Claude Code missing or incompatible: x"):
+            with self.subTest(failure=failure):
+                self.assertIsNone(app.attention({**state, "modelRetry": {**retry, "failure": failure}}))
 
     def test_a_paused_authors_reply_that_waits_for_its_program_needs_attention(self):
         app = server.App(runs=self.runs, load_latest=False)
@@ -1186,7 +1201,7 @@ class AttentionTests(ServerCase):
         status, snapshot = self.call(f"/state?job={app.state['runId']}")
         self.assertEqual(status, 200, snapshot)
         self.assertEqual(snapshot["phase"], "paused")
-        notice = f"Claude CLI missing or incompatible — retrying in 1 min (attempt 4). CLI message: {text}"
+        notice = f"Claude Code missing or incompatible — retrying in 1 min (attempt 4). CLI message: {text}"
         self.assertEqual(snapshot["needsAttention"], {"kind": "cli", "title": "Claude Code not installed or not working",
                                                       "retrying": True, "text": notice})
         self.assertEqual(snapshot["conversation"]["items"][-1]["retry"]["text"], notice)  # The reply's own line.
@@ -1227,7 +1242,7 @@ class AttentionTests(ServerCase):
         attention = snapshot["needsAttention"]
         self.assertEqual((attention["kind"], attention["title"], attention["retrying"]),
                          ("cli", "Claude Code not installed or not working", True))
-        self.assertTrue(attention["text"].startswith("Claude CLI missing or incompatible — retrying in 1 min "
+        self.assertTrue(attention["text"].startswith("Claude Code missing or incompatible — retrying in 1 min "
                                                      "(attempt 4). CLI message: Claude Code is not installed"))
         status, batches = self.call("/batches")
         root = next(card for card in batches["batches"] if card["id"] == "__root__")
@@ -1251,18 +1266,33 @@ class WebCutoffStartTests(ServerCase):
 
 
 class ReadmeTests(unittest.TestCase):
-    """The README says what a missing program stops, and no longer what the change made untrue."""
+    """The README and its guides say what a missing program stops, and no longer what the change made untrue."""
 
     def test_the_readme_names_the_web_cutoff_exception_and_drops_the_old_claims(self):
-        text = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
-        self.assertIn("A missing program never stops a start (a web-cutoff run is the exception: its checks before "
-                      "launch need the native Codex binary).", text)
-        self.assertIn("API model, has its saved key; a web-cutoff run also needs Codex CLI models for its proof roles "
-                      "and the native Codex binary", text)
+        def read(path):
+            return " ".join(path.read_text(encoding="utf-8").split())
+
+        # The README's former sections: model providers in docs/models.md, retries in docs/retries.md.
+        readme, models = read(ROOT / "README.md"), read(ROOT / "docs" / "models.md")
+        retries = read(ROOT / "docs" / "retries.md")
+        text = " ".join(read(path) for path in (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))))
+        # Only a web cutoff timestamp (a historical policy) needs the native Codex binary and Codex CLI models,
+        # and with Writing & polishing MacTeX for its isolated compiler; a cutoff of -1 does not.
+        self.assertIn("A missing program never stops a start (a run with a web cutoff timestamp is the exception: its "
+                      "checks before launch need the native Codex binary, and with Writing & polishing on MacTeX; a "
+                      "job that fails them is held until you install what is missing and choose **Re-run "
+                      "preflight**).", models)
+        self.assertIn("API model, has its saved key; a run with a web cutoff timestamp also needs Codex CLI models for "
+                      "its proof roles and the native Codex binary, and with **Writing & polishing** on also MacTeX "
+                      "in `/usr/local/texlive` and macOS's `sandbox-exec` for its isolated LaTeX compiler", models)
+        self.assertIn("Nothing here stops a start: a job whose program or LaTeX is missing says so, tries again every "
+                      "minute, and continues by itself once you install it. Runs with a web cutoff timestamp are the "
+                      "exception: they need the native Codex CLI, and with **Writing & polishing** on also MacTeX (in "
+                      "`/usr/local/texlive`), before they start.", readme)
         self.assertIn("The message of a CLI that could not start is labelled *CLI message*, as no provider was reached, "
-                      "and the runner's own message about a CLI that is not installed is quoted whole.", text)
+                      "and the runner's own message about a CLI that is not installed is quoted whole.", retries)
         self.assertIn("(a CLI that is not installed is no such setting: the resume goes ahead, and the model call that "
-                      "needs it says so and is retried every minute)", text)
+                      "needs it says so and is retried every minute)", retries)
         for claim in ("installed programs are never checked there", "a CLI that is only missing for a moment",
                       "a CLI's own message is quoted whole"):
             self.assertNotIn(claim, text)
@@ -1281,7 +1311,7 @@ class PageTests(unittest.TestCase):
 for (const [model, text] of [
   ['api:claude-gw', 'API · Anthropic format via Claude Code · anthropic-gw.invalid'],
   ['api:gpt-gw', 'API · OpenAI format via Codex CLI · openai-gw.invalid'],
-  ['claude-opus-5-5', 'Claude CLI'], ['gpt-6.1-sol', 'Codex CLI'],
+  ['claude-opus-5-5', 'Claude Code'], ['gpt-6.1-sol', 'Codex CLI'],
 ]) {
   for (const role of ['review', 'author', 'critic', 'writer']) {
     const select = ui[role + 'Model'];
@@ -1298,8 +1328,11 @@ for (const [model, text] of [
 
     def test_the_overview_and_the_job_card_list_a_missing_program(self):
         item = {"kind": "cli", "title": "Claude Code not installed or not working", "retrying": True,
-                "text": "Claude CLI missing or incompatible — retrying in 1 min (attempt 4). CLI message: Claude Code "
+                "text": "Claude Code missing or incompatible — retrying in 1 min (attempt 4). CLI message: Claude Code "
                         "is not installed or is not on PATH."}
+        # A saved job keeps the words an earlier version wrote, which the page shows as they are.
+        earlier = {**item, "text": "Claude CLI missing or incompatible — retrying in 1 min (attempt 4). CLI message: "
+                                   "Claude CLI is not installed or is not on PATH."}
         script = r"""
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
 const source = fs.readFileSync(process.argv[1], 'utf8');
@@ -1345,9 +1378,11 @@ assert.equal(row.className, 'attention-item cli');
 assert.deepEqual(row.children.map((child) => child.textContent), [item.title, 'P1.md', item.text]);
 `, {assert, URLSearchParams, item});
 """
-        result = subprocess.run([NODE, "-e", script, str(provider_ui.APP), json.dumps(item)], capture_output=True,
-                                text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for shown in (item, earlier):
+            with self.subTest(text=shown["text"]):
+                result = subprocess.run([NODE, "-e", script, str(provider_ui.APP), json.dumps(shown)],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_the_connection_form_and_the_notification_help_say_what_to_install(self):
         script = r"""

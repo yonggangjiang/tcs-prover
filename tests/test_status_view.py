@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -171,7 +172,9 @@ const liveJobs = [
   [{phase: 'stopping'}, 'running'], [{phase: 'stopping', manuallyStopped: true, stoppedStage: 'critic'}, 'running'],
   [{phase: 'paused'}, 'paused'], [{phase: 'paused', pauseCause: 'user'}, 'paused'],
   [{phase: 'paused', pauseCause: 'restart'}, 'paused'], [{phase: 'paused', pauseCause: 'time-limit'}, 'limit'],
-  [{phase: 'reviewed'}, 'waiting'],
+  [{phase: 'paused', pauseCause: 'stopped', activeNode: 'critic'}, 'stopped'],
+  [{phase: 'pausing', pauseCause: 'stopped', activeNode: 'author'}, 'running'],
+  [{phase: 'reviewed'}, 'waiting'], [{phase: 'reviewed', manuallyStopped: true, stoppedStage: 'review'}, 'stopped'],
   [{phase: 'prepared'}, 'waiting'], [{phase: 'prepared', launchQueued: true}, 'queued'],
 ];
 """
@@ -216,11 +219,12 @@ const proof = rows[0];
 assert.equal(proof.children[0].children[1].textContent, 'Proof accepted');
 assert.match(proof.className, /tone-done/);
 assert(!text(ui.jobsList).includes('Workflow complete'));
-// The Complete filter shows the done rows, Incomplete the failed and stopped ones (index.html CSS and
-// the filter read these classes).
+// The Complete filter shows the done rows, Incomplete the failed ones, and Stopped every job you stopped
+// (index.html CSS and the filter read these classes).
 const tones = rows.map(row => row.className.match(/tone-(\w+)/)[1]);
 assert.equal(tones.filter(tone => tone === 'done').length, 9);
-assert.equal(tones.filter(tone => ['failed', 'stopped'].includes(tone)).length, 5);
+assert.equal(tones.filter(tone => tone === 'failed').length, 4);
+assert.equal(tones.filter(tone => tone === 'stopped').length, 3);
 """)
 
     def test_the_job_page_status_label_and_subtitle_follow_the_selected_stages(self):
@@ -625,7 +629,7 @@ const document = {createElement: tag => new Element(tag), createElementNS: (name
   createTextNode: value => Object.assign(new Element('#text'), {textContent: value})};
 const svgNS = 'http://www.w3.org/2000/svg', batchUrl = id => `/?batch=${id}`, liveWords = new Element('span');
 const stats = {};
-for (const key of ['running', 'waiting', 'paused', 'limit', 'done']) {
+for (const key of ['running', 'waiting', 'paused', 'limit', 'stopped', 'done']) {
   const stat = new Element('div'), value = Object.assign(new Element('strong'), {closest: () => stat});
   stats[`[data-stat="${key}"]`] = value;
 }
@@ -648,16 +652,19 @@ const jobs = [...finishedJobs.map(([job]) => job), ...liveJobs.map(([job]) => jo
 console.log(JSON.stringify(jobs.map(job => [job, jobTone(job)])));
 """)
         classified = json.loads(result.stdout)
-        self.assertEqual(len(classified), 33)
+        self.assertEqual(len(classified), 36)
         for job, tone in classified:
             self.assertEqual(batches.job_tone(job), tone, job)
-        # The batch counts hold each job once; a finished job is done (complete) or incomplete.
+        # The batch counts hold each job once; a finished job is done (complete) or incomplete, and every job
+        # you stopped (finished by an earlier version, at its statement review, or at a step) is counted apart.
         rows = [job for job, _ in classified]
         finished = [tone for job, tone in classified if job["phase"] == "done"]
         counts = batches.batch_counts(rows)
         self.assertEqual(sum(counts.values()), len(rows))
         self.assertEqual(counts["done"], sum(1 for tone in finished if tone == "done"))
-        self.assertEqual(counts["incomplete"], sum(1 for tone in finished if tone != "done"))
+        self.assertEqual(counts["incomplete"], sum(1 for tone in finished if tone == "failed"))
+        self.assertEqual(counts["stopped"], sum(1 for _, tone in classified if tone == "stopped"))
+        self.assertEqual(counts["stopped"], 5)
 
     def test_the_sidebar_and_overview_give_the_check_mark_only_to_complete_jobs(self):
         run_node(self, SIDEBAR, SIDEBAR_SETUP, r"""
@@ -743,8 +750,9 @@ class BatchCardCountTests(NoModelCase):
             saved_job(root / "earlier" / name, files=files, records=[AUTHOR_STEP, *records])
         catalog = batches.BatchCatalog(root, current_root=root / "current")
         card = next(card for card in catalog.list_batches() if card["id"] == "earlier")
-        self.assertEqual(card["counts"], {"running": 0, "done": 1, "paused": 0, "limit": 0, "prepared": 0,
-                                          "incomplete": 2})
+        # The job an earlier version stopped is counted with the stopped jobs, not as incomplete.
+        self.assertEqual(card["counts"], {"running": 0, "done": 1, "paused": 0, "limit": 0, "stopped": 1,
+                                          "prepared": 0, "incomplete": 1})
         jobs = {job["runId"]: job for job in catalog.jobs("earlier")}
         self.assertEqual({name: batches.job_tone(job) for name, job in jobs.items()},
                          {"ok": "done", "failed": "failed", "stopped": "stopped"})
@@ -775,7 +783,7 @@ class BatchCardCountTests(NoModelCase):
             http_server.server_close()
             thread.join(timeout=2)
         root_card = next(card for card in cards if card["id"] == "__root__")
-        self.assertEqual(root_card["counts"], {"done": 1, "incomplete": 2})
+        self.assertEqual(root_card["counts"], {"done": 1, "incomplete": 1, "stopped": 1})
 
     def test_the_gateway_counts_its_controllers_incomplete_jobs_apart(self):
         from types import SimpleNamespace
@@ -791,7 +799,7 @@ class BatchCardCountTests(NoModelCase):
             current=controller({"phase": "running"}, {"phase": "done", "manuallyStopped": True}))
         cards = {card["id"]: card for card in live_gateway.GatewayServer.batch_cards(gateway)["batches"]}
         self.assertEqual(cards["v4"]["counts"], {"done": 1, "incomplete": 1})
-        self.assertEqual(cards["new"]["counts"], {"running": 1, "incomplete": 1})
+        self.assertEqual(cards["new"]["counts"], {"running": 1, "stopped": 1})
 
 
 class RetryKindTests(NoModelCase):
@@ -994,7 +1002,7 @@ assert.deepEqual(shell.overviewMeta.children.map(child => [child.className, chil
         self.assertLess(html.index(tiles[0]), html.index(tiles[1]))
         self.assertLess(html.index(tiles[1]), html.index(tiles[2]))
         css = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
-        for rule in (".stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));",
+        for rule in (".stat-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));",
                      ".nc.limit { --tone: var(--stopped); }", ".batch-progress .limit, .tone-limit { --tone: "
                      "var(--stopped); }", ".job[data-status=\"limit\"] { --status: var(--stopped); }",
                      ".page-meta .meta-limit { color: var(--stopped); }"):
@@ -1053,7 +1061,6 @@ assert.equal(ui.runDescription.textContent, 'The proof author reached the time l
 assert.equal(ui.authorTimeLimitControl.hidden, false);
 assert.equal(ui.resume.hidden, false);
 assert.equal(ui.resume.textContent, 'Continue');
-assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
 // Raised, it still continues (not resumes).
 render({...base, pauseCause: 'time-limit', thinkingHours: 3, timeLimitExhausted: false});
 assert.equal(ui.globalStatus.textContent, 'Time limit reached');
@@ -1066,12 +1073,96 @@ for (const [index, pauseCause] of ['user', 'restart', 'interrupted', 'error', ''
   assert.equal(ui.runLabel.textContent, 'RUN PAUSED');
   assert.equal(ui.runTitle.textContent, 'Ready to resume');
   assert.equal(ui.resume.textContent, 'Resume');
-  assert.equal(ui.authorSteerLabel.textContent, 'Ask the paused author');
 }
-// Back at the time limit, the box asks the author again.
-render({...base, pauseCause: 'time-limit', timeLimitExhausted: true});
-assert.equal(ui.authorSteerLabel.textContent, 'Ask the author');
+// A stop by you reads Stopped, never Paused or Time limit reached, and also continues.
+render({...base, runId: 's', pauseCause: 'stopped'});
+assert.deepEqual([ui.globalStatus.textContent, ui.runLabel.textContent, ui.runTitle.textContent, ui.resume.textContent],
+  ['Stopped', 'STOPPED', 'Stopped', 'Continue']);
 """)
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
+class StoppedStatusTests(unittest.TestCase):
+    """A job you stopped reads "Stopped" (a square) everywhere and is counted apart, like the time limit."""
+
+    def test_the_batch_list_says_where_it_stopped_and_counts_it_apart(self):
+        run_node(self, LISTS, LISTS_SETUP, r"""
+renderJobs([
+  {runId: 'author', title: 'A', phase: 'paused', pauseCause: 'stopped', activeNode: 'author'},
+  {runId: 'critic', title: 'C', phase: 'paused', pauseCause: 'stopped', activeNode: 'critic', error: 'Ignored.'},
+  {runId: 'compile', title: 'L', phase: 'paused', pauseCause: 'stopped', activeNode: 'latex_compile'},
+  {runId: 'review', title: 'R', phase: 'input', manuallyStopped: true, stoppedStage: 'review',
+   error: 'You stopped the statement review. Start workflow runs it again in this job.'},
+  {runId: 'older', title: 'O', phase: 'done', manuallyStopped: true, stoppedStage: 'critic', error: 'Stopped.'},
+  {runId: 'stopping', title: 'S', phase: 'pausing', pauseCause: 'stopped', activeNode: 'author'},
+  {runId: 'pausing', title: 'P', phase: 'pausing', pauseCause: 'user', activeNode: 'author'}]);
+const status = row => row.children[0].children[1];
+const rows = ui.jobsList.children;
+assert.deepEqual(rows.map(row => status(row).textContent), ['Stopped at proof author', 'Stopped at critic',
+  'Stopped at PDF compilation', 'Stopped at statement review', 'Stopped at critic', 'Stopping', 'Pausing']);
+assert.deepEqual(rows.map(row => row.className.match(/tone-(\w+)/)[1]),
+  ['stopped', 'stopped', 'stopped', 'stopped', 'stopped', 'running', 'running']);
+// A stop is no failure: no error line under it.
+assert.deepEqual(rows[1].children[0].children.filter(child => child.className === 'job-error'), []);
+assert.equal(ui.jobsCount.textContent, '7 problems · 5 stopped · 2 running');
+renderBatches([{id: 'b', label: 'B', readOnly: true, jobCount: 4, counts: {paused: 1, limit: 1, stopped: 2}}]);
+const progress = ui.batchesList.children[0].children[0].children[2];
+assert.deepEqual(progress.children.map(child => [child.className, child.textContent]),
+  [['paused', '1 paused'], ['limit', '1 time limit reached'], ['stopped', '2 stopped']]);
+""")
+
+    def test_the_filter_sidebar_and_overview_count_stopped_jobs_apart(self):
+        run_node(self, FILTER, FILTER_SETUP.replace("'limit', 'done'", "'limit', 'stopped', 'done'"), r"""
+for (const tone of ['stopped', 'stopped', 'limit', 'paused', 'done', 'failed']) {
+  ui.jobsList.append(Object.assign(new Element('li'), {className: `job-card tone-${tone}`}));
+}
+ui.jobsList.dataset.signature = 'rows';
+renderFilter();
+const counts = () => buttons.map(button => [button.dataset.show, button.querySelector('.seg-count').textContent]);
+assert.deepEqual(counts(), [['all', '6'], ['running', '0'], ['waiting', '0'], ['paused', '1'], ['limit', '1'],
+  ['stopped', '2'], ['done', '1'], ['failed', '1']]);
+""")
+        run_node(self, SIDEBAR, SIDEBAR_SETUP, r"""
+const batches = [{id: '__root__', label: 'Runs', current: true, jobCount: 4, counts: {running: 1, stopped: 2, done: 1}}];
+renderNavBatches(batches);
+const link = shell.batches.children[0].children[0];
+const part = name => link.children.find(child => child.className === name);
+assert.deepEqual(part('nav-counts').children.filter(child => child.className.startsWith('nc '))
+  .map(child => [child.className, text(child)]), [['nc running', '1'], ['nc stopped', '2'], ['nc done', '1']]);
+assert.equal(link.dataset.tipMeta, 'Current batch · 4 problems · 1 running · 2 stopped · 1 complete');
+assert.deepEqual(part('nav-meter').children.map(child => [child.className, child.style.flexGrow]),
+  [['running', '1'], ['stopped', '2'], ['done', '1']]);
+renderTotals(batches);
+assert.equal(stats['[data-stat="stopped"]'].textContent, '2');
+assert.deepEqual(shell.overviewMeta.children.map(child => [child.className, child.textContent]),
+  [['', '1 batch'], ['', '4 problems'], ['meta-running', '1 running'], ['meta-stopped', '2 stopped'],
+   ['meta-done', '1 complete']]);
+""")
+        html = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<div class="stat tone-stopped"><dt>Stopped</dt><dd><strong data-stat="stopped">–</strong>'
+                      '<span class="stat-note">by you, can continue</span></dd></div>', html)
+        self.assertIn('<button type="button" class="seg" data-show="stopped" aria-pressed="false">Stopped <span '
+                      'class="seg-count" data-count="stopped"></span></button>', html)
+        self.assertIn('<li><span class="legend-dot stopped"></span>Stopped</li>', html)
+        css = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
+        for rule in ('.jobs-list[data-show="stopped"] > li:not(.tone-stopped)',
+                     '.jobs-list[data-show="failed"] > li:not(.tone-failed) { display: none; }',
+                     ".stat.tone-stopped { --tone: var(--stopped); }", ".nc.stopped { --tone: var(--stopped); }",
+                     ".page-meta .meta-stopped { color: var(--stopped); }",
+                     ".workflow-node.stopped .node-dot {", ".node-position.stopped .position-tag {",
+                     # The Ink theme draws each total's glyph by tone: Stopped is its square, never Running's dot.
+                     ':root[data-theme="ink"] .stat.tone-stopped::before { border-radius: 1.5px; }'):
+            self.assertIn(rule, css)
+        ink_dot = css.index(':root[data-theme="ink"] .stat::before {')
+        self.assertLess(ink_dot, css.index(':root[data-theme="ink"] .stat.tone-stopped::before'))
+        # Six totals in rows of three on a phone: a label too long for its tile ("Time limit reached") wraps
+        # instead of being cut to "Time limit rea…".
+        phone = css[css.index("@media (max-width: 599px)"):]
+        phone = phone[:phone.index("\n}\n")]
+        self.assertIn(".stat dt { flex: 1 0 auto; font-size: var(--text-xs); overflow-wrap: break-word; }", phone)
+        for rule in re.findall(r"\.stat dt \{[^}]*\}", css):
+            self.assertNotIn("ellipsis", rule)
+            self.assertNotIn("nowrap", rule)
 
 
 class SavedPauseCauseTests(NoModelCase):
@@ -1097,6 +1188,74 @@ class SavedPauseCauseTests(NoModelCase):
                          {"job": "limit", "other": "paused"})
         card = next(card for card in catalog.list_batches() if card["id"] == "earlier")
         self.assertEqual((card["counts"]["limit"], card["counts"]["paused"]), (1, 1))
+
+
+# The sidebar's place marks, and the New problem and Models & API entries, which only switch the view.
+ACTIVE = [["  function renderActive(where)", "  function renderTitle(where)"],
+          ["  async function openComposer(models)", "  async function go(item)"]]
+ACTIVE_SETUP = r"""
+let currentJob = '', currentBatch = 'batch_00000000a1', composingProblem = true, opened = [];
+const location = {pathname: '/', search: '?new=1&batch=batch_00000000a1', hash: ''};
+const history = {urls: [], pushState(a, b, url) { this.urls.push(url); }, replaceState(a, b, url) { this.urls.push(url); }};
+const items = ['new', 'models', 'batch', 'batch'].map((nav, index) => Object.assign(new Element('a'),
+  {dataset: {nav, ...(nav === 'batch' ? {batchId: index === 2 ? 'batch_00000000a1' : '__root__'} : {})}}));
+items.forEach(item => { item.removeAttribute = name => { delete item.attributes[name]; }; });
+const sidebar = {querySelectorAll: () => items};
+let where = 'new';
+const route = () => where, sync = () => {};
+const newProblem = async (batch = '') => { opened.push(batch); currentBatch = batch; composingProblem = true; };
+const marks = () => items.map(item => item.attributes['aria-current'] || '').join('|');
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
+class NamedBatchSidebarTests(unittest.TestCase):
+    """Batches made with New batch in the sidebar: their kind words, the New problem page's place, New problem."""
+
+    def test_the_sidebar_names_the_default_and_the_made_batches(self):
+        run_node(self, SIDEBAR, SIDEBAR_SETUP, r"""
+renderNavBatches([{id: '__root__', label: 'Default batch', current: true, default: true, jobCount: 1, counts: {running: 1}},
+  {id: 'batch_00000000a1', label: 'Graph coloring', named: true, jobCount: 0, counts: {}},
+  {id: 'batch_00000000b2', label: 'Lower bounds', named: true, jobCount: 2, counts: {done: 2}},
+  {id: 'old', label: 'old', readOnly: true, jobCount: 1, counts: {done: 1}},
+  {id: 'v4', label: 'Batch four', current: true, jobCount: 1, counts: {}}]);
+const links = shell.batches.children.map(item => item.children[0]);
+const part = (link, name) => link.children.find(child => child.className === name);
+const kind = link => part(link, 'nav-counts').children.filter(child => child.className === 'nc-kind')
+  .map(child => child.textContent).join();
+assert.equal(links.map(kind).join('|'), 'default|||read-only|current');
+assert.deepEqual(links.map(link => link.dataset.tipMeta), ['New problems go here · 1 problem · 1 running',
+  '0 problems', '2 problems · 2 complete', 'Read-only · 1 problem · 1 complete', 'Current batch · 1 problem']);
+assert.deepEqual(links.map(link => text(part(link, 'visually-hidden'))), [', 1 problem, 1 running', ', 0 problems',
+  ', 2 problems, 2 complete', ', read-only, 1 problem, 1 complete', ', current batch, 1 problem']);
+assert.deepEqual(links.map(link => link.dataset.batchId), ['__root__', 'batch_00000000a1', 'batch_00000000b2', 'old', 'v4']);
+""")
+
+    def test_the_new_problem_page_marks_its_batch_and_keeps_it_when_the_view_switches(self):
+        run_node(self, ACTIVE, ACTIVE_SETUP, r"""
+// Adding to a batch: that batch is marked (as the place above the page), not New problem.
+renderActive('new');
+assert.equal(marks(), '||true|');
+// Models & API and New problem switch the view of the open page: its batch and draft stay.
+await openComposer(true);
+assert.equal(history.urls.at(-1), '/?new=1&batch=batch_00000000a1#models');
+where = 'models'; renderActive('models');
+assert.equal(marks(), '|page||');
+await openComposer(false);
+assert.equal(history.urls.at(-1), '/?new=1&batch=batch_00000000a1');
+assert.deepEqual(opened, []);
+// From another page, New problem opens a page for the default batch, and is marked itself.
+composingProblem = false; where = 'batch';
+renderActive('batch');
+assert.equal(marks(), '||page|');
+await openComposer(false);
+assert.deepEqual(opened, ['']);
+where = 'new'; renderActive('new');
+assert.equal(marks(), 'page|||');
+// A job page marks its batch as the place it is in.
+currentJob = 'job-1'; currentBatch = '__root__'; where = 'job'; renderActive('job');
+assert.equal(marks(), '|||true');
+""")
 
 
 if __name__ == "__main__":

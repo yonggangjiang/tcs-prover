@@ -170,7 +170,7 @@ class SurpriseToolTests(AuthorCase):
         self.assertNotIn("--disallowedTools", first)
         self.assertEqual(second[second.index("--disallowedTools") + 1], "Artifact")
         diagnostic = next(event["text"] for event in self.events if event["kind"] == "diagnostic")
-        self.assertIn("Claude CLI enabled unexpected tools (Artifact); the request was stopped, and the next attempt "
+        self.assertIn("Claude Code enabled unexpected tools (Artifact); the request was stopped, and the next attempt "
                       "denies them with --disallowedTools.", diagnostic)
         # Later starts of this runner deny it from the outset.
         self.script([["init", OK]])

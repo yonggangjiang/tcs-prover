@@ -18,6 +18,10 @@ import stat
 
 
 MAX_PROOF_BYTES = 8 * 1024 * 1024
+# Why a PROOF_FILE is refused where proof files cannot be read safely (file_handoff_supported()): it becomes the
+# pause reason and the note to the resumed author, so it says what to do instead.
+NO_FILE_HANDOFF = ("This computer cannot read a proof file safely, so PROOF_FILE does not work here; "
+                   "reply with the complete proof itself.")
 PROOF_SUFFIXES = {".md", ".txt", ".tex"}
 # A plain PROOF_FILE line is a pointer only in a message this short (without
 # its marker lines); in a longer one it is a leftover beside an inline proof.
@@ -37,6 +41,9 @@ PROTECTED_COMPONENTS = {
     "fresh-critic-audits", "config", "credentials",
     # The user's related works and the paused author's progress summary are never the proof.
     "related-works", "progress-summary.md",
+    # Nor is an answer the author writes to the user's chat message (chat/answer-<message id>.md). This only
+    # refuses such a path as the proof; the author still writes its answers there.
+    "chat",
 }
 
 
@@ -289,10 +296,18 @@ def _directory_identity(info):
 
 
 def _require_secure_access():
-    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
-            or not hasattr(os, "geteuid")
-            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd):
-        raise ProofHandoffError("Secure proof file handoff requires descriptor-based no-follow file access.")
+    if not file_handoff_supported():
+        raise ProofHandoffError(NO_FILE_HANDOFF)
+
+
+def file_handoff_supported():
+    """Whether this computer can read a proof file safely: descriptor-based no-follow access (not on Windows).
+
+    Where it cannot, every PROOF_FILE is refused with NO_FILE_HANDOFF, and the
+    runner asks the author for the proof in its reply (workflow_runner.INLINE_PROOF_NOTE).
+    """
+    return (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and hasattr(os, "geteuid")
+            and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd)
 
 
 def _secure_read(workspace, parts, max_bytes, expected_root):

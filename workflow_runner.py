@@ -52,7 +52,7 @@ ROOT = Path(__file__).resolve().parent
 WORKFLOWS = ROOT / "workflows"
 MARKER = "[STATEMENT]"
 # Built-in models offered in menus and docs (runner/providers.py is the
-# registry): Codex CLI models first, then Claude CLI models. Configured API
+# registry): Codex CLI models first, then Claude Code models. Configured API
 # models (`api:<id>`) are accepted too; they are user data, not constants.
 OFFERED_MODELS = providers.offered_models()
 # Codex now calls the 5.6 generation "Older". Saved runs and scripts that name
@@ -81,11 +81,23 @@ STRUCTURED_WORKSPACE = ROOT / ".codex-structured-workspace"
 _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 # Lifecycle prompts a goal node may also bind: the short prompt of a reopened
 # conversation, the paused author's conversation turns (--converse), the
-# block of the first prompt that points to related works and the note that
-# tells a resumed author why the controller refused its last submission.
-_GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "related_works", "handoff_refused",
+# framing of a chat message sent to the working author (the controller
+# renders it into a live instruction), the block of the first prompt that
+# points to related works and the note that tells a resumed author why the
+# controller refused its last submission.
+_GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "chat", "related_works", "handoff_refused",
                             "subagents")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
+# Where TCS Prover cannot read the author's proof file safely (Windows; see
+# proof_handoff.file_handoff_supported()), the runner adds this note after the
+# author's first prompt, which {original_prompt} carries into the resume and
+# compaction prompts, and after the lifecycle prompts INLINE_PROOF_PROMPTS
+# and the recovery prompt, the instructions that ask for PROOF_FILE. The
+# workflow's own prompts stay the same on every computer.
+INLINE_PROOF_NOTE = ("PROOF FORMAT ON THIS COMPUTER:\nThe critic cannot receive proof.md here; it receives your reply "
+                     "instead. When your proof is complete, reply with the complete proof itself instead of "
+                     "PROOF_FILE: proof.md.")
+INLINE_PROOF_PROMPTS = ("continuation", "repair")
 
 
 REASONING_SUMMARIES = ("none", "concise", "detailed")
@@ -93,7 +105,7 @@ REASONING_SUMMARIES = ("none", "concise", "detailed")
 DEFAULT_REASONING_SUMMARY = "concise"
 
 # Provider ids in events and YAML provider_options: native Codex models,
-# Claude CLI subscription models, and every configured API model ("tcs_api"
+# Claude Code subscription models, and every configured API model ("tcs_api"
 # is also the isolated Codex custom provider of OpenAI-format endpoints).
 OPENAI_PROVIDER = "openai"
 
@@ -309,6 +321,9 @@ SAVED_CANDIDATE_FILENAME = "saved-candidate.md"
 FINAL_INPUT_FILENAME = "final-input.json"
 
 AUTHOR_STEER_MAX_CHARS = 12000
+# The queue holds an instruction of at most AUTHOR_STEER_MAX_CHARS plus the chat framing; the server
+# refuses anything longer, so nothing is skipped.
+AUTHOR_STEER_QUEUE_MAX_CHARS = 16_000
 
 EMIT_LOCK = threading.Lock()
 REVIEW_MODEL = MODEL
@@ -747,8 +762,10 @@ def prompt_file(path, default):
     return Path(path).read_text(encoding="utf-8") if path else default
 
 
-# The program each CLI is, in the words of missing_cli_text().
-CLI_PROGRAMS = {"Codex": "the Codex CLI", "Claude": "Claude Code"}
+# The program each CLI is, as the source menus name it: in a title ("Claude Code missing or
+# incompatible") and in a sentence (missing_cli_text(): "Install the Codex CLI").
+CLI_NAMES = {"Codex": providers.PROVIDER_LABELS[providers.CODEX], "Claude": providers.PROVIDER_LABELS[providers.CLAUDE]}
+CLI_PROGRAMS = {cli: f"the {name}" if name.endswith(" CLI") else name for cli, name in CLI_NAMES.items()}
 
 
 def missing_cli_text(cli, model=None, stage=None):
@@ -1520,7 +1537,7 @@ def wait_before_retry(options, stage, attempt, error, *, cancel=None, node=None,
     streaks[key] = ((cli, reason), repeats, now)
     missing = repeats >= CLI_PROBLEM_REPEATS
     if missing:
-        plain = f"{cli} CLI missing or incompatible"
+        plain = f"{CLI_NAMES.get(cli, f'{cli} CLI')} missing or incompatible"
     details = [f"attempt {attempt}"]
     spent = max(0.0, _wall_clock() - since) if since is not None else 0.0
     if spent >= 60:
@@ -1567,6 +1584,21 @@ def wait_before_retry(options, stage, attempt, error, *, cancel=None, node=None,
             _emit_budget_clock(stage, change)
 
 
+def missing_cli_failure(failure):
+    """ "Codex" or "Claude" when a retry's ``failure`` names a CLI that keeps failing to start, else "".
+
+    That is wait_before_retry()'s "Codex CLI missing or incompatible" or
+    "Claude Code missing or incompatible". Earlier versions said "Claude CLI
+    missing or incompatible": saved jobs, and runners started before an
+    update, still use those words.
+    """
+
+    for cli, name in CLI_NAMES.items():
+        if failure in (f"{name} missing or incompatible", f"{cli} CLI missing or incompatible"):
+            return cli
+    return ""
+
+
 def pending_author_steer(path, delivered_id=None):
     """The next controller-authored live instruction to deliver, as (id, instruction), or None.
 
@@ -1592,12 +1624,18 @@ def pending_author_steer(path, delivered_id=None):
             instruction = str(entry["instruction"]).strip()
         except (KeyError, TypeError, IndexError):
             continue
-        if command_id and instruction and "\0" not in instruction and len(instruction) <= AUTHOR_STEER_MAX_CHARS:
+        if command_id and instruction and "\0" not in instruction and len(instruction) <= AUTHOR_STEER_QUEUE_MAX_CHARS:
             commands.append((command_id, instruction))
     identities = [command[0] for command in commands]
     if delivered_id in identities:
         commands = commands[identities.index(delivered_id) + 1:]
     return commands[0] if commands else None
+
+# Why the controller asks the author to stop ("stopped" for the user's Stop, else "pause"), and the
+# runner's words for a Stop; one definition for the Codex and the Claude author.
+pause_request_cause = claude_cli.pause_request_cause
+STOP_REQUESTED_TEXT, AUTHOR_STOPPED_TEXT = claude_cli.STOP_REQUESTED_TEXT, claude_cli.AUTHOR_STOPPED_TEXT
+
 
 def model_provider(model):
     """Return the provider id of one supported model (see OPENAI_PROVIDER)."""
@@ -1769,10 +1807,10 @@ def private_permissions(base, model, *, codex_home=None, live=False):
     and to any Unix socket, even one in a denied folder, and they can list
     the sockets of the user's other processes (lsof): the variables that
     name the user's agents are left out (confinement.AGENT_VARIABLES), but
-    their sockets stay reachable (the README says so). Verified with Codex
+    their sockets stay reachable (docs/sandbox.md says so). Verified with Codex
     0.160's macOS Seatbelt sandbox: other platforms return None and keep the
     legacy sandbox modes (legacy_network_arguments(),
-    legacy_read_only_policy(), README).
+    legacy_read_only_policy(), docs/sandbox.md).
     """
 
     if not confinement.supported():
@@ -4110,6 +4148,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     expired = threading.Event()
     pausing = threading.Event()
     pause_file = options.get("goal_pause_file")
+    # Why the controller asked the author to stop (pause_request_cause), once its request is seen.
+    stop_cause = {"value": ""}
     # "turn_id" is the latest turn's id and "instruction_turn" the turn that
     # carried our latest instruction; "output" says whether the model produced
     # anything in the latest turn and "steered" whether a live instruction or
@@ -4242,6 +4282,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if pause_file and Path(pause_file).is_file() and state["active"]:
                 if pause_started is None:
                     pause_started = time.monotonic()
+                    # A Stop the user asked for, or a pause: read once, when the request is first seen.
+                    stop_cause["value"] = pause_request_cause(pause_file)
                     pausing.set()
                 if thread and state["turn"] and state["turn"] != interrupted_turn:
                     interrupted_turn = state["turn"]
@@ -4249,8 +4291,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         rpc.request("turn/interrupt", {"threadId": thread, "turnId": interrupted_turn})
                         emit("status", label="Author stopping", threadId=thread,
-                             text=f"Pause requested: the author may finish its current step for up to "
-                                  f"{_span_text(grace)} before it is stopped.")
+                             text=STOP_REQUESTED_TEXT.format(grace=_span_text(grace))
+                             if stop_cause["value"] == "stopped" else
+                             f"Pause requested: the author may finish its current step for up to "
+                             f"{_span_text(grace)} before it is stopped.")
                     except (runtime.Error, OSError) as exc:
                         emit("diagnostic", text=f"Could not interrupt the author: {exc}")
                 if time.monotonic() - pause_started >= grace:
@@ -4556,7 +4600,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         failure = runtime.Error(stalled["reason"]) if stalled["reason"] else exc
         if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
             pausing.set()
-            emit("status", label="Author paused", text=str(failure), threadId=thread)
+            stopped = (stop_cause["value"] or (pause_request_cause(pause_file) if pause_file
+                                               else "pause")) == "stopped"
+            if stopped:
+                emit("status", label="Author stopped", text=AUTHOR_STOPPED_TEXT, threadId=thread)
+            else:
+                emit("status", label="Author paused", text=str(failure), threadId=thread)
         else:
             pausing.set()
             # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
@@ -6076,11 +6125,12 @@ def prepare(workflow, options):
             if isinstance(lifecycle, list):
                 lifecycle = {key: key for key in lifecycle}
             for key, reference in lifecycle.items():
-                # Only the paused author's conversation prompt quotes the user's message, the note on a
-                # refused submission its reason, and the subagents note their number (the controller
-                # renders these with nothing else).
+                # Only the paused author's conversation prompt quotes the user's message, the chat framing
+                # the message and its answer file, the note on a refused submission its reason, and the
+                # subagents note their number (the controller renders these with nothing else).
                 _template_parts(prompts[reference], {"reason"} if key == "handoff_refused"
                                 else {"author_subagents"} if key == "subagents"
+                                else {"message", "answer_file"} if key == "chat"
                                 else fields | {"message"} if key == "conversation" else fields)
     return prompts
 
@@ -7311,13 +7361,18 @@ def _execute(workflow, state, options, prompts):
                         # The author may start subagents: the first prompt says how many, like the related
                         # works, and {original_prompt} carries it into the later prompts.
                         prompt += "\n\n" + render_template(prompts[lifecycle["subagents"]], {"author_subagents": count})
-                    session_prompts = {key: prompts[ref] for key, ref in lifecycle.items() if key != "subagents"}
+                    # Where the author's proof file cannot be read safely, each instruction that asks for
+                    # PROOF_FILE is followed by the request for the proof in the reply (INLINE_PROOF_NOTE).
+                    inline = "\n\n" + INLINE_PROOF_NOTE if not proof_handoff.file_handoff_supported() else ""
+                    prompt += inline
+                    session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
+                                       for key, ref in lifecycle.items() if key != "subagents"}
                     directory = options.get("goal_cwd") or str(Path.cwd())
                     recovery = node.get("recovery")
                     instruction = ""
                     if recovery and evaluate(recovery["when"], context):
                         feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
-                        instruction = render_template(prompts[recovery["prompt"]], {
+                        instruction = render_template(prompts[recovery["prompt"]] + inline, {
                             "original_prompt": prompt, "directory": str(directory),
                             "instruction": "", "revision_number": 1, **feedback,
                         })
@@ -7327,7 +7382,7 @@ def _execute(workflow, state, options, prompts):
                         settings["subagents"] = count
                         note_no_subagent_tool(node.get("stage", "solve"), settings["model"], count)
                     # Claude models (and Anthropic-format API models) run the
-                    # same goal protocol through the Claude CLI.
+                    # same goal protocol through Claude Code.
                     session_function = (claude_cli.goal_session
                                         if providers.harness(settings["model"]) == providers.CLAUDE
                                         else goal_session)
@@ -7880,7 +7935,7 @@ def check_clis(models, directory=None):
     except (retrieval_runtime.RetrievalPolicyError, OSError, ValueError):
         return  # The run's own checks report a broken policy.
     if models and not confinement.supported():
-        # Said once per runner; the run continues with the legacy sandboxes (see README).
+        # Said once per runner; the run continues with the legacy sandboxes (see docs/sandbox.md).
         emit("diagnostic", "workflow", text=confinement.UNSUPPORTED_NOTICE)
     # CLI -> (stage, model, API model?) of the first model that needs it; a built-in Codex model
     # first, as its calls look for Codex on PATH only.
@@ -7913,11 +7968,11 @@ def check_clis(models, directory=None):
             problems.append(str(exc))  # What to install, and that the job continues by itself.
             continue
         except (Error, OSError, subprocess.SubprocessError) as exc:
-            problems.append(f"{name} CLI missing or incompatible: {exc} {retried}")
+            problems.append(f"{CLI_NAMES[name]} missing or incompatible: {exc} {retried}")
             continue
         version = _clipped(" ".join(result.stdout.split()), 200)
         if result.returncode or not version:
-            problems.append(f"{name} CLI missing or incompatible: `{Path(path).name} --version` exited with code "
+            problems.append(f"{CLI_NAMES[name]} missing or incompatible: `{Path(path).name} --version` exited with code "
                             f"{result.returncode}" + (f" ({version})." if version else ".") + f" {retried}")
             continue
         found[name] = {"path": path, "version": version}
@@ -7935,8 +7990,9 @@ def check_clis(models, directory=None):
     for name, item in found.items():
         before = previous.get(name)
         if isinstance(before, dict) and before != item:
+            program = CLI_PROGRAMS[name]
             emit("diagnostic", "workflow",
-                 text=f"The {name} CLI changed since this job last started: {before.get('version')} "
+                 text=f"{program[0].upper()}{program[1:]} changed since this job last started: {before.get('version')} "
                       f"({before.get('path')}) is now {item['version']} ({item['path']}).")
     if any(previous.get(name) != item for name, item in found.items()):
         try:

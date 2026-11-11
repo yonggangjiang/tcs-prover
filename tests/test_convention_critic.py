@@ -977,7 +977,7 @@ assert.equal(composerSeed.settings.criticPrompt, 'JOB CRITIC PROMPT');
 // It starts nothing: no request is made.
 """, slices=(("function workflowStagesFor(", "// Read historical mode names"),
              ("const promptLabels =", "function syncPrompts("),
-             ("// Settings and statement the composer opens with once", "async function newProblem()")))
+             ("// Settings and statement the composer opens with once", "async function newProblem(")))
         source = (server.UI / "app.js").read_text()
         block = source[source.index('if (phase === "input" && previousPhase !== "input") {'):]
         block = block[:block.index("restoreWorkflowStages(source);")]

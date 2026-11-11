@@ -43,7 +43,7 @@ class RegistryTests(StoreCase):
         luna = next(row for row in rows if row["id"] == "gpt-6-luna")
         self.assertNotIn("ultra", luna["efforts"])
         for row in rows[4:]:
-            self.assertEqual((row["provider"], row["providerLabel"], row["supportsFast"]), ("claude", "Claude CLI", False))
+            self.assertEqual((row["provider"], row["providerLabel"], row["supportsFast"]), ("claude", "Claude Code", False))
             self.assertEqual(row["efforts"], ["low", "medium", "high", "xhigh", "max"])
         legacy = providers.catalog(include_legacy=True)[8:]
         self.assertEqual([row["id"] for row in legacy], list(providers.LEGACY_CODEX_MODELS))
@@ -502,7 +502,9 @@ class StoreTests(StoreCase):
                                                      state / "codex-homes", state / "claude-settings",
                                                      state / "claude-homes", state / "claude-transcripts",
                                                      state / "sessions", state / "run-owners", state / "servers",
-                                                     state / "last-good-workflows", state / "settings.json"])
+                                                     state / "last-good-workflows", state / "settings.json",
+                                                     state / "new-problem-presets.json",
+                                                     state / "new-problem-presets.lock"])
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex"), "CLAUDE_CONFIG_DIR": str(self.root / "c")}):
             self.assertEqual(providers.user_login_files(), [(self.root / "codex" / "auth.json").resolve(),
                                                             (self.root / "c" / ".credentials.json").resolve()])

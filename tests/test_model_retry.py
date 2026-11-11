@@ -404,7 +404,7 @@ class StructuredRetryTests(RetryCase):
             ("configuration", {}, runtime.ConfigurationError(runtime.HISTORICAL_CODEX_ONLY), runtime.ConfigurationError),
             ("invalid bundle", {}, runtime.ConfigurationError("Invalid proof snapshot bundle."),
              runtime.ConfigurationError),
-            ("safety refusal", {}, runtime.SafetyStop("Claude CLI enabled unexpected tools (RemoteTrigger)."),
+            ("safety refusal", {}, runtime.SafetyStop("Claude Code enabled unexpected tools (RemoteTrigger)."),
              runtime.SafetyStop),
             ("workflow rule", {}, runtime.WorkflowDefinitionError("Cannot evaluate workflow expression"),
              runtime.WorkflowDefinitionError),
@@ -418,7 +418,7 @@ class StructuredRetryTests(RetryCase):
         self.assertEqual(self.clock.sleeps, [])
         # Transport failures and an unacceptable answer are retried.
         for outcome in (OSError(2, "No such file or directory: 'claude'"),
-                        runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH."),
+                        runtime.CLIUnavailable("Claude Code is not installed or is not on PATH."),
                         runtime.ConversationUnavailable("gone"), runtime.InvalidAnswer("bad")):
             self.assertTrue(runtime.retryable_failure(outcome), outcome)
         for outcome in (runtime.FinalError("x"), runtime.WorkflowPaused(), runtime.RetryCancelled("x"),

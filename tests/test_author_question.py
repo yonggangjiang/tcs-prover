@@ -773,24 +773,32 @@ class QuestionPageTests(unittest.TestCase):
         for marker in {marker for pair in HANDLERS for marker in pair}:
             self.assertEqual(source.count(marker), 1, marker)
         page = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
-        for text in ('id="authorQuestion"', 'id="authorQuestionHeading">The proof author asks<',
+        for text in ('id="authorQuestionForm"',
                      ">The author keeps working while it waits; answering is optional.<",
                      ">Click a selected option again to leave that question unanswered.<",
-                     'id="sendAuthorAnswerButton"', ">Send</button>", 'id="dismissAuthorQuestionButton"',
+                     'id="sendAuthorAnswerButton"', ">Send answer</button>", 'id="dismissAuthorQuestionButton"',
                      ">Dismiss</button>"):
             self.assertEqual(page.count(text), 1, text)
-        # At the top of the job view: right after the job's header.
-        self.assertLess(page.index("</header>"), page.index('id="authorQuestion"'))
-        self.assertLess(page.index('id="authorQuestion"'), page.index('id="reviewPanel"'))
+        # No box of its own at the top of the page: the form lives in the chat, between its list and its box.
+        self.assertNotIn('id="authorQuestion"', page)
+        self.assertLess(page.index('id="authorConversationList"'), page.index('id="authorQuestionForm"'))
+        self.assertLess(page.index('id="authorQuestionForm"'), page.index('id="authorSteerControl"'))
         # The hint is hidden until several questions are shown.
         self.assertIn('<p id="authorQuestionSkipHint" class="help author-question-note" hidden>', page)
+        # In its row of the chat, the form never unrolls the whole conversation: the list keeps its height while the
+        # author asks, and the page scrolls the question's row into view (test_conversation_ui).
+        css = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
+        start = css.index(".conversation-list {")
+        self.assertIn("max-height: 28rem;", css[start:css.index("}", start)])
+        self.assertNotIn(".conversation-list:has(", css)
+        self.assertNotIn("max-height: none", css[start:css.index(".conversation-item {", start)])
 
     def test_the_box_shows_the_options_first_chosen_and_a_field_that_overrides_them(self):
         self.run_app(page_test.RENDER, page_test.RENDER_SETUP, r"""
 const question = %s;
 const running = {...author, phase: 'running', authorQuestion: question};
 render(running);
-assert.equal(ui.authorQuestion.hidden, false);
+assert.equal(ui.authorQuestionForm.hidden, false);
 assert.match(ui.authorQuestionMeta.textContent, /^Asked at [^.]+\. Unanswered, it closes once the author has finished the step in which it asked, at [^.]+ at the earliest\.$/);
 const rows = ui.authorQuestionList.children;
 assert.equal(rows.length, 1);
@@ -825,12 +833,108 @@ render({...running, authorQuestion: {...question, turnEnded: true}});
 assert.match(ui.authorQuestionMeta.textContent, /The author has finished the step in which it asked; unanswered, this question closes at [^.]+\.$/);
 // The server closed it (an answer, Dismiss, a newer question, the author stopped, or time): the box goes.
 render({...running, authorQuestion: null});
-assert.equal(ui.authorQuestion.hidden, true);
+assert.equal(ui.authorQuestionForm.hidden, true);
 // A saved batch or a job another process runs shows no box.
 render({...running, readOnly: true});
-assert.equal(ui.authorQuestion.hidden, true);
+assert.equal(ui.authorQuestionForm.hidden, true);
 render({...running, runningElsewhere: 'Running in another process.'});
-assert.equal(ui.authorQuestion.hidden, true);
+assert.equal(ui.authorQuestionForm.hidden, true);
+""" % json.dumps(QUESTION))
+
+    def test_the_question_is_answered_in_its_row_of_the_chat_and_survives_its_rebuilds(self):
+        self.run_app([*page_test.RENDER, *HANDLERS], page_test.RENDER_SETUP, r"""
+const question = %s;
+const item = {id: 'c_q', kind: 'question', origin: 'author', status: 'open', createdAt: 1761580800,
+  text: '', reply: '', error: '', questionId: question.id, questions: question.questions};
+const chat = items => ({mode: 'author', note: 'Your message reaches the author at its next step.',
+  summary: 'pause', items});
+const running = {...author, phase: 'running', authorQuestion: question, conversation: chat([item])};
+render(running);
+const row = () => ui.authorConversationList.children.find(entry => entry.dataset.kind === 'question');
+// The chat lists it as the author's; its row holds the form with the options.
+assert.match(row().children[0].textContent, /^The author asks · /);
+assert.equal(ui.authorQuestionForm.parent, row());
+assert.equal(ui.authorQuestionForm.hidden, false);
+const field = ui.authorQuestionList.children[0].querySelector('textarea');
+field.value = 'Two subagents.';
+// A new message rebuilds the chat's rows: the same form, with what was written, moves into the new row.
+const message = {id: 'c_m', kind: 'instruction', origin: 'user', status: 'queued', createdAt: 1761580900,
+  text: 'Also: which bound?', reply: '', error: '', steerId: 's1', answerFile: 'chat/answer-c_m.md'};
+render({...running, conversation: chat([item, message])});
+assert.equal(ui.authorQuestionForm.parent, row());
+assert.equal(ui.authorQuestionList.children[0].querySelector('textarea'), field);
+assert.equal(field.value, 'Two subagents.');
+// Answered: the row says what was sent and whether the author took it in; the form leaves it.
+await ui.sendAuthorAnswer.onclick();
+assert.equal(acted.at(-1).path, '/answer-author-question');
+render({...running, authorQuestion: null, conversation: chat([{...item, status: 'answered', finishedAt: 1761581000,
+  reply: 'Answer to your question "May I use independent subagents?": Two subagents.', steerId: 's2'}, message])});
+assert.equal(ui.authorQuestionForm.hidden, true);
+assert.notEqual(ui.authorQuestionForm.parent, row());
+assert.deepEqual(row().children.slice(-2).map(node => node.textContent),
+  ['Answer to your question "May I use independent subagents?": Two subagents.',
+   'Waiting for the author to take it in at its next step.']);
+""" % json.dumps(QUESTION))
+
+    def test_a_new_question_brings_its_form_into_view_in_its_row(self):
+        self.run_app(page_test.RENDER, page_test.RENDER_SETUP, r"""
+const question = %s;
+const item = {id: 'c_q', kind: 'question', origin: 'author', status: 'open', createdAt: 1761580800,
+  text: '', reply: '', error: '', questionId: question.id, questions: question.questions};
+const running = {...author, phase: 'running', conversation: {mode: 'author', note: '', summary: 'pause', items: []}};
+const row = id => ui.authorConversationList.children.find(entry => entry.dataset.questionId === id);
+render(running);
+render({...running, authorQuestion: question, conversation: {...running.conversation, items: [item]}});
+// The question's form, in its own row, is brought into view: not the whole card.
+assert.equal(ui.authorQuestionForm.parent, row(question.id));
+assert.equal(ui.authorQuestionForm.scrolled, true);
+assert.equal(ui.authorConversation.scrolled, undefined);
+// A poll that rebuilds the rows does not move the page again.
+ui.authorQuestionForm.scrolled = undefined;
+render({...running, authorQuestion: question, conversation: {...running.conversation,
+  items: [{...item, createdAt: 1761580801}]}});
+assert.equal(ui.authorQuestionForm.parent, row(question.id));
+assert.equal(ui.authorQuestionForm.scrolled, undefined);
+// While you type in a field, a newer question does not move the page under you.
+document.activeElement = new Element('textarea');
+const newer = {...question, id: 'call_newer'};
+render({...running, authorQuestion: newer, conversation: {...running.conversation,
+  items: [{...item, status: 'closed'}, {...item, id: 'c_q2', questionId: newer.id}]}});
+assert.equal(ui.authorQuestionForm.scrolled, undefined);
+document.activeElement = null;
+// A job's page that opens with the question open brings it into view too (the job list tags such a job).
+render({...running, runId: 'r2', authorQuestion: newer, conversation: {...running.conversation,
+  items: [{...item, id: 'c_q2', questionId: newer.id}]}});
+assert.equal(ui.authorQuestionForm.scrolled, true);
+// A question this page cannot answer (a saved batch) has no form and moves nothing.
+ui.authorQuestionForm.scrolled = undefined;
+render({...running, runId: 'r3', readOnly: true, authorQuestion: question, conversation: {...running.conversation,
+  items: [item]}});
+assert.equal(ui.authorQuestionForm.hidden, true);
+assert.equal(ui.authorQuestionForm.scrolled, undefined);
+""" % json.dumps(QUESTION))
+
+    def test_leaving_a_job_parks_its_question_form_with_the_chat(self):
+        self.run_app([*page_test.RENDER, ["function clearJobView()", "function selectJob("]],
+                     page_test.RENDER_SETUP + "\nconst timelineRows = new Map(), detailRows = new Map();\n", r"""
+const question = %s;
+const item = {id: 'c_q', kind: 'question', origin: 'author', status: 'open', createdAt: 1761580800,
+  text: '', reply: '', error: '', questionId: question.id, questions: question.questions};
+render({...author, phase: 'running', authorQuestion: question,
+  conversation: {mode: 'author', note: '', summary: 'pause', items: [item]}});
+const row = ui.authorConversationList.children.find(entry => entry.dataset.kind === 'question');
+assert.equal(ui.authorQuestionForm.parent, row);
+assert.equal(ui.authorQuestionForm.hidden, false);
+// Another job, the batch list or the overview: the form goes back to the chat card, hidden.
+clearJobView();
+assert.equal(ui.authorQuestionForm.parent, ui.authorConversation);
+assert.equal(ui.authorQuestionForm.hidden, true);
+// The note of a statement review you stopped belongs to its job too.
+render({runId: 'review', phase: 'input', manuallyStopped: true, error: 'You stopped the statement review. Start '
+  + 'workflow runs it again in this job.'});
+assert.equal(ui.stoppedNote.hidden, false);
+clearJobView();
+assert.equal(ui.stoppedNote.hidden, true);
 """ % json.dumps(QUESTION))
 
     def test_free_text_and_several_questions_each_get_their_own_field(self):
@@ -893,7 +997,7 @@ assert.equal(ui.sendAuthorAnswer.disabled, false);
 
     def test_a_question_that_closes_while_an_answer_is_written_says_so(self):
         self.run_app([*page_test.RENDER, *HANDLERS], page_test.RENDER_SETUP, r"""
-const LOST = "The author's question closed before your answer was sent; you can still send it as a live instruction.";
+const LOST = "The author's question closed before your answer was sent. You can still send your answer as a message in the chat.";
 const question = %s;
 const running = {...author, phase: 'running', authorQuestion: question};
 const field = () => ui.authorQuestionList.children[0].querySelector('textarea');
@@ -901,13 +1005,13 @@ ui.notice.textContent = ''; ui.notice.hidden = true;
 // Closed with nothing written: the box just goes.
 render(running);
 render({...running, authorQuestion: null});
-assert.equal(ui.authorQuestion.hidden, true);
+assert.equal(ui.authorQuestionForm.hidden, true);
 assert.deepEqual([ui.notice.textContent, ui.notice.hidden], ['', true]);
 // Closed while an answer is written: the notice says so, once.
 render({...running, authorQuestion: {...question, id: 'call_a'}});
 field().value = 'Use two subagents only.';
 render({...running, authorQuestion: null});
-assert.equal(ui.authorQuestion.hidden, true);
+assert.equal(ui.authorQuestionForm.hidden, true);
 assert.deepEqual([ui.notice.textContent, ui.notice.hidden], [LOST, false]);
 ui.notice.hidden = true;
 render({...running, authorQuestion: null});
@@ -959,9 +1063,10 @@ for (const [id, after] of [['call_critic', {phase: 'running', stage: 'critic', a
   render({...running, authorQuestion: {...question, id}});
   field().value = 'Use two subagents only.';
   render({...running, ...after, authorQuestion: null});
-  assert.equal(ui.authorQuestion.hidden, true);
+  assert.equal(ui.authorQuestionForm.hidden, true);
   assert.deepEqual([ui.notice.textContent, ui.notice.hidden], [ENDED, false]);
-  assert.equal(ui.authorSteerControl.hidden, true);
+  // Nothing can reach it now: the chat's Send is off (or the finished job has no box).
+  assert.equal(ui.authorSteerControl.hidden || ui.sendAuthorSteer.disabled, true);
 }
 """ % json.dumps(QUESTION))
 

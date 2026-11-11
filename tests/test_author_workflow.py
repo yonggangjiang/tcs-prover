@@ -30,7 +30,8 @@ class AuthorWorkflowTests(unittest.TestCase):
 
     def execute(self, options=None):
         options = options or {}
-        with patch.object(runtime, 'goal_session', side_effect=self.goal), patch.object(runtime, 'structured') as structured, patch.object(runtime, 'emit'):
+        with patch.object(runtime, 'goal_session', side_effect=self.goal), patch.object(runtime, 'structured') as structured, \
+                patch.object(runtime.proof_handoff, 'file_handoff_supported', return_value=True), patch.object(runtime, 'emit'):
             result = runtime._execute(self.workflow, {'statement': 'Exact statement'}, options, self.workflow['prompts'])
         structured.assert_not_called()
         return result

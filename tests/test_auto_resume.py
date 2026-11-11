@@ -71,7 +71,8 @@ class AutoResumeTests(unittest.TestCase):
                   "Claude author turn failed: API Error: 529 Overloaded.", "Author stopped: usageLimited.",
                   "exceeded retry limit, last status: 429 Too Many Requests",
                   "stream disconnected before completion: stream closed before response.completed",
-                  "Codex app-server stopped unexpectedly.", "Claude CLI stopped unexpectedly.",
+                  "Codex app-server stopped unexpectedly.", "Claude Code stopped unexpectedly.",
+                  "Claude CLI stopped unexpectedly.",  # An earlier version's words, in a saved job.
                   "Please run codex login: 401 Unauthorized",
                   "Could not resume the saved Codex conversation; no replacement was started. network unavailable")
         for reason in causes:

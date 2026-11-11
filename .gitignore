@@ -13,6 +13,8 @@
 !.gitignore
 !.gitattributes
 !README.md
+!docs/
+!docs/**/*
 !web_ui.py
 !workflow_runner.py
 !requirements.txt

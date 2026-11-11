@@ -99,7 +99,7 @@ let batchCatalog = [];
 const $ = (id) => document.getElementById(id);
 const ui = {
   input: $("inputPanel"), review: $("reviewPanel"), run: $("runPanel"),
-  notice: $("notice"), problem: $("problem"), proposed: $("proposed"),
+  notice: $("notice"), stoppedNote: $("stoppedNote"), problem: $("problem"), proposed: $("proposed"),
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
   feedback: $("feedback"), notes: $("notes"), editHint: $("editHint"),
@@ -145,14 +145,22 @@ const ui = {
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   jobsHeading: $("jobsHeading"), jobsEmpty: $("jobsEmpty"),
   batchesPanel: $("batchesPanel"), batchesList: $("batchesList"), batchesStatus: $("batchesStatus"),
+  batchesProblem: $("batchesProblem"),
   batchNavigation: $("batchNavigation"), allBatches: $("allBatchesButton"),
   batchProblems: $("batchProblemsButton"), selectedBatchBadge: $("selectedBatchBadge"),
   batchReadOnlyNotice: $("batchReadOnlyNotice"), newProblem: $("newProblemButton"),
+  newBatch: $("newBatchButton"), navNewBatchItem: $("navNewBatchItem"), composerBatch: $("composerBatch"),
+  composerBatchText: $("composerBatchText"), composerDefaultBatch: $("composerDefaultBatchButton"),
+  batchActions: $("batchActions"), renameBatch: $("renameBatchButton"), deleteBatch: $("deleteBatchButton"),
+  newProblemInBatch: $("newProblemInBatchButton"),
+  batchDialog: $("batchDialog"), batchDialogTitle: $("batchDialogTitle"), batchNameLabel: $("batchNameLabel"),
+  batchNameInput: $("batchNameInput"), batchNameHelp: $("batchNameHelp"), batchDialogError: $("batchDialogError"),
+  cancelBatchDialog: $("cancelBatchDialogButton"), saveBatchDialog: $("saveBatchDialogButton"),
   check: $("checkButton"), recheck: $("recheckButton"), approve: $("approveButton"),
   runFolder: $("runFolderButton"), runFolderHelp: $("runFolderHelp"), folderInput: $("folderInput"),
   batchStatus: $("batchStatus"),
   attentionBanner: $("attentionBanner"), attentionList: $("attentionList"),
-  stop: $("stopButton"),
+  stop: $("stopButton"), stopText: $("stopButtonText"),
   pause: $("pauseButton"), resume: $("resumeButton"), downloadTex: $("downloadTexButton"),
   downloadPdf: $("downloadPdfButton"), downloadProof: $("downloadProofButton"),
   downloadSource: $("downloadSourceButton"),
@@ -167,7 +175,7 @@ const ui = {
   authorSteerCount: $("authorSteerCount"),
   sendAuthorSteer: $("sendAuthorSteerButton"), sendAuthorSteerText: $("sendAuthorSteerText"),
   requestSummary: $("requestSummaryButton"), stopReply: $("stopReplyButton"),
-  authorQuestion: $("authorQuestion"), authorQuestionMeta: $("authorQuestionMeta"),
+  authorQuestionForm: $("authorQuestionForm"), authorQuestionMeta: $("authorQuestionMeta"),
   authorQuestionList: $("authorQuestionList"), authorQuestionSkipHint: $("authorQuestionSkipHint"),
   sendAuthorAnswer: $("sendAuthorAnswerButton"),
   dismissAuthorQuestion: $("dismissAuthorQuestionButton"),
@@ -264,7 +272,8 @@ const pinnedKinds = new Set([
 // Serialize requests so a slow poll cannot overwrite a newer action.
 function request(path, body) {
   const run = async () => {
-    if (body !== undefined && (state.readOnly || selectedBatch()?.readOnly)) {
+    // Making, renaming or deleting a batch changes no saved batch or job on screen.
+    if (body !== undefined && !/^\/batches(\/|\?|$)/.test(path) && (state.readOnly || selectedBatch()?.readOnly)) {
       throw new Error("This saved batch is read-only. Open the current batch or create a new problem from All batches.");
     }
     const options = { headers: { "X-TCS-Prover-Token": sessionToken } };
@@ -280,7 +289,8 @@ function request(path, body) {
     }
     const response = await fetch(path, options);
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Request failed.");
+    // The refusal's words, and its HTTP status for the callers that tell refusals apart.
+    if (!response.ok) throw Object.assign(new Error(data.error || "Request failed."), { status: response.status });
     return data;
   };
   const result = requests.then(run, run);
@@ -328,18 +338,103 @@ function selectedBatch() {
   return batchCatalog.find(batch => batch.id === currentBatch);
 }
 
+// What the last /batches answer said the server offers, kept on the function itself (it exists wherever
+// this part of the file runs): whether it makes batches (an older server or the live gateway does not),
+// why its list of batches cannot be read (when it cannot), whether an answer has arrived yet, and how
+// many answers have been taken (the sidebar uses the count to tell whose list is the newer).
+function batchOptions() {
+  return (batchOptions.value ||= { create: false, problem: "", loaded: false, adopted: 0 });
+}
+
+// A /batches answer: its cards, after noting what the server offers.
+function adoptBatchCatalog(catalog) {
+  batchOptions.value = { create: catalog?.canCreateBatches === true,
+    problem: String(catalog?.batchesProblem || ""), loaded: true, adopted: batchOptions().adopted + 1 };
+  return catalog?.batches || [];
+}
+
+// Whether the page is in a batch other than the default one ("" and "__root__" are the default batch).
+function inOtherBatch() {
+  return Boolean(currentBatch) && currentBatch !== "__root__";
+}
+
+// The batch a new problem joins: the batch the New problem page was opened from, else the default batch.
+function composerTarget() {
+  return inOtherBatch() ? { id: currentBatch, label: selectedBatch()?.label || currentBatch }
+    : { id: "", label: "Default batch" };
+}
+
+// The New problem page says which batch its problem joins. Another batch can be left for the default one
+// without losing what was written there.
+function renderComposerBatch() {
+  const batch = selectedBatch(), other = inOtherBatch(), { create, loaded } = batchOptions();
+  const shown = composingProblem && !currentJob && create;
+  ui.composerBatchText.textContent = !shown ? ""
+    : !other ? "Adding to the default batch."
+    : batch?.addProblems && !batch.readOnly ? `Adding to batch “${batch.label || batch.id}”.`
+    : loaded ? "The batch this page was adding to is no longer available." : "";
+  show(ui.composerBatch, Boolean(ui.composerBatchText.textContent));
+  show(ui.composerDefaultBatch, shown && other && loaded);
+}
+
+// Whether the New problem page adds to a batch the server no longer lists (deleted in another tab, say),
+// once the list of batches has arrived.
+function composerBatchGone() {
+  return composingProblem && !currentJob && inOtherBatch() && batchOptions().loaded && !selectedBatch();
+}
+
+// The New problem page reads the list of batches again, after a start was refused: a batch deleted
+// meanwhile is then said to be gone, with the way back to the default batch. The refusal stays on screen.
+async function reloadComposerBatches() {
+  const batch = currentBatch;
+  if (!composingProblem || currentJob || !inOtherBatch()) return;
+  try {
+    const catalog = await request("/batches");
+    if (!composingProblem || currentJob || batch !== currentBatch) return;
+    batchCatalog = adoptBatchCatalog(catalog);
+    renderBatchNavigation();
+  } catch (_) {
+    // The sidebar reads the list again within seconds, and the page with it.
+  }
+}
+
+// "Add to the default batch instead": what was written and the settings stay.
+function addToDefaultBatch() {
+  currentBatch = "";
+  history.replaceState(null, "", `${location.pathname}?new=1${location.hash}`);
+  renderBatchNavigation();
+}
+
+// A live batch's page offers New problem in this batch; a batch made with New batch also Rename, and
+// Delete batch while it holds no problems.
+function renderBatchActions() {
+  const batch = selectedBatch();
+  const live = Boolean(batch?.addProblems) && !batch.readOnly && !currentJob && !composingProblem;
+  show(ui.batchActions, live);
+  show(ui.renameBatch, live && Boolean(batch.named));
+  show(ui.deleteBatch, live && Boolean(batch.named) && !Number(batch.jobCount || 0));
+}
+
 function renderBatchNavigation() {
   const batch = selectedBatch();
   const browsing = !currentJob && !composingProblem;
   show(ui.batchesPanel, browsing && !currentBatch);
   show(ui.jobsPanel, browsing && Boolean(currentBatch));
   show(ui.batchNavigation, Boolean(currentJob || currentBatch || composingProblem));
-  show(ui.batchProblems, Boolean(currentBatch));
+  // A batch the New problem page was adding to that is no longer listed has no name or page to lead to.
+  show(ui.batchProblems, Boolean(currentBatch) && !composerBatchGone());
   ui.batchProblems.textContent = batch?.label || currentBatch;
-  ui.batchProblems.disabled = !currentJob;
-  ui.batchProblems.setAttribute("aria-current", currentJob ? "false" : "page");
-  show(ui.selectedBatchBadge, Boolean(batch?.current));
+  // From a job, or from the New problem page adding to it, the batch's crumb leads back to its page.
+  const below = Boolean(currentJob || composingProblem);
+  ui.batchProblems.disabled = !below;
+  ui.batchProblems.setAttribute("aria-current", below ? "false" : "page");
+  // The default batch says so in its name: only another server's current batch gets the badge.
+  show(ui.selectedBatchBadge, Boolean(batch?.current && !batch?.default));
   ui.selectedBatchBadge.textContent = "Current batch";
+  show(ui.newBatch, batchOptions().create);
+  show(ui.navNewBatchItem, batchOptions().create);
+  renderBatchActions();
+  renderComposerBatch();
   show(ui.batchReadOnlyNotice, Boolean(batch?.readOnly || state.readOnly));
   ui.home.textContent = currentBatch ? "Back to problems" : "All batches";
   ui.reviewHome.textContent = ui.home.textContent;
@@ -357,6 +452,10 @@ function renderBatchNavigation() {
 function renderBatches(batches) {
   batchCatalog = batches;
   renderAttention(batches);
+  // Why the server cannot read its list of batches, above the list (their problems are in the default batch).
+  const problem = batchOptions().problem;
+  if (ui.batchesProblem.textContent !== problem) ui.batchesProblem.textContent = problem;
+  show(ui.batchesProblem, Boolean(problem));
   const signature = JSON.stringify(batches);
   if (ui.batchesList.dataset.signature === signature) {
     renderBatchNavigation();
@@ -381,7 +480,8 @@ function renderBatches(batches) {
     top.className = "batch-card-top";
     mark.className = "batch-folder-mark"; mark.textContent = "▤"; mark.setAttribute("aria-hidden", "true");
     top.append(mark);
-    if (batch.current || batch.readOnly) {
+    // The default batch says so in its name: only another server's current batch and saved batches get a badge.
+    if ((batch.current && !batch.default) || batch.readOnly) {
       const badge = document.createElement("span");
       badge.className = `batch-badge${batch.current ? "" : " archive"}`;
       badge.textContent = batch.current ? "Current batch" : "Previous batch · read-only";
@@ -396,12 +496,12 @@ function renderBatches(batches) {
     const progress = document.createElement("p"); progress.className = "batch-progress";
     // Work that needs the user comes first; transient phases count as running.
     // Queued jobs are prepared jobs that wait for a running slot. Jobs stopped at their time limit
-    // ("limit") are counted apart from paused ones. Finished jobs count as complete ("done": a successful
-    // outcome) or incomplete, as the batch page's Complete and Incomplete filters do.
+    // ("limit") or by you ("stopped") are counted apart from paused ones. Finished jobs count as complete
+    // ("done": a successful outcome) or incomplete, as the batch page's Complete and Incomplete filters do.
     const counts = batch.counts || {}, queued = Number(batch.queued || 0);
     for (const [key, label] of [["reviewed", "awaiting approval"], ["prepared", "ready to start"],
-      ["queued", "queued"], ["paused", "paused"], ["limit", "time limit reached"], ["running", "running"],
-      ["done", "complete"], ["incomplete", "incomplete"]]) {
+      ["queued", "queued"], ["paused", "paused"], ["limit", "time limit reached"], ["stopped", "stopped"],
+      ["running", "running"], ["done", "complete"], ["incomplete", "incomplete"]]) {
       const value = key === "queued" ? queued : Number(counts[key] || 0) - (key === "prepared" ? queued : 0)
         + (key === "running" ? Number(counts.reviewing || 0) + Number(counts.pausing || 0) + Number(counts.stopping || 0) : 0);
       if (!value) continue;
@@ -411,7 +511,8 @@ function renderBatches(batches) {
     const time = document.createElement("span"), open = document.createElement("span");
     time.className = "batch-card-time";
     time.textContent = batch.lastActivityAt ? `Last activity ${localDateTime(batch.lastActivityAt)}`
-      : batch.startedAt ? `Started ${localDateTime(batch.startedAt)}` : "Saved research workspace";
+      : batch.startedAt ? `Started ${localDateTime(batch.startedAt)}`
+      : batch.createdAt ? `Created ${localDateTime(batch.createdAt)}` : "Saved research workspace";
     open.className = "batch-card-open"; open.textContent = "Open problems →";
     link.append(top, copy, progress, time, open); item.append(link); ui.batchesList.append(item);
   }
@@ -432,7 +533,11 @@ function renderAttention(batches) {
     const link = document.createElement("a"), text = document.createElement("span");
     row.className = `attention-item ${item.kind}`;
     title.textContent = item.title;
-    link.href = jobUrl(item.runId);
+    // The job's own batch (the list gathers every batch's jobs), never the page's: the link, opened in a new
+    // tab or copied, finds the job. Without one (an older server) the job's page fills it in.
+    const query = new URLSearchParams({ job: item.runId });
+    if (item.batchId) query.set("batch", item.batchId);
+    link.href = `${location.pathname}?${query}`;
     link.textContent = item.job || item.runId;
     link.onclick = (event) => {
       if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -480,15 +585,90 @@ async function rerunWithStatement(statement) {
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
   composerSeed = { statement, settings };
-  await newProblem();
+  // The new problem joins this job's batch while that batch takes problems, else the default batch.
+  await newProblem(typeof selectedBatch === "function" && !state.readOnly && selectedBatch()?.addProblems
+    ? currentBatch : "");
 }
 
-async function newProblem() {
-  currentBatch = ""; currentJob = ""; composingProblem = true;
-  history.pushState(null, "", `${location.pathname}?new=1`);
+// The New problem page, adding to ``batchId``: a batch whose jobs this server runs ("" is the default batch).
+async function newProblem(batchId = "") {
+  currentBatch = batchId; currentJob = ""; composingProblem = true;
+  history.pushState(null, "", `${location.pathname}?new=1${batchId ? `&batch=${encodeURIComponent(batchId)}` : ""}`);
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false); renderBatchNavigation();
   await refresh();
+}
+
+// New batch and Rename share one dialog: a name, which a new batch may leave empty. What the dialog acts on
+// is fixed when it opens: the batch it renames, and whether a new batch is made from the New problem page
+// (whose problem then joins it, with what was written there).
+let batchDialogFor = { mode: "create", batch: "", composing: false };
+function openBatchDialog(mode) {
+  const batch = selectedBatch(), rename = mode === "rename";
+  if (rename && !batch?.named) return;
+  batchDialogFor = { mode, batch: rename ? batch.id : "", composing: composingProblem && !currentJob };
+  ui.batchDialogTitle.textContent = rename ? "Rename batch" : "New batch";
+  ui.batchNameLabel.replaceChildren("Name", ...(rename ? [] : [" ", Object.assign(document.createElement("span"),
+    { textContent: "(optional)" })]));
+  ui.batchNameInput.value = rename ? batch.label || "" : "";
+  show(ui.batchNameHelp, !rename);
+  // Without the help line, the field is described by nothing else.
+  if (rename) ui.batchNameInput.removeAttribute("aria-describedby");
+  else ui.batchNameInput.setAttribute("aria-describedby", "batchNameHelp");
+  ui.saveBatchDialog.textContent = rename ? "Rename" : "Create batch";
+  ui.saveBatchDialog.disabled = false;
+  show(ui.batchDialogError, false);
+  if (!ui.batchDialog.open) ui.batchDialog.showModal();
+  ui.batchNameInput.focus();
+  if (rename) ui.batchNameInput.select();
+}
+
+async function saveBatchDialog(event) {
+  event.preventDefault();
+  if (ui.saveBatchDialog.disabled) return;
+  const { mode, batch: id, composing } = batchDialogFor, rename = mode === "rename";
+  ui.saveBatchDialog.disabled = true;
+  show(ui.batchDialogError, false);
+  try {
+    const result = rename
+      ? await request(`/batches/rename?batch=${encodeURIComponent(id)}`, { name: ui.batchNameInput.value })
+      : await request("/batches", { name: ui.batchNameInput.value });
+    batchCatalog = adoptBatchCatalog(result);
+    ui.batchDialog.close();
+    if (rename) {
+      // The renamed batch shows its new name (its page reads its list again).
+      if (!currentJob && !composingProblem && currentBatch === id) await loadJobs();
+      else renderBatchNavigation();
+    } else if (composing && composingProblem && !currentJob) {
+      // Made from the New problem page: the problem being written joins the new batch, and the page stays,
+      // with the statement, the settings and the related works listed there.
+      currentBatch = result.batch.id;
+      history.replaceState(null, "", `${location.pathname}?new=1&batch=${encodeURIComponent(currentBatch)}${location.hash}`);
+      renderBatchNavigation();
+    } else {
+      // Elsewhere the new batch opens at once, ready for its first problem.
+      await selectBatch(result.batch.id);
+    }
+  } catch (error) {
+    // The dialog stays open with what was typed, and says why.
+    ui.batchDialogError.textContent = error.message;
+    show(ui.batchDialogError, true);
+  } finally {
+    ui.saveBatchDialog.disabled = false;
+  }
+}
+
+// Delete batch: only an empty batch made with New batch; the page then returns to the Overview.
+async function deleteCurrentBatch() {
+  const batch = selectedBatch();
+  if (!batch?.named || !confirm(`Delete the empty batch “${batch.label || batch.id}”?`)) return;
+  try {
+    batchCatalog = adoptBatchCatalog(await request(`/batches/delete?batch=${encodeURIComponent(batch.id)}`, {}));
+    await selectBatch("");
+  } catch (error) {
+    ui.notice.textContent = error.message;
+    show(ui.notice, true);
+  }
 }
 
 function adoptJob(next) {
@@ -514,7 +694,10 @@ function clearJobView() {
   ui.jobRecovery.replaceChildren();
   ui.jobRecovery.dataset.key = "";
   show(ui.jobRecovery, false);
+  // The author's question form belongs to the job it was shown for.
+  if (typeof parkAuthorQuestionForm === "function" && ui.authorQuestionForm) parkAuthorQuestionForm();
   show(ui.batchStatus, false); // a folder-run result belongs to the view it was started from
+  if (ui.stoppedNote) show(ui.stoppedNote, false); // so does the note of a statement review you stopped
   // Related works listed in the composer belong to the problem being written there.
   if (typeof clearComposerRelatedWorks === "function") clearComposerRelatedWorks(true);
 }
@@ -552,8 +735,9 @@ async function deleteJob(job, title) {
   card?.remove();
   ui.jobsList.dataset.signature = "";
   const remaining = ui.jobsList.children.length;
-  // The last problem took its batch with it: return to All batches, not to a missing batch.
-  if (!remaining) return selectBatch("");
+  // The last problem took its batch with it: return to All batches, not to a missing batch. A batch made
+  // with New batch stays, empty, until it is deleted itself.
+  if (!remaining && !selectedBatch()?.named) return selectBatch("");
   ui.jobsCount.textContent = `${remaining} ${remaining === 1 ? "problem" : "problems"}`;
   loadJobs();
 }
@@ -674,14 +858,15 @@ function renderJobs(jobs) {
   ui.jobsList.replaceChildren();
   const tally = {};
   for (const job of jobs) {
-    // A job stopped at its time limit is counted apart from paused ones (see jobTone).
+    // Jobs stopped at their time limit or by you are counted apart from paused and finished ones (see jobTone).
+    const tone = jobTone(job);
     const key = ["reviewing", "pausing", "stopping"].includes(job.phase) ? "running"
-      : job.phase === "prepared" && job.launchQueued ? "queued" : timeLimitStopped(job) ? "limit" : job.phase;
+      : job.phase === "prepared" && job.launchQueued ? "queued" : ["limit", "stopped"].includes(tone) ? tone : job.phase;
     tally[key] = (tally[key] || 0) + 1;
   }
   ui.jobsCount.textContent = [`${jobs.length} ${jobs.length === 1 ? "problem" : "problems"}`,
     ...[["reviewed", "awaiting approval"], ["prepared", "ready to start"], ["queued", "queued"], ["paused", "paused"],
-      ["limit", "time limit reached"], ["running", "running"], ["done", "finished"]]
+      ["limit", "time limit reached"], ["stopped", "stopped"], ["running", "running"], ["done", "finished"]]
       .filter(([key]) => tally[key]).map(([key, label]) => `${tally[key]} ${label}`)].join(" · ");
   const stoppedStages = { review: "statement review", solve: "proof author", repair: "proof author",
     critic: "critic", final: "LaTeX editor", failure: "failure summary" };
@@ -706,8 +891,9 @@ function renderJobs(jobs) {
     status.className = `job-status ${job.phase} tone-${tone}`;
     const labels = {
       reviewing: "Checking statement", reviewed: "Waiting for approval",
-      running: "Running", stopping: "Stopping", pausing: "Pausing", done: outcome,
-      paused: timeLimitStopped(job) ? "Time limit reached" : "Paused",
+      running: "Running", stopping: "Stopping", pausing: stoppedByUser(job) ? "Stopping" : "Pausing", done: outcome,
+      paused: timeLimitStopped(job) ? "Time limit reached"
+        : stoppedByUser(job) ? `Stopped at ${STEP_WORDS[job.activeNode] || "saved step"}` : "Paused",
       prepared: queued ? "Queued" : "Ready to start",
     };
     // A job that is stopping says so, as its page does, until it has stopped.
@@ -739,8 +925,9 @@ function renderJobs(jobs) {
     copy.append(times);
     if (job.phase === "running" && job.stageLabel && !job.launchHold) status.textContent = `Running · ${job.stageLabel}`;
     if (attention) status.textContent += ` · ${attention.title}`;
-    // A stop at the time limit is no failure: its status says it, without the checkpoint's error line.
-    if (job.error && !job.manuallyStopped && !timeLimitStopped(job) && job.error !== attention?.text) {
+    // A stop at the time limit or by you is no failure: its status says it, without the checkpoint's error line.
+    if (job.error && !job.manuallyStopped && !timeLimitStopped(job) && !stoppedByUser(job)
+        && job.error !== attention?.text) {
       const reason = document.createElement("small");
       reason.className = "job-error";
       reason.textContent = job.error;
@@ -875,7 +1062,7 @@ async function loadJobs() {
   try {
     const catalog = await request("/batches");
     if (currentJob || composingProblem || batch !== currentBatch) return;
-    renderBatches(catalog.batches || []);
+    renderBatches(adoptBatchCatalog(catalog));
     if (batch) {
       if (!selectedBatch()) throw new Error("This batch is no longer available. Return to All batches.");
       const result = await request(jobPath("/jobs"));
@@ -988,7 +1175,7 @@ function modelProvider(model) {
     : /^claude-/.test(model) ? "claude" : "";
 }
 
-// Web cutoff timestamps run only on native Codex CLI models: not on Claude CLI models and not
+// Web cutoff timestamps run only on native Codex CLI models: not on Claude Code models and not
 // on API models, even OpenAI-format ones that the Codex CLI runs.
 function cutoffBlockedRoles() {
   const stages = selectedWorkflowStages();
@@ -1007,7 +1194,7 @@ function cutoffModelMessage(roles = cutoffBlockedRoles()) {
 
 // Under each role menu: the CLI that runs the chosen model, and an API model's format, the program
 // that runs it (fixed by the format; nothing checks that it is installed) and host. With a web cutoff
-// the proof roles' Claude CLI and API groups are disabled, and a chosen model that cannot run there
+// the proof roles' Claude Code and API groups are disabled, and a chosen model that cannot run there
 // is flagged (the choice itself is never changed).
 function renderModelChoices() {
   const cutoff = selectedRetrievalMode() === "historical";
@@ -1025,7 +1212,7 @@ function renderModelChoices() {
     for (const group of select.querySelectorAll?.("optgroup") || []) {
       group.disabled = restricted && group.dataset.provider !== "codex";
     }
-    let text = { codex: "Codex CLI", claude: "Claude CLI", api: "API" }[provider] || "Unknown model";
+    let text = { codex: "Codex CLI", claude: "Claude Code", api: "API" }[provider] || "Unknown model";
     let warning = restricted && provider !== "codex";
     if (provider === "codex" && catalog && !row) text += " · older model";
     if (provider === "api" && !row) {
@@ -1708,8 +1895,9 @@ function completedRunLabel(job) {
 
 // What a finished job produced, from its recorded stages and result, in one place for the batch list
 // (its status, filter and counts), the job header, the now-card and the workflow rail: its label; its
-// tone ("done" for every successful outcome, counted under Complete, else "failed" or "stopped", counted
-// under Incomplete); the sentence under the job title, which says what was made and what was skipped;
+// tone ("done" for every successful outcome, counted under Complete; "failed", counted under Incomplete;
+// or "stopped", counted with the other stopped jobs); the sentence under the job title, which says what
+// was made and what was skipped;
 // where the run ended (a workflow rail node) and why, in plain words.
 function completedRunOutcome(job) {
   // Older jobs did not record their stages: every stage ran.
@@ -1776,12 +1964,14 @@ function completedRunOutcome(job) {
 
 // One status classification for every list, filter and count and for the job page: "running",
 // "paused" (by you, a restart, an interruption, a failure, ...), "limit" (stopped at the author time
-// limit: "Time limit reached", never counted as paused; raising the limit lets it continue), "queued"
-// (waiting for a running slot, not for you), "waiting" (for you), or a finished job's tone (see
-// completedRunOutcome).
+// limit: "Time limit reached", never counted as paused; raising the limit lets it continue), "stopped"
+// (stopped by you, counted apart like "limit": at a step Continue picks up, at its statement review, or
+// by an earlier version), "queued" (waiting for a running slot, not for you), "waiting" (for you), or a
+// finished job's tone (see completedRunOutcome).
 function jobTone(job) {
   if (["reviewing", "running", "stopping", "pausing"].includes(job.phase)) return "running";
-  if (job.phase === "paused") return timeLimitStopped(job) ? "limit" : "paused";
+  if (job.phase === "paused") return timeLimitStopped(job) ? "limit" : stoppedByUser(job) ? "stopped" : "paused";
+  if (job.manuallyStopped && ["input", "reviewed", "done"].includes(job.phase)) return "stopped";
   if (job.phase === "prepared" && job.launchQueued) return "queued";
   if (["reviewed", "prepared"].includes(job.phase)) return "waiting";
   if (job.phase !== "done") return job.manuallyStopped ? "stopped" : "failed";
@@ -1811,6 +2001,18 @@ function retryWaitText(retry) {
 function timeLimitStopped(job) {
   return job?.phase === "paused" && job.pauseCause === "time-limit";
 }
+
+// A job you stopped that continues where it stopped (its checkpoint's pause cause "stopped"): it reads
+// "Stopped", with a square, never Paused or Time limit reached; while the author still ends its current
+// step it is stopping (see jobTone).
+function stoppedByUser(job) {
+  return ["paused", "pausing"].includes(job?.phase) && job.pauseCause === "stopped";
+}
+
+// The workflow steps in words, as the lists and the job page name where a job stopped (the server's STEP_WORDS).
+const STEP_WORDS = { statement_reviewer: "statement review", author: "proof author", critic: "critic",
+  convention: "convention critic", latex_editor: "LaTeX editor", latex_compile: "PDF compilation",
+  latex_repair: "PDF compilation", failure_summary: "failure summary" };
 
 // Whether the stopped author's automatic progress summary at the time limit is queued or being written.
 function limitSummaryWriting(job) {
@@ -1965,7 +2167,7 @@ function roleModelSource(role, model) {
 
 // One role's two Run settings lines: its model and effort, then where it runs. A built-in model
 // runs through its CLI with this computer's login; an API model through the program its format
-// needs (OpenAI format the Codex CLI, Anthropic format the Claude CLI), each program under the one
+// needs (OpenAI format the Codex CLI, Anthropic format Claude Code), each program under the one
 // name its source menu gives it. A removed or unreadable connection shows what the job recorded.
 // One edited since the job started also names the host, format and model it started with, which a
 // model call already under way keeps using (the job's next model call uses the edited connection);
@@ -1975,8 +2177,10 @@ function roleModelText(role, model, effort) {
   // A saved job or a script may still say ultra, which is no longer offered and runs as max.
   const level = effort === "ultra" ? "max (Ultra is no longer offered)" : effort;
   const formatName = (format) => format === "anthropic" ? "Anthropic format" : "OpenAI format";
-  // The source menus' names (the server's providers.PROVIDER_LABELS), for an older controller.
-  const cliName = { codex: "Codex CLI", claude: "Claude CLI" };
+  // The source menus' names (the server's providers.PROVIDER_LABELS), for an older controller. An earlier
+  // controller still calls Claude Code "Claude CLI": the panel names it as the menus do now.
+  const cliName = { codex: "Codex CLI", claude: "Claude Code" };
+  const named = (name) => name === "Claude CLI" || name === "the Claude CLI" ? cliName.claude : name;
   const edited = (was) => {
     if (was.host === source.host && was.format === source.format && was.wireModel === source.wireModel) {
       return "edited since this job started";
@@ -1988,7 +2192,7 @@ function roleModelText(role, model, effort) {
   let where;
   if (source.kind === "codex" || source.kind === "claude") {
     const codex = source.kind === "codex";
-    where = `${source.source || cliName[source.kind]} · this computer's ${codex ? "Codex" : "Claude"} login`
+    where = `${named(source.source) || cliName[source.kind]} · this computer's ${codex ? "Codex" : "Claude"} login`
       + (source.older ? " · older model" : "");
   } else if (source.kind === "api") {
     const unreadable = source.reason || "connection list cannot be read now";
@@ -1996,7 +2200,8 @@ function roleModelText(role, model, effort) {
       where = source.configured === false ? "API connection not configured"
         : source.configured === null ? `API connection · ${unreadable}` : "API connection";
     } else {
-      const program = source.runsThroughLabel || `the ${cliName[source.format === "anthropic" ? "claude" : "codex"]}`;
+      const program = named(source.runsThroughLabel)
+        || (source.format === "anthropic" ? cliName.claude : `the ${cliName.codex}`);
       where = [source.connection ? `API connection “${source.connection}”` : "API connection",
         source.configured === false ? "not configured now; as this job recorded it"
           : source.configured === null ? `${unreadable}; as this job recorded it`
@@ -2065,26 +2270,33 @@ function renderRunOverview() {
   ui.runProblemTitle.title = title;
   const reviewCycles = criticReviewModel().cycles;
   const latestCycle = reviewCycles.at(-1);
-  // A job stopped at its time limit is not paused: it says "time limit reached" (see jobTone).
+  // A job stopped at its time limit or by you is not paused: it says so (see jobTone).
   const limitStop = timeLimitStopped(state);
-  ui.runStage.textContent = state.phase === "reviewed" ? "Waiting for approval"
+  const userStop = stoppedByUser(state) && state.phase === "paused";
+  const stopping = stoppedByUser(state) && state.phase === "pausing";
+  // A revision of the statement review you stopped is back at the earlier review: stopped, not waiting.
+  const reviewStopped = state.phase === "reviewed" && Boolean(state.manuallyStopped);
+  ui.runStage.textContent = reviewStopped
+    ? `${state.workflow?.nodes?.statement_reviewer?.label || "Statement reviewer"} · stopped`
+    : state.phase === "reviewed" ? "Waiting for approval"
     : state.phase === "prepared" ? (state.launchHold ? "Awaiting review" : "Ready to start")
     : state.phase === "done" ? completedRunLabel(state)
     : `${state.workflow?.nodes?.[state.activeNode]?.label || state.stage || "Starting"}`
-      + (limitStop ? " · time limit reached" : ["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
+      + (limitStop ? " · time limit reached" : userStop ? " · stopped" : stopping ? " · stopping"
+        : ["paused", "pausing"].includes(state.phase) ? ` · ${state.phase}` : "")
       + (state.activeNode === "critic" && latestCycle ? ` · cycle ${reviewCycles.length} · round ${criticRoundNumber(latestCycle)}` : "");
   const seconds = runElapsedSeconds(), hours = Number(state.thinkingHours ?? 0), limit = hours * 3600;
   ui.runActiveTime.textContent = durationText(seconds);
   ui.runBudget.textContent = hours === 0 ? "Unlimited" : state.timeLimitExhausted ? `${hours}h · used up`
     : `${hours}h · ${durationText(Math.max(0, limit - seconds))} left`;
-  const halted = limitStop ? "Stopped at the time limit" : "Paused";
+  const halted = limitStop ? "Stopped at the time limit" : userStop ? "Stopped" : "Paused";
   ui.runHealth.textContent = state.processAlive == null && state.workerActive == null ? "Unknown · telemetry unavailable"
     // The automatic progress summary at the time limit, queued or being written.
     : limitStop && limitSummaryWriting(state) && !state.readOnly ? "Time limit reached · writing progress summary"
     : state.processAlive ? (state.phase === "paused" ? `${halted} · author replying` : "Running")
     : state.workerActive ? "Starting / closing"
     : state.runningElsewhere ? "Running in another process"
-    : state.phase === "paused" ? `${halted} · saved conversation`
+    : state.phase === "paused" ? `${halted} · ${userStop && state.activeNode !== "author" ? "saved step" : "saved conversation"}`
     : ["reviewed", "prepared"].includes(state.phase) ? "Waiting for you" : "No active process";
   const nextSteps = {
     review: "After review, approve the checked statement to continue the selected stages.",
@@ -2099,7 +2311,8 @@ function renderRunOverview() {
       : "The critic starts independent critics on the supplied work and reports any unresolved errors. The Author stage is off.",
     final: "The accepted proof is being formatted and compiled. Source and PDF downloads appear when compilation succeeds.",
   };
-  let nextStep = state.phase === "reviewed" ? "Statement review finished. Approve the statement to continue the selected stages."
+  let nextStep = reviewStopped ? "The earlier review is shown. Approve its statement to continue the selected stages."
+    : state.phase === "reviewed" ? "Statement review finished. Approve the statement to continue the selected stages."
     : state.phase === "paused" ? (state.readOnly ? "No final answer yet. This saved job is read-only."
       : "No final answer yet. The work so far is saved.")
     : state.phase === "prepared" ? (state.launchHold || "Start this prepared workspace to begin proof search.")
@@ -3074,25 +3287,32 @@ function renderWorkflow() {
     const row = document.createElement("li");
     const unselected = offStage(name);
     const current = activeStep === name;
-    const paused = current && ["paused", "pausing"].includes(state.phase);
+    // A stop by you is no pause either: its step gets a square; while the author ends its step it still works.
+    // A revision of the statement review you stopped waits at its step the same way.
+    const userStopped = current && (stoppedByUser(state) && state.phase === "paused"
+      || state.phase === "reviewed" && Boolean(state.manuallyStopped));
+    const stopping = current && stoppedByUser(state) && state.phase === "pausing";
+    const paused = current && !userStopped && !stopping && ["paused", "pausing"].includes(state.phase);
     // A stop at the time limit is no pause: its step gets the clock (see jobTone).
     const limitStop = current && timeLimitStopped(state);
-    const active = ["running", "reviewing", "stopping"].includes(state.phase) && current;
+    const active = (["running", "reviewing", "stopping"].includes(state.phase) || stopping) && current;
     const failed = state.phase === "done" && current
       && (state.error || name === "failure_summary");
     const settled = name === "critic"
       ? verdict === "reject" ? "rejected" : criticApproved ? "complete"
         : latestCritic || seen.has(name) ? "reviewed" : ""
       : seen.has(name) ? "complete" : "";
-    const status = overrides.status ?? (limitStop ? "limit" : paused ? "paused" : active ? "active" : failed ? "failed"
+    const status = overrides.status ?? (limitStop ? "limit" : userStopped ? "stopped" : paused ? "paused"
+      : active ? "active" : failed ? "failed"
       : (unselected || name === "convention" && conventionPredatesJob) && !seen.has(name) ? "disabled" : settled);
     row.className = `workflow-node ${status}`;
     row.dataset.node = name;
     if (status === "active") row.setAttribute("aria-current", "step");
     const dot = document.createElement("span");
     dot.className = "node-dot";
-    // The time limit's clock is drawn by the stylesheet.
-    dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ" : status === "limit" ? ""
+    // The time limit's clock and a stop's square are drawn by the stylesheet.
+    dot.textContent = ["failed", "warning"].includes(status) ? "!" : status === "paused" ? "Ⅱ"
+      : ["limit", "stopped"].includes(status) ? ""
       : status === "rejected" ? "×" : status === "reviewed" ? "·"
       : status === "complete" ? "✓" : status === "disabled" ? "–" : number;
     const copy = document.createElement("div");
@@ -3125,9 +3345,9 @@ function renderWorkflow() {
     };
     description.textContent = descriptions[name] || item.description;
     copy.append(description);
-    // The position mark says "Paused here" on the paused step ("Stopped here" at the time limit).
-    let noteText = overrides.note || (paused && position?.node !== name
-      ? (limitStop ? "Stopped at the time limit" : "Paused") : "");
+    // The position mark says "Paused here" on the paused step ("Stopped here" at the time limit or by you).
+    let noteText = overrides.note || ((paused || userStopped) && position?.node !== name
+      ? (limitStop ? "Stopped at the time limit" : userStopped ? "Stopped by you" : "Paused") : "");
     if (name === "author" && authorRepairing && current
         && ["running", "pausing", "paused", "stopping"].includes(state.phase)) {
       noteText = noteText ? `${noteText} · repairing critic objections` : "Repairing critic objections";
@@ -3138,7 +3358,7 @@ function renderWorkflow() {
       const latestConvention = trace.findLast(entry => entry.kind === "convention_result" && entry.root !== false);
       const warning = state.conventionWarning;
       const warned = Boolean(warning && typeof warning === "object" && !warning.dismissed && warning.loophole);
-      noteText = active || paused ? "" : failed ? "Check interrupted"
+      noteText = active || paused || userStopped ? "" : failed ? "Check interrupted"
         : latestConvention?.verdict === "loophole" ? (warned ? "May exploit a loophole: see the warning above"
           : `May exploit a loophole${warning?.dismissed ? " (warning ignored)" : ""}; see the critic review history`)
           : latestConvention?.verdict === "faithful" ? "Faithful to the statement"
@@ -3147,7 +3367,7 @@ function renderWorkflow() {
     // A paused critic step names the round that stays open, not the verdict of an earlier one.
     if (name === "critic" && !noteText && !unselected) {
       const round = currentCycle ? ` · cycle ${cycles.length}, round ${criticRoundNumber(currentCycle)}` : "";
-      noteText = active ? `Reviewing candidate${round}` : paused ? `Candidate under review${round}`
+      noteText = active ? `Reviewing candidate${round}` : paused || userStopped ? `Candidate under review${round}`
         : failed ? "Review interrupted"
         : criticApproved ? criticCycleOutcomeLabel(currentCycle || {})
           : verdict === "reject" ? "Candidate needs repair"
@@ -3312,13 +3532,16 @@ function workflowPosition(stages, authorRepairing = false) {
     return at(railNode(outcome.node, stages) || current, "ended", "Ended here", outcome.ended);
   }
   if (timeLimitStopped(state)) return at(current, "limit", "Stopped here", pauseCauseText());
+  if (stoppedByUser(state) && state.phase === "paused") return at(current, "stopped", "Stopped here", pauseCauseText());
   if (state.phase === "paused") return at(current, "paused", "Paused here", pauseCauseText());
   if (["reviewing", "running", "stopping", "pausing"].includes(state.phase)) {
     const node = current || (state.phase === "reviewing" ? "statement_reviewer" : "");
     return at(node, "now", "Now", workflowStepText(node, authorRepairing));
   }
   if (state.phase === "reviewed") {
-    return at("statement_reviewer", "waiting", "Waiting here", "Approve the checked statement to continue");
+    // A revision you stopped is back at the earlier review: stopped there, not waiting for approval.
+    return state.manuallyStopped ? at("statement_reviewer", "stopped", "Stopped here", "Stopped by you")
+      : at("statement_reviewer", "waiting", "Waiting here", "Approve the checked statement to continue");
   }
   if (state.phase === "prepared") {
     const first = current || [["review", "statement_reviewer"], ["author", "author"], ["critic", "critic"],
@@ -3332,7 +3555,10 @@ function workflowPosition(stages, authorRepairing = false) {
 // The step that works now, as the rail's "Now" mark names it.
 function workflowStepText(node, authorRepairing = false) {
   if (state.phase === "stopping") return "Stopping";
-  if (state.phase === "pausing") return "Pausing: the current turn ends and the conversation is saved";
+  if (state.phase === "pausing") {
+    return stoppedByUser(state) ? "Stopping: the author ends its current step and its conversation is saved"
+      : "Pausing: the current turn ends and the conversation is saved";
+  }
   const step = node === "statement_reviewer" ? "Checking the statement"
     : node === "author" ? (authorRepairing ? "Repairing critic objections" : "Working on the proof")
     : node === "critic" ? criticStepText()
@@ -3399,6 +3625,7 @@ function pauseCauseText() {
       + (state.readOnly ? "" : limitSummaryWriting(state) ? " · writing progress summary" : "; you can continue");
   }
   if (state.pauseCause === "user") return "Paused by you";
+  if (state.pauseCause === "stopped") return "Stopped by you";
   if (state.pauseCause === "interrupted") return `The run process ended part-way${retry}`;
   if (state.pauseCause === "restart") return `Paused when the server closed${retry}`;
   // A saved batch's job is read only: there is no Resume to offer.
@@ -3512,10 +3739,15 @@ function render(next) {
   // The job's own error is stated once, in the now-card. While the run panel is hidden
   // (a failed statement review returns to the composer) the notice states it instead.
   // Otherwise the notice keeps action feedback until the phase changes.
-  if (ui.run.hidden && state.error) {
+  // A statement review you stopped is no failure: a neutral note says how it runs again (the server's text).
+  const reviewStopped = Boolean(state.manuallyStopped) && ["input", "reviewed"].includes(phase);
+  if (ui.run.hidden && state.error && !reviewStopped) {
     if (ui.notice.textContent !== state.error) ui.notice.textContent = state.error;
     show(ui.notice, true);
   } else if (phase !== previousPhase) show(ui.notice, false);
+  const stopNote = reviewStopped ? state.error || "You stopped the statement review." : "";
+  if (ui.stoppedNote.textContent !== stopNote) ui.stoppedNote.textContent = stopNote;
+  show(ui.stoppedNote, Boolean(stopNote));
   // Older routine events left the live window (the server's or this page's own): say so, and
   // offer the job's complete transcript.jsonl.
   const truncated = Boolean(state.traceTruncated || state.traceNotice || state.traceTrimmed);
@@ -3525,27 +3757,12 @@ function render(next) {
   show(ui.downloadTranscript, truncated);
 
   if (phase === "input" && previousPhase !== "input") {
-    const rounds = state.workflow?.settings?.critic_rounds || {};
-    const critics = state.workflow?.settings?.critic_count || {};
-    const hours = state.workflow?.settings?.thinking_hours || {};
     // "Rerun with suggested statement" (see rerunWithStatement): that statement, with the job's settings.
     const seed = typeof composerSeed === "undefined" ? null : composerSeed;
     if (seed) composerSeed = null;
     const source = seed ? { ...state, ...seed.settings } : state;
     ui.problem.value = seed ? seed.statement : state.originalContent || state.draft || state.latexInput || "";
-    syncModelMenus();
-    setChoice(ui.reviewModel, source.reviewModel || "gpt-6.1-sol");
-    setChoice(ui.authorModel, source.authorModel || "gpt-6.1-sol");
-    setChoice(ui.criticModel, source.criticModel || "gpt-6.1-sol");
-    setChoice(ui.writerModel, source.writerModel || "gpt-6.1-sol");
-    ui.reviewEffort.value = source.reviewEffort || "max";
-    ui.authorEffort.value = source.authorEffort || source.reasoningEffort || "max";
-    ui.criticEffort.value = source.criticEffort || source.reasoningEffort || "max";
-    ui.writerEffort.value = source.writerEffort || source.reasoningEffort || "max";
-    ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
-    ui.speedMode.value = source.speedMode || "standard";
-    ui.reasoningSummary.value = source.reasoningSummary || "concise";
-    restoreRetrievalSettings(source);
+    applyComposerSettings(source);
     syncPrompts(source);
     if (seed) {
       // The job's own prompts go with the new problem as edits of the defaults.
@@ -3554,23 +3771,11 @@ function render(next) {
         if (prompt && prompt.trim() !== (defaults[name] || "").trim()) promptOverrides[name] = prompt.trim();
       }
     }
-    updateModelSummary();
-    ui.criticRounds.value = source.criticRounds || 2;
-    ui.criticRounds.min = rounds.minimum || 1;
-    ui.criticRounds.max = rounds.maximum || 100;
-    ui.criticCount.value = source.criticCount || 3;
-    ui.criticCount.min = critics.minimum || 1;
-    ui.criticCount.max = critics.maximum || 10;
-    const subagents = state.workflow?.settings?.author_subagents || {};
-    ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 0;
-    ui.authorSubagents.min = subagents.minimum ?? 0;
-    ui.authorSubagents.max = subagents.maximum ?? 10;
-    ui.thinkingHours.value = source.thinkingHours ?? 0;
-    ui.thinkingHours.min = hours.minimum ?? 0;
-    // No maximum: any positive number of hours is a valid limit.
-    ui.thinkingHours.max = hours.maximum ?? "";
-
-    restoreWorkflowStages(source);
+    // Saved settings (see presetsFormOpened): a fresh form takes the default, when one is saved; a rerun
+    // pre-fill and a job sent back to the form keep their own settings.
+    if (typeof presetsFormOpened === "function") {
+      presetsFormOpened(!seed && typeof composingProblem !== "undefined" && composingProblem && !currentJob);
+    }
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
     syncModelMenus();
@@ -3620,31 +3825,41 @@ function render(next) {
   // A stop at the time limit is not a pause: it says so everywhere, and a higher limit lets the author
   // continue (see jobTone).
   const timeLimitPause = timeLimitStopped(state);
+  // Nor is a stop by you: it continues where it stopped; while the author ends its current step it is stopping.
+  const userStop = stoppedByUser(state) && phase === "paused";
+  const stopping = stoppedByUser(state) && phase === "pausing";
   ui.liveDot.classList.toggle("active", working);
-  ui.globalStatus.textContent = phase === "input" ? "Ready"
+  ui.globalStatus.textContent = phase === "input" ? (state.manuallyStopped ? "Stopped" : "Ready")
     : phase === "prepared" ? "Ready to start" : timeLimitPause ? "Time limit reached"
+    : userStop ? "Stopped" : stopping ? "Stopping"
     : phase === "paused" ? "Paused" : phase === "pausing" ? "Pausing"
-    : phase === "reviewed" ? "Waiting for approval"
+    : phase === "reviewed" ? (reviewStopped ? "Stopped" : "Waiting for approval")
       : phase === "stopping" ? "Stopping"
         : done ? completedRunLabel(state) : (node.label || "Model is working");
   ui.runLabel.textContent = phase === "prepared" ? "PREPARED RUN" : timeLimitPause ? "TIME LIMIT REACHED"
+    : userStop ? "STOPPED" : stopping ? "STOPPING"
     : phase === "paused" ? "RUN PAUSED"
     : done ? completedRunLabel(state).toUpperCase() : (node.short_label || "MODEL");
   // A short status title; the error, when there is one, is the description below it.
   ui.runTitle.textContent = phase === "reviewing" ? "Checking the statement…"
     : phase === "prepared" ? "Prepared research workspace"
+    : userStop ? "Stopped" : stopping ? "Stopping…"
     : phase === "paused" ? (timeLimitPause ? "Time limit reached" : "Ready to resume") : phase === "pausing" ? "Pausing…"
     : phase === "stopping" ? "Stopping safely…"
       : done ? completedRunLabel(state) : (node.label || "Working…");
+  const replyBusy = Boolean(state.conversation?.busy);
+  const chatMode = chatControl().mode;
   // The header already says what happens next; the now-card adds only the error or what its buttons need.
   ui.runDescription.textContent = timeLimitPause ? timeLimitDescription()
+    : userStop ? userStopDescription(["paused", "busy"].includes(chatMode))
+    : stopping ? "Stopping the proof author: it may finish its current step for up to 30 seconds, then its "
+      + "conversation is saved. Stop now stops it at once."
     : (done && state.manuallyStopped ? "You stopped this job." : state.error)
     || (phase === "prepared" ? (state.launchHold || "Review the prepared statement and settings, then start a fresh author session in this workspace.")
       : phase === "paused" ? "Resume reopens the saved author conversation in this same run folder. You can update your CLI login or API model settings before resuming."
       : phase === "pausing" ? "Interrupting the current turn and preserving the saved conversation. Wait for Paused before closing the UI."
       : "");
-  const replyBusy = Boolean(state.conversation?.busy);
-  if (phase === "paused" && !timeLimitPause && state.conversation?.available && !state.readOnly && !replyBusy) {
+  if (phase === "paused" && !timeLimitPause && !userStop && chatMode === "paused" && !state.readOnly) {
     ui.runDescription.textContent += " You can also ask the author questions below.";
   }
   if (phase === "paused" && state.autoResumeAt) {
@@ -3670,16 +3885,8 @@ function render(next) {
   // or LaTeX steps run it applies at the author's next step, and while paused at Resume.
   const canSetAuthorLimit = !state.readOnly && state.workflowStages?.author !== false
     && ["reviewing", "prepared", "running", "pausing", "paused"].includes(phase);
-  // While paused the box asks the author in its saved conversation; one reply is written at a time.
-  const conversation = state.conversation || {};
-  const replying = phase === "paused" && Boolean(conversation.busy);
-  const canTalk = phase === "paused" && Boolean(conversation.available) && !state.readOnly;
-
-  show(ui.authorSteerControl, authorRunning || canTalk);
-  renderAuthorSteerMode(canTalk && (timeLimitPause ? "limit" : "paused"));
-  ui.sendAuthorSteer.disabled = !(authorRunning || (canTalk && !replying));
-  show(ui.requestSummary, canTalk && !replying);
-  show(ui.stopReply, replying && !state.readOnly);
+  // While paused one reply of the author is written at a time (the chat, see renderAuthorConversation).
+  const replying = phase === "paused" && replyBusy;
   show(ui.authorTimeLimitControl, canSetAuthorLimit);
   ui.authorLimitSummary.textContent = authorLimit === 0 ? "No time limit" : `Time limit: ${limitHoursText(authorLimit)}`;
   ui.authorLimitHours.max = maximumAuthorLimit === null ? "" : String(maximumAuthorLimit);
@@ -3704,9 +3911,9 @@ function render(next) {
   ui.pause.title = retryPending ? "Cancel automatic retries"
     : "Pause the author";
   show(ui.resume, phase === "paused" || phase === "prepared");
-  // After a stop at the time limit the work continues (raising the limit first); a pause resumes.
+  // After a stop at the time limit (raising the limit first) or by you the work continues; a pause resumes.
   ui.resume.textContent = state.launchHold ? "Awaiting review" : phase === "prepared" ? "Start prepared run"
-    : timeLimitPause ? "Continue" : "Resume";
+    : timeLimitPause || userStop ? "Continue" : "Resume";
   ui.resume.disabled = Boolean(state.launchHold) || replying;
   ui.resume.title = replying ? "The author is replying. Wait for the reply or stop it." : "";
   show(ui.downloadTex, Boolean(state.canDownloadTex));
@@ -3715,16 +3922,21 @@ function render(next) {
   show(ui.downloadProof, Boolean(state.canDownloadProof && !state.readOnly));
   show(ui.downloadSource, Boolean(state.canDownloadSource && !state.readOnly));
   show(ui.stop, working);
-  ui.stop.disabled = phase === "stopping";
+  // Stop at the author lets it end its current step; pressed again while it pauses, it stops at once.
+  ui.stop.disabled = phase === "stopping" || stopRequestPending;
+  if (ui.stopText) ui.stopText.textContent = phase === "pausing" ? "Stop now" : "Stop";
+  ui.stop.title = phase === "pausing" ? "Stop at once instead of waiting; the job still continues where it stopped."
+    : authorRunning ? "Stop the job: the author ends its current step (up to 30 seconds), then the job stays "
+      + "stopped until you continue it."
+    : "Stop the job at once; Continue runs this step again later.";
   ui.run.setAttribute("aria-busy", String(working));
 
   renderWorkflow();
   renderClock();
   renderBatchNavigation();
-  // After the overview is shown, so the conversation can scroll to its newest item.
+  // After the overview is shown, so the chat can scroll to its newest item (it also places the author's question).
   renderAuthorConversation();
   renderRelatedWorksPanel();
-  renderAuthorQuestion();
   if (state.readOnly || state.runningElsewhere) {
     for (const control of [ui.stop, ui.pause, ui.resume, ui.authorSteerControl, ui.authorTimeLimitControl,
       ui.approve, ui.recheck,
@@ -3732,7 +3944,7 @@ function render(next) {
     ui.proposed.readOnly = true;
     // Saved batches cannot resume; do not promise an action that is not offered.
     if (phase === "paused") {
-      ui.runTitle.textContent = timeLimitPause ? "Time limit reached" : "Paused";
+      ui.runTitle.textContent = timeLimitPause ? "Time limit reached" : userStop ? "Stopped" : "Paused";
       ui.runDescription.textContent = state.error || "";
     }
     // Another process owns the run: say so instead of offering its controls.
@@ -3757,18 +3969,64 @@ function render(next) {
   if (working || waiting) clock = setInterval(renderClock, 1000);
 }
 
+// Set the New problem form's settings from `source`: a job's state (a fresh form's is the built-in
+// settings), a rerun's settings, or saved settings (see applyPreset). Stages, each role's source,
+// model and reasoning, author subagents, critics and rounds, the time limit, the web search cutoff,
+// speed and activity log detail; never the statement, related works or prompts. The cutoff comes from
+// `source` itself (restoreRetrievalSettings): merged into a state whose retrieval says "live", saved
+// settings would lose theirs.
+function applyComposerSettings(source) {
+  const rounds = state.workflow?.settings?.critic_rounds || {};
+  const critics = state.workflow?.settings?.critic_count || {};
+  const hours = state.workflow?.settings?.thinking_hours || {};
+  syncModelMenus();
+  setChoice(ui.reviewModel, source.reviewModel || "gpt-6.1-sol");
+  setChoice(ui.authorModel, source.authorModel || "gpt-6.1-sol");
+  setChoice(ui.criticModel, source.criticModel || "gpt-6.1-sol");
+  setChoice(ui.writerModel, source.writerModel || "gpt-6.1-sol");
+  ui.reviewEffort.value = source.reviewEffort || "max";
+  ui.authorEffort.value = source.authorEffort || source.reasoningEffort || "max";
+  ui.criticEffort.value = source.criticEffort || source.reasoningEffort || "max";
+  ui.writerEffort.value = source.writerEffort || source.reasoningEffort || "max";
+  ["review", "author", "critic", "writer"].forEach(syncEffortChoices);
+  ui.speedMode.value = source.speedMode || "standard";
+  ui.reasoningSummary.value = source.reasoningSummary || "concise";
+  restoreRetrievalSettings(source);
+  updateModelSummary();
+  ui.criticRounds.value = source.criticRounds || 2;
+  ui.criticRounds.min = rounds.minimum || 1;
+  ui.criticRounds.max = rounds.maximum || 100;
+  ui.criticCount.value = source.criticCount || 3;
+  ui.criticCount.min = critics.minimum || 1;
+  ui.criticCount.max = critics.maximum || 10;
+  const subagents = state.workflow?.settings?.author_subagents || {};
+  ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 0;
+  ui.authorSubagents.min = subagents.minimum ?? 0;
+  ui.authorSubagents.max = subagents.maximum ?? 10;
+  ui.thinkingHours.value = source.thinkingHours ?? 0;
+  ui.thinkingHours.min = hours.minimum ?? 0;
+  // No maximum: any positive number of hours is a valid limit.
+  ui.thinkingHours.max = hours.maximum ?? "";
+
+  restoreWorkflowStages(source);
+}
+
 // The round badge: the job's critic round (the visit of the critic step) out of the edited rounds
 // allowed; the round after them is the read-only final check.
 function roundBadgeText(job) {
   return job.round > job.criticRounds ? `Round ${job.round} · final check` : `Round ${job.round} / ${job.criticRounds}`;
 }
 
-// The job page's time-limit text, steer box mode, author conversation and related works, as render()
-// shows them. Without their data they only hide themselves (no rows are built).
+// The job page's time-limit text, the chat ("Talk to the author") and related works, as render() shows
+// them. Without their data they only hide themselves (no rows are built).
 let limitControlOpenedFor = "";
 let authorLimitField = { run: null, value: "" };
-let authorSteerPaused = false;
+// The chat: its rows' signature; the job whose draft the box holds; the answers and questions already
+// shown (a new answer scrolls into view, a new question brings the chat into view); a Send or a Stop on its way.
 let conversationSignature = "";
+let chatDraftRun = null;
+let chatSeen = { run: null, answers: new Map(), questions: new Set() };
+let chatSending = false, stopRequestPending = false;
 let relatedWorksSignature = "";
 let relatedWorksRun = null;
 
@@ -3793,16 +4051,19 @@ function timeLimitDescription() {
     ? " The critic rejected the latest proof; the author receives its report when the run continues." : "");
 }
 
-// The steer box guides the running author, or asks the paused one, or the one stopped at its time limit
-// ("paused", "limit"; false while it runs). The texts change with the mode only.
-function renderAuthorSteerMode(paused) {
-  if (paused === authorSteerPaused) return;
-  authorSteerPaused = paused;
-  ui.authorSteerLabel.textContent = paused === "limit" ? "Ask the author" : paused ? "Ask the paused author"
-    : "Guide the running proof author";
-  ui.authorSteerInstruction.placeholder = paused ? "For example: which step in the summary is the main obstacle?"
-    : "For example: try a potential-function argument before the case analysis.";
-  ui.sendAuthorSteerText.textContent = paused ? "Send" : "Send instruction now";
+// The now-card of a job you stopped: where it stopped and what Continue does. ``canTalk``: the stopped
+// author can still be asked (the chat).
+function userStopDescription(canTalk) {
+  if (state.activeNode !== "author") {
+    return `You stopped the ${STEP_WORDS[state.activeNode] || "current step"}. Continue runs it again in this same `
+      + "job, from the same saved input.";
+  }
+  return "You stopped the proof author. Its saved conversation is kept; Continue picks the work up in this same job, "
+    + "and the time already used still counts."
+    + (canTalk ? " You can still talk to the author or ask for a progress summary below." : "")
+    + (state.timeLimitExhausted ? " The time limit is used up: raise it, or set 0 for no limit, before you continue." : "")
+    + (state.criticFeedbackPending
+      ? " The critic rejected the latest proof; the author receives its report when you continue." : "");
 }
 
 // Conversation times are epoch seconds; "" when unknown.
@@ -3812,17 +4073,128 @@ function conversationClock(value, seconds = false) {
   return seconds ? date.toLocaleTimeString() : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-// One summary or message with its reply, and where it stands.
-function conversationEntry(item, criticNote) {
+// A byte count as the server writes it (related_works.size_text): "512 B", "3.4 KB", "5.0 MB".
+function chatSizeText(bytes) {
+  const size = Number(bytes) || 0;
+  return size < 1024 ? `${size} B` : size < 1048576 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1048576).toFixed(1)} MB`;
+}
+
+// Where the author stands for a chat message it has not taken in yet: "author" (it works: at its next
+// step), "held" (pausing, paused or stopped at the proof author: when it works again), "elsewhere"
+// (another step works or holds the job: at its next turn, if any) or "ended".
+function chatWhere() {
+  const atAuthor = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
+  if (state.phase === "done") return "ended";
+  if (state.phase === "running" && atAuthor) return "author";
+  if (["pausing", "paused"].includes(state.phase) && atAuthor) return "held";
+  return "elsewhere";
+}
+
+// What Send and the summary button do now: the server's state.conversation (mode, note, summary,
+// summaryNote), with "legacy" "". A job of the earlier controller (shown through the live gateway) has no
+// mode: Send takes the routes the page used before the chat, "steer" (/steer-author) while its proof author
+// works and "ask" (/ask-author) while it is paused with its conversation available.
+const EARLIER_CONTROLLER_STEER = "This job belongs to the earlier controller: your message reaches the working "
+  + "author as a live instruction, but this chat does not list it or show an answer.";
+const EARLIER_CONTROLLER_OFF = "This job belongs to the earlier controller: you can write to its author while "
+  + "the author works.";
+// That controller sends a live instruction without recording it in a web-cutoff run's audit log: a web-cutoff
+// author receives nothing unrecorded, so the chat sends it none.
+const EARLIER_CONTROLLER_CUTOFF = "This job belongs to the earlier controller, which does not record live "
+  + "instructions in the run's web-cutoff audit log, so the chat sends none to this job.";
+function chatControl() {
+  const conversation = state.conversation || {};
+  if (typeof conversation.mode === "string") return { ...conversation, legacy: "" };
+  const closed = Boolean(state.readOnly || state.runningElsewhere);
+  const atAuthor = state.activeNode === "author" && ["solve", "repair"].includes(state.stage);
+  const webCutoff = Boolean(state.retrievalPolicyPath) || state.retrieval?.mode === "historical"
+    || state.retrievalMode === "historical";
+  if (!closed && state.phase === "running" && atAuthor) {
+    return webCutoff ? { ...conversation, legacy: "off", mode: "off", note: EARLIER_CONTROLLER_CUTOFF, summary: "off",
+      summaryNote: EARLIER_CONTROLLER_CUTOFF }
+      : { ...conversation, legacy: "steer", mode: "author", note: EARLIER_CONTROLLER_STEER, summary: "off",
+        summaryNote: EARLIER_CONTROLLER_STEER };
+  }
+  if (!closed && state.phase === "paused" && conversation.available && !conversation.busy) {
+    return { ...conversation, legacy: "ask", mode: "paused", note: "", summary: "now", summaryNote: "" };
+  }
+  const note = conversation.busy ? "The author is replying. Wait for the reply or stop it."
+    : conversation.reason || (closed ? "" : EARLIER_CONTROLLER_OFF);
+  return { ...conversation, legacy: "off", mode: conversation.busy ? "busy" : "off", note, summary: "off",
+    summaryNote: note };
+}
+
+// Whether the author took in a chat message or an answer, as one status line.
+function chatDeliveryText(item, where) {
+  const delivered = conversationClock(item.deliveredAt);
+  return item.deliveredAt || item.status === "delivered" ? `Delivered to the author${delivered ? ` · ${delivered}` : ""}`
+    : where === "author" ? "Waiting for the author to take it in at its next step."
+    : where === "held" ? "Not delivered yet: the author receives it when it works again."
+    : where === "ended" ? "Not delivered: the job ended before the author received it."
+    : "Not delivered yet: the author receives it at its next turn, if it works again in this run.";
+}
+
+// One chat item and where it stands: your message with the author's answer, the author's question
+// (answered here while it is open), or a progress summary or a message to the paused author with its
+// reply. Every text is set as text: the author's answers are untrusted model output, never markup.
+function conversationEntry(item, criticNote, where = chatWhere()) {
   const row = document.createElement("li");
   row.className = "conversation-item";
   row.dataset.status = item.status || "queued";
+  row.dataset.kind = item.kind || "message";
   const line = (className, text) => {
     const node = document.createElement(className === "conversation-reply" ? "div" : "p");
     node.className = className;
     node.textContent = text;
     row.append(node);
+    return node;
   };
+  if (item.kind === "instruction") {
+    line("conversation-meta", ["You", conversationClock(item.createdAt)].filter(Boolean).join(" · "));
+    line("conversation-text", item.text || "");
+    if (!item.reply) {
+      line("conversation-status", chatDeliveryText(item, where));
+      return row;
+    }
+    line("conversation-meta", ["Author", conversationClock(item.finishedAt),
+      item.answerUpdatedAt ? `updated ${conversationClock(item.answerUpdatedAt)}` : ""].filter(Boolean).join(" · "));
+    line("conversation-reply", item.reply);
+    if (item.answerShortened) {
+      line("conversation-status", `Shortened: the author's answer is ${chatSizeText(item.answerBytes)} long, so the `
+        + `chat shows its first ${(100000).toLocaleString("en-US")} characters. The whole answer is in `
+        + `${item.answerPath || item.answerFile || "its answer file"}.`);
+      if (!state.readOnly) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "ghost compact conversation-download";
+        button.textContent = "Download the whole answer";
+        button.onclick = () => downloadArtifact(button, "md", `answer-${item.id}.md`, "/chat-answer", { id: item.id });
+        row.append(button);
+      }
+    }
+    return row;
+  }
+  if (item.kind === "question") {
+    row.dataset.questionId = item.questionId || "";
+    line("conversation-meta", ["The author asks", conversationClock(item.createdAt)].filter(Boolean).join(" · "));
+    // An open question this page can answer: its form (renderAuthorQuestion) shows the questions and options.
+    if (item.status === "open" && state.authorQuestion?.id === item.questionId && !state.readOnly
+        && !state.runningElsewhere) return row;
+    for (const entry of Array.isArray(item.questions) ? item.questions : []) {
+      line("conversation-question", entry.title || "");
+      if (Array.isArray(entry.options) && entry.options.length) line("conversation-options", `Options: ${entry.options.join(" · ")}`);
+    }
+    if (item.status === "answered") {
+      line("conversation-meta", ["You answered", conversationClock(item.finishedAt)].filter(Boolean).join(" · "));
+      line("conversation-text", item.reply || "");
+      line("conversation-status", chatDeliveryText(item, where));
+    } else {
+      line("conversation-status", item.status === "open" ? "Open: you can answer when the author works again."
+        : item.status === "dismissed" ? "Dismissed: nothing was sent to the author."
+        : item.error || "The author's question closed.");
+    }
+    return row;
+  }
   const summary = item.kind === "summary";
   line("conversation-meta", (summary
     ? (item.origin === "time-limit" ? ["Progress summary at the time limit", conversationClock(item.createdAt)]
@@ -3834,7 +4206,11 @@ function conversationEntry(item, criticNote) {
     line("conversation-reply", item.reply);
   }
   const retryAt = conversationClock(item.retry?.retryAt, true);
-  const status = item.status === "queued" ? (item.error ? `Waiting to start: ${item.error}` : "Waiting to start…")
+  // A Stop reads as stopping, never as pausing.
+  const status = item.status === "queued" ? (summary && state.phase === "pausing" && !item.error
+      ? (stoppedByUser(state) ? "The author is stopping; it writes the summary once it has stopped."
+        : "The author is pausing; it writes the summary once it has paused.")
+      : item.error ? `Waiting to start: ${item.error}` : "Waiting to start…")
     : item.status === "running" ? (item.retry?.text ? `${item.retry.text}${retryAt ? ` Next attempt at ${retryAt}.` : ""}`
       : summary ? "The author is writing the summary…" : "The author is replying…")
     : item.status === "failed" ? (item.error ? `No reply: ${item.error}` : "No reply.")
@@ -3846,44 +4222,144 @@ function conversationEntry(item, criticNote) {
   return row;
 }
 
-// Every summary, message and reply of the run, oldest first, in every phase; shown with items or the
-// paused input. Rebuilt only when an item changes, then scrolled to the newest.
+// Send works while the author works (a live instruction) and while it is paused or stopped at the proof
+// author (a reply in its saved conversation); otherwise it is off and the note says why and when. While a
+// message is on its way, Send stays off, also across polls.
+function renderChatSend() {
+  const control = chatControl();
+  const open = ["author", "paused"].includes(control.mode);
+  ui.sendAuthorSteer.disabled = !open || chatSending;
+  ui.sendAuthorSteer.title = open ? "" : control.note || control.reason || "";
+  // The same words for every stop at the proof author: paused by you, stopped by you or at the time limit.
+  const placeholder = control.legacy === "steer" ? "Tell the author what to try next."
+    : control.mode === "paused" ? "Ask the author a question."
+    : "Ask a question, or tell the author what to try next.";
+  if (ui.authorSteerInstruction.placeholder !== placeholder) ui.authorSteerInstruction.placeholder = placeholder;
+}
+
+// The chat ("Talk to the author") of a job with an Author stage, in every phase: your messages and the
+// author's answers, the author's questions and the progress summaries, oldest first, then the box. The
+// server says what Send and the summary button do now (state.conversation: mode, note, summary,
+// summaryNote; see chatControl). Rows are rebuilt only when an item changes; the box keeps what you typed,
+// per job.
 function renderAuthorConversation() {
-  const conversation = state.conversation;
-  const items = Array.isArray(conversation?.items) ? conversation.items : [];
-  const canTalk = state.phase === "paused" && Boolean(conversation?.available) && !state.readOnly;
+  const conversation = chatControl();
+  const items = Array.isArray(conversation.items) ? conversation.items : [];
   // A saved conversation too large to show is named instead of listed.
-  const notice = typeof conversation?.notice === "string" ? conversation.notice : "";
-  show(ui.authorConversation, items.length > 0 || canTalk || Boolean(notice));
-  if (!items.length && !canTalk && !notice) return;
-  const authorRunning = state.phase === "running" && ["solve", "repair"].includes(state.stage)
-    && state.activeNode === "author";
-  const note = notice || (state.phase === "paused"
-    ? (canTalk ? `The author answers in its saved conversation${conversation.readOnly === false ? "" : " without changing files"}, `
-      + "and remembers the exchange when the run resumes. Replies do not use the time limit." : conversation?.reason || "")
-    : authorRunning ? "Live instructions reach the author at its next step; it does not reply here." : "");
+  const notice = typeof conversation.notice === "string" ? conversation.notice : "";
+  const authorStage = state.workflowStages?.author !== false && state.problemMode !== "latex";
+  const closed = state.phase === "done" || Boolean(state.readOnly) || Boolean(state.runningElsewhere);
+  const visible = authorStage && (!closed || items.length > 0 || Boolean(notice));
+  show(ui.authorConversation, visible);
+  show(ui.authorSteerControl, visible && !closed);
+  if (!visible) {
+    conversationSignature = "";
+    renderAuthorQuestion();
+    return;
+  }
+  if (chatDraftRun !== state.runId) {
+    // Another job: its own draft, which polls never overwrite.
+    chatDraftRun = state.runId;
+    ui.authorSteerInstruction.value = typeof loadChatDraft === "function" ? loadChatDraft(state.runId) : "";
+    if (typeof renderAuthorSteerCount === "function") renderAuthorSteerCount();
+  }
+  const note = conversation.note || conversation.reason || "";
   if (ui.authorConversationNote.textContent !== note) ui.authorConversationNote.textContent = note;
   show(ui.authorConversationNote, Boolean(note));
+  renderChatSend();
+  // Pause and summarize while the author works; Summarize progress while it pauses or is paused (or stopped).
+  const summary = conversation.summary || "off";
+  show(ui.requestSummary, !closed);
+  ui.requestSummary.textContent = summary === "pause" ? "Pause and summarize" : "Summarize progress";
+  ui.requestSummary.disabled = summary === "off";
+  ui.requestSummary.title = summary === "pause"
+    ? "Pauses the author like Pause, then it writes a progress summary here. Resume continues the work."
+    : summary === "queue" ? `The author writes a progress summary here once it has ${stoppedByUser(state) ? "stopped"
+      : "paused"}.`
+    : summary === "now" ? "The author writes a progress summary here." : conversation.summaryNote || "";
+  show(ui.stopReply, state.phase === "paused" && Boolean(conversation.busy) && !state.readOnly);
+  // The question form may be in a row about to be rebuilt: an answer being typed keeps its focus.
+  const active = typeof document !== "undefined" ? document.activeElement : null;
+  const typing = active && ui.authorQuestionForm?.contains?.(active) ? active : null;
   const pending = state.phase === "paused" && Boolean(state.criticFeedbackPending);
   const newestSummary = pending ? items.filter((item) => item.kind === "summary").at(-1) : null;
-  const signature = JSON.stringify([items, newestSummary?.id || ""]);
-  if (signature === conversationSignature) return;
-  conversationSignature = signature;
-  const rows = items.map((item) => conversationEntry(item, item === newestSummary));
-  ui.authorConversationList.replaceChildren(...rows);
-  ui.authorConversationList.scrollTop = ui.authorConversationList.scrollHeight;
-  // The box opens at its newest item; a link above it leads to the newest summary written at the time limit.
-  const limitSummary = items.findLastIndex((item) => item.kind === "summary" && item.origin === "time-limit");
-  show(ui.conversationSummaryLink, limitSummary >= 0);
-  ui.conversationSummaryLink.onclick = limitSummary < 0 ? null : () => {
-    const list = ui.authorConversationList, row = rows[limitSummary];
-    list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top;
-    row.focus?.({ preventScroll: true });
-  };
-  if (limitSummary >= 0) {
-    rows[limitSummary].tabIndex = -1;
-    const time = conversationClock(items[limitSummary].createdAt);
-    ui.conversationSummaryLink.textContent = `Go to the progress summary at the time limit${time ? ` (${time})` : ""}`;
+  const where = chatWhere();
+  const question = state.authorQuestion?.id || "";
+  // A Stop during Pause and summarize changes how a waiting summary reads (stopping, not pausing).
+  const signature = JSON.stringify([state.runId, items, newestSummary?.id || "", where, question,
+    Boolean(state.readOnly), notice, stoppedByUser(state)]);
+  // Where the list scrolls after a rebuild, once the open question's form is in its row (renderAuthorQuestion).
+  let placeRows = null;
+  if (signature !== conversationSignature) {
+    conversationSignature = signature;
+    const list = ui.authorConversationList;
+    // An answer being written to the author's question keeps its place in the list.
+    const kept = typing ? list.scrollTop : null;
+    const rows = items.map((item) => conversationEntry(item, item === newestSummary, where));
+    if (notice) {
+      const row = document.createElement("li"), text = document.createElement("p");
+      row.className = "conversation-item";
+      row.dataset.status = "notice";
+      text.className = "conversation-status";
+      text.textContent = notice;
+      row.append(text);
+      rows.push(row);
+    }
+    list.replaceChildren(...rows);
+    // A new or updated answer is brought into view; otherwise the list opens at its newest item.
+    const fresh = chatSeen.run !== state.runId;
+    if (fresh) chatSeen = { run: state.runId, answers: new Map(), questions: new Set() };
+    let answered = -1;
+    items.forEach((item, index) => {
+      if (item.kind !== "instruction" || !item.reply) return;
+      const mark = `${item.answerStat || ""}|${item.answerUpdatedAt || ""}|${item.reply.length}`;
+      if (!fresh && chatSeen.answers.get(item.id) !== mark) answered = index;
+      chatSeen.answers.set(item.id, mark);
+    });
+    // The author's question has no box of its own at the top of the page: a new one, or one already open when its
+    // job's page opens, is brought into view in the list and on the page, unless you are typing.
+    const asked = items.filter((item) => item.kind === "question" && item.status === "open").map((item) => item.questionId);
+    const newQuestion = asked.some((identity) => !chatSeen.questions.has(identity));
+    asked.forEach((identity) => chatSeen.questions.add(identity));
+    const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(active?.tagName);
+    const host = newQuestion && !editing && question ? rows.find((row) => row.dataset.questionId === question) : null;
+    const toTop = (row) => {
+      list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    };
+    const measurable = (row) => Boolean(row?.getBoundingClientRect && list.getBoundingClientRect);
+    placeRows = () => {
+      const form = ui.authorQuestionForm;
+      const asking = host && !form.hidden && (form.parentElement ?? form.parent) === host;
+      if (kept !== null) {
+        list.scrollTop = kept;
+      } else if (asking && measurable(host)) {
+        // The question's row at the top of the list; a row taller than the list (on a phone) shows its form whole.
+        toTop(host.getBoundingClientRect().height > list.clientHeight ? form : host);
+      } else if (answered >= 0 && measurable(rows[answered])) {
+        toTop(rows[answered]);
+      } else {
+        list.scrollTop = list.scrollHeight;
+      }
+      if (asking) form.scrollIntoView?.({ block: "nearest" });
+    };
+    // The box opens at its newest item; a link above it leads to the newest summary written at the time limit.
+    const limitSummary = items.findLastIndex((item) => item.kind === "summary" && item.origin === "time-limit");
+    show(ui.conversationSummaryLink, limitSummary >= 0);
+    ui.conversationSummaryLink.onclick = limitSummary < 0 ? null : () => {
+      const row = rows[limitSummary];
+      list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+      row.focus?.({ preventScroll: true });
+    };
+    if (limitSummary >= 0) {
+      rows[limitSummary].tabIndex = -1;
+      const time = conversationClock(items[limitSummary].createdAt);
+      ui.conversationSummaryLink.textContent = `Go to the progress summary at the time limit${time ? ` (${time})` : ""}`;
+    }
+  }
+  renderAuthorQuestion();
+  placeRows?.();
+  if (typing && typeof document !== "undefined" && document.activeElement !== typing && typing.isConnected) {
+    typing.focus({ preventScroll: true });
   }
 }
 
@@ -3930,19 +4406,26 @@ function renderRelatedWorksPanel() {
   if (!actions) show(ui.relatedNoteForm, false);
 }
 
-// The running author's open question (state.authorQuestion; the server closes it by its rules): each
-// question with its options, the first preselected, and a field whose text replaces the option. The rows
-// are rebuilt only for another question, so a choice or an answer being written survives the polls.
+// The running author's open question (state.authorQuestion; the server closes it by its rules), in its row
+// of the chat: each question with its options, the first preselected, and a field whose text replaces the
+// option. The form is one element that moves into the question's row, and its rows are rebuilt only for
+// another question, so a choice or an answer being written survives the polls and the chat's rebuilds.
 let authorQuestionSignature = "";
 // The job and question the rows were built for; the question that needs no closing notice (this page
 // answered or dismissed it, or the notice was shown for it).
 let authorQuestionRows = null, authorQuestionSettled = "";
 // While the author still works (a newer question replaced it, or it closed after its turn and ten minutes) the
-// answer can go as a live instruction; once the author has stopped working, it cannot.
-const AUTHOR_QUESTION_LOST = "The author's question closed before your answer was sent; you can still send it "
-  + "as a live instruction.";
+// answer can go as a message in the chat; once the author has stopped working, it cannot.
+const AUTHOR_QUESTION_LOST = "The author's question closed before your answer was sent. You can still send your "
+  + "answer as a message in the chat.";
 const AUTHOR_QUESTION_ENDED = "The author's question closed when the author stopped working; your answer was "
   + "not sent.";
+// Put the question form back in the chat card, hidden (another job, or no open question).
+function parkAuthorQuestionForm() {
+  show(ui.authorQuestionForm, false);
+  const parent = ui.authorQuestionForm.parentElement ?? ui.authorQuestionForm.parent;
+  if (parent !== ui.authorConversation) ui.authorConversation.append?.(ui.authorQuestionForm);
+}
 function renderAuthorQuestion() {
   const question = state.authorQuestion;
   const visible = Boolean(question?.id) && Array.isArray(question.questions) && question.questions.length > 0
@@ -3963,8 +4446,17 @@ function renderAuthorQuestion() {
     ui.notice.textContent = authorRunning ? AUTHOR_QUESTION_LOST : AUTHOR_QUESTION_ENDED;
     show(ui.notice, true);
   }
-  show(ui.authorQuestion, visible);
-  if (!visible) return;
+  if (!visible) {
+    parkAuthorQuestionForm();
+    return;
+  }
+  // Its row in the chat holds the form; without one (an older controller lists no questions) it follows the list.
+  const host = Array.from(ui.authorConversationList.children || [])
+    .find((row) => row.dataset?.questionId === question.id);
+  const parent = ui.authorQuestionForm.parentElement ?? ui.authorQuestionForm.parent;
+  if (host && parent !== host) host.append?.(ui.authorQuestionForm);
+  else if (!host && parent !== ui.authorConversation) ui.authorConversation.append?.(ui.authorQuestionForm);
+  show(ui.authorQuestionForm, true);
   // When it closes unanswered: once the author's step that asked it has ended, and not before closesAt.
   const asked = conversationClock(question.askedAt), closes = conversationClock(question.closesAt);
   const meta = [asked ? `Asked at ${asked}.` : "", question.turnEnded
@@ -4115,7 +4607,7 @@ function roleModelCatalog() {
 function modelSourceChoices(catalog) {
   const saved = state.workflow?.settings?.model_sources;
   if (Array.isArray(saved)) return [...saved];
-  const sources = [{ id: "codex", label: "Codex CLI" }, { id: "claude", label: "Claude CLI" }];
+  const sources = [{ id: "codex", label: "Codex CLI" }, { id: "claude", label: "Claude Code" }];
   for (const row of catalog.filter((item) => item.provider === "api")) {
     const id = modelSourceId(row);
     if (!sources.some((source) => source.id === id)) {
@@ -4126,7 +4618,10 @@ function modelSourceChoices(catalog) {
 }
 
 function modelSourceLabel(source, sources) {
-  if (source.provider !== "api" && !source.id.startsWith("api:")) return source.label;
+  // An earlier controller still calls Claude Code "Claude CLI".
+  if (source.provider !== "api" && !source.id.startsWith("api:")) {
+    return source.label === "Claude CLI" ? "Claude Code" : source.label;
+  }
   const duplicate = sources.filter((item) => item.label === source.label).length > 1;
   return `API key · ${source.label}${duplicate && source.keyHint ? ` · ${source.keyHint}` : ""}`;
 }
@@ -4200,16 +4695,23 @@ async function refresh() {
     return;
   }
   try {
-    if (job && (!batchCatalog.length || (batch && !selectedBatch()))) {
+    // A job page and the New problem page name their batch: read the batches first.
+    if ((job || composingProblem) && (!batchCatalog.length || (batch && !selectedBatch()))) {
       const catalog = await request("/batches");
       if (job !== currentJob || batch !== currentBatch) return;
-      batchCatalog = catalog.batches || [];
+      batchCatalog = adoptBatchCatalog(catalog);
+      renderBatchNavigation();
     }
+    // A fresh New problem form opens with the default saved settings: read them with its state (a failed
+    // read leaves the built-in settings and says why; see loadPresets).
+    const presets = job ? null : loadPresets();
     const next = await request(jobPath("/state", {
       after: state.traceVersion || 0,
     }));
+    if (presets) await presets;
     if (job !== currentJob || batch !== currentBatch) return;
-    if (job && !currentBatch && next.batchId) {
+    // A link without its batch, or naming a batch no longer listed, takes the batch the server shows the job in.
+    if (job && next.batchId && next.batchId !== currentBatch && (!currentBatch || !selectedBatch())) {
       currentBatch = next.batchId;
       history.replaceState(null, "", jobUrl(currentJob));
     }
@@ -4221,6 +4723,12 @@ async function refresh() {
     loadJobRecovery();
   } catch (error) {
     if (job !== currentJob || batch !== currentBatch) return;
+    // A link naming a batch its job is not in (one kept from before the list of batches was repaired, say):
+    // the job is asked for without it, and the answer names the job's own batch, which the address takes.
+    if (job && batch && error.status === 404 && error.message === "That job is not in this batch.") {
+      currentBatch = "";
+      return refresh();
+    }
     ui.notice.textContent = pollNotice = error.message;
     show(ui.notice, true);
     timer = setTimeout(refresh, 1200);
@@ -4336,6 +4844,8 @@ async function startReview(statement, feedback = "") {
   } catch (error) {
     reviewPending = false;
     showCreateError(error.message);
+    // Refused on the New problem page: its batch may be gone (deleted in another tab), which its note then says.
+    if (typeof reloadComposerBatches === "function") reloadComposerBatches();
     // A failed Retry must not end the review page's polling (the composer does not poll).
     if (job && job === currentJob && batch === currentBatch && state.phase === "reviewed") {
       clearTimeout(timer);
@@ -4666,11 +5176,18 @@ async function sendFolderBatch(chosen) {
   if (relatedProblem) return showCreateError(relatedProblem);
   // The listed related works go to the folder run's own store, which every one of its jobs sees.
   const relatedWorks = composerRelatedTokens();
+  // The batch the jobs join, named in the question while the server makes batches.
+  const target = typeof batchOptions === "function" && batchOptions().create ? composerTarget() : null;
+  // A batch no longer listed (deleted in another tab) takes no job: the question would name it in vain.
+  if (target?.id && typeof composerBatchGone === "function" && composerBatchGone()) {
+    return showCreateError("That batch no longer exists.");
+  }
   const count = statements.length;
   const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
     + "Each runs the selected workflow. All of them share the rate and usage limits of the same CLI "
     + "logins and API keys; jobs beyond the running-jobs limit (Models & API) wait in a queue.\n\n"
     + `Folder: ${folder}\n`
+    + (target ? `Batch: ${target.label}\n` : "")
     + "Each job uses the selected stages."
     + (selectedWorkflowStages().review ? " Statement review will pause each job for your approval." : "")
     + (relatedWorks.length ? ` Every job gets the ${relatedWorks.length} related work`
@@ -4686,7 +5203,8 @@ async function sendFolderBatch(chosen) {
   }
   clearTimeout(jobsTimer);
   try {
-    const result = await request("/direct-batch", body);
+    const result = await request(target?.id ? `/direct-batch?batch=${encodeURIComponent(target.id)}` : "/direct-batch",
+      body);
     if (relatedWorks.length) clearComposerRelatedWorks();
     // Jobs beyond the running-jobs limit wait in the queue. The server's notice says so, and names
     // any job it could not create or start yet (it tries again every minute).
@@ -4706,6 +5224,8 @@ async function sendFolderBatch(chosen) {
     ui.batchStatus.scrollIntoView({ block: "nearest", behavior: "smooth" });
   } catch (error) {
     showCreateError(error.message);
+    // Refused on the New problem page: its batch may be gone (deleted in another tab), which its note then says.
+    if (typeof reloadComposerBatches === "function") reloadComposerBatches();
   }
   if (!currentJob) loadJobs();
 }
@@ -4881,35 +5401,73 @@ ui.setAuthorTimeLimit.onclick = () => {
   }
   act("/set-author-time-limit", { hours });
 };
-ui.sendAuthorSteer.onclick = () => {
-  // While the run is paused, render() turns the box into a message to the paused author.
-  const paused = typeof authorSteerPaused !== "undefined" && authorSteerPaused;
-  const instruction = ui.authorSteerInstruction.value.trim();
-  if (!instruction) {
-    ui.notice.textContent = paused ? "Enter a message for the author." : "Enter an instruction for the proof author.";
+ui.sendAuthorSteer.onclick = async () => {
+  // The server decides what a message is now: a live instruction for the working author, or a reply turn of
+  // the author paused (or stopped) at the proof author (see state.conversation.mode). A job of the earlier
+  // controller takes the routes the page used before the chat (see chatControl).
+  if (chatSending) return; // One message at a time: Send stays off until the last one was answered.
+  const typed = ui.authorSteerInstruction.value;
+  const text = typed.trim();
+  if (!text) {
+    ui.notice.textContent = "Enter a message for the author.";
     show(ui.notice, true);
     ui.authorSteerInstruction.focus();
     return;
   }
   const limit = authorSteerLimit();
-  if (instruction.length > limit) {
-    ui.notice.textContent = `Keep the ${paused ? "message" : "live instruction"} at or below `
-      + `${limit.toLocaleString("en-US")} characters `
-      + `(it has ${instruction.length.toLocaleString("en-US")}); shorten it or send it in parts.`;
+  if (text.length > limit) {
+    ui.notice.textContent = `Keep the message at or below ${limit.toLocaleString("en-US")} characters `
+      + `(it has ${text.length.toLocaleString("en-US")}); shorten it or send it in parts.`;
     show(ui.notice, true);
     ui.authorSteerInstruction.focus();
     return;
   }
-  if (!paused) {
-    act("/steer-author", { instruction });
-    return;
+  const run = state.runId, draft = loadChatDraft(run);
+  const legacy = typeof chatControl === "function" ? chatControl().legacy : "";
+  chatSending = true;
+  ui.sendAuthorSteer.disabled = true;
+  try {
+    const sent = await (legacy === "steer" ? act("/steer-author", { instruction: text })
+      : legacy === "ask" ? act("/ask-author", { text }) : act("/chat", { text }));
+    if (sent) {
+      // The job it was sent to loses its draft, also when the page shows another job by now; a refusal keeps
+      // it to send again, and what was typed after Send stays.
+      if (loadChatDraft(run) === draft) saveChatDraft(run, "");
+      if (state.runId === run && ui.authorSteerInstruction.value === typed) {
+        ui.authorSteerInstruction.value = "";
+        renderAuthorSteerCount();
+      }
+    }
+  } finally {
+    chatSending = false;
+    renderChatSend();
   }
-  act("/ask-author", { text: instruction }).then((sent) => {
-    if (!sent) return;
-    ui.authorSteerInstruction.value = "";
-    renderAuthorSteerCount();
-  });
 };
+// What you typed in the chat box, per job: in this page and in this browser (localStorage, which may
+// be unavailable), so a reload or a visit to another job keeps it.
+const chatDrafts = new Map();
+function chatDraftKey(run) {
+  return `tcs-prover-chat-draft:${run}`;
+}
+function loadChatDraft(run) {
+  if (!run) return "";
+  if (chatDrafts.has(run)) return chatDrafts.get(run);
+  try {
+    return localStorage.getItem(chatDraftKey(run)) || "";
+  } catch (_) {
+    return "";
+  }
+}
+function saveChatDraft(run, text) {
+  if (!run) return;
+  chatDrafts.set(run, text);
+  try {
+    if (text) localStorage.setItem(chatDraftKey(run), text);
+    else localStorage.removeItem(chatDraftKey(run));
+  } catch (_) {
+    // Kept in this page only.
+  }
+}
 // A visible count instead of a silent cut at the limit the server enforces.
 function authorSteerLimit() {
   return Number(ui.authorSteerInstruction.dataset?.maxChars) || 12000;
@@ -4923,8 +5481,22 @@ function renderAuthorSteerCount() {
     : "";
   ui.authorSteerCount.classList.toggle("over", length > limit);
 }
-ui.authorSteerInstruction.addEventListener("input", renderAuthorSteerCount);
-ui.stop.onclick = () => act("/stop");
+ui.authorSteerInstruction.addEventListener("input", () => {
+  renderAuthorSteerCount();
+  saveChatDraft(state.runId, ui.authorSteerInstruction.value);
+});
+ui.stop.onclick = async () => {
+  // One request at a time: a double click must not turn the first Stop into the second (Stop now).
+  if (stopRequestPending) return;
+  stopRequestPending = true;
+  ui.stop.disabled = true;
+  try {
+    await act("/stop");
+  } finally {
+    stopRequestPending = false;
+    ui.stop.disabled = state.phase === "stopping";
+  }
+};
 ui.pause.onclick = () => act("/pause");
 // Resume first sets a limit typed in the time limit field, then resumes once the server has it. A
 // used-up limit is not sent: the field opens with the reason instead.
@@ -4960,7 +5532,8 @@ function pendingAuthorLimit() {
 ui.requestSummary.onclick = () => act("/author-summary", {});
 // Stops the summary or reply being written (by its id); the job stays paused.
 ui.stopReply.onclick = () => {
-  const item = (state.conversation?.items || []).find((entry) => ["queued", "running"].includes(entry.status));
+  const item = (state.conversation?.items || []).find((entry) => ["summary", "message"].includes(entry.kind)
+    && ["queued", "running"].includes(entry.status));
   return act("/stop-author-reply", item ? { id: item.id } : {});
 };
 async function downloadArtifact(button, extension, filename = `final.${extension}`, path = `/download-${extension}`,
@@ -5008,7 +5581,15 @@ ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
 ui.allBatches.onclick = () => selectBatch("");
 ui.batchProblems.onclick = goHome;
-ui.newProblem.onclick = newProblem;
+// The Overview's New problem adds to the default batch (never pass the click event as a batch).
+ui.newProblem.onclick = () => newProblem();
+ui.newProblemInBatch.onclick = () => newProblem(currentBatch);
+ui.composerDefaultBatch.onclick = addToDefaultBatch;
+ui.newBatch.onclick = () => openBatchDialog("create");
+ui.renameBatch.onclick = () => openBatchDialog("rename");
+ui.deleteBatch.onclick = deleteCurrentBatch;
+ui.cancelBatchDialog.onclick = () => ui.batchDialog.close();
+ui.batchDialog.querySelector("form").onsubmit = saveBatchDialog;
 // The author's question: Send queues the answered questions as one live instruction; Dismiss closes it
 // without sending anything. Either way the server closes the question, and the next state hides the box.
 // Both act only on the question whose rows are on screen: a click that meets another question is ignored.
@@ -5057,6 +5638,8 @@ function followInPageLink(event) {
 document.addEventListener("click", followInPageLink);
 window.onpopstate = () => {
   if (ui.activityPanel.open) ui.activityPanel.close();
+  // The batch dialog belongs to the page it was opened on (its Rename names that page's batch).
+  if (ui.batchDialog.open) ui.batchDialog.close();
   currentJob = new URLSearchParams(location.search).get("job") || "";
   currentBatch = new URLSearchParams(location.search).get("batch") || "";
   composingProblem = new URLSearchParams(location.search).get("new") === "1" && !currentJob;
@@ -5392,6 +5975,16 @@ const apiFormats = {
       + "computer, but needs no login. Models load automatically when you save." },
 };
 const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic", writer: "LaTeX writer" };
+// The roles whose model the menus replaced with the default model, as one sentence: "The proof author now uses
+// the default model." or "The statement reviewer and the proof author now use the default model." ``gone``
+// adds why: their selected model is no longer available.
+function defaultModelSentence(roles, gone = false) {
+  const names = roles.map((role) => `the ${roleNames[role] || role}`);
+  const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
+  const one = roles.length === 1;
+  return `${list.charAt(0).toUpperCase()}${list.slice(1)} now ${one ? "uses" : "use"} the default model`
+    + (gone ? ` because ${one ? "its selected model is" : "their selected models are"} no longer available.` : ".");
+}
 let apiModels = [], apiModelEditing = null, apiModelBusy = false;
 // Replace key was chosen: the key field is shown and its new key replaces the saved one.
 let apiKeyReplacing = false;
@@ -5443,6 +6036,9 @@ function adoptApiModels(data) {
     for (const role of Object.keys(roleNames)) syncEffortChoices(role);
     renderRetrievalSettings();
     updateModelSummary();
+    // A model or reasoning level the menus replaced (its connection removed) is a change of the New
+    // problem form's settings: the saved-settings bar then says "· changed".
+    if (typeof renderPresetBar === "function") renderPresetBar();
   }
   renderApiModels();
   return replaced;
@@ -5769,7 +6365,7 @@ async function refreshApiConnection(connection, button) {
     const replaced = result.model_catalog || result.connections ? adoptApiModels(result) : [];
     warning = !result.ok;
     message = `${connection.label}: ${result.message || apiTestText(result)}`;
-    if (replaced.length) message += ` ${replaced.map((role) => roleNames[role]).join(", ")} now use the default model because their selected model is no longer available.`;
+    if (replaced.length) message += ` ${defaultModelSentence(replaced, true)}`;
   } catch (error) { message = error.message; warning = true; }
   setApiBusy(false); renderApiModels();
   if (apiFocusLost()) [...apiUi.list.querySelectorAll("button")].find((item) => item.dataset.apiModel === connection.id
@@ -5785,7 +6381,7 @@ async function removeApiModel(connection, button) {
     if (apiModelEditing?.id === connection.id) resetApiForm();
     const replaced = adoptApiModels(data); removed = true;
     message = [`Removed ${connection.label}.`, data.warning].filter(Boolean).join(" ");
-    if (replaced.length) message += ` ${replaced.map((role) => roleNames[role]).join(", ")} now use the default model.`;
+    if (replaced.length) message += ` ${defaultModelSentence(replaced)}`;
     warning = Boolean(data.warning);
   } catch (error) { message = error.message; warning = true; }
   setApiBusy(false); renderApiForm(); renderApiModels();
@@ -6111,8 +6707,12 @@ renderApiForm();
   }
 
   async function openComposer(models) {
-    const url = `${location.pathname}?new=1${models ? "#models" : ""}`;
-    if (composingProblem && !currentJob) {
+    // A new New problem page adds to the default batch; an open one keeps its batch, as its draft, when only
+    // the view switches.
+    const composing = composingProblem && !currentJob;
+    const target = composing ? currentBatch : "";
+    const url = `${location.pathname}?new=1${target ? `&batch=${encodeURIComponent(target)}` : ""}${models ? "#models" : ""}`;
+    if (composing) {
       // Already composing: switch the view only, so the draft and its settings stay as they are.
       if (route() !== (models ? "models" : "new")) history.pushState(null, "", url);
       sync();
@@ -6130,6 +6730,7 @@ renderApiForm();
     if (target === "home") await selectBatch("");
     else if (target === "batch") await selectBatch(item.dataset.batchId);
     else if (target === "new" || target === "models") await openComposer(target === "models");
+    else if (target === "new-batch") openBatchDialog("create");
     else if (target === "prompts") {
       // Prompt edits apply to the next problem, so they are made from the composer.
       if (!(composingProblem && !currentJob)) await openComposer(false);
@@ -6152,8 +6753,10 @@ renderApiForm();
     const wasDrawer = drawer;
     if (drawer) setDrawer(false, false);
     go(item).finally(() => {
-      // The drawer closed under the focused link: continue from the page instead.
-      if (wasDrawer && item.dataset.nav !== "prompts") document.getElementById("main")?.focus({ preventScroll: true });
+      // The drawer closed under the focused link: continue from the page instead (a dialog keeps its focus).
+      if (wasDrawer && !["prompts", "new-batch"].includes(item.dataset.nav)) {
+        document.getElementById("main")?.focus({ preventScroll: true });
+      }
     });
   });
 
@@ -6162,13 +6765,26 @@ renderApiForm();
   let polled = null;
   let polledAt = 0;
   let polling = false;
+  // The page's count of /batches answers when the sidebar last took one (see batchOptions).
+  let polledAdopted = 0;
   async function pollBatches() {
     if (polling) return;
     polling = true;
+    const before = batchOptions().adopted;
     try {
       const response = await fetch("/batches", { headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" });
       const data = await response.json().catch(() => ({}));
-      if (response.ok && Array.isArray(data.batches)) polled = data.batches;
+      // An answer is dropped when the page took one of its own meanwhile (New batch, say): it may be older.
+      if (response.ok && Array.isArray(data.batches) && batchOptions().adopted === before) {
+        polled = adoptBatchCatalog(data);
+        polledAdopted = batchOptions().adopted;
+        // The New problem page names its batch from this list too, so a batch deleted or renamed in another
+        // tab shows there within seconds.
+        if (composingProblem && !currentJob) {
+          batchCatalog = polled;
+          renderBatchNavigation();
+        }
+      }
     } catch (_) {
       // Keep the last counts; the page's own notice reports a lost connection.
     } finally {
@@ -6178,11 +6794,14 @@ renderApiForm();
     sync();
   }
   function catalog() {
-    return !currentJob && !composingProblem && batchCatalog.length ? batchCatalog : polled || batchCatalog;
+    // The page's own list on the home and batch pages, and wherever the page read it after the sidebar did.
+    const own = (!currentJob && !composingProblem) || batchOptions().adopted > polledAdopted;
+    return own && batchCatalog.length ? batchCatalog : polled || batchCatalog;
   }
   // Finished jobs count as complete ("done": a successful outcome, with the check mark) or
-  // incomplete (failed, stopped or interrupted), as on the batch page; the server classifies them.
-  // Jobs stopped at their time limit ("limit", with the clock) are never counted as paused.
+  // incomplete (failed or interrupted), as on the batch page; the server classifies them. Jobs
+  // stopped at their time limit ("limit", with the clock) or by you ("stopped", with a square) are
+  // never counted as paused or finished.
   function tally(batch) {
     const counts = batch.counts || {};
     const count = (key) => Number(counts[key] || 0);
@@ -6191,13 +6810,14 @@ renderApiForm();
       waiting: count("reviewed") + count("prepared") - Number(batch.queued || 0),
       paused: count("paused"),
       limit: count("limit"),
+      stopped: count("stopped"),
       done: count("done"),
       incomplete: count("incomplete"),
       total: Number(batch.jobCount || 0),
     };
   }
   const toneWords = { running: "running", waiting: "need you", paused: "paused", limit: "time limit reached",
-    done: "complete", incomplete: "incomplete" };
+    stopped: "stopped", done: "complete", incomplete: "incomplete" };
   const toneText = (key, count) => `${count} ${key === "waiting" && count === 1 ? "needs you" : toneWords[key]}`;
 
   function setText(node, text) {
@@ -6223,8 +6843,8 @@ renderApiForm();
 
   let batchSignature = "";
   function renderNavBatches(batches) {
-    const signature = JSON.stringify(batches.map((batch) => [batch.id, batch.label, batch.current, batch.readOnly,
-      batch.jobCount, batch.counts]));
+    const signature = JSON.stringify(batches.map((batch) => [batch.id, batch.label, batch.current, batch.default,
+      batch.named, batch.readOnly, batch.jobCount, batch.counts]));
     if (signature === batchSignature) return;
     batchSignature = signature;
     shell.batchTotal.textContent = batches.length ? String(batches.length) : "";
@@ -6243,15 +6863,18 @@ renderApiForm();
       const parts = Object.keys(toneWords).filter((key) => counts[key]).map((key) => toneText(key, counts[key]));
       const problems = `${counts.total} ${counts.total === 1 ? "problem" : "problems"}`;
       link.dataset.tip = label;
-      link.dataset.tipMeta = [batch.current ? "Current batch" : batch.readOnly ? "Read-only" : "", problems, ...parts]
-        .filter(Boolean).join(" · ");
+      // The default batch takes New problem; a batch made with New batch needs no word (its name is its own).
+      link.dataset.tipMeta = [batch.default ? "New problems go here" : batch.current ? "Current batch"
+        : batch.readOnly ? "Read-only" : "", problems, ...parts].filter(Boolean).join(" · ");
       const icon = element("span", "nav-batch-icon");
       icon.append(folderIcon());
       if (counts.running) icon.append(element("span", "nav-pulse"));
       const name = element("span", "nav-text", label);
       const line = element("span", "nav-counts");
       line.setAttribute("aria-hidden", "true");
-      line.append(element("span", "nc-kind", batch.current ? "current" : batch.readOnly ? "read-only" : "saved"));
+      const kind = batch.default ? "default" : batch.current ? "current" : batch.readOnly ? "read-only"
+        : batch.named ? "" : "saved";
+      if (kind) line.append(element("span", "nc-kind", kind));
       for (const key of Object.keys(toneWords)) {
         if (!counts[key]) continue;
         const stat = element("span", `nc ${key}`);
@@ -6268,15 +6891,16 @@ renderApiForm();
         segment.style.flexGrow = String(counts[key]);
         meter.append(segment);
       }
-      const other = counts.total - counts.running - counts.waiting - counts.paused - counts.limit - counts.done
-        - counts.incomplete;
+      const other = counts.total - counts.running - counts.waiting - counts.paused - counts.limit - counts.stopped
+        - counts.done - counts.incomplete;
       if (other > 0) {
         const segment = element("i", "other");
         segment.style.flexGrow = String(other);
         meter.append(segment);
       }
-      const spoken = element("span", "visually-hidden",
-        `, ${[batch.current ? "current batch" : batch.readOnly ? "read-only" : "", problems, ...parts].filter(Boolean).join(", ")}`);
+      // Read out after the name: "Default batch" needs no "current batch".
+      const spoken = element("span", "visually-hidden", `, ${[batch.default ? "" : batch.current ? "current batch"
+        : batch.readOnly ? "read-only" : "", problems, ...parts].filter(Boolean).join(", ")}`);
       link.append(icon, name, badge, line, meter, spoken);
       item.append(link);
       return item;
@@ -6284,7 +6908,7 @@ renderApiForm();
   }
 
   function renderTotals(batches) {
-    const sum = { running: 0, waiting: 0, paused: 0, limit: 0, done: 0, incomplete: 0, total: 0 };
+    const sum = { running: 0, waiting: 0, paused: 0, limit: 0, stopped: 0, done: 0, incomplete: 0, total: 0 };
     for (const batch of batches) {
       const counts = tally(batch);
       for (const key of Object.keys(sum)) sum[key] += counts[key];
@@ -6297,7 +6921,7 @@ renderApiForm();
         .filter(Boolean).join(" · ")
       : "Local workbench · idle");
     shell.foot.dataset.state = sum.running ? "running" : sum.waiting ? "waiting" : "idle";
-    // Overview: the meta line and the five totals.
+    // Overview: the meta line and the six totals.
     const meta = [element("span", "", `${batches.length} ${batches.length === 1 ? "batch" : "batches"}`),
       element("span", "", `${sum.total} ${sum.total === 1 ? "problem" : "problems"}`)];
     for (const key of Object.keys(toneWords)) {
@@ -6308,7 +6932,7 @@ renderApiForm();
       shell.overviewMeta.dataset.key = metaKey;
       shell.overviewMeta.replaceChildren(...meta);
     }
-    for (const key of ["running", "waiting", "paused", "limit", "done"]) {
+    for (const key of ["running", "waiting", "paused", "limit", "stopped", "done"]) {
       const value = shell.overviewStats.querySelector(`[data-stat="${key}"]`);
       if (!value) continue;
       setText(value, String(sum[key]));
@@ -6321,11 +6945,13 @@ renderApiForm();
   }
 
   function renderActive(where) {
+    // The New problem page adding to a batch marks that batch, not New problem (which adds to the default batch).
+    const inBatch = ["batch", "job"].includes(where) || (where === "new" && Boolean(currentBatch));
     for (const item of sidebar.querySelectorAll(".nav-item")) {
       const target = item.dataset.nav;
       const current = target === "batch"
-        ? (["batch", "job"].includes(where) && item.dataset.batchId === currentBatch ? (where === "job" ? "true" : "page") : "")
-        : target === where ? "page" : "";
+        ? (inBatch && item.dataset.batchId === currentBatch ? (where === "batch" ? "page" : "true") : "")
+        : target === where && !(where === "new" && currentBatch) ? "page" : "";
       if ((item.getAttribute("aria-current") || "") === current) continue;
       if (current) item.setAttribute("aria-current", current);
       else item.removeAttribute("aria-current");
@@ -6341,8 +6967,8 @@ renderApiForm();
   }
 
   // Batch page: show one status at a time; the counts follow the rows app.js renders.
-  const filterTones = { running: ["running"], waiting: ["waiting"], paused: ["paused"], limit: ["limit"], done: ["done"],
-    failed: ["failed", "stopped"] };
+  const filterTones = { running: ["running"], waiting: ["waiting"], paused: ["paused"], limit: ["limit"],
+    stopped: ["stopped"], done: ["done"], failed: ["failed"] };
   let filterBatch = null;
   function renderFilter() {
     if (filterBatch !== currentBatch) {
@@ -6381,7 +7007,7 @@ renderApiForm();
     if (route() !== "models") return;
     const catalog = roleModelCatalog();
     const size = (provider) => catalog.filter((model) => model.provider === provider).length;
-    const parts = [`${size("codex")} Codex CLI`, `${size("claude")} Claude CLI`,
+    const parts = [`${size("codex")} Codex CLI`, `${size("claude")} Claude Code`,
       apiModelsLoaded ? `${apiModels.length} API ${apiModels.length === 1 ? "key" : "keys"}` : "API keys"];
     const text = parts.join(" · ");
     setText(shell.modelsMeta, text);
@@ -6406,6 +7032,8 @@ renderApiForm();
       renderTotals(batches);
       notifyAttention(batches);
     }
+    // New batch appears where the server makes batches (not on an older server or the live gateway).
+    ui.navNewBatchItem.hidden = !batchOptions().create;
     renderActive(where);
     renderTitle(where);
     if (where === "batch") renderFilter();
@@ -6422,6 +7050,8 @@ renderApiForm();
   setInterval(sync, 1000);
   window.addEventListener("popstate", () => setTimeout(sync, 0));
   document.addEventListener("click", () => setTimeout(sync, 0));
+  // A batch made or renamed: the sidebar shows it, and marks the place, as soon as the dialog closes.
+  ui.batchDialog.addEventListener("close", () => setTimeout(sync, 0));
   document.addEventListener("visibilitychange", () => { if (!document.hidden) sync(); });
   // Transitions start after the first layout, so a remembered rail does not animate in.
   requestAnimationFrame(() => requestAnimationFrame(() => root.classList.add("shell-ready")));
@@ -6556,6 +7186,646 @@ ui.input.querySelector("details.advanced")?.addEventListener("toggle", (event) =
   if (event.target.open) loadRunningJobs();
 });
 syncAttentionAlerts();
+
+// Saved settings: the bar at the top of the New problem card (GET and POST /presets, ui/presets.py).
+// Named sets of this form's settings, kept on this computer; one of them may be the default that
+// every fresh New problem form opens with. A rerun pre-fill and a job sent back to the form keep their
+// own settings, and switching to Models & API keeps the draft. Saved settings hold the stages, each
+// role's source, model and reasoning, author subagents, critics and rounds, the time limit, the web
+// search cutoff, speed and activity log detail; never the statement, related works or prompts, which
+// Load leaves as they are. The page's own record lives on a function property: the first refresh(),
+// which runs before the declarations below, already reads the list.
+function presetStore() {
+  return (presetStore.value ||= {
+    loaded: false, unsupported: false, presets: [], defaultId: "", builtIn: null,
+    // Why the server cannot use its saved settings file (problem), or why the last read failed (error).
+    problem: "", error: "",
+    // Where the form's settings came from ({kind: "builtin"}, {kind: "preset", id, name} or {kind: "job"}),
+    // and presetSignature() when the form last matched it: "· changed" marks any difference.
+    current: { kind: "builtin" }, baseline: "",
+    // The note under the bar: a confirmation, or a warning (what a load could not keep).
+    note: "", warning: false, busy: false, renaming: "",
+    // The form problem a Save… showed on the page's error line (see showPresetFormProblem), and the bar
+    // button that gets the focus once a request ends, when its dialog closed meanwhile (see presetFocusBar).
+    formProblem: "", refocus: null,
+  });
+}
+
+async function presetRequest(path, body) {
+  const options = { headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  // Only a server without saved settings answers 404. Any other answer clears that: a tab left open
+  // across the advised restart can save and load again from its next New problem form.
+  presetStore().unsupported = response.status === 404;
+  if (response.status === 404) throw new Error(presetUnsupportedText);
+  if (!response.ok) throw new Error(data.error || `The request failed (HTTP ${response.status}).`);
+  return data;
+}
+
+// A name as saved settings' names are compared, ignoring case: lower case, as the server compares them
+// (name_key in ui/presets.py), so both sides agree on which names are taken.
+function presetNameKey(name) {
+  return String(name).toLowerCase();
+}
+
+function adoptPresets(data) {
+  const store = presetStore();
+  store.presets = Array.isArray(data.presets) ? data.presets : [];
+  store.defaultId = String(data.defaultId || "");
+  if (data.builtIn?.settings) store.builtIn = data.builtIn;
+  store.problem = String(data.problem || "");
+  store.error = "";
+  store.loaded = true;
+  // The settings the form came from keep their latest name (renamed here or in another tab), which
+  // the bar still shows once they are deleted.
+  const current = store.current?.kind === "preset"
+    ? store.presets.find((item) => item.id === store.current.id && !item.unusable) : null;
+  if (current) store.current.name = current.name;
+}
+
+// Read the list again; a failure leaves the form as it is (the built-in settings on a fresh form) and
+// the bar says why.
+async function loadPresets() {
+  const store = presetStore();
+  try {
+    adoptPresets(await presetRequest("/presets"));
+  } catch (error) {
+    if (!store.unsupported) store.error = `Saved settings cannot be read now: ${error.message}`;
+  }
+  renderPresetBar();
+}
+
+// A New problem form opened (see render): a fresh one takes the default saved settings, when they can
+// be used; a rerun pre-fill or a job sent back to the form keeps the job's settings.
+function presetsFormOpened(fresh) {
+  const store = presetStore();
+  store.note = "";
+  store.warning = false;
+  store.renaming = "";
+  const preset = fresh && !store.unsupported
+    ? store.presets.find((item) => item.id === store.defaultId && !item.unusable) : null;
+  if (preset) applyPreset(preset);
+  else store.current = { kind: fresh ? "builtin" : "job" };
+  store.baseline = presetSignature();
+  renderPresetBar();
+}
+
+// Load saved settings into the form. A role whose model is gone (an API model removed with its
+// connection, or a model TCS Prover no longer supports) gets GPT 6.1 Sol and keeps its reasoning
+// (lowered if that model lacks it), with a note; the saved settings themselves are never changed, so
+// they work again once the connection is added back. The server says which models are gone when it
+// lists the saved settings (unavailable); the menus, read with that list (see openPresetLoad), may
+// only lack one that was removed since.
+function applyPreset(preset) {
+  const store = presetStore();
+  const settings = { ...preset.settings };
+  const catalog = state.workflow?.settings?.model_catalog;
+  const missing = [], roles = ["review", "author", "critic", "writer"];
+  for (const role of roles) {
+    const model = String(settings[`${role}Model`] || "");
+    const listed = (preset.unavailable || []).find((item) => item.role === role);
+    const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
+    if (!gone) continue;
+    settings[`${role}Model`] = "gpt-6.1-sol";
+    missing.push({ role, label: listed?.label || preset.labels?.[model] || model });
+  }
+  applyComposerSettings(settings);
+  store.current = { kind: "preset", id: preset.id, name: preset.name };
+  store.note = missing.length ? presetMissingText(missing) : "";
+  store.warning = missing.length > 0;
+}
+
+function presetMissingText(missing) {
+  const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer" };
+  const fallback = "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.";
+  if (missing.length === 1) {
+    const [{ role, label }] = missing;
+    return `${roles[role][0].toUpperCase()}${roles[role].slice(1)} model not available (${label}), so the ${roles[role]} `
+      + `uses ${fallback}`;
+  }
+  return `Models not available (${missing.map(({ role, label }) => `${roles[role]}: ${label}`).join("; ")}), `
+    + `so these roles use ${fallback}`;
+}
+
+// What the bar compares to tell "· changed": every setting saved settings hold, as the form shows it.
+function presetSignature() {
+  const number = (input) => (String(input.value).trim() === "" ? "" : Number(input.value));
+  return JSON.stringify([selectedWorkflowStages(),
+    ...["review", "author", "critic", "writer"].flatMap((role) => [ui[`${role}Model`].value, ui[`${role}Effort`].value]),
+    number(ui.authorSubagents), number(ui.criticCount), number(ui.criticRounds), number(ui.thinkingHours),
+    ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings()]);
+}
+
+// The settings a Save sends: a job's (proofJobSettings) without its prompts. A number field of a stage
+// that is off (hidden, and not checked at Start) goes as the built-in value when it is not valid; see
+// presetNumberFields.
+function presetFormSettings() {
+  const settings = proofJobSettings();
+  delete settings.promptOverrides;
+  const builtIn = { authorSubagents: 0, criticCount: 3, criticRounds: 2, thinkingHours: 0,
+    ...presetStore().builtIn?.settings };
+  for (const { key, stage, problem } of presetNumberFields()) {
+    if (problem && !settings.workflowStages[stage]) settings[key] = builtIn[key];
+  }
+  return settings;
+}
+
+// The number fields saved settings hold: each one's setting, field, the stage that shows it, and why its
+// value cannot be saved (or ""). As at Start, a field is checked only while its stage is on; a Save keeps
+// a hidden field's value when it is valid, else the built-in value, which Start runs a stage that is off
+// with (ui/presets.py does the same).
+function presetNumberFields() {
+  const whole = (input, what) => {
+    const value = String(input.value).trim(), number = Number(value);
+    const min = Number(input.min || 0), max = input.max === "" ? Infinity : Number(input.max);
+    return value !== "" && Number.isInteger(number) && number >= min && number <= max ? ""
+      : `Enter ${min} to ${max} ${what}.`;
+  };
+  const hours = String(ui.thinkingHours.value).trim();
+  return [
+    { key: "authorSubagents", field: ui.authorSubagents, stage: "author",
+      problem: whole(ui.authorSubagents, "author subagents") },
+    { key: "criticCount", field: ui.criticCount, stage: "critic",
+      problem: whole(ui.criticCount, "independent critics") },
+    { key: "criticRounds", field: ui.criticRounds, stage: "critic", problem: whole(ui.criticRounds, "critic rounds") },
+    { key: "thinkingHours", field: ui.thinkingHours, stage: "author",
+      problem: hours === "" || !(Number(hours) >= 0) || !Number.isFinite(Number(hours))
+        ? "Enter a time limit: 0 for unlimited, or a positive number of hours." : "" },
+  ];
+}
+
+// Why the form's settings cannot be saved as they are, as [message, control to fix], or null. Only what
+// Start checks too: the fields of stages that are off are not (see presetNumberFields). Whether the
+// settings can run now (the models, a cutoff in the past) is checked at Start, as for any job.
+function presetFormProblem() {
+  const stages = selectedWorkflowStages();
+  if (!Object.values(stages).some(Boolean)) {
+    return ["Select at least one workflow stage before saving settings.", ui.workflowReview];
+  }
+  const shown = presetNumberFields().find(({ stage, problem }) => problem && stages[stage]);
+  if (shown) return [shown.problem, shown.field];
+  const cutoff = ui.retrievalCutoffUtc.value.trim();
+  return selectedRetrievalMode() === "historical" && !presetCutoffValid(cutoff)
+    ? ["Enter -1 to disable web-search tools, or a valid UTC cutoff such as 2026-10-02T14:13:12Z. Include "
+      + "seconds and the UTC timezone.", ui.retrievalCutoffUtc] : null;
+}
+
+// A cutoff the server reads (historical_search.parse_cutoff): seconds and UTC, and a real date.
+function presetCutoffValid(value) {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d{1,6})?(?:Z|\+00:00)$/.exec(value);
+  const parsed = match && new Date(`${match[1]}T${match[2]}Z`);
+  return Boolean(match) && Number.isFinite(parsed.getTime())
+    && parsed.toISOString().slice(0, 19) === `${match[1]}T${match[2]}`;
+}
+
+// The page's error line (as Start shows its own); the next Save… that passes these checks, and the next
+// Load, take it away again unless another message has replaced it since.
+function showPresetFormProblem([message, control]) {
+  presetStore().formProblem = message;
+  ui.notice.textContent = message;
+  show(ui.notice, true);
+  ui.notice.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+  const details = control.closest?.("details");
+  if (details) details.open = true;
+  control.focus();
+}
+
+function clearPresetFormProblem() {
+  const store = presetStore();
+  if (store.formProblem && !ui.notice.hidden && ui.notice.textContent === store.formProblem) show(ui.notice, false);
+  store.formProblem = "";
+}
+
+// The words the model summary uses for each reasoning level (Ultra, no longer offered, runs as Max).
+function presetEffortText(effort) {
+  return { ultra: "Max", max: "Max", xhigh: "Extra high", high: "High", medium: "Medium", low: "Low" }[effort] || effort;
+}
+
+// The menu label of each model the form names, by id.
+function presetFormLabels() {
+  const catalog = state.workflow?.settings?.model_catalog || [];
+  return Object.fromEntries(["review", "author", "critic", "writer"].map((role) => {
+    const select = ui[`${role}Model`];
+    const row = catalog.find((item) => item.id === select.value);
+    return [select.value, row?.label || select.selectedOptions?.[0]?.textContent || select.value];
+  }));
+}
+
+// One line about saved settings: their stages, the author's and the critics' models, the critic rounds,
+// the time limit and the web search cutoff ("All stages · GPT 6.1 Sol/Max author · …").
+function presetSummary(settings, labels = {}) {
+  const stages = settings.workflowStages || {};
+  const names = { review: "Review", author: "Author", critic: "Critic", writing: "Writing" };
+  const on = Object.keys(names).filter((stage) => stages[stage]);
+  const model = (role) => `${shortModelName(labels[settings[`${role}Model`]] || settings[`${role}Model`])}`
+    + `/${presetEffortText(settings[`${role}Effort`])}`;
+  const parts = [on.length === 4 ? "All stages" : on.map((stage, index) => (index ? names[stage].toLowerCase() : names[stage]))
+    .join(", ")];
+  if (stages.author) parts.push(`${model("author")} author`);
+  if (stages.critic) {
+    const rounds = Number(settings.criticRounds);
+    parts.push(`${model("critic")} critics × ${settings.criticCount}, ${rounds} round${rounds === 1 ? "" : "s"}`);
+  }
+  if (!stages.author && !stages.critic) {
+    const role = stages.review ? "review" : "writer";
+    parts.push(`${model(role)} ${role === "review" ? "reviewer" : "writer"}`);
+  }
+  if (stages.author) {
+    const hours = Number(settings.thinkingHours);
+    parts.push(hours > 0 ? `Time limit ${hoursText(hours)}` : "No time limit");
+  }
+  parts.push(settings.retrievalMode === "historical" ? `Cutoff ${settings.retrievalCutoffUtc}`
+    : settings.retrievalMode === "disabled" ? "No web search" : "Cutoff off");
+  // As in the footer's model summary: each part stays on one line, and a wrapped line starts after a "·".
+  return parts.map((part) => part.replace(/ /g, "\u00a0").replace(/-/g, "-\u2060")).join("\u00a0· ");
+}
+
+// The name a Save without one uses: the author's model and reasoning (or the first selected role's)
+// and the time, "GPT 6.1 Sol/Max author · 31 Oct 17:48", with " (2)" when saved settings have it.
+function presetGeneratedName(now = new Date()) {
+  const stages = selectedWorkflowStages();
+  const role = stages.author ? "author"
+    : ["review", "critic", "writer"].find((name) => stages[name === "writer" ? "writing" : name]) || "author";
+  const words = { review: "reviewer", author: "author", critic: "critic", writer: "writer" };
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const model = ui[`${role}Model`].value;
+  const time = `${now.getDate()} ${months[now.getMonth()]} ${String(now.getHours()).padStart(2, "0")}:`
+    + String(now.getMinutes()).padStart(2, "0");
+  const base = `${shortModelName(presetFormLabels()[model] || model)}/${presetEffortText(ui[`${role}Effort`].value)} `
+    + `${words[role]} · ${time}`;
+  const taken = new Set(presetStore().presets.filter((item) => !item.unusable).map((item) => presetNameKey(item.name)));
+  let name = base;
+  for (let number = 2; taken.has(presetNameKey(name)); number += 1) name = `${base} (${number})`;
+  return name;
+}
+
+function renderPresetBar() {
+  const store = presetStore();
+  const current = store.current || { kind: "builtin" };
+  const saved = current.kind === "preset" ? store.presets.find((item) => item.id === current.id && !item.unusable) : null;
+  const changed = Boolean(store.baseline) && presetSignature() !== store.baseline;
+  // A confirmation ("Saved as …") gives way to the next edit; a warning stays until the next load.
+  if (changed && store.note && !store.warning) store.note = "";
+  presetUi.name.textContent = current.kind === "job" ? "From the job"
+    : current.kind === "preset" ? saved?.name || current.name : "Built-in";
+  presetUi.marks.textContent = [
+    saved && saved.id === store.defaultId ? "default" : "",
+    current.kind === "preset" && !saved && store.loaded && !store.problem && !store.error ? "deleted" : "",
+    changed ? "changed" : "",
+  ].filter(Boolean).map((mark) => ` · ${mark}`).join("");
+  presetUi.bar.dataset.changed = String(changed);
+  const note = store.note || (store.unsupported ? presetUnsupportedText : store.problem || store.error);
+  // A live region that stays rendered: empty, it takes no room (styles.css).
+  if (presetUi.note.textContent !== note) presetUi.note.textContent = note;
+  presetUi.note.dataset.tone = store.note && !store.warning ? "info" : "warning";
+  // Writes are refused while the file cannot be used; Built-in settings still load.
+  presetUi.load.disabled = store.unsupported || store.busy;
+  presetUi.save.disabled = presetUi.confirmSave.disabled = store.unsupported || store.busy || Boolean(store.problem);
+}
+
+function openPresetSave() {
+  const store = presetStore();
+  if (presetUi.save.disabled) return;
+  const problem = presetFormProblem();
+  if (problem) return showPresetFormProblem(problem);
+  clearPresetFormProblem();
+  presetUi.saveName.value = "";
+  presetUi.saveName.placeholder = presetGeneratedName();
+  presetUi.saveDefault.checked = true;
+  presetUi.saveSummary.textContent = presetSummary(presetFormSettings(), presetFormLabels());
+  show(presetUi.saveError, false);
+  // Closing a modal dialog returns focus to what had it: the button that opened it (a click does not
+  // focus a button in every browser).
+  presetUi.save.focus();
+  presetUi.saveDialog.showModal();
+  presetUi.saveName.focus();
+  // Saved settings may have changed in another tab: whether a name is taken depends on the list.
+  loadPresets().then(() => {
+    if (presetUi.saveDialog.open && !store.busy) presetUi.saveName.placeholder = presetGeneratedName();
+  });
+}
+
+async function savePreset(event) {
+  event?.preventDefault();
+  const store = presetStore();
+  if (store.busy || presetUi.confirmSave.disabled) return;
+  const name = presetUi.saveName.value.trim() || presetUi.saveName.placeholder || presetGeneratedName();
+  const clash = store.presets.find((item) => !item.unusable && presetNameKey(item.name) === presetNameKey(name));
+  if (clash && !confirm(`Replace the saved settings “${clash.name}”?`)) return;
+  const makeDefault = presetUi.saveDefault.checked;
+  const body = { name, settings: presetFormSettings(), makeDefault, ...(clash ? { replaceId: clash.id } : {}) };
+  setPresetBusy(true);
+  show(presetUi.saveError, false);
+  try {
+    const data = await presetRequest("/presets", body);
+    adoptPresets(data);
+    const saved = store.presets.find((item) => item.id === data.savedId);
+    store.current = { kind: "preset", id: data.savedId, name: saved?.name || name };
+    store.baseline = presetSignature();
+    store.note = `Saved as “${saved?.name || name}”.${makeDefault ? " New problems open with these settings." : ""}`;
+    store.warning = false;
+    presetUi.saveDialog.close();
+  } catch (error) {
+    presetUi.saveError.textContent = error.message;
+    show(presetUi.saveError, true);
+    // Settings saved meanwhile under this name (in another tab): the next Save asks to replace them.
+    if (!store.unsupported) await loadPresets();
+  } finally {
+    setPresetBusy(false);
+  }
+}
+
+async function openPresetLoad() {
+  const store = presetStore();
+  if (presetUi.load.disabled) return;
+  store.renaming = "";
+  presetUi.loadStatus.textContent = "Reading saved settings…";
+  // Closing a modal dialog returns focus to what had it: the button that opened it (a click does not
+  // focus a button in every browser). Focused before the list disables it while it is read.
+  presetUi.load.focus();
+  // The list is read again every time; until it arrives its rows (as last read) take no action. So are
+  // the model menus, which Load fills: another tab may have added or removed an API connection since
+  // this form opened (see applyPreset).
+  setPresetBusy(true);
+  renderPresetList();
+  presetUi.loadDialog.showModal();
+  await Promise.all([loadPresets(), loadPresetModels()]);
+  presetUi.loadStatus.textContent = store.problem || store.error;
+  setPresetBusy(false);
+}
+
+// The role menus as the server has them now (GET /api-models, as Models & API reads them). A failed read
+// keeps them as they are. Not while an API connection is being changed: its answer brings the menus.
+async function loadPresetModels() {
+  if (typeof apiModelRequest !== "function" || apiModelBusy) return;
+  try {
+    adoptApiModels(await apiModelRequest("/api-models"));
+  } catch (_) {
+    // The menus stay as they were read last.
+  }
+}
+
+function presetElement(tag, className = "", text = "") {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text) element.textContent = text;
+  return element;
+}
+
+function presetButton(id, name, action, label, enabled, primary = false) {
+  const button = presetElement("button", `${primary ? "secondary" : "ghost"} compact preset-${action}`, label);
+  button.type = "button";
+  button.dataset.presetAction = action;
+  button.dataset.presetId = id;
+  button.setAttribute("aria-label", `${label} ${name}`);
+  button.disabled = !enabled;
+  return button;
+}
+
+// One row of the Load list: the name (Default marked), a summary and any model that is gone, then
+// Load, Rename, Make default (or Remove default) and Delete in columns. Settings that cannot be used
+// say why and can only be deleted; Built-in settings can be loaded or made the default.
+function presetRow(preset) {
+  const store = presetStore();
+  const writable = !store.busy && !store.unsupported && !store.problem;
+  const builtIn = preset.id === "builtin";
+  const isDefault = builtIn ? !store.defaultId : !preset.unusable && preset.id === store.defaultId;
+  const renaming = store.renaming === preset.id;
+  const row = presetElement("li", `preset-row${preset.unusable ? " unusable" : ""}${builtIn ? " builtin" : ""}`);
+  row.dataset.preset = preset.id;
+  const copy = presetElement("div", "preset-row-copy"), head = presetElement("div", "preset-row-head");
+  if (renaming) {
+    const input = presetElement("input", "preset-rename");
+    input.type = "text";
+    // No maxLength: a pasted longer name is refused by the server with its reason, never cut silently.
+    input.autocomplete = "off";
+    input.value = preset.name;
+    input.dataset.presetRename = preset.id;
+    input.setAttribute("aria-label", `New name for ${preset.name}`);
+    head.append(input);
+  } else head.append(presetElement("strong", "preset-row-name", preset.name));
+  if (isDefault && !renaming) head.append(presetElement("span", "badge preset-default-badge", "Default"));
+  copy.append(head);
+  if (preset.unusable) {
+    copy.append(presetElement("p", "preset-row-warning", `${preset.problem} These settings can only be deleted.`));
+  } else {
+    copy.append(presetElement("p", "preset-row-summary", preset.settings
+      ? presetSummary(preset.settings, preset.labels) : "TCS Prover's own settings"));
+    for (const missing of preset.unavailable || []) {
+      copy.append(presetElement("p", "preset-row-warning", `${missing.text}; it loads GPT 6.1 Sol instead.`));
+    }
+  }
+  row.append(copy);
+  const cells = builtIn ? [["load", "Load", !store.busy, true], null,
+    isDefault ? null : ["builtin-default", "Make default", writable], null]
+    : preset.unusable ? [null, null, null, ["delete", "Delete", writable]]
+    : renaming ? [["rename-save", "Save name", writable, true], ["rename-cancel", "Cancel", !store.busy], null, null]
+    : [["load", "Load", !store.busy, true], ["rename", "Rename", writable],
+      ["default", isDefault ? "Remove default" : "Make default", writable], ["delete", "Delete", writable]];
+  for (const cell of cells) {
+    row.append(cell ? presetButton(preset.id, preset.name, ...cell) : presetElement("span", "preset-cell"));
+  }
+  return row;
+}
+
+function renderPresetList(focus = null) {
+  const store = presetStore();
+  const usable = store.presets.filter((item) => !item.unusable);
+  const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
+  const rows = [...usable.filter((item) => item.id === store.defaultId),
+    ...usable.filter((item) => item.id !== store.defaultId).sort(byName),
+    ...store.presets.filter((item) => item.unusable)].map(presetRow);
+  if (store.loaded && !usable.length && !store.problem) {
+    rows.push(presetElement("li", "preset-empty", "No saved settings yet. Choose Save… on the form to keep its settings "
+      + "under a name."));
+  }
+  rows.push(presetRow({ id: "builtin", name: store.builtIn?.name || "Built-in settings",
+    settings: store.builtIn?.settings || null, labels: store.builtIn?.labels || {} }));
+  presetUi.list.replaceChildren(...rows);
+  // A re-drawn list keeps the focus on the same action (or the row's Load), else on Close.
+  if (focus) {
+    const rename = presetUi.list.querySelector("input[data-preset-rename]");
+    const target = focus.action === "rename" && rename ? rename
+      : [...presetUi.list.querySelectorAll("button[data-preset-action]")].find((button) => button.dataset.presetId === focus.id
+        && button.dataset.presetAction === focus.action && !button.disabled)
+      || [...presetUi.list.querySelectorAll("button[data-preset-action]")].find((button) => button.dataset.presetId === focus.id
+        && button.dataset.presetAction === "load" && !button.disabled)
+      || presetUi.closeLoad;
+    target.focus();
+    if (target === rename) rename.select?.();
+  }
+}
+
+function setPresetBusy(busy, focus = null) {
+  presetStore().busy = busy;
+  // While a request runs the list stays as it is, its controls disabled; its answer re-draws it.
+  if (busy) {
+    for (const control of [...presetUi.list.querySelectorAll("button"), ...presetUi.list.querySelectorAll("input")]) {
+      control.disabled = true;
+    }
+  }
+  if (!busy && presetUi.loadDialog.open) renderPresetList(focus);
+  presetUi.loadDialog.setAttribute("aria-busy", String(busy));
+  renderPresetBar();
+  // A dialog closed while the request ran (Escape): its bar button takes the focus now that it can, unless
+  // the focus went somewhere else meanwhile.
+  const store = presetStore(), button = store.refocus;
+  if (busy || !button) return;
+  store.refocus = null;
+  const lost = !document.activeElement || document.activeElement === document.body;
+  if (lost && !presetUi.saveDialog.open && !presetUi.loadDialog.open) button.focus();
+}
+
+// Back to the bar's button that opened a dialog when it closes. While a request runs that button is
+// disabled and cannot take the focus; setPresetBusy gives it the focus when the request ends.
+function presetFocusBar(button) {
+  const store = presetStore();
+  store.refocus = button.disabled && store.busy ? button : null;
+  if (!store.refocus) button.focus();
+}
+
+// A change made from the Load list; the list shows the server's answer (or, after a refusal, the
+// list as it is now) and the status line says what happened.
+async function presetListAction(path, body, done, focus) {
+  const store = presetStore();
+  if (store.busy) return;
+  setPresetBusy(true);
+  try {
+    adoptPresets(await presetRequest(path, body));
+    presetUi.loadStatus.textContent = done();
+    store.renaming = "";
+  } catch (error) {
+    presetUi.loadStatus.textContent = error.message;
+    if (!store.unsupported) {
+      await loadPresets();
+      if (store.error) presetUi.loadStatus.textContent = `${error.message} ${store.error}`;
+    }
+  } finally {
+    setPresetBusy(false, focus);
+  }
+}
+
+function loadPresetFromList(id) {
+  const store = presetStore();
+  const preset = id === "builtin" ? null : store.presets.find((item) => item.id === id && !item.unusable);
+  if (preset) applyPreset(preset);
+  else {
+    applyComposerSettings(store.builtIn?.settings || {});
+    store.current = { kind: "builtin" };
+    store.warning = false;
+  }
+  if (!store.warning) store.note = `Loaded “${preset ? preset.name : "Built-in settings"}”.`;
+  store.baseline = presetSignature();
+  // Every number field now holds a saved value: a problem a Save… named is gone.
+  clearPresetFormProblem();
+  presetUi.loadDialog.close();
+  renderPresetBar();
+}
+
+// Make saved settings the default ("": the built-in settings); the focus stays on the row acted on.
+function setPresetDefault(id, row = id || "builtin") {
+  const store = presetStore();
+  const name = store.presets.find((item) => item.id === id)?.name;
+  return presetListAction("/presets/default", { id }, () => (id ? `New problems now open with “${name}”.`
+    : "New problems now open with the built-in settings."),
+  { id: row, action: row === "builtin" ? "builtin-default" : "default" });
+}
+
+function startPresetRename(id) {
+  presetStore().renaming = id;
+  presetUi.loadStatus.textContent = "";
+  renderPresetList({ id, action: "rename" });
+}
+
+function cancelPresetRename() {
+  const store = presetStore(), id = store.renaming;
+  store.renaming = "";
+  renderPresetList({ id, action: "rename" });
+}
+
+function savePresetRename(id) {
+  const store = presetStore();
+  const input = presetUi.list.querySelector("input[data-preset-rename]");
+  const name = String(input?.value || "").trim();
+  const preset = store.presets.find((item) => item.id === id);
+  const clash = store.presets.find((item) => !item.unusable && item.id !== id
+    && presetNameKey(item.name) === presetNameKey(name));
+  if (!name || clash) {
+    presetUi.loadStatus.textContent = !name ? "Enter a name."
+      : `Saved settings called “${clash.name}” already exist. Choose another name.`;
+    input?.focus();
+    return;
+  }
+  if (name === preset?.name) return cancelPresetRename();
+  return presetListAction("/presets/rename", { id, name }, () => `Renamed to “${name}”.`, { id, action: "rename" });
+}
+
+function deletePresetFromList(id) {
+  const store = presetStore();
+  const preset = store.presets.find((item) => item.id === id);
+  if (!preset) return;
+  const fallback = preset.id === store.defaultId ? "\n\nNew problems will open with the built-in settings." : "";
+  if (!confirm(`Delete the saved settings “${preset.name}”?${fallback}`)) return;
+  return presetListAction("/presets/delete", { id }, () => `Deleted “${preset.name}”.`, { id: "", action: "" });
+}
+
+const presetUnsupportedText = "This TCS Prover server cannot save settings. Restart TCS Prover to update it.";
+const presetUi = {
+  card: ui.input.querySelector(".composer"), bar: $("presetBar"), name: $("presetName"), marks: $("presetMarks"),
+  note: $("presetNote"), load: $("loadPresetButton"), save: $("savePresetButton"),
+  saveDialog: $("presetSaveDialog"), saveForm: $("presetSaveForm"), saveName: $("presetSaveName"),
+  saveSummary: $("presetSaveSummary"), saveDefault: $("presetSaveDefault"), saveError: $("presetSaveError"),
+  cancelSave: $("cancelPresetSaveButton"), confirmSave: $("confirmPresetSaveButton"),
+  loadDialog: $("presetLoadDialog"), closeLoad: $("closePresetLoadButton"), loadStatus: $("presetLoadStatus"),
+  list: $("presetList"),
+};
+presetUi.load.onclick = openPresetLoad;
+presetUi.save.onclick = openPresetSave;
+presetUi.saveForm.addEventListener("submit", savePreset);
+presetUi.cancelSave.onclick = () => presetUi.saveDialog.close();
+presetUi.closeLoad.onclick = () => presetUi.loadDialog.close();
+// Back to the bar's button (see presetFocusBar); a load closes the list with its own result in the bar.
+presetUi.saveDialog.addEventListener("close", () => presetFocusBar(presetUi.save));
+presetUi.loadDialog.addEventListener("close", () => {
+  presetStore().renaming = "";
+  presetFocusBar(presetUi.load);
+});
+// Escape while renaming ends the renaming, not the list.
+presetUi.loadDialog.addEventListener("cancel", (event) => {
+  if (!presetStore().renaming) return;
+  event.preventDefault();
+  cancelPresetRename();
+});
+presetUi.list.onclick = (event) => {
+  const button = event.target.closest?.("button[data-preset-action]");
+  if (!button || button.disabled) return;
+  const id = button.dataset.presetId;
+  ({ load: loadPresetFromList, rename: startPresetRename, "rename-save": savePresetRename,
+    "rename-cancel": cancelPresetRename, delete: deletePresetFromList, "builtin-default": () => setPresetDefault("", "builtin"),
+    default: (identity) => setPresetDefault(identity === presetStore().defaultId ? "" : identity, identity),
+  })[button.dataset.presetAction]?.(id);
+};
+// Enter in the name being edited saves it (Escape ends the renaming, above); not an Enter that ends an
+// input method's composition (Chinese or Japanese text still being typed).
+presetUi.list.onkeydown = (event) => {
+  const input = event.target.closest?.("input[data-preset-rename]");
+  if (!input || event.key !== "Enter" || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  savePresetRename(input.dataset.presetRename);
+};
+// Any edit of the form may change what "· changed" says (the bar reads the controls themselves).
+for (const type of ["input", "change"]) {
+  presetUi.card?.addEventListener(type, (event) => {
+    if (!presetUi.bar.contains(event.target)) renderPresetBar();
+  });
+}
+renderPresetBar();
 
 // Reduced motion: two page calls ask for a smooth scroll (the create error notice and a folder
 // run's result). An explicit behavior wins over the stylesheet's preference, so on these

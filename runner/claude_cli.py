@@ -103,6 +103,9 @@ _STATE_LOCK = threading.Lock()
 _CONFIG_CHECK_LOCK = threading.Lock()
 # Identical refusals to reopen a saved author conversation before it is replaced.
 RESUME_REFUSALS = 3
+# A Stop the user asked for, as workflow_runner.STOP_REQUESTED_TEXT and AUTHOR_STOPPED_TEXT say it.
+STOP_REQUESTED_TEXT = "Stop requested: the author may finish its current step for up to {grace} before it is stopped."
+AUTHOR_STOPPED_TEXT = "The author stopped at your request; its saved conversation is kept."
 _REFUSALS = {}  # session id -> [refusal, count] within this process
 # Private settings folders are named run-<owner PID>-<random>.
 SETTINGS_PREFIX = "run-"
@@ -159,19 +162,19 @@ def _failure(runtime, name):
 
 
 def executable(runtime):
-    """Find the installed Claude CLI, preferring a native binary to a Windows batch launcher."""
+    """Find the installed Claude Code, preferring a native binary to a Windows batch launcher."""
 
     path = shutil.which("claude")
     if path and os.name == "nt":
         path = native_windows_executable(path)
     if not path:
         # Not installed yet, or missing for a moment while Claude Code updates itself: a later attempt finds it.
-        raise _failure(runtime, "CLIUnavailable")("Claude CLI is not installed or is not on PATH.")
+        raise _failure(runtime, "CLIUnavailable")("Claude Code is not installed or is not on PATH.")
     return path
 
 
 def located(runtime, model, stage=None):
-    """executable(), where a Claude CLI that is not installed fails with the runner's missing_cli().
+    """executable(), where Claude Code not being installed fails with the runner's missing_cli().
 
     That error names the role (``stage``) and the model that need the CLI; a
     runtime without missing_cli() (a test double) gets executable()'s own error.
@@ -691,10 +694,10 @@ def surprise_failure(surprise, denied, runtime, stopped):
     names = ", ".join(surprise)
     if any(name in denied or not TOOL_NAME.match(name) for name in surprise):
         return _failure(runtime, "SafetyStop")(
-            f"Claude CLI enabled unexpected tools ({names}) that --disallowedTools did not remove; {stopped}.")
+            f"Claude Code enabled unexpected tools ({names}) that --disallowedTools did not remove; {stopped}.")
     with _STATE_LOCK:
         DISALLOWED_TOOLS.update(surprise)
-    return runtime.Error(f"Claude CLI enabled unexpected tools ({names}); {stopped}, and the next attempt "
+    return runtime.Error(f"Claude Code enabled unexpected tools ({names}); {stopped}, and the next attempt "
                          "denies them with --disallowedTools.")
 
 
@@ -1184,7 +1187,7 @@ def _missing_session(text):
 
 
 def config_directory(environment):
-    """Where a Claude CLI started with ``environment`` keeps its saved conversations."""
+    """Where Claude Code started with ``environment`` keeps its saved conversations."""
 
     configured = environment.get("CLAUDE_CONFIG_DIR")
     if configured:
@@ -1486,6 +1489,20 @@ def _close_stream(stream):
         pass
 
 
+def pause_request_cause(path):
+    """Why the controller asks the author to stop: "stopped" (the user's Stop) or "pause".
+
+    As workflow_runner.pause_request_cause: the controller writes {"cause": "stopped"} for a Stop and
+    "{}" for a pause; a file that cannot be read or parsed is a pause.
+    """
+
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError, TypeError):
+        return "pause"
+    return "stopped" if isinstance(value, dict) and value.get("cause") == "stopped" else "pause"
+
+
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  node_name="author", stages=None, initial_instruction="", handoff_note=""):
     """Run the persistent author through Claude with the Codex goal-session protocol.
@@ -1602,6 +1619,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     expired = threading.Event()
     pausing = threading.Event()
     pause_file = options.get("goal_pause_file")
+    # Why the controller asked the author to stop ("stopped" or "pause"), once its request is seen.
+    stop_cause = {"value": ""}
     # "output": the model produced something in the current turn; "steered": a
     # live instruction or re-anchor joined it; "anchor": the newest assistant
     # message with output; "fresh": this attempt started the conversation;
@@ -1755,6 +1774,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if pause_file and Path(pause_file).is_file() and state["active"]:
                 if pause_started is None:
                     pause_started = time.monotonic()
+                    # A Stop the user asked for, or a pause: read once, when the request is first seen.
+                    stop_cause["value"] = pause_request_cause(pause_file)
                     pausing.set()
                 with lock:
                     if transport and state["running"] and state["turn"] and state["turn"] != interrupted_turn:
@@ -1762,8 +1783,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         try:
                             interrupt()
                             emit("status", label="Author stopping", threadId=thread,
-                                 text=f"Pause requested: the author may finish its current step for up to "
-                                      f"{runtime._span_text(grace)} before it is stopped.")
+                                 text=STOP_REQUESTED_TEXT.format(grace=runtime._span_text(grace))
+                                 if stop_cause["value"] == "stopped" else
+                                 f"Pause requested: the author may finish its current step for up to "
+                                 f"{runtime._span_text(grace)} before it is stopped.")
                         except (OSError, ValueError) as exc:
                             emit("diagnostic", text=f"Could not interrupt the author: {exc}")
                 if time.monotonic() - pause_started >= grace:
@@ -1833,7 +1856,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Workflow time limit reached.")
         if transport.process.poll() is not None and state["initialized"]:
             # The idle CLI ended (for example during a long review); its session is saved.
-            emit("diagnostic", text="The Claude CLI exited between turns; resuming its saved session.", threadId=thread)
+            emit("diagnostic", text="Claude Code exited between turns; resuming its saved session.", threadId=thread)
             launch(session, True)
         state.update(active=True, instruction=instruction, request={
             "label": "Exact solve input", "text": instruction, "model": model,
@@ -1948,7 +1971,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if not leftovers:
             return False
         emit("diagnostic", threadId=session,
-             text=f"A Claude CLI left by an earlier TCS Prover runner (PID {', '.join(map(str, leftovers))}) still "
+             text=f"A Claude Code process left by an earlier TCS Prover runner (PID {', '.join(map(str, leftovers))}) still "
                   "held the saved author conversation; it was stopped and the conversation is reopened.")
         stop_processes(leftovers, grace)
         launch(session, True)
@@ -2122,7 +2145,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 now = time.monotonic()
                 if activity["at"] is not None and now - activity["at"] >= probe_limit:
                     raise runtime.Error(
-                        f"The Claude CLI stopped responding: no event for {runtime._span_text(now - activity['last'])} "
+                        f"Claude Code stopped responding: no event for {runtime._span_text(now - activity['last'])} "
                         f"and no answer to a check within {runtime._span_text(probe_limit)}.")
                 if activity["at"] is None and state["running"] and now - activity["last"] >= inactivity:
                     # Any message, the answer included, shows that the CLI still works.
@@ -2133,7 +2156,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     except (OSError, ValueError):
                         pass  # The CLI ended; its output reports why.
                     emit("diagnostic", text=f"No author event for {runtime._span_text(inactivity)}; checking that "
-                                            "the Claude CLI still answers.", threadId=thread)
+                                            "Claude Code still answers.", threadId=thread)
                 continue
             activity.update(last=time.monotonic(), at=None)
             if message is None or (message.get("type") == "result" and state["resuming"] and not state["initialized"]):
@@ -2153,7 +2176,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         state["resent"] = True
                     continue
                 if message is None:
-                    raise runtime.Error("Claude CLI stopped unexpectedly." + (f"\n{detail}" if detail else ""))
+                    raise runtime.Error("Claude Code stopped unexpectedly." + (f"\n{detail}" if detail else ""))
             kind = message.get("type")
             retrying = api_retry_text(message)
             if retrying:
@@ -2269,7 +2292,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         abandon_turn("interrupted" if stopping else "failed")
         if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
             pausing.set()
-            emit("status", label="Author paused", text=str(exc), threadId=thread)
+            if (stop_cause["value"] or (pause_request_cause(pause_file) if pause_file else "pause")) == "stopped":
+                emit("status", label="Author stopped", text=AUTHOR_STOPPED_TEXT, threadId=thread)
+            else:
+                emit("status", label="Author paused", text=str(exc), threadId=thread)
         else:
             pausing.set()
             # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
@@ -2437,7 +2463,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         if not leftovers:
             return False
         emit("diagnostic", threadId=session,
-             text=f"A Claude CLI left by an earlier TCS Prover runner (PID {', '.join(map(str, leftovers))}) still "
+             text=f"A Claude Code process left by an earlier TCS Prover runner (PID {', '.join(map(str, leftovers))}) still "
                   "held the saved author conversation; it was stopped and the conversation is reopened.")
         stop_processes(leftovers, grace)
         launch()
@@ -2507,7 +2533,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                     except (OSError, ValueError):
                         pass  # The CLI ended; its output reports why.
                     emit("diagnostic", text=f"No author event for {runtime._span_text(inactivity)}; checking that "
-                                            "the Claude CLI still answers.", threadId=session)
+                                            "Claude Code still answers.", threadId=session)
                 continue
             activity.update(last=time.monotonic(), at=None)
             if message is None or (message.get("type") == "result" and not state["initialized"]):
@@ -2533,7 +2559,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                         # Claude refused to reopen the conversation; it is not a provider failure.
                         first = next((line.strip() for line in detail.splitlines() if line.strip()), detail)
                         raise _failure(runtime, "ConversationRefused")(_clip(first, 300))
-                raise runtime.Error("Claude CLI stopped unexpectedly." + (f"\n{detail}" if detail else ""))
+                raise runtime.Error("Claude Code stopped unexpectedly." + (f"\n{detail}" if detail else ""))
             kind = message.get("type")
             retrying = api_retry_text(message)
             if retrying:

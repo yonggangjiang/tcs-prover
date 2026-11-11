@@ -237,10 +237,41 @@ class ProviderMarkupTests(unittest.TestCase):
                 self.assertEqual(groups, expected)
                 source_options = parsed.menus[f"{role}Source"]
                 self.assertEqual([option[0] for option in source_options], ['codex', 'claude'])
+                # The source menus' names, as the server names the sources (providers.PROVIDER_LABELS).
+                self.assertEqual([option[2] for option in source_options],
+                                 [providers.PROVIDER_LABELS[option[0]] for option in source_options])
+                self.assertEqual(source_options[1][2], "Claude Code")
                 chip = parsed.elements[f"{role}Model"].get("aria-describedby")
                 self.assertEqual(chip, f"{role}ModelProvider")
                 self.assertEqual(parsed.elements[chip]["class"], "provider-chip")
                 self.assertEqual(parsed.texts[chip].strip(), "Codex CLI")
+
+    def test_the_page_and_the_readme_call_the_claude_program_claude_code(self):
+        # The owner's decision C: "Claude Code" everywhere, while the Codex CLI keeps its name.
+        self.assertNotIn("Claude CLI", INDEX.read_text(encoding="utf-8"))
+        parsed = page()
+        self.assertEqual(parsed.texts["modelsMeta"].strip(), "Codex CLI · Claude Code · API models")
+        self.assertIn("Codex CLI and Claude Code models use the logins on this computer",
+                      " ".join(parsed.texts["modelHelp"].split()))
+        self.assertIn("leave room for the max output (Claude Code also asks for at most that much).",
+                      " ".join(parsed.texts["apiModelLimitsHelp"].split()))
+        # The script says "Claude CLI" only to recognize an earlier controller's words (which it shows as now).
+        code = "\n".join(line for line in APP.read_text(encoding="utf-8").splitlines()
+                         if not line.strip().startswith("//"))
+        before = re.findall(r'(.{0,4})"(?:the )?Claude CLI"', code)
+        self.assertTrue(before)
+        self.assertTrue(all(text.endswith("=== ") for text in before), before)
+        # The README and its guide pages (docs/) name the earlier name once, in the Claude Code section of the
+        # models guide, for the activity logs of older jobs.
+        guides = {path.name: path.read_text(encoding="utf-8")
+                  for path in (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")))}
+        self.assertIn("models.md", guides)
+        self.assertEqual(sum(" ".join(text.split()).count("Claude CLI") for text in guides.values()), 1)
+        self.assertIn("Earlier versions of TCS Prover called this program the Claude CLI; the activity logs of jobs "
+                      "run then keep that name.", " ".join(guides["models.md"].split()))
+        self.assertRegex(guides["models.md"], r"(?m)^#{2,3} Claude Code$")
+        for name, text in guides.items():
+            self.assertNotIn("#claude-cli", text, name)
 
     def test_deepseek_and_the_static_preview_are_gone(self):
         for name in ("index.html", "app.js", "styles.css"):
@@ -252,7 +283,7 @@ class ProviderMarkupTests(unittest.TestCase):
         parsed = page()
         speed = " ".join(parsed.texts["speedHelp"].split())
         self.assertIn("Fast applies to Codex CLI models only", speed)
-        self.assertIn("Claude CLI and API models always run at standard speed", speed)
+        self.assertIn("Claude Code models and API models always run at standard speed", speed)
 
     def test_api_model_form_keeps_the_key_out_of_sight(self):
         parsed = page()
@@ -346,11 +377,28 @@ let state = {workflow: {settings: {model_catalog: fixture.catalog, model_efforts
 const ui = {};
 for (const role of ['review', 'author', 'critic', 'writer']) {
   ui[role + 'Model'] = roleMenu(fixture.menu);
-  ui[role + 'Source'] = new Select([new Option('Codex CLI', 'codex'), new Option('Claude CLI', 'claude')]);
+  ui[role + 'Source'] = new Select([new Option('Codex CLI', 'codex'), new Option('Claude Code', 'claude')]);
   ui[role + 'Effort'] = new Select([new Option('Max', 'max')]);
 }
 const modelProvider = (id) => fixture.catalog.find((row) => row.id === id)?.provider
   || (id.startsWith('api:') ? 'api' : id.startsWith('claude-') ? 'claude' : 'codex');
+""")
+
+    def test_the_source_menus_call_the_claude_program_claude_code(self):
+        self.run_app(self.MENUS, self.menus_setup([]), r"""
+const names = (role) => ui[role + 'Source'].options.map((option) => [option.value, option.textContent]);
+// Before the server names the sources, the page's own names.
+syncModelMenus();
+for (const role of ['review', 'author', 'critic', 'writer']) {
+  assert.deepEqual(names(role), [['codex', 'Codex CLI'], ['claude', 'Claude Code']]);
+}
+// As the server names them now, and as an earlier controller still names Claude Code.
+for (const label of ['Claude Code', 'Claude CLI']) {
+  state.workflow.settings.model_sources = [{id: 'codex', label: 'Codex CLI', provider: 'codex'},
+    {id: 'claude', label, provider: 'claude'}];
+  syncModelMenus();
+  assert.deepEqual(names('author'), [['codex', 'Codex CLI'], ['claude', 'Claude Code']], label);
+}
 """)
 
     def test_source_model_picker_filters_and_preserves_independent_role_choices(self):
@@ -423,7 +471,7 @@ const offered = () => ui.authorEffort.options.filter((o) => !o.hidden && !o.disa
 ui.authorEffort.value = 'ultra';
 syncEffortChoices('author');
 assert.deepEqual(offered(), levels);
-// Claude CLI models list no Ultra: it is hidden, and a chosen Ultra runs as Max.
+// Claude Code models list no Ultra: it is hidden, and a chosen Ultra runs as Max.
 ui.authorModel.value = 'claude-opus-5-5';
 syncEffortChoices('author');
 assert.deepEqual(offered(), ['max', 'xhigh', 'high', 'medium', 'low']);
@@ -472,7 +520,7 @@ const disabledGroups = (role) => ui[role + 'Model'].children.filter((group) => g
                  "hasKey": False}]
         self.run_app(self.PROVIDERS, self.providers_setup(rows), r"""
 for (const [model, text, provider] of [
-  ['gpt-6.1-sol', 'Codex CLI', 'codex'], ['claude-haiku-5-5', 'Claude CLI', 'claude'],
+  ['gpt-6.1-sol', 'Codex CLI', 'codex'], ['claude-haiku-5-5', 'Claude Code', 'claude'],
   ['gpt-5.6-terra', 'Codex CLI · older model', 'codex'],
   ['api:lab-sol', 'API · OpenAI format via Codex CLI · gateway.lab.example', 'api'],
   ['api:gone', 'API · not configured', 'api'],
@@ -511,13 +559,13 @@ assert.equal(ui.retrievalConfigurationNotice.hidden, true);
 ui.retrievalMode.value = 'historical';
 ui.retrievalCutoffUtc.value = '2024-03-31T00:00:00Z';
 renderRetrievalSettings();
-for (const role of ['author', 'critic', 'writer']) assert.deepEqual(disabledGroups(role), ['Claude CLI', 'API']);
+for (const role of ['author', 'critic', 'writer']) assert.deepEqual(disabledGroups(role), ['Claude Code', 'API']);
 assert.deepEqual(disabledGroups('review'), []);
-assert.equal(chip('author').textContent, 'Claude CLI · not with a web cutoff');
+assert.equal(chip('author').textContent, 'Claude Code · not with a web cutoff');
 assert.equal(chip('author').dataset.state, 'warning');
 assert.equal(chip('writer').textContent, 'API · OpenAI format via Codex CLI · gateway.lab.example · not with a web cutoff');
 assert.equal(chip('critic').textContent, 'Codex CLI');
-assert.equal(chip('review').textContent, 'Claude CLI');
+assert.equal(chip('review').textContent, 'Claude Code');
 assert.equal(ui.authorModel.value, 'claude-opus-5-5');
 const notice = ui.retrievalConfigurationNotice.textContent;
 assert.equal(notice, `${rule} Choose a Codex CLI model for the proof author and LaTeX writer.`);
@@ -627,7 +675,7 @@ renderRunOverview();
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, state.settingsWarning);
 assert.equal(rows()['Settings warning'], state.settingsWarning);
-assert.equal(rows()['Proof author'], "claude-opus-5-5 · max · no subagents\nSource: Claude CLI · this computer's Claude login");
+assert.equal(rows()['Proof author'], "claude-opus-5-5 · max · no subagents\nSource: Claude Code · this computer's Claude login");
 // Without a catalog nothing is claimed about the connection: the line is what the job recorded, never its URL.
 assert.equal(rows()['Independent critic'], 'gpt-6.1-sol · high · 3 independent critics as subagents · max 2 consecutive rounds\n'
   + 'Source: API connection “Sol via lab gateway” · as this job recorded it · OpenAI format · gateway.lab.example · '
@@ -642,6 +690,7 @@ assert.equal(rows()['Settings warning'], undefined);
 
 // The API model is removed while the page is open: /state's catalog no longer lists it. The
 // run settings mark it, and the header says what Resume would say, in the server's words.
+// The earlier controller's catalog still calls Claude Code "Claude CLI".
 const catalog = [{id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol', provider: 'codex', providerLabel: 'Codex CLI'},
   {id: 'claude-opus-5-5', label: 'Claude Opus 5.5', provider: 'claude', providerLabel: 'Claude CLI'}];
 // A job cannot switch models: the only remedy is adding it again with the settings it recorded.
@@ -653,8 +702,8 @@ renderRunOverview();
 assert.deepEqual(lines('Independent critic'), ['gpt-6.1-sol · high · 3 independent critics as subagents · max 2 consecutive rounds',
   'Source: API connection “Sol via lab gateway” · not configured now; as this job recorded it · OpenAI format · '
   + 'gateway.lab.example · runs through the Codex CLI · id api:lab-sol']);
-// With a catalog, built-in models are named as the menus name them.
-assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude CLI · this computer's Claude login"]);
+// With a catalog, built-in models are named as the menus name them, and the program as the menus now name it.
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
 assert.deepEqual(lines('LaTeX writer'), ['GPT 6.1 Sol · max', "Source: Codex CLI · this computer's Codex login"]);
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, missing);
@@ -679,11 +728,11 @@ state = {...state, workflow: {...state.workflow, settings: {model_catalog: [...c
   {...solRow, format: 'anthropic', host: 'claude.lab.example'}]}}};
 renderRunOverview();
 assert.equal(lines('Independent critic')[1], 'Source: API connection “Sol via lab gateway” · Anthropic format · '
-  + 'claude.lab.example · runs through the Claude CLI · this job started with gateway.lab.example (OpenAI format, '
+  + 'claude.lab.example · runs through Claude Code · this job started with gateway.lab.example (OpenAI format, '
   + 'model gpt-6.1-sol) · id api:lab-sol');
 // One name for the Claude program in the panel: the source menu's, for the author's CLI and for the format's.
-assert.match(lines('Proof author')[1], /^Source: Claude CLI ·/);
-assert.doesNotMatch(Object.values(rows()).join('\n'), /Claude Code/);
+assert.match(lines('Proof author')[1], /^Source: Claude Code ·/);
+assert.doesNotMatch(Object.values(rows()).join('\n'), /Claude CLI|the Claude Code/);
 // Another wire model under the same id: the first line names the model the next call uses, the source
 // line the one the job started with.
 state = {...state, workflow: {...state.workflow, settings: {model_catalog: [...catalog,
@@ -732,14 +781,14 @@ const codex = (model, label, older = false) => ({model, kind: 'codex', label, so
   runsThroughLabel: 'the Codex CLI', older});
 const api = (model, values) => ({model, kind: 'api', configured: true, label: 'claude-gw', wireModel: 'claude-gw',
   connection: 'Claude gateway', format: 'anthropic', formatLabel: 'Anthropic format', host: 'claude.example.com',
-  runsThrough: 'claude', runsThroughLabel: 'the Claude CLI', ...values});
+  runsThrough: 'claude', runsThroughLabel: 'Claude Code', ...values});
 const started = {format: 'openai', formatLabel: 'OpenAI format', host: 'gateway.lab.example', wireModel: 'gpt-6.1-sol'};
 state = {...state, settingsWarning: '', skipStatementReview: false, reviewModel: 'api:claude-gw', reviewEffort: 'ultra',
   workflow: {...state.workflow, settings: {model_catalog: []}},
   modelSources: {
     review: api('api:claude-gw'),
-    author: {model: 'claude-opus-5-5', kind: 'claude', label: 'Claude Opus 5.5', source: 'Claude CLI',
-      runsThrough: 'claude', runsThroughLabel: 'the Claude CLI', older: false},
+    author: {model: 'claude-opus-5-5', kind: 'claude', label: 'Claude Opus 5.5', source: 'Claude Code',
+      runsThrough: 'claude', runsThroughLabel: 'Claude Code', older: false},
     critic: {...api('api:lab-sol'), label: 'gpt-6.1-sol', wireModel: 'gpt-6.1-sol', connection: 'Sol via lab gateway',
       format: 'openai', formatLabel: 'OpenAI format', host: 'new-gateway.example', runsThrough: 'codex',
       runsThroughLabel: 'the Codex CLI', recorded: started},
@@ -747,9 +796,9 @@ state = {...state, settingsWarning: '', skipStatementReview: false, reviewModel:
   writerModel: 'gpt-5.6-sol'};
 renderRunOverview();
 assert.deepEqual(lines('Statement reviewer'), ['claude-gw · max (Ultra is no longer offered)',
-  'Source: API connection “Claude gateway” · Anthropic format · claude.example.com · runs through the Claude CLI · '
+  'Source: API connection “Claude gateway” · Anthropic format · claude.example.com · runs through Claude Code · '
   + 'id api:claude-gw']);
-assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude CLI · this computer's Claude login"]);
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
 assert.deepEqual(lines('Independent critic'), ['gpt-6.1-sol · high · 3 independent critics as subagents · max 2 consecutive rounds',
   'Source: API connection “Sol via lab gateway” · OpenAI format · new-gateway.example · runs through the Codex CLI · '
   + 'this job started with gateway.lab.example (OpenAI format, model gpt-6.1-sol) · id api:lab-sol']);
@@ -775,11 +824,11 @@ for (const [values, first, edit] of [
 }
 // Another format only: the format the job started with. A record without a wire model or a host names what it has.
 state.modelSources.critic = {...state.modelSources.critic, label: 'gpt-6.1-sol', wireModel: 'gpt-6.1-sol',
-  host: 'localhost:8000', format: 'anthropic', formatLabel: 'Anthropic format', runsThroughLabel: 'the Claude CLI',
+  host: 'localhost:8000', format: 'anthropic', formatLabel: 'Anthropic format', runsThroughLabel: 'Claude Code',
   recorded: local};
 renderRunOverview();
 assert.equal(lines('Independent critic')[1], 'Source: API connection “Sol via lab gateway” · Anthropic format · localhost:8000 · '
-  + 'runs through the Claude CLI · this job started with localhost:8000 (OpenAI format, model gpt-6.1-sol) · id api:lab-sol');
+  + 'runs through Claude Code · this job started with localhost:8000 (OpenAI format, model gpt-6.1-sol) · id api:lab-sol');
 for (const [recorded, edit] of [[{format: 'openai', host: 'localhost:8000'}, 'localhost:8000 (OpenAI format)'],
   [{format: 'openai', host: '', wireModel: 'gpt-6.1-sol'}, 'OpenAI format, model gpt-6.1-sol']]) {
   state.modelSources.critic.recorded = recorded;
@@ -787,7 +836,16 @@ for (const [recorded, edit] of [[{format: 'openai', host: 'localhost:8000'}, 'lo
   assert.equal(lines('Independent critic')[1].split(' · this job started with ')[1], `${edit} · id api:lab-sol`);
 }
 // One name for the Claude program in the panel: the source menu's.
-assert.doesNotMatch(Object.values(rows()).join('\n'), /Claude Code/);
+assert.doesNotMatch(Object.values(rows()).join('\n'), /Claude CLI|the Claude Code/);
+// An earlier controller's entries still say "Claude CLI": the panel names the program as the menus now do.
+const earlier = {...state.modelSources};
+state.modelSources = {...earlier, author: {...earlier.author, source: 'Claude CLI', runsThroughLabel: 'the Claude CLI'},
+  review: api('api:claude-gw', {runsThroughLabel: 'the Claude CLI'})};
+renderRunOverview();
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
+assert.equal(lines('Statement reviewer')[1], 'Source: API connection “Claude gateway” · Anthropic format · claude.example.com · '
+  + 'runs through Claude Code · id api:claude-gw');
+state.modelSources = earlier;
 
 // The connection list cannot be read now: the line says so, never "removed", and the header claims nothing.
 state.modelSources.critic = {model: 'api:lab-sol', kind: 'api', configured: null, reason: 'connection list cannot be read now',
@@ -967,6 +1025,37 @@ await settle();
 assert.equal($('apiModelCount').textContent, 'None saved');
 assert.equal(document.activeElement, $('apiModelsHeading'));
 assert(sent.every((request) => !request.path.includes('secret')));
+""")
+
+    def test_roles_moved_to_the_default_model_are_named_in_one_correct_sentence(self):
+        # syncModelMenus answers the roles whose chosen model the new menus no longer list.
+        setup = self.MANAGER_SETUP.replace("const syncModelMenus = () => [],",
+                                           "let replacedRoles = [];\nconst syncModelMenus = () => replacedRoles,")
+        self.assertIn("replacedRoles", setup)
+        self.run_app(self.MANAGER, setup, r"""
+advanced.open = true; advanced.listeners.toggle({target:advanced});
+sent[0].reply(200, listing([connection]));
+await settle();
+// Load models again: the connection lists one model fewer, the one two roles had chosen.
+replacedRoles = ['review', 'author'];
+click(rowButton('refresh'));
+sent[1].reply(200, {ok:true,message:'Found 1 model.',...listing([{...connection,models:[connection.models[0]]}])});
+await settle();
+assert.equal($('apiModelsStatus').textContent, 'Lab key: Found 1 model. The statement reviewer and the proof author '
+  + 'now use the default model because their selected models are no longer available.');
+replacedRoles = ['critic'];
+click(rowButton('refresh'));
+sent[2].reply(200, {ok:true,message:'Found 1 model.',...listing([{...connection,models:[connection.models[0]]}])});
+await settle();
+assert.equal($('apiModelsStatus').textContent, 'Lab key: Found 1 model. The independent critic now uses the default '
+  + 'model because its selected model is no longer available.');
+// Remove the connection: the author had chosen one of its models.
+replacedRoles = ['author'];
+click(rowButton('remove'));
+assert.equal(sent[3].path, '/api-models/delete');
+sent[3].reply(200, {deleted:connection.id,...listing([])});
+await settle();
+assert.equal($('apiModelsStatus').textContent, 'Removed Lab key. The proof author now uses the default model.');
 """)
 
     def test_editing_keeps_the_saved_key_on_its_server_and_asks_only_for_another_server(self):
@@ -1413,7 +1502,7 @@ for (const role of ['review','author','critic','writer']) {
 type('apiModelBaseUrl',connection.baseUrl); type('apiModelKey','secret-api-key');
 $('apiModelSaveButton').onclick();
 const data = listing([connection]);
-data.model_sources.unshift({id:'codex',label:'Codex CLI'}, {id:'claude',label:'Claude CLI'});
+data.model_sources.unshift({id:'codex',label:'Codex CLI'}, {id:'claude',label:'Claude Code'});
 data.model_catalog.unshift({id:'gpt-6.1-sol',label:'GPT 6.1 Sol',provider:'codex',sourceId:'codex'});
 data.model_efforts = {'gpt-6.1-sol':['low','high','max','ultra'], 'api:lab-a':['low','high'], 'api:lab-b':['high','max']};
 sent[0].reply(200,{connection,...data}); await settle();

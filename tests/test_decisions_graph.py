@@ -426,6 +426,13 @@ class HandoffTests(GraphCase):
     The resumed author is told why (its handoff_refused prompt) until it submits again.
     """
 
+    def setUp(self):
+        super().setUp()
+        # The exact critic feedback does not depend on the computer (no note for one that cannot read proof files).
+        patcher = mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def author_submits(self, *answers):
         def author(module, prompt, **kwargs):
             for answer in answers:
@@ -697,8 +704,8 @@ class StepPauseTests(GraphCase):
 
     def test_configuration_and_safety_errors_pause_without_automatic_retry(self):
         for error, start in ((runtime.ConfigurationError("Add an API key for Gateway."), "Add an API key"),
-                             (runtime.SafetyStop("Claude CLI enabled unexpected tools (Artifact)."),
-                              "Stopped for safety: Claude CLI enabled unexpected tools")):
+                             (runtime.SafetyStop("Claude Code enabled unexpected tools (Artifact)."),
+                              "Stopped for safety: Claude Code enabled unexpected tools")):
             self.events.clear()
             with self.subTest(error=type(error).__name__), mock.patch.object(runtime, "structured", side_effect=error):
                 runtime.execute_workflows([AUTHOR_CRITIC], {"statement": "Task", "solution": PROOF},

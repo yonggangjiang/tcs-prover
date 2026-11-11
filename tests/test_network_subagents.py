@@ -80,7 +80,7 @@ class StructuredCallTests(network.Folders):
                             self.assertIn(["-s", "workspace-write"], pairs(command))
                             self.assertEqual(settings[LEGACY_NETWORK], "true" if mode == "live" else "false")
                         else:
-                            # `codex exec`'s legacy read-only mode has no network setting (README).
+                            # `codex exec`'s legacy read-only mode has no network setting (docs/sandbox.md).
                             self.assertIn(["-s", "read-only"], pairs(command))
                             self.assertNotIn(LEGACY_NETWORK, settings)
 

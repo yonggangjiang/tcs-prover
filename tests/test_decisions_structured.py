@@ -275,7 +275,7 @@ class ClaudeStallTests(claude_test.FakeClaudeCase):
         notices = [event for event in self.events if event.get("label") == runtime.RETRY_LABEL and "retryAt" in event]
         self.assertEqual(len(notices), 3)
         self.assertTrue(notices[1]["text"].startswith("Model call failed"), notices[1]["text"])
-        self.assertTrue(notices[2]["text"].startswith("Claude CLI missing or incompatible — retrying in"),
+        self.assertTrue(notices[2]["text"].startswith("Claude Code missing or incompatible — retrying in"),
                         notices[2]["text"])
         self.assertIn("CLI message: error: unknown option '--safe-mode'", notices[2]["text"])
         self.assertEqual(notices[2]["failureKind"], "cli")
@@ -495,8 +495,12 @@ class CLIProblemTests(StandInCase):
             self.assertEqual((notice["failure"], notice["failureKind"]), ("Codex CLI missing or incompatible", "cli"))
 
     def test_a_missing_cli_is_named_too(self):
+        self.run_failures(lambda: runtime.CLIUnavailable("Claude Code is not installed or is not on PATH."))
+        self.assertEqual(self.notices()[2]["failure"], "Claude Code missing or incompatible")
+        # An earlier version's words name the same program.
+        self.events.clear()
         self.run_failures(lambda: runtime.CLIUnavailable("Claude CLI is not installed or is not on PATH."))
-        self.assertEqual(self.notices()[2]["failure"], "Claude CLI missing or incompatible")
+        self.assertEqual(self.notices()[2]["failure"], "Claude Code missing or incompatible")
 
     def test_a_cli_that_ran_and_reported_a_provider_failure_is_never_called_incompatible(self):
         def login():
@@ -581,6 +585,11 @@ class CLICheckTests(unittest.TestCase):
         self.assertEqual(json.loads((self.run_dir / runtime.CLI_VERSIONS_FILENAME).read_text())["Codex"]["version"],
                          "codex-cli 0.161.0")
         self.assertEqual([event for event in self.check() if event["kind"] == "diagnostic"], [])
+        # So is a Claude Code update, by the program's name.
+        (self.bin / "claude").write_text(f"#!{sys.executable}\nprint('2.1.290 (Claude Code)')\n")
+        changed = [event["text"] for event in self.check() if event["kind"] == "diagnostic"]
+        self.assertEqual(changed, [f"Claude Code changed since this job last started: 2.1.289 (Claude Code) "
+                                   f"({self.bin / 'claude'}) is now 2.1.290 (Claude Code) ({self.bin / 'claude'})."])
 
     def test_only_the_clis_of_the_models_are_checked(self):
         events = self.check("gpt-6.1-sol")

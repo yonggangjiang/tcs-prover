@@ -784,6 +784,45 @@ class InterruptGraceTests(unittest.TestCase):
         stopping = next(event for event in double.events if event.get("label") == "Author stopping")
         self.assertIn("Pause requested", stopping["text"])
 
+    def test_a_stop_says_so_and_ends_as_stopped(self):
+        pause = self.directory / "pause-request.json"
+        double = goal_test.Runtime([[]])
+
+        def stop_after_start(rpc):
+            pause.write_text(json.dumps({"cause": "stopped"}))
+            self.assertTrue(double.interrupted.wait(2))
+            rpc.messages.extend([goal_test.goal("paused"), goal_test.completed("interrupted")])
+
+        double.on_empty = stop_after_start
+        session = runtime.goal_session(double, goal_test.PROMPT, prompts=goal_test.PROMPTS,
+                                       settings=goal_test.SETTINGS,
+                                       options={"goal_cwd": str(self.directory), "goal_pause_file": str(pause)})
+        self.addCleanup(session.close)
+        with self.assertRaises(runtime.WorkflowPaused):
+            next(session)
+        self.assertTrue(wait_until(lambda: any(event.get("label") == "Author stopping" for event in double.events)))
+        stopping = next(event for event in double.events if event.get("label") == "Author stopping")
+        self.assertEqual(stopping["text"], runtime.STOP_REQUESTED_TEXT.format(
+            grace=runtime._span_text(double.INTERRUPT_GRACE_SECONDS)))
+        stopped = [event for event in double.events if event.get("label") == "Author stopped"]
+        self.assertEqual([event["text"] for event in stopped], [runtime.AUTHOR_STOPPED_TEXT])
+        self.assertFalse([event for event in double.events if event.get("label") == "Author paused"])
+
+    def test_a_malformed_pause_request_is_a_pause(self):
+        pause = self.directory / "pause-request.json"
+        pause.write_text("{", encoding="utf-8")
+        self.assertEqual(runtime.pause_request_cause(pause), "pause")
+
+    def test_the_queue_carries_a_full_chat_message_and_never_a_longer_one(self):
+        steer = self.directory / "author-steer.json"
+        framed = "x" * (runtime.AUTHOR_STEER_MAX_CHARS + 294)
+        steer.write_text(json.dumps({"queue": [{"id": "chat-1", "instruction": framed}]}), encoding="utf-8")
+        self.assertEqual(runtime.pending_author_steer(steer), ("chat-1", framed))
+        steer.write_text(json.dumps({"queue": [{"id": "long", "instruction": "x" * 16_001},
+                                               {"id": "next", "instruction": "Go on."}]}), encoding="utf-8")
+        self.assertEqual(runtime.pending_author_steer(steer), ("next", "Go on."))
+        self.assertEqual(runtime.AUTHOR_STEER_QUEUE_MAX_CHARS, 16_000)
+
 
 class HandshakeRPC:
     """An app-server double that answers turn/steer at once and lets the session handle the answer
@@ -983,7 +1022,9 @@ const over = [];
 ui.authorSteerCount.classList.toggle = (name, on) => over.push([name, on]);
 const show = (element, visible) => { element.hidden = !visible; };
 const acted = [];
-const act = (path, body) => acted.push({path, body});
+const act = async (path, body) => { acted.push({path, body}); return true; };
+let state = {runId: 'job-1'}, chatSending = false;
+const renderChatSend = () => {};
 """
         checks = r"""
 ui.authorSteerInstruction.value = '  Short.  ';
@@ -994,15 +1035,15 @@ ui.authorSteerInstruction.value = 'x'.repeat(25);
 listeners.input();
 assert.match(ui.authorSteerCount.textContent, /^25 of 20 characters — too long to send/);
 assert.deepEqual(over.at(-1), ['over', true]);
-ui.sendAuthorSteer.onclick();
+await ui.sendAuthorSteer.onclick();
 assert.equal(acted.length, 0);
-assert.match(ui.notice.textContent, /at or below 20 characters \(it has 25\)/);
+assert.match(ui.notice.textContent, /Keep the message at or below 20 characters \(it has 25\)/);
 assert.equal(ui.authorSteerInstruction.focused, true);
 ui.authorSteerInstruction.value = 'Use the lemma.';
-ui.sendAuthorSteer.onclick();
-assert.deepEqual(acted, [{path: '/steer-author', body: {instruction: 'Use the lemma.'}}]);
-ui.authorSteerInstruction.value = '';
-listeners.input();
+await ui.sendAuthorSteer.onclick();
+// The chat's one route: the server sends it as a live instruction or a reply of the paused author.
+assert.deepEqual(acted, [{path: '/chat', body: {text: 'Use the lemma.'}}]);
+assert.equal(ui.authorSteerInstruction.value, '');
 assert.equal(ui.authorSteerCount.textContent, '');
 """
         payload = json.dumps({"slices": [["ui.sendAuthorSteer.onclick =", "ui.stop.onclick ="]],
@@ -1405,7 +1446,7 @@ class ClaudeAuthorDecisionTests(claude_test.FakeClaudeCase):
                 mock.patch.object(runtime, "INTERRUPT_GRACE_SECONDS", 0.5):
             with self.assertRaises(runtime.WorkflowPaused) as raised:
                 next(self.start())
-        self.assertTrue(raised.exception.reason.startswith("The Claude CLI stopped responding: no event for"),
+        self.assertTrue(raised.exception.reason.startswith("Claude Code stopped responding: no event for"),
                         raised.exception.reason)
         self.assertIsNotNone(raised.exception.retry)
         controls = [message for message in self.inputs("control_request")

@@ -35,7 +35,8 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 BATCH_WORKS_ROUTES = {'/batch-related-works', '/batch-related-works/add'}
 # Actions the earlier controller does not have.
 UPDATED_CONTROL_ROUTES = {'/related-works/add', '/ask-author', '/author-summary', '/stop-author-reply',
-                          '/answer-author-question', '/dismiss-author-question', '/dismiss-convention-warning'}
+                          '/answer-author-question', '/dismiss-author-question', '/dismiss-convention-warning',
+                          '/chat'}
 LEGACY_UNSUPPORTED = 'This job belongs to the earlier controller, which does not support this action.'
 MAX_DISCARDED_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024
@@ -48,15 +49,18 @@ STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
           '/favicon.svg': ('favicon.svg', 'image/svg+xml')}
 GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/download-proof': {'job'}, '/download-source': {'job'},
-              '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'}}
+              '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'},
+              '/chat-answer': {'job', 'id'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',
                   '/set-author-time-limit', '/steer-author',
                   '/stop', '/pause', '/reset', '/clear-trace', *UPDATED_CONTROL_ROUTES}
 # API models belong to the updated controller's installation, not to a job:
-# GET lists them; the POST routes save, delete and test one.
-API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover', '/settings'}
+# GET lists them; the POST routes save, delete and test one. So do the running-jobs
+# limit and the saved New problem settings (save, rename, delete, default).
+API_MODEL_ROUTES = {'/api-models', '/api-models/delete', '/api-models/test', '/api-models/discover', '/settings',
+                    '/presets', '/presets/rename', '/presets/delete', '/presets/default'}
 
 
 class GatewayError(Exception):
@@ -354,7 +358,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return self.send((self.server.ui_directory / filename).read_bytes(), content_type=kind)
             if not self.authorized():
                 raise GatewayError('Open TCS Prover from its launch URL.', 403)
-            if path in {'/api-models', '/settings'} and not query:
+            if path in {'/api-models', '/settings', '/presets'} and not query:
                 return self.forward_api_models('GET', path)
             if path == '/batch-related-works':
                 # Here ``batch`` names a folder batch, not a saved batch of runs.

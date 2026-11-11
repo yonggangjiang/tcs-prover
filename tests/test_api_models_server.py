@@ -211,7 +211,7 @@ class ApiModelEndpointTests(HttpCase):
         self.assertEqual([row["id"] for row in listing["models"]], [model["id"]])
         self.assertNotIn("apiKey", listing["models"][0])
         self.assertEqual([(row["id"], row["headerName"], row["cli"]) for row in listing["formats"]],
-                         [("openai", "Authorization", "Codex CLI"), ("anthropic", "x-api-key", "Claude CLI")])
+                         [("openai", "Authorization", "Codex CLI"), ("anthropic", "x-api-key", "Claude Code")])
 
         # An empty key on update keeps the saved one.
         status, updated = self.call("/api-models", {
@@ -402,7 +402,7 @@ class CatalogTests(HttpCase):
         rows = {row["id"]: row for row in catalog}
         self.assertEqual((rows["gpt-6.1-sol"]["providerLabel"], rows["gpt-6.1-sol"]["supportsFast"]), ("Codex CLI", True))
         self.assertEqual((rows["claude-opus-5-5"]["providerLabel"], rows["claude-opus-5-5"]["supportsFast"]),
-                         ("Claude CLI", False))
+                         ("Claude Code", False))
         self.assertEqual({key: rows[model["id"]][key] for key in ("provider", "format", "host", "hasKey", "label")},
                          {"provider": "api", "format": "openai", "host": "gateway.example.com", "hasKey": True,
                           "label": "gpt-gateway"})
@@ -478,9 +478,9 @@ class ModelSourceTests(HttpCase):
             "review": {"model": self.claude["id"], "kind": "api", "configured": True, "label": "claude-gw",
                        "wireModel": "claude-gw", "connection": "Claude gateway", "format": "anthropic",
                        "formatLabel": "Anthropic format", "host": "claude.example.com", "runsThrough": "claude",
-                       "runsThroughLabel": "the Claude CLI"},
-            "author": {"model": "claude-opus-5-5", "kind": "claude", "label": "Claude Opus 5.5", "source": "Claude CLI",
-                       "runsThrough": "claude", "runsThroughLabel": "the Claude CLI", "older": False},
+                       "runsThroughLabel": "Claude Code"},
+            "author": {"model": "claude-opus-5-5", "kind": "claude", "label": "Claude Opus 5.5", "source": "Claude Code",
+                       "runsThrough": "claude", "runsThroughLabel": "Claude Code", "older": False},
             "critic": {"model": self.sol["id"], "kind": "api", "configured": True, "label": "gpt-6.1-sol",
                        "wireModel": "gpt-6.1-sol", "connection": "Sol via lab gateway", "format": "openai",
                        "formatLabel": "OpenAI format", "host": "gateway.lab.example", "runsThrough": "codex",
@@ -488,11 +488,11 @@ class ModelSourceTests(HttpCase):
             "writer": {"model": "gpt-5.6-sol", "kind": "codex", "label": "GPT 5.6 Sol (older)", "source": "Codex CLI",
                        "runsThrough": "codex", "runsThroughLabel": "the Codex CLI", "older": True},
         })
-        # Both names come from the source menus' labels, so renaming a program there renames it here too.
-        self.assertEqual(server.SOURCE_PROGRAMS, {kind: f"the {providers.PROVIDER_LABELS[kind]}"
-                                                  for kind in (providers.CODEX, providers.CLAUDE)})
-        with mock.patch.dict(providers.PROVIDER_LABELS, {providers.CLAUDE: "Claude Code"}):
-            self.assertEqual(server._program_name(providers.CLAUDE), "Claude Code")
+        # Both names come from the source menus' labels, so renaming a program there renames it here too:
+        # a "… CLI" takes an article in a sentence, a product name such as Claude Code does not.
+        self.assertEqual(server.SOURCE_PROGRAMS, {providers.CODEX: "the Codex CLI", providers.CLAUDE: "Claude Code"})
+        with mock.patch.dict(providers.PROVIDER_LABELS, {providers.CLAUDE: "Claude CLI"}):
+            self.assertEqual(server._program_name(providers.CLAUDE), "the Claude CLI")
         snapshot = json.dumps(app.snapshot())
         for secret in (KEY, ANTHROPIC_KEY):
             self.assertNotIn(secret, snapshot)
@@ -515,7 +515,7 @@ class ModelSourceTests(HttpCase):
         self.assertEqual(self.sources(app)["review"], {
             "model": self.claude["id"], "kind": "api", "configured": False, "label": "claude-gw", "wireModel": "claude-gw",
             "connection": "Claude gateway", "format": "anthropic", "formatLabel": "Anthropic format",
-            "host": "claude.example.com", "runsThrough": "claude", "runsThroughLabel": "the Claude CLI"})
+            "host": "claude.example.com", "runsThrough": "claude", "runsThroughLabel": "Claude Code"})
         # Nothing recorded: only the id.
         app.state["apiModels"] = {}
         self.assertEqual(self.sources(app)["review"], {"model": self.claude["id"], "kind": "api", "configured": False})

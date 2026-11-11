@@ -477,6 +477,38 @@ renderWorkflow();
 assert.match(text(row('author')), /Now Stopping/);
 """)
 
+    def test_a_job_you_stopped_marks_stopped_here_with_a_square(self):
+        self.run_sidebar(r"""
+state.workflowStages = {review: true, author: true, critic: true, writing: true};
+for (const [node, stage] of [['author', 'solve'], ['critic', 'critic'], ['latex_editor', 'final']]) {
+  state.phase = 'paused'; state.activeNode = node; state.stage = stage; state.pauseCause = 'stopped';
+  renderWorkflow();
+  // A stop by you is no pause and no time limit: "Stopped here", its own square, and it can continue.
+  assert.match(text(row(node)), /Stopped here Stopped by you/, node);
+  assert(!/Paused|Time limit/.test(text(row(node))), node);
+  assert.equal(row(node).className, 'workflow-node stopped');
+  assert.equal(row(node).querySelector('.node-dot').textContent, '');
+  assert(row(node).querySelector('.node-position').className.split(' ').includes('stopped'));
+}
+// While the author ends its current step it still works, and the mark says it is stopping.
+state.phase = 'pausing'; state.activeNode = 'author'; state.stage = 'solve';
+renderWorkflow();
+assert.equal(row('author').className, 'workflow-node active');
+assert.match(text(row('author')), /Now Stopping: the author ends its current step and its conversation is saved/);
+// A revision of the statement review you stopped is back at the earlier review: stopped there, not waiting.
+state.phase = 'reviewed'; state.activeNode = 'statement_reviewer'; state.stage = 'review'; state.pauseCause = '';
+state.manuallyStopped = true;
+renderWorkflow();
+assert.match(text(row('statement_reviewer')), /Stopped here Stopped by you/);
+assert(!/Waiting|Approve/.test(text(row('statement_reviewer'))));
+assert.equal(row('statement_reviewer').className, 'workflow-node stopped pre-loop');
+assert.equal(row('statement_reviewer').querySelector('.node-dot').textContent, '');
+assert(row('statement_reviewer').querySelector('.node-position').className.split(' ').includes('stopped'));
+state.manuallyStopped = false;
+renderWorkflow();
+assert.match(text(row('statement_reviewer')), /Waiting here Approve the checked statement to continue/);
+""")
+
     def test_a_paused_or_waiting_job_marks_where_and_why(self):
         self.run_sidebar(r"""
 state.workflowStages = {review: true, author: true, critic: true, writing: true};

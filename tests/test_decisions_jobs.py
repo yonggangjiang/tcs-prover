@@ -669,8 +669,14 @@ class AttentionTests(Isolated):
         attention = login.attention()
         self.assertEqual((attention["kind"], attention["title"], attention["retrying"]),
                          ("login", "Codex login needed", True))
-        self.assertIn("codex login", attention["text"])
+        self.assertEqual(attention["text"], "Log in to the Codex CLI again (codex login); the job continues by itself.")
         self.assertGreater(login.state["autoResumeAt"], 0)
+        # The Claude program is Claude Code, with no article.
+        claude = self.paused_job(reason="Claude author turn failed: 401 Unauthorized: please log in again",
+                                 authorModel="claude-opus-5-5")
+        self.assertEqual({key: claude.attention()[key] for key in ("kind", "title", "text")},
+                         {"kind": "login", "title": "Claude login needed",
+                          "text": "Log in to Claude Code again (claude, then /login); the job continues by itself."})
         running = server.App(runs=self.runs, load_latest=False)
         running.state.update(phase="running", stage="critic", modelRetry={"failure": "usage limit reached",
                                                                         "stage": "critic", "retryAt": 10**9})
@@ -818,7 +824,10 @@ class RunningLimitTests(Isolated):
         self.assertEqual(json.loads((self.store.parent / server.INSTALLATION_SETTINGS).read_text()), {"maxRunningJobs": 4})
 
     def test_no_job_claims_a_quota_of_its_own(self):
-        for path in (APP, server.UI / "index.html", Path(server.ROOT) / "README.md"):
+        # The README and every guide page in docs/ (the README's former sections live there).
+        guides = sorted((Path(server.ROOT) / "docs").glob("*.md"))
+        self.assertGreaterEqual(len(guides), 10)
+        for path in (APP, server.UI / "index.html", Path(server.ROOT) / "README.md", *guides):
             self.assertNotIn("own quota", path.read_text(encoding="utf-8"))
 
 

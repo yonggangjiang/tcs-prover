@@ -7,7 +7,7 @@ nodes:
     role: author
     stage: solve
     prompt: author
-    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, related_works, handoff_refused, subagents]
+    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents]
     # The run's Author subagents setting (0 to 10): with 1 or more the author gets the subagent tool, limited to that
     # many at a time, and the subagents prompt; with 0 it has no subagent tool.
     subagents: {option: author_subagents, default: 0, minimum: 0}
@@ -92,39 +92,43 @@ nodes:
     next: {done: end}
 prompts:
   # EDIT AUTHOR HERE: instructions for proving the exact statement.
+  # On a computer where TCS Prover cannot read proof.md safely (Windows), the runner adds a short note
+  # after this prompt, the continuation prompt and the repair prompt asking for the proof in the reply.
   author: |-
-    The following is the statement to prove. Try to prove it with a complete, rigorous argument.
+    The following is the statement to prove. Solving it is important to my life, so you must solve it, even if it looks like a long-standing open problem. Do not give up just because a problem is hard or open: I know the answer, and I need you to come up with the solution.
 
-    On macOS or Linux, when complete, write the entire self-contained proof to
-    proof.md in your working directory and submit exactly PROOF_FILE: proof.md
-    as your final response. Include every argument needed by the critic in that
-    file. The critic receives a read-only snapshot of this file and the exact
-    statement. After a rejection, update proof.md with the revised complete
-    proof and submit it again. A complete inline proof is also accepted.
-    On Windows, return the entire self-contained proof inline in your final
-    response, including after a rejection; do not submit a file pointer.
+    Think deeply and hard. Explore substantially diversified approaches: when one line of attack stalls, try a genuinely different idea instead of small variations of the same one, and keep track of what you have ruled out. Submit only a proof you have checked.
+
+    When your proof is complete, write it to proof.md and reply with exactly:
+    PROOF_FILE: proof.md
+    The critic reads only proof.md and the statement, so make the proof complete and self-contained.
 
     STATEMENT:
     [STATEMENT]
   goal: >-
-    Prove the exact statement given in the initial prompt with a complete, rigorous argument.
+    Prove the exact statement given in the initial prompt with a complete,
+    rigorous argument. Do not give up: think deeply and hard, and try
+    substantially different approaches until the proof is complete.
   continuation: >-
-    Continue trying to prove the same statement in this conversation. Return a
-    complete, rigorous solution only when the exact statement is resolved.
+    Keep working on the same statement and do not give up. Think deeply and
+    hard, and try approaches substantially different from the ones that failed;
+    I know the statement can be proved. When your proof is complete, write it to
+    proof.md and reply with exactly PROOF_FILE: proof.md.
   reopen: >-
-    Continue trying to prove the same statement in this conversation.
+    Keep working on the same statement and do not give up. Think deeply and
+    hard, and try approaches substantially different from the ones that failed.
   compaction: |-
     Continue the same proof task using the conversation summary. Preserve the exact assumptions and requested conclusion.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
   resume: |-
-    Continue trying to prove the statement below, using any previous work in this conversation.
+    Keep working on the statement below, building on any previous work in this conversation or in your working directory. Do not give up: think deeply and hard, and try substantially different approaches where earlier ones failed.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
   repair: |-
-    Correct the unresolved errors in this candidate and continue proving the exact statement.
+    Fix the unresolved errors the critic found in this candidate, then write the complete corrected proof to proof.md and reply with exactly PROOF_FILE: proof.md. Do not give up on the statement.
 
     CURRENT CANDIDATE:
     {solution}
@@ -150,6 +154,13 @@ prompts:
 
     USER MESSAGE:
     {message}
+  # Sent with every chat message while the author works (a live instruction): {message} is the user's text,
+  # {answer_file} where the author writes an answer the message asks for; TCS Prover shows it in the chat.
+  chat: |-
+    [MESSAGE FROM THE USER]
+    {message}
+
+    If this message asks you a question or asks for information, answer it for the user: write your answer, addressed to the user, to the file {answer_file}, then continue your proof work. If it only gives an instruction, follow it; no answer file is needed.
   # Appended to the author's first prompt when the run has related works.
   related_works: |-
     RELATED WORKS:

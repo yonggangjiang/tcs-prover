@@ -58,15 +58,20 @@ def _timestamp(value):
 def job_tone(job):
     """One job row's status, classified as jobTone and completedRunOutcome in app.js classify it.
 
-    "running", "paused", "limit" (stopped at the author time limit: never counted as paused), "queued"
-    (waiting for a running slot), "waiting" (for the user), or a finished job's tone: "done" for every
-    successful outcome (counted under Complete), else "failed" or "stopped" (both counted under Incomplete).
+    "running", "paused", "limit" (stopped at the author time limit: never counted as paused), "stopped"
+    (stopped by the user: at a step it continues from, at its statement review, or by an earlier version;
+    counted apart, like "limit"), "queued" (waiting for a running slot), "waiting" (for the user), or a
+    finished job's tone: "done" for every successful outcome (counted under Complete), else "failed"
+    (counted under Incomplete).
     """
     phase = job.get('phase')
     if phase in {'reviewing', 'running', 'stopping', 'pausing'}:
         return 'running'
     if phase == 'paused':
-        return 'limit' if job.get('pauseCause') == 'time-limit' else 'paused'
+        cause = job.get('pauseCause')
+        return 'limit' if cause == 'time-limit' else 'stopped' if cause == 'stopped' else 'paused'
+    if job.get('manuallyStopped') and phase in {'input', 'reviewed', 'done'}:
+        return 'stopped'
     if phase == 'prepared' and job.get('launchQueued'):
         return 'queued'
     if phase in {'reviewed', 'prepared'}:
@@ -84,17 +89,17 @@ def job_tone(job):
 
 
 def batch_counts(rows):
-    """A batch card's counts, each job once: by phase, except that a finished job counts as "done" only
-    for a successful outcome (the check mark) and as "incomplete" otherwise (failed, stopped or
-    interrupted), as the batch page's Complete and Incomplete filters count them, and that a job stopped
-    at its time limit counts as "limit", not as "paused"."""
+    """A batch card's counts, each job once: by phase, except that a job stopped at its time limit counts
+    as "limit" and one stopped by the user as "stopped" (neither as paused, nor a stopped one as finished),
+    and that a finished job counts as "done" only for a successful outcome (the check mark) and as
+    "incomplete" otherwise (failed or interrupted), as the batch page's filters count them."""
     counts = {}
     for row in rows:
-        phase = row.get('phase') or 'unknown'
-        if phase == 'done' and job_tone(row) != 'done':
+        phase, tone = row.get('phase') or 'unknown', job_tone(row)
+        if tone in {'limit', 'stopped'}:
+            phase = tone
+        elif phase == 'done' and tone != 'done':
             phase = 'incomplete'
-        elif job_tone(row) == 'limit':
-            phase = 'limit'
         counts[phase] = counts.get(phase, 0) + 1
     return counts
 
@@ -287,12 +292,16 @@ class BatchCatalog:
         return {'mode': mode, 'cutoffExclusiveUtc': cutoff, 'fixed': mode == 'historical',
                 'available': False, 'error': 'Open this saved job to see its recorded search statistics.'}
 
-    def list_batches(self):
+    def list_batches(self, include_root=True):
+        """Every batch's card. Without ``include_root`` the runs directly under the root are left out: the server
+        lists those as its live jobs (the live gateway keeps them)."""
         cards = []
         for identity, directory in self._batches().items():
+            if identity == ORIGINAL_BATCH and not include_root:
+                continue
             jobs = self._runs(directory)
             started = [self._started_at(job, self._json(job, 'job-settings.json')) for job in jobs]
-            counts = {'running': 0, 'done': 0, 'paused': 0, 'limit': 0, 'prepared': 0, 'incomplete': 0,
+            counts = {'running': 0, 'done': 0, 'paused': 0, 'limit': 0, 'stopped': 0, 'prepared': 0, 'incomplete': 0,
                       **batch_counts([self._summary(path) for path in jobs])}
             name = 'Original batch' if identity == ORIGINAL_BATCH else directory.name
             cards.append({'id': identity, 'name': name, 'label': name,
@@ -352,7 +361,7 @@ class BatchCatalog:
                     'Interrupted: the run stopped part-way, while its last checkpoint says it was running.'
                     if interrupted else ''),
                 'interrupted': interrupted,
-                'pauseCause': cause if cause in {'error', 'user', 'interrupted', 'restart', 'time-limit'} else '',
+                'pauseCause': cause if cause in {'error', 'user', 'interrupted', 'restart', 'time-limit', 'stopped'} else '',
                 'manuallyStopped': bool(stopped), 'stoppedStage': _text(stopped.get('stage')),
                 'problemMode': _text(settings.get('problemMode')) or 'statement',
                 'workflowStages': selected, 'revisionRequired': settings.get('revisionRequired') is True,
@@ -397,16 +406,19 @@ class BatchCatalog:
 
         A conversation too large to read here gets a notice instead of its items.
         """
-        from .server import CONTROLLER_FOLDER, CONVERSATION_FILENAME, saved_conversation_items
+        from .server import CONTROLLER_FOLDER, CONVERSATION_FILENAME, REPLY_KINDS, saved_conversation_items
 
-        conversation = {'available': False, 'reason': reason, 'busy': False, 'readOnly': True, 'items': []}
+        conversation = {'available': False, 'reason': reason, 'busy': False, 'readOnly': True, 'items': [],
+                        'mode': 'off', 'note': reason, 'summary': 'off', 'summaryNote': reason}
         info = self._info(directory.parent, f'{CONTROLLER_FOLDER}/{directory.name}/{CONVERSATION_FILENAME}')
         if info is not None and info.st_size > MAX_CONTROLLER_BYTES:
             path = directory.parent / CONTROLLER_FOLDER / directory.name / CONVERSATION_FILENAME
             conversation['notice'] = (f'The saved conversation is too large to show here ({info.st_size / 1048576:.1f} MB). '
                                       f'See {path}.')
             return conversation
-        conversation['items'] = [{**item, 'status': 'stopped' if item['status'] in {'queued', 'running'} else item['status']}
+        # A reply that was still to be written ended with the batch; a chat message keeps how far it got.
+        conversation['items'] = [{**item, 'status': 'stopped' if item['kind'] in REPLY_KINDS
+                                  and item['status'] in {'queued', 'running'} else item['status']}
                                  for item in saved_conversation_items(self._controller_json(directory, CONVERSATION_FILENAME))]
         return conversation
 

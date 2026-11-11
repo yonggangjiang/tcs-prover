@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import MagicMock, patch
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from ui.batches import BatchCatalog
@@ -86,6 +86,24 @@ class _ApiModelRoutes:
         self.assertEqual(self.request('/api-models/delete?job=current', method='POST', body={})[0], 404)
         self.assertEqual(self.request('/api-models/test', method='POST', body={},
                                       headers={'Content-Type': 'text/plain'})[0], 400)
+
+    def test_saved_settings_routes_reach_only_the_updated_controller(self):
+        # Saved New problem settings belong to the updated controller's installation, as API models do.
+        status, value = self.request('/presets')
+        self.assertEqual((status, value['route'], value['method']), (200, '/presets', 'GET'))
+        self.assertNotIn('batchId', value)
+        for path in ('/presets', '/presets/rename', '/presets/delete', '/presets/default'):
+            status, value = self.request(path, method='POST', body={'id': 'p-0123456789ab'})
+            self.assertEqual((status, value['route'], value['method']), (200, path, 'POST'))
+        self.assertEqual([json.loads(body) for method, path, body in self.current.calls if path == '/presets/rename'],
+                         [{'id': 'p-0123456789ab'}])
+        self.assertFalse([call for call in self.legacy.calls if call[1].startswith('/presets')])
+        # The same authorization, query and body checks as every other route.
+        self.assertEqual(self.request('/presets', authenticate=False)[0], 403)
+        self.assertEqual(self.request('/presets', method='POST', body={}, authenticate=False)[0], 403)
+        self.assertEqual(self.request('/presets?job=current')[0], 404)
+        self.assertEqual(self.request('/presets/default?job=current', method='POST', body={})[0], 404)
+        self.assertEqual(self.request('/presets', method='POST', body={}, headers={'Content-Type': 'text/plain'})[0], 400)
 
 
 class _GatewayFixture(unittest.TestCase):
@@ -319,6 +337,24 @@ class GatewayConversationAndRelatedWorksTests(_GatewayFixture):
                 self.assertEqual((status, value['route']), (200, f'/{route}?job=current'))
         self.assertFalse([call for call in self.legacy.calls if call[0] == 'POST'])
 
+    def test_the_chat_reaches_only_the_updated_controller(self):
+        # Talk to the author (round 4): a message goes to an updated controller's job, and the whole answer to one
+        # is read from there; the earlier controller has no chat, so its jobs refuse a message.
+        status, value = self.request('/chat?job=legacy', method='POST', body={'text': 'Which lemma?'})
+        self.assertEqual((status, value['error']),
+                         (400, 'This job belongs to the earlier controller, which does not support this action.'))
+        status, value = self.request('/chat?job=current', method='POST', body={'text': 'Which lemma?'})
+        self.assertEqual((status, value['route'], value['method']), (200, '/chat?job=current', 'POST'))
+        self.assertEqual([json.loads(body) for method, path, body in self.current.calls if path == '/chat?job=current'],
+                         [{'text': 'Which lemma?'}])
+        status, value = self.request('/chat-answer?job=current&id=c_0123456789')
+        self.assertEqual((status, value['method']), (200, 'GET'))
+        self.assertEqual(dict(parse_qsl(urlsplit(value['route']).query)), {'job': 'current', 'id': 'c_0123456789'})
+        self.assertEqual(urlsplit(value['route']).path, '/chat-answer')
+        # Only its own parameters pass.
+        self.assertEqual(self.request('/chat-answer?job=current&id=c_0123456789&file=x'), (404, {'error': 'Not found.'}))
+        self.assertFalse([call for call in self.legacy.calls if '/chat' in call[1]])
+
     def test_a_folder_batchs_related_works_live_on_the_updated_controller(self):
         status, value = self.request('/batch-related-works?batch=b_0123456789')
         self.assertEqual((status, value['route']), (200, '/batch-related-works?batch=b_0123456789'))
@@ -393,6 +429,21 @@ class GatewayBatchTests(_GatewayFixture):
                                 for _, path, _ in controller.calls))
         self.assertEqual(self.request('/state?batch=v4&job=current')[0], 404)
         self.assertEqual(self.request('/state?batch=new&job=legacy')[0], 404)
+
+    def test_the_gateway_offers_no_new_batch_and_passes_on_no_batch_change(self):
+        # Its own cards: no New batch, no New problem in this batch (the page then shows neither).
+        status, value = self.request('/batches')
+        self.assertEqual(status, 200)
+        self.assertNotIn('canCreateBatches', value)
+        self.assertFalse([card['id'] for card in value['batches'] if 'addProblems' in card])
+        for controller in (self.legacy, self.current):
+            controller.calls.clear()
+        for path in ('/batches', '/batches/rename?batch=new', '/batches/delete?batch=new',
+                     '/batches/rename?batch=v4', '/batches/delete?batch=old-one'):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path, method='POST', body={'name': 'Renamed'}),
+                                 (404, {'error': 'Not found.'}))
+        self.assertEqual(self.legacy.calls + self.current.calls, [])
 
     def test_live_control_strips_batch_and_never_mutates_same_id_in_other_batch(self):
         for batch, controller, other in (('v4', self.legacy, self.current),

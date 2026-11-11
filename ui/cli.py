@@ -22,9 +22,9 @@ from .server import (
     DEFAULT_CRITIC_COUNT, MAX_AUTHOR_SUBAGENTS,
     DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, HOST,
-    MAX_CRITIC_COUNT, MAX_STATEMENT_CHARS, OFFERED_MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, SleepWatch,
-    load_installation_settings, raise_open_file_limit, read_utf8, retry_interval_text, saved_critic_source,
-    saved_research_source, stop_process_tree,
+    MAX_CRITIC_COUNT, MAX_STATEMENT_CHARS, OFFERED_MODELS, PORT, REASONING_SUMMARIES, RUNS, SPEEDS, STEP_WORDS,
+    SleepWatch, load_installation_settings, raise_open_file_limit, read_pause_object, read_utf8,
+    retry_interval_text, saved_critic_source, saved_research_source, stop_process_tree,
 )
 
 ACTIVE_PHASES = {"reviewing", "running", "stopping", "pausing"}
@@ -41,7 +41,7 @@ class ConciseHeadlessOutput:
         "final": ("final", "LaTeX editor"),
         "failure": ("failure", "Failure summary"),
     }
-    IMPORTANT_STATUSES = {"Author paused", "Author stopped for safety", runtime.RETRY_LABEL,
+    IMPORTANT_STATUSES = {"Author paused", "Author stopped", "Author stopped for safety", runtime.RETRY_LABEL,
                           runtime.COMMAND_RETRY_LABEL, runtime.STORAGE_RETRY_LABEL, "Conversation replaced",
                           "Author needs attention"}
 
@@ -302,7 +302,8 @@ def _stop_headless_apps(apps):
         except Exception:
             pass
         try:
-            app.stop()
+            # At once: a working author keeps its saved conversation, any other step continues in place.
+            app.stop(at_once=True)
         except ValueError:
             pass
         except Exception:
@@ -377,11 +378,28 @@ def _report_headless(apps, error_stream):
             phase, error, run_dir = app.state["phase"], app.state.get("error", ""), app.run_dir
             stopped = app.state.get("manuallyStopped")
             stage = app.state.get("stoppedStage") or app.state.get("stage")
-        if run_dir is None or phase in {"input", "prepared"}:
+            node = app.state.get("activeNode")
+        if run_dir is not None and stopped and phase in {"input", "reviewed"}:
+            # A statement review stopped in place returns to its input and runs again with Continue.
+            unfinished = True
+            _say(error_stream, f"[{source.name}] Stopped at the statement review.")
+            _say(error_stream, f"[{source.name}] Continue it in the web UI (python3 web_ui.py): Continue runs the "
+                               "statement review again in the same job.")
+        elif run_dir is None or phase in {"input", "prepared"}:
             unfinished = True
             # A queued job that Ctrl-C took out of the queue stays prepared.
             _say(error_stream, f"[{source.name}] Not started." + (
                 " Start it from its job in the web UI: python3 web_ui.py" if phase == "prepared" else ""))
+        elif phase == "paused" and read_pause_object(run_dir).get("pauseCause") == "stopped":
+            unfinished = True
+            if node == "author":
+                _say(error_stream, f"[{source.name}] Stopped.")
+                _say(error_stream, f"[{source.name}] Continue the same conversation with: "
+                                   + _continue_command("--resume-research", run_dir))
+            else:
+                _say(error_stream, f"[{source.name}] Stopped at the {STEP_WORDS.get(node, 'current step')}.")
+                _say(error_stream, f"[{source.name}] Continue it in the web UI (python3 web_ui.py): Continue runs "
+                                   "that step again in the same job.")
         elif phase == "paused":
             unfinished = True
             _say(error_stream, f"[{source.name}] Paused{': ' + error if error else '.'}")

@@ -624,7 +624,7 @@ class ConfinementLiveTests(unittest.TestCase):
                 self.sandbox(":workspace" if writable else ":read-only", snapshot, probes)
 
     def test_only_a_live_run_reaches_the_network_and_then_local_services_too(self):
-        # A service on this Mac, as the README warns a live run's commands can reach.
+        # A service on this Mac, as docs/sandbox.md warns a live run's commands can reach.
         server = socket.socket()
         self.addCleanup(server.close)
         server.bind(("127.0.0.1", 0))
@@ -686,7 +686,7 @@ class ConfinementLiveTests(unittest.TestCase):
             "variables": ('test -n "$SSH_AUTH_SOCK$SSH_AGENT_PID$GPG_AGENT_INFO"', False),
             "launchctl_getenv": ('test -n "$(/bin/launchctl getenv SSH_AUTH_SOCK)"', False),
             "socket_folder_list": (f"/bin/ls {q(str(folder))}", False),
-            # What the README says remains: a socket whose path a command finds, with lsof for one.
+            # What docs/sandbox.md says remains: a socket whose path a command finds, with lsof for one.
             "lsof_lists_the_socket": (f"/usr/sbin/lsof -U | /usr/bin/grep -qF {q(str(agent_socket))}", True),
             "socket_connect_by_path": (connect, True),
             "public_tcp": (PUBLIC_TCP, True),

@@ -75,7 +75,7 @@ CLAUDE_VERSIONS = "~/.local/share/claude/versions"
 # The private temp folders made here are named <prefix><owner's PID>-<8 characters>, so the
 # folder of a process killed before it removed it is swept at the next start (sweep_temps()):
 # a runner's own one without a run temp folder from the controller, one per structured call
-# attempt, and one per Claude CLI.
+# attempt, and one per Claude Code process.
 RUN_TEMP_PREFIX, CALL_TEMP_PREFIX, CLAUDE_TEMP_PREFIX = "tcs-run-tmp-", "tcs-call-tmp-", "tcs-prover-"
 OWNED_TEMP_NAME = re.compile(r"(?:tcs-run-tmp|tcs-call-tmp|tcs-prover)-(\d+)-[A-Za-z0-9_]{8}\Z")
 # Claude Code gives Bash $TMPDIR=<CLAUDE_CODE_TMPDIR>/claude-<uid> only when that path has at
@@ -231,7 +231,7 @@ def runner_folder(workspace):
 
 
 def claude_temp(workspace=None):
-    """A short private temp folder for one Claude CLI process (CLAUDE_CODE_TMPDIR), as /tmp/... (see CLAUDE_TEMP_PARENT).
+    """A short private temp folder for one Claude Code process (CLAUDE_CODE_TMPDIR), as /tmp/... (see CLAUDE_TEMP_PARENT).
 
     Its name carries this process's ID: sweep_temps() removes the folders
     of processes that ended without removing theirs.

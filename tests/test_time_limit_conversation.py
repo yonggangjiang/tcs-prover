@@ -487,9 +487,12 @@ class ConversationRuleTests(PausedAuthorCase):
 
     def test_availability_follows_the_paused_author(self):
         talk = "Talking to the author is available while the run is paused at the proof author."
+        # Elsewhere the reason is the chat's note: where the job is, and when the author works again.
+        held = ("The job is paused at the critic step. If the critic sends the proof back after you resume, you "
+                "can write to the author then.")
         cases = (({}, ""),
-                 ({"phase": "running"}, talk), ({"activeNode": "critic", "stage": "critic"}, talk),
-                 ({"workflowStages": {**LIVE_STAGES, "author": False}}, talk),
+                 ({"phase": "running"}, talk), ({"activeNode": "critic", "stage": "critic"}, held),
+                 ({"workflowStages": {**LIVE_STAGES, "author": False}}, server.CHAT_NOTE_NO_AUTHOR),
                  ({"goalThreadId": ""}, "The author has not started its conversation yet."),
                  ({"sessionUnavailable": True}, "The saved author conversation is no longer available."),
                  ({"safetyStop": True}, "The author was stopped for safety; check the setup, then resume."),

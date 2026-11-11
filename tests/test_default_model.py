@@ -24,6 +24,8 @@ MODEL, EFFORT = "gpt-6.1-sol", "max"
 ROLES = ("review", "author", "critic", "writer")
 INDEX = server.UI / "index.html"
 README = Path(__file__).resolve().parents[1] / "README.md"
+# The README's guide pages: the terminal options and the model sources moved there.
+DOCS = README.parent / "docs"
 
 
 class Launched(Exception):
@@ -348,8 +350,12 @@ class BrowserDefaultTests(unittest.TestCase):
         )
 
     def test_readme_documents_the_current_models_and_defaults(self):
-        text = README.read_text(encoding="utf-8")
-        row = next(line for line in text.splitlines() if line.startswith("| `-authorModel MODEL`"))
+        # The options table is in docs/terminal.md and the model sources in docs/models.md; the README links both.
+        terminal = (DOCS / "terminal.md").read_text(encoding="utf-8")
+        models = (DOCS / "models.md").read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        text = "\n".join(path.read_text(encoding="utf-8") for path in (README, *sorted(DOCS.glob("*.md"))))
+        row = next(line for line in terminal.splitlines() if line.startswith("| `-authorModel MODEL`"))
         self.assertIn(f"| `{MODEL}` |", row)
         for model in runtime.OFFERED_MODELS:
             self.assertIn(f"`{model}`", row)
@@ -357,8 +363,11 @@ class BrowserDefaultTests(unittest.TestCase):
         # The removed provider's setup is gone; only its migration is described.
         for removed in ("DEEPSEEK_API_KEY", "deepseek-v4-pro", "How to use DeepSeek", "deepseek-models.json"):
             self.assertNotIn(removed, text)
-        self.assertIn("## Model providers", text)
-        self.assertIn("| `-reasoningEffort LEVEL` | `max` |", text)
+        self.assertIn("DeepSeek V4 Pro is no longer supported", models)
+        self.assertTrue(models.startswith("# Models and API connections\n"))
+        self.assertIn("(docs/models.md)", readme)
+        self.assertIn("(docs/terminal.md)", readme)
+        self.assertIn("| `-reasoningEffort LEVEL` | `max` |", terminal)
         self.assertNotIn("1.5× on", text.replace("1.5× on the other models", ""))
 
     def test_fallbacks_for_a_state_without_settings_match_the_python_defaults(self):

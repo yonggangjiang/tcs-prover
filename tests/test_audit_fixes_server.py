@@ -169,9 +169,11 @@ class RunFolderWriteTests(TemporaryRuns):
         self.assertEqual(stat.S_IMODE(self.app.trace_file.stat().st_mode), 0o600)
 
     def test_stop_and_pause_still_end_the_child_with_planted_links(self):
-        for action in ("stop", "pause"):
-            with self.subTest(action=action):
-                app = self.new_app(f"Statement for {action}")
+        # Stop works like the time limit: its first press lets the author end its step (as Pause does); at
+        # once (a second press, or the terminal's Ctrl-C) the runner is stopped and the job stays in place.
+        for action, options in (("stop", {}), ("stop", {"at_once": True}), ("pause", {})):
+            with self.subTest(action=action, **options):
+                app = self.new_app(f"Statement for {action} {options}")
                 for name in ("transcript.jsonl", server.PAUSE_FILENAME, server.PAUSE_REQUEST_FILENAME,
                              server.MANUAL_STOP_FILENAME, server.JOB_SETTINGS_FILENAME):
                     (app.run_dir / name).unlink(missing_ok=True)
@@ -181,15 +183,17 @@ class RunFolderWriteTests(TemporaryRuns):
                 process.wait.return_value = 0
                 app.process = process
                 app.state.update(phase="running", stage="solve", activeNode="author")
-                with mock.patch.object(server, "stop_process_tree") as stop_tree:
-                    getattr(app, action)()
+                with mock.patch.object(server, "stop_process_tree") as stop_tree, \
+                        mock.patch.object(server.App, "_watch_author_pause"):
+                    getattr(app, action)(**options)
                 self.assert_outside_untouched()
-                if action == "stop":
+                self.assertTrue(stat.S_ISREG((app.run_dir / server.PAUSE_FILENAME).lstat().st_mode))
+                if options.get("at_once"):
                     stop_tree.assert_called_once_with(process)
-                    self.assertEqual(app.state["phase"], "done")
+                    self.assertEqual(app.state["phase"], "paused")  # No reader is left: settled at once.
                 else:
+                    stop_tree.assert_not_called()
                     self.assertEqual(app.state["phase"], "pausing")
-                    self.assertTrue(stat.S_ISREG((app.run_dir / server.PAUSE_FILENAME).lstat().st_mode))
 
     def test_saved_artifacts_replace_planted_links(self):
         names = ["partial-output.md", server.PAUSE_FILENAME, server.PAUSE_REQUEST_FILENAME,

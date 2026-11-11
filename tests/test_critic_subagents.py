@@ -914,6 +914,7 @@ class AuthorSubagentsRunnerTests(CriticCase):
             yield {"outcome": "done", "output": PROOF}
 
         with mock.patch.object(runtime, "goal_session", side_effect=author), \
+                mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True), \
                 mock.patch.object(runtime, "run_structured_attempt", side_effect=self.attempts(unchanged)):
             runtime.execute_workflows([AUTHOR_CRITIC], {"statement": "Task"}, options)
         return launched[0]

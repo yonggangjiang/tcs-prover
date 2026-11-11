@@ -1,5 +1,6 @@
 """Manage proof jobs and serve the local browser interface."""
 
+import codecs
 import decimal
 import errno
 import getpass
@@ -30,7 +31,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import workflow_runner as runtime
 from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, providers
-from . import ownership, related_works, retrieval
+from . import named_batches, ownership, presets, related_works, retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -128,15 +129,85 @@ WORKFLOW_TIME_LIMIT_ERROR = "Workflow time limit reached"
 TIME_LIMIT_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "paused"}
 # Resume needs at least this much of the time limit left, so a resumed author never pauses at once.
 RESUME_MARGIN_SECONDS = 60
-# Talking to a paused author: one turn in its saved conversation (workflow_runner.py --converse).
+# The chat on the job page ("Talk to the author"): every item lives in conversation.json (controller folder).
+# A summary or a message is one turn of the paused author in its saved conversation (workflow_runner.py
+# --converse); an instruction is a chat message sent while the author works (a live instruction with the chat
+# framing, answered in a file); a question is one the running author asked the user.
 CONVERSATION_FILENAME = "conversation.json"
 PROGRESS_SUMMARY_FILENAME = "progress-summary.md"
 MAX_CONVERSATION_CHARS = runtime.CONVERSATION_MAX_CHARS  # The runner refuses a longer request.
 CONVERSATION_ID = re.compile(r"c_[0-9a-f]{10}\Z")
-CONVERSATION_KINDS = ("summary", "message")
-CONVERSATION_STATUSES = ("queued", "running", "answered", "failed", "stopped")
+CONVERSATION_KINDS = ("summary", "message", "instruction", "question")
+# Kinds answered by a reply turn of the paused author (workflow_runner.py --converse); only these make it busy.
+REPLY_KINDS = ("summary", "message")
+REPLY_STATUSES = ("queued", "running", "answered", "failed", "stopped")
+KIND_STATUSES = {"summary": REPLY_STATUSES, "message": REPLY_STATUSES,
+                 "instruction": ("queued", "delivered", "answered"),
+                 "question": ("open", "answered", "dismissed", "closed")}
+CONVERSATION_STATUSES = tuple(dict.fromkeys(status for statuses in KIND_STATUSES.values() for status in statuses))
 CONVERSATION_BUSY = "The author is replying. Wait for the reply or stop it."
 CONVERSATION_STAGES = {"review": False, "author": True, "critic": False, "writing": False}
+# A chat message sent while the author works asks for any answer in this folder of its working directory.
+CHAT_FOLDER = "chat"
+# An answer file is read once it has not changed for this long (the author may still be writing it).
+CHAT_ANSWER_SETTLE_SECONDS = 2
+# The chat shows at most this much of one answer, says so, and offers the whole file.
+MAX_CHAT_ANSWER_CHARS = 100_000
+CHAT_ANSWER_READ_BYTES = 4 * MAX_CHAT_ANSWER_CHARS + 4
+# The workflow steps in words, as the lists and the job page name where a job stopped.
+STEP_WORDS = {"statement_reviewer": "statement review", "author": "proof author", "critic": "critic",
+              "convention": "convention critic", "latex_editor": "LaTeX editor", "latex_compile": "PDF compilation",
+              "latex_repair": "PDF compilation", "failure_summary": "failure summary"}
+# A statement review the user stopped returns to its input, which says how it runs again there: a first review
+# to the composer (Start workflow), a revision to the earlier review with the feedback (Retry with feedback).
+REVIEW_STOPPED_TEXT = "You stopped the statement review. Start workflow runs it again in this job."
+REVISION_STOPPED_TEXT = "You stopped the statement review. Retry with feedback runs it again in this job."
+# What Continue does for a job the user stopped, by the step it stopped at.
+STOPPED_CONTINUE_DESCRIPTIONS = {
+    "author": "Continues the proof author in this same job, in its saved conversation. The time already used still "
+              "counts.",
+    "critic": "Runs the critic step again in this same job, on the same saved proof.",
+    "convention": "Runs the convention critic again in this same job, on the accepted proof.",
+    "latex_editor": "Runs the LaTeX editor again in this same job, from the same accepted proof.",
+    "latex_compile": "Compiles the saved LaTeX source again in this same job.",
+    "latex_repair": "Compiles the saved LaTeX source again in this same job.",
+}
+# The chat's note (state.conversation.note): what Send does now, or why it is off and when the author works again.
+CHAT_NOTE_AUTHOR = ("Your message reaches the author at its next step. If you ask something, it writes its answer "
+                    "here and keeps working; an instruction it simply follows.")
+CHAT_NOTE_PAUSED = ("The author answers in its saved conversation without changing files, and remembers the "
+                    "exchange when the work continues. Replies do not use the time limit.")
+CHAT_NOTE_PAUSED_CUTOFF = ("The author answers in its saved conversation, and remembers the exchange when the work "
+                           "continues. Replies do not use the time limit.")
+CHAT_NOTE_STARTING = "The proof author is starting. You can write to it in a moment."
+CHAT_NOTE_REVIEWING = ("The statement reviewer is checking the statement. You can talk to the proof author once it "
+                       "starts working.")
+CHAT_NOTE_REVIEWED = "The proof author starts after you approve the statement. You can talk to it then."
+CHAT_NOTE_PREPARED = "You can talk to the proof author once this job starts."
+CHAT_NOTE_CRITIC = ("The critic is reviewing the author's proof. If it sends the proof back, the author works again "
+                    "and you can write to it then.")
+CHAT_NOTE_CONVENTION = ("The convention critic is checking the accepted proof. The proof author does not work again "
+                        "in this run.")
+CHAT_NOTE_LATEX = ("The accepted proof is being written up in LaTeX. The proof author does not work again in this "
+                   "run.")
+CHAT_NOTE_OTHER = "Another step is working. You can talk to the proof author when it works again."
+CHAT_NOTE_PAUSING = "The author is pausing. You can write to it once it has paused, in less than a minute."
+CHAT_NOTE_STOPPING_AUTHOR = "The author is stopping. You can write to it once it has stopped, in less than a minute."
+CHAT_NOTE_STOPPING = "The job is stopping."
+CHAT_NOTE_PAUSING_STEP = "The job is pausing."
+CHAT_NOTE_HELD_CRITIC = ("The job is {held} at the critic step. If the critic sends the proof back after you {go}, "
+                         "you can write to the author then.")
+CHAT_NOTE_HELD_AFTER = "The job is {held} at the {step} step. The proof author does not work again in this run."
+CHAT_NOTE_DONE = "This job has finished, so the author can no longer be asked."
+CHAT_NOTE_NO_AUTHOR = "This job has no Author stage."
+CHAT_NOTE_NO_THREAD = "The author has not started its conversation yet; ask for a summary once it has."
+CHAT_NOTE_SUMMARY_QUEUED = "A progress summary is already asked for; the author writes it once it has paused."
+CHAT_NOTE_SUMMARY_QUEUED_STOP = "A progress summary is already asked for; the author writes it once it has stopped."
+# Why a summary or message asked for of the pausing author got no reply turn (the chat shows "No reply: " first).
+CHAT_SUMMARY_MISSED = ("The author handed in its proof just before the {event}, so the job {settled} at the {step} "
+                       "step, where the author cannot write a summary.")
+CHAT_SUMMARY_ENDED = "The job ended before the author paused, so it wrote no summary."
+CHAT_REPLY_ENDED = "The job ended before the author could reply."
 # Related works can be added while the job can still reach its author.
 RELATED_WORKS_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "paused"}
 # The transcript stage of controller records about related works. Like conversation records,
@@ -152,6 +223,8 @@ AUTHOR_QUESTION_CLOSED = "The author's question is no longer open."
 # Pauses that a restart of TCS Prover causes ("restart") or finds ("interrupted"): the author continues
 # its conversation by itself after them, so its open question stays open.
 RESTART_PAUSE_CAUSES = {"restart", "interrupted"}
+# The batch of the live jobs that no batch made with New batch claims (batches.ORIGINAL_BATCH): "Default batch".
+DEFAULT_BATCH = "__root__"
 # A folder batch ("Run a folder…") shares one related-works store among its jobs.
 FOLDER_BATCH_ID = re.compile(r"b_[0-9a-f]{10}\Z")
 # Staged uploads older than a day are removed at most this often (and when the server starts).
@@ -298,7 +371,7 @@ def complete_pause_checkpoint(checkpoint):
 
 # What a damaged checkpoint still decides when it is rebuilt from the transcript.
 DAMAGED_CHECKPOINT_FIELDS = {
-    "pauseCause": lambda value: value in {"error", "user", "interrupted", "restart", "time-limit"},
+    "pauseCause": lambda value: value in {"error", "user", "interrupted", "restart", "time-limit", "stopped"},
     "autoResumeAt": finite_seconds,
     "error": lambda value: isinstance(value, str),
     "elapsedSeconds": finite_seconds,
@@ -498,13 +571,31 @@ def related_works_record(entries, *, batch=""):
             **({"folderBatch": batch} if batch else {})}
 
 
+def chat_answer_file(identity):
+    """Where the author writes its answer to the chat message ``identity``, relative to its working directory."""
+
+    return f"{CHAT_FOLDER}/answer-{identity}.md"
+
+
 def valid_conversation_item(item):
     """Whether one saved conversation item can be shown and continued."""
 
-    return (isinstance(item, dict) and isinstance(item.get("id"), str) and bool(CONVERSATION_ID.match(item["id"]))
-            and item.get("kind") in CONVERSATION_KINDS and item.get("status") in CONVERSATION_STATUSES
+    if not (isinstance(item, dict) and isinstance(item.get("id"), str) and bool(CONVERSATION_ID.match(item["id"]))
+            and item.get("kind") in KIND_STATUSES and item.get("status") in KIND_STATUSES[item["kind"]]
             and all(isinstance(item.get(key), str) for key in ("text", "reply", "error", "createdAt"))
-            and finite_seconds(item.get("dueAt", 0)))
+            and finite_seconds(item.get("dueAt", 0))):
+        return False
+    if item["kind"] == "instruction":
+        return (isinstance(item.get("steerId"), str) and bool(item["steerId"])
+                and item.get("answerFile") == chat_answer_file(item["id"]))
+    if item["kind"] == "question":
+        return (isinstance(item.get("questionId"), str) and bool(item["questionId"])
+                and bool(question_entries(item.get("questions"))))
+    return True
+
+
+# The fields a chat message (instruction) or an author question adds to its conversation item, all text.
+CHAT_TEXT_FIELDS = ("steerId", "answerFile", "deliveredAt", "answerPath", "answerUpdatedAt", "questionId")
 
 
 def controller_note(record):
@@ -529,15 +620,25 @@ def saved_conversation_items(value):
         if not valid_conversation_item(item):
             continue
         notice = item.get("notice") if isinstance(item.get("notice"), list) else []
+        extra = {key: item[key] for key in CHAT_TEXT_FIELDS if isinstance(item.get(key), str)}
+        if type(item.get("answerBytes")) is int:
+            extra["answerBytes"] = item["answerBytes"]
+        if isinstance(item.get("answerShortened"), bool):
+            extra["answerShortened"] = item["answerShortened"]
+        signature = item.get("answerStat")
+        if isinstance(signature, list) and len(signature) == 2 and all(type(value) is int for value in signature):
+            extra["answerStat"] = list(signature)
+        if item["kind"] == "question":
+            extra["questions"] = question_entries(item.get("questions"))
         loaded.append({
             **{key: item[key] for key in ("id", "kind", "text", "status", "createdAt", "reply", "error")},
-            "origin": "time-limit" if item.get("origin") == "time-limit" else "user",
+            "origin": item["origin"] if item.get("origin") in {"time-limit", "author"} else "user",
             "dueAt": float(item.get("dueAt") or 0),
             "startedAt": item.get("startedAt") if isinstance(item.get("startedAt"), str) else "",
             "finishedAt": item.get("finishedAt") if isinstance(item.get("finishedAt"), str) else "",
             "attempts": item["attempts"] if type(item.get("attempts")) is int else 0,
             "notice": [name for name in notice if isinstance(name, str)],
-            "compacted": item.get("compacted") is True})
+            "compacted": item.get("compacted") is True, **extra})
     return loaded
 
 
@@ -636,6 +737,139 @@ def author_answer_text(questions, answers):
         return f'Answer to your question "{questions[0]["title"]}": {given[0]}'
     return "\n".join(["Answers to your questions:", *(f'"{questions[index]["title"]}": {given[index]}'
                                                        for index in sorted(given))])
+
+
+def chat_template():
+    """The chat framing of workflows/author_critic.yaml: the prompt its goal node binds as "chat".
+
+    The last readable copy of the file is used while an edit does not load. Raise ValueError, with the
+    reason, when the prompt is not bound or does not name both {message} and {answer_file}.
+    """
+
+    try:
+        workflow = runtime.builtin_workflow("author_critic")
+    except (OSError, ValueError, KeyError, TypeError, runtime.Error) as exc:
+        raise ValueError(str(exc).rstrip(".") or type(exc).__name__) from exc
+    nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
+    node = next((node for node in (nodes or {}).values() if isinstance(node, dict) and node.get("run") == "goal"),
+                None)
+    lifecycle = node.get("lifecycle") if node else None
+    if isinstance(lifecycle, list):
+        lifecycle = {key: key for key in lifecycle}
+    reference = lifecycle.get("chat") if isinstance(lifecycle, dict) else None
+    template = (workflow.get("prompts") or {}).get(reference) if reference else None
+    if not isinstance(template, str) or not template.strip():
+        raise ValueError("its proof author has no chat prompt")
+    try:
+        names = {field.split(".")[0] for _, field, _, _ in runtime._template_parts(template) if field is not None}
+    except ValueError as exc:
+        raise ValueError(str(exc).rstrip(".")) from exc
+    for name in ("message", "answer_file"):
+        if name not in names:
+            raise ValueError(f"its chat prompt does not name {{{name}}}")
+    return template
+
+
+# Control characters an answer file may hold; they are removed before it is shown (tabs and line ends stay).
+CHAT_CONTROL_CHARACTERS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _chat_answer_descriptor(workspace, identity):
+    """Open the author's answer to chat message ``identity`` read-only, or return None.
+
+    The file is the author's output in a folder it can write: a `chat` entry that is not a real folder,
+    and a link, a FIFO or a file with a second hard link where the answer belongs, are never read.
+    """
+
+    folder, name = Path(workspace) / CHAT_FOLDER, f"answer-{identity}.md"
+    try:
+        info = os.lstat(folder)
+    except OSError:
+        return None
+    if linked_entry(info) or not stat.S_ISDIR(info.st_mode):
+        return None
+    if os.open in os.supports_dir_fd and NOFOLLOW and hasattr(os, "O_DIRECTORY"):
+        # The folder is opened first, without following a link, so it cannot be swapped meanwhile.
+        try:
+            directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            descriptor = os.open(name, os.O_RDONLY | NOFOLLOW | NONBLOCK | BINARY, dir_fd=directory)
+        except OSError:
+            return None
+        finally:
+            os.close(directory)
+        try:
+            info = os.fstat(descriptor)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                return descriptor
+        except OSError:
+            pass
+        os.close(descriptor)
+        return None
+    try:
+        return open_run_log(folder / name, os.O_RDONLY, private=False)
+    except OSError:
+        return None
+
+
+def chat_answer_signature(workspace, identity):
+    """(size, mtime_ns) of the author's answer file to chat message ``identity``, or None when it is not there."""
+
+    descriptor = _chat_answer_descriptor(workspace, identity)
+    if descriptor is None:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        return (info.st_size, info.st_mtime_ns)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def read_chat_answer(workspace, identity, signature=None):
+    """The author's answer to chat message ``identity`` as the chat shows it, or None when it cannot be read now.
+
+    {"text", "bytes", "shortened", "signature"}: a bounded read decoded as UTF-8 (invalid bytes
+    replaced), with line ends normalized and control characters removed, cut at MAX_CHAT_ANSWER_CHARS
+    ("shortened" says so). A file read whole that holds no text gives the text "". None means it could
+    not be read this time: it cannot be opened or read (too many open files, an I/O error), or it changed
+    since ``signature`` was taken or while it was read; the next check reads it again. The text is
+    untrusted model output: shown, never run.
+    """
+
+    descriptor = _chat_answer_descriptor(workspace, identity)
+    if descriptor is None:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        current = (info.st_size, info.st_mtime_ns)
+        if signature is not None and tuple(signature) != current:
+            return None
+        chunks, size = [], 0
+        while size <= CHAT_ANSWER_READ_BYTES:
+            chunk = os.read(descriptor, CHAT_ANSWER_READ_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    whole = len(data) <= CHAT_ANSWER_READ_BYTES
+    if (after.st_size, after.st_mtime_ns) != current or (whole and len(data) != info.st_size):
+        return None  # Still being written: read again once it has settled.
+    if not whole:
+        data = data[:CHAT_ANSWER_READ_BYTES]
+    text = codecs.getincrementaldecoder("utf-8")(errors="replace").decode(data, final=whole)
+    text = CHAT_CONTROL_CHARACTERS.sub("", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
+    return {"text": text[:MAX_CHAT_ANSWER_CHARS], "bytes": info.st_size,
+            "shortened": not whole or len(text) > MAX_CHAT_ANSWER_CHARS, "signature": list(current)}
 
 
 def delivered_repair(record):
@@ -967,6 +1201,23 @@ RETIRED_DEFAULT_PROMPTS = {
         "found and that you confirm but cannot rigorously fix: then keep the safe fixes in proof.md and return\n"
         "verdict=reject with every unresolved bug and its exact location in bugs. Otherwise return verdict=pass and an\n"
         "empty bugs string. If no edits are needed, leave proof.md unchanged. Return only the requested JSON."),),
+    # The author prompt with separate macOS or Linux and Windows instructions: the runner now adds the
+    # Windows note itself (workflow_runner.INLINE_PROOF_NOTE). The earlier research-notebook defaults are not
+    # listed: the runs they started keep the notebooks those prompts set up.
+    "author": ((
+        "The following is the statement to prove. Try to prove it with a complete, rigorous argument.\n"
+        "\n"
+        "On macOS or Linux, when complete, write the entire self-contained proof to\n"
+        "proof.md in your working directory and submit exactly PROOF_FILE: proof.md\n"
+        "as your final response. Include every argument needed by the critic in that\n"
+        "file. The critic receives a read-only snapshot of this file and the exact\n"
+        "statement. After a rejection, update proof.md with the revised complete\n"
+        "proof and submit it again. A complete inline proof is also accepted.\n"
+        "On Windows, return the entire self-contained proof inline in your final\n"
+        "response, including after a rejection; do not submit a file pointer.\n"
+        "\n"
+        "STATEMENT:\n"
+        "[STATEMENT]"),),
 }
 
 
@@ -1746,9 +1997,11 @@ def require_model_access(models):
 API_SNAPSHOT_FIELDS = ("label", "format", "baseUrl", "headerName", "model", "requestSource", "sourceId", "sourceLabel")
 # The add/edit form's choices; which CLI runs each format is fixed in providers.
 API_MODEL_FORMATS = [
-    {"id": providers.OPENAI_FORMAT, "label": "OpenAI-compatible (Responses API)", "cli": "Codex CLI",
+    {"id": providers.OPENAI_FORMAT, "label": "OpenAI-compatible (Responses API)",
+     "cli": providers.PROVIDER_LABELS[providers.CODEX],
      "headerName": providers.DEFAULT_HEADERS[providers.OPENAI_FORMAT]},
-    {"id": providers.ANTHROPIC_FORMAT, "label": "Anthropic (Messages API)", "cli": "Claude CLI",
+    {"id": providers.ANTHROPIC_FORMAT, "label": "Anthropic (Messages API)",
+     "cli": providers.PROVIDER_LABELS[providers.CLAUDE],
      "headerName": providers.DEFAULT_HEADERS[providers.ANTHROPIC_FORMAT]},
 ]
 
@@ -1798,9 +2051,9 @@ API_FORMAT_LABELS = {providers.OPENAI_FORMAT: "OpenAI format", providers.ANTHROP
 
 
 def _program_name(harness):
-    """A CLI as a sentence names it, from its source menu's name: "the Codex CLI", "the Claude CLI".
+    """A CLI as a sentence names it, from its source menu's name: "the Codex CLI", "Claude Code".
 
-    A product name that is not "… CLI" (Claude Code, say) takes no article.
+    A product name that is not "… CLI" (Claude Code) takes no article.
     """
 
     label = providers.PROVIDER_LABELS[harness]
@@ -1955,7 +2208,7 @@ def _api_test_request(entry, effort=None):
     With an ``effort`` the request is shaped like the ones runs send: it
     streams its answer (server-sent events), offers one tool, asks for a JSON
     answer (Codex's prompt contract for OpenAI-format models, the structured
-    output tool of the Claude CLI for Anthropic-format ones) at that effort,
+    output tool of Claude Code for Anthropic-format ones) at that effort,
     with the model's max output (Anthropic: what runs ask for when none is
     set). Without one it is the minimal request ("Reply with OK.", 16 tokens).
     """
@@ -1978,7 +2231,7 @@ def _api_test_request(entry, effort=None):
                                "parameters": API_TEST_SCHEMA}],
                     "tool_choice": "auto", **({"max_output_tokens": output} if output else {})}
     else:
-        # The Claude CLI takes the base URL without /v1 and adds /v1/messages.
+        # Claude Code takes the base URL without /v1 and adds /v1/messages.
         path = _api_endpoint_path(entry, "messages")
         body = {"model": entry["model"], "max_tokens": API_TEST_MAX_TOKENS,
                 "messages": [{"role": "user", "content": API_TEST_PROMPT}]}
@@ -2346,6 +2599,10 @@ class App:
         trace, total, self.pinned = self._load_trace()
         self.state = empty_state(trace, total)
         self.state["runId"] = self.run_dir.name if self.run_dir else ""
+        # The batch made with New batch that this job belongs to ("" for the default batch). The server
+        # sets it on a new job before the job starts; a saved job reads it from its job settings. It is
+        # kept apart from self.state, which many steps rebuild.
+        self.batch_id = saved_named_batch(self.run_dir) if self.run_dir else ""
         self.process = None
         self.active_token = None
         self.worker_token = None
@@ -2371,6 +2628,13 @@ class App:
         self._carry_critic_feedback = False
         # The author's questions that closed; a late copy of one (its "completed" event) never reopens it.
         self._closed_questions = set()
+        # The answer files of chat messages seen changing: {item id: ((size, mtime_ns), monotonic time that
+        # signature was first seen, whether it was read already and held no answer)}.
+        self._chat_seen = {}
+        # Read the answer files once more, at once, after the job ended (see collect_chat_answers).
+        self._chat_final_pass = False
+        # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
+        self._stop_in_place = False
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -2481,10 +2745,11 @@ class App:
         # thread/steering state. Readers must never observe a truncated JSON.
         # Stage outside the writable workspace so a same-UID sandboxed author
         # cannot alter temporary contents before the controller installs them.
-        payload = json.dumps(
-            {key: options[key] for key in keys if key in options},
-            ensure_ascii=False, indent=2, sort_keys=True,
-        ) + "\n"
+        values = {key: options[key] for key in keys if key in options}
+        # Every save records the job's batch, whatever ``options`` holds.
+        if self.batch_id:
+            values["batch"] = self.batch_id
+        payload = json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         # The controller's copy first: restoring trusts it, and the run
         # folder's copy is only what the author may read.
         for folder in (self._controller_directory(), self.run_dir):
@@ -2525,11 +2790,13 @@ class App:
         )
 
     def _clear_manual_stop(self):
-        """Let a completed terminal result win a concurrent stop request."""
+        """Let a completed terminal result, or a new launch, end a stop: its marker and flags go."""
 
-        if self.run_dir:
-            (self.run_dir / MANUAL_STOP_FILENAME).unlink(missing_ok=True)
+        self._stop_in_place = False
         self.state.update(manuallyStopped=False, stoppedStage="")
+        if self.run_dir:
+            for path in (self.run_dir / MANUAL_STOP_FILENAME, controller_directory(self.run_dir) / MANUAL_STOP_FILENAME):
+                path.unlink(missing_ok=True)
 
     def _spawn_worker(self, target, args, token):
         """Track one reader until all buffered output and artifacts settle."""
@@ -2597,7 +2864,12 @@ class App:
                 and reader[0] is self.worker_token and not reader[1].is_alive())
 
     def _finish_stopped_locked(self, token, message):
-        """Publish a stopped job only after its matching reader has settled."""
+        """Publish a stopped job only after its matching reader has settled.
+
+        A statement review stopped in place returns to its review input and runs again with Continue; any
+        other stop that no reader settled ends the job as stopped (its manual-stop marker offers the
+        continuations that create new jobs).
+        """
 
         if self.worker_token is token:
             self.worker_token = None
@@ -2605,12 +2877,39 @@ class App:
             self.active_token = None
         if self.state["phase"] == "stopping":
             self.process = None
-            self.state.update(
-                phase="done", error="Stopped.",
-                finishedAt=datetime.now(timezone.utc).isoformat(),
-            )
-            self.state["output"] = self.state["output"] or message
+            if self._stop_in_place and self.state.get("stoppedStage") == "review":
+                revision = bool(self.state.get("review")) and bool(self.state.get("reviewFeedback"))
+                self.state.update(phase="reviewed" if revision else "input", stage="review",
+                                  activeNode="statement_reviewer",
+                                  error=REVISION_STOPPED_TEXT if revision else REVIEW_STOPPED_TEXT, finishedAt="",
+                                  output="", manuallyStopped=True, stoppedStage="review")
+                try:
+                    self._save_job_settings(self.state)
+                except (OSError, UnicodeError, TypeError, ValueError):
+                    pass  # The marker and the transcript restore the same state.
+            else:
+                if self._stop_in_place:
+                    # No reader was left to settle the stop in place: it ends as a stop of earlier versions.
+                    self._write_legacy_stop_marker()
+                self.state.update(
+                    phase="done", error="Stopped.",
+                    finishedAt=datetime.now(timezone.utc).isoformat(),
+                )
+                self.state["output"] = self.state["output"] or message
+                self._end_waiting_replies_locked()
+            self._stop_in_place = False
         self._settle_run_claim()
+
+    def _write_legacy_stop_marker(self):
+        """Write the manual-stop marker of a stop that ends the job (best effort; the transcript keeps the stop)."""
+
+        try:
+            self._save(MANUAL_STOP_FILENAME, json.dumps({
+                "schemaVersion": 1, "stage": self.state["stage"], "node": self.state["activeNode"],
+                "problemMode": self.state["problemMode"], "stoppedAt": self.state.get("lastActivityAt", ""),
+            }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        except (OSError, UnicodeError, TypeError, ValueError):
+            pass
 
     def _write_author_limit(self, hours):
         """Atomically publish the total workflow limit to the active solver (from the controller folder)."""
@@ -2836,10 +3135,13 @@ class App:
             state["relatedWorksPending"] = list(state.get("relatedWorksPending") or [])
             historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
             talk_problem = self._conversation_problem_locked()
+            mode, note, summary, summary_note = self._chat_mode_locked()
             state["conversation"] = {"available": not talk_problem, "reason": talk_problem,
                                      "busy": self._conversation_busy_locked(),
                                      # Live runs answer read-only; a web-cutoff author keeps its audited launch.
                                      "readOnly": not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True),
+                                     # What the chat's Send and Summary do now (see _chat_mode_locked).
+                                     "mode": mode, "note": note, "summary": summary, "summaryNote": summary_note,
                                      "items": self._conversation_copies_locked()}
             works_problem = self.related_works_problem()
             workspace = self._author_workspace() if run_dir else None
@@ -3190,6 +3492,10 @@ class App:
                 raise ValueError("Start a new problem from the home screen.")
             if retry and tokens:
                 raise ValueError("Add related works on the job page.")
+            self._stop_in_place = False
+            if retry:
+                # Running the review again ends a stop of it: its marker goes (a restart must not restore it).
+                self._clear_manual_stop()
             if failed_retry:
                 self._save("draft.md", f"# Draft problem\n\n{statement}\n")
             works = ([], "")
@@ -3525,6 +3831,7 @@ class App:
         paths = [runtime.builtin_workflow_path(Path(name).stem) for name in workflows]
         locks = self._claim_run_locked()
         child_environment = self._retrieval_child_environment()
+        self._stop_in_place = False
         token = self.active_token = object()
         try:
             process = subprocess.Popen(
@@ -3575,6 +3882,11 @@ class App:
             self._save("workflow-input.json", json.dumps(state, ensure_ascii=False))
             options = [*options, "--state-file", str(self.run_dir / "workflow-input.json")]
         process, token = self._spawn_runner_locked(workflows, source, options)
+        try:
+            # Every launch ends an earlier stop: its marker goes, and failed model calls are retried again.
+            self._clear_manual_stop()
+        except OSError:
+            pass  # The flags are cleared; a marker left behind is older than this launch's records.
         self.state.update(
             phase="running", stage=stage, activeNode=node, round=0, output="", resultKind="",
         )
@@ -3868,7 +4180,8 @@ class App:
                 deadline = now
             if self.state["phase"] != "paused" or not deadline or now < deadline or self.state.get("manuallyStopped"):
                 return False
-            reply = next((item for item in self._conversation if item["status"] in {"queued", "running"}), None)
+            reply = next((item for item in self._conversation
+                          if item["kind"] in REPLY_KINDS and item["status"] in {"queued", "running"}), None)
             if reply is not None:
                 # A reply of the paused author goes first, but one that has already
                 # failed never holds the run's own retry: it is stopped with a visible
@@ -4012,15 +4325,16 @@ class App:
             # runner, whose retry waits are kept on its conversation item only (_read_conversation_output).
             with self.lock:
                 waiting = next((dict(item["retry"]) for item in self._conversation
-                                if item["status"] == "running" and isinstance(item.get("retry"), dict)), None)
+                                if item["kind"] in REPLY_KINDS and item["status"] == "running"
+                                and isinstance(item.get("retry"), dict)), None)
         failure = str((waiting or {}).get("failure") or "")
-        if failure.endswith("CLI missing or incompatible"):
+        cli = runtime.missing_cli_failure(failure)
+        if cli:
             # Named after the same failure three times in a row (a CLI updating itself is back sooner);
-            # the retries go on meanwhile, and the call continues by itself once the CLI works.
-            program = runtime.CLI_PROGRAMS.get(failure.split(" ", 1)[0], "the CLI")
-            # A title, so no article: "Codex CLI not installed …", like "Claude Code not installed …".
-            program = program.removeprefix("the ")
-            return {"kind": "cli", "title": f"{program[0].upper()}{program[1:]} not installed or not working",
+            # the retries go on meanwhile, and the call continues by itself once the CLI works. A title,
+            # so no article: "Codex CLI not installed …", "Claude Code not installed …", also for the
+            # earlier words "Claude CLI missing or incompatible" of a saved job or an older runner.
+            return {"kind": "cli", "title": f"{runtime.CLI_NAMES[cli]} not installed or not working",
                     "retrying": True, "text": str(waiting.get("text") or failure)}
         if cause not in {"authentication failed", "usage limit reached"}:
             return None
@@ -4039,8 +4353,9 @@ class App:
             return {"kind": "key", "title": "API key rejected", "retrying": retrying,
                     "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; "
                             "the job continues by itself."}
+        program = runtime.CLI_PROGRAMS.get(name, "the CLI")  # "the Codex CLI", "Claude Code"
         return {"kind": "login", "title": f"{name} login needed", "retrying": retrying,
-                "text": f"Log in to the {name} CLI again ({'codex login' if name == 'Codex' else 'claude, then /login'}); "
+                "text": f"Log in to {program} again ({'codex login' if name == 'Codex' else 'claude, then /login'}); "
                         "the job continues by itself."}
 
     def defer_auto_resume(self, problem, now=None):
@@ -4084,32 +4399,62 @@ class App:
                 # automatic retry stops.
                 checkpoint = read_pause_object(self.run_dir)
                 if checkpoint:
-                    # A time-limit pause keeps its cause (it never resumes by itself anyway).
-                    checkpoint.update(pauseCause="time-limit" if checkpoint.get("pauseCause") == "time-limit"
-                                      else "user", autoResumeAt=0)
+                    # A stop at the time limit or by the user keeps its cause (neither resumes by itself anyway).
+                    keep = checkpoint.get("pauseCause") in {"time-limit", "stopped"}
+                    checkpoint.update(pauseCause=checkpoint["pauseCause"] if keep else "user", autoResumeAt=0)
                     self._save_pause(checkpoint)
                 self.state["autoResumeAt"] = 0
-            if self.state["phase"] in {"pausing", "paused"}:
                 self._settle_run_claim()
                 return
             if (self.state["phase"] != "running" or self.state["activeNode"] != "author"
                     or self.state["stage"] not in {"solve", "repair"}):
                 raise ValueError("Pause is available while the proof author is working.")
-            checkpoint_state = self._author_checkpoint_state()
-            cause = "restart" if _for_restart else "user"
-            self._save_pause({"status": "pausing", "node": "author", "state": checkpoint_state,
-                              "pauseCause": cause, "autoResumeAt": 0,
-                              "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
-                              "goalThreadId": self.state.get("goalThreadId", "")})
-            self._save_controlled(PAUSE_REQUEST_FILENAME, "{}\n", run_copy=False)
-            self.state.update(phase="pausing", error="", autoResumeAt=0)
-            self._save_job_settings(self.state)
-            self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
-                            "label": "Paused for a restart" if _for_restart else "Pause requested",
-                            "text": ("TCS Prover is closing: preserving the author conversation, which resumes "
-                                     "automatically when TCS Prover starts again." if _for_restart
-                                     else "Interrupting the author and preserving its saved conversation for Resume.")})
-            process, token = self.process, self.active_token
+            process, token = self._request_author_pause_locked("restart" if _for_restart else "user")
+        self._watch_author_pause(process, token)
+
+    def _author_pause_checkpoint_locked(self, cause):
+        """The checkpoint of an author asked to pause: its saved input, stage, thread and active time."""
+
+        return {"status": "pausing", "node": "author", "state": self._author_checkpoint_state(),
+                "pauseCause": cause, "autoResumeAt": 0,
+                "elapsedSeconds": self._elapsed_seconds(), "stage": self.state["stage"],
+                "goalThreadId": self.state.get("goalThreadId", ""), "summaryRequested": False}
+
+    def _request_author_pause_locked(self, cause, *, summary=False, record=True):
+        """Ask the working author to pause; return (process, token) for _watch_author_pause.
+
+        ``cause`` is "user" (Pause, or Pause and summarize with ``summary``), "restart" (a closing server)
+        or "stopped" (Stop: the job then shows Stopped and continues only with Continue). The runner sees
+        the request file, lets the author finish its current step for its interrupt grace and keeps the
+        saved conversation. ``record`` False leaves the activity record to the caller.
+        """
+
+        self._save_pause(self._author_pause_checkpoint_locked(cause))
+        self._save_controlled(PAUSE_REQUEST_FILENAME, json.dumps({"cause": cause}) + "\n", run_copy=False)
+        self.state.update(phase="pausing", error="", autoResumeAt=0)
+        self._save_job_settings(self.state)
+        if record:
+            grace = span_text(runtime.INTERRUPT_GRACE_SECONDS)
+            entry = {"kind": "status", "stage": self.state["stage"], "node": "author"}
+            if cause == "stopped":
+                entry.update(label="Stop requested", stopInPlace=True,
+                             text=f"Stopping the proof author at its next step: it may finish its current step for "
+                                  f"up to {grace}. Its saved conversation is kept, and Continue picks the work up "
+                                  "in this same job.")
+            elif cause == "restart":
+                entry.update(label="Paused for a restart",
+                             text="TCS Prover is closing: preserving the author conversation, which resumes "
+                                  "automatically when TCS Prover starts again.")
+            else:
+                entry.update(label="Pause requested",
+                             text="Interrupting the author and preserving its saved conversation; it then writes the "
+                                  "progress summary you asked for. Resume continues the work." if summary
+                             else "Interrupting the author and preserving its saved conversation for Resume.")
+            self.add_trace(entry)
+        return self.process, self.active_token
+
+    def _watch_author_pause(self, process, token):
+        """Close an author that does not acknowledge its pause in time, then settle the pause if no reader did."""
 
         def finish_if_unresponsive():
             # Also covers workers started before pause support was installed.
@@ -4121,8 +4466,13 @@ class App:
                 with self.lock:
                     if self.active_token is not token or self.state["phase"] != "pausing":
                         return
-                    self.add_trace({"kind": "diagnostic", "stage": self.state["stage"],
-                                    "text": "The author did not acknowledge the pause; closing its process. Resume will reopen the saved conversation."})
+                    # A Stop shows Stopped, and Continue (not Resume) picks it up.
+                    text = (f"The author did not stop within {span_text(PAUSE_ACKNOWLEDGE_SECONDS)}; closing its "
+                            "process. Continue reopens its saved conversation."
+                            if self._pause_cause_locked() == "stopped" else
+                            "The author did not acknowledge the pause; closing its process. Resume will reopen the "
+                            "saved conversation.")
+                    self.add_trace({"kind": "diagnostic", "stage": self.state["stage"], "text": text})
                 stop_process_tree(process)
             self._settle_pause_without_reader(token)
 
@@ -4135,22 +4485,27 @@ class App:
         with self.lock:
             if self.active_token is not token or self.state["phase"] != "pausing" or not self._reader_gone_locked():
                 return
-            self.process = self.active_token = self.worker_token = None
-            checkpoint = read_pause_object(self.run_dir)
-            try:
-                if checkpoint.get("node") and checkpoint.get("stage"):
-                    checkpoint["status"] = "paused"
-                    self._configure_auto_resume(checkpoint)
-                    self._save_pause(checkpoint)
-            except (OSError, UnicodeError, TypeError, ValueError):
-                pass
-            self.state.update(phase="paused", finishedAt="")
-            try:
-                if checkpoint.get("node") and checkpoint.get("stage"):
-                    self._time_limit_reached_locked(checkpoint)
-            except (OSError, UnicodeError, TypeError, ValueError):
-                pass
-            self._settle_run_claim()
+            self._settle_pause_locked()
+
+    def _settle_pause_locked(self):
+        """Settle a pausing job as paused from its checkpoint (no reader is left to do it)."""
+
+        self.process = self.active_token = self.worker_token = None
+        checkpoint = read_pause_object(self.run_dir)
+        try:
+            if checkpoint.get("node") and checkpoint.get("stage"):
+                checkpoint["status"] = "paused"
+                self._configure_auto_resume(checkpoint)
+                self._save_pause(checkpoint)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            pass
+        self.state.update(phase="paused", finishedAt="")
+        try:
+            if checkpoint.get("node") and checkpoint.get("stage"):
+                self._time_limit_reached_locked(checkpoint)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            pass
+        self._settle_run_claim()
 
     def _check_launch_hold(self):
         """A held run must fail before credentials, workers or elapsed clocks."""
@@ -4226,10 +4581,11 @@ class App:
     def rerun_historical_preflight(self):
         """Check a held historical job again; once every check passes, release its hold.
 
-        A prepared job then starts and a paused one resumes; a stopped one waits
-        for its own continuation. The checks can take a minute, so they run
-        without the job lock: the job list, this job's page and the server's
-        once-a-second loop never wait for them.
+        A prepared job then starts and a paused one resumes; a stopped one (Stop,
+        or a stop of an earlier version) stays stopped until the user chooses
+        Continue, also when the check that passed ran by itself. The checks can
+        take a minute, so they run without the job lock: the job list, this
+        job's page and the server's once-a-second loop never wait for them.
         """
         with self.lock:
             if (not self.state.get("retrievalPolicyPath") or not recheckable_hold(self.state.get("launchHold"))
@@ -4268,8 +4624,10 @@ class App:
                 try:
                     if phase == "prepared":
                         self.start_prepared_run()
-                    elif phase == "paused" and not self.resume_refusal():
-                        # A reply being written, or a used-up time limit, keeps the job paused for the user.
+                    elif (phase == "paused" and self._pause_cause_locked() != "stopped"
+                          and not self.resume_refusal()):
+                        # A reply being written, or a used-up time limit, keeps the job paused for the user; a
+                        # job the user stopped waits for Continue.
                         self.resume()
                 except (OSError, ValueError, RuntimeError) as exc:
                     if not self.state.get("launchHold"):
@@ -4794,8 +5152,11 @@ class App:
         if continuation_source:
             saved_prompt = controlled_path(continuation_source, "prompts/author.txt")
             if saved_prompt.is_file():
-                original_template = read_utf8(saved_prompt, "saved author prompt")
-                if author_prompt is not None and str(author_prompt).strip() != original_template.strip():
+                # Compared as the job reads it: a retired default, saved or given again, is the current default
+                # (current_prompt), as the restored job and its saved settings already show it.
+                original_template = current_prompt("author", read_utf8(saved_prompt, "saved author prompt"))
+                if author_prompt is not None and (current_prompt("author", str(author_prompt)).strip()
+                                                  != original_template.strip()):
                     raise ValueError("A continued author must keep its original author prompt; start a new job to change it.")
                 author_prompt = original_template
         options = self._workflow_options(
@@ -5256,8 +5617,14 @@ class App:
             pass
         self._settle_from_saved_run(process, token)
 
-    def _settle_from_saved_run(self, process, token):
-        """Settle a job whose reader failed with the outcome a restart would restore from its files."""
+    def _settle_from_saved_run(self, process, token, stopped_in_place=False):
+        """Settle a job whose reader failed, or a step the user stopped in place, with the outcome a restart
+        would restore from its files.
+
+        A stop in place becomes a pause at the stopped step (cause "stopped"), which Continue runs again;
+        when nothing there can be rebuilt (the failure summary, say), the job ends as stopped, as in earlier
+        versions.
+        """
 
         self.flush_trace(force=True)  # The outcome is read from the transcript.
         conversation = None
@@ -5269,13 +5636,23 @@ class App:
         with self.lock:
             if self.active_token not in (None, token) or self.worker_token not in (None, token):
                 return  # A newer run of this job owns it now.
+            stopped_in_place = stopped_in_place or (self.state["phase"] == "stopping" and self._stop_in_place)
             if self.process is process:
                 self.process = None
             self.active_token = self.worker_token = None
+            self._stop_in_place = False
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts = {}, {}
             self.state["modelRetry"] = None
-            if restored is not None:
+            if stopped_in_place and not (restored is not None and restored["phase"] == "paused"
+                                         and read_pause_object(self.run_dir).get("pauseCause") == "stopped"):
+                # Nothing to continue in this job was saved: the stop ends it, as in earlier versions.
+                stage = self.state.get("stoppedStage") or self.state["stage"]
+                self._write_legacy_stop_marker()
+                self.state.update(phase="done", error="Stopped.", manuallyStopped=True, stoppedStage=stage,
+                                  finishedAt=datetime.now(timezone.utc).isoformat())
+                self.state["output"] = self.state["output"] or "The model was stopped before it produced an answer."
+            elif restored is not None:
                 self.state.update({key: restored[key] for key in SETTLED_FIELDS if key in restored})
                 # The settled pause may have asked for its progress summary (see _restore_conversation).
                 self._conversation = conversation
@@ -5283,6 +5660,14 @@ class App:
                 self.state.update(phase="done", finishedAt=datetime.now(timezone.utc).isoformat(),
                                   error=f"The job's output reader failed ({str(problem) or type(problem).__name__}). "
                                         "Continue from a saved checkpoint.")
+            # Answers to chat messages the author wrote last are read once more, at once.
+            self._chat_final_pass = self.state["phase"] == "done"
+            self._end_waiting_replies_locked()
+            if stopped_in_place:
+                try:
+                    self._save_job_settings(self.state)
+                except (OSError, UnicodeError, TypeError, ValueError):
+                    pass  # The pause checkpoint and the transcript restore the same state.
 
     def _read_records(self, process, token=None):
         """Store tagged solver events and build the visible final answer."""
@@ -5354,6 +5739,8 @@ class App:
                     with self.lock:
                         self.state["authorSteerDelivered"] = delivered
                         self._save_job_settings(self.state)
+                        # A chat message or an answer to the author's question it took in says so in the chat.
+                        self._chat_delivered_locked(delivered, entry.get("time") or datetime.now(timezone.utc).isoformat())
                 repair = delivered_repair(record)
                 if repair:
                     with self.lock:
@@ -5414,8 +5801,9 @@ class App:
                             checkpoint = read_pause_object(self.run_dir)
                             reason = record.get("reason", "")
                             cause = checkpoint.get("pauseCause") if self.state["phase"] == "pausing" else "error"
-                            # A closing server's pause ('restart') resumes by itself at the next start.
-                            if cause not in {"user", "error", "restart"}:
+                            # A closing server's pause ('restart') resumes by itself at the next start; a Stop
+                            # ('stopped') waits for Continue, also when the time limit ran out meanwhile.
+                            if cause not in {"user", "error", "restart", "stopped"}:
                                 cause = "error" if reason else "user"
                             if (cause in {"error", "restart"} and record["node"] == "author"
                                     and str(reason).startswith(WORKFLOW_TIME_LIMIT_ERROR)):
@@ -5535,6 +5923,12 @@ class App:
             # A record or a write that cannot be handled never stops a working runner.
             return self._read_after_failure(process, token, exc)
         with self.lock:
+            # A step stopped in place is rebuilt from its saved input, as after a restart.
+            in_place = (self.state["phase"] == "stopping" and self._stop_in_place and not final
+                        and self.active_token is token)
+        if in_place:
+            return self._settle_from_saved_run(process, token, stopped_in_place=True)
+        with self.lock:
             terminal_stop_race = (
                 final
                 and self.state.get("manuallyStopped")
@@ -5611,6 +6005,11 @@ class App:
                 self.state["error"] = "The workflow exited without a final answer. Continue from a saved checkpoint."
             if self.state["output"] and not final:
                 self._save("partial-output.md", self.state["output"])
+            self._stop_in_place = False
+            # Answers to chat messages the author wrote last are read once more, at once.
+            self._chat_final_pass = self.state["phase"] == "done"
+            # A summary asked for with Pause and summarize that the job ended before: it says so.
+            self._end_waiting_replies_locked()
             self._save_job_settings(self.state)
             # The author stopped running with this runner: its open question closes (unless a restart paused it).
             self._author_question_locked()
@@ -5631,58 +6030,67 @@ class App:
             if self.trace_file:
                 self.trace_file.unlink(missing_ok=True)
 
-    def stop(self):
-        """Immediately stop the running CLI and all of its descendants."""
+    def stop(self, *, at_once=False):
+        """Stop the job like reaching the time limit: it shows Stopped and continues in this job with Continue.
+
+        While the proof author works, the first Stop lets it finish its current step for up to the runner's
+        interrupt grace (the pause mechanism, cause "stopped"); a second Stop, a Stop while it pauses, and
+        ``at_once`` (the terminal's Ctrl-C) stop it at once. Either way its saved conversation is kept and
+        nothing resumes by itself. The statement review, the critic, the convention critic and the LaTeX steps
+        stop at once and are rebuilt from their saved input, as after a restart. When the records of a stop in
+        place cannot be written, the job ends as stopped, as in earlier versions: never is a runner left working.
+        """
 
         with self.lock:
             self._check_owned_here()
-            if self.state["phase"] == "stopping" or (
-                self.state["phase"] == "done"
-                and self.state["error"] == "Stopped."
-            ):
+            phase = self.state["phase"]
+            if phase == "stopping" or (phase == "done" and self.state["error"] == "Stopped."):
                 return
-            if self.state["phase"] not in {"reviewing", "running", "pausing"}:
+            if phase not in {"reviewing", "running", "pausing"}:
                 raise ValueError("No model request is running in this job.")
-            self.add_trace({
-                "kind": "status", "stage": self.state["stage"],
-                "node": self.state["activeNode"],
-                "label": "Stop requested",
-                "text": "The running model and any subagents are being stopped.",
-            })
-            stopped_at = self.state.get("lastActivityAt", "")
+            at_author = self.state["activeNode"] == "author" and self.state["stage"] in {"solve", "repair"}
             try:
-                self._save(
-                    MANUAL_STOP_FILENAME,
-                    json.dumps({
-                        "schemaVersion": 1,
-                        "stage": self.state["stage"],
-                        "node": self.state["activeNode"],
-                        "problemMode": self.state["problemMode"],
-                        "stoppedAt": stopped_at,
-                    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                )
+                if phase == "running" and at_author and not at_once:
+                    # First press: the author ends its current step, as at the time limit.
+                    process, token = self._request_author_pause_locked("stopped")
+                    mode = "watch"
+                elif phase in {"running", "pausing"} and at_author:
+                    # A second press, a Stop while the author pauses, or the terminal: at once; the pause
+                    # still settles, as Stopped.
+                    if phase == "running":
+                        self._request_author_pause_locked("stopped", record=False)
+                    else:
+                        checkpoint = read_pause_object(self.run_dir) or self._author_pause_checkpoint_locked("stopped")
+                        checkpoint.update(pauseCause="stopped", autoResumeAt=0)
+                        self._save_pause(checkpoint)
+                        self._save_controlled(PAUSE_REQUEST_FILENAME, json.dumps({"cause": "stopped"}) + "\n",
+                                              run_copy=False)
+                        self.state["autoResumeAt"] = 0
+                    self.add_trace({"kind": "status", "stage": self.state["stage"], "node": "author",
+                                    "label": "Stop requested", "stopInPlace": True,
+                                    "text": "Stopping the proof author at once. Its saved conversation is kept, and "
+                                            "Continue picks the work up in this same job."})
+                    process, token, mode = self.process, self.active_token, "author-now"
+                else:
+                    self._stop_step_in_place_locked()
+                    process, token, mode = self.process, self.active_token, "step"
             except (OSError, UnicodeError, TypeError, ValueError):
-                # The transcript entry remains a restart-safe legacy fallback.
-                pass
-            self.state.update(
-                manuallyStopped=True,
-                autoResumeAt=0,
-                stoppedStage=self.state["stage"],
-            )
-            process, self.state["phase"] = self.process, "stopping"
-            # A full disk or a planted entry must not leave the runner working after Stop.
-            try:
-                self._clear_pause_request()
-                for path in (controller_directory(self.run_dir) / PAUSE_FILENAME, self.run_dir / PAUSE_FILENAME):
-                    path.unlink(missing_ok=True)
-                self._save_job_settings(self.state)
-            except (OSError, UnicodeError, TypeError, ValueError):
-                pass
+                # A full disk or a planted entry must never leave the runner working after Stop.
+                self._legacy_stop_locked()
+                process, token, mode = self.process, self.active_token, "step"
+        if mode == "watch":
+            self._watch_author_pause(process, token)
+            return
         stop_process_tree(process)
         with self.lock:
-            # Real jobs stay non-continuable until their reader has drained all
-            # buffered output. Synthetic/no-worker callers, and jobs whose reader
-            # ended without settling, settle here.
+            if mode == "author-now":
+                # The reader settles the pause as Stopped; without one (it ended, or never ran) it is settled here.
+                if (self.state["phase"] == "pausing" and self.active_token is token
+                        and (self.worker_token is None or self._reader_gone_locked())):
+                    self._settle_pause_locked()
+                return
+            # Real jobs settle once their reader has drained all buffered output. Synthetic/no-worker callers,
+            # and jobs whose reader ended without settling, settle here.
             if self.state["phase"] == "stopping" and self._reader_gone_locked():
                 self.worker_token = None
             if self.state["phase"] == "stopping" and self.worker_token is None:
@@ -5690,6 +6098,68 @@ class App:
                     self.active_token,
                     "The model was stopped before it produced an answer.",
                 )
+
+    def _stop_step_in_place_locked(self):
+        """Stop the statement review or a step after the author at once, to continue it in this job.
+
+        The reader then rebuilds the stopped step from its saved input with the restart code
+        (_settle_from_saved_run): the job shows Stopped there, and Continue runs the step again. A stopped
+        statement review returns to its review input (_finish_stopped_locked); its marker says so after a
+        restart.
+        """
+
+        node, stage = self.state["activeNode"], self.state["stage"]
+        review = self.state["phase"] == "reviewing" or stage == "review"
+        self._stop_in_place = True
+        self.add_trace({"kind": "status", "stage": stage, "node": node, "label": "Stop requested", "stopInPlace": True,
+                        "text": "Stopping the statement review at once. Continue runs it again in this job." if review
+                        else f"Stopping the {STEP_WORDS.get(node, 'current step')} at once. Continue runs it again "
+                             "in this same job."})
+        if review:
+            # The controller's copy is trusted (the author can write the run folder's); see saved_manual_stop.
+            self._save_controlled(MANUAL_STOP_FILENAME, json.dumps({
+                "schemaVersion": 1, "stage": "review", "node": node, "problemMode": self.state["problemMode"],
+                "stoppedAt": self.state.get("lastActivityAt", ""), "inPlace": True,
+            }, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        self.state.update(phase="stopping", manuallyStopped=True, autoResumeAt=0, stoppedStage=stage)
+        self._clear_pause_request()
+        # A pause that landed at this step's boundary settles as this stop (its checkpoint is the step's input).
+        checkpoint = read_pause_object(self.run_dir)
+        if checkpoint.get("status") in {"pausing", "paused"}:
+            checkpoint.update(pauseCause="stopped", autoResumeAt=0)
+            self._save_pause(checkpoint)
+        # The pause checkpoint stays: a Resume's "running" checkpoint carries the critic visit to continue.
+        self._save_job_settings(self.state)
+
+    def _legacy_stop_locked(self):
+        """Stop as earlier versions did: the job ends as stopped, and its continuations create new jobs."""
+
+        self._stop_in_place = False
+        try:
+            self.add_trace({
+                "kind": "status", "stage": self.state["stage"],
+                "node": self.state["activeNode"],
+                "label": "Stop requested",
+                "text": "The running model and any subagents are being stopped.",
+            })
+        except OSError:
+            pass  # The marker below keeps the stop.
+        # The transcript entry remains a restart-safe legacy fallback.
+        self._write_legacy_stop_marker()
+        self.state.update(
+            manuallyStopped=True,
+            autoResumeAt=0,
+            stoppedStage=self.state["stage"],
+            phase="stopping",
+        )
+        # A full disk or a planted entry must not leave the runner working after Stop.
+        try:
+            self._clear_pause_request()
+            for path in (controller_directory(self.run_dir) / PAUSE_FILENAME, self.run_dir / PAUSE_FILENAME):
+                path.unlink(missing_ok=True)
+            self._save_job_settings(self.state)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            pass
 
     def set_author_time_limit(self, hours):
         """Replace the total-workflow time limit of a job with an Author stage, until it finishes.
@@ -5755,20 +6225,37 @@ class App:
                 )
             if self.process is None or self.process.poll() is not None:
                 raise ValueError("The proof author is no longer running.")
-            return self._queue_live_instruction_locked(instruction)
+            return self._queue_live_instruction_locked(instruction, audit_kind="instruction", audit_text=instruction)
 
     def _author_running_locked(self):
         return (self.state["phase"] == "running" and self.state["activeNode"] == "author"
                 and self.state["stage"] in {"solve", "repair"})
 
-    def _queue_live_instruction_locked(self, instruction, **fields):
-        """Queue a checked instruction for the running author and record it as the user's live instruction."""
+    def _queue_live_instruction_locked(self, instruction, *, audit_kind, audit_text, conversation_id="", **fields):
+        """Queue a checked instruction for the running author and record it as the user's live instruction.
 
+        In a web-cutoff run the run's audit log first records what the user sends (author_message_sent,
+        ``audit_kind`` "instruction", "chat" or "answer", with ``audit_text``, the user's own words): a web-cutoff
+        author receives nothing unrecorded. If the log does not accept it, nothing is queued and ValueError says so.
+        """
+
+        policy_path = self.state.get("retrievalPolicyPath")
+        if policy_path:
+            try:
+                retrieval_runtime.controller_audit(
+                    retrieval_runtime.load_policy(policy_path), "author_message_sent",
+                    conversationKind=audit_kind, conversationId=conversation_id, text=audit_text,
+                    textSha256=hashlib.sha256(audit_text.encode("utf-8")).hexdigest(),
+                    textChars=len(audit_text), notice="")
+            except Exception as exc:  # noqa: BLE001 - any audit failure keeps the message unsent.
+                raise ValueError(f"The message was not sent: the web-cutoff audit log did not accept it "
+                                 f"({str(exc).rstrip('.') or type(exc).__name__}). Try again in a moment.") from exc
         command_id = self._write_author_steer(instruction)
         self.add_trace({
             "kind": "status", "stage": self.state["stage"],
             "node": "author", "label": "Live instruction queued",
-            "text": instruction, "steerId": command_id, **fields,
+            "text": instruction, "steerId": command_id,
+            **({"conversationId": conversation_id} if conversation_id else {}), **fields,
         })
         return command_id
 
@@ -5792,12 +6279,24 @@ class App:
             if asked and asked["id"] not in self._closed_questions:
                 if current and current["id"] == asked["id"]:
                     current["questions"] = asked["questions"]
+                    item = self._question_item_locked(asked["id"])
+                    if item is not None and item["status"] == "open" and item.get("questions") != asked["questions"]:
+                        item["questions"] = asked["questions"]
+                        self._save_conversation_locked()
                 else:
                     if current:
                         self._close_author_question_locked("The author's question closed: the author asked a "
                                                            "newer question.")
                     self.state["authorQuestion"] = {**asked, "askedAt": now, "turnEndedAt": None}
                     self._save_question_locked()
+                    # The chat lists the question as the author's, with its options.
+                    if self._question_item_locked(asked["id"]) is None:
+                        self._conversation.append({
+                            "id": "c_" + secrets.token_hex(5), "kind": "question", "origin": "author", "text": "",
+                            "status": "open", "createdAt": datetime.now(timezone.utc).isoformat(), "dueAt": 0,
+                            "startedAt": "", "finishedAt": "", "attempts": 0, "reply": "", "error": "", "notice": [],
+                            "compacted": False, "questionId": asked["id"], "questions": asked["questions"]})
+                        self._save_conversation_locked()
             elif current and current["turnEndedAt"] is None and self._ends_question_turn(record, current):
                 current["turnEndedAt"] = now
                 self._save_question_locked()
@@ -5854,6 +6353,12 @@ class App:
             return None
         return question
 
+    def _question_item_locked(self, question_id):
+        """The chat item of the author's question ``question_id``, or None."""
+
+        return next((item for item in self._conversation
+                     if item["kind"] == "question" and item.get("questionId") == question_id), None)
+
     def _close_author_question_locked(self, note="", label="Author question closed"):
         """Close the open question for good and say why in the activity log (an answer says it itself)."""
 
@@ -5863,6 +6368,12 @@ class App:
         self._closed_questions.add(question["id"])
         self.state["authorQuestion"] = None
         self._save_question_locked()
+        item = self._question_item_locked(question["id"])
+        if item is not None and item["status"] == "open":
+            # The chat keeps how it ended; an answered one stays answered.
+            item.update(status="dismissed" if label == "Author question dismissed" else "closed", error=note,
+                        finishedAt=datetime.now(timezone.utc).isoformat())
+            self._save_conversation_locked()
         if note:
             try:
                 # Its own stage: the record says nothing about where the workflow is.
@@ -5912,7 +6423,14 @@ class App:
                 raise ValueError(f"The answer is too long to send: with the question it answers it has "
                                  f"{len(instruction):,} characters, and a live instruction holds at most "
                                  f"{runtime.AUTHOR_STEER_MAX_CHARS:,}. Shorten it.")
-            command_id = self._queue_live_instruction_locked(instruction, questionId=question["id"])
+            item = self._question_item_locked(question["id"])
+            command_id = self._queue_live_instruction_locked(instruction, audit_kind="answer", audit_text=instruction,
+                                                             conversation_id=item["id"] if item else "",
+                                                             questionId=question["id"])
+            if item is not None:
+                item.update(status="answered", reply=instruction, steerId=command_id,
+                            finishedAt=datetime.now(timezone.utc).isoformat())
+                self._save_conversation_locked()
             self._close_author_question_locked()
             return command_id
 
@@ -6002,10 +6520,12 @@ class App:
     # --- Talking to a paused author --------------------------------------------------------------------------------
 
     def _conversation_busy_locked(self):
-        return any(item["status"] in {"queued", "running"} for item in self._conversation)
+        """Whether a reply of the paused author (a summary or a message) is queued or being written."""
+
+        return any(item["kind"] in REPLY_KINDS and item["status"] in {"queued", "running"} for item in self._conversation)
 
     def _conversation_running_locked(self):
-        return any(item["status"] == "running" for item in self._conversation)
+        return any(item["kind"] in REPLY_KINDS and item["status"] == "running" for item in self._conversation)
 
     def conversation_busy(self):
         """Whether a summary or reply of the paused author is queued or being written."""
@@ -6022,16 +6542,21 @@ class App:
         return next((item for item in self._conversation if item["id"] == identity), None)
 
     def _conversation_problem_locked(self):
-        """Why the paused author cannot be asked now, or "" when it can."""
+        """Why the paused author cannot be asked now (a reply turn), or "" when it can."""
 
         state = self.state
         try:
             author = saved_workflow_stages(state)["author"]
         except ValueError:
             author = False
-        if not (state["phase"] == "paused" and author and state.get("activeNode") == "author"
-                and state.get("stage") in {"solve", "repair"}):
+        if not author:
+            return CHAT_NOTE_NO_AUTHOR
+        at_author = state.get("activeNode") == "author" and state.get("stage") in {"solve", "repair"}
+        if state["phase"] == "running" and at_author:
+            # A message for the working author goes as a live instruction (send_chat), never as a reply turn.
             return "Talking to the author is available while the run is paused at the proof author."
+        if not (state["phase"] == "paused" and at_author):
+            return self._chat_step_note_locked()
         if not state.get("goalThreadId"):
             return "The author has not started its conversation yet."
         if state.get("sessionUnavailable"):
@@ -6043,6 +6568,247 @@ class App:
         if state.get("runningElsewhere"):
             return state["runningElsewhere"]
         return ""
+
+    def _pause_cause_locked(self):
+        """The saved cause of a pausing or paused job ("user", "stopped", "time-limit", ...; "" otherwise)."""
+
+        if self.state["phase"] not in {"paused", "pausing"} or self.run_dir is None:
+            return ""
+        return str(read_pause_object(self.run_dir).get("pauseCause") or "")
+
+    def _chat_step_note_locked(self):
+        """Why the proof author cannot be written to now, and when it works again (the job is not at its author)."""
+
+        state = self.state
+        phase, node = state["phase"], state.get("activeNode") or ""
+        if phase == "pausing":
+            return CHAT_NOTE_STOPPING if self._pause_cause_locked() == "stopped" else CHAT_NOTE_PAUSING_STEP
+        if phase == "paused":
+            cause = self._pause_cause_locked()
+            held = "stopped" if cause == "stopped" else "paused"
+            if node == "critic":
+                return CHAT_NOTE_HELD_CRITIC.format(held=held,
+                                                    go="continue" if cause in {"stopped", "time-limit"} else "resume")
+            return CHAT_NOTE_HELD_AFTER.format(held=held, step=STEP_WORDS.get(node, "current"))
+        if phase == "running":
+            return (CHAT_NOTE_CRITIC if node == "critic" else CHAT_NOTE_CONVENTION if node == "convention"
+                    else CHAT_NOTE_LATEX if node in {"latex_editor", "latex_compile", "latex_repair"}
+                    else CHAT_NOTE_OTHER)
+        return {"reviewing": CHAT_NOTE_REVIEWING, "reviewed": CHAT_NOTE_REVIEWED, "prepared": CHAT_NOTE_PREPARED,
+                "stopping": CHAT_NOTE_STOPPING, "done": CHAT_NOTE_DONE}.get(phase, CHAT_NOTE_PREPARED)
+
+    def _chat_mode_locked(self):
+        """What the chat's Send and Summary buttons do now: (mode, note, summary, summary note).
+
+        ``mode`` is "author" (Send queues a live instruction with the chat framing), "paused" (a reply turn
+        of the author paused at the proof author), "busy" (a reply is being written) or "off"; ``note`` says
+        what Send does, or why it is off and when the author works again. ``summary`` is "pause" (Pause and
+        summarize), "queue" (written once the author has paused), "now" or "off" (with its reason). One
+        source for the page (the snapshot) and for the server's own checks.
+        """
+
+        state = self.state
+        try:
+            author = saved_workflow_stages(state)["author"]
+        except ValueError:
+            author = False
+        if not author:
+            return "off", CHAT_NOTE_NO_AUTHOR, "off", CHAT_NOTE_NO_AUTHOR
+        if state.get("runningElsewhere"):
+            return "off", state["runningElsewhere"], "off", state["runningElsewhere"]
+        phase = state["phase"]
+        at_author = state.get("activeNode") == "author" and state.get("stage") in {"solve", "repair"}
+        busy = self._conversation_busy_locked()
+        if phase == "running" and at_author:
+            if self.process is None or self.process.poll() is not None:
+                return "off", CHAT_NOTE_STARTING, "off", CHAT_NOTE_STARTING
+            reason = CONVERSATION_BUSY if busy else "" if state.get("goalThreadId") else CHAT_NOTE_NO_THREAD
+            return "author", CHAT_NOTE_AUTHOR, "off" if reason else "pause", reason
+        if phase == "pausing" and at_author:
+            # A Stop reads as stopping, never as pausing.
+            stopping = self._pause_cause_locked() == "stopped"
+            note = CHAT_NOTE_STOPPING_AUTHOR if stopping else CHAT_NOTE_PAUSING
+            queued = CHAT_NOTE_SUMMARY_QUEUED_STOP if stopping else CHAT_NOTE_SUMMARY_QUEUED
+            reason = queued if busy else "" if state.get("goalThreadId") else CHAT_NOTE_NO_THREAD
+            return "off", note, "off" if reason else "queue", reason
+        if phase == "paused" and at_author:
+            problem = self._conversation_problem_locked()
+            if problem:
+                return "off", problem, "off", problem
+            if busy:
+                return "busy", CONVERSATION_BUSY, "off", CONVERSATION_BUSY
+            historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+            read_only = not historical and getattr(runtime, "CONVERSATION_READ_ONLY", True)
+            return "paused", CHAT_NOTE_PAUSED if read_only else CHAT_NOTE_PAUSED_CUTOFF, "now", ""
+        note = self._chat_step_note_locked()
+        return "off", note, "off", note
+
+    def send_chat(self, text):
+        """Send one chat message: a live instruction with the chat framing while the author works, or a reply
+        turn of the author paused (or stopped) at the proof author. Return the new chat item."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Enter a message for the author.")
+        text = text.strip()
+        if "\0" in text:
+            raise ValueError("The message cannot contain NUL characters.")
+        if len(text) > MAX_CONVERSATION_CHARS:
+            raise ValueError(f"Keep the message at or below {MAX_CONVERSATION_CHARS:,} characters.")
+        with self.lock:
+            self._check_owned_here()
+            mode, note, _, _ = self._chat_mode_locked()
+            if mode == "author":
+                return self._send_chat_instruction_locked(text)
+            if mode == "paused":
+                return self._queue_conversation_locked("message", text, "user")
+            raise ValueError(note)
+
+    def _send_chat_instruction_locked(self, text):
+        """Queue a chat message for the working author: the YAML's chat framing asks it to write any answer
+        to chat/answer-<id>.md in its working directory, which collect_chat_answers shows in the chat."""
+
+        identity = "c_" + secrets.token_hex(5)
+        answer_file = chat_answer_file(identity)
+        try:
+            template = chat_template()
+        except ValueError as exc:
+            raise ValueError(f"The chat prompt of workflows/author_critic.yaml cannot be used ({exc}); the message "
+                             "was not sent.") from exc
+        framed = runtime.render_template(template, {"message": text, "answer_file": answer_file})
+        limit = getattr(runtime, "AUTHOR_STEER_QUEUE_MAX_CHARS", runtime.AUTHOR_STEER_MAX_CHARS)
+        if len(framed) > limit:
+            raise ValueError(f"With its chat framing this message has {len(framed):,} characters; a live "
+                             f"instruction holds at most {limit:,}. Shorten it.")
+        self._prepare_chat_folder_locked()
+        steer_id = self._queue_live_instruction_locked(framed, audit_kind="chat", audit_text=text,
+                                                       conversation_id=identity, chatText=text)
+        item = {"id": identity, "kind": "instruction", "origin": "user", "text": text, "status": "queued",
+                "createdAt": datetime.now(timezone.utc).isoformat(), "dueAt": 0, "startedAt": "", "finishedAt": "",
+                "attempts": 0, "reply": "", "error": "", "notice": [], "compacted": False,
+                "steerId": steer_id, "answerFile": answer_file, "deliveredAt": "", "answerPath": "",
+                "answerUpdatedAt": ""}
+        self._conversation.append(item)
+        self._save_conversation_locked()
+        return item
+
+    def _prepare_chat_folder_locked(self):
+        """Create the author's chat folder, where it writes its answers (best effort: the message goes anyway).
+
+        mkdir never follows a link: an entry already named chat (a folder, or a link, file or FIFO through
+        which no answer is ever read) is left as it is.
+        """
+
+        try:
+            os.mkdir(self._author_workspace() / CHAT_FOLDER, 0o700)
+        except OSError:
+            pass
+
+    def _chat_delivered_locked(self, steer_id, when):
+        """The author took in the live instruction ``steer_id``: its chat message or question answer says so."""
+
+        changed = False
+        for item in self._conversation:
+            if (item["kind"] in {"instruction", "question"} and item.get("steerId") == steer_id
+                    and not item.get("deliveredAt")):
+                item["deliveredAt"] = when
+                if item["kind"] == "instruction" and item["status"] == "queued":
+                    item["status"] = "delivered"
+                changed = True
+        if changed:
+            self._save_conversation_locked()
+        return changed
+
+    def collect_chat_answers(self, now=None):
+        """Show the answers the author wrote to chat messages (the server's tick, about once a second).
+
+        An answer file is read once it has not changed for CHAT_ANSWER_SETTLE_SECONDS, and again whenever
+        it changes; after the job ended, once more at once (_chat_final_pass). A file that could not be read
+        (an open or read error, a change while it was read) is read again at the next check; only a file
+        read whole that holds no text waits for its next change. Nothing waits for an answer.
+        """
+
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            if self.run_dir is None or self.state.get("readOnly") or self.state.get("runningElsewhere"):
+                return
+            # The pass after the job ended reads at once; never while it works (an answer may be half written).
+            final = self._chat_final_pass and self.state["phase"] == "done"
+            if self.state["phase"] == "done" and not final:
+                return
+            watched = [(item["id"], tuple(item["answerStat"]) if item.get("answerStat") else None)
+                       for item in self._conversation if item["kind"] == "instruction"]
+            self._chat_final_pass = False
+            if not watched:
+                return
+            workspace = self._author_workspace()
+        answers, unread = [], False
+        for identity, captured in watched:
+            # The file system is read outside the lock: polls never wait for it.
+            signature = chat_answer_signature(workspace, identity)
+            if signature is None or signature == captured:
+                continue
+            seen = self._chat_seen.get(identity)
+            if seen is None or seen[0] != signature:
+                seen = self._chat_seen[identity] = (signature, now, False)
+            if not final and (seen[2] or now - seen[1] < CHAT_ANSWER_SETTLE_SECONDS):
+                continue  # Still being written, or read whole already and empty: read again once it changes.
+            answer = read_chat_answer(workspace, identity, signature)
+            if answer is None:
+                unread = True  # Not readable this time: the next check reads it again.
+                continue
+            if not answer["text"]:
+                self._chat_seen[identity] = (signature, seen[1], True)
+                continue
+            answers.append((identity, answer))
+        if not answers and not (final and unread):
+            return
+        with self.lock:
+            if final and unread and self.state["phase"] == "done":
+                self._chat_final_pass = True  # The pass after the job ended tries that answer again.
+            for identity, answer in answers:
+                item = self._conversation_item_locked(identity)
+                if item is None or item["kind"] != "instruction" or item.get("answerStat") == answer["signature"]:
+                    continue
+                when = datetime.now(timezone.utc).isoformat()
+                first = item["status"] != "answered"
+                item.update(status="answered", reply=answer["text"], answerBytes=answer["bytes"],
+                            answerShortened=answer["shortened"], answerStat=answer["signature"],
+                            answerPath=str(workspace / item["answerFile"]))
+                if first:
+                    item["finishedAt"] = when
+                else:
+                    item["answerUpdatedAt"] = when
+                # An answer written before the delivery record arrived says that it was delivered.
+                if not item.get("deliveredAt"):
+                    item["deliveredAt"] = when
+                self._save_conversation_locked()
+                try:
+                    # No "node": the record says nothing about where the workflow is (a critic may run now).
+                    self.add_trace({"kind": "status", "stage": "conversation",
+                                    "label": "Author answered" if first else "Author answer updated",
+                                    "conversationId": identity, "text": answer["text"],
+                                    "answerFile": item["answerFile"]})
+                except OSError:
+                    pass  # The chat keeps the answer; only its activity record is missing.
+
+    def open_chat_answer(self, identity):
+        """The whole answer file of one answered chat message, opened for a download: (binary stream, size)."""
+
+        identity = str(identity or "")
+        with self.lock:
+            item = self._conversation_item_locked(identity) if CONVERSATION_ID.match(identity) else None
+            if item is None or item["kind"] != "instruction" or not item.get("reply"):
+                raise ValueError("No answer to that message is saved.")
+            workspace = self._author_workspace()
+        descriptor = _chat_answer_descriptor(workspace, identity)
+        if descriptor is None:
+            raise ValueError("The answer file is no longer available.")
+        try:
+            size = os.fstat(descriptor).st_size
+        except OSError:
+            os.close(descriptor)
+            raise
+        return os.fdopen(descriptor, "rb"), size
 
     def _save_conversation_locked(self):
         """Save the conversation in the controller folder only (the author cannot change it)."""
@@ -6056,7 +6822,9 @@ class App:
                                   run_copy=False)
         except (OSError, UnicodeError, ValueError) as exc:
             try:
-                self.add_trace({"kind": "diagnostic", "stage": "conversation", "node": "author",
+                # No "node": the chat is saved while a critic or LaTeX step works or holds the job too (an
+                # answer, a question that closes), and add_trace would move the job's step to the author.
+                self.add_trace({"kind": "diagnostic", "stage": "conversation",
                                 "text": f"The author conversation could not be saved ({exc}); it is kept here and "
                                         "saved with its next change."})
             except OSError:
@@ -6108,11 +6876,26 @@ class App:
             return self._queue_conversation_locked("message", text, "user")
 
     def request_author_summary(self):
-        """Ask the paused author for a progress summary."""
+        """Ask the author for a progress summary, which the chat shows.
+
+        While the author works this is Pause and summarize: a normal Pause (Resume continues the work),
+        with the summary asked for at once and written by the paused author's reply turn once it has
+        paused. While it pauses, the summary is written once it has paused; while it is paused or stopped
+        at the proof author, at once.
+        """
 
         with self.lock:
-            self._check_can_talk_locked()
-            return self._queue_conversation_locked("summary", "", "user")
+            self._check_owned_here()
+            _, _, summary, summary_note = self._chat_mode_locked()
+            if summary == "pause":
+                process, token = self._request_author_pause_locked("user", summary=True)
+                item = self._queue_conversation_locked("summary", "", "user")
+            elif summary in {"queue", "now"}:
+                return self._queue_conversation_locked("summary", "", "user")
+            else:
+                raise ValueError(summary_note)
+        self._watch_author_pause(process, token)
+        return item
 
     def stop_author_reply(self, identity=None):
         """Cancel the queued or running reply (``identity``: the one the page shows); the job stays paused."""
@@ -6120,7 +6903,8 @@ class App:
         identity = identity or None
         with self.lock:
             self._check_owned_here()
-            item = next((item for item in self._conversation if item["status"] in {"queued", "running"}), None)
+            item = next((item for item in self._conversation
+                         if item["kind"] in REPLY_KINDS and item["status"] in {"queued", "running"}), None)
             if item is None:
                 raise ValueError("No author reply is being written.")
             if identity is not None and identity != item["id"]:
@@ -6129,7 +6913,9 @@ class App:
             item.update(status="stopped", finishedAt=datetime.now(timezone.utc).isoformat())
             item.pop("retry", None)
             self._save_conversation_locked()
-            self.add_trace({"kind": "status", "stage": "conversation", "node": "author", "conversationId": item["id"],
+            # No "node": a summary asked for with Pause and summarize can be stopped while the pause holds the
+            # job at the critic, where add_trace must not move the job's step to the author.
+            self.add_trace({"kind": "status", "stage": "conversation", "conversationId": item["id"],
                             "label": "Author reply stopped", "text": "The reply was stopped; the job stays paused."})
             process = None
             if running:
@@ -6170,6 +6956,26 @@ class App:
         self._save_conversation_locked()
         self._settle_run_claim()  # Nothing more may start this run's runner by itself.
 
+    def _end_waiting_replies_locked(self):
+        """The job ended: a summary or message still waiting for the paused author's reply turn gets none.
+
+        Pause and summarize asks for its summary before the pause lands; when the author hands in its proof
+        just then and nothing follows it, the workflow ends instead of pausing. Only a paused job starts a
+        reply, so the item would wait (and keep the chat busy) for good.
+        """
+
+        if self.state["phase"] != "done":
+            return
+        changed = False
+        for item in self._conversation:
+            if item["kind"] in REPLY_KINDS and item["status"] in {"queued", "running"}:
+                item.update(status="failed", finishedAt=datetime.now(timezone.utc).isoformat(),
+                            error=CHAT_SUMMARY_ENDED if item["kind"] == "summary" else CHAT_REPLY_ENDED)
+                item.pop("retry", None)
+                changed = True
+        if changed:
+            self._save_conversation_locked()
+
     def _delay_conversation_locked(self, item, now, error):
         """Try a queued reply again after the usual wait (an API model store that cannot be read for a moment,
         a web-cutoff check, a launch that failed)."""
@@ -6183,7 +6989,8 @@ class App:
 
         now = time.time() if now is None else now
         with self.lock:
-            item = next((item for item in self._conversation if item["status"] == "queued"), None)
+            item = next((item for item in self._conversation
+                         if item["kind"] in REPLY_KINDS and item["status"] == "queued"), None)
             if item is None:
                 return
             self._delay_conversation_locked(item, now, f"Could not start the reply: {str(problem).rstrip('.')}. "
@@ -6229,13 +7036,20 @@ class App:
         with self.lock:
             if self.state["phase"] != "paused" or self.has_active_worker() or self.state.get("runningElsewhere"):
                 return False
-            item = next((item for item in self._conversation if item["status"] == "queued"), None)
+            item = next((item for item in self._conversation
+                         if item["kind"] in REPLY_KINDS and item["status"] == "queued"), None)
             if item is None or (item.get("dueAt") or 0) > now:
                 return False
             resume_due = 0 < (self.state.get("autoResumeAt") or 0) <= now
             if resume_due and self._reply_failed_before(item):
                 return False  # auto_resume_if_due stops it and resumes the run; no relaunch first.
             problem = self._conversation_problem_locked()
+            if problem and item["kind"] == "summary" and self.state.get("activeNode") != "author":
+                # Pause and summarize met an author that had just handed in its proof.
+                stopped = self._pause_cause_locked() == "stopped"
+                problem = CHAT_SUMMARY_MISSED.format(event="stop" if stopped else "pause",
+                                                     settled="stopped" if stopped else "paused",
+                                                     step=STEP_WORDS.get(self.state.get("activeNode"), "next"))
             if not problem and check is not None:
                 try:
                     check()
@@ -6408,12 +7222,14 @@ class App:
         except (OSError, UnicodeError, TypeError, ValueError):
             pass  # Kept in memory; saved with the next change.
 
-    def _restore_conversation(self, checkpoint, *, owned=True):
+    def _restore_conversation(self, checkpoint, *, owned=True, delivered=None):
         """Load the saved conversation after a restart (see restore_saved_app).
 
         A paused job asks again for a reply the restart interrupted, and for the
         automatic summary of a time-limit pause that never asked for it; any
-        other job's unfinished items end as stopped.
+        other job's unfinished replies end as stopped. Chat messages and answers
+        to the author's questions that the transcript shows the author took in
+        (``delivered``: {steer ID: time}) say so.
         """
 
         self._conversation = self._load_conversation()
@@ -6422,6 +7238,15 @@ class App:
         paused = self.state["phase"] == "paused"
         changed = False
         for item in self._conversation:
+            steer = item.get("steerId")
+            if item["kind"] in {"instruction", "question"} and steer in (delivered or {}) and not item.get("deliveredAt"):
+                item["deliveredAt"] = delivered[steer] or datetime.now(timezone.utc).isoformat()
+                if item["kind"] == "instruction" and item["status"] == "queued":
+                    item["status"] = "delivered"
+                changed = True
+        for item in self._conversation:
+            if item["kind"] not in REPLY_KINDS:
+                continue
             if item["status"] == "running" and paused:
                 item.update(status="queued", dueAt=0)
                 changed = True
@@ -6446,6 +7271,21 @@ class App:
                 if not self._conversation_problem_locked() and not self._conversation_busy_locked():
                     self._queue_conversation_locked("summary", "", "time-limit")
                 checkpoint["summaryRequested"] = True
+
+    def _close_stale_question_items(self):
+        """After a restart: the author's questions the chat still lists as open closed with their author,
+        unless a restart pause keeps the question open until the author continues."""
+
+        kept = self.state.get("authorQuestion")
+        changed = False
+        for item in self._conversation:
+            if item["kind"] == "question" and item["status"] == "open" and (
+                    not kept or item.get("questionId") != kept["id"]):
+                item.update(status="closed", error="The author's question closed: the proof author is no longer "
+                                                   "running.", finishedAt=datetime.now(timezone.utc).isoformat())
+                changed = True
+        if changed:
+            self._save_conversation_locked()
 
     # --- Related works -------------------------------------------------------------------------------------------
 
@@ -6634,7 +7474,8 @@ class App:
             if self.has_active_worker():
                 raise ValueError("The author is replying. Stop the reply first." if self._conversation_running_locked()
                                  else "Wait for the current model request to finish.")
-            queued = [item for item in self._conversation if item["status"] == "queued"]
+            # Only replies of the paused author end as stopped; chat messages keep how far they got.
+            queued = [item for item in self._conversation if item["kind"] in REPLY_KINDS and item["status"] == "queued"]
             for item in queued:
                 self._finish_conversation_locked(item, "stopped")
             trace, version = self.state["trace"], self.state["traceVersion"]
@@ -6715,15 +7556,21 @@ def saved_author_instructions(run_dir):
         text.strip() for text in (record.get("text") for record in restored)
         if isinstance(text, str) and text.strip()
     }
+    # Chat messages are replayed as the user wrote them, without the chat framing the author received.
+    chat_ids = {str(record.get("steerId") or "").strip() for record in records
+                if record.get("label") == "Live instruction queued" and isinstance(record.get("chatText"), str)
+                and record.get("conversationId")}
+    chat_ids.discard("")
     instructions, seen = [], set()
     for record in records:
         if record.get("label") == "Live author instruction sent":
             text = record.get("text")
-            if (str(record.get("steerId") or "").strip() in restored_ids
+            if (str(record.get("steerId") or "").strip() in restored_ids | chat_ids
                     or (isinstance(text, str) and text.strip() in restored_texts)):
                 continue
         values = record.get("restoredInstructions")
-        values = values if isinstance(values, list) else [record.get("text")]
+        chat = record.get("chatText") if record.get("conversationId") else None
+        values = values if isinstance(values, list) else [chat if isinstance(chat, str) else record.get("text")]
         for value in values:
             if not isinstance(value, str) or not value.strip() or "\0" in value:
                 continue
@@ -6794,6 +7641,13 @@ def saved_folder_batch(run_dir):
     return value if isinstance(value, str) and FOLDER_BATCH_ID.match(value) else ""
 
 
+def saved_named_batch(run_dir):
+    """The ID of the batch made with New batch that a run belongs to, or "" (the default batch)."""
+
+    value = saved_job_setting(run_dir, "batch")
+    return value if isinstance(value, str) and named_batches.BATCH_ID.match(value) else ""
+
+
 def saved_goal_options(run_dir):
     """Recover generic session/workspace settings without reading author files."""
 
@@ -6811,15 +7665,21 @@ def saved_goal_options(run_dir):
 
 
 def saved_manual_stop(run_dir, records=None):
-    """Return one durable manual-stop marker, including legacy transcripts."""
+    """Return one durable manual-stop marker, including legacy transcripts.
+
+    A statement review stopped in place says so with "inPlace" (it returns to its review input), which is
+    trusted only from the controller's copy: the author can write the run folder's. A "Stop requested"
+    record of a stop in place (stopInPlace) is no marker: that job paused at the stopped step. Nor is one
+    that a later launch of the job ended (RELAUNCH_LABELS): a web-cutoff job stopped the earlier way and
+    continued in its own folder runs again, and its launch removed the marker files.
+    """
 
     run_dir = Path(run_dir)
     records = _run_records(run_dir) if records is None else records
     marker = None
+    path = controlled_path(run_dir, MANUAL_STOP_FILENAME)
     try:
-        value = json.loads(
-            (run_dir / MANUAL_STOP_FILENAME).read_text(encoding="utf-8")
-        )
+        value = json.loads(path.read_text(encoding="utf-8"))
         if (
             isinstance(value, dict)
             and value.get("schemaVersion") == 1
@@ -6828,14 +7688,19 @@ def saved_manual_stop(run_dir, records=None):
             }
         ):
             marker = dict(value)
+            controlled = path.parent != run_dir
+            marker["inPlace"] = controlled and value.get("inPlace") is True and value["stage"] == "review"
     except (OSError, UnicodeError, json.JSONDecodeError):
         pass
 
     legacy = None
     for index, record in enumerate(records):
-        if (
+        if record.get("kind") == "status" and record.get("label") in RELAUNCH_LABELS:
+            legacy = None  # The job ran again since that stop.
+        elif (
             record.get("kind") == "status"
             and record.get("label") == "Stop requested"
+            and record.get("stopInPlace") is not True
             and record.get("stage") in {
                 "review", "solve", "repair", "critic", "final", "failure",
             }
@@ -6976,6 +7841,11 @@ def saved_setting_problem(key, value):
     return "" if valid else f"The saved {key} setting in {JOB_SETTINGS_FILENAME} is invalid; the default is used."
 
 
+# The records of a launch of an idle job in its own folder (Resume, Continue, a web-cutoff job's continuation):
+# each ends the stop before it, of either kind (see saved_manual_stop and restore_saved_app).
+RELAUNCH_LABELS = frozenset({"Resume requested", "Historical run continued"})
+
+
 def restore_record(record):
     """The part of one transcript record that restoring needs after its single pass, or None."""
 
@@ -6986,15 +7856,16 @@ def restore_record(record):
         return {key: record.get(key) for key in ("kind", "stage", "text", "time")}
     if kind == "proof_handoff":
         return {"kind": kind, "manifest": record.get("manifest")}
-    if kind == "status" and record.get("label") in {"Workflow step: critic", "Resume requested"}:
-        # Which critic round a restart interrupted (see interrupted_critic_visit).
+    if kind == "status" and record.get("label") in {"Workflow step: critic", *RELAUNCH_LABELS}:
+        # Which critic round a restart interrupted (see interrupted_critic_visit), and the launches that end a
+        # stop of an earlier version (see saved_manual_stop).
         return {key: record.get(key) for key in ("kind", "stage", "label", "node", "visit", "verify")}
     if kind == "request":
         return {"kind": kind, "stage": record.get("stage")}
     if kind in {"final_result", "failure_result", "review_result"}:
         return {"kind": kind}
     if kind == "status" and record.get("label") in {"Critic approved", "Stop requested", "Statement review failed"}:
-        return {key: record.get(key) for key in ("kind", "stage", "label", "node", "time", "text")}
+        return {key: record.get(key) for key in ("kind", "stage", "label", "node", "time", "text", "stopInPlace")}
     if kind == "convention_result":
         # The convention critic answered: its step is over (see interrupted_stage_checkpoint).
         return {key: record.get(key) for key in ("kind", "stage", "round", "verdict", "time")}
@@ -7367,10 +8238,22 @@ def restore_saved_app(app, *, owned=True):
     ended_with_error = False
     # The transcript holds every record of the time limit (the job settings keep a copy for saved batches).
     state["timeLimitHistory"] = []
+    # When the author took in each live instruction (by its steer ID), for the chat (see _restore_conversation).
+    delivered_steers = {}
+    # Whether the latest Stop of the author or a later step still holds: no Resume (or historical
+    # continuation) has launched the job since. Records the stopped runner wrote after the Stop never end
+    # it; a stopped statement review keeps its own marker (see saved_manual_stop).
+    stop_in_force = False
     for record in _iter_run_records(run_dir):
         follow_time_limit(state["timeLimitHistory"], record)
         if controller_note(record):
             continue
+        label = record.get("label")
+        if (record.get("kind") == "status" and label == "Stop requested" and record.get("stopInPlace") is True
+                and record.get("stage") != "review"):
+            stop_in_force = True
+        elif record.get("kind") == "status" and label in RELAUNCH_LABELS:
+            stop_in_force = False
         if not any_records and record.get("label") != "Total time limit set":
             # A limit set while the job waited to start does not mean it started.
             first_time, any_records = record.get("time"), True
@@ -7394,6 +8277,7 @@ def restore_saved_app(app, *, owned=True):
         if (record.get("kind") == "status" and record.get("stage") in {"solve", "repair"}
                 and record.get("root") is not False and isinstance(delivered, str) and delivered):
             state["authorSteerDelivered"] = delivered
+            delivered_steers[delivered] = record.get("time") if isinstance(record.get("time"), str) else ""
         if delivered_repair(record):
             state["authorRepairDelivered"] = delivered_repair(record)
         stage = record.get("stage")
@@ -7586,7 +8470,16 @@ def restore_saved_app(app, *, owned=True):
         except ValueError:
             pass
     manual_stop = saved_manual_stop(run_dir, relevant)
-    if manual_stop is not None:
+    if manual_stop is not None and manual_stop.get("inPlace") is True and post_review_request:
+        manual_stop = None  # A stopped review that the proof stages followed since: its marker is stale.
+    if manual_stop is not None and manual_stop.get("inPlace") is True:
+        # A statement review the user stopped: back at its review input, until Continue runs it again.
+        revision = bool(state["review"] and state["reviewFeedback"])
+        state.update(phase="reviewed" if revision else "input",
+                     stage="review", activeNode="statement_reviewer", finishedAt="", resultKind="", output="",
+                     error=REVISION_STOPPED_TEXT if revision else REVIEW_STOPPED_TEXT, manuallyStopped=True,
+                     stoppedStage="review", reviewRetryAt=0)
+    elif manual_stop is not None:
         stopped_stage = manual_stop["stage"]
         # The LaTeX step it stopped at (the PDF compiles in the same stage as the editor writes).
         latex_node = manual_stop.get("node") if stopped_stage == "final" else None
@@ -7654,7 +8547,7 @@ def restore_saved_app(app, *, owned=True):
                        "stage": "repair" if recovered_state.get("report") else "solve",
                        "error": "The previous author process ended without a final answer; "
                                 "its saved conversation continues automatically."}
-    elif (interrupted and not ended_with_error and last_work_node in INTERRUPTIBLE_NODES
+    elif (interrupted and (not ended_with_error or stop_in_force) and last_work_node in INTERRUPTIBLE_NODES
           and state["resultKind"] not in {"failure", "needs-revision"}):
         # The critic or LaTeX step continues from its exact saved input in this run folder.
         running = prior if checkpoint.get("status") == "running" and checkpoint.get("node") == "critic" else None
@@ -7672,6 +8565,9 @@ def restore_saved_app(app, *, owned=True):
             "goalThreadId": checkpoint.get("goalThreadId") or state["goalThreadId"],
             "elapsedSeconds": elapsed, "pauseCause": "interrupted", "autoResumeAt": 0, **damaged,
         }
+        if stop_in_force:
+            # The user stopped this step (or the author): it waits for Continue, never resuming by itself.
+            checkpoint.update(pauseCause="stopped", autoResumeAt=0, error="")
     elif damaged:
         state["error"] = (f"The saved pause checkpoint ({PAUSE_FILENAME}) is damaged and could not be rebuilt "
                           "from the transcript. Continue from a saved checkpoint.")
@@ -7718,7 +8614,7 @@ def restore_saved_app(app, *, owned=True):
             changed = time.time()
         app._configure_auto_resume(checkpoint, changed)
         # Before the checkpoint is saved: it records that a time-limit pause asked for its summary.
-        app._restore_conversation(checkpoint)
+        app._restore_conversation(checkpoint, delivered=delivered_steers)
         # Only a role the remaining steps use is worth a check before the job retries by itself; a
         # replaced model resumes as its documented replacement, with the warning shown.
         roles = set(checkpoint_roles(checkpoint.get("node"), state["workflowStages"]))
@@ -7734,7 +8630,7 @@ def restore_saved_app(app, *, owned=True):
             settings_warnings.append(f"The pause checkpoint could not be saved ({exc}); it is saved again "
                                      "before the next resume.")
     else:
-        app._restore_conversation(checkpoint, owned=owned)
+        app._restore_conversation(checkpoint, owned=owned, delivered=delivered_steers)
     question = state.get("authorQuestion")
     if question and (state["phase"] == "paused" and state["activeNode"] == "author"
                      and checkpoint.get("pauseCause") in RESTART_PAUSE_CAUSES):
@@ -7746,6 +8642,11 @@ def restore_saved_app(app, *, owned=True):
         # Answered, dismissed, replaced or expired questions were saved as closed; any other open one
         # closed when its author stopped working.
         state["authorQuestion"] = None
+    if owned:
+        app._close_stale_question_items()
+        # Answers to chat messages the author wrote before the job ended are read once more, at once.
+        app._chat_final_pass = state["phase"] == "done" and any(
+            item["kind"] == "instruction" and not item.get("reply") for item in app._conversation)
     state["settingsWarning"] = " ".join(settings_warnings)
     if owned and state.get("retrievalPolicyPath") and (
             (state["phase"] == "prepared" and state.get("launchHold") == HISTORICAL_PENDING_HOLD)
@@ -7818,6 +8719,7 @@ def damaged_saved_app(run_dir, runs, problem):
 
     app = App(runs=runs, load_latest=False)
     app.run_dir, app.trace_file, app.fixed_trace = Path(run_dir), Path(run_dir) / "transcript.jsonl", False
+    app.batch_id = saved_named_batch(app.run_dir)
     detail = str(problem) or type(problem).__name__
     app.state.update(runId=app.run_dir.name, phase="done", startedAt=_artifact_time(app.run_dir),
                      error=f"This saved run could not be restored ({detail}). Its files in "
@@ -8016,6 +8918,10 @@ class Server(ThreadingHTTPServer):
         self._retry_stop = threading.Event()
         self._sleep = SleepWatch()
         self.installation = load_installation_settings()
+        # The batches made with New batch (runs/.controller/batches.json), read once here.
+        self.named_batches = named_batches.NamedBatches(self.runs / CONTROLLER_FOLDER / named_batches.FILENAME)
+        if self.named_batches.problem:
+            print(f"Warning: {self.named_batches.problem}", file=sys.stderr, flush=True)
         # Folder-batch statements whose job could not be created yet, retried every minute.
         self._pending_jobs = []
         self.instance = None
@@ -8156,7 +9062,7 @@ class Server(ThreadingHTTPServer):
         for item in list(getattr(self, "_pending_jobs", [])):
             if now < item["retryAt"]:
                 continue
-            app = App(runs=self.runs, load_latest=False)
+            app = self._new_app(item.get("batch", ""))
             batch = item.get("folderBatch") or None
             try:
                 if "body" in item:
@@ -8168,8 +9074,9 @@ class Server(ThreadingHTTPServer):
                 app.discard_unstarted_run()
                 item.update(retryAt=now + AUTO_RESUME_SECONDS, error=str(exc))
                 continue
-            self._pending_jobs.remove(item)
+            # Together, so a batch is never seen empty (and deleted) between the two.
             with self.jobs_lock:
+                self._pending_jobs.remove(item)
                 self.jobs[app.state["runId"]] = app
 
     def installation_settings(self):
@@ -8198,6 +9105,10 @@ class Server(ThreadingHTTPServer):
                 app.exclude_sleep(slept)
             app.flush_trace()
             app.close_stale_author_question()
+            try:
+                app.collect_chat_answers()
+            except Exception:
+                traceback.print_exc()  # One job's answer files never stop the other jobs' tick.
 
     def _adopt_released_runs(self):
         """Take over each job another process owned, once that process has let it go."""
@@ -8263,12 +9174,144 @@ class Server(ThreadingHTTPServer):
             raise ValueError("That job is not available in this TCS Prover session.")
         return app
 
-    def start_job(self, body, run_id=""):
-        """Create a new job, or revise the selected existing job."""
+    # --- Batches made with New batch ------------------------------------------------------------------------------
+
+    def _named_batch_ids(self):
+        # A Server built without __init__ (some tests) has no batches made with New batch.
+        named = getattr(self, "named_batches", None)
+        return named.ids() if named is not None else set()
+
+    def live_batch(self, batch_id):
+        """Whether a batch ID names a batch whose jobs this server runs: the default one or one made with New batch."""
+
+        return batch_id == DEFAULT_BATCH or batch_id in self._named_batch_ids()
+
+    def saved_batch(self, batch_id):
+        """Whether a batch ID names a saved (read-only) folder of runs."""
+
+        try:
+            self.batch_catalog.batch_root(batch_id)
+        except ValueError:
+            return False
+        return True
+
+    def job_route_batch(self, batch_id, run_id):
+        """The batch a request about one job acts in. A link naming a batch made with New batch that is no longer
+        listed (its list cannot be read, or it was deleted just as the job joined it) reaches the job in the
+        default batch, where the job is shown; every other batch stays as named."""
+
+        if (run_id and isinstance(batch_id, str) and named_batches.BATCH_ID.match(batch_id)
+                and not self.live_batch(batch_id) and not self.saved_batch(batch_id)):
+            return DEFAULT_BATCH
+        return batch_id
+
+    def batch_of(self, app, ids=None):
+        """The batch a live job is shown in: its batch made with New batch while that is listed, else the default.
+        ``ids``: the listed batches, when the caller has read them already."""
+
+        ids = self._named_batch_ids() if ids is None else ids
+        return app.batch_id if app.batch_id and app.batch_id in ids else DEFAULT_BATCH
+
+    def _new_app(self, batch="", *, from_job=False):
+        """A new job's App in ``batch`` (an ID from the page, or "" / DEFAULT_BATCH for the default batch).
+
+        ``from_job``: the job is made from another job's work, and ``batch`` is that job's saved batch. While the
+        list of batches cannot be read, the new job keeps that ID as its source does: both are shown in the
+        default batch until the list is repaired and TCS Prover is started again, then both are in the batch."""
+
+        app = App(runs=self.runs, load_latest=False)
+        named = getattr(self, "named_batches", None)
+        listed = bool(batch) and batch in self._named_batch_ids()
+        unreadable = (from_job and named is not None and bool(named.problem) and isinstance(batch, str)
+                      and named_batches.BATCH_ID.match(batch) is not None)
+        app.batch_id = batch if listed or unreadable else ""
+        return app
+
+    def _run_batch(self, run_dir):
+        """The batch of a saved run, for a new job made from its work: its live job's, else its saved one."""
+
+        run_dir = Path(run_dir).resolve()
+        with self.jobs_lock:
+            source = next((app for app in self.jobs.values() if app.run_dir is not None
+                           and app.run_dir.name == run_dir.name and app.run_dir.resolve() == run_dir), None)
+        return source.batch_id if source is not None else saved_named_batch(run_dir)
+
+    def job_batch_problem(self, run_id, batch):
+        """Why a request naming ``batch`` may not act on this live job ("" when it may, or when there is no such job)."""
+
+        with self.jobs_lock:
+            app = self.jobs.get(run_id)
+        return "That job is not in this batch." if app is not None and self.batch_of(app) != batch else ""
+
+    def batch_cards(self):
+        """The /batches answer: the default batch (while it has jobs), the batches made with New batch (newest
+        first, empty ones too), then the saved folders of runs, read-only. ``canCreateBatches`` offers New batch
+        (an older server or the live gateway sends none); ``batchesProblem`` says why the list cannot be read."""
+
+        from .batches import batch_counts
+
+        named = getattr(self, "named_batches", None)
+        entries = named.entries() if named is not None else []
+        ids = {entry["id"] for entry in entries}
+        # A batch made with New batch wins over a saved folder named like its ID.
+        saved = [card for card in self.batch_catalog.list_batches(include_root=False) if card["id"] not in ids]
+        groups = {}
+        for row in self.job_list():
+            groups.setdefault(row["batchId"], []).append(row)
+
+        def card(batch_id, name, rows, **extra):
+            starts = [row["startedAt"] for row in rows if row.get("startedAt")]
+            return {"id": batch_id, "name": name, "label": name, "folder": "runs", "jobCount": len(rows),
+                    "counts": batch_counts(rows), "startedAt": min(starts, default=""), "readOnly": False,
+                    # The batch's page offers New problem in this batch.
+                    "addProblems": True,
+                    # The home page's banner: jobs that need you.
+                    "attention": [{**row["needsAttention"], "runId": row["runId"], "batchId": batch_id,
+                                   "job": row.get("sourceFile") or row["title"] or row["runId"]}
+                                  for row in rows if row.get("needsAttention")],
+                    "queued": sum(1 for row in rows if row.get("launchQueued")), **extra}
+
+        cards = []
+        if groups.get(DEFAULT_BATCH):
+            cards.append(card(DEFAULT_BATCH, named_batches.DEFAULT_NAME, groups[DEFAULT_BATCH], current=True,
+                              default=True, runningLimit=getattr(self, "installation", {}).get("maxRunningJobs", 0)))
+        for entry in reversed(entries):  # Newest first: the file lists them in the order they were made.
+            cards.append(card(entry["id"], entry["name"], groups.get(entry["id"], []), current=False, named=True,
+                              createdAt=entry["createdAt"]))
+        problem = named.problem if named is not None else ""
+        return {"batches": cards + saved, "currentBatch": DEFAULT_BATCH,
+                "canCreateBatches": named is not None and not problem, "batchesProblem": problem}
+
+    def create_batch(self, body):
+        """Make a batch with New batch: {"batch": {"id", "name", "createdAt"}, and the /batches answer}."""
+
+        return {"batch": self.named_batches.create(body.get("name")), **self.batch_cards()}
+
+    def rename_batch(self, batch_id, body):
+        """Rename a batch made with New batch; its ID, and so its jobs, stay."""
+
+        if batch_id == DEFAULT_BATCH:
+            raise ValueError("The default batch cannot be renamed.")
+        return {"batch": self.named_batches.rename(batch_id, body.get("name")), **self.batch_cards()}
+
+    def delete_batch(self, batch_id):
+        """Delete a batch made with New batch that holds no job (nor a folder-run statement waiting for one)."""
+
+        if batch_id == DEFAULT_BATCH:
+            raise ValueError("The default batch cannot be deleted.")
+        with self.jobs_lock:
+            if (any(app.batch_id == batch_id for app in self.jobs.values())
+                    or any(item.get("batch") == batch_id for item in getattr(self, "_pending_jobs", []))):
+                raise ValueError("Only an empty batch can be deleted. Delete its problems first.")
+            self.named_batches.delete(batch_id)
+        return {"deleted": batch_id, **self.batch_cards()}
+
+    def start_job(self, body, run_id="", batch=""):
+        """Create a new job (in ``batch``), or revise the selected existing job."""
 
         if body.get("relatedWorks"):
             raise ValueError("Related works are attached with Start workflow.")
-        app = self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False)
+        app = self.get_job(run_id) if run_id else self._new_app(batch)
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         review_only_option = (
             {"review_only": body.get("statementReviewOnly")}
@@ -8306,8 +9349,8 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def start_workflow(self, body, run_id="", *, app=None, _prepare_only=False, _folder_batch=None):
-        """Run the selected ordered stages on one input, preserving review approval.
+    def start_workflow(self, body, run_id="", *, app=None, batch="", _prepare_only=False, _folder_batch=None):
+        """Run the selected ordered stages on one input (a new job in ``batch``), preserving review approval.
 
         A folder batch passes its new job's ``app``, ``_prepare_only`` and its
         ``_folder_batch``: the job then waits in the queue the server starts
@@ -8317,7 +9360,7 @@ class Server(ThreadingHTTPServer):
         """
 
         created = app is None and not run_id
-        app = app or (self.get_job(run_id) if run_id else App(runs=self.runs, load_latest=False))
+        app = app or (self.get_job(run_id) if run_id else self._new_app(batch))
         stages = normalize_workflow_stages(body.get("workflowStages", app.state.get("workflowStages") if run_id else None))
         content = body.get("content", body.get("statement", ""))
         if not isinstance(content, str) or not content.strip():
@@ -8398,14 +9441,14 @@ class Server(ThreadingHTTPServer):
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
         }
 
-    def start_direct_job(self, body, run_id=""):
-        """Create a statement job that starts directly with the author."""
+    def start_direct_job(self, body, run_id="", batch=""):
+        """Create a statement job (in ``batch``) that starts directly with the author."""
 
         if run_id:
             raise ValueError("Start a direct proof from the home screen.")
         if body.get("relatedWorks"):
             raise ValueError("Related works are attached with Start workflow.")
-        app = App(runs=self.runs, load_latest=False)
+        app = self._new_app(batch)
         app.start_direct_statement(
             statement=body.get("statement", ""), **self._direct_options(body),
         )
@@ -8413,8 +9456,8 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def start_direct_batch(self, body, run_id=""):
-        """Start one proof job per statement, all sharing one set of settings.
+    def start_direct_batch(self, body, run_id="", batch=""):
+        """Start one proof job per statement (in ``batch``), all sharing one set of settings.
 
         Every statement and the shared settings are validated before any job
         starts. Each job is an ordinary /direct job (statement review skipped,
@@ -8501,7 +9544,8 @@ class Server(ThreadingHTTPServer):
 
         try:
             for current, (name, statement) in enumerate(statements):
-                app = App(runs=self.runs, load_latest=False)
+                # ``batch`` is the batch the jobs join; ``batch_id`` names the run's related-works store.
+                app = self._new_app(batch)
                 pending = ({"body": {**shared, "content": statement, "sourceFile": name}} if review
                            else {"options": dict(options)})
                 try:
@@ -8517,7 +9561,7 @@ class Server(ThreadingHTTPServer):
                     app.discard_unstarted_run()
                     self._pending_jobs = getattr(self, "_pending_jobs", [])
                     self._pending_jobs.append({"name": name, "statement": statement, **pending,
-                                               "folderBatch": batch_id,
+                                               "folderBatch": batch_id, "batch": app.batch_id,
                                                "retryAt": time.time() + AUTO_RESUME_SECONDS, "error": str(exc)})
                     notes.append(f"Could not create the job for {label(current)} "
                                  f"({str(exc).rstrip('.') or type(exc).__name__}); TCS Prover tries again every "
@@ -8598,12 +9642,12 @@ class Server(ThreadingHTTPServer):
         started.notice = " ".join(notes)
         return started
 
-    def start_latex_job(self, body, run_id=""):
-        """Create a job that runs only the final LaTeX editor."""
+    def start_latex_job(self, body, run_id="", batch=""):
+        """Create a job (in ``batch``) that runs only the final LaTeX editor."""
 
         if run_id:
             raise ValueError("Start LaTeX-only editing from the home screen.")
-        app = App(runs=self.runs, load_latest=False)
+        app = self._new_app(batch)
         legacy_effort = body.get("reasoningEffort", DEFAULT_REASONING_EFFORT)
         app.start_latex_only(
             source=body.get("content", ""),
@@ -8637,7 +9681,8 @@ class Server(ThreadingHTTPServer):
             # A new run cannot take over its policy; its saved settings stay.
             historical.continue_historical("critic")
             return historical
-        app = App(runs=self.runs, load_latest=False)
+        # A job made from another job's work joins that job's batch.
+        app = self._new_app(self._run_batch(source["run_dir"]), from_job=True)
         app.start_critic_resume(
             statement=source["statement"],
             solution=source["solution"],
@@ -8688,7 +9733,8 @@ class Server(ThreadingHTTPServer):
             historical.continue_historical("author")
             return historical
         options = {**source["settings"], **(settings or {})}
-        app = App(runs=self.runs, load_latest=False)
+        # A job made from another job's work joins that job's batch.
+        app = self._new_app(self._run_batch(source["run_dir"]), from_job=True)
         app.start_direct_statement(
             source["statement"],
             critic_rounds=options.get("criticRounds", DEFAULT_CRITIC_ROUNDS),
@@ -8947,9 +9993,12 @@ class Server(ThreadingHTTPServer):
         historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
         # Also after a finished result: a held run's critic can run again once the hold is released.
         if historical and state.get("retrievalPolicyPath") and recheckable_hold(state.get("launchHold")):
+            stopped = state.get("phase") == "paused" and state.get("pauseCause") == "stopped"
             return {"action": "preflight", "label": "Re-run preflight",
                     "description": f"Checks this run's {historical_checks(saved_workflow_stages(state))} again; "
-                                   "once they pass, the hold is released and a prepared or paused run continues."}
+                                   + ("once they pass, the hold is released. The job stays stopped until you choose "
+                                      "Continue." if stopped else
+                                      "once they pass, the hold is released and a prepared or paused run continues.")}
         if (state.get("resultKind") in {"final", "proof", "review"}
                 and not state.get("manuallyStopped") and not state.get("error")):
             return None
@@ -8958,9 +10007,13 @@ class Server(ThreadingHTTPServer):
             return None
         if state.get("phase") == "paused" and not (
                 state.get("sessionUnavailable") and state.get("stage") in {"solve", "repair"}):
-            # A job stopped at its time limit (and since given more) continues; a paused one resumes.
-            return {"action": "resume", "label": "Continue" if state.get("pauseCause") == "time-limit" else "Resume",
-                    "description": "Continue in the same run folder using the saved author session and notebooks."}
+            # A job stopped at its time limit (and since given more) or by the user continues; a paused one resumes.
+            cause = state.get("pauseCause")
+            description = "Continue in the same run folder using the saved author session and notebooks."
+            if cause == "stopped":
+                description = STOPPED_CONTINUE_DESCRIPTIONS.get(state.get("activeNode"), description)
+            return {"action": "resume", "label": "Continue" if cause in {"time-limit", "stopped"} else "Resume",
+                    "description": description}
         if state.get("phase") == "prepared":
             if state.get("launchHold"):
                 return None
@@ -9023,8 +10076,9 @@ class Server(ThreadingHTTPServer):
             }
         if (state.get("phase") in {"input", "reviewed"} and state.get("error") and state.get("reviewInputRecorded")
                 and state.get("reviewStatement", "").strip()):
-            # A failed or interrupted review runs again in this job, feedback included.
-            return {"action": "review", "label": "Retry statement review", "inPlace": True,
+            # A failed, interrupted or stopped review runs again in this job, feedback included.
+            return {"action": "review", "label": "Continue" if state.get("manuallyStopped") else "Retry statement review",
+                    "inPlace": True,
                     "description": "Runs the statement review again in this job from its saved input, with the "
                                    "same feedback, settings and prompt."}
         # The stage-specific retries are for a stage that ended without its result:
@@ -9245,7 +10299,8 @@ class Server(ThreadingHTTPServer):
                 self._queue_saved_author_instructions(source_app, continued)
             return continued
 
-        app = App(runs=self.runs, load_latest=False)
+        # The continuation joins the stopped job's batch.
+        app = self._new_app(source_app.batch_id, from_job=True)
         source_run = source_app.run_dir
         common = {
             "speed_mode": source_state["speedMode"],
@@ -9347,13 +10402,17 @@ class Server(ThreadingHTTPServer):
             self.jobs[app.state["runId"]] = app
         return app
 
-    def job_list(self):
-        """Return only the fields needed by the home-page job switcher."""
+    def job_list(self, batch=None):
+        """Return only the fields needed by the home-page job switcher: of every job, or of the jobs of ``batch``."""
 
         with self.jobs_lock:
             apps = list(self.jobs.values())
+        ids = self._named_batch_ids()
         jobs = []
         for app in apps:
+            # Another batch's jobs are left out before their state is read.
+            if batch is not None and self.batch_of(app, ids) != batch:
+                continue
             state = app.snapshot()
             job = {
                 key: state[key] for key in (
@@ -9367,8 +10426,11 @@ class Server(ThreadingHTTPServer):
                 )
             }
             job["sourceFile"] = state.get("sourceFile") or ""
-            # Why a paused job paused: the lists show a stop at the time limit apart from a pause.
-            job["pauseCause"] = (state.get("pauseCause") or "") if state["phase"] == "paused" else ""
+            # The batch the job is shown in: a batch made with New batch, or the default batch.
+            job["batchId"] = self.batch_of(app, ids)
+            # Why a paused job paused: the lists show a stop at the time limit, and a stop by the user (also while
+            # it is stopping), apart from a pause.
+            job["pauseCause"] = (state.get("pauseCause") or "") if state["phase"] in {"paused", "pausing"} else ""
             # The folder batch whose related works the job shares ("" for a job started alone).
             job["folderBatch"] = state.get("folderBatch") or ""
             # Whether the paused author is writing a summary or reply (Resume waits for it).
@@ -9893,24 +10955,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             if request.path == "/batches":
-                cards = self.server.batch_catalog.list_batches()
-                root = next((card for card in cards if card["id"] == "__root__"), None)
-                jobs = self.server.job_list()
-                if root is None and jobs:
-                    root = {"id": "__root__", "name": "Runs", "folder": "."}
-                    cards.insert(0, root)
-                if root is not None:
-                    from .batches import batch_counts
-
-                    root.update(jobCount=len(jobs), counts=batch_counts(jobs), current=True, readOnly=False)
-                    # The home page's banner: jobs that need you, and the running-jobs limit.
-                    root["attention"] = [{**row["needsAttention"], "runId": row["runId"],
-                                          "job": row.get("sourceFile") or row["title"] or row["runId"]}
-                                         for row in jobs if row.get("needsAttention")]
-                    root["runningLimit"] = getattr(self.server, "installation", {}).get("maxRunningJobs", 0)
-                    root["queued"] = sum(1 for row in jobs if row.get("launchQueued"))
-                return self.send({"batches": cards, "currentBatch": "__root__"})
-            if batch != "__root__":
+                return self.send(self.server.batch_cards())
+            batch = self.server.job_route_batch(batch, run_id)
+            if request.path == "/state" and not run_id:
+                pass  # The New problem page's empty state, whatever batch it adds to.
+            elif not self.server.live_batch(batch):
                 try:
                     body, kind, headers = self.server.batch_catalog.response(
                         request.path, batch, run_id,
@@ -9929,6 +10978,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(body, kind, headers=headers)
                 except (ValueError, OSError):
                     return self.send({"error": "Unknown batch, job, or saved artifact."}, status=404)
+            # A live batch: the job routes below, for the batch's own jobs only.
+            problem = self.server.job_batch_problem(run_id, batch) if run_id else ""
+            if problem:
+                return self.send({"error": problem}, status=404)
         if request.path in {"/download-tex", "/download-pdf"}:
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -9972,13 +11025,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(state)
                 values = query.get("after")
                 after = int(values[0]) if values else None
-                return self.send({**self.server.get_job(run_id).snapshot(after), "batchId": "__root__"})
+                app = self.server.get_job(run_id)
+                return self.send({**app.snapshot(after), "batchId": self.server.batch_of(app)})
             except ValueError:
                 return self.send({"error": "Invalid job or transcript position."}, status=400)
         if request.path == "/jobs":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
-            return self.send({"jobs": [{**row, "batchId": "__root__"} for row in self.server.job_list()]})
+            # Without a batch: every job (the live gateway and the current-run check read them all).
+            return self.send({"jobs": self.server.job_list(batch)})
         if request.path == "/api-models":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -9987,6 +11042,37 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.send(self.server.installation_settings())
+        if request.path == "/presets":
+            # The saved New problem settings (ui/presets.py), read again whenever the page asks.
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            return self.send(presets.listing())
+        if request.path == "/chat-answer":
+            # The whole answer file of one chat message (the chat shows at most MAX_CHAT_ANSWER_CHARS of it).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            identity = (query.get("id") or [""])[0]
+            try:
+                stream, size = self.server.get_job(run_id).open_chat_answer(identity)
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, status=400)
+            with stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="answer-{identity}.md"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+                self.end_headers()
+                remaining = size  # Never more than announced, even if the author appends meanwhile.
+                while remaining > 0:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            return
         if request.path == "/transcript":
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -10028,10 +11114,19 @@ class Handler(BaseHTTPRequestHandler):
             if any(len(values) != 1 for values in query.values()):
                 raise ValueError("Duplicate request parameters are not allowed.")
             batch = (query.get("batch") or [None])[0]
-            # Only the batch related-works route names a folder batch; elsewhere ``batch`` is a saved batch.
-            folder_batch = batch if request.path == "/batch-related-works/add" and batch != "__root__" else None
-            if batch is not None and batch != "__root__" and folder_batch is None:
-                return self.send({"error": "Saved batches are read-only."}, status=403)
+            # Only the batch related-works route names a folder batch; elsewhere ``batch`` is a batch of runs.
+            folder_batch = batch if request.path == "/batch-related-works/add" and batch != DEFAULT_BATCH else None
+            if batch is not None and folder_batch is None:
+                batch = self.server.job_route_batch(batch, run_id)
+                if not self.server.live_batch(batch):
+                    # Refused as before; the words say whether the batch is saved (read-only) or gone.
+                    return self.send({"error": "Saved batches are read-only." if self.server.saved_batch(batch)
+                                      else "That batch no longer exists."}, status=403)
+                problem = self.server.job_batch_problem(run_id, batch) if run_id else ""
+                if problem:
+                    return self.send({"error": problem}, status=404)
+            # The batch a new job joins: one made with New batch, or "" for the default batch.
+            target = batch if folder_batch is None and batch not in (None, DEFAULT_BATCH) else ""
             if request.path == "/uploads":
                 return self.receive_upload(query)
             if self.headers.get_content_type() != "application/json":
@@ -10054,6 +11149,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/api-models/test": self.server.probe_api_model,
                 "/api-models/discover": self.server.discover_api_models,
                 "/settings": self.server.save_installation_settings,
+                # Saved New problem settings (save, rename, delete, default) belong to the installation too.
+                **presets.ACTIONS,
             }
             if request.path in api_model_actions:
                 try:
@@ -10073,16 +11170,23 @@ class Handler(BaseHTTPRequestHandler):
                                                                      run_id))
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
+            # New batch, and a batch's Rename and Delete batch (``batch`` names it).
+            if request.path == "/batches":
+                return self.send(self.server.create_batch(body))
+            if request.path == "/batches/rename":
+                return self.send(self.server.rename_batch(batch or "", body))
+            if request.path == "/batches/delete":
+                return self.send(self.server.delete_batch(batch or ""))
             if request.path == "/direct-batch":
-                started = self.server.start_direct_batch(body, run_id)
+                started = self.server.start_direct_batch(body, run_id, batch=target)
                 return self.send({
-                    "batchId": "__root__",
+                    "batchId": target or DEFAULT_BATCH,
                     # The folder batch's ID, which names its shared related works.
                     "folderBatch": getattr(started, "folder_batch", ""),
                     "startedJobs": [app.state["runId"] for app in started],
                     "queuedJobs": [app.state["runId"] for app in started if app.state.get("phase") == "prepared"],
                     "notice": getattr(started, "notice", ""),
-                    "jobs": self.server.job_list(),
+                    "jobs": self.server.job_list(target or DEFAULT_BATCH),
                 })
             if request.path == "/resume":
                 app = self.server.resume_paused_job(run_id)
@@ -10095,13 +11199,13 @@ class Handler(BaseHTTPRequestHandler):
             elif request.path == "/continue-stopped":
                 app = self.server.continue_stopped_job(run_id)
             elif request.path == "/review":
-                app = self.server.start_job(body, run_id)
+                app = self.server.start_job(body, run_id, batch=target)
             elif request.path == "/start-workflow":
-                app = self.server.start_workflow(body, run_id)
+                app = self.server.start_workflow(body, run_id, batch=target)
             elif request.path == "/direct":
-                app = self.server.start_direct_job(body, run_id)
+                app = self.server.start_direct_job(body, run_id, batch=target)
             elif request.path == "/finalize":
-                app = self.server.start_latex_job(body, run_id)
+                app = self.server.start_latex_job(body, run_id, batch=target)
             else:
                 app = self.server.get_job(run_id)
             if request.path in {"/approve", "/solve"}:
@@ -10114,6 +11218,8 @@ class Handler(BaseHTTPRequestHandler):
                 app.answer_author_question(body.get("questionId"), body.get("answers"))
             elif request.path == "/dismiss-author-question":
                 app.dismiss_author_question(body.get("questionId"))
+            elif request.path == "/chat":
+                app.send_chat(body.get("text"))
             elif request.path == "/ask-author":
                 app.ask_author(body.get("text"))
             elif request.path == "/author-summary":
@@ -10137,7 +11243,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/resume-critic", "/resume-checkpoint", "/continue-stopped", "/resume",
             }:
                 return self.send({"error": "Not found."}, status=404)
-            self.send({**app.snapshot(), "batchId": "__root__"})
+            self.send({**app.snapshot(), "batchId": self.server.batch_of(app)})
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             # Includes runtime.Error and RetrievalPolicyError: their messages
             # are written for the user and reach only this authorized client.

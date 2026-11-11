@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
-from runner import proof_handoff as handoff
+from retrieval import runtime as retrieval_runtime
+from runner import confinement, proof_handoff as handoff
 
 
 class ProofReferenceTests(unittest.TestCase):
@@ -129,6 +130,22 @@ class ProofSnapshotTests(unittest.TestCase):
         # A proof of the author's own beside them is still handed over.
         self.assertEqual(self.resolve().content, self.data)
 
+    def test_an_answer_to_a_chat_message_is_never_the_proof(self):
+        chat = self.workspace / 'chat'
+        chat.mkdir()
+        (chat / 'answer-c_0123456789.md').write_bytes(self.data)
+        (chat / 'proof.md').write_bytes(self.data)
+        for reference in ('chat/answer-c_0123456789.md', 'chat/proof.md', 'Chat/answer-c_0123456789.md',
+                          './chat/answer-c_0123456789.md', str(chat / 'answer-c_0123456789.md')):
+            with self.subTest(reference=reference):
+                with self.assertRaisesRegex(handoff.ProofHandoffError, 'protected or hidden'):
+                    self.resolve(reference)
+        # The author's own proof beside the folder is still handed over.
+        self.assertEqual(self.resolve().content, self.data)
+        # Only the handoff refuses the folder: the author may still write its answers there.
+        self.assertNotIn('chat', confinement.PROTECTED_ENTRIES)
+        self.assertNotIn('chat', (*retrieval_runtime.BENCHMARK_FILES, *retrieval_runtime.BENCHMARK_DIRECTORIES))
+
     def test_missing_empty_invalid_utf8_oversized_and_special_files_fail(self):
         with self.assertRaises(handoff.ProofHandoffError):
             self.resolve('missing.md')
@@ -224,13 +241,19 @@ class ProofSnapshotTests(unittest.TestCase):
                 self.resolve(max_bytes=limit)
 
     def test_platform_without_secure_descriptor_access_fails_closed(self):
+        self.assertTrue(handoff.file_handoff_supported())
         with patch.object(handoff.os, 'supports_dir_fd', set()):
-            with self.assertRaisesRegex(handoff.ProofHandoffError, 'descriptor'):
+            self.assertFalse(handoff.file_handoff_supported())
+            with self.assertRaises(handoff.ProofHandoffError) as caught:
                 self.resolve()
+            # The reason is the pause reason and the resumed author's note: it says what to do instead.
+            self.assertEqual(str(caught.exception), handoff.NO_FILE_HANDOFF)
+            self.assertIn('reply with the complete proof itself', handoff.NO_FILE_HANDOFF)
         original_geteuid = handoff.os.geteuid
         try:
             del handoff.os.geteuid
-            with self.assertRaisesRegex(handoff.ProofHandoffError, 'descriptor'):
+            self.assertFalse(handoff.file_handoff_supported())
+            with self.assertRaisesRegex(handoff.ProofHandoffError, 'cannot read a proof file safely'):
                 self.resolve()
         finally:
             handoff.os.geteuid = original_geteuid

@@ -914,13 +914,15 @@ kbd {
 .nc.waiting { --tone: var(--waiting); }
 .nc.paused { --tone: var(--paused); }
 .nc.limit { --tone: var(--stopped); }
+.nc.stopped { --tone: var(--stopped); }
 .nc.done { --tone: var(--done); }
 .nc.incomplete { --tone: var(--failed); }
-/* The same glyphs as the status labels: dot, diamond, pause bars, clock, check, cross. */
+/* The same glyphs as the status labels: dot, diamond, pause bars, clock, square, check, cross. */
 .nc-glyph { flex: none; width: 6px; height: 6px; border-radius: 50%; color: var(--tone); background: currentColor; }
 .nc.waiting .nc-glyph { border-radius: 1px; transform: rotate(45deg) scale(0.9); }
 .nc.paused .nc-glyph { width: 6px; height: 7px; border-radius: 0; background: linear-gradient(90deg, currentColor 0 2px, transparent 2px 4px, currentColor 4px 6px); }
 .nc.limit .nc-glyph { width: 9px; height: 9px; border: 1.25px solid currentColor; background: var(--clock-hands); }
+.nc.stopped .nc-glyph { width: 7px; height: 7px; border-radius: 1.5px; }
 .nc.done .nc-glyph { width: 7px; height: 4px; border: solid currentColor; border-width: 0 0 1.5px 1.5px; border-radius: 0; background: none; transform: translateY(-1px) rotate(-45deg); }
 .nc.incomplete .nc-glyph {
   width: 7px;
@@ -946,6 +948,7 @@ kbd {
 .nav-meter i.waiting { background: var(--waiting); }
 .nav-meter i.paused { background: var(--paused); }
 .nav-meter i.limit { background: rgb(var(--stopped-rgb) / 0.75); }
+.nav-meter i.stopped { background: rgb(var(--stopped-rgb) / 0.55); }
 .nav-meter i.done { background: rgb(var(--done-rgb) / 0.7); }
 .nav-meter i.incomplete { background: rgb(var(--failed-rgb) / 0.6); }
 
@@ -1397,6 +1400,8 @@ kbd {
   font-size: var(--text-sm);
 }
 .readonly-note::before { top: 9px; left: 14px; background: var(--stopped); content: "i" / ""; font-family: var(--font-math); font-style: italic; }
+/* A statement review you stopped: the stop's square, as on every Stopped status, never the error mark. */
+.stopped-note::before { top: 15px; left: 19px; width: 8px; height: 8px; border-radius: 1.5px; content: "" / ""; }
 .batch-status {
   margin: 0 0 var(--space-4);
   padding: 10px 14px;
@@ -1406,6 +1411,9 @@ kbd {
   font-size: var(--text-sm);
   white-space: pre-line;
 }
+/* The Overview's warning that the list of batches cannot be read (a notice above the table): it names the
+   file, whose long path may wrap anywhere. */
+.batches-problem { font-size: var(--text-sm); overflow-wrap: anywhere; }
 
 /* Page head: title, a monospaced meta line, and the page's actions at the right. */
 .page-head {
@@ -1443,13 +1451,23 @@ kbd {
 .page-meta .meta-waiting { color: var(--waiting); }
 .page-meta .meta-paused { color: var(--paused); }
 .page-meta .meta-limit { color: var(--stopped); }
+.page-meta .meta-stopped { color: var(--stopped); }
 .page-meta .meta-done { color: var(--done); }
 .page-meta .meta-incomplete { color: var(--failed); }
 .page-lede { max-width: 68ch; margin-top: 8px; color: var(--ink-2); font-size: var(--text-base); line-height: 1.55; }
 .page-head > button { flex: none; }
+/* Several page actions (New batch and New problem; a batch's own actions), the primary one last. */
+.page-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.page-actions[hidden] { display: none; }
+/* The batch a new problem joins, under the New problem title. */
+.composer-batch { display: flex; flex-wrap: wrap; align-items: center; gap: 2px var(--space-4); margin-top: 6px;
+  color: var(--ink-2); font-size: var(--text-sm); }
+.composer-batch[hidden] { display: none; }
+/* Its button's words line up with the note's when the button wraps under it (phones). */
+.composer-batch .ghost { margin-inline-start: calc(-1 * var(--space-2)); padding-inline: var(--space-2); }
 
-/* Overview: five totals, then the batches as a table. */
-.stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 0 0 var(--space-7); }
+/* Overview: six totals, then the batches as a table. */
+.stat-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin: 0 0 var(--space-7); }
 .stat {
   --tone: var(--stopped);
   position: relative;
@@ -1474,6 +1492,7 @@ kbd {
 .stat.tone-waiting { --tone: var(--waiting); }
 .stat.tone-paused { --tone: var(--paused); }
 .stat.tone-limit { --tone: var(--stopped); }
+.stat.tone-stopped { --tone: var(--stopped); }
 .stat.tone-done { --tone: var(--done); }
 .stat.zero::before { background: var(--ink-4); }
 .stat dt { color: var(--ink-2); font-size: var(--text-sm); font-weight: 600; }
@@ -1619,6 +1638,7 @@ kbd {
 .batch-progress :is(.reviewed, .prepared), .tone-waiting { --tone: var(--waiting); }
 .batch-progress .paused, .tone-paused { --tone: var(--paused); }
 .batch-progress .limit, .tone-limit { --tone: var(--stopped); }
+.batch-progress .stopped { --tone: var(--stopped); }
 .batch-progress .running, .tone-running { --tone: var(--running); }
 .batch-progress .done, .tone-done { --tone: var(--done); }
 .batch-progress .incomplete { --tone: var(--failed); }
@@ -1654,7 +1674,8 @@ kbd {
     linear-gradient(45deg, transparent 40%, currentColor 40% 60%, transparent 60%),
     linear-gradient(-45deg, transparent 40%, currentColor 40% 60%, transparent 60%);
 }
-.job-status.tone-stopped::before { border-radius: 1.5px; }
+/* A stop by you: a small square. */
+:is(.batch-progress .stopped, .job-status.tone-stopped)::before { border-radius: 1.5px; }
 /* In the batch table the counts are words after their glyphs, without pills. */
 .batch-progress span { min-height: 20px; padding: 0; border: 0; color: var(--ink); background: none; font-size: var(--text-sm); font-weight: 550; }
 
@@ -1690,8 +1711,9 @@ kbd {
 .jobs-list[data-show="waiting"] > li:not(.tone-waiting),
 .jobs-list[data-show="paused"] > li:not(.tone-paused),
 .jobs-list[data-show="limit"] > li:not(.tone-limit),
+.jobs-list[data-show="stopped"] > li:not(.tone-stopped),
 .jobs-list[data-show="done"] > li:not(.tone-done),
-.jobs-list[data-show="failed"] > li:not(:is(.tone-failed, .tone-stopped)) { display: none; }
+.jobs-list[data-show="failed"] > li:not(.tone-failed) { display: none; }
 .jobs-panel:has(.jobs-filter-empty:not([hidden])) .jobs-list { display: none; }
 
 .jobs-list {
@@ -1847,12 +1869,47 @@ kbd {
   white-space: nowrap;
 }
 .job-new-window:is(:hover, :focus-visible)::after { opacity: 1; }
-.job-delete { color: var(--ink-2); }
-.job-delete:hover { color: var(--failed); background: rgb(var(--failed-rgb) / 0.08); }
+.job-delete, .batch-delete { color: var(--ink-2); }
+.job-delete:hover, .batch-delete:hover { color: var(--failed); background: rgb(var(--failed-rgb) / 0.08); }
 
 /* New problem composer. */
 .models-head { display: none; }
 .composer { padding: var(--space-6); }
+/* Saved settings: a slim strip across the top of the card, edge to edge like the sticky footer. It
+   names the settings the form started from ("· changed" after an edit, in the same quiet grey) and
+   holds Load… and Save…; the note under it confirms a save or a load, or warns. */
+.preset-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px var(--space-3);
+  margin: calc(-1 * var(--space-6)) calc(-1 * var(--space-6)) 0;
+  padding: 7px var(--space-4) 7px var(--space-6);
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  background: var(--tint);
+}
+.preset-bar-text { min-width: 0; margin: 0; color: var(--ink); font-size: var(--text-sm); line-height: 1.5; overflow-wrap: anywhere; }
+.preset-bar-label {
+  margin-right: 10px;
+  color: var(--ink-3);
+  font: var(--label-weight) var(--label-size)/1.4 var(--font-label);
+  font-variant-caps: var(--label-caps);
+  letter-spacing: var(--label-tracking);
+  text-transform: var(--label-transform);
+}
+.preset-name { font-weight: 650; }
+.preset-marks { color: var(--ink-3); }
+.preset-bar-actions { display: flex; flex: none; gap: 6px; }
+/* The note quotes a saved name, which may be one long word: it wraps anywhere rather than widen the page. */
+.preset-note {
+  margin: var(--space-3) 0 0;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .workflow-options, .settings-group { min-width: 0; margin: 0; padding: 0; border: 0; }
 .workflow-options legend {
   margin-bottom: 8px;
@@ -2006,7 +2063,7 @@ kbd {
 .retrieval-cutoff-setting { margin-top: var(--space-3); }
 #retrievalCutoffUtc { font-family: var(--font-mono); }
 /* Warnings: a neutral note with a short amber rule at its edge. */
-.retrieval-configuration-notice, .job-warning, .api-models-status.warning {
+.retrieval-configuration-notice, .job-warning, .api-models-status.warning, .preset-note[data-tone="warning"] {
   margin-top: var(--space-3);
   padding: 9px 13px;
   border: 1px solid var(--line-strong);
@@ -2052,7 +2109,8 @@ kbd {
 /* Models & API settings use the composer's source and model controls on their own page. */
 [data-view="models"] .models-head { display: flex; }
 [data-view="models"] :is(.composer-head, #runFolderHelp),
-[data-view="models"] .composer > :is(#statementFields, .workflow-options, .related-works-field, .composer-actions),
+[data-view="models"] .composer > :is(#presetBar, #presetNote, #statementFields, .workflow-options, .related-works-field,
+  .composer-actions),
 [data-view="models"] .advanced > summary,
 [data-view="models"] .advanced-body > :is(#retrievalSetting, .limits-group) { display: none !important; }
 [data-view="models"] .composer { padding: 0; border: 0; background: none; }
@@ -2311,6 +2369,9 @@ kbd {
   border-top: 1px solid var(--line);
 }
 .author-steer-control label { grid-column: 1 / -1; margin: 0; }
+/* Inside the chat card the box follows the list directly; the note says what Send does now. */
+.author-conversation > .author-steer-control { padding-top: var(--space-2); border-top: 0; }
+.chat-note { grid-column: 1 / -1; max-width: 80ch; margin: 0; }
 .author-steer-control textarea { min-height: 40px; font-size: var(--text-sm); }
 .author-steer-control .steer-count { grid-column: 1 / -1; margin: 0; }
 .author-steer-control .steer-count:empty { display: none; }
@@ -2773,6 +2834,16 @@ kbd {
   content: "";
 }
 .legend-dot.limit::after { width: 10px; height: 10px; }
+/* Stopped by you: a muted ring around a small square. */
+.workflow-node.stopped .node-dot { border-color: rgb(var(--stopped-rgb) / 0.7); color: var(--stopped); }
+:is(.workflow-node.stopped .node-dot, .legend-dot.stopped)::after {
+  width: 8px;
+  height: 8px;
+  border-radius: 1.5px;
+  background: currentColor;
+  content: "";
+}
+.legend-dot.stopped::after { width: 7px; height: 7px; }
 .workflow-node.rejected .node-dot { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .workflow-node.reviewed .node-dot { background: var(--tint-2); }
 .workflow-node.disabled { opacity: 0.62; }
@@ -2800,16 +2871,17 @@ kbd {
 }
 .node-position.paused .position-tag { border-color: rgb(var(--paused-rgb) / 0.6); background: rgb(var(--paused-rgb) / 0.1); }
 .node-position.limit .position-tag { border-color: rgb(var(--stopped-rgb) / 0.6); background: rgb(var(--stopped-rgb) / 0.1); }
+.node-position.stopped .position-tag { border-color: rgb(var(--stopped-rgb) / 0.6); background: rgb(var(--stopped-rgb) / 0.1); }
 .node-position.waiting .position-tag { border-color: rgb(var(--waiting-rgb) / 0.6); background: rgb(var(--waiting-rgb) / 0.1); }
 .node-position.ended .position-tag { border-color: var(--line-strong); background: var(--tint-2); }
 .node-position .position-text { color: var(--ink); font-weight: 600; }
 .node-copy { min-width: 0; overflow-wrap: anywhere; }
 .node-copy strong { display: block; color: var(--ink); font-size: var(--text-sm); font-weight: 650; }
-.workflow-node:not(:is(.active, .complete, .paused, .limit, .failed, .warning, .rejected, .reviewed)) .node-copy strong { color: var(--ink-2); }
+.workflow-node:not(:is(.active, .complete, .paused, .limit, .stopped, .failed, .warning, .rejected, .reviewed)) .node-copy strong { color: var(--ink-2); }
 .node-copy span { display: block; margin-top: 2px; font-size: var(--text-xs); line-height: 1.45; }
 /* Only the current step explains itself; the others show their status notes. */
 .node-copy > span:not([class]) { display: none; }
-.workflow-node:is(.active, .paused, .limit, .failed, .warning) > .node-copy > span:not([class]) { display: block; color: var(--ink-2); }
+.workflow-node:is(.active, .paused, .limit, .stopped, .failed, .warning) > .node-copy > span:not([class]) { display: block; color: var(--ink-2); }
 /* Status notes and verdicts are words in ink; the marker beside them carries the colour. */
 .node-resume-note, .node-status { color: var(--ink-2); font-weight: 600; }
 .disabled .node-status, .reviewed .node-status, .node-review-count { color: var(--ink-2); }
@@ -2987,6 +3059,7 @@ kbd {
 .legend-dot.active::after { width: 6px; height: 6px; border-radius: 50%; background: var(--on-live); content: ""; }
 .legend-dot.paused { border-color: rgb(var(--paused-rgb) / 0.65); color: var(--paused); }
 .legend-dot.limit { border-color: rgb(var(--stopped-rgb) / 0.65); color: var(--stopped); }
+.legend-dot.stopped { border-color: rgb(var(--stopped-rgb) / 0.65); color: var(--stopped); }
 .legend-dot.rejected { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .legend-dot.failed { border-color: rgb(var(--failed-rgb) / 0.65); color: var(--failed); }
 .legend-dot.disabled { opacity: 0.62; }
@@ -3009,6 +3082,8 @@ kbd {
   backdrop-filter: blur(3px);
 }
 .prompt-dialog form { display: grid; gap: var(--space-4); padding: var(--space-6); }
+/* New batch and Rename: one field, so a narrow dialog. */
+.batch-dialog { width: min(460px, calc(100vw - 32px)); }
 .prompt-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-5); }
 .prompt-dialog-head h2, .drawer-head h2 { margin-top: 4px; color: var(--ink-strong); font-family: var(--font-title); font-size: var(--text-xl); font-weight: var(--heading-weight); letter-spacing: var(--job-title-tracking); }
 .prompt-tabs {
@@ -3052,6 +3127,72 @@ kbd {
 .prompt-dialog textarea { min-height: min(44vh, 420px); }
 #promptEditorError { margin: var(--space-3) 0 0; }
 .prompt-dialog-actions { display: flex; justify-content: space-between; gap: var(--space-3); }
+/* Save settings and Load settings: the prompt dialog's frame, narrower for Save. */
+.preset-dialog { width: min(560px, calc(100vw - 32px)); }
+.preset-load-dialog { width: min(900px, calc(100vw - 32px)); }
+/* One column that never grows past the dialog: a long line wraps instead of pushing the list's buttons out. */
+.preset-dialog-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  padding: var(--space-6);
+}
+.preset-dialog .help { margin: 0; }
+.preset-save-field label { margin-bottom: 6px; }
+.preset-summary { margin: -6px 0 0; color: var(--ink-3); font: var(--text-xs)/1.6 var(--font-mono); overflow-wrap: anywhere; }
+.preset-save-default { margin-top: 0; }
+#presetSaveError { margin: 0; overflow-wrap: anywhere; }
+.preset-dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
+.preset-load-status { margin: 0; color: var(--ink-2); font-size: var(--text-sm); overflow-wrap: anywhere; }
+/* Every row shares the list's columns (a subgrid, as in the API connection list), so Load, Rename,
+   Make default and Delete line up from row to row; an absent action keeps its empty cell. */
+.preset-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+  gap: 8px 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.preset-row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) 4.5rem 5.5rem 8.5rem 4.5rem;
+  grid-template-columns: subgrid;
+  align-items: center;
+  gap: 8px 2px;
+  padding: 10px 8px 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+.preset-row-copy { min-width: 0; padding-right: var(--space-3); }
+.preset-row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.preset-row-name { font-size: var(--text-sm); font-weight: 650; overflow-wrap: anywhere; }
+.preset-row-summary { margin: 3px 0 0; color: var(--ink-2); font: var(--text-xs)/1.5 var(--font-mono); overflow-wrap: anywhere; }
+.preset-row-warning {
+  margin: 6px 0 0;
+  padding-left: 10px;
+  color: var(--ink);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  box-shadow: inset 2px 0 0 var(--waiting);
+}
+.preset-row.unusable { border-style: dashed; }
+/* Built-in settings close the list, set apart from what you saved. */
+.preset-row.builtin { margin-top: 6px; background: transparent; }
+.preset-rename { max-width: 32rem; min-height: 30px; padding: 4px 9px; font-size: var(--text-sm); }
+.preset-row > button { justify-self: stretch; }
+.preset-delete { color: var(--ink-2); }
+.preset-delete:hover, .preset-delete:focus-visible { color: var(--failed); background: rgb(var(--failed-rgb) / 0.08); }
+.preset-empty {
+  grid-column: 1 / -1;
+  padding: 11px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+}
 
 .drawer-scrim { display: none; }
 .audit-drawer {
@@ -3111,7 +3252,7 @@ kbd {
   white-space: nowrap;
 }
 /* Provider, format and connection chips: neutral pills. The provider is named in words; its
-   marker is a neutral shape (dot Codex CLI, ring Claude CLI, diamond API). Only a state that
+   marker is a neutral shape (dot Codex CLI, ring Claude Code, diamond API). Only a state that
    needs attention (a web cutoff, a missing key or model) and a test result carry a status colour. */
 .provider-chip, .format-chip, .status-chip {
   --tone: var(--ink-3);
@@ -3172,7 +3313,7 @@ kbd {
 .api-test-result.stale strong { color: var(--ink-2); }
 /* The live regions stay rendered while empty (a screen reader then hears their first message),
    but take no room. */
-.api-models-status:empty, .api-test-result:empty, .api-saved-key:empty {
+.api-models-status:empty, .api-test-result:empty, .api-saved-key:empty, .preset-note:empty, .preset-load-status:empty {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -3405,10 +3546,9 @@ kbd {
   [data-sidebar="rail"] .sidebar-foot:has(.foot-status[data-state="waiting"])::before { border-radius: 1.5px; background: var(--waiting); transform: rotate(45deg); }
 }
 @media (max-width: 1180px) {
-  /* Five totals in two full rows: three, then two wider ones (as the phone filter sets its segments). */
+  /* Six totals in two full rows of three. */
   .stat-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .stat { grid-column: span 2; }
-  .stat:nth-child(n + 4) { grid-column: span 3; }
 }
 @container main (max-width: 999px) {
   /* Below the work, the diagram keeps a readable width and the key sits in three columns. */
@@ -3518,15 +3658,17 @@ kbd {
   #promptEditor, #problem, #proposed { font-size: var(--text-edit); }
   .work-pane { padding-top: var(--space-2); padding-bottom: var(--space-12); }
   .page-head { flex-direction: column; align-items: stretch; gap: var(--space-4); margin-bottom: var(--space-5); }
-  .page-head > button { align-self: flex-start; }
+  .page-head > button, .page-head > .page-actions { align-self: flex-start; }
   .stat-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; margin-bottom: var(--space-6); }
-  .stat { padding: 11px 10px 10px; border-radius: var(--radius-md); }
+  /* A label too long for its tile ("Time limit reached") wraps instead of being cut; the numbers of a row
+     stay level at the foot of their tiles. */
+  .stat { display: flex; flex-direction: column; padding: 11px 10px 10px; border-radius: var(--radius-md); }
   .stat::before { left: 10px; width: 18px; }
-  .stat dt { overflow: hidden; font-size: var(--text-xs); white-space: nowrap; text-overflow: ellipsis; }
+  .stat dt { flex: 1 0 auto; font-size: var(--text-xs); overflow-wrap: break-word; }
   .stat dd { margin-top: 6px; }
   .stat strong { font-size: 1.375rem; }
   .stat-note { display: none; }
-  /* The batch filter: its seven segments wrap into full rows (four, then three on most phones), all in view. */
+  /* The batch filter: its eight segments wrap into full rows (four and four on most phones), all in view. */
   .seg-filter { display: flex; flex-wrap: wrap; width: 100%; }
   .seg { flex: 1 1 auto; justify-content: center; min-width: 0; padding-inline: 6px; white-space: nowrap; }
   .advanced > summary::before { display: none; }
@@ -3584,7 +3726,16 @@ kbd {
   .retrieval-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .run-metadata > div { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .prompt-dialog { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; border-radius: 0; }
-  .prompt-dialog form { padding: var(--space-5) var(--space-4); }
+  .prompt-dialog form, .preset-dialog-body { padding: var(--space-5) var(--space-4); }
+  .preset-bar { margin: calc(-1 * var(--space-4)) calc(-1 * var(--space-4)) 0; padding: 8px var(--space-3) 8px var(--space-4); }
+  .preset-list { display: flex; flex-direction: column; }
+  .preset-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 10px 10px 12px; }
+  .preset-row-copy { flex: 1 1 100%; padding-right: 0; }
+  .preset-row > .preset-cell { display: none; }
+  .preset-row > button { flex: 0 1 auto; }
+  /* One field: New batch and Rename stay a small card in the middle of the screen (as tall as its content). */
+  .prompt-dialog.batch-dialog { width: calc(100vw - 32px); height: fit-content; max-height: calc(100dvh - 32px);
+    margin: auto; border-radius: var(--radius-dialog); }
   .drawer-inner { padding: var(--space-5) var(--space-4); }
   .workflow-rail { padding: var(--space-4) var(--space-4); }
   .rail-legend { grid-template-columns: repeat(2, max-content); }
@@ -3601,6 +3752,7 @@ kbd {
   .segment { flex: 1 1 0; min-width: 0; }
   .segment span { white-space: normal; }
   .composer { padding-inline: 14px; }
+  .preset-bar { margin-inline: -14px; padding-left: 14px; }
   .composer .settings-group { padding-inline: 12px; }
   .model-setting { padding: 10px; }
 }
@@ -3655,7 +3807,7 @@ kbd {
 :root[data-theme="ink"] .page-head { padding-bottom: var(--space-5); border-bottom: 1px solid var(--line-strong); }
 :root[data-theme="ink"] .page-meta { color: var(--ink-2); }
 :root[data-theme="ink"] .page-meta::before { content: none; }
-:root[data-theme="ink"] .page-meta > :is(.meta-running, .meta-waiting, .meta-paused, .meta-limit, .meta-done, .meta-incomplete) { color: var(--ink-2); }
+:root[data-theme="ink"] .page-meta > :is(.meta-running, .meta-waiting, .meta-paused, .meta-limit, .meta-stopped, .meta-done, .meta-incomplete) { color: var(--ink-2); }
 :root[data-theme="ink"] .table-head {
   padding-block: 9px 7px;
   border: 0;
@@ -3704,6 +3856,8 @@ kbd {
   color: var(--tone);
   background: var(--clock-hands);
 }
+/* Stopped by you: the stop's square, as on the batch list and in the sidebar (Running keeps the dot). */
+:root[data-theme="ink"] .stat.tone-stopped::before { border-radius: 1.5px; }
 :root[data-theme="ink"] .stat.tone-done::before {
   top: 22px;
   width: 8px;
@@ -3732,10 +3886,12 @@ kbd {
 :root[data-theme="ink"] .nav-meter i.waiting { background: rgb(var(--accent-rgb) / 0.66); }
 :root[data-theme="ink"] .nav-meter i.paused { background: rgb(var(--accent-rgb) / 0.42); }
 :root[data-theme="ink"] .nav-meter i.limit { background: rgb(var(--accent-rgb) / 0.32); }
+:root[data-theme="ink"] .nav-meter i.stopped { background: rgb(var(--accent-rgb) / 0.28); }
 :root[data-theme="ink"] .nav-meter i.done { background: rgb(var(--accent-rgb) / 0.24); }
 :root[data-theme="ink"] .nav-meter i.incomplete { background: rgb(var(--accent-rgb) / 0.18); }
 :root[data-theme="ink"] :is(.critic-cycle, .checkpoint-row, .job-error) { box-shadow: inset 2px 0 0 var(--ink-3); }
-:root[data-theme="ink"] :is(.retrieval-configuration-notice, .job-warning, .api-models-status.warning) { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] :is(.retrieval-configuration-notice, .job-warning, .api-models-status.warning,
+  .preset-note[data-tone="warning"], .preset-row-warning) { box-shadow: inset 2px 0 0 var(--ink); }
 :root[data-theme="ink"] .critic-review[data-outcome="pass_edited_limit"] > p { color: var(--ink); }
 :root[data-theme="ink"] :is(.notice, .provider-chip[data-state="warning"]) { border-color: var(--line-strong); }
 :root[data-theme="ink"] .job[data-status="running"] .timeline-head h2::after {
@@ -3745,7 +3901,7 @@ kbd {
 /* Stop and the delete buttons stay monochrome: the label and the square say what they do. */
 :root[data-theme="ink"] .danger .icon { color: currentColor; }
 :root[data-theme="ink"] .danger:is(:hover, :focus-visible) { border-color: var(--ink); color: var(--ink); background: var(--tint-2); }
-:root[data-theme="ink"] :is(.job-delete, .api-model-remove):is(:hover, :focus-visible) { color: var(--ink); background: var(--tint-2); }
+:root[data-theme="ink"] :is(.job-delete, .batch-delete, .api-model-remove, .preset-delete):is(:hover, :focus-visible) { color: var(--ink); background: var(--tint-2); }
 /* Disclosure titles of the statement and the result read as section heads of the paper. */
 :root[data-theme="ink"] :is(.statement-panel, .run-result, .run-context) > summary {
   font-family: var(--font-title);
@@ -3792,7 +3948,7 @@ kbd {
   }
   html, body { color: #000; background: #fff; }
   .sidebar, .sidebar-scrim, .nav-tooltip, .topbar, .workflow-rail, .run-actions, .author-steer-control, .composer-actions,
-  .jump-latest, .filters, .job-footer, .skip-link, .jobs-toolbar { display: none !important; }
+  .jump-latest, .filters, .job-footer, .skip-link, .jobs-toolbar, .preset-bar { display: none !important; }
   .main-column { margin: 0; }
   .card, .batch-card, .job-card, .retrieval-panel, .job-context > details { border-color: #ccc; background: #fff; box-shadow: none; }
   .timeline, .statement-copy { max-height: none; overflow: visible; }
@@ -3891,6 +4047,8 @@ kbd {
   list-style: none;
 }
 .conversation-list:empty { display: none; }
+/* The list keeps its height while the author asks a question: app.js scrolls the question's row, with its form,
+   into view instead of unrolling the whole conversation. */
 .conversation-item {
   display: grid;
   gap: 6px;
@@ -3912,6 +4070,26 @@ kbd {
   white-space: pre-wrap;
 }
 .conversation-status { color: var(--ink-2); }
+/* The author's question in the chat: its titles, read-only options once it is no longer open, and the
+   form (the persistent #authorQuestionForm) while it is. */
+.conversation-question {
+  max-width: 80ch;
+  margin: 0;
+  color: var(--ink-strong);
+  font-family: var(--font-prose);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.conversation-options { margin: 0; color: var(--ink-2); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.conversation-item[data-kind="question"] { border-color: var(--accent-line); box-shadow: inset 2px 0 0 var(--accent); }
+.conversation-item[data-kind="question"]:not([data-status="open"]) { border-color: var(--line); box-shadow: none; }
+.conversation-item[data-kind="question"] > .conversation-meta:first-child { color: var(--accent-text); }
+.conversation-item[data-kind="question"]:not([data-status="open"]) > .conversation-meta:first-child { color: var(--ink-3); }
+.conversation-download { justify-self: start; }
+.author-question-form { display: grid; gap: 10px; }
 .conversation-item[data-status="running"] .conversation-status { color: var(--ink); }
 .conversation-item[data-status="failed"] .conversation-status { padding-left: 10px; box-shadow: inset 2px 0 0 var(--failed); }
 .conversation-item[data-status="stopped"] { border-style: dashed; }
@@ -3991,32 +4169,16 @@ kbd {
   .related-note-actions > button { flex: 1 1 auto; }
 }
 :root[data-theme="ink"] .conversation-item[data-status="failed"] .conversation-status { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] .conversation-item[data-kind="question"][data-status="open"] { box-shadow: inset 2px 0 0 var(--ink); }
 @media (forced-colors: active) {
   .conversation-reply { border-left-color: CanvasText; }
   .related-work-mark { border: 1px solid CanvasText; }
 }
 
 /* 15. The author's question ------------------------------------------------------ */
-/* The running author's open question, under the job header. It is something to act on, not a
-   warning: a card edged in the accent, each question in a sunken well with its options (one chosen,
-   a raised neutral thumb like the filters') and a field of its own. */
-.author-question {
-  display: grid;
-  gap: var(--space-3);
-  padding: var(--space-4) var(--space-5);
-  border-color: var(--accent-line);
-  background: linear-gradient(var(--accent-wash), var(--accent-wash)), var(--surface);
-  box-shadow: inset 3px 0 0 var(--accent), var(--card-shadow);
-}
-.author-question-head { display: grid; gap: 4px; }
-.author-question-head h2 {
-  margin: 0;
-  color: var(--accent-text);
-  font: var(--label-weight) var(--label-size)/1.4 var(--font-label);
-  font-variant-caps: var(--label-caps);
-  letter-spacing: var(--label-tracking);
-  text-transform: var(--label-transform);
-}
+/* The running author's open question, in its row of the chat (the row is edged in the accent): each
+   question in a well with its options (one chosen, a raised neutral thumb like the filters') and a
+   field of its own. */
 .author-question-meta { margin: 0; color: var(--ink-3); font-size: var(--text-xs); }
 .author-question-meta:empty { display: none; }
 .author-question-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
@@ -4027,7 +4189,7 @@ kbd {
   padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
-  background: var(--surface-sunken);
+  background: var(--surface);
 }
 .author-question-title {
   max-width: 80ch;
@@ -4073,15 +4235,13 @@ kbd {
 /* The job list: a small tag beside the status while the author's question is open. */
 .job-question { order: 2; align-self: center; min-height: 20px; padding: 0 8px; color: var(--ink); }
 .job-question::before { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); content: ""; }
-:root[data-theme="ink"] .author-question { box-shadow: inset 3px 0 0 var(--ink), var(--card-shadow); }
 @media (max-width: 599px) {
-  .author-question { padding: var(--space-4); }
   .author-question-actions > button { flex: 1 1 auto; }
 }
 @media (forced-colors: active) {
-  .author-question { border-color: Highlight; }
+  .conversation-item[data-kind="question"][data-status="open"] { border-color: Highlight; }
   .question-option[aria-pressed="true"] { outline: 2px solid Highlight; }
 }
 @media print {
-  .author-question { display: none !important; }
+  #authorQuestionForm { display: none !important; }
 }
