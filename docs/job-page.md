@@ -255,13 +255,19 @@ Papers, drafts and notes that the proof author can read while it works. Only the
 author sees them: the critic, the LaTeX writer and the statement reviewer never
 do, so the proof must still be complete and self-contained.
 
-- **On the New problem page**, **Related works (optional)** (shown while the
-  Author stage is on) has **Add files…** and **Add a note** (an optional title
-  and the text). Each file uploads at once into a private staging area
-  (`runs/.uploads`, kept for 24 hours); its row shows the name, the size, for a
-  PDF whether its text could be extracted, and **Remove**. **Start workflow** is
-  refused while an upload is still running or has failed (remove it first). With
-  **Run a folder…** they go to every job of the folder run (see
+- **On the New problem page**, **Related works (optional)**, under **Advanced
+  settings** after [Saved settings](saved-settings.md) (shown while the Author
+  stage is on), has **Add files…** and **Add a note** (an optional title and the
+  text). Each file uploads at once into a private staging area (`runs/.uploads`,
+  kept for 24 hours); its row shows the name, the size, for a PDF whether its
+  text could be extracted, and **Remove**. While the section is closed, its
+  summary line counts them ("2 related works", with "· uploading" while one
+  uploads), and marks a warning, with its reason in words, when one failed ("·
+  1 failed to upload") or the Author stage is off ("· Author stage off").
+  **Start workflow** and **Run a folder…** are refused while an upload is still
+  running or has failed (remove it first), or while the Author stage is off,
+  and the refusal opens **Advanced settings** on the list. With **Run a
+  folder…** they go to every job of the folder run (see
   [Batches and folder runs](batches.md#run-a-folder)).
 - **On the job page**, **Related works · N** lists them; **Add files…** and
   **Add a note** add more while the job is reviewing, prepared, running, pausing

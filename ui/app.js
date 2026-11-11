@@ -4861,7 +4861,7 @@ async function startReview(statement, feedback = "") {
   if (stages.author && !validateWorkflowHours()) return;
   // The composer's related works go with a new problem only; a retried review keeps its job's own.
   const relatedProblem = fromComposer ? composerRelatedWorksProblem(stages) : "";
-  if (relatedProblem) return showCreateError(relatedProblem);
+  if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   const relatedWorks = fromComposer ? composerRelatedTokens() : [];
   clearTimeout(timer);
   clearTimeout(jobsTimer);
@@ -4910,6 +4910,14 @@ function showCreateError(message) {
   ui.notice.textContent = message;
   show(ui.notice, true);
   ui.notice.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+// Why the listed related works cannot be sent yet, as a create error. They are listed under Advanced
+// settings, which open, so the list the message names is there to see.
+function showRelatedWorksProblem(message) {
+  const details = ui.relatedWorksField.closest?.("details");
+  if (details) details.open = true;
+  showCreateError(message);
 }
 
 function proofJobSettings() {
@@ -5036,7 +5044,8 @@ function composerRelatedTokens() {
   return composerRelatedWorks().items.map((item) => item.upload?.token).filter(Boolean);
 }
 
-// Shown while the Author stage is on or anything is listed; rows are rebuilt only when one changes.
+// Under Advanced settings, shown while the Author stage is on or anything is listed; rows are rebuilt only
+// when one changes. The summary of Advanced settings counts them, so they show while it is closed too.
 function renderComposerRelatedWorks() {
   const list = composerRelatedWorks(), items = list.items;
   const author = Boolean(ui.workflowAuthor.checked);
@@ -5047,6 +5056,7 @@ function renderComposerRelatedWorks() {
       + "author. Up to 64 MB per file. With Run a folder…, every problem of the folder run gets them.";
   if (ui.relatedWorksHelp.textContent !== help) ui.relatedWorksHelp.textContent = help;
   show(ui.composerRelatedList, items.length > 0);
+  if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
   const signature = JSON.stringify(items.map(({ file, ...item }) => item));
   if (signature === list.signature) return;
   list.signature = signature;
@@ -5175,7 +5185,7 @@ async function startFolderBatch(files) {
   if (!chosen.length || folderBatchBusy || ui.check.disabled) return;
   if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
-  if (relatedProblem) return showCreateError(relatedProblem);
+  if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   folderBatchBusy = true;
   ui.check.dataset.creating = "1";
   ui.runFolder.disabled = ui.check.disabled = true;
@@ -5216,7 +5226,7 @@ async function sendFolderBatch(chosen) {
   // File reading is asynchronous; recheck the current settings before sending.
   if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
-  if (relatedProblem) return showCreateError(relatedProblem);
+  if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   // The listed related works go to the folder run's own store, which every one of its jobs sees.
   const relatedWorks = composerRelatedTokens();
   // The batch the jobs join, named in the question while the server makes batches.
@@ -5234,7 +5244,7 @@ async function sendFolderBatch(chosen) {
     + "Each job uses the selected stages."
     + (selectedWorkflowStages().review ? " Statement review will pause each job for your approval." : "")
     + (relatedWorks.length ? ` Every job gets the ${relatedWorks.length} related work`
-      + `${relatedWorks.length === 1 ? "" : "s"} listed above.` : "")
+      + `${relatedWorks.length === 1 ? "" : "s"} listed under Advanced settings.` : "")
     + (skipped ? `\n\n${skipped}` : "");
   if (!confirm(question)) return;
   const body = { statements, ...proofJobSettings(), ...(relatedWorks.length ? { relatedWorks } : {}) };
@@ -5352,7 +5362,7 @@ ui.homeLink.onclick = (event) => {
 ui.runFolder.onclick = () => {
   // Related works still uploading (or failed) are refused before a folder is chosen.
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
-  if (relatedProblem) return showCreateError(relatedProblem);
+  if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   ui.folderInput.value = "";
   ui.folderInput.click();
 };
@@ -6104,7 +6114,7 @@ function adoptApiModels(data) {
     renderRetrievalSettings();
     updateModelSummary();
     // A model or reasoning level the menus replaced (its connection removed) is a change of the New
-    // problem form's settings: the saved-settings bar then says "· changed".
+    // problem form's settings: the Saved settings panel then says "· changed on this form".
     if (typeof renderPresetBar === "function") renderPresetBar();
   }
   renderApiModels();
@@ -7270,7 +7280,9 @@ syncAttentionAlerts();
 // commands to copy. A step (install, update, sign-in) starts only from #setupDialog, which shows its exact
 // command; its output (GET /setup/task) shows in a panel under the cards, with Stop. The same status feeds the
 // sidebar badge, the Overview's Setup notice, the role chips, the hints beside the role menus and Start, and the
-// links from jobs whose program is missing or signed out. Every text is set as text, never as markup. The
+// links from jobs whose program is missing or signed out. Each of them warns only about a program that something
+// needs (setupNeeds): the New problem form, the saved default settings or a job that can still run; any other
+// program is shown calmly, whatever its state. Every text is set as text, never as markup. The
 // page's record lives on a function property (setupStore()): the first refresh() and the shell's first sync()
 // run before this part of the file.
 function setupStore() {
@@ -7282,7 +7294,7 @@ function setupStore() {
 
 function setupEls() {
   return (setupEls.value ||= {
-    panel: $("setupPanel"), meta: $("setupMeta"), notice: $("setupNotice"), list: $("setupList"),
+    panel: $("setupPanel"), meta: $("setupMeta"), notice: $("setupNotice"), first: $("setupFirst"), list: $("setupList"),
     tasks: $("setupTasks"), check: $("setupCheckButton"), checkText: $("setupCheckText"), limits: $("setupLimits"),
     badge: $("navSetupBadge"), words: $("navSetupWords"), banner: $("setupBanner"), bannerList: $("setupBannerList"),
     modelHint: $("modelSetupHint"), startHint: $("startSetupHint"),
@@ -7306,6 +7318,8 @@ function setupWords() {
     roles: { review: "Statement reviewer", author: "Proof author", critic: "Independent critic", writer: "LaTeX writer" },
     missing: "This TCS Prover server has no Setup page. Restart TCS Prover to update it, or open it from its own launch link.",
     gone: "This Setup step is no longer available (TCS Prover may have restarted).",
+    none: "TCS Prover runs every model, API keys included, through one of them: install the Codex CLI for GPT models "
+      + "(the default) or Claude Code for Claude models.",
   });
 }
 
@@ -7503,23 +7517,56 @@ function setupFormRoles() {
   });
 }
 
-// Per program: the New problem roles that use it (the form when it is open, else the default settings), the jobs
-// that can still run with it, the API connections of its format, and whether it is needed and must be signed in.
+// Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your saved
+// default settings), the saved default settings also while the form is open (kept apart, and only when they use the
+// program where the form does not, or its sign-in where the form does not), the jobs that can still run with it in
+// a stage still ahead (GET /setup), and the API connections of its format (listed only: a connection that no role or
+// job uses needs nothing). The built-in settings never count, as nobody chose them: a form that opens with them
+// counts as the form. A program is needed when one of these uses it, and must be signed in when one of them uses a
+// built-in model through it. A program nothing needs is never a warning: no badge, no notice, no warning colour
+// (setupPill, setupProblems).
 function setupNeeds() {
   const data = setupStore().data;
   const form = setupFormRoles();
-  const roles = (form || data?.defaults?.roles || []).filter((row) => row.on && row.program);
+  const active = (rows) => (rows || []).filter((row) => row.on && row.program);
+  const formRows = active(form);
+  const defaultRows = data?.defaults?.source === "saved" ? active(data.defaults.roles) : [];
   const needs = {};
   for (const program of ["codex", "claude", "latex"]) {
-    const used = program === "latex" ? roles.filter((row) => row.role === "writer")
-      : roles.filter((row) => row.program === program);
+    const uses = (rows) => program === "latex" ? rows.filter((row) => row.role === "writer")
+      : rows.filter((row) => row.program === program);
+    const used = uses(form ? formRows : defaultRows);
+    const byDefaults = form ? uses(defaultRows) : [];
+    const signInOnly = program !== "latex" && byDefaults.some((row) => row.signIn) && !used.some((row) => row.signIn);
+    const defaults = byDefaults.length && (!used.length || signInOnly) ? byDefaults : [];
     const jobs = data?.jobs?.[program] || { count: 0, running: 0, signIn: 0, items: [] };
-    needs[program] = { roles: used, rolesSignIn: used.filter((row) => row.signIn), jobs, form: Boolean(form),
+    needs[program] = { roles: used, rolesSignIn: used.filter((row) => row.signIn), defaults,
+      defaultsSignIn: defaults.filter((row) => row.signIn), jobs, form: Boolean(form),
       connections: program === "latex" ? [] : data?.connections?.[program] || [],
-      needed: used.length > 0 || jobs.count > 0,
-      signIn: used.some((row) => row.signIn) || Number(jobs.signIn || 0) > 0 };
+      needed: used.length > 0 || defaults.length > 0 || jobs.count > 0,
+      signIn: used.some((row) => row.signIn) || defaults.some((row) => row.signIn) || Number(jobs.signIn || 0) > 0 };
   }
   return needs;
+}
+
+// Whether the built-in settings, which new problems open with while nothing is saved, sign in through this program
+// (with the New problem form closed: an open form counts by itself). They never make a program needed (setupNeeds),
+// but they will use its login: Install offers the sign-in, and the calm sign-in line says so.
+function setupBuiltInSignIn(program, need) {
+  const defaults = setupStore().data?.defaults;
+  return !need.form && defaults?.source === "built-in"
+    && (defaults.roles || []).some((row) => row.on && row.program === program && row.signIn);
+}
+
+// What uses a program in general, for a program nothing uses now: "only needed for Claude models".
+function setupOnlyFor(program) {
+  return { codex: "GPT models", claude: "Claude models", latex: "Writing & polishing" }[program];
+}
+
+// Whether a program is missing, does not run or is not found by jobs (LaTeX: not found or does not run): the states
+// that are a warning while something needs the program, and calm otherwise.
+function setupMissing(program, info) {
+  return (program === "latex" ? ["missing", "broken"] : ["missing", "broken", "offpath"]).includes(info?.state);
 }
 
 function setupJoin(words) {
@@ -7543,8 +7590,9 @@ function setupRoleGroups(rows) {
   }).join("; ");
 }
 
-// The programs that need setting up for what new problems and jobs use: {program, kind, title}. An unknown
-// sign-in never counts; nothing counts once the server said it has no Setup page.
+// The programs that need setting up for what new problems, the saved default settings and jobs use (setupNeeds):
+// {program, kind, title}. A program nothing needs never counts, whatever its state; neither does an unknown
+// sign-in, nor anything once the server said it has no Setup page.
 function setupProblems(needs = setupNeeds()) {
   const store = setupStore(), data = store.data, words = setupWords();
   if (!data || store.missing) return [];
@@ -7560,6 +7608,11 @@ function setupProblems(needs = setupNeeds()) {
       problems.push({ program, kind: "signin", title: `${name} not signed in` });
     }
   }
+  // With neither the Codex CLI nor Claude Code installed no model can run, whatever the settings: one line says so,
+  // unless a program's own line already asks for its install.
+  if (!problems.length && ["codex", "claude"].every((program) => data.programs?.[program]?.state === "missing")) {
+    problems.push({ program: "none", kind: "none", title: "Neither the Codex CLI nor Claude Code is installed" });
+  }
   const latex = data.programs?.latex;
   if (latex && needs.latex.needed && ["missing", "broken"].includes(latex.state)) {
     problems.push({ program: "latex", kind: "latex", title: latex.state === "missing" ? "LaTeX not found" : "LaTeX does not run" });
@@ -7567,7 +7620,9 @@ function setupProblems(needs = setupNeeds()) {
   return problems;
 }
 
-// After a role's program under its menu: what Setup found, when the program needs setting up.
+// After a role's program under its menu: what Setup found, when the program needs setting up. Only the chip of a
+// role shows it, so only a model the user chose there (a role of a stage that is off is hidden); the source menus
+// never mark a source.
 function setupChipSuffix(provider, row) {
   const store = setupStore(), data = store.data;
   if (!data || store.missing) return "";
@@ -7593,18 +7648,20 @@ function renderSetupBadge() {
   if (els.words && els.words.textContent !== words) els.words.textContent = words;
 }
 
-// Who uses a program with a problem, for the Overview's notice.
+// Who uses a program with a problem, for the Overview's notice ("New problems" covers the form and the default
+// settings).
 function setupProblemText(problem, needs) {
+  if (problem.kind === "none") return setupWords().none;
   if (problem.kind === "latex") return "Jobs cannot make the PDF without it.";
   const need = needs[problem.program];
   const count = (value) => `${value} ${value === 1 ? "job" : "jobs"}`;
   if (problem.kind === "signin") {
-    const roles = need.rolesSignIn.length > 0, jobs = Number(need.jobs.signIn || 0);
+    const roles = need.rolesSignIn.length + need.defaultsSignIn.length > 0, jobs = Number(need.jobs.signIn || 0);
     const who = roles && jobs ? `New problems and ${count(jobs)} use` : roles ? "New problems use"
       : `${count(jobs)} ${jobs === 1 ? "uses" : "use"}`;
     return `${who} your ${setupWords().logins[problem.program]} login through it.`;
   }
-  const roles = need.roles.length > 0, jobs = need.jobs.count;
+  const roles = need.roles.length + need.defaults.length > 0, jobs = need.jobs.count;
   return roles && jobs ? `New problems and ${count(jobs)} use it.` : roles ? "New problems use it."
     : `${count(jobs)} ${jobs === 1 ? "uses" : "use"} it.`;
 }
@@ -7634,6 +7691,7 @@ function renderSetupHints() {
   const roleNames = (rows) => `the ${setupJoin(rows.map((row) => words.roles[row.role].toLowerCase()))
     .replace("latex writer", "LaTeX writer")}`;
   const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
+    if (problem.kind === "none") return [];  // A role that uses a program gets that program's own line instead.
     const need = needs[problem.program], info = setupStore().data.programs[problem.program], name = words.the[problem.program];
     if (problem.kind === "latex") {
       return need.roles.length ? [problem.title === "LaTeX not found" ? "LaTeX was not found, so Writing & polishing cannot make the PDF."
@@ -7669,7 +7727,9 @@ function setupState(info) {
   return info?.state || (store.error && !store.checking ? "unknown" : "checking");
 }
 
-// A program's state as its pill says it: [words, tone].
+// A program's state as its pill says it: [words, tone]. Missing, not running or not found by jobs is a warning only
+// while something needs the program (setupNeeds); otherwise the same words are calm ("idle": a hollow ring, and no
+// mark on the card's top edge).
 function setupPill(program, info, need, task) {
   if (task && ["running", "waiting"].includes(task.state)) {
     return [{ install: "Installing…", update: "Updating…", "sign-in": "Signing in…" }[task.action] || "Working…", "running"];
@@ -7677,12 +7737,14 @@ function setupPill(program, info, need, task) {
   const state = setupState(info);
   if (state === "checking") return ["Checking…", "stopped"];
   if (state === "unknown") return ["Could not check", "stopped"];
+  const warn = (tone) => need.needed ? tone : "idle";
   if (program === "latex") {
-    return state === "works" ? ["Found", "done"] : state === "broken" ? ["Does not run", "failed"]
-      : ["Not found", need.needed ? "failed" : "stopped"];
+    return state === "works" ? ["Found", "done"] : state === "broken" ? ["Does not run", warn("failed")]
+      : ["Not found", warn("failed")];
   }
-  return { works: ["Installed", "done"], broken: ["Does not run", "failed"], offpath: ["Jobs cannot find it", "waiting"],
-    missing: ["Not installed", need.needed ? "failed" : "stopped"] }[state] || ["Could not check", "stopped"];
+  return { works: ["Installed", "done"], broken: ["Does not run", warn("failed")],
+    offpath: ["Jobs cannot find it", warn("waiting")], missing: ["Not installed", warn("failed")] }[state]
+    || ["Could not check", "stopped"];
 }
 
 // "Codex CLI 0.160.0", "Claude Code not installed", "LaTeX found", for the line under the page title.
@@ -7761,12 +7823,18 @@ function setupCommandList(rows, help = "", scope = "") {
   return list;
 }
 
-// "What needs it": the New problem roles, the jobs (each a link), the API connections.
-function setupNeedList(program, need, problem) {
+// "What needs it": the New problem roles, the saved default settings (beside an open form, when they add a reason),
+// the jobs (each a link), the API connections. A program nothing needs says so calmly, and, when it is missing or
+// does not run, what would need it: "Nothing uses it now · only needed for Claude models".
+function setupNeedList(program, need, problem, info) {
   const list = setupElement("ul", "setup-needs");
   if (need.roles.length) {
     list.append(setupElement("li", "", program === "latex" ? "New problem: Writing & polishing"
       : `New problem: ${setupRoleGroups(need.roles)}`));
+  }
+  if (need.defaults.length) {
+    list.append(setupElement("li", "", program === "latex" ? "Default settings: Writing & polishing"
+      : `Default settings: ${setupRoleGroups(need.defaults)}`));
   }
   const jobs = need.jobs;
   if (jobs.count) {
@@ -7798,7 +7866,13 @@ function setupNeedList(program, need, problem) {
     list.append(setupElement("li", "", `API connections: ${need.connections.map((label) => `“${label}”`).join(", ")} `
       + "(no sign-in needed)"));
   }
-  if (!list.children.length) list.append(setupElement("li", "setup-none", "Nothing uses it now."));
+  const missing = !need.needed && setupMissing(program, info);
+  if (!list.children.length) {
+    list.append(setupElement("li", "setup-none", missing
+      ? `Nothing uses it now · only needed for ${setupOnlyFor(program)}` : "Nothing uses it now."));
+  } else if (missing) {
+    list.append(setupElement("li", "setup-none", "No role or job uses it now"));
+  }
   return list;
 }
 
@@ -7865,16 +7939,20 @@ function setupProgramCard(program, info, need, task, problem) {
   else if (state !== "works") signLine = [setupNone(state === "missing" ? "After it is installed" : "—")];
   else if (signIn.state === "signed-in") signLine = [setupElement("span", "job-status tone-done", "Signed in"), setupElement("span", "", signIn.text)];
   else if (signIn.state === "signed-out") {
+    // A warning only while something here uses a built-in model through it; otherwise calm, and why.
     const login = words.logins[program];
     const detail = need.rolesSignIn.length ? `New problems use your ${login} login`
+      : need.defaultsSignIn.length ? `Your default settings use your ${login} login`
       : need.jobs.signIn ? `${need.jobs.signIn} ${need.jobs.signIn === 1 ? "job uses" : "jobs use"} your ${login} login`
-      : need.connections.length || need.needed ? "Not needed: API connections need no sign-in." : "";
-    signLine = [setupElement("span", `job-status tone-${need.signIn ? "waiting" : "stopped"}`, "Not signed in"),
-      ...(detail ? [setupElement("span", "", detail)] : [])];
+      : setupBuiltInSignIn(program, need) ? `New problems open with the built-in settings, which use your ${login} login`
+      : need.connections.length || need.needed ? "Not needed: API connections need no sign-in."
+      : "Not needed by your settings or jobs";
+    signLine = [setupElement("span", `job-status tone-${need.signIn ? "waiting" : "idle"}`, "Not signed in"),
+      setupElement("span", "", detail)];
   } else {
     signLine = [setupElement("span", "job-status tone-stopped", "Could not check"), ...(signIn.text ? [setupElement("span", "", signIn.text)] : [])];
   }
-  facts.append(setupFact("Sign-in", signLine, "setup-dd-status"), setupFact("Needed by", [setupNeedList(program, need, problem)]));
+  facts.append(setupFact("Sign-in", signLine, "setup-dd-status"), setupFact("Needed by", [setupNeedList(program, need, problem, info)]));
   // The buttons (none while TCS Prover runs as administrator), or the running step.
   const actions = setupElement("div", "setup-card-actions");
   const planned = info?.actions || {};
@@ -7888,9 +7966,10 @@ function setupProgramCard(program, info, need, task, problem) {
     busy.append(elapsed, " · ", link);
     actions.append(busy);
   } else if (!data?.elevated) {
+    // The step that fixes the program is the primary button only while something needs it (as Install).
     if (planned.useFolder?.shown) {
-      actions.append(setupButton(program, "use-folder", "Use it for jobs", "primary", planned.useFolder.available, "",
-        (event, button) => useSetupFolder(program, button)));
+      actions.append(setupButton(program, "use-folder", "Use it for jobs", need.needed ? "primary" : "secondary",
+        planned.useFolder.available, "", (event, button) => useSetupFolder(program, button)));
     }
     if (planned.install?.shown) {
       const primary = need.needed && state === "missing";
@@ -7961,7 +8040,7 @@ function setupLatexCard(info, need, problem) {
     if (found.some((tool) => !tool.onPath)) where.push(setupElement("span", "setup-sub", "found in a standard TeX folder, not on PATH"));
     if (state === "missing") where.push(setupElement("span", "setup-sub", info.problem));
   }
-  facts.append(setupFact("Location", where), setupFact("Needed by", [setupNeedList("latex", need, problem)]));
+  facts.append(setupFact("Location", where), setupFact("Needed by", [setupNeedList("latex", need, problem, info)]));
   const ways = setupElement("div", "setup-card-ways");
   const details = setupDetails("latex:install", "How to install", need.needed && ["missing", "broken"].includes(state));
   details.append(setupCommandList(info?.commands || [], info?.help || "", "latex"));
@@ -8017,10 +8096,19 @@ function renderSetup() {
     els.list.replaceChildren();
     els.tasks.replaceChildren();
     store.panels = {};
+    if (els.first) els.first.hidden = true;
     return;
   }
   const needs = setupNeeds();
   const problems = Object.fromEntries(setupProblems(needs).map((problem) => [problem.program, problem]));
+  if (els.first) {
+    const first = problems.none ? [`${problems.none.title}.`, setupProblemText(problems.none, needs)] : [];
+    if (els.first.dataset.text !== first.join(" ")) {
+      els.first.dataset.text = first.join(" ");
+      els.first.replaceChildren(...(first.length ? [setupElement("strong", "", first[0]), ` ${first[1]}`] : []));
+    }
+    els.first.hidden = !first.length;
+  }
   const steps = Object.fromEntries(["codex", "claude"].map((program) => {
     const task = store.tasks[program];
     return [program, task ? [task.id, task.state, task.action, task.signInAfter, task.openCommands] : null];
@@ -8457,8 +8545,12 @@ function renderSetupDialog() {
   els.dialogWhat.replaceChildren(...(dialog.what || []).map((line) => setupElement("li", "", line)));
   els.dialogWarning.textContent = dialog.warning || "";
   els.dialogWarning.hidden = !dialog.warning;
-  // Install, then sign in under the same confirmation, when something here needs the sign-in.
-  const then = current.action === "install" && Boolean(dialog.checkbox) && setupNeeds()[current.program].signIn;
+  // Install, then sign in under the same confirmation, when the login will be used: by something here (setupNeeds),
+  // by the built-in settings (setupBuiltInSignIn), or on a computer with neither program yet, where the program
+  // installed first is the one whose models you will use.
+  const need = setupNeeds()[current.program];
+  const then = current.action === "install" && Boolean(dialog.checkbox) && (need.signIn
+    || setupBuiltInSignIn(current.program, need) || setupProblems().some((problem) => problem.kind === "none"));
   els.dialogThen.hidden = !then;
   if (then) {
     els.dialogThenText.textContent = dialog.checkbox.label;
@@ -8567,7 +8659,8 @@ async function copyText(button, text) {
   if (!setupOnScreen()) loadSetup();
 })();
 
-// Saved settings: the bar at the top of the New problem card (GET and POST /presets, ui/presets.py).
+// Saved settings: the first panel of Advanced settings on the New problem card (GET and POST /presets,
+// ui/presets.py), named in the summary of Advanced settings too, which shows while they are closed.
 // Named sets of this form's settings, kept on this computer; one of them may be the default that
 // every fresh New problem form opens with. A rerun pre-fill and a job sent back to the form keep their
 // own settings, and switching to Models & API keeps the draft. Saved settings hold the stages, each
@@ -8581,11 +8674,14 @@ function presetStore() {
     // Why the server cannot use its saved settings file (problem), or why the last read failed (error).
     problem: "", error: "",
     // Where the form's settings came from ({kind: "builtin"}, {kind: "preset", id, name} or {kind: "job"}),
-    // and presetSignature() when the form last matched it: "· changed" marks any difference.
+    // and presetSignature() when the form last matched it: "· changed on this form" marks any difference.
     current: { kind: "builtin" }, baseline: "",
-    // The note under the bar: a confirmation, or a warning (what a load could not keep).
-    note: "", warning: false, busy: false, renaming: "",
-    // The form problem a Save… showed on the page's error line (see showPresetFormProblem), and the bar
+    // The note at the foot of the panel: a confirmation, or a warning (what a load could not keep: the
+    // models of `missing` roles).
+    note: "", warning: false, missing: 0, busy: false, renaming: "",
+    // What the summary of Advanced settings says about them (see renderPresetBar).
+    summary: { text: "Saved settings: built-in", tone: "quiet" },
+    // The form problem a Save… showed on the page's error line (see showPresetFormProblem), and the panel's
     // button that gets the focus once a request ends, when its dialog closed meanwhile (see presetFocusBar).
     formProblem: "", refocus: null,
   });
@@ -8623,14 +8719,14 @@ function adoptPresets(data) {
   store.error = "";
   store.loaded = true;
   // The settings the form came from keep their latest name (renamed here or in another tab), which
-  // the bar still shows once they are deleted.
+  // the panel still shows once they are deleted.
   const current = store.current?.kind === "preset"
     ? store.presets.find((item) => item.id === store.current.id && !item.unusable) : null;
   if (current) store.current.name = current.name;
 }
 
 // Read the list again; a failure leaves the form as it is (the built-in settings on a fresh form) and
-// the bar says why.
+// the panel says why (the summary of Advanced settings too).
 async function loadPresets() {
   const store = presetStore();
   try {
@@ -8642,13 +8738,15 @@ async function loadPresets() {
 }
 
 // A New problem form opened (see render): a fresh one takes the default saved settings, when they can
-// be used; a rerun pre-fill or a job sent back to the form keeps the job's settings.
+// be used; a rerun pre-fill or a job sent back to the form keeps the job's settings. While the list cannot
+// be read (refresh reads it first), the one this page read before may be out of date: a fresh form then
+// has the built-in settings, as when the page could never read it, and the panel and the summary say so.
 function presetsFormOpened(fresh) {
   const store = presetStore();
   store.note = "";
   store.warning = false;
   store.renaming = "";
-  const preset = fresh && !store.unsupported
+  const preset = fresh && !store.unsupported && !store.error
     ? store.presets.find((item) => item.id === store.defaultId && !item.unusable) : null;
   if (preset) applyPreset(preset);
   else store.current = { kind: fresh ? "builtin" : "job" };
@@ -8679,6 +8777,7 @@ function applyPreset(preset) {
   store.current = { kind: "preset", id: preset.id, name: preset.name };
   store.note = missing.length ? presetMissingText(missing) : "";
   store.warning = missing.length > 0;
+  store.missing = missing.length;
 }
 
 function presetMissingText(missing) {
@@ -8693,7 +8792,8 @@ function presetMissingText(missing) {
     + `so these roles use ${fallback}`;
 }
 
-// What the bar compares to tell "· changed": every setting saved settings hold, as the form shows it.
+// What the panel compares to tell "· changed on this form": every setting saved settings hold, as the form
+// shows it.
 function presetSignature() {
   const number = (input) => (String(input.value).trim() === "" ? "" : Number(input.value));
   return JSON.stringify([selectedWorkflowStages(),
@@ -8845,28 +8945,84 @@ function presetGeneratedName(now = new Date()) {
   return name;
 }
 
+// The panel's line "Now using: <name> (default) · changed on this form", its note and its buttons, and what the
+// summary of Advanced settings says about them: the saved settings that filled the form (marked when they are
+// not the built-in ones, and as a warning when the note warns), "· changed" after an edit.
 function renderPresetBar() {
   const store = presetStore();
   const current = store.current || { kind: "builtin" };
   const saved = current.kind === "preset" ? store.presets.find((item) => item.id === current.id && !item.unusable) : null;
+  const deleted = current.kind === "preset" && !saved && store.loaded && !store.problem && !store.error;
   const changed = Boolean(store.baseline) && presetSignature() !== store.baseline;
   // A confirmation ("Saved as …") gives way to the next edit; a warning stays until the next load.
   if (changed && store.note && !store.warning) store.note = "";
-  presetUi.name.textContent = current.kind === "job" ? "From the job"
-    : current.kind === "preset" ? saved?.name || current.name : "Built-in";
-  presetUi.marks.textContent = [
-    saved && saved.id === store.defaultId ? "default" : "",
-    current.kind === "preset" && !saved && store.loaded && !store.problem && !store.error ? "deleted" : "",
-    changed ? "changed" : "",
-  ].filter(Boolean).map((mark) => ` · ${mark}`).join("");
+  const name = current.kind === "preset" ? saved?.name || current.name : "";
+  presetUi.name.textContent = current.kind === "job" ? "the job's settings" : name || "built-in settings";
+  presetUi.marks.textContent = (saved && saved.id === store.defaultId ? " (default)" : "")
+    + (deleted ? " (deleted)" : "") + (changed ? " · changed on this form" : "");
   presetUi.bar.dataset.changed = String(changed);
   const note = store.note || (store.unsupported ? presetUnsupportedText : store.problem || store.error);
   // A live region that stays rendered: empty, it takes no room (styles.css).
   if (presetUi.note.textContent !== note) presetUi.note.textContent = note;
-  presetUi.note.dataset.tone = store.note && !store.warning ? "info" : "warning";
+  const warning = Boolean(note) && !(store.note && !store.warning);
+  presetUi.note.dataset.tone = warning ? "warning" : "info";
   // Writes are refused while the file cannot be used; Built-in settings still load.
   presetUi.load.disabled = store.unsupported || store.busy;
   presetUi.save.disabled = presetUi.confirmSave.disabled = store.unsupported || store.busy || Boolean(store.problem);
+  // A warning in the summary always says what it is: a saved model that a load could not keep, or saved settings
+  // that cannot be read or used now (the note says why). A fresh form then has the built-in settings ("Saved
+  // settings: not available", see presetsFormOpened); a form that saved settings or a job filled keeps them, and
+  // the summary says so after their name.
+  const unavailable = Boolean(note) && !store.note;
+  const label = current.kind === "job" ? "Settings from the job"
+    : name ? `Saved settings: ${name}${deleted ? " (deleted)" : ""}`
+    : unavailable ? "Saved settings: not available" : "Saved settings: built-in";
+  const marks = [
+    unavailable && (current.kind === "job" || name) ? "saved settings not available" : "",
+    store.note && store.warning ? `${store.missing > 1 ? `${store.missing} models` : "model"} not available` : "",
+    changed ? "changed" : "",
+  ].filter(Boolean);
+  store.summary = { text: [label, ...marks].join(" · "),
+    tone: warning ? "warning" : current.kind === "builtin" ? "quiet" : "accent" };
+  renderAdvancedSummary();
+}
+
+// The summary line of Advanced settings, in view while they are closed too: the saved settings that filled the
+// form (see renderPresetBar) and the related works listed for the next problem, each a chip. The related
+// works' chip says when one is uploading or failed, and when the Author stage that reads them is off: a warning
+// always names its cause. Reads only function-held records: it may run before the declarations of this part of
+// the file.
+function renderAdvancedSummary() {
+  const box = $("advancedSummary");
+  if (!box) return;
+  const chips = [presetStore().summary];
+  const items = typeof composerRelatedWorks === "function" ? composerRelatedWorks().items : [];
+  if (items.length) {
+    const failed = items.filter((item) => item.status === "failed").length;
+    const author = Boolean(ui.workflowAuthor.checked);
+    const marks = [
+      failed ? `${failed} failed to upload` : items.some((item) => item.status === "uploading") ? "uploading" : "",
+      author ? "" : "Author stage off",
+    ].filter(Boolean);
+    chips.push({ text: [`${items.length} related work${items.length === 1 ? "" : "s"}`, ...marks].join(" · "),
+      tone: failed || !author ? "warning" : "accent" });
+  }
+  const signature = JSON.stringify(chips);
+  if (box.dataset.signature === signature) return;
+  box.dataset.signature = signature;
+  // A quiet chip leaves room for the list of what is inside (styles.css); a marked one replaces it.
+  if (box.parentElement) box.parentElement.dataset.marked = String(chips.some((chip) => chip.tone !== "quiet"));
+  box.replaceChildren(...chips.flatMap(({ text, tone }) => {
+    const chip = document.createElement("span");
+    chip.className = "advanced-chip";
+    chip.dataset.tone = tone;
+    chip.textContent = text;
+    // The summary names the disclosure button: "Advanced settings, Saved settings: …, 2 related works".
+    const pause = document.createElement("span");
+    pause.className = "visually-hidden";
+    pause.textContent = ", ";
+    return [pause, chip];
+  }));
 }
 
 function openPresetSave() {
@@ -8900,11 +9056,14 @@ async function savePreset(event) {
   if (clash && !confirm(`Replace the saved settings “${clash.name}”?`)) return;
   const makeDefault = presetUi.saveDefault.checked;
   const body = { name, settings: presetFormSettings(), makeDefault, ...(clash ? { replaceId: clash.id } : {}) };
+  // Replacing the default saved settings changes them too, ticked or not.
+  const changesDefault = makeDefault || Boolean(clash && clash.id === store.defaultId);
   setPresetBusy(true);
   show(presetUi.saveError, false);
   try {
     const data = await presetRequest("/presets", body);
     adoptPresets(data);
+    if (changesDefault) presetDefaultChanged();
     const saved = store.presets.find((item) => item.id === data.savedId);
     store.current = { kind: "preset", id: data.savedId, name: saved?.name || name };
     store.baseline = presetSignature();
@@ -9022,8 +9181,8 @@ function renderPresetList(focus = null) {
     ...usable.filter((item) => item.id !== store.defaultId).sort(byName),
     ...store.presets.filter((item) => item.unusable)].map(presetRow);
   if (store.loaded && !usable.length && !store.problem) {
-    rows.push(presetElement("li", "preset-empty", "No saved settings yet. Choose Save… on the form to keep its settings "
-      + "under a name."));
+    rows.push(presetElement("li", "preset-empty", "No saved settings yet. Choose Save these settings… to keep this "
+      + "form's settings under a name."));
   }
   rows.push(presetRow({ id: "builtin", name: store.builtIn?.name || "Built-in settings",
     settings: store.builtIn?.settings || null, labels: store.builtIn?.labels || {} }));
@@ -9053,7 +9212,7 @@ function setPresetBusy(busy, focus = null) {
   if (!busy && presetUi.loadDialog.open) renderPresetList(focus);
   presetUi.loadDialog.setAttribute("aria-busy", String(busy));
   renderPresetBar();
-  // A dialog closed while the request ran (Escape): its bar button takes the focus now that it can, unless
+  // A dialog closed while the request ran (Escape): its panel button takes the focus now that it can, unless
   // the focus went somewhere else meanwhile.
   const store = presetStore(), button = store.refocus;
   if (busy || !button) return;
@@ -9062,7 +9221,7 @@ function setPresetBusy(busy, focus = null) {
   if (lost && !presetUi.saveDialog.open && !presetUi.loadDialog.open) button.focus();
 }
 
-// Back to the bar's button that opened a dialog when it closes. While a request runs that button is
+// Back to the panel's button that opened a dialog when it closes. While a request runs that button is
 // disabled and cannot take the focus; setPresetBusy gives it the focus when the request ends.
 function presetFocusBar(button) {
   const store = presetStore();
@@ -9070,9 +9229,15 @@ function presetFocusBar(button) {
   if (!store.refocus) button.focus();
 }
 
+// The Setup page counts the default saved settings, also beside this form (setupNeeds): a change of them is read
+// there at once, from the server's last check of the programs (no program starts), not at its next minute's read.
+function presetDefaultChanged() {
+  if (typeof loadSetup === "function") loadSetup("poll");
+}
+
 // A change made from the Load list; the list shows the server's answer (or, after a refusal, the
-// list as it is now) and the status line says what happened.
-async function presetListAction(path, body, done, focus) {
+// list as it is now) and the status line says what happened. ``changesDefault``: it may change the default.
+async function presetListAction(path, body, done, focus, changesDefault = false) {
   const store = presetStore();
   if (store.busy) return;
   setPresetBusy(true);
@@ -9080,6 +9245,7 @@ async function presetListAction(path, body, done, focus) {
     adoptPresets(await presetRequest(path, body));
     presetUi.loadStatus.textContent = done();
     store.renaming = "";
+    if (changesDefault) presetDefaultChanged();
   } catch (error) {
     presetUi.loadStatus.textContent = error.message;
     if (!store.unsupported) {
@@ -9114,7 +9280,7 @@ function setPresetDefault(id, row = id || "builtin") {
   const name = store.presets.find((item) => item.id === id)?.name;
   return presetListAction("/presets/default", { id }, () => (id ? `New problems now open with “${name}”.`
     : "New problems now open with the built-in settings."),
-  { id: row, action: row === "builtin" ? "builtin-default" : "default" });
+  { id: row, action: row === "builtin" ? "builtin-default" : "default" }, true);
 }
 
 function startPresetRename(id) {
@@ -9152,7 +9318,8 @@ function deletePresetFromList(id) {
   if (!preset) return;
   const fallback = preset.id === store.defaultId ? "\n\nNew problems will open with the built-in settings." : "";
   if (!confirm(`Delete the saved settings “${preset.name}”?${fallback}`)) return;
-  return presetListAction("/presets/delete", { id }, () => `Deleted “${preset.name}”.`, { id: "", action: "" });
+  return presetListAction("/presets/delete", { id }, () => `Deleted “${preset.name}”.`, { id: "", action: "" },
+    preset.id === store.defaultId);
 }
 
 const presetUnsupportedText = "This TCS Prover server cannot save settings. Restart TCS Prover to update it.";
@@ -9170,7 +9337,7 @@ presetUi.save.onclick = openPresetSave;
 presetUi.saveForm.addEventListener("submit", savePreset);
 presetUi.cancelSave.onclick = () => presetUi.saveDialog.close();
 presetUi.closeLoad.onclick = () => presetUi.loadDialog.close();
-// Back to the bar's button (see presetFocusBar); a load closes the list with its own result in the bar.
+// Back to the panel's button (see presetFocusBar); a load closes the list with its own result in the panel.
 presetUi.saveDialog.addEventListener("close", () => presetFocusBar(presetUi.save));
 presetUi.loadDialog.addEventListener("close", () => {
   presetStore().renaming = "";
@@ -9199,7 +9366,7 @@ presetUi.list.onkeydown = (event) => {
   event.preventDefault();
   savePresetRename(input.dataset.presetRename);
 };
-// Any edit of the form may change what "· changed" says (the bar reads the controls themselves).
+// Any edit of the form may change what "· changed on this form" says (the panel reads the controls themselves).
 for (const type of ["input", "change"]) {
   presetUi.card?.addEventListener(type, (event) => {
     if (!presetUi.bar.contains(event.target)) renderPresetBar();

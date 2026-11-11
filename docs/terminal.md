@@ -13,10 +13,11 @@ python3 web_ui.py statement.md
 This sends the whole file to the proof author, like turning off **Statement
 review** and keeping the other three stages on. It starts no web server and
 opens no browser. Without options it uses the built-in defaults (a default saved
-with **Save…** applies only to the web form): 3 independent critics per round,
-no author subagents, at most 2 consecutive edited critic passes (then one last
-review that cannot edit), no time limit, GPT 6.1 Sol at Max for every proof
-role, the built-in prompts, Standard speed and concise reasoning summaries.
+with **Save these settings…** applies only to the web form): 3 independent
+critics per round, no author subagents, at most 2 consecutive edited critic
+passes (then one last review that cannot edit), no time limit, GPT 6.1 Sol at
+Max for every proof role, the built-in prompts, Standard speed and concise
+reasoning summaries.
 
 ## Folders
 

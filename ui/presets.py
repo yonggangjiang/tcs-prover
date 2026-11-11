@@ -1,8 +1,9 @@
 """Saved New problem settings: named sets of the form's settings, one of which may be the default.
 
-The New problem form saves and loads them (Save… and Load… at the top of its card),
-and every fresh form opens with the default; a rerun or a job sent back to the form
-keeps its own settings. Terminal runs never read them.
+The New problem form saves and loads them (Save these settings… and Load saved
+settings… under Advanced settings → Saved settings), and every fresh form opens with
+the default; a rerun or a job sent back to the form keeps its own settings. Terminal
+runs never read them.
 
 They live in <state>/new-problem-presets.json (runner.providers.PRESETS, beside the
 API model store): an owner-only file in an owner-only folder that no model sandbox can
@@ -60,7 +61,7 @@ SETTINGS = ("workflowStages", "reviewModel", "reviewEffort", "authorModel", "aut
 # What a preset keeps of each API model it names (from its catalog row): no key, no address.
 API_FIELDS = ("label", "model", "format", "sourceId", "sourceLabel")
 BUILTIN_NAME = "Built-in settings"
-GONE = "Those saved settings no longer exist. Open Load… again to see the current list."
+GONE = "Those saved settings no longer exist. Open Load saved settings… again to see the current list."
 _LOCK = threading.Lock()
 
 # One entry of the file: as read (item), its checked form (preset, None when it cannot be used),

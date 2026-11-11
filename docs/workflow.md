@@ -35,8 +35,11 @@ flowchart TD
 
 ## Settings and prompts
 
-**Advanced settings** on the New problem page hold each role's model and
-reasoning (see [Models and API connections](models.md)) and:
+**Advanced settings** on the New problem page start with
+[Saved settings](saved-settings.md) (save these settings under a name, load
+them, and choose the default new problems open with) and the
+[related works](job-page.md#related-works) for the author. Then they hold each
+role's model and reasoning (see [Models and API connections](models.md)) and:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |

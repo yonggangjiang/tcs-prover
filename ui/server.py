@@ -9311,6 +9311,14 @@ class Server(ThreadingHTTPServer):
     # Jobs that can still run, whose programs the Setup page lists under "Needed by" (a statement review you stopped
     # waits in phase input or reviewed).
     SETUP_LIVE_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "stopping", "paused"}
+    # The stages still ahead of a job at a step (PUBLIC_GRAPH): the critic sends a rejected proof back to the author,
+    # the convention critic (the critic's model) passes to the writer whatever it says, and the LaTeX steps only
+    # repeat each other. At another step (the statement review, or none yet), and in a phase before the run (a
+    # statement review, a queued job), every stage is ahead.
+    SETUP_STEP_PHASES = {"running", "pausing", "stopping", "paused"}
+    SETUP_STAGES_AHEAD = {"author": {"author", "critic", "writing"}, "critic": {"author", "critic", "writing"},
+                          "failure_summary": {"author", "critic", "writing"}, "convention": {"critic", "writing"},
+                          "latex_editor": {"writing"}, "latex_compile": {"writing"}, "latex_repair": {"writing"}}
 
     def _setup(self):
         """The Setup page's state; a Server built without __init__ (some tests) makes it here."""
@@ -9320,17 +9328,29 @@ class Server(ThreadingHTTPServer):
             setup = self.setup = program_setup.SetupTasks(busy=self._setup_busy)
         return setup
 
-    @staticmethod
-    def _setup_programs(state):
-        """The programs a job's selected roles run through, and those of them that need a sign-in (built-in models).
+    @classmethod
+    def _setup_stages_ahead(cls, state):
+        """The selected stages a job has not left behind (SETUP_STAGES_AHEAD): a job paused in Writing & polishing,
+        for example, no longer needs the program of its critic."""
+
+        stages = saved_workflow_stages(state)
+        ahead = set(WORKFLOW_STAGES)
+        if state.get("phase") in cls.SETUP_STEP_PHASES:
+            ahead = cls.SETUP_STAGES_AHEAD.get(state.get("activeNode") or "", ahead)
+        return {stage for stage in WORKFLOW_STAGES if stages.get(stage) and stage in ahead}
+
+    @classmethod
+    def _setup_programs(cls, state):
+        """The programs the roles of a job's stages still ahead run through, and those of them that need a sign-in
+        (built-in models).
 
         A role whose model cannot be read now (an unknown model, an API model store that cannot be read) is left out.
         """
 
         programs, sign_in = set(), set()
-        stages = saved_workflow_stages(state)
+        ahead = cls._setup_stages_ahead(state)
         for stage, role in STAGE_ROLES.items():
-            if not stages.get(stage):
+            if stage not in ahead:
                 continue
             model = state.get(f"{role}Model")
             try:
@@ -9354,7 +9374,9 @@ class Server(ThreadingHTTPServer):
         return text if len(text) <= program_setup.TITLE_CHARS else f"{text[:program_setup.TITLE_CHARS - 1]}…"
 
     def _setup_busy(self, program):
-        """The titles of this server's jobs that run a model process through ``program`` now (occupies_slot()).
+        """The titles of this server's jobs that run a model process now (occupies_slot()) and use ``program`` in a
+        stage still ahead (_setup_programs), as "Needed by" lists them: a job in Writing & polishing does not hold
+        its critic's program.
 
         Update, a repair install and a sign-in that may replace a login wait for them. A job whose every call
         waits for that program's sign-in or start (App.waits_for_setup) runs none, and waits for that very step:
@@ -9398,7 +9420,8 @@ class Server(ThreadingHTTPServer):
                 "reviewing": "checking the statement"}.get(phase, phase or "")
 
     def _setup_job_needs(self):
-        """Per program, the jobs that can still run and use it: {count, running, signIn, items}."""
+        """Per program, the jobs that can still run and use it in a stage still ahead (_setup_stages_ahead):
+        {count, running, signIn, items}."""
 
         with self.jobs_lock:
             apps = list(self.jobs.values())
@@ -9412,7 +9435,7 @@ class Server(ThreadingHTTPServer):
                                                             and state.get("manuallyStopped")):
                 continue
             programs, sign_in = self._setup_programs(state)
-            if saved_workflow_stages(state).get("writing"):
+            if "writing" in self._setup_stages_ahead(state):
                 programs = programs | {"latex"}
             item = {"runId": state.get("runId") or "", "title": self._setup_title(state), "running": running,
                     "batchId": self.batch_of(app), "status": self._setup_job_status(app, state, running)}

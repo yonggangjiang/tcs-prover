@@ -99,7 +99,7 @@ retried every minute, without limit.
 | [The workflow](docs/workflow.md) | Statement review, the author, the critic, the convention critic, LaTeX |
 | [The job page](docs/job-page.md) | Status, the chat, Pause, Summary, Stop, the time limit, related works, downloads |
 | [Batches and folder runs](docs/batches.md) | Batches, running a folder of statements, the running-jobs limit |
-| [Saved settings](docs/saved-settings.md) | **Save…** and **Load…** on the New problem page |
+| [Saved settings](docs/saved-settings.md) | Saving and loading New problem settings, and the default, under **Advanced settings** |
 | [Web search cutoff](docs/web-cutoff.md) | Runs with no web access, or with archives from before a date only |
 | [Sandbox and network](docs/sandbox.md) | What a run's models can read, write and reach |
 | [Retries and what needs you](docs/retries.md) | Automatic retries, restarts, checkpoints, continuing a job |

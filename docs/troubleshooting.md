@@ -146,8 +146,9 @@ the Default batch meanwhile. Repair the file and start TCS Prover again.
 
 **Saved settings cannot be saved.** `.tcs-prover/new-problem-presets.json` cannot
 be read, is damaged or comes from a newer version; it is never overwritten. Fix
-or remove it. **Load…** and **Save…** turned off with a note to restart means
-the server is older than the page: restart TCS Prover.
+or remove it. **Load saved settings…** and **Save these settings…** turned off
+with a note to restart means the server is older than the page: restart TCS
+Prover.
 
 **The API connections list cannot be read.** It is reported instead of shown
 as empty; running jobs keep the settings they read last, and waiting jobs try

@@ -26,6 +26,8 @@ COMPOSER = [
     ["function selectedWorkflowStages(", "// Read historical mode names"],
     ["async function startReview(", "async function act("],
 ]
+# Run a folder…: it refuses related works that are not ready before the folder chooser opens.
+FOLDER_BUTTON = [["ui.runFolder.onclick = () => {", "ui.check.onclick ="]]
 COMPOSER_SETUP = r"""
 let currentJob = '', currentBatch = '', timer = 0, jobsTimer = 0, reviewPending = false;
 let state = {phase: 'input'};
@@ -65,6 +67,9 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const until = async (check) => { for (let i = 0; i < 50 && !check(); i += 1) await tick(); assert(check()); };
 const rows = () => ui.composerRelatedList.children.map(row => [row.dataset.state,
   row.children[1].children.map(node => node.textContent).join(' | ')]);
+// The composer's related works are listed under Advanced settings (closed): a refusal about them opens it.
+const advanced = new Element('details');
+advanced.append(ui.relatedWorksField);
 """
 
 # The run page's panel: render() and the related-works span, and the add flows of the run page.
@@ -109,7 +114,7 @@ class RelatedWorksBrowserTests(unittest.TestCase):
 
     def test_markers_occur_once(self):
         source = APP.read_text(encoding="utf-8")
-        for marker in sorted({marker for pair in COMPOSER + PANEL for marker in pair}):
+        for marker in sorted({marker for pair in COMPOSER + FOLDER_BUTTON + PANEL for marker in pair}):
             with self.subTest(marker=marker):
                 self.assertEqual(source.count(marker), 1)
 
@@ -133,24 +138,33 @@ assert.equal(uploads[0].path, '/uploads?name=My%20Paper.pdf');
 assert.equal(uploads[0].options.method, 'POST');
 assert.equal(uploads[0].options.body, paper);
 assert.deepEqual(uploads[0].options.headers, {'X-TCS-Prover-Token': 'secret', 'Content-Type': 'application/octet-stream'});
-// Start waits for the upload, then for the failed rows to be removed.
+// Start waits for the upload, then for the failed rows to be removed; each refusal opens Advanced settings, where
+// the list is. Other refusals leave them as they are.
+await startReview('');
+assert.equal(ui.notice.textContent, 'Enter the text for this workflow.');
+assert.equal(advanced.open, false);
 await startReview('Prove P.');
 assert.equal(ui.notice.textContent, 'Wait for the related works to finish uploading.');
+assert.equal(advanced.open, true);
 assert.equal(sent.length, 1);
 uploads[0].answer(200, staged('tok-paper', 'My-Paper.pdf', {mediaType: 'application/pdf',
   textStatus: 'text extracted (3 pages)', originalName: 'My Paper.pdf'}));
 await adding;
 assert.deepEqual(rows()[0], ['ready', 'My Paper.pdf | 1.2 KB · text extracted (3 pages)']);
+advanced.open = false;
 await startReview('Prove P.');
 assert.equal(ui.notice.textContent, 'Remove the related works that could not be uploaded, then start.');
+assert.equal(advanced.open, true);
 const remove = index => ui.composerRelatedList.children[index].children[2];
 assert.equal(remove(1).attributes['aria-label'], 'Remove empty.md');
 remove(2).onclick(); remove(1).onclick();
 assert.deepEqual(sent.slice(1), [], 'a failed upload has nothing to discard');
 // Related works need the Author stage.
 chooseStages({review: false, author: false});
+advanced.open = false;
 await startReview('Prove P.');
 assert.equal(ui.notice.textContent, 'Related works are read by the proof author. Turn on the Author stage or remove them.');
+assert.equal(advanced.open, true);
 chooseStages({review: false});
 start = startReview('Prove P.');
 assert.deepEqual(sent[1].body.relatedWorks, ['tok-paper']);
@@ -201,15 +215,17 @@ assert.equal(ui.composerRelatedList.children.length, 0);
         self.run_app(COMPOSER, COMPOSER_SETUP, r"""
 const adding = addComposerFiles([file('survey.pdf', 10)]);
 await until(() => uploads.length === 1);
-// Refused while the upload runs (before any folder is read).
+// Refused while the upload runs (before any folder is read), with Advanced settings open on the list.
 await startFolderBatch([file('a.md', 8, 'Prove A.')]);
 assert.equal(ui.notice.textContent, 'Wait for the related works to finish uploading.');
+assert.equal(advanced.open, true);
 assert.equal(questions.length, 0);
 uploads[0].answer(200, staged('tok-survey', 'survey.pdf'));
 await adding;
 const run = startFolderBatch([file('a.md', 8, 'Prove A.'), file('b.md', 8, 'Prove B.')]);
 await until(() => sent.length === 1);
-assert.match(questions[0], /Each job uses the selected stages\. Every job gets the 1 related work listed above\./);
+assert.match(questions[0],
+  /Each job uses the selected stages\. Every job gets the 1 related work listed under Advanced settings\./);
 assert.equal(sent[0].path, '/direct-batch');
 assert.deepEqual(sent[0].body.relatedWorks, ['tok-survey']);
 assert.deepEqual(sent[0].body.statements.map(item => item.name), ['a.md', 'b.md']);
@@ -223,6 +239,65 @@ assert.equal('relatedWorks' in sent[1].body, false);
 assert.doesNotMatch(questions[1], /related work/);
 sent[1].resolve({batchId: '__root__', startedJobs: ['j3'], jobs: []});
 await plain;
+""")
+
+    def test_run_a_folder_refuses_related_works_that_are_not_ready_before_the_folder_chooser(self):
+        self.run_app(COMPOSER + FOLDER_BUTTON, COMPOSER_SETUP, r"""
+// Still uploading: refused with Advanced settings open on the list, and the folder chooser stays closed.
+const adding = addComposerFiles([file('survey.pdf', 10)]);
+await until(() => uploads.length === 1);
+ui.folderInput.value = 'statements';
+ui.runFolder.onclick();
+assert.equal(ui.notice.textContent, 'Wait for the related works to finish uploading.');
+assert.deepEqual([advanced.open, ui.folderInput.clicked, ui.folderInput.value], [true, 0, 'statements']);
+// Failed: the same, with its own reason.
+uploads[0].answer(500, {error: 'The upload failed.'});
+await adding;
+assert.deepEqual(rows(), [['failed', 'survey.pdf | Upload failed: The upload failed.']]);
+advanced.open = false;
+ui.runFolder.onclick();
+assert.equal(ui.notice.textContent, 'Remove the related works that could not be uploaded, then start.');
+assert.deepEqual([advanced.open, ui.folderInput.clicked], [true, 0]);
+// Ready but the Author stage that reads them is off: the same.
+ui.composerRelatedList.children[0].children[2].onclick();
+const ready = addComposerFiles([file('notes.md', 10)]);
+await until(() => uploads.length === 2);
+uploads[1].answer(200, staged('tok-notes', 'notes.md'));
+await ready;
+chooseStages({review: false, author: false});
+advanced.open = false;
+ui.runFolder.onclick();
+assert.equal(ui.notice.textContent, 'Related works are read by the proof author. Turn on the Author stage or remove them.');
+assert.deepEqual([advanced.open, ui.folderInput.clicked], [true, 0]);
+// Ready with the Author stage on: the chooser opens, cleared so the same folder can be chosen again.
+chooseStages({review: false});
+advanced.open = false;
+ui.runFolder.onclick();
+assert.deepEqual([advanced.open, ui.folderInput.clicked, ui.folderInput.value], [false, 1, '']);
+assert.deepEqual([questions.length, sent.length], [0, 0]);
+""")
+
+    def test_a_related_work_added_while_the_folder_is_read_stops_that_folder_run(self):
+        self.run_app(COMPOSER, COMPOSER_SETUP, r"""
+// Nothing is listed when the folder run starts; a file is added while the folder's statements are read. The
+// recheck before the question refuses it, with Advanced settings open on the list: nothing is asked or sent.
+const run = startFolderBatch([file('a.md', 8, 'Prove A.'), file('b.md', 8, 'Prove B.')]);
+const adding = addComposerFiles([file('late.pdf', 10)]);
+await run;
+assert.equal(ui.notice.textContent, 'Wait for the related works to finish uploading.');
+assert.equal(ui.notice.hidden, false);
+assert.equal(advanced.open, true);
+assert.deepEqual([questions.length, sent.length], [0, 0]);
+assert.deepEqual([ui.runFolder.disabled, ui.check.disabled], [false, false]);
+// Uploaded, it goes with the next folder run.
+uploads[0].answer(200, staged('tok-late', 'late.pdf'));
+await adding;
+const again = startFolderBatch([file('a.md', 8, 'Prove A.')]);
+await until(() => sent.length === 1);
+assert.equal(questions.length, 1);
+assert.deepEqual(sent[0].body.relatedWorks, ['tok-late']);
+sent[0].resolve({batchId: '__root__', startedJobs: ['j1'], jobs: []});
+await again;
 """)
 
     def test_a_composer_note_is_staged_and_a_refusal_keeps_its_text(self):
@@ -502,21 +577,33 @@ class RelatedWorksMarkupTests(unittest.TestCase):
         self.assertEqual(page.elements["authorSteerInstruction"]["data-max-chars"], "12000")
         self.assertIn("authorTimeLimitControl", page.parents["authorLimitHint"])
         self.assertLess(order("setAuthorTimeLimitButton"), order("authorLimitHint"))
-        # The run page's panel follows the statement; the composer field follows the workflow stages.
+        # The run page's panel follows the statement. The composer's list is under Advanced settings, after the
+        # workflow stages and the Saved settings panel, before the models.
         self.assertLess(order("statementDetails"), order("relatedWorksPanel"))
         self.assertLess(order("relatedWorksPanel"), order("resultPanel"))
-        self.assertLess(order("workflowWriting"), order("relatedWorksField"))
+        self.assertLess(order("workflowWriting"), order("advancedSettings"))
+        self.assertLess(order("presetBar"), order("relatedWorksField"))
+        self.assertLess(order("relatedWorksField"), order("reviewModelSetting"))
         self.assertLess(order("problem"), order("workflowReview"))
         self.assertIn("inputPanel", page.parents["relatedWorksField"])
+        self.assertIn("advancedSettings", page.parents["relatedWorksField"])
+        self.assertEqual(page.elements["advancedSettings"]["tag"], "details")
+        for identity in ("relatedWorksLabel", "relatedWorksHelp", "composerRelatedList", "composerAddFilesButton",
+                         "composerAddNoteButton", "composerNoteForm", "composerRelatedFiles"):
+            self.assertIn("relatedWorksField", page.parents[identity])
         self.assertIn("jobsPanel", page.parents["batchRelatedWorks"])
         for prefix in ("relatedNote", "composerNote", "batchNote"):
             for field in ("Title", "Text"):
                 self.assertIn(prefix + field, page.labels)
             self.assertEqual(page.elements[prefix + "Title"]["maxlength"], "200")
+        # Each hidden file input is named, and opened only by its button, which clears it first (so the same file
+        # chosen again still adds it): no label points at one, as a click on that label would open it as well.
         for identity in ("relatedFilesInput", "composerRelatedFiles", "batchRelatedFiles"):
-            element = page.elements[identity]
-            self.assertEqual((element["type"], "multiple" in element, "hidden" in element), ("file", True, True))
-            self.assertTrue(element.get("aria-label") or identity in page.labels, identity)
+            with self.subTest(identity=identity):
+                element = page.elements[identity]
+                self.assertEqual((element["type"], "multiple" in element, "hidden" in element), ("file", True, True))
+                self.assertTrue(element.get("aria-label"))
+                self.assertNotIn(identity, page.labels)
 
     def test_every_new_element_is_in_the_ui_map(self):
         source = APP.read_text(encoding="utf-8")

@@ -17,7 +17,7 @@ INDEX = ROOT / "ui" / "index.html"
 NODE = shutil.which("node")
 
 SETUP = ["// Setup page: what this computer has and what new problems and jobs need.",
-         "// Saved settings: the bar at the top of the New problem card"]
+         "// Saved settings: the first panel of Advanced settings on the New problem card"]
 PAGES = ["function request(", "function selectedProblemMode("]
 OUTCOME = ["function completedRunLabel(", "function localDateTime("]
 MODELS = ["function modelProvider(", "function renderRetrievalSettings()"]

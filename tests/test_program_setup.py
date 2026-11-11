@@ -1000,6 +1000,63 @@ class ProtectionTests(HttpCase):
         self.assertTrue(claude["update"]["available"] and claude["signIn"]["available"])
         self.assertEqual(self.calls("installer"), [])
 
+    def test_a_running_job_holds_only_the_programs_of_its_stages_still_ahead(self):
+        self.official_codex()
+        self.official_claude()
+        # The critic ran through Claude Code; the job now writes the LaTeX with GPT 6.1 Sol: Claude Code is behind it.
+        app = self.job(criticModel="claude-opus-5-5")
+        app.state.update(workflowStages={"review": False, "author": True, "critic": True, "writing": True},
+                         writerModel="gpt-6.1-sol", activeNode="latex_editor", stage="final")
+        status = self.status()
+        claude = self.program(status, "claude")["actions"]
+        self.assertTrue(claude["update"]["available"] and claude["signIn"]["available"])
+        self.assertEqual(status["jobs"]["claude"]["count"], 0)
+        codex = self.program(status, "codex")["actions"]
+        self.assertEqual((codex["update"]["available"], codex["update"]["reason"]), (False, self.REASON))
+        # The same job while its critic runs: Claude Code is still ahead, and its Update waits.
+        app.state.update(activeNode="critic", stage="critic")
+        status = self.status()
+        claude = self.program(status, "claude")["actions"]
+        self.assertEqual((claude["update"]["available"], claude["update"]["reason"]),
+                         (False, self.REASON.replace("the Codex CLI", "Claude Code")))
+        self.assertEqual(status["jobs"]["claude"]["count"], 1)
+
+    def test_the_author_step_keeps_the_critic_ahead(self):
+        self.official_codex()
+        self.official_claude()
+        # A GPT author at work, a Claude critic next: Claude Code is needed now, and its Update waits.
+        app = self.job(criticModel="claude-opus-5-5")
+        app.state.update(activeNode="author", stage="solve")
+        status = self.status()
+        self.assertEqual(status["jobs"]["claude"]["count"], 1)
+        self.assertEqual(self.program(status, "claude")["actions"]["update"]["reason"],
+                         self.REASON.replace("the Codex CLI", "Claude Code"))
+
+    def test_the_failure_summary_step_keeps_the_author_ahead(self):
+        self.official_codex()
+        self.official_claude()
+        # A job at the failure summary step (in records from older runs; the time limit now pauses the author, which
+        # writes its summary as a reply): its Claude author is still at work, with a GPT critic after it.
+        app = self.job(authorModel="claude-opus-5-5")
+        app.state.update(activeNode="failure_summary", stage="failure")
+        status = self.status()
+        self.assertEqual(status["jobs"]["claude"]["count"], 1)
+        self.assertEqual(self.program(status, "claude")["actions"]["update"]["reason"],
+                         self.REASON.replace("the Codex CLI", "Claude Code"))
+
+    def test_fix_latex_errors_keeps_writing_ahead(self):
+        self.official_codex()
+        self.official_claude()
+        # Fix LaTeX errors runs the writer's GPT 6.1 Sol and compiles again; the Claude critic is behind it.
+        app = self.job(criticModel="claude-opus-5-5")
+        app.state.update(workflowStages={"review": False, "author": True, "critic": True, "writing": True},
+                         writerModel="gpt-6.1-sol", activeNode="latex_repair", stage="final")
+        status = self.status()
+        self.assertEqual((status["jobs"]["codex"]["count"], status["jobs"]["latex"]["count"],
+                          status["jobs"]["claude"]["count"]), (1, 1, 0))
+        self.assertEqual(self.program(status, "codex")["actions"]["update"]["reason"], self.REASON)
+        self.assertTrue(self.program(status, "claude")["actions"]["update"]["available"])
+
     def test_a_paused_job_without_a_worker_allows_them(self):
         self.official_codex()
         self.job(phase="paused", worker=False)
@@ -1357,8 +1414,8 @@ class NeedsTests(HttpCase):
         app._new_run(f"Statement in phase {phase}.")
         app.state.update(runId=app.run_dir.name, phase=phase, draft=f"Statement in phase {phase}.",
                          workflowStages=stages or {"review": True, "author": True, "critic": True, "writing": True},
-                         reviewModel="gpt-6.1-sol", authorModel="gpt-6.1-sol", criticModel="claude-opus-5-5",
-                         writerModel="gpt-6.1-sol", **models)
+                         **{"reviewModel": "gpt-6.1-sol", "authorModel": "gpt-6.1-sol",
+                            "criticModel": "claude-opus-5-5", "writerModel": "gpt-6.1-sol", **models})
         with self.http.jobs_lock:
             self.http.jobs[app.state["runId"]] = app
         return app
@@ -1380,6 +1437,41 @@ class NeedsTests(HttpCase):
         self.assertEqual(jobs["latex"]["count"], 2)  # Writing is off in the paused one.
         self.assertEqual({item["status"] for item in jobs["codex"]["items"]}, {"queued", "stopped", "paused"})
         self.assertNotIn("done", {item["status"] for item in jobs["codex"]["items"]})
+
+    def test_a_job_needs_only_the_programs_of_its_stages_still_ahead(self):
+        claude, gpt = "claude-opus-5-5", "gpt-6.1-sol"
+        # The critic (Claude Opus 5.5) is behind a job in Writing & polishing, paused or running: the LaTeX steps
+        # only repeat each other.
+        writing = self.app("paused", activeNode="latex_editor", stage="final")
+        compiling = self.app("running", activeNode="latex_compile", stage="final")
+        # The author (Claude Opus 5.5) is behind the convention critic, which passes to the writer whatever it says.
+        convention = self.app("paused", activeNode="convention", stage="critic", authorModel=claude, criticModel=gpt)
+        # The critic can send the proof back to the author: the author is still ahead of it.
+        critic = self.app("paused", activeNode="critic", stage="critic", authorModel=claude, criticModel=gpt)
+        # The statement review is behind a running author; a queued job (prepared jobs wait at the author) and a
+        # statement waiting for approval have every stage ahead.
+        author = self.app("running", activeNode="author", stage="solve", reviewModel=claude, criticModel=gpt)
+        queued = self.app("prepared", launchQueued=True, activeNode="author", stage="solve", reviewModel=claude,
+                          criticModel=gpt)
+        approval = self.app("reviewed", activeNode="statement_reviewer", stage="review", authorModel=claude,
+                            criticModel=gpt)
+        jobs = self.status("cached=1")["jobs"]
+        ids = lambda program: {item["runId"] for item in jobs[program]["items"]}  # noqa: E731
+        every = {app.state["runId"] for app in (writing, compiling, convention, critic, author, queued, approval)}
+        self.assertEqual(ids("claude"), {app.state["runId"] for app in (critic, queued, approval)})
+        self.assertEqual((jobs["claude"]["count"], jobs["claude"]["signIn"], jobs["claude"]["running"]), (3, 3, 0))
+        self.assertEqual(ids("codex"), every)  # Every writer is GPT 6.1 Sol.
+        self.assertEqual(jobs["codex"]["running"], 2)
+        self.assertEqual(ids("latex"), every)
+        # A job without Writing & polishing needs no LaTeX at any step; one at the review needs every stage's program.
+        for app in (writing, compiling, convention, critic, author, queued, approval):
+            with self.http.jobs_lock:
+                del self.http.jobs[app.state["runId"]]
+        self.app("running", activeNode="critic", stage="critic",
+                 stages={"review": False, "author": True, "critic": True, "writing": False})
+        self.app("reviewing", activeNode="statement_reviewer", stage="review", reviewModel=claude, criticModel=gpt)
+        jobs = self.status("cached=1")["jobs"]
+        self.assertEqual((jobs["claude"]["count"], jobs["codex"]["count"], jobs["latex"]["count"]), (2, 2, 1))
 
     def test_saved_default_settings_are_what_new_problems_need(self):
         from ui import presets

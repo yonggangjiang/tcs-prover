@@ -27,7 +27,7 @@ ui/
   review.py                 Independent statement review
   batches.py                Saved run folders shown as read-only batches
   named_batches.py          Batches made with New batch (runs/.controller/batches.json)
-  presets.py                Saved New problem settings (Save… and Load…)
+  presets.py                Saved New problem settings (Advanced settings → Saved settings)
   program_setup.py          The Setup page: program checks, installs, updates and sign-ins
   related_works.py          Related works given to the proof author
   retrieval.py              Web search cutoff setup for the page
@@ -258,8 +258,22 @@ younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's
 background read, never starts a process: it returns the last check of any age,
 and programs in state `checking` before the first) and lists, per
 program, its state, its actions with the exact command each dialog shows, and
-the commands to copy, with the New problem roles, the jobs that can still run
-and the API connections that need it. `POST /setup/action` takes a program, an
+the commands to copy, with the default settings' roles (`defaults.source` is
+`saved` or `built-in`), the jobs that can still run and use it in their current
+or a later step (`Server._setup_stages_ahead`, which also decides the running
+jobs that hold an Update or a sign-in), and, for information only, the API
+connections of its format. The page adds the New problem form's selected roles
+while the form is open (app.js `setupNeeds`), and gives a warning (the sidebar
+count, the Overview notice, a red or amber mark) only to a program that the
+form, the saved default settings or such a job needs; the built-in settings and
+an API connection alone never make a program needed, and any other program is
+shown calmly (`tone-idle`). The one exception (`setupProblems`, kind `none`) is
+a computer with neither the Codex CLI nor Claude Code installed: one line says
+so, counted and on the Overview and at the top of Setup, until a program has a
+line of its own. Install offers its sign-in when that login will be used,
+including by the built-in settings while nothing is saved and the form is
+closed (`setupBuiltInSignIn`), and on a computer with neither program yet.
+`POST /setup/action` takes a program, an
 action and an option from fixed sets plus the command the dialog showed (a
 command that changed is refused with 409 and the new status; a program that
 changed since its last check in a way seen without starting anything, such as

@@ -48,7 +48,9 @@
           <p class="nav-label" id="navConfigureLabel">Configure</p>
           <ul class="nav-list" aria-labelledby="navConfigureLabel">
             <!-- Setup: the programs the models run through. The badge counts the programs that need setting up for
-                 what new problems and jobs use (app.js renderSetupBadge); the hidden words read it out. -->
+                 what new problems, the saved default settings and jobs use (app.js renderSetupBadge); a program nothing
+                 uses never counts, except for the one line that says neither the Codex CLI nor Claude Code is
+                 installed. The hidden words read it out. -->
             <li><a class="nav-item" href="/?setup=1" data-nav="setup" data-tip="Setup" data-tip-meta="Programs your models run through"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v7M5 6.75 8 9.75l3-3"/><path d="M2.75 10v2a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg><span class="nav-text">Setup</span><span id="navSetupBadge" class="nav-badge nav-badge-setup" aria-hidden="true" hidden></span><span id="navSetupWords" class="visually-hidden"></span></a></li>
             <li><a class="nav-item" href="/?new=1#models" data-nav="models" data-tip="Models &amp; API" data-tip-meta="Role models and your API endpoints"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/><rect x="6.5" y="6.5" width="3" height="3" rx=".5"/><path d="M6 1.75V4M10 1.75V4M6 12v2.25M10 12v2.25M1.75 6H4M1.75 10H4M12 6h2.25M12 10h2.25"/></svg><span class="nav-text">Models &amp; API</span></a></li>
             <li><button class="nav-item" type="button" data-nav="prompts" aria-haspopup="dialog" data-tip="Prompts" data-tip-meta="Role prompts for the next problem"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.5 10a1.5 1.5 0 0 1-1.5 1.5H5.25L2.5 14V3.5A1.5 1.5 0 0 1 4 2h8a1.5 1.5 0 0 1 1.5 1.5Z"/><path d="M5.5 5.5h5M5.5 8h3.25"/></svg><span class="nav-text">Prompts</span></button></li>
@@ -137,8 +139,9 @@
               <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
             </div>
           </div>
-          <!-- Programs that new problems or jobs need and that are missing, do not run or are not signed in, each with
-               a link to Setup (app.js renderSetupBanner from GET /setup). -->
+          <!-- Programs that new problems, the saved default settings or jobs need and that are missing, do not run or
+               are not signed in, or the one line that says neither the Codex CLI nor Claude Code is installed, each
+               with a link to Setup (app.js renderSetupBanner from GET /setup). -->
           <section id="setupBanner" class="attention-banner setup-banner" aria-labelledby="setupBannerHeading" hidden>
             <h2 id="setupBannerHeading" class="attention-heading">Setup</h2>
             <ul id="setupBannerList" class="attention-list"></ul>
@@ -198,22 +201,6 @@
             </div>
           </div>
           <div class="composer card">
-            <!-- Saved settings: which settings this form started from (a saved name, Built-in, or the job's
-                 own), "· changed" after an edit, and Load… and Save… (app.js; GET and POST /presets). The
-                 note under it says what a load could not keep, or why settings cannot be saved. -->
-            <div id="presetBar" class="preset-bar" role="group" aria-labelledby="presetBarLabel">
-              <p class="preset-bar-text">
-                <span id="presetBarLabel" class="preset-bar-label">Settings</span>
-                <span id="presetName" class="preset-name">Built-in</span><span id="presetMarks" class="preset-marks"></span>
-              </p>
-              <div class="preset-bar-actions">
-                <button id="loadPresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Load…</button>
-                <button id="savePresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Save…</button>
-              </div>
-            </div>
-            <!-- A live region: always rendered, it takes no room while empty (styles.css), so a screen reader
-                 hears its first message. -->
-            <p id="presetNote" class="preset-note" role="status"></p>
             <div id="statementFields" class="field">
               <label id="problemLabel" for="problem">Problem statement</label>
               <textarea id="problem" rows="8" required
@@ -241,33 +228,58 @@
               </div>
               <p id="workflowStageHelp" class="help">Click any stage to turn it on or off. Selected stages run from left to right.</p>
             </fieldset>
-            <!-- Related works for the proof author: each file uploads as soon as it is added (a note is
-                 staged the same way); Start workflow and Run a folder send what is listed here. -->
-            <div id="relatedWorksField" class="field related-works-field" role="group"
-              aria-labelledby="relatedWorksLabel" aria-describedby="relatedWorksHelp">
-              <label id="relatedWorksLabel" for="composerRelatedFiles">Related works <span>(optional)</span></label>
-              <ul id="composerRelatedList" class="related-works-list" aria-label="Related works to send" hidden></ul>
-              <div class="related-works-actions">
-                <button id="composerAddFilesButton" class="secondary compact" type="button">Add files…</button>
-                <button id="composerAddNoteButton" class="ghost compact" type="button" aria-expanded="false"
-                  aria-controls="composerNoteForm">Add a note</button>
-              </div>
-              <div id="composerNoteForm" class="related-note-form" hidden>
-                <label for="composerNoteTitle">Note title <span>(optional)</span></label>
-                <input id="composerNoteTitle" type="text" maxlength="200" autocomplete="off">
-                <label for="composerNoteText">Note</label>
-                <textarea id="composerNoteText" rows="4"></textarea>
-                <div class="related-note-actions">
-                  <button id="composerSaveNoteButton" class="secondary compact" type="button">Add note</button>
-                  <button id="composerCancelNoteButton" class="ghost compact" type="button">Cancel</button>
-                </div>
-              </div>
-              <p id="relatedWorksHelp" class="help"></p>
-              <input id="composerRelatedFiles" type="file" multiple hidden>
-            </div>
-            <details class="advanced">
-              <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>Advanced settings</summary>
+            <!-- Advanced settings: Saved settings first, then the related works, then the settings themselves. Its
+                 summary stays in view while it is closed: it names the saved settings that filled the form and
+                 counts the related works listed for this problem (app.js renderAdvancedSummary). -->
+            <details id="advancedSettings" class="advanced">
+              <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg><span class="advanced-title">Advanced settings</span><span id="advancedSummary" class="advanced-summary"><span class="visually-hidden">, </span><span class="advanced-chip" data-tone="quiet">Saved settings: built-in</span></span></summary>
               <div class="advanced-body">
+                <!-- Saved settings: what they are, which settings fill this form (a saved name, the built-in settings,
+                     or the job's own) with "(default)" and "· changed on this form" after an edit, and the buttons
+                     that save and load them (app.js; GET and POST /presets). The note at its foot says what a save or
+                     a load did, what a load could not keep, or why settings cannot be saved. -->
+                <div id="presetBar" class="preset-panel" role="group" aria-labelledby="presetBarLabel"
+                  aria-describedby="presetHelp">
+                  <h3 id="presetBarLabel" class="preset-panel-title">Saved settings</h3>
+                  <p id="presetHelp" class="preset-panel-help">Save the workflow stages, models, limits and web search
+                    cutoff under a name to reuse them, and choose which saved settings new problems open with.</p>
+                  <div class="preset-panel-row">
+                    <p class="preset-state"><span class="preset-state-label">Now using:</span>
+                      <span id="presetName" class="preset-name">built-in settings</span><span id="presetMarks" class="preset-marks"></span></p>
+                    <div class="preset-panel-actions">
+                      <button id="savePresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Save these settings…</button>
+                      <button id="loadPresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Load saved settings…</button>
+                    </div>
+                  </div>
+                  <!-- A live region: always rendered, it takes no room while empty (styles.css), so a screen reader
+                       hears its first message. -->
+                  <p id="presetNote" class="preset-note" role="status"></p>
+                </div>
+                <!-- Related works for the proof author: each file uploads as soon as it is added (a note is
+                     staged the same way); Start workflow and Run a folder send what is listed here. Titled by a
+                     heading, not a label: only Add files… opens the file chooser (app.js clears it first). -->
+                <div id="relatedWorksField" class="settings-group related-works-field" role="group"
+                  aria-labelledby="relatedWorksLabel" aria-describedby="relatedWorksHelp">
+                  <h3 id="relatedWorksLabel">Related works <span>(optional)</span></h3>
+                  <p id="relatedWorksHelp" class="help"></p>
+                  <ul id="composerRelatedList" class="related-works-list" aria-label="Related works to send" hidden></ul>
+                  <div class="related-works-actions">
+                    <button id="composerAddFilesButton" class="secondary compact" type="button">Add files…</button>
+                    <button id="composerAddNoteButton" class="ghost compact" type="button" aria-expanded="false"
+                      aria-controls="composerNoteForm">Add a note</button>
+                  </div>
+                  <div id="composerNoteForm" class="related-note-form" hidden>
+                    <label for="composerNoteTitle">Note title <span>(optional)</span></label>
+                    <input id="composerNoteTitle" type="text" maxlength="200" autocomplete="off">
+                    <label for="composerNoteText">Note</label>
+                    <textarea id="composerNoteText" rows="4"></textarea>
+                    <div class="related-note-actions">
+                      <button id="composerSaveNoteButton" class="secondary compact" type="button">Add note</button>
+                      <button id="composerCancelNoteButton" class="ghost compact" type="button">Cancel</button>
+                    </div>
+                  </div>
+                  <input id="composerRelatedFiles" type="file" multiple hidden aria-label="Related works to add">
+                </div>
                 <fieldset class="settings-group models-group">
                   <legend>Models and reasoning</legend>
                   <div class="model-grid">
@@ -614,7 +626,8 @@
             you choose, using the selected stages and settings above. Any file extension
             is accepted. Hidden files and subfolders are ignored; empty, binary and oversized
             (over 8 MB) files are skipped and listed. Jobs beyond the running-jobs limit wait
-            in a queue. Related works listed above are shared by every job of the folder run.
+            in a queue. Related works listed under Advanced settings are shared by every job of the
+            folder run.
           </p>
           <input id="folderInput" type="file" webkitdirectory multiple hidden
             aria-label="Folder of statement files (any extension or none)">
@@ -695,6 +708,7 @@
             </div>
           </div>
           <p id="setupNotice" class="notice setup-notice" role="alert" hidden></p>
+          <p id="setupFirst" class="setup-hint setup-first" role="status" hidden></p>
           <div id="setupList" class="setup-cards" role="list" aria-label="Programs"></div>
           <div id="setupTasks" class="setup-task-slot"></div>
           <div class="help setup-foot">
@@ -1022,8 +1036,6 @@
       </form>
     </dialog>
 
-    <!-- Save the New problem form's settings under a name (app.js; POST /presets). The name may stay
-         empty: its placeholder is the name it then gets. Set as default is ticked whenever it opens. -->
     <!-- Setup: one confirmation per step, showing the exact command (app.js openSetupDialog). The page sends that
          command back; a command that changed meanwhile is refused and the dialog shows the new one. -->
     <dialog id="setupDialog" class="prompt-dialog setup-dialog" aria-labelledby="setupDialogTitle">
@@ -1054,12 +1066,15 @@
       </form>
     </dialog>
 
+    <!-- Save these settings… (Advanced settings → Saved settings): the New problem form's settings under a name
+         (app.js; POST /presets). The name may stay empty: its placeholder is the name it then gets. Set as default
+         is ticked whenever it opens. -->
     <dialog id="presetSaveDialog" class="prompt-dialog preset-dialog" aria-labelledby="presetSaveTitle">
       <form id="presetSaveForm" method="dialog">
         <div class="prompt-dialog-head">
           <div>
             <p class="eyebrow">New problem</p>
-            <h2 id="presetSaveTitle">Save settings</h2>
+            <h2 id="presetSaveTitle">Save these settings</h2>
           </div>
         </div>
         <div class="preset-save-field">
@@ -1084,14 +1099,15 @@
       </form>
     </dialog>
 
-    <!-- Load saved New problem settings; rename, delete, or make or stop being the default (app.js; GET and
-         POST /presets). The list is read again whenever it opens; Built-in settings come last. -->
+    <!-- Load saved settings… (Advanced settings → Saved settings): load saved New problem settings; rename, delete,
+         or make or stop being the default (app.js; GET and POST /presets). The list is read again whenever it opens;
+         Built-in settings come last. -->
     <dialog id="presetLoadDialog" class="prompt-dialog preset-dialog preset-load-dialog" aria-labelledby="presetLoadTitle">
       <div class="preset-dialog-body">
         <div class="prompt-dialog-head">
           <div>
             <p class="eyebrow">New problem</p>
-            <h2 id="presetLoadTitle">Load settings</h2>
+            <h2 id="presetLoadTitle">Load saved settings</h2>
           </div>
           <button id="closePresetLoadButton" class="ghost compact" type="button">Close</button>
         </div>

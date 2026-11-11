@@ -1,4 +1,6 @@
-"""The saved-settings bar of the New problem form and its Save and Load dialogs (ui/app.js).
+"""The Saved settings panel of the New problem form (the first panel of Advanced settings), its Save and Load
+dialogs, and the summary of Advanced settings that names the saved settings and counts the related works while
+the section is closed (ui/app.js).
 
 The browser checks cut ui/app.js into slices by marker text and run them in Node's vm with the
 small fake DOM of test_provider_ui, through the real render(). Requests go to a fake fetch that
@@ -8,6 +10,7 @@ Nothing reaches a server, a CLI or a model.
 
 import json
 import os
+from html.parser import HTMLParser
 from pathlib import Path
 import re
 import shutil
@@ -36,12 +39,15 @@ SLICES = [
     ["function render(next)", "async function refresh()"],
     ["function proofJobSettings()", "// An empty or malformed number field"],
     ["async function apiModelRequest(", "async function loadApiModels()"],
-    ["// Saved settings: the bar at the top of the New problem card", "// Reduced motion: two page calls"],
+    ["// Saved settings: the first panel of Advanced settings on the New problem card",
+     "// Reduced motion: two page calls"],
 ]
 # Names that lower case and casefold() tell apart: the page and the server must agree on each.
 NAMES = ["Straße", "STRASSE", "STRAẞE", "İstanbul", "ΟΔΟΣ ΟΔΟΣ", "ǅemal", "ﬁle", "\u212a", "\u2126",
          "MAX"]
 REFRESH = ["async function refresh()", "function checkEdited("]
+# The related works listed for the next problem (the summary of Advanced settings counts them).
+RELATED = ["function composerRelatedWorks()", "// Read files directly"]
 
 # The page as index.html has it, as far as these slices read it, plus a server that keeps saved
 # settings the way ui/presets.py does (fixture.listing is its answer when the page opens).
@@ -103,13 +109,23 @@ const escape = (dialog) => {
   if (!event.defaultPrevented) dialog.close();
   return event;
 };
-// The New problem card: the bar first, then the controls whose edits it follows.
+// The New problem card as index.html has it: the statement and the stages, then Advanced settings (closed), whose
+// summary holds the chips and whose first panel is Saved settings (its note at its foot), then the controls
+// whose edits the panel follows.
 const card = Object.assign(new Element("div"), { className: "composer" });
 elements.input = new Element("section");
 elements.input.append(card);
-ui.presetBar.append(ui.presetName, ui.presetMarks, ui.loadPresetButton, ui.savePresetButton);
-card.append(ui.presetBar, ui.presetNote, ui.problem, ui.workflowReview, ui.workflowAuthor, ui.workflowCritic,
-  ui.workflowWriting, ui.criticCount, ui.thinkingHours, ui.retrievalMode, ui.retrievalCutoffUtc);
+elements.advancedSettings = Object.assign(new Element("details"), { className: "advanced", open: false });
+const summary = new Element("summary");
+summary.append(ui.advancedSummary);
+ui.presetBar.append(ui.presetName, ui.presetMarks, ui.savePresetButton, ui.loadPresetButton, ui.presetNote);
+ui.advancedSettings.append(summary, ui.presetBar, ui.criticCount, ui.thinkingHours, ui.retrievalMode,
+  ui.retrievalCutoffUtc);
+card.append(ui.problem, ui.workflowReview, ui.workflowAuthor, ui.workflowCritic, ui.workflowWriting,
+  ui.advancedSettings);
+// The summary of Advanced settings: each chip's words and tone.
+const chips = () => ui.advancedSummary.children.filter((node) => node.className === "advanced-chip")
+  .map((chip) => [chip.textContent, chip.dataset.tone]);
 
 let state = { trace: [], traceVersion: 0, workflow: { nodes: {}, edges: [] } };
 let previousPhase = "", currentJob = "", currentBatch = "", composingProblem = true, composerSeed = null;
@@ -142,6 +158,8 @@ const fetch = async (path, options = {}) => {
   for (let index = 0; index < server.delays; index += 1) await tick();
   const answer = (status, data) => ({ status, ok: status < 400, json: async () => copy(data) });
   if (server.status === 404) return answer(404, { error: "Not found." });
+  // A server that fails (a full disk, say): every request is refused with its reason.
+  if (server.status >= 500) return answer(server.status, { error: "The server could not read its files." });
   if (path === "/api-models" && !body) return answer(200, server.apiModels);
   if (path === "/presets" && body && server.refuse) return answer(400, { error: server.refuse });
   const listing = server.listing;
@@ -160,7 +178,8 @@ const fetch = async (path, options = {}) => {
     return answer(200, { savedId: preset.id, ...listing });
   }
   if (body.id && !find(body.id)) {
-    return answer(400, { error: "Those saved settings no longer exist. Open Load… again to see the current list." });
+    return answer(400, { error: "Those saved settings no longer exist. Open Load saved settings… again to see the "
+      + "current list." });
   }
   if (path === "/presets/rename") find(body.id).name = body.name;
   else if (path === "/presets/default") listing.defaultId = body.id;
@@ -263,11 +282,11 @@ class PresetBrowserTests(unittest.TestCase):
 
     def test_a_fresh_form_opens_with_the_default_and_save_sends_only_its_settings(self):
         self.run_form(r"""
-assert.equal(ui.presetName.textContent, "Built-in");
+assert.equal(ui.presetName.textContent, "built-in settings");
 await openFresh();
 assert.deepEqual(requests.map((item) => [item.method, item.path, item.token]), [["GET", "/presets", "page-token"]]);
 assert.equal(ui.presetName.textContent, "Careful proof");
-assert.equal(ui.presetMarks.textContent, " · default");
+assert.equal(ui.presetMarks.textContent, " (default)");
 assert.equal(note(), "");
 assert.deepEqual([ui.criticModel.value, ui.criticEffort.value, ui.criticSource.value], ["claude-opus-5-5", "high", "claude"]);
 assert.deepEqual([ui.criticCount.value, ui.criticRounds.value, ui.thinkingHours.value, ui.authorSubagents.value].map(String),
@@ -300,7 +319,7 @@ assert.deepEqual([sent.body.settings.criticModel, sent.body.settings.criticCount
 assert.equal(JSON.stringify(sent.body).includes("Edited"), false, "prompts are never saved");
 assert.equal(ui.presetSaveDialog.open, false);
 assert.equal(ui.presetName.textContent, "Mine");
-assert.equal(ui.presetMarks.textContent, " · default");
+assert.equal(ui.presetMarks.textContent, " (default)");
 assert.equal(note(), "Saved as “Mine”. New problems open with these settings.");
 assert.equal(ui.presetNote.dataset.tone, "info");
 
@@ -318,13 +337,13 @@ assert.equal(ui.presetMarks.textContent, "");
         self.run_form(r"""
 await openFresh();
 edit(ui.criticCount, "4");
-assert.equal(ui.presetMarks.textContent, " · default · changed");
+assert.equal(ui.presetMarks.textContent, " (default) · changed on this form");
 assert.equal(ui.presetBar.dataset.changed, "true");
 edit(ui.criticCount, "5");
-assert.equal(ui.presetMarks.textContent, " · default", "back to the saved values");
+assert.equal(ui.presetMarks.textContent, " (default)", "back to the saved values");
 // The statement and other fields are not settings.
 edit(ui.problem, "Prove that every planar graph is 4-colourable.");
-assert.equal(ui.presetMarks.textContent, " · default");
+assert.equal(ui.presetMarks.textContent, " (default)");
 for (const [control, value] of [[ui.workflowWriting, false], [ui.thinkingHours, "2"], [ui.retrievalMode, "historical"],
   [ui.authorSubagents, "3"], [ui.speedMode, "fast"], [ui.reasoningSummary, "none"], [ui.writerEffort, "low"],
   [ui.authorModel, "gpt-6-luna"], [ui.criticRounds, "4"], [ui.reviewEffort, "low"], [ui.authorEffort, "low"],
@@ -334,15 +353,15 @@ for (const [control, value] of [[ui.workflowWriting, false], [ui.thinkingHours, 
   assert.notEqual(shown(), value, "a value the default does not have");
   edit(control, value);
   assert.equal(shown(), value, "a value the control offers");
-  assert.equal(ui.presetMarks.textContent, " · default · changed", String(value));
+  assert.equal(ui.presetMarks.textContent, " (default) · changed on this form", String(value));
 }
 // A confirmation gives way to the next edit; a save and a load clear the mark.
 clickSave();
 await submitSave();
-assert.equal(ui.presetMarks.textContent, " · default", "saved, and the default (ticked)");
+assert.equal(ui.presetMarks.textContent, " (default)", "saved, and the default (ticked)");
 assert.match(note(), /^Saved as /);
 edit(ui.criticCount, "6");
-assert.equal(ui.presetMarks.textContent, " · default · changed");
+assert.equal(ui.presetMarks.textContent, " (default) · changed on this form");
 assert.equal(note(), "");
 await clickLoad();
 await click(button("Careful proof", "Load"));
@@ -354,7 +373,7 @@ await clickLoad();
 await click(button("Historical cutoff", "Load"));
 assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Historical cutoff", ""]);
 edit(ui.retrievalCutoffUtc, "2026-02-01T00:00:00Z");
-assert.equal(ui.presetMarks.textContent, " · changed");
+assert.equal(ui.presetMarks.textContent, " · changed on this form");
 edit(ui.retrievalCutoffUtc, fixture.cutoff);
 assert.equal(ui.presetMarks.textContent, "");
 """)
@@ -517,13 +536,13 @@ assert.deepEqual(posts().at(-1), { path: "/presets/delete", method: "POST", body
 assert.equal(ui.presetLoadStatus.textContent, "Deleted “Careful proof”.");
 assert.ok(!rowNames().includes("Careful proof"));
 assert.equal(ui.presetName.textContent, "Careful proof");
-assert.equal(ui.presetMarks.textContent, " · deleted");
+assert.equal(ui.presetMarks.textContent, " (deleted)");
 await click(button("Broken", "Delete"));
 assert.deepEqual(posts().at(-1).body, { id: "invalid-5-0123456789ab" });
 
 // Built-in settings load TCS Prover's own settings.
 await click(button("Built-in settings", "Load"));
-assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["Built-in", "", "Loaded “Built-in settings”."]);
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["built-in settings", "", "Loaded “Built-in settings”."]);
 assert.deepEqual([ui.criticModel.value, String(ui.criticCount.value), String(ui.criticRounds.value), String(ui.thinkingHours.value)],
   ["gpt-6.1-sol", "3", "2", "0"]);
 assert.deepEqual(selectedWorkflowStages(), { review: true, author: true, critic: true, writing: true });
@@ -537,7 +556,7 @@ renaming.value = "Elsewhere";
 enter(renaming);
 for (let i = 0; i < 6; i += 1) await tick();
 assert.equal(ui.presetLoadStatus.textContent,
-  "Those saved settings no longer exist. Open Load… again to see the current list.");
+  "Those saved settings no longer exist. Open Load saved settings… again to see the current list.");
 assert.ok(!rowNames().includes("Lab key author"));
 assert.equal(ui.presetList.querySelector("input[data-preset-rename]"), null);
 """)
@@ -556,14 +575,75 @@ enter(field);
 for (let i = 0; i < 4; i += 1) await tick();
 assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Quick look", ""]);
 await click(button("Quick look", "Delete"));
-assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Quick look", " · deleted"]);
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Quick look", " (deleted)"]);
 // Renamed in another tab: the next read of the list gives the bar the new name.
 await clickLoad();
 await click(button("Careful proof", "Load"));
 server.listing.presets.find((item) => item.name === "Careful proof").name = "Careful proof, renamed";
 await loadPresets();
-assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Careful proof, renamed", " · default"]);
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent], ["Careful proof, renamed", " (default)"]);
 """)
+
+    def test_a_change_of_the_default_has_the_setup_page_read_it_at_once(self):
+        # The Setup page counts the default saved settings, also beside this form (app.js setupNeeds). A change that
+        # may change them has it read them again at once (loadSetup("poll"): the server's last check, no program
+        # starts); a rename, another preset's delete or save, and a refused change do not.
+        self.run_app(r"""
+await openFresh();
+await clickLoad();
+await click(button("Quick check", "Rename"));
+const field = ui.presetList.querySelector("input[data-preset-rename]");
+field.value = "Quick look";
+enter(field);
+for (let i = 0; i < 4; i += 1) await tick();
+assert.equal(ui.presetLoadStatus.textContent, "Renamed to “Quick look”.");
+assert.deepEqual(setupReads, []);
+// Make default, Remove default, and the built-in settings as the default.
+await click(button("Quick look", "Make default"));
+assert.deepEqual(setupReads, ["poll"]);
+await click(button("Quick look", "Remove default"));
+assert.equal(server.listing.defaultId, "");
+assert.deepEqual(setupReads, ["poll", "poll"]);
+await click(button("Careful proof", "Make default"));
+await click(button("Built-in settings", "Make default"));
+assert.equal(setupReads.length, 4);
+// Deleting other saved settings changes nothing there; deleting the default does.
+await click(button("Careful proof", "Make default"));
+await click(button("Quick look", "Delete"));
+assert.equal(ui.presetLoadStatus.textContent, "Deleted “Quick look”.");
+assert.equal(setupReads.length, 5);
+await click(button("Careful proof", "Delete"));
+assert.equal(server.listing.defaultId, "");
+assert.equal(setupReads.length, 6);
+// A refused change.
+server.listing.presets = server.listing.presets.filter((item) => item.name !== "Lab key author");
+await click(button("Lab key author", "Make default"));
+assert.match(ui.presetLoadStatus.textContent, /no longer exist/);
+assert.equal(setupReads.length, 6);
+ui.presetLoadDialog.close();
+// Save…: with Set as default, then without it under a new name, then without it over the default.
+const save = async (name, makeDefault) => {
+  clickSave();
+  await tick();
+  ui.presetSaveName.value = name;
+  ui.presetSaveDefault.checked = makeDefault;
+  await submitSave();
+};
+await save("Mine", true);
+assert.equal(server.listing.defaultId, server.listing.presets.find((item) => item.name === "Mine").id);
+assert.equal(setupReads.length, 7);
+await save("Other", false);
+assert.equal(setupReads.length, 7);
+await save("Mine", false);
+assert.equal(confirms.at(-1), "Replace the saved settings “Mine”?");
+assert.equal(setupReads.length, 8);
+server.refuse = "The settings file cannot be written.";
+await save("Third", true);
+assert.equal(ui.presetSaveError.textContent, "The settings file cannot be written.");
+assert.equal(setupReads.length, 8);
+assert.deepEqual([...new Set(setupReads)], ["poll"]);
+""", extra_setup="const refresh = () => {};\nconst setupReads = [];\n"
+                        "const loadSetup = (kind) => { setupReads.push(kind); };\n")
 
     def test_the_list_takes_no_action_until_it_is_read_again(self):
         self.run_form(r"""
@@ -589,11 +669,11 @@ assert.equal(document.activeElement, ui.presetList.querySelector("input[data-pre
 server.listing.presets = [];
 server.listing.defaultId = "";
 await openFresh();
-assert.equal(ui.presetName.textContent, "Built-in");
+assert.equal(ui.presetName.textContent, "built-in settings");
 await clickLoad();
 assert.deepEqual(rowNames(), ["Built-in settings"]);
 assert.equal(ui.presetList.querySelector(".preset-empty").textContent,
-  "No saved settings yet. Choose Save… on the form to keep its settings under a name.");
+  "No saved settings yet. Choose Save these settings… to keep this form's settings under a name.");
 assert.deepEqual(actions("Built-in settings"), ["Load", "", "", ""]);
 """)
 
@@ -606,15 +686,15 @@ composerSeed = { statement: "Suggested statement", settings: { runId: "job-0", c
 previousPhase = "";
 render(fresh());
 assert.deepEqual([ui.problem.value, ui.criticModel.value, String(ui.criticCount.value)], ["Suggested statement", "gpt-6-sol", "7"]);
-assert.equal(ui.presetName.textContent, "From the job");
+assert.equal(ui.presetName.textContent, "the job's settings");
 // A job sent back to the form keeps its own settings.
 currentJob = "job-1";
 previousPhase = "";
 render({ ...fresh(), runId: "job-1", originalContent: "Saved statement", criticCount: 6, criticModel: "gpt-6-astra" });
 assert.deepEqual([ui.problem.value, String(ui.criticCount.value), ui.criticModel.value], ["Saved statement", "6", "gpt-6-astra"]);
-assert.equal(ui.presetName.textContent, "From the job");
+assert.equal(ui.presetName.textContent, "the job's settings");
 edit(ui.criticCount, "9");
-assert.equal(ui.presetMarks.textContent, " · changed");
+assert.equal(ui.presetMarks.textContent, " · changed on this form");
 // A fresh form takes the default; a later render of the same form (a poll, or a return from Models &
 // API) keeps what was edited.
 currentJob = "";
@@ -624,7 +704,7 @@ assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value)], ["Ca
 edit(ui.criticCount, "8");
 render(fresh());
 assert.equal(String(ui.criticCount.value), "8");
-assert.equal(ui.presetMarks.textContent, " · default · changed");
+assert.equal(ui.presetMarks.textContent, " (default) · changed on this form");
 """)
 
     def test_a_new_problem_page_reads_the_list_before_drawing_the_form(self):
@@ -684,7 +764,7 @@ const request = async (path) => {
         self.run_form(r"""
 server.status = 404;
 await openFresh();
-assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value), ui.criticModel.value], ["Built-in", "3", "gpt-6.1-sol"]);
+assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value), ui.criticModel.value], ["built-in settings", "3", "gpt-6.1-sol"]);
 assert.equal(note(), "This TCS Prover server cannot save settings. Restart TCS Prover to update it.");
 assert.equal(ui.presetNote.dataset.tone, "warning");
 assert.deepEqual([ui.loadPresetButton.disabled, ui.savePresetButton.disabled], [true, true]);
@@ -699,7 +779,7 @@ assert.equal(requests.length, 1);
 server.listing = { ...server.listing, presets: [], defaultId: "", problem: "The saved settings file is damaged; fix "
   + "or remove it. Until then new problems open with the built-in settings, and settings cannot be saved." };
 await openFresh();
-assert.equal(ui.presetName.textContent, "Built-in");
+assert.equal(ui.presetName.textContent, "built-in settings");
 assert.match(note(), /is damaged; fix or remove it/);
 assert.deepEqual([ui.loadPresetButton.disabled, ui.savePresetButton.disabled], [false, true]);
 await clickLoad();
@@ -836,11 +916,11 @@ server.status = 404;
 await openFresh();
 assert.deepEqual([ui.loadPresetButton.disabled, ui.savePresetButton.disabled], [true, true]);
 assert.equal(note(), "This TCS Prover server cannot save settings. Restart TCS Prover to update it.");
-assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value)], ["Built-in", "3"]);
+assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value)], ["built-in settings", "3"]);
 // Restarted with the update (the tab keeps its token): the next fresh form takes the default, and both work.
 server.status = 200;
 await openFresh();
-assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["Careful proof", " · default", ""]);
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["Careful proof", " (default)", ""]);
 assert.equal(String(ui.criticCount.value), "5");
 assert.deepEqual([ui.loadPresetButton.disabled, ui.savePresetButton.disabled], [false, false]);
 await clickLoad();
@@ -889,13 +969,13 @@ assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, ui.auth
 // back to the default model; the bar says the settings are no longer those loaded.
 adoptApiModels(withoutApi(fixture.apiModels));
 assert.equal(ui.authorModel.value, "gpt-6.1-sol");
-assert.equal(ui.presetMarks.textContent, " · changed");
+assert.equal(ui.presetMarks.textContent, " · changed on this form");
 // Menus that leave the form as it is change nothing.
 await clickLoad();
 await click(button("Careful proof", "Load"));
-assert.equal(ui.presetMarks.textContent, " · default");
+assert.equal(ui.presetMarks.textContent, " (default)");
 adoptApiModels(withoutApi(fixture.apiModels));
-assert.equal(ui.presetMarks.textContent, " · default");
+assert.equal(ui.presetMarks.textContent, " (default)");
 """)
 
     def test_names_in_use_follow_the_same_rule_as_the_server(self):
@@ -1027,7 +1107,7 @@ await submitSave();
 assert.equal(ui.presetSaveDialog.open, true);
 assert.deepEqual([ui.presetSaveError.hidden, ui.presetSaveError.textContent],
   [false, "Cannot save the settings (No space left on device)."]);
-assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["Careful proof", " · default", ""]);
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, note()], ["Careful proof", " (default)", ""]);
 assert.deepEqual([requests.at(-1).method, requests.at(-1).path], ["GET", "/presets"]);
 assert.equal(ui.confirmPresetSaveButton.disabled, false, "it can be tried again");
 // Tried again once the problem is gone: saved, the error gone with the dialog.
@@ -1048,7 +1128,182 @@ assert.equal(posts().length, 2);
 assert.equal(document.activeElement, field);
 """)
 
-    def test_the_note_under_the_bar_stays_rendered_while_empty(self):
+    def test_the_summary_of_advanced_settings_names_the_saved_settings_while_closed(self):
+        self.run_form(r"""
+// Before the list is read: the built-in settings, quietly, beside the list of what is inside.
+assert.deepEqual(chips(), [["Saved settings: built-in", "quiet"]]);
+const summary = ui.advancedSummary.parentElement;
+assert.equal(summary.dataset.marked, "false");
+// A fresh form with a default other than the built-in settings: named and marked while the section stays closed.
+await openFresh();
+assert.equal(ui.advancedSettings.open, false);
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"]]);
+assert.equal(summary.dataset.marked, "true");
+// An edit says so; back at the saved values, it does not.
+edit(ui.criticCount, "4");
+assert.deepEqual(chips(), [["Saved settings: Careful proof · changed", "accent"]]);
+edit(ui.criticCount, "5");
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"]]);
+// The built-in settings: quiet again, beside the list of what is inside.
+await clickLoad();
+await click(button("Built-in settings", "Load"));
+assert.deepEqual(chips(), [["Saved settings: built-in", "quiet"]]);
+assert.equal(summary.dataset.marked, "false");
+edit(ui.criticCount, "4");
+assert.deepEqual(chips(), [["Saved settings: built-in · changed", "quiet"]]);
+// A model that is gone: a warning that says so; the panel's note names the role and the model.
+await clickLoad();
+await click(button("Gateway critic", "Load"));
+assert.deepEqual(chips(), [["Saved settings: Gateway critic · model not available", "warning"]]);
+assert.equal(ui.presetNote.dataset.tone, "warning");
+server.listing.presets.find((item) => item.name === "Gateway critic").unavailable.push({ role: "author",
+  label: "Old gateway · Model D", text: "Author model not available: Old gateway · Model D" });
+await clickLoad();
+await click(button("Gateway critic", "Load"));
+assert.deepEqual(chips(), [["Saved settings: Gateway critic · 2 models not available", "warning"]]);
+// Loaded, then deleted: the name stays, marked deleted.
+await clickLoad();
+await click(button("Quick check", "Load"));
+assert.deepEqual(chips(), [["Saved settings: Quick check", "accent"]]);
+await clickLoad();
+await click(button("Quick check", "Delete"));
+assert.deepEqual(chips(), [["Saved settings: Quick check (deleted)", "accent"]]);
+// A rerun keeps the job's settings, which the summary names too.
+composerSeed = { statement: "Suggested statement", settings: { runId: "job-0", criticCount: 7 } };
+previousPhase = "";
+render(fresh());
+assert.deepEqual(chips(), [["Settings from the job", "accent"]]);
+edit(ui.criticCount, "8");
+assert.deepEqual(chips(), [["Settings from the job · changed", "accent"]]);
+assert.equal(ui.advancedSettings.open, false, "nothing opens the section by itself");
+""")
+
+    def test_the_summary_warns_when_saved_settings_cannot_be_read_or_used(self):
+        self.run_form(r"""
+// The server cannot read its files: a fresh form opens with the built-in settings, and the summary says the
+// saved ones are not available (the panel's note says why).
+server.status = 500;
+await openFresh();
+assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value)], ["built-in settings", "3"]);
+assert.equal(note(), "Saved settings cannot be read now: The server could not read its files.");
+assert.deepEqual(chips(), [["Saved settings: not available", "warning"]]);
+// Read again: the default fills the next fresh form.
+server.status = 200;
+await openFresh();
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"]]);
+// The list cannot be read again when Load saved settings… opens: the form keeps the default that filled it,
+// and the summary's warning says why after its name, as the panel's note does.
+const unreadable = "Saved settings cannot be read now: The server could not read its files.";
+server.status = 500;
+await clickLoad();
+assert.equal(ui.presetLoadStatus.textContent, unreadable);
+ui.presetLoadDialog.close();
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, String(ui.criticCount.value), note()],
+  ["Careful proof", " (default)", "5", unreadable]);
+assert.deepEqual(chips(), [["Saved settings: Careful proof · saved settings not available", "warning"]]);
+edit(ui.criticCount, "4");
+assert.deepEqual(chips(), [["Saved settings: Careful proof · saved settings not available · changed", "warning"]]);
+// The next fresh form: the list this page read before may be out of date, so it has the built-in settings,
+// as when the page could never read it.
+await openFresh();
+assert.deepEqual([ui.presetName.textContent, ui.presetMarks.textContent, String(ui.criticCount.value), note()],
+  ["built-in settings", "", "3", unreadable]);
+assert.deepEqual(chips(), [["Saved settings: not available", "warning"]]);
+// Read again, the default fills the next one; then Save these settings… reads the list and finds the file
+// damaged: the same warning after the name.
+server.status = 200;
+await openFresh();
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"]]);
+const listing = server.listing;
+server.listing = { ...listing, presets: [], defaultId: "", problem: "The saved settings file is damaged." };
+clickSave();
+for (let i = 0; i < 4; i += 1) await tick();
+ui.presetSaveDialog.close();
+assert.deepEqual([ui.presetName.textContent, String(ui.criticCount.value), note()],
+  ["Careful proof", "5", "The saved settings file is damaged."]);
+assert.deepEqual(chips(), [["Saved settings: Careful proof · saved settings not available", "warning"]]);
+// A rerun keeps the job's settings, on a server without saved settings too: the summary says both.
+server.listing = listing;
+server.status = 404;
+composerSeed = { statement: "Suggested statement", settings: { runId: "job-0", criticCount: 7 } };
+await openFresh();
+assert.equal(String(ui.criticCount.value), "7");
+assert.deepEqual(chips(), [["Settings from the job · saved settings not available", "warning"]]);
+// An older server, and a file that cannot be used, say the same.
+await openFresh();
+assert.deepEqual(chips(), [["Saved settings: not available", "warning"]]);
+server.status = 200;
+server.listing = { ...server.listing, presets: [], defaultId: "", problem: "The saved settings file is damaged." };
+await openFresh();
+assert.deepEqual(chips(), [["Saved settings: not available", "warning"]]);
+// Built-in settings still load: the summary then names them, as the panel does.
+await clickLoad();
+await click(button("Built-in settings", "Load"));
+assert.deepEqual(chips(), [["Saved settings: built-in", "quiet"]]);
+""")
+
+    def test_the_summary_counts_the_related_works(self):
+        self.run_app(r"""
+await openFresh();
+const list = composerRelatedWorks();
+const work = (name, status = "ready") => ({ kind: "file", name, status,
+  error: status === "failed" ? `${name} is empty.` : "",
+  ...(status === "ready" ? { upload: { token: `t-${name}`, kind: "file", name, sizeText: "1 KB" } } : {}) });
+list.items = [work("a.pdf")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"], ["1 related work", "accent"]]);
+list.items = [work("a.pdf"), work("Plan.md")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"], ["2 related works", "accent"]]);
+// The summary names the disclosure button: its chips are read as separate phrases, after the title.
+assert.deepEqual(ui.advancedSummary.children.map((node) => [node.className, node.textContent]),
+  [["visually-hidden", ", "], ["advanced-chip", "Saved settings: Careful proof"], ["visually-hidden", ", "],
+    ["advanced-chip", "2 related works"]]);
+// One still uploading, one that failed, and the Author stage that reads them turned off.
+list.items = [work("a.pdf", "uploading"), work("Plan.md")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips()[1], ["2 related works · uploading", "accent"]);
+list.items = [work("a.pdf", "failed"), work("Plan.md")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips()[1], ["2 related works · 1 failed to upload", "warning"]);
+list.items = [work("Plan.md")];
+edit(ui.workflowAuthor, false);
+renderComposerRelatedWorks();
+assert.deepEqual(chips(), [["Saved settings: Careful proof · changed", "accent"],
+  ["1 related work · Author stage off", "warning"]]);
+// The Author stage being off is a warning whatever else the chip says: its words say so too.
+list.items = [work("a.pdf", "uploading"), work("Plan.md")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips()[1], ["2 related works · uploading · Author stage off", "warning"]);
+list.items = [work("a.pdf", "failed"), work("Plan.md")];
+renderComposerRelatedWorks();
+assert.deepEqual(chips()[1], ["2 related works · 1 failed to upload · Author stage off", "warning"]);
+list.items = [work("Plan.md")];
+// With the built-in settings, a related work alone marks the summary.
+edit(ui.workflowAuthor, true);
+await clickLoad();
+await click(button("Built-in settings", "Load"));
+assert.deepEqual(chips(), [["Saved settings: built-in", "quiet"], ["1 related work", "accent"]]);
+assert.equal(ui.advancedSummary.parentElement.dataset.marked, "true");
+// None listed: the related works' chip is gone.
+list.items = [];
+renderComposerRelatedWorks();
+assert.deepEqual(chips(), [["Saved settings: built-in", "quiet"]]);
+assert.equal(ui.advancedSummary.parentElement.dataset.marked, "false");
+""", extra_slices=[RELATED], extra_setup="const refresh = () => {};\n")
+
+    def test_a_save_problem_opens_advanced_settings_at_its_field(self):
+        self.run_form(r"""
+await openFresh();
+assert.equal(ui.advancedSettings.open, false);
+edit(ui.criticCount, "11");
+clickSave();
+assert.equal(ui.presetSaveDialog.open, false);
+assert.deepEqual([ui.notice.textContent, document.activeElement, ui.advancedSettings.open],
+  ["Enter 1 to 10 independent critics.", ui.criticCount, true]);
+""")
+
+    def test_the_note_at_the_foot_of_the_panel_stays_rendered_while_empty(self):
         # A live region: a screen reader hears its first message only if it was there before.
         self.run_form(r"""
 await openFresh();
@@ -1061,24 +1316,94 @@ assert.deepEqual([ui.presetNote.hidden, ui.presetNote.textContent], [false, ""])
 """)
 
 
+class Ancestors(HTMLParser):
+    """The ids of each element's ancestors (outermost first), by id."""
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__()
+        self.parents, self._open = {}, []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if "id" in attrs:
+            self.parents[attrs["id"]] = [identity for _, identity in self._open if identity]
+        if tag not in self.VOID:
+            self._open.append((tag, attrs.get("id")))
+
+    def handle_endtag(self, tag):
+        while self._open:
+            if self._open.pop()[0] == tag:
+                break
+
+
 class PresetMarkupTests(unittest.TestCase):
-    def test_the_bar_and_the_dialogs(self):
+    def test_the_panel_opens_advanced_settings_before_the_related_works(self):
         parsed = page()
         markup = INDEX.read_text(encoding="utf-8")
+        tree = Ancestors()
+        tree.feed(markup)
         card = markup.index('<div class="composer card">')
         # The batch the problem joins comes first, under the New problem title ("Adding to batch …"), then the
-        # card, whose first thing is the bar: saved settings never name a batch.
+        # card, which opens with the statement: saved settings never name a batch.
         head = markup.index('<div class="page-head composer-head">')
         self.assertLess(head, markup.index('id="composerHeading"'))
         self.assertLess(markup.index('id="composerHeading"'), markup.index('id="composerBatch"'))
         self.assertLess(markup.index('id="composerBatch"'), card)
-        between = markup[card + len('<div class="composer card">'):markup.index('<div id="presetBar"')]
+        between = markup[card + len('<div class="composer card">'):markup.index('<div id="statementFields"')]
         self.assertEqual(re.sub(r"<!--.*?-->", "", between, flags=re.S).strip(), "")
-        # The bar is the first thing in the New problem card.
-        self.assertLess(card, markup.index('id="presetBar"'))
-        self.assertLess(markup.index('id="presetBar"'), markup.index('id="presetNote"'))
-        self.assertLess(markup.index('id="presetNote"'), markup.index('id="statementFields"'))
-        self.assertEqual(" ".join(parsed.texts["presetBar"].split()), "Settings Built-in Load… Save…")
+        # Advanced settings follow the stages. The Saved settings panel is the first thing inside them, then the
+        # related works, then the settings themselves; the panel's note is its own.
+        details = markup.index('<details id="advancedSettings" class="advanced">')
+        self.assertLess(markup.index('id="workflowStageHelp"'), details)
+        body = markup.index('<div class="advanced-body">', details)
+        first = markup[body + len('<div class="advanced-body">'):markup.index('<div id="presetBar"')]
+        self.assertEqual(re.sub(r"<!--.*?-->", "", first, flags=re.S).strip(), "")
+        places = [markup.index(f'id="{identity}"') for identity in (
+            "advancedSummary", "presetBar", "presetBarLabel", "presetHelp", "presetName", "presetMarks",
+            "savePresetButton", "loadPresetButton", "presetNote", "relatedWorksField", "reviewModelSetting")]
+        self.assertEqual(places, sorted(places))
+        for identity in ("presetBar", "relatedWorksField", "composerRelatedList", "composerAddFilesButton"):
+            with self.subTest(identity=identity):
+                self.assertIn("advancedSettings", tree.parents[identity])
+                self.assertIn("inputPanel", tree.parents[identity])
+        for identity in ("presetBarLabel", "presetHelp", "presetName", "presetMarks", "savePresetButton",
+                         "loadPresetButton", "presetNote"):
+            with self.subTest(identity=identity):
+                self.assertIn("presetBar", tree.parents[identity])
+        self.assertNotIn("presetBar", tree.parents["relatedWorksField"])
+        # The panel says what saved settings are, which settings fill the form, and what each button does.
+        self.assertEqual(parsed.elements["presetBar"]["role"], "group")
+        self.assertEqual(parsed.elements["presetBar"]["aria-labelledby"], "presetBarLabel")
+        self.assertEqual(parsed.elements["presetBar"]["aria-describedby"], "presetHelp")
+        self.assertEqual(parsed.elements["presetBarLabel"]["tag"], "h3")
+        self.assertEqual(" ".join(parsed.texts["presetBar"].split()),
+                         "Saved settings Save the workflow stages, models, limits and web search cutoff under a name "
+                         "to reuse them, and choose which saved settings new problems open with. Now using: built-in "
+                         "settings Save these settings… Load saved settings…")
+        # The summary names the settings that fill the form, in view while the section is closed.
+        self.assertEqual(" ".join(parsed.texts["advancedSummary"].split()), ", Saved settings: built-in")
+        self.assertIn("advancedSettings", tree.parents["advancedSummary"])
+        summary = markup[details:markup.index("</summary>", details)]
+        self.assertIn('<span class="advanced-title">Advanced settings</span>', summary)
+        self.assertIn('id="advancedSummary"', summary)
+        # The related works are a group of their own there, titled by a heading as the panel is. Not a label of
+        # the hidden file input: a click on the title would open the file chooser without clearing it first, as
+        # Add files… does, and the same file chosen again would add nothing.
+        related = parsed.elements["relatedWorksField"]
+        self.assertEqual((related["role"], related["aria-labelledby"]), ("group", "relatedWorksLabel"))
+        self.assertIn("settings-group", related["class"].split())
+        self.assertEqual(parsed.elements["relatedWorksLabel"]["tag"], "h3")
+        self.assertEqual(" ".join(parsed.texts["relatedWorksLabel"].split()), "Related works (optional)")
+        self.assertIsNone(re.search(r'<label\b[^>]*\bfor="composerRelatedFiles"', markup))
+        self.assertEqual(parsed.elements["composerRelatedFiles"]["aria-label"], "Related works to add")
+        self.assertTrue(" ".join(parsed.texts["runFolderHelp"].split()).endswith(
+            " Related works listed under Advanced settings are shared by every job of the folder run."))
+
+    def test_the_dialogs(self):
+        parsed = page()
+        markup = INDEX.read_text(encoding="utf-8")
         # The live regions are always rendered (empty, they take no room; see the styles test), so a screen
         # reader hears their first message; the Save dialog's error interrupts.
         for identity, role in (("presetNote", "status"), ("presetLoadStatus", "status"), ("presetSaveError", "alert")):
@@ -1101,31 +1426,40 @@ class PresetMarkupTests(unittest.TestCase):
                          "Saves stages, models and reasoning, subagents, critics and rounds, time limit, web search "
                          "cutoff, speed and activity log detail. Not saved: the statement, related works and edited "
                          "prompts.")
-        for dialog, title in (("presetSaveDialog", "Save settings"), ("presetLoadDialog", "Load settings")):
+        # Each dialog is titled as the button that opens it.
+        for dialog, title, button in (("presetSaveDialog", "Save these settings", "savePresetButton"),
+                                      ("presetLoadDialog", "Load saved settings", "loadPresetButton")):
             with self.subTest(dialog=dialog):
                 self.assertEqual(parsed.elements[dialog]["tag"], "dialog")
                 self.assertEqual(parsed.texts[parsed.elements[dialog]["aria-labelledby"]].strip(), title)
+                self.assertEqual(parsed.texts[button].strip(), f"{title}…")
+                self.assertEqual(parsed.elements[button]["aria-haspopup"], "dialog")
         self.assertEqual(parsed.elements["confirmPresetSaveButton"]["type"], "submit")
         self.assertEqual(parsed.elements["presetList"]["tag"], "ul")
         # Element ids stay unique.
         ids = re.findall(r'\sid="([^"]+)"', markup)
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_the_bar_is_hidden_in_the_models_view_and_in_print(self):
+    def test_the_panel_and_the_related_works_are_hidden_in_the_models_view_and_the_panel_in_print(self):
         styles = STYLES.read_text(encoding="utf-8")
         hidden = styles[styles.index('[data-view="models"] .models-head'):]
         hidden = hidden[:hidden.index("{ display: none !important; }")]
-        self.assertIn("#presetBar", hidden)
-        self.assertIn("#presetNote", hidden)
+        # Inside Advanced settings, which the Models & API view shows without its summary.
+        rule = re.search(r'\[data-view="models"\] \.advanced-body > :is\(([^)]*)\)', hidden).group(1)
+        for name in ("#presetBar", ".related-works-field", "#retrievalSetting", ".limits-group"):
+            with self.subTest(name=name):
+                self.assertIn(name, rule)
+        self.assertIn('[data-view="models"] .advanced > summary', hidden)
         printing = styles[styles.index("@media print"):]
-        self.assertIn(".preset-bar", printing[:printing.index("{ display: none !important; }")])
+        self.assertIn(".preset-panel", printing[:printing.index("{ display: none !important; }")])
 
     def test_long_names_wrap_and_empty_live_regions_take_no_room(self):
         rules = style_rules()
-        # A saved name can be one long word of 200 characters: the lines that quote one wrap anywhere,
-        # and the dialogs' single column never grows past the dialog (or the list's buttons go out of view).
-        for selector in (".preset-note", ".preset-load-status", "#presetSaveError", ".preset-bar-text",
-                         ".preset-row-name"):
+        # A saved name can be one long word of 200 characters: the lines that quote one wrap anywhere (the
+        # summary's chip too, whose row has no room to spare on a phone), and the dialogs' single column never
+        # grows past the dialog (or the list's buttons go out of view).
+        for selector in (".preset-note", ".preset-load-status", "#presetSaveError", ".preset-state",
+                         ".preset-row-name", ".advanced-chip"):
             with self.subTest(selector=selector):
                 self.assertTrue(any("overflow-wrap: anywhere" in body for body in rules[selector]))
         self.assertTrue(any("grid-template-columns: minmax(0, 1fr)" in body for body in rules[".preset-dialog-body"]))
@@ -1137,12 +1471,22 @@ class PresetMarkupTests(unittest.TestCase):
                 self.assertIn(live[0], rules[selector])
                 self.assertIn("position: absolute", live[0])
                 self.assertIn("clip: rect(0 0 0 0)", live[0])
-        # (The Models & API view hides the whole bar on purpose: that rule names them too.)
+        # (The Models & API view hides the whole panel on purpose: that rule names it.)
         for selector, bodies in rules.items():
             if (re.search(r"(\.preset-note|\.preset-load-status|#presetNote|#presetLoadStatus)\b", selector)
                     and not selector.startswith('[data-view="models"]')):
                 with self.subTest(selector=selector):
                     self.assertFalse(any(re.search(r"\bdisplay:\s*none", body) for body in bodies))
+
+    def test_a_warning_chip_looks_unlike_a_marked_one_in_every_theme(self):
+        # Its words always name the warning (see the browser tests); its mark differs as well: an amber dot beside
+        # the accent dot, and in Ink, whose accent and warnings are both ink, a diamond beside the round dot.
+        rules = style_rules()
+        marked = rules['.advanced-chip:is([data-tone="accent"], [data-tone="warning"])::before']
+        self.assertTrue(any("border-radius: 50%" in body and "background: var(--accent)" in body for body in marked))
+        self.assertIn("background: var(--waiting);", rules['.advanced-chip[data-tone="warning"]::before'])
+        ink = rules[':root[data-theme="ink"] .advanced-chip[data-tone="warning"]::before']
+        self.assertTrue(any("transform: rotate(45deg)" in body and "border-radius: 1px" in body for body in ink))
 
 
 def style_rules():

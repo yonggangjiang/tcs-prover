@@ -33,8 +33,31 @@ run through, and LaTeX, one card each:
 | LaTeX | whether `latexmk` and `pdflatex` are found, and their versions | the install command for your system, to run yourself |
 
 - **Needed by** lists the New problem roles (the form in this tab while it is
-  open, else your default saved settings), the jobs that can still run, and your
-  API connections. API connections need the program installed but no sign-in.
+  open, else your saved default settings), your saved default settings also
+  while the form is open if they use the program where the form does not, the
+  jobs that can still run and use it in their current or a later step (a job in
+  **Writing & polishing** no longer needs the program of its critic), and your
+  API connections. The built-in settings, which new problems open with when
+  none are saved, count only as the open form. API connections are only
+  listed: one needs its program installed but no sign-in, and only a role or a
+  job that uses it makes the program needed.
+- Only a program that the form, your saved default settings or such a job
+  needs is a warning (a red or amber mark, the sidebar count, the Overview
+  notice) when it is missing, does not run, is not on the jobs' path or, for a
+  built-in model, is not signed in. Any other program is shown calmly, in the
+  same words with a plain ring and no colour, for example *Not installed* with
+  *Nothing uses it now · only needed for Claude models*, *No role or job uses it
+  now* under an API connection, or *Not signed in · Not needed by your settings
+  or jobs* (*New problems open with the built-in settings, which use your
+  ChatGPT login* while nothing is saved and the New problem form is closed):
+  if you use only GPT models, Claude Code is never flagged. A calm
+  card keeps its **Install**, **Use it for jobs** and **Sign in** buttons, none
+  of them highlighted.
+- On a computer with neither the Codex CLI nor Claude Code installed, no model
+  can run, so one line says so (the sidebar count, the Overview and the top of
+  Setup): *Neither the Codex CLI nor Claude Code is installed*, with which one
+  each kind of model needs. It gives way to a program's own line as soon as
+  the form, your saved default settings or a job needs that program.
 - Setup checks the programs exactly as jobs find and start them, with no model
   call: `codex --version`, `codex login status`, `claude --version`, `claude auth
   status`, `latexmk -v` and `pdflatex --version`. "Signed in" means a login is
@@ -59,7 +82,10 @@ run through, and LaTeX, one card each:
   you chose does not start. **Update** runs the Codex installer again, or
   `claude update`.
   **Then sign in** in the Install dialog starts the sign-in once the install
-  works, under the same confirmation.
+  works, under the same confirmation. It is offered when that login will be
+  used: by the New problem form, your saved default settings or a job, by the
+  built-in settings new problems open with while nothing is saved, or, on a
+  computer with neither program yet, by the program you install first.
 - A program you install here is used by new jobs at once, and by jobs already
   waiting for it: when its folder is not on TCS Prover's PATH, Setup remembers
   the folder (`.tcs-prover/program-folders.json`, which no model can read or
@@ -72,9 +98,10 @@ run through, and LaTeX, one card each:
   does not run it when your own script is there. A program that changed since
   the last check, for example a script you put there while the dialog was open,
   is checked again before anything runs, and the step is then refused.)
-- While one of this server's jobs runs a model through a program, its
-  **Update**, a repair install and **Sign in again** (also **Sign in** when the
-  sign-in could not be checked) wait: pause or stop the job, or let it finish.
+- While one of this server's jobs runs and its current or a later step runs a
+  model through a program, that program's **Update**, a repair install and
+  **Sign in again** (also **Sign in** when the sign-in could not be checked)
+  wait: pause or stop the job, or let it finish.
   A job whose model calls all wait for that program's sign-in or for it to run
   again does not count: that step is what it waits for. Installing a missing
   program and a first sign-in never wait.
@@ -92,10 +119,16 @@ run through, and LaTeX, one card each:
   page until TCS Prover restarts: keys, tokens and sign-in codes are removed,
   and each step keeps its newest 2,000 lines (the panel says how many earlier
   lines it dropped).
-- The sidebar's Setup item counts the programs that need setting up for your
-  roles and jobs; the Overview lists them, the role menus and **Start workflow**
-  say so, and a job that waits for a program or a login links to Setup. None of
-  this stops a start: the job retries every minute and continues by itself.
+- The sidebar's Setup item counts the programs that need setting up and that
+  something needs (the New problem form while it is open, your saved default
+  settings, the jobs that can still run and use them), and the Overview lists
+  them; on a computer with neither the Codex CLI nor Claude Code, it counts the
+  one line that says so. The chip of a role whose chosen model needs one, the
+  hint under the role menus and the hint beside **Start workflow** follow the
+  form's selected roles only, and a job that waits for a program or a login
+  links to Setup from its line under **Needs your attention**, its row and its
+  page. None of this stops a start: the job retries every minute and continues
+  by itself.
 - Setup is not available through the live gateway; open TCS Prover from its own
   launch link.
 
@@ -122,7 +155,9 @@ program and host (for example *API · Anthropic format via Claude Code ·
 gateway.example.com*). When the Setup page's last check found that program
 missing, not running, not on the jobs' path or, for a built-in model, not signed
 in, the chip adds it (for example *Claude Code · not installed*) and a hint under
-the menus links to Setup; nothing stops a start.
+the menus links to Setup; nothing stops a start. Only the model you chose for a
+role of a selected stage gets this note: the **Source** menus offer every source
+without marks.
 
 ## Codex CLI
 
