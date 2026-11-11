@@ -110,6 +110,13 @@ INSTALLATION_SETTINGS = "settings.json"
 # hidden like the rest, so that a model can never change the settings the next problem opens with.
 PRESETS = "new-problem-presets.json"
 PRESETS_LOCK = "new-problem-presets.lock"
+# The folders the Setup page installed the Codex CLI or Claude Code into when that folder is not on
+# TCS Prover's PATH (ui.program_setup): {"version": 1, "folders": {"codex": "/abs/folder", ...}}. Only
+# Setup writes it; the program lookups read it only when PATH has no copy. Hidden like the rest, so that
+# no model can choose the program the next job runs.
+PROGRAM_FOLDERS = "program-folders.json"
+PROGRAM_FOLDERS_VERSION = 1
+PROGRAM_NAMES = ("codex", "claude")
 _STORE_LOCK = threading.RLock()
 
 _BUILTIN = {row["id"]: row for row in (*BUILTIN_MODELS, *_LEGACY_MODELS)}
@@ -171,9 +178,10 @@ def private_paths():
     the Claude settings folders, the copies of Claude conversations, the
     browser session tokens, the run and server lock records, the last
     readable copies of the bundled workflows (a launch may run from one), the
-    installation settings and the saved New problem settings with their lock
-    file. These entries rather than the whole state folder: an overridden
-    store path may share its folder with run folders.
+    installation settings, the saved New problem settings with their lock
+    file, and the program folders the Setup page remembered (they name the
+    binary jobs run). These entries rather than the whole state folder: an
+    overridden store path may share its folder with run folders.
     """
 
     state = state_directory()
@@ -181,7 +189,94 @@ def private_paths():
         store_path(), state / STORE_STAGING, state / CODEX_HOMES, state / CLAUDE_SETTINGS,
         state / CLAUDE_HOMES, state / CLAUDE_TRANSCRIPTS, state / SESSIONS, state / RUN_OWNERS,
         state / SERVERS, state / LAST_GOOD_WORKFLOWS, state / INSTALLATION_SETTINGS,
-        state / PRESETS, state / PRESETS_LOCK)]
+        state / PRESETS, state / PRESETS_LOCK, state / PROGRAM_FOLDERS)]
+
+
+def _program_folders():
+    """The remembered program folders as written ({} when the file is missing, linked or unusable)."""
+
+    path = state_directory() / PROGRAM_FOLDERS
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return {}
+        with open(path, encoding="utf-8") as stream:
+            value = json.loads(stream.read())
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return {}
+    if not isinstance(value, dict) or value.get("version") != PROGRAM_FOLDERS_VERSION:
+        return {}
+    folders = value.get("folders")
+    return {name: folder for name, folder in folders.items()
+            if name in PROGRAM_NAMES and isinstance(folder, str)} if isinstance(folders, dict) else {}
+
+
+def program_folder(name):
+    """The folder the Setup page remembered for the program ``name`` ("codex" or "claude"), or None.
+
+    Only an absolute folder that exists counts; a missing, linked, damaged or
+    newer file gives None. It never raises.
+    """
+
+    folder = _program_folders().get(name)
+    if not folder or not os.path.isabs(folder) or not os.path.isdir(folder):
+        return None
+    return folder
+
+
+def remembered_program(name):
+    """The program ``name`` in its remembered folder (see program_folder()), or None.
+
+    The lookups of jobs use it only when PATH has no copy, so a program the
+    Setup page installed outside TCS Prover's PATH is found at once, also by a
+    job that is already waiting for it. ``shutil.which`` is asked only when a
+    folder is remembered.
+    """
+
+    folder = program_folder(name)
+    if not folder:
+        return None
+    import shutil  # Here only: most callers never need it.
+    return shutil.which(name, path=folder)
+
+
+def save_program_folder(name, folder):
+    """Remember ``folder`` as where the program ``name`` is installed (written only by the Setup page).
+
+    The file is owner-only in the private state folder, replaced atomically;
+    the other program's folder stays as it was.
+    """
+
+    if name not in PROGRAM_NAMES:
+        raise ProviderError("Unknown program.")
+    folder = os.path.abspath(str(folder))
+    if not os.path.isdir(folder):
+        raise ProviderError(f"{folder} is not a folder.")
+    with _STORE_LOCK:
+        state = private_directory(state_directory())
+        path = state / PROGRAM_FOLDERS
+        if path.is_symlink():
+            raise ProviderError(f"{path} is a symbolic link; remove it.")
+        folders = {**_program_folders(), name: folder}
+        payload = json.dumps({"version": PROGRAM_FOLDERS_VERSION, "folders": folders}, ensure_ascii=False,
+                             indent=2) + "\n"
+        descriptor, temporary = tempfile.mkstemp(dir=state, prefix=".program-folders.", suffix=".tmp")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                try:
+                    os.fchmod(stream.fileno(), 0o600)
+                except (AttributeError, OSError):
+                    pass  # mkstemp already created the file owner-only.
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    return folder
 
 
 def user_login_files():

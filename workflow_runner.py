@@ -820,9 +820,14 @@ def located_cli(lookup, cli, model, stage=None):
 
 
 def codex():
-    """Find the installed Codex CLI."""
+    """Find the installed Codex CLI: on PATH, else in the folder the Setup page remembered.
 
-    path = shutil.which("codex")
+    The remembered folder (providers.remembered_program) lets a job that waits
+    for a Codex CLI installed outside this process's PATH find it at its next
+    retry, without a restart.
+    """
+
+    path = shutil.which("codex") or providers.remembered_program("codex")
     if not path:
         raise CLIUnavailable("Codex CLI is not installed or is not on PATH.")
     return path
@@ -842,13 +847,15 @@ class _ProbeFailed(Error):
 
 
 def _codex_candidates():
-    """The Codex on PATH first, then other PATH entries and the standard native installs."""
+    """The Codex on PATH first, then other PATH entries, the folder the Setup page remembered and the
+    standard native installs."""
 
     names = ("codex.exe",) if os.name == "nt" else ("codex",)
     paths = [shutil.which("codex")]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry and Path(entry).is_absolute():
             paths.extend(str(Path(entry) / name) for name in names)
+    paths.append(providers.remembered_program("codex"))
     if os.name != "nt":
         paths += [str(Path.home() / ".codex/packages/standalone/current/bin/codex"),
                   "/Applications/Codex.app/Contents/Resources/codex"]
@@ -6838,7 +6845,8 @@ def _run_command(config, context, attempt=None):
     The status is pass, fail (with timed_out when it did not finish, and
     runaway when it was stopped for printing without end), unavailable
     (nothing ran: its tools are missing or, with transient, could not start;
-    under a web cutoff, the isolated compiler is not ready) or uncompiled (the
+    under a web cutoff, the isolated compiler is not ready, also when after a
+    failed compile it fails its own fixed test document) or uncompiled (the
     isolated compiler refuses the source). A TeX build (one with -jobname) also
     fails when its log names unresolved citations or references (unresolved);
     its outputs are then kept. output holds every TeX error and the end of a
@@ -6852,11 +6860,17 @@ def _run_command(config, context, attempt=None):
     result = {"returncode": None, "output": ""}
     if policy is not None:
         from retrieval import isolated_compiler
+
+        def not_ready(exc):
+            # Checked again before the next attempt; nothing of this attempt is used (I-069).
+            advice = isolated_compiler.ADVICE.get(getattr(exc, "kind", "mactex"), "")
+            return {"status": "unavailable", "diagnostic": f"The isolated compiler is not ready: {exc}"
+                                                           + (f" {advice}" if advice else "")}
+
         try:
             result = isolated_compiler.compile_command(policy, config, argv, directory)
         except isolated_compiler.CompilerNotReady as exc:
-            # Checked again before the next attempt; nothing ran (I-069).
-            result.update(status="unavailable", diagnostic=f"The isolated compiler is not ready: {exc}")
+            result.update(not_ready(exc))
         except isolated_compiler.CompilerRefusal as exc:
             # Fail closed: no output of this or an earlier attempt is published (I-061).
             for path in outputs:
@@ -6865,6 +6879,15 @@ def _run_command(config, context, attempt=None):
         except isolated_compiler.CompilerIsolationError as exc:
             # An unsupported command, platform or timeout: no retry can change it.
             raise ConfigurationError(str(exc)) from exc
+        if result["status"] == "fail":
+            # A MacTeX being updated or damaged can pass the toolchain and sandbox checks and still fail
+            # every document: only a compiler that compiles its fixed test document (preflight) holds the
+            # source to account. One that does not waits, like any compiler that is not ready; anything
+            # the test document meets is the toolchain's, never the source's.
+            try:
+                isolated_compiler.preflight(policy)
+            except isolated_compiler.CompilerIsolationError as exc:
+                result = {"returncode": None, "output": result.get("output") or "", **not_ready(exc)}
         return _command_result(config, argv, directory, result, attempt)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     for path in outputs:

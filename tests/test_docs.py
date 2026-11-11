@@ -54,7 +54,9 @@ class GuideTests(unittest.TestCase):
                        ".venv/bin/python -m pip install -r requirements.txt", "python3 web_ui.py", "--no-browser",
                        "private access key", "curl -fsSL https://chatgpt.com/codex/install.sh | sh", "codex login",
                        "curl -fsSL https://claude.ai/install.sh | bash", "`latexmk` and `pdflatex`",
-                       "A Setup page that does this from the browser is coming"):
+                       # Setup first (owner decision B3), the terminal commands kept as the alternative.
+                       "Open **Setup** in the sidebar (first under Configure).",
+                       "Set up the command-line programs in a terminal instead", "claude auth login"):
             self.assertIn(needed, text)
         # web_ui.py runs in the checkout's .venv whichever Python starts it, so `python3 web_ui.py` works there.
         launcher = (ROOT / "web_ui.py").read_text(encoding="utf-8")
@@ -94,6 +96,55 @@ class AccuracyTests(unittest.TestCase):
                        '"Historical compilation requires MacTeX and sandbox-exec"', "**Re-run preflight**"):
             self.assertIn(needed, checks)
         self.assertIn("compilation requires MacTeX and sandbox-exec", compiler)
+
+    def test_a_web_cutoff_job_held_for_its_compiler_is_described_as_checked_every_minute(self):
+        # Owner decision: such a job is checked again every minute and starts or continues by itself once the
+        # check passes. The guides name it as Needs your attention does (App.attention), quote what its hold
+        # advises for each cause (isolated_compiler.ADVICE), and never send it to Re-run preflight. Checked
+        # paragraph by paragraph: "every minute" is in these pages for other checks too.
+        from retrieval import isolated_compiler
+
+        def paragraph(name):
+            parts = [" ".join(part.split()) for part in re.split(r"\n\s*\n", (DOCS / name).read_text(encoding="utf-8"))
+                     if "*LaTeX compiler not ready*" in part]
+            self.assertEqual(len(parts), 1, name)
+            return parts[0]
+
+        server = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
+        self.assertIn('"title": "LaTeX compiler not ready"', server)
+        cutoff, trouble, retries = paragraph("web-cutoff.md"), paragraph("troubleshooting.md"), paragraph("retries.md")
+        self.assertIn("The check runs again every minute, and the job starts or continues by itself once it passes.",
+                      cutoff)
+        self.assertIn("That check, like one that could not finish, runs again every minute, and the job starts or "
+                      "continues by itself once it passes (a job you stopped only has its hold released and stays "
+                      "stopped until you choose **Continue**).", trouble)
+        self.assertIn("The check runs again every minute, also while the running-jobs limit is reached, and the job "
+                      "starts or continues by itself once it passes; a job you stopped only has its hold released",
+                      retries)
+        for name, text in (("web-cutoff.md", cutoff), ("troubleshooting.md", trouble)):
+            with self.subTest(page=name):
+                # Only MacTeX's own failures are MacTeX's to fix; a Python under Rosetta needs a native one.
+                self.assertIn(f"*{isolated_compiler.ADVICE['mactex'].rstrip('.')}", text)
+                self.assertIn(f"*{isolated_compiler.ADVICE['sandbox'].rstrip('.')}", text)
+                self.assertIn("A cause that mentions `rosetta error`", text)
+                self.assertRegex(text, r"[Rr]ecreate `\.venv` with a native \(arm64\) Python")
+        self.assertNotIn("Re-run preflight", cutoff)
+        self.assertNotIn("Re-run preflight", retries)
+        self.assertEqual(trouble.count("Re-run preflight"), 1)
+        self.assertIn("For any other cause, fix it and click **Re-run preflight**.", trouble)
+        # The checks take no running slot, and a damaged MacTeX met during a run is waited for too.
+        text = flat(DOCS / "web-cutoff.md")
+        self.assertIn("These checks start no model, so they run every minute whatever the running-jobs limit; after "
+                      "one that ran by itself, the job starts or resumes as soon as a running slot is free", text)
+        self.assertIn("After a compile that fails, it also compiles its small test document, so a MacTeX that is "
+                      "being updated or damaged is never taken for an error in the source.", text)
+        self.assertIn("The every-minute checks of held web-cutoff jobs start no model and take no slot: they run "
+                      "whatever the limit and the spacing, at most four starting in the same second.",
+                      flat(DOCS / "batches.md"))
+        self.assertIn("HOLD_CHECKS_PER_SECOND = 4\n", server)
+        checks = text[text.index("## What a timestamp run checks"):text.index("## What else is recorded")]
+        self.assertNotIn("install MacTeX, then choose **Re-run preflight**", checks)
+        self.assertNotIn("held until you install what is missing and choose", flat(DOCS / "models.md"))
 
     def test_python_commands_name_the_checkouts_venv(self):
         # A stock Mac's python3 is 3.9 (no tomllib) and it has no `python`; only web_ui.py switches to the .venv

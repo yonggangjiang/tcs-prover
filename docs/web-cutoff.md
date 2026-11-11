@@ -58,16 +58,34 @@ the native sandbox of the author and of the structured roles.
   LaTeX compiler, which never uses your `PATH`: it needs MacTeX as its installer
   puts it, in `/usr/local/texlive` with `latexmk` and `pdflatex` in
   `/Library/TeX/texbin` (owned by root and writable by no one else), and macOS's
-  `sandbox-exec`. Without MacTeX the job is held with "Historical compilation
-  requires MacTeX and sandbox-exec"; install MacTeX, then choose **Re-run
-  preflight**.
+  `sandbox-exec`, and its sandbox and a small test document must pass. When the
+  compiler fails these checks, the job is held with the cause, for example
+  "Historical compilation requires MacTeX and sandbox-exec", and listed under
+  **Needs your attention** as *LaTeX compiler not ready*. The check runs again
+  every minute, and the job starts or continues by itself once it passes. The
+  hold says what fixes the cause:
+  - MacTeX missing, being updated, not protected or failing the test document:
+    *Install or repair MacTeX.*
+  - macOS's `sandbox-exec`, `perl` or `sh` missing or not protected, or the
+    compiler's sandbox failing its own checks: *The compiler's macOS sandbox
+    check failed; MacTeX is not the cause.*
+  - A cause that mentions `rosetta error`: TCS Prover's Python is an Intel
+    (x86_64) build running under Rosetta, which the compiler's sandbox does not
+    allow. Recreate `.venv` with a native (arm64) Python 3.11 or newer, then
+    start TCS Prover again.
+
+  The checks are never relaxed; no model starts before they pass.
 - A failed check blocks launch: the prepared job is held and names the cause. A
   check that could not finish (a timeout, no connectivity for the controls, an
   early exit) runs again every minute, before launch and before every model
-  call; a proven violation stops the run for safety. **Re-run preflight**
-  releases a held job once its checks pass: a prepared job then starts and a
-  paused one resumes, while a job you stopped stays stopped until you choose
-  **Continue**.
+  call; a proven violation stops the run for safety. A check that passes
+  releases the hold, whether it ran by itself or you chose **Re-run preflight**
+  (which checks at once): a prepared job then starts and a paused one resumes,
+  while a job you stopped stays stopped until you choose **Continue**. These
+  checks start no model, so they run every minute whatever the running-jobs
+  limit; after one that ran by itself, the job starts or resumes as soon as a
+  running slot is free, a prepared one waiting in the queue (see
+  [Running jobs](batches.md#running-jobs)).
 - A problem no retry fixes (a moved or missing policy, a pinned binary with no
   verified replacement, an isolated configuration with settings TCS Prover does
   not write) holds the job with that message instead of retrying every minute. A
@@ -79,10 +97,17 @@ the native sandbox of the author and of the structured roles.
 Every model process of a timestamp run is checked this way: the author and its
 paused replies (which use the author's own audited launch), the critic and its
 subagents, the convention critic and the LaTeX writer. The LaTeX compile runs in
-a separate isolated compiler; a source it refuses ends the job with `final.tex`
-and a "PDF not compiled" note. Such runs save no Codex session, so a failed
-subagent of a version-2 critic is not detected there (the activity log says so),
-and the critic's progress line says only that its critics have started.
+a separate isolated compiler, which repeats its MacTeX and sandbox checks before
+every compile; a source it refuses ends the job with `final.tex` and a "PDF not
+compiled" note. After a compile that fails, it also compiles its small test
+document, so a MacTeX that is being updated or damaged is never taken for an
+error in the source. When the compiler is not ready at that step (MacTeX
+missing, being updated or damaged, or a sandbox check failing), the job keeps
+running, waits at **Compile PDF** with *Waiting to retry a command that could
+not run* and checks again every minute, without a limit and without using the
+time budget. Such runs save no Codex session, so a failed subagent of a
+version-2 critic is not detected there (the activity log says so), and the
+critic's progress line says only that its critics have started.
 
 ## What else is recorded
 

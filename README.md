@@ -28,15 +28,21 @@ On Windows: `py -3 -m venv .venv`, `.venv\Scripts\python -m pip install -r requi
 your browser. The part after `#` is a private access key, so the bare address
 does not work. **To open the page again**, run `python3 web_ui.py` again: while
 TCS Prover runs, this opens the same link instead of starting a second copy
-(`--no-browser` only prints it). Then click **New problem**, paste your
-statement and click **Start workflow**. Ctrl-C stops TCS Prover; working authors
-pause and continue by themselves about a minute after the next start.
+(`--no-browser` only prints it). Then open **Setup** (below), click **New
+problem**, paste your statement and click **Start workflow**. Ctrl-C stops TCS
+Prover; working authors pause and continue by themselves about a minute after
+the next start.
 
 ## What you need for models
 
-Install the program your models run through (the default GPT models use the
-Codex CLI). A Setup page that does this from the browser is coming; until then,
-use the official commands:
+Open **Setup** in the sidebar (first under Configure). It shows whether the
+Codex CLI (used by the default GPT models), Claude Code and LaTeX are installed
+and signed in, and which of your roles and jobs need each one, and it installs,
+updates or signs in the one you need after you confirm the exact command (see
+[the Setup page](docs/models.md#the-setup-page)).
+
+<details>
+<summary>Set up the command-line programs in a terminal instead</summary>
 
 ```bash
 # Codex CLI: the built-in GPT models (the default) and OpenAI-format API keys
@@ -45,18 +51,20 @@ codex login        # sign in with ChatGPT (on another computer: codex login --de
 
 # Claude Code: Claude models and Anthropic-format API keys
 curl -fsSL https://claude.ai/install.sh | bash
-claude             # sign in once with your Claude account
+claude auth login  # sign in once with your Claude account
 ```
 
 On Windows (PowerShell): `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"`
 and `irm https://claude.ai/install.ps1 | iex`.
 
+</details>
+
 - **Built-in models** need the program installed and signed in. **API
   connections** (your own key, saved under **Models & API**) need the program
-  for their format installed, with no sign-in.
+  for their format installed (Setup installs it too), with no sign-in.
 - **LaTeX** makes the PDF (`latexmk` and `pdflatex`): [MacTeX](https://tug.org/mactex/)
   or `brew install --cask mactex-no-gui` on macOS, [TeX Live](https://tug.org/texlive/)
-  or MiKTeX elsewhere.
+  or MiKTeX elsewhere. Setup shows the command for your system; you run it.
 - Nothing here stops a start: a job whose program or LaTeX is missing says so,
   tries again every minute, and continues by itself once you install it. Runs
   with a web cutoff timestamp are the exception: they need the native Codex CLI,
@@ -87,7 +95,7 @@ retried every minute, without limit.
 
 | Guide | What it covers |
 | --- | --- |
-| [Models and API connections](docs/models.md) | Codex CLI, Claude Code, API keys, which program each model needs |
+| [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
 | [The workflow](docs/workflow.md) | Statement review, the author, the critic, the convention critic, LaTeX |
 | [The job page](docs/job-page.md) | Status, the chat, Pause, Summary, Stop, the time limit, related works, downloads |
 | [Batches and folder runs](docs/batches.md) | Batches, running a folder of statements, the running-jobs limit |

@@ -28,6 +28,7 @@ ui/
   batches.py                Saved run folders shown as read-only batches
   named_batches.py          Batches made with New batch (runs/.controller/batches.json)
   presets.py                Saved New problem settings (Save… and Load…)
+  program_setup.py          The Setup page: program checks, installs, updates and sign-ins
   related_works.py          Related works given to the proof author
   retrieval.py              Web search cutoff setup for the page
   ownership.py              One owner per run, one server per runs folder
@@ -69,7 +70,9 @@ working folder.
   (owner-only).
 - `runs/.uploads`: staged related-work uploads, removed after 24 hours.
 - `runs/.trash/`: deleted jobs, kept for 30 days.
-- `.tcs-prover/`: the private state (see [Sandbox and network](sandbox.md)).
+- `.tcs-prover/`: the private state (see [Sandbox and network](sandbox.md)),
+  including `program-folders.json`, the folders the Setup page remembered.
+  Setup's own output is kept in memory only.
 - Private per-call folders are pruned once they are a day old, beyond the newest
   50 critic snapshots and historical critic sessions and 200 historical
   discovery runs.
@@ -250,6 +253,30 @@ with an HTTP 4xx other than 401, 403 or 404, one minimal request
 (`Reply with OK.`) follows, and the result says whether the endpoint refuses
 only the shape of run requests.
 
+**The Setup page.** `GET /setup` checks the programs (it reuses a check
+younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's
+background read, never starts a process: it returns the last check of any age,
+and programs in state `checking` before the first) and lists, per
+program, its state, its actions with the exact command each dialog shows, and
+the commands to copy, with the New problem roles, the jobs that can still run
+and the API connections that need it. `POST /setup/action` takes a program, an
+action and an option from fixed sets plus the command the dialog showed (a
+command that changed is refused with 409 and the new status; a program that
+changed since its last check in a way seen without starting anything, such as
+where jobs find it, what made it or a file of your own where OpenAI's installer
+writes, is checked again first); `GET
+/setup/task?id=&after=N` returns a step's state and its output after line N;
+`POST /setup/stop` and `POST /setup/input` (the code Claude Code's sign-in page
+shows) act on a step. Every route needs the session token, the exact Host and a
+matching Origin. Each step runs with no terminal (a new session, or a new
+process group without a window on Windows), its output cleaned of escape codes,
+keys and tokens. Stop asks its process group, and every process group its
+descendants started, to end, and ends them after 10 seconds (on Windows,
+taskkill /T ends its tree); on macOS and Linux, what an install or update
+leaves in its process group ends with it (after 2 seconds). Checks
+run outside the Setup state's lock, so Stop, a step's output and closing never
+wait for one.
+
 ## Tests
 
 Run the regression suite without model calls:
@@ -261,7 +288,10 @@ Run the regression suite without model calls:
 The suite keeps TCS Prover's private state in a temporary folder it removes at
 the end (`tests/isolated_state.py` points `TCS_PROVER_API_MODELS` there before
 any TCS Prover module is imported), so it never reads or writes the checkout's
-`.tcs-prover/`.
+`.tcs-prover/`. The Setup tests (`tests/test_program_setup.py`) run the real
+Setup code against fake `codex`, `claude`, `latexmk` and installer programs
+(`tests/setup_fakes.py`) in an empty home, with a guard that fails any test that
+starts another program.
 
 `TCS_PROVER_LIVE_CLI_TESTS=1 .venv/bin/python -m unittest tests.test_provider_cli_live.ConfinementLiveTests`
 checks the run confinement on macOS with the installed Codex CLI and no model:
@@ -339,5 +369,8 @@ restarted original controller is found again through its launch status file.
 - The gateway cannot make batches: its pages show no **New batch** or **New
   problem in this batch**, and every job of the new controller appears in its
   card.
+- The gateway does not forward the Setup page: `/?setup=1` loads, its `/setup`
+  routes answer 404, and the page says to open TCS Prover from its own launch
+  link (a step's jobs protection sees only one controller's jobs).
 - Closing the gateway (Ctrl-C or SIGTERM) pauses the new controller's jobs as
   closing the server does.

@@ -1277,11 +1277,14 @@ class ReadmeTests(unittest.TestCase):
         retries = read(ROOT / "docs" / "retries.md")
         text = " ".join(read(path) for path in (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))))
         # Only a web cutoff timestamp (a historical policy) needs the native Codex binary and Codex CLI models,
-        # and with Writing & polishing MacTeX for its isolated compiler; a cutoff of -1 does not.
-        self.assertIn("A missing program never stops a start (a run with a web cutoff timestamp is the exception: its "
-                      "checks before launch need the native Codex binary, and with Writing & polishing on MacTeX; a "
-                      "job that fails them is held until you install what is missing and choose **Re-run "
-                      "preflight**).", models)
+        # and with Writing & polishing MacTeX for its isolated compiler; a cutoff of -1 does not. A start without
+        # the native Codex binary is refused before any job exists (retrieval.prepare_policy); a job whose MacTeX
+        # fails its checks is held and checked again every minute (owner decision).
+        self.assertIn("A missing program never stops a start (a run with a web cutoff timestamp is the exception: a "
+                      "start without the native Codex binary is refused, so install it and start again; with Writing "
+                      "& polishing on it also needs MacTeX, and a job whose MacTeX is missing or fails its checks is "
+                      "held, checked again every minute, and starts or continues by itself once MacTeX is installed "
+                      "or repaired).", models)
         self.assertIn("API model, has its saved key; a run with a web cutoff timestamp also needs Codex CLI models for "
                       "its proof roles and the native Codex binary, and with **Writing & polishing** on also MacTeX "
                       "in `/usr/local/texlive` and macOS's `sandbox-exec` for its isolated LaTeX compiler", models)
@@ -1400,13 +1403,14 @@ syncAttentionAlerts();
         result = subprocess.run([NODE, "-e", script, str(provider_ui.APP)], capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         texts = json.loads(result.stdout)
+        # Both name Setup, where the program is installed (owner decision B4: API users need no sign-in).
         openai = ("Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this "
-                  "computer, but needs no login. Models load automatically when you save.")
+                  "computer (see Setup), but needs no login. Models load automatically when you save.")
         self.assertEqual(texts["openai"], openai)
         self.assertEqual(texts["anthropic"], (
             "Runs through Claude Code in a private configuration folder, with subagents and web tools; a claude "
             "launcher that drops CLAUDE_CONFIG_DIR limits it to bare mode. Claude Code must be installed on this "
-            "computer, but needs no login. Models load automatically when you save."))
+            "computer (see Setup), but needs no login. Models load automatically when you save."))
         self.assertEqual(texts["alerts"], (
             "While TCS Prover is open in a tab, a notification says when a job first needs you: a CLI login, a usage "
             "limit, a rejected API key, a program to install, or a model or setting to fix. The Overview lists these "

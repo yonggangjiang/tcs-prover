@@ -47,6 +47,9 @@
         <div class="nav-group">
           <p class="nav-label" id="navConfigureLabel">Configure</p>
           <ul class="nav-list" aria-labelledby="navConfigureLabel">
+            <!-- Setup: the programs the models run through. The badge counts the programs that need setting up for
+                 what new problems and jobs use (app.js renderSetupBadge); the hidden words read it out. -->
+            <li><a class="nav-item" href="/?setup=1" data-nav="setup" data-tip="Setup" data-tip-meta="Programs your models run through"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v7M5 6.75 8 9.75l3-3"/><path d="M2.75 10v2a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg><span class="nav-text">Setup</span><span id="navSetupBadge" class="nav-badge nav-badge-setup" aria-hidden="true" hidden></span><span id="navSetupWords" class="visually-hidden"></span></a></li>
             <li><a class="nav-item" href="/?new=1#models" data-nav="models" data-tip="Models &amp; API" data-tip-meta="Role models and your API endpoints"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/><rect x="6.5" y="6.5" width="3" height="3" rx=".5"/><path d="M6 1.75V4M10 1.75V4M6 12v2.25M10 12v2.25M1.75 6H4M1.75 10H4M12 6h2.25M12 10h2.25"/></svg><span class="nav-text">Models &amp; API</span></a></li>
             <li><button class="nav-item" type="button" data-nav="prompts" aria-haspopup="dialog" data-tip="Prompts" data-tip-meta="Role prompts for the next problem"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.5 10a1.5 1.5 0 0 1-1.5 1.5H5.25L2.5 14V3.5A1.5 1.5 0 0 1 4 2h8a1.5 1.5 0 0 1 1.5 1.5Z"/><path d="M5.5 5.5h5M5.5 8h3.25"/></svg><span class="nav-text">Prompts</span></button></li>
           </ul>
@@ -134,6 +137,12 @@
               <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
             </div>
           </div>
+          <!-- Programs that new problems or jobs need and that are missing, do not run or are not signed in, each with
+               a link to Setup (app.js renderSetupBanner from GET /setup). -->
+          <section id="setupBanner" class="attention-banner setup-banner" aria-labelledby="setupBannerHeading" hidden>
+            <h2 id="setupBannerHeading" class="attention-heading">Setup</h2>
+            <ul id="setupBannerList" class="attention-list"></ul>
+          </section>
           <!-- Jobs that need you (a CLI login, a usage limit, a rejected API key, a program to install, a model
                or its settings, a missing saved thread ID, a safety stop); app.js fills it from /batches. Jobs
                whose cause can pass keep retrying meanwhile. -->
@@ -379,6 +388,7 @@
                     reasoning levels the chosen model supports. Codex CLI and Claude Code models use
                     the logins on this computer; add your own endpoints under API models below.
                   </p>
+                  <p id="modelSetupHint" class="help setup-hint" role="status" hidden></p>
                   <input id="reasoningEffort" type="hidden" value="max">
                 </fieldset>
 
@@ -433,7 +443,7 @@
                         <label class="segment"><input id="apiModelFormatOpenai" type="radio" name="apiModelFormat" value="openai" checked><span>OpenAI-compatible</span></label>
                         <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
                       </div>
-                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer, but needs no login. Models load automatically when you save.</p>
+                      <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer (see Setup), but needs no login. Models load automatically when you save.</p>
                       <details class="api-optional-settings">
                         <summary>Optional source, name and token limits</summary>
                         <div class="api-model-fields">
@@ -588,6 +598,8 @@
                 </div>
               </div>
             </details>
+            <!-- A program the selected roles need that is missing or signed out: a start still works (app.js). -->
+            <p id="startSetupHint" class="help setup-hint" role="status" hidden></p>
             <div class="composer-actions">
               <p id="modelSummary" class="model-summary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</p>
               <div class="composer-buttons">
@@ -664,6 +676,37 @@
           <ol id="jobsList" class="jobs-list"></ol>
           <p class="jobs-filter-empty help">No problems with this status. Choose All to see every problem.</p>
           <p id="jobsEmpty" class="help" hidden>No problems have been saved in this batch yet.</p>
+        </section>
+
+        <!-- Setup (?setup=1): the Codex CLI, Claude Code and LaTeX as jobs find them, one card each (app.js renderSetup
+             from GET /setup), then the output of a step that runs or ran (installs, updates and sign-ins, each only
+             after #setupDialog confirms the exact command). The New problem draft stays while this page is open. -->
+        <section id="setupPanel" class="page setup-view" aria-labelledby="setupHeading" hidden>
+          <div class="page-head">
+            <div>
+              <p class="eyebrow page-eyebrow">Configure</p>
+              <h1 id="setupHeading">Setup</h1>
+              <p id="setupMeta" class="page-meta" aria-live="polite"><span>Checking…</span></p>
+              <p class="page-lede">The programs your models run through, and LaTeX for the PDF. TCS Prover checks them as
+                jobs use them. Nothing is installed, updated or signed in until you confirm.</p>
+            </div>
+            <div class="page-actions">
+              <button id="setupCheckButton" class="secondary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M13.25 8a5.25 5.25 0 1 1-1.54-3.71"/><path d="M13.25 2.75v3h-3"/></svg><span id="setupCheckText">Check again</span></button>
+            </div>
+          </div>
+          <p id="setupNotice" class="notice setup-notice" role="alert" hidden></p>
+          <div id="setupList" class="setup-cards" role="list" aria-label="Programs"></div>
+          <div id="setupTasks" class="setup-task-slot"></div>
+          <div class="help setup-foot">
+            <p>Jobs never wait for Setup: a job whose program is missing or signed out retries every minute and continues
+              by itself once it works. “Signed in” means a login is saved; if it has expired, the job that needs it is
+              listed under Needs your attention.</p>
+            <p>Setup never uses administrator rights, never asks for API keys, and keeps its output only on this page until
+              TCS Prover restarts.</p>
+            <p id="setupLimits">Each step's output keeps its newest 2,000 lines, and each check waits at most 20 seconds
+              for a program to answer. Installs, updates and sign-ins have no time limit (in a Codex sign-in, each answer
+              of the Codex CLI must come within 120 seconds); Stop ends them.</p>
+          </div>
         </section>
 
         <!-- Job: one header, then the panel that needs the user, then context. -->
@@ -981,6 +1024,36 @@
 
     <!-- Save the New problem form's settings under a name (app.js; POST /presets). The name may stay
          empty: its placeholder is the name it then gets. Set as default is ticked whenever it opens. -->
+    <!-- Setup: one confirmation per step, showing the exact command (app.js openSetupDialog). The page sends that
+         command back; a command that changed meanwhile is refused and the dialog shows the new one. -->
+    <dialog id="setupDialog" class="prompt-dialog setup-dialog" aria-labelledby="setupDialogTitle">
+      <form method="dialog">
+        <div class="prompt-dialog-head">
+          <div>
+            <p class="eyebrow">Setup</p>
+            <h2 id="setupDialogTitle">Setup</h2>
+          </div>
+        </div>
+        <div class="setup-dialog-body">
+          <p id="setupDialogLede" class="section-copy setup-dialog-lede"></p>
+          <div class="setup-command-block"><pre id="setupDialogCommand" aria-label="The exact command"></pre><button id="setupDialogCopy" class="ghost compact setup-copy" type="button">Copy</button></div>
+          <fieldset id="setupDialogOptions" class="setup-options" hidden>
+            <legend id="setupDialogLegend">How to sign in</legend>
+            <div id="setupDialogOptionList" class="setup-option-list"></div>
+          </fieldset>
+          <h3 id="setupDialogWhatTitle" class="setup-what-title">What it does</h3>
+          <ul id="setupDialogWhat" class="setup-what" aria-labelledby="setupDialogWhatTitle"></ul>
+          <p id="setupDialogWarning" class="job-warning setup-dialog-warning" hidden></p>
+          <label id="setupDialogThen" class="toggle-line setup-then" hidden><input id="setupDialogThenInput" type="checkbox" checked> <span id="setupDialogThenText"></span></label>
+          <p id="setupDialogError" class="notice setup-dialog-error" role="alert" hidden></p>
+        </div>
+        <div class="prompt-dialog-actions">
+          <button id="setupDialogCancel" class="ghost" type="submit" value="cancel" autofocus>Cancel</button>
+          <button id="setupDialogConfirm" class="primary" type="button">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="presetSaveDialog" class="prompt-dialog preset-dialog" aria-labelledby="presetSaveTitle">
       <form id="presetSaveForm" method="dialog">
         <div class="prompt-dialog-head">

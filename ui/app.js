@@ -93,12 +93,16 @@ if (launchFragment) {
 let currentJob = new URLSearchParams(location.search).get("job") || "";
 let currentBatch = new URLSearchParams(location.search).get("batch") || "";
 let composingProblem = new URLSearchParams(location.search).get("new") === "1" && !currentJob;
+// The Setup page (?setup=1, openSetup()): it shows in place of the Overview, a batch or the New problem page, and
+// keeps a New problem draft, with the batch it adds to, for when you go back. Code that a page may load in pieces
+// reads it as `typeof settingUp !== "undefined" && settingUp`.
+let settingUp = new URLSearchParams(location.search).get("setup") === "1" && !currentJob;
 let batchCatalog = [];
 
 // Cache the small set of elements that the state renderer controls.
 const $ = (id) => document.getElementById(id);
 const ui = {
-  input: $("inputPanel"), review: $("reviewPanel"), run: $("runPanel"),
+  input: $("inputPanel"), review: $("reviewPanel"), run: $("runPanel"), setupPanel: $("setupPanel"),
   notice: $("notice"), stoppedNote: $("stoppedNote"), problem: $("problem"), proposed: $("proposed"),
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
@@ -417,10 +421,12 @@ function renderBatchActions() {
 
 function renderBatchNavigation() {
   const batch = selectedBatch();
-  const browsing = !currentJob && !composingProblem;
+  const setup = typeof settingUp !== "undefined" && settingUp && !currentJob;
+  const browsing = !currentJob && !composingProblem && !setup;
   show(ui.batchesPanel, browsing && !currentBatch);
   show(ui.jobsPanel, browsing && Boolean(currentBatch));
-  show(ui.batchNavigation, Boolean(currentJob || currentBatch || composingProblem));
+  if (ui.setupPanel) show(ui.setupPanel, setup);
+  show(ui.batchNavigation, !setup && Boolean(currentJob || currentBatch || composingProblem));
   // A batch the New problem page was adding to that is no longer listed has no name or page to lead to.
   show(ui.batchProblems, Boolean(currentBatch) && !composerBatchGone());
   ui.batchProblems.textContent = batch?.label || currentBatch;
@@ -439,10 +445,11 @@ function renderBatchNavigation() {
   ui.home.textContent = currentBatch ? "Back to problems" : "All batches";
   ui.reviewHome.textContent = ui.home.textContent;
   if (!currentJob) {
-    show(ui.input, composingProblem);
+    show(ui.input, composingProblem && !setup);
     for (const panel of [ui.review, ui.run, ui.runOverview, ui.workflowRail, ui.activityToggle]) show(panel, false);
-    ui.globalStatus.textContent = composingProblem ? "New problem" : currentBatch ? "Batch problems" : "Problem batches";
-    document.title = composingProblem ? "New problem — TCS Prover"
+    ui.globalStatus.textContent = setup ? "Setup" : composingProblem ? "New problem"
+      : currentBatch ? "Batch problems" : "Problem batches";
+    document.title = setup ? "Setup — TCS Prover" : composingProblem ? "New problem — TCS Prover"
       : currentBatch ? `${batch?.label || currentBatch} — TCS Prover` : "TCS Prover";
     ui.elapsed.textContent = "";
     ui.liveDot.classList.toggle("active", false);
@@ -463,7 +470,12 @@ function renderBatches(batches) {
   }
   ui.batchesList.dataset.signature = signature;
   ui.batchesList.replaceChildren();
-  ui.batchesStatus.textContent = batches.length ? "" : "No batches yet. Create a problem to get started.";
+  if (!batches.length && typeof setupLink === "function") {
+    ui.batchesStatus.replaceChildren("No batches yet. ", setupLink(),
+      " to check the programs your models need, then create a problem.");
+  } else {
+    ui.batchesStatus.textContent = batches.length ? "" : "No batches yet. Create a problem to get started.";
+  }
   show(ui.batchesStatus, !batches.length);
   for (const batch of batches) {
     const item = document.createElement("li"), link = document.createElement("a");
@@ -546,6 +558,8 @@ function renderAttention(batches) {
     };
     text.textContent = item.text;
     row.append(title, link, text);
+    // A program to install or to sign in again: Setup does it (see setupLink()).
+    if (["cli", "login"].includes(item.kind) && typeof setupLink === "function") row.append(setupLink());
     return row;
   }));
 }
@@ -560,6 +574,7 @@ async function selectBatch(batchId) {
   currentBatch = batchId;
   currentJob = "";
   composingProblem = false;
+  settingUp = false;
   history.pushState(null, "", batchUrl(batchId));
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false); show(ui.batchStatus, false); renderBatchNavigation();
@@ -592,7 +607,7 @@ async function rerunWithStatement(statement) {
 
 // The New problem page, adding to ``batchId``: a batch whose jobs this server runs ("" is the default batch).
 async function newProblem(batchId = "") {
-  currentBatch = batchId; currentJob = ""; composingProblem = true;
+  currentBatch = batchId; currentJob = ""; composingProblem = true; settingUp = false;
   history.pushState(null, "", `${location.pathname}?new=1${batchId ? `&batch=${encodeURIComponent(batchId)}` : ""}`);
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false); renderBatchNavigation();
@@ -675,6 +690,7 @@ function adoptJob(next) {
   currentJob = next.runId;
   currentBatch = next.batchId || next.batch?.id || "";
   composingProblem = false;
+  settingUp = false;
   history.pushState(null, "", jobUrl(currentJob));
 }
 
@@ -705,6 +721,7 @@ function clearJobView() {
 function selectJob(runId) {
   currentJob = runId;
   composingProblem = false;
+  settingUp = false;
   history.pushState(null, "", jobUrl(runId));
   clearJobView();
   clearTimeout(timer);
@@ -938,6 +955,7 @@ function renderJobs(jobs) {
       const line = document.createElement("small");
       line.className = `job-attention ${attention.kind}`;
       line.textContent = `${attention.title}: ${attention.text}`;
+      if (["cli", "login"].includes(attention.kind) && typeof setupLink === "function") line.append(" ", setupLink());
       copy.append(line);
     }
     const retry = retryText(job);
@@ -1057,7 +1075,7 @@ let pollNotice = "";
 
 async function loadJobs() {
   clearTimeout(jobsTimer);
-  if (currentJob || composingProblem) return;
+  if (currentJob || composingProblem || (typeof settingUp !== "undefined" && settingUp)) return;
   const batch = currentBatch;
   try {
     const catalog = await request("/batches");
@@ -1077,7 +1095,9 @@ async function loadJobs() {
     ui.notice.textContent = pollNotice = error.message;
     show(ui.notice, true);
   }
-  if (!currentJob && !composingProblem && batch === currentBatch) jobsTimer = setTimeout(loadJobs, 2500);
+  if (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp) && batch === currentBatch) {
+    jobsTimer = setTimeout(loadJobs, 2500);
+  }
 }
 
 function selectedWorkflowStages() {
@@ -1193,9 +1213,11 @@ function cutoffModelMessage(roles = cutoffBlockedRoles()) {
 }
 
 // Under each role menu: the CLI that runs the chosen model, and an API model's format, the program
-// that runs it (fixed by the format; nothing checks that it is installed) and host. With a web cutoff
-// the proof roles' Claude Code and API groups are disabled, and a chosen model that cannot run there
-// is flagged (the choice itself is never changed).
+// that runs it (fixed by the format) and host; then what the Setup page last found about that program
+// when it needs setting up (not installed, does not run, not on the jobs' path, or, for a built-in
+// model, not signed in), with the hint under the menus linking to Setup. With a web cutoff the proof
+// roles' Claude Code and API groups are disabled, and a chosen model that cannot run there is flagged
+// (the choice itself is never changed).
 function renderModelChoices() {
   const cutoff = selectedRetrievalMode() === "historical";
   const catalog = state.workflow?.settings?.model_catalog;
@@ -1227,12 +1249,18 @@ function renderModelChoices() {
       }
     }
     if (restricted && provider !== "codex") text += " · not with a web cutoff";
+    const setupSuffix = typeof setupChipSuffix === "function" ? setupChipSuffix(provider, row) : "";
+    if (setupSuffix) {
+      text += setupSuffix;
+      warning = true;
+    }
     // A long API model name is cut off in the closed menu: hovering shows it whole.
     select.title = select.selectedOptions?.[0]?.textContent || "";
     chip.textContent = text;
     chip.dataset.provider = provider || "unknown";
     chip.dataset.state = warning ? "warning" : "";
   }
+  if (typeof renderSetupHints === "function") renderSetupHints();
 }
 
 function renderRetrievalSettings() {
@@ -1335,6 +1363,8 @@ function updateModelSummary() {
   // starts with one and no model name is split. A part longer than a line still wraps (CSS).
   ui.modelSummary.textContent = [...speed, log, ...roles]
     .map((part) => part.replace(/ /g, "\u00a0").replace(/-/g, "-\u2060")).join("\u00a0· ");
+  // The roles' programs may need setting up: the hints under the menus and beside Start say so.
+  if (typeof renderSetupHints === "function") renderSetupHints();
 }
 
 const promptLabels = {
@@ -2348,7 +2378,15 @@ function renderRunOverview() {
   // Why the job needs you; it keeps retrying meanwhile where it can. Written only on change.
   const attention = state.needsAttention && !state.readOnly
     ? `${state.needsAttention.title}: ${state.needsAttention.text}` : "";
-  if (ui.runAttention.textContent !== attention) ui.runAttention.textContent = attention;
+  // A program to install or to sign in again ends with a link to Setup. Written only on change.
+  const setupLinked = Boolean(attention) && ["cli", "login"].includes(state.needsAttention.kind)
+    && typeof setupLink === "function";
+  const attentionKey = `${setupLinked ? "setup:" : ""}${attention}`;
+  if (ui.runAttention.dataset.attention !== attentionKey || (!setupLinked && ui.runAttention.textContent !== attention)) {
+    ui.runAttention.dataset.attention = attentionKey;
+    if (setupLinked) ui.runAttention.replaceChildren(attention, " ", setupLink());
+    else ui.runAttention.textContent = attention;
+  }
   show(ui.runAttention, Boolean(attention));
   renderConventionWarning();
   renderRetrievalOverview();
@@ -4687,6 +4725,11 @@ function syncModelMenus() {
 }
 
 async function refresh() {
+  if (typeof settingUp !== "undefined" && settingUp && !currentJob) {
+    renderBatchNavigation();
+    await loadSetup(true);
+    return;
+  }
   const job = currentJob;
   const batch = currentBatch;
   if (!job && !composingProblem) {
@@ -5640,9 +5683,33 @@ window.onpopstate = () => {
   if (ui.activityPanel.open) ui.activityPanel.close();
   // The batch dialog belongs to the page it was opened on (its Rename names that page's batch).
   if (ui.batchDialog.open) ui.batchDialog.close();
-  currentJob = new URLSearchParams(location.search).get("job") || "";
-  currentBatch = new URLSearchParams(location.search).get("batch") || "";
-  composingProblem = new URLSearchParams(location.search).get("new") === "1" && !currentJob;
+  const params = new URLSearchParams(location.search);
+  const wasComposing = composingProblem && !currentJob;
+  currentJob = params.get("job") || "";
+  const setup = params.get("setup") === "1" && !currentJob;
+  if (setup) {
+    // Setup keeps a New problem draft and the batch it adds to; anything else is left as on the way there.
+    settingUp = true;
+    if (!wasComposing) {
+      currentBatch = params.get("batch") || "";
+      composingProblem = false;
+    }
+    clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+    show(ui.notice, false);
+    renderBatchNavigation();
+    loadSetup(true);
+    return;
+  }
+  settingUp = false;
+  currentBatch = params.get("batch") || "";
+  const composing = params.get("new") === "1" && !currentJob;
+  if (composing && wasComposing) {
+    // Back to the draft from Setup (or between New problem and Models & API): the view switches, the draft stays.
+    composingProblem = true;
+    renderBatchNavigation();
+    return;
+  }
+  composingProblem = composing;
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false);
   refresh();
@@ -5967,12 +6034,12 @@ const apiUi = {
 };
 const apiFormats = {
   openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1", key: "sk-…",
-    help: "Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer, "
-      + "but needs no login. Models load automatically when you save." },
+    help: "Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer "
+      + "(see Setup), but needs no login. Models load automatically when you save." },
   anthropic: { name: "Anthropic", baseUrl: "https://api.anthropic.com", key: "sk-ant-…",
     help: "Runs through Claude Code in a private configuration folder, with subagents and web tools; a claude "
       + "launcher that drops CLAUDE_CONFIG_DIR limits it to bare mode. Claude Code must be installed on this "
-      + "computer, but needs no login. Models load automatically when you save." },
+      + "computer (see Setup), but needs no login. Models load automatically when you save." },
 };
 const roleNames = { review: "statement reviewer", author: "proof author", critic: "independent critic", writer: "LaTeX writer" };
 // The roles whose model the menus replaced with the default model, as one sentence: "The proof author now uses
@@ -6681,10 +6748,11 @@ renderApiForm();
   sidebar.addEventListener("focusout", hideTip);
   sidebar.addEventListener("scroll", hideTip, true);
 
-  // Where the page is: home, a batch, a job, the composer, or Models & API (the composer's
-  // settings on their own, at ?new=1#models).
+  // Where the page is: home, a batch, a job, Setup (?setup=1), the composer, or Models & API (the
+  // composer's settings on their own, at ?new=1#models).
   function route() {
     if (currentJob) return "job";
+    if (typeof settingUp !== "undefined" && settingUp) return "setup";
     if (composingProblem) return location.hash === "#models" ? "models" : "new";
     return currentBatch ? "batch" : "home";
   }
@@ -6708,16 +6776,20 @@ renderApiForm();
 
   async function openComposer(models) {
     // A new New problem page adds to the default batch; an open one keeps its batch, as its draft, when only
-    // the view switches.
+    // the view switches (also back from Setup, which keeps the draft).
     const composing = composingProblem && !currentJob;
     const target = composing ? currentBatch : "";
     const url = `${location.pathname}?new=1${target ? `&batch=${encodeURIComponent(target)}` : ""}${models ? "#models" : ""}`;
     if (composing) {
       // Already composing: switch the view only, so the draft and its settings stay as they are.
-      if (route() !== (models ? "models" : "new")) history.pushState(null, "", url);
+      const from = route();
+      settingUp = false;
+      if (from !== (models ? "models" : "new")) history.pushState(null, "", url);
+      if (from === "setup") renderBatchNavigation();
       sync();
       return;
     }
+    settingUp = false;
     const loading = newProblem();
     if (models) history.replaceState(null, "", url);
     sync();
@@ -6730,6 +6802,7 @@ renderApiForm();
     if (target === "home") await selectBatch("");
     else if (target === "batch") await selectBatch(item.dataset.batchId);
     else if (target === "new" || target === "models") await openComposer(target === "models");
+    else if (target === "setup") await openSetup();
     else if (target === "new-batch") openBatchDialog("create");
     else if (target === "prompts") {
       // Prompt edits apply to the next problem, so they are made from the composer.
@@ -6795,7 +6868,8 @@ renderApiForm();
   }
   function catalog() {
     // The page's own list on the home and batch pages, and wherever the page read it after the sidebar did.
-    const own = (!currentJob && !composingProblem) || batchOptions().adopted > polledAdopted;
+    const own = (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp))
+      || batchOptions().adopted > polledAdopted;
     return own && batchCatalog.length ? batchCatalog : polled || batchCatalog;
   }
   // Finished jobs count as complete ("done": a successful outcome, with the check mark) or
@@ -6959,7 +7033,7 @@ renderApiForm();
   }
 
   function renderTitle(where) {
-    const words = { home: "Overview", new: "New problem", models: "Models & API", batch: "", job: "" };
+    const words = { home: "Overview", new: "New problem", models: "Models & API", setup: "Setup", batch: "", job: "" };
     const text = where === "job" ? (ui.runProblemTitle.textContent || "Problem") : words[where];
     setText(shell.title, text);
     shell.title.hidden = !text;
@@ -7019,12 +7093,12 @@ renderApiForm();
     applyView();
     if (where !== lastRoute) {
       // A new page: the sidebar counts are read again at once outside home and batch pages.
-      if (["job", "new", "models"].includes(where) && lastRoute !== "") polledAt = 0;
+      if (["job", "new", "models", "setup"].includes(where) && lastRoute !== "") polledAt = 0;
       lastRoute = where;
     }
     // A hidden tab reads the counts only for notifications (when they are on), and less often.
     const due = Date.now() - polledAt > (document.hidden ? 30000 : 5000);
-    if (["job", "new", "models"].includes(where) && due && (!document.hidden || attentionAlertsOn())) pollBatches();
+    if (["job", "new", "models", "setup"].includes(where) && due && (!document.hidden || attentionAlertsOn())) pollBatches();
     // Until the first catalog arrives, the placeholders stay (an empty list would claim no batches).
     if (polled !== null || batchCatalog.length) {
       const batches = catalog();
@@ -7038,6 +7112,9 @@ renderApiForm();
     renderTitle(where);
     if (where === "batch") renderFilter();
     renderModelsMeta();
+    // The Setup badge in the sidebar and the Overview's Setup notice follow the page and its last status.
+    renderSetupBadge();
+    renderSetupBanner();
   }
 
   // The shortcut hint names this platform's key.
@@ -7186,6 +7263,1309 @@ ui.input.querySelector("details.advanced")?.addEventListener("toggle", (event) =
   if (event.target.open) loadRunningJobs();
 });
 syncAttentionAlerts();
+
+// Setup page: what this computer has and what new problems and jobs need.
+// The Codex CLI, Claude Code and LaTeX as jobs find them (GET /setup; the server checks them with no model
+// call), one card each: the state, version, location, sign-in and what needs it, then the buttons and the
+// commands to copy. A step (install, update, sign-in) starts only from #setupDialog, which shows its exact
+// command; its output (GET /setup/task) shows in a panel under the cards, with Stop. The same status feeds the
+// sidebar badge, the Overview's Setup notice, the role chips, the hints beside the role menus and Start, and the
+// links from jobs whose program is missing or signed out. Every text is set as text, never as markup. The
+// page's record lives on a function property (setupStore()): the first refresh() and the shell's first sync()
+// run before this part of the file.
+function setupStore() {
+  return (setupStore.value ||= {
+    data: null, missing: false, error: "", actionError: "", checking: 0, refreshedAt: 0,
+    tasks: {}, polls: {}, inflight: {}, panels: {}, hidden: new Set(), dialog: null, timer: 0, opened: {},
+  });
+}
+
+function setupEls() {
+  return (setupEls.value ||= {
+    panel: $("setupPanel"), meta: $("setupMeta"), notice: $("setupNotice"), list: $("setupList"),
+    tasks: $("setupTasks"), check: $("setupCheckButton"), checkText: $("setupCheckText"), limits: $("setupLimits"),
+    badge: $("navSetupBadge"), words: $("navSetupWords"), banner: $("setupBanner"), bannerList: $("setupBannerList"),
+    modelHint: $("modelSetupHint"), startHint: $("startSetupHint"),
+    dialog: $("setupDialog"), dialogTitle: $("setupDialogTitle"), dialogLede: $("setupDialogLede"),
+    dialogCommand: $("setupDialogCommand"), dialogCopy: $("setupDialogCopy"), dialogOptions: $("setupDialogOptions"),
+    dialogLegend: $("setupDialogLegend"), dialogOptionList: $("setupDialogOptionList"),
+    dialogWhat: $("setupDialogWhat"), dialogWarning: $("setupDialogWarning"), dialogThen: $("setupDialogThen"),
+    dialogThenInput: $("setupDialogThenInput"), dialogThenText: $("setupDialogThenText"),
+    dialogError: $("setupDialogError"), dialogCancel: $("setupDialogCancel"), dialogConfirm: $("setupDialogConfirm"),
+  });
+}
+
+// The words the page uses for the programs, the roles and the server's answers.
+function setupWords() {
+  return (setupWords.value ||= {
+    names: { codex: "Codex CLI", claude: "Claude Code", latex: "LaTeX" },
+    the: { codex: "The Codex CLI", claude: "Claude Code", latex: "LaTeX" },
+    glyphs: { codex: "CX", claude: "CC", latex: "TeX" },
+    purposes: { codex: "Runs the GPT models", claude: "Runs the Claude models", latex: "Makes the PDF" },
+    logins: { codex: "ChatGPT", claude: "Claude" },
+    roles: { review: "Statement reviewer", author: "Proof author", critic: "Independent critic", writer: "LaTeX writer" },
+    missing: "This TCS Prover server has no Setup page. Restart TCS Prover to update it, or open it from its own launch link.",
+    gone: "This Setup step is no longer available (TCS Prover may have restarted).",
+  });
+}
+
+function setupElement(tag, className = "", text = "") {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}
+
+// Keyboard focus across redraws. Each control of the cards carries a key that a redraw keeps
+// (data-setup-focus: "codex:update", "codex:install:summary", "claude:copy:<command>", ...). When the cards are
+// drawn again, during a check, after a step or after a refusal, the control that had the focus gets it back; one
+// that is gone hands it to the first button of its card (after Use it for jobs, the buttons that replace it),
+// else to the card (which has a key too). A control that waits (a check runs, a request is on its way) is
+// aria-disabled, never disabled, so it keeps the focus meanwhile.
+function setupFocusKey(node, key) {
+  node.dataset.setupFocus = key;
+  return node;
+}
+
+function setupFocusedKey() {
+  return document.activeElement?.dataset?.setupFocus || "";
+}
+
+function setupFocusLost() {
+  const active = document.activeElement;
+  return !active || active === document.body || active.isConnected === false;
+}
+
+function setupRestoreFocus(key) {
+  const list = setupEls().list;
+  if (!key || !list) return false;
+  const usable = (node) => node && !node.disabled && !node.hidden;
+  const nodes = [...list.querySelectorAll("[data-setup-focus]")];
+  const card = list.querySelector(`[data-program="${key.split(":")[0]}"]`);
+  const target = nodes.find((node) => node.dataset.setupFocus === key && usable(node))
+    || (card ? [...card.querySelectorAll("button")].find(usable) : null) || card;
+  if (!target) return false;
+  target.focus();
+  return true;
+}
+
+// A waiting control: it keeps the focus, looks disabled and does nothing until it may run again.
+function setupWaiting(button, waiting) {
+  if (waiting) button.setAttribute("aria-disabled", "true");
+  else button.removeAttribute("aria-disabled");
+}
+
+// Whether the Setup page is on screen.
+function setupOnScreen() {
+  return typeof settingUp !== "undefined" && settingUp && !currentJob;
+}
+
+// GET and POST to /setup*, outside the job request queue (like the API model calls). A refusal keeps the
+// server's words, its status and its answer (a 409 carries the new status, or the step that runs).
+async function setupRequest(path, body) {
+  const options = { headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" };
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw Object.assign(new Error(data.error || `The request failed (${response.status}).`),
+      { status: response.status, data });
+  }
+  return data;
+}
+
+// Read the status: "refresh" (or true) checks every program again (opening Setup, Check again, a focus on
+// Setup); "poll" reads the server's last check with fresh job data and starts no process (a server that has
+// not checked yet, after a restart, leaves this page its own last check); the first load of any page reads
+// the last check when it is younger than ten minutes, else checks.
+async function loadSetup(refresh = false) {
+  const store = setupStore();
+  const kind = refresh === true ? "refresh" : typeof refresh === "string" ? refresh : "load";
+  if (kind === "poll" && (store.checking || store.missing)) {
+    scheduleSetupPoll();
+    return;
+  }
+  if (kind === "refresh") {
+    store.checking += 1;
+    store.refreshedAt = Date.now();
+  }
+  if (setupOnScreen()) renderSetup();
+  try {
+    let data = await setupRequest(kind === "refresh" ? "/setup?refresh=1" : kind === "poll" ? "/setup?cached=1" : "/setup");
+    // A server with no check yet (it restarted) answers a poll without one: the page keeps its own last check
+    // of the programs, with the fresh job data, until Setup opens or the page loads again.
+    if (kind === "poll" && !data.checkedAt && store.data?.checkedAt) {
+      data = { ...data, checkedAt: store.data.checkedAt, programs: store.data.programs };
+    }
+    // An answer from an older check never replaces a newer one (a poll can overtake a check).
+    if (!store.data || !data.checkedAt || !store.data.checkedAt || data.checkedAt >= store.data.checkedAt) store.data = data;
+    store.missing = false;
+    store.error = "";
+  } catch (error) {
+    if (error.status === 404) store.missing = true;
+    else store.error = error.message;
+  } finally {
+    if (kind === "refresh") store.checking = Math.max(0, store.checking - 1);
+  }
+  try {
+    adoptSetupStatus();
+  } catch (error) {
+    // An answer the page cannot draw says so; the next read still comes.
+    setupShowProblem(`The Setup page could not show the programs (${error?.name || "Error"}). Click Check again.`);
+  } finally {
+    scheduleSetupPoll();
+  }
+}
+
+// A notice at the top of Setup that needs nothing else of the page drawn.
+function setupShowProblem(text) {
+  const notice = setupEls().notice;
+  if (!notice) return;
+  notice.textContent = text;
+  notice.hidden = !text;
+}
+
+// While Setup is on screen (and no dialog is open) the status is read every 5 s, elsewhere every minute,
+// from the server's last check: neither starts a process.
+function scheduleSetupPoll() {
+  const store = setupStore();
+  clearTimeout(store.timer);
+  if (store.missing) return;
+  store.timer = setTimeout(() => {
+    if (document.hidden || setupEls().dialog?.open) scheduleSetupPoll();
+    else loadSetup("poll");
+  }, setupOnScreen() ? 5000 : 60000);
+}
+
+// A new status: follow the steps it names (a step another tab started, or one this page has not read yet),
+// then draw everything that uses it.
+function adoptSetupStatus() {
+  const store = setupStore();
+  for (const program of ["codex", "claude"]) {
+    const summary = store.data?.programs?.[program]?.task;
+    if (!summary) continue;
+    const known = store.tasks[program];
+    // A step this page has not read yet, or one it still follows; a step it saw end is never read again.
+    const fresh = !known || known.id !== summary.id;
+    const following = !fresh && ["running", "waiting"].includes(known.state);
+    const reading = store.polls[program] || store.inflight[program] === summary.id;
+    if ((fresh || following) && !reading) pollSetupTask(program, summary.id);
+  }
+  if (setupOnScreen()) renderSetup();
+  renderSetupBadge();
+  renderSetupBanner();
+  if (composingProblem && !currentJob && typeof renderModelChoices === "function") renderModelChoices();
+  else renderSetupHints();
+}
+
+async function openSetup() {
+  const fromJob = Boolean(currentJob);
+  const already = setupOnScreen();
+  currentJob = "";
+  settingUp = true;
+  // A New problem draft stays, with the batch it adds to (see openComposer); otherwise Setup belongs to no batch.
+  if (!composingProblem) currentBatch = "";
+  if (!already) history.pushState(null, "", `${location.pathname}?setup=1`);
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+  if (fromJob) clearJobView();
+  show(ui.notice, false);
+  renderBatchNavigation();
+  await loadSetup(true);
+}
+
+// "Open Setup": a link that opens the Setup page in place (a click with a modifier opens it as a link does).
+function setupLink(text = "Open Setup") {
+  const link = setupElement("a", "setup-link", text);
+  link.href = "/?setup=1";
+  link.dataset.setupLink = "";
+  return link;
+}
+
+// --- What needs each program ---------------------------------------------------------------------------------
+
+// The New problem roles of the form in this tab, while it is open (else null): each role's stage, model and
+// program (an API model's program follows its format), and whether it needs a sign-in (a built-in model).
+function setupFormRoles() {
+  const catalog = state?.workflow?.settings?.model_catalog;
+  if (!(composingProblem && !currentJob && state.phase === "input" && Array.isArray(catalog))) return null;
+  const stages = selectedWorkflowStages();
+  return ["review", "author", "critic", "writer"].map((role) => {
+    const select = ui[`${role}Model`], model = select?.value || "";
+    const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
+    const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
+    const label = row?.label || String(select?.selectedOptions?.[0]?.textContent || model).replace(/ — default$/, "");
+    return { role, on: Boolean(stages[role === "writer" ? "writing" : role]), model, modelLabel: label, program,
+      signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
+  });
+}
+
+// Per program: the New problem roles that use it (the form when it is open, else the default settings), the jobs
+// that can still run with it, the API connections of its format, and whether it is needed and must be signed in.
+function setupNeeds() {
+  const data = setupStore().data;
+  const form = setupFormRoles();
+  const roles = (form || data?.defaults?.roles || []).filter((row) => row.on && row.program);
+  const needs = {};
+  for (const program of ["codex", "claude", "latex"]) {
+    const used = program === "latex" ? roles.filter((row) => row.role === "writer")
+      : roles.filter((row) => row.program === program);
+    const jobs = data?.jobs?.[program] || { count: 0, running: 0, signIn: 0, items: [] };
+    needs[program] = { roles: used, rolesSignIn: used.filter((row) => row.signIn), jobs, form: Boolean(form),
+      connections: program === "latex" ? [] : data?.connections?.[program] || [],
+      needed: used.length > 0 || jobs.count > 0,
+      signIn: used.some((row) => row.signIn) || Number(jobs.signIn || 0) > 0 };
+  }
+  return needs;
+}
+
+function setupJoin(words) {
+  return words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : words[0] || "";
+}
+
+// "Statement reviewer, Proof author and LaTeX writer (GPT 6.1 Sol)"; one model for all four roles: "all four
+// roles (GPT 6.1 Sol)"; an API model: "Independent critic (API connection “Lab key”, no sign-in needed)".
+function setupRoleGroups(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    if (!groups.has(row.model)) groups.set(row.model, []);
+    groups.get(row.model).push(row);
+  }
+  const words = setupWords();
+  return [...groups.values()].map((members) => {
+    const row = members[0];
+    const names = members.length === 4 ? "all four roles" : setupJoin(members.map((item) => words.roles[item.role]));
+    return row.signIn ? `${names} (${row.modelLabel})`
+      : `${names} (API connection “${row.connection || row.modelLabel}”, no sign-in needed)`;
+  }).join("; ");
+}
+
+// The programs that need setting up for what new problems and jobs use: {program, kind, title}. An unknown
+// sign-in never counts; nothing counts once the server said it has no Setup page.
+function setupProblems(needs = setupNeeds()) {
+  const store = setupStore(), data = store.data, words = setupWords();
+  if (!data || store.missing) return [];
+  const problems = [];
+  for (const program of ["codex", "claude"]) {
+    const info = data.programs?.[program], need = needs[program];
+    if (!info) continue;
+    const name = words.names[program];
+    if (need.needed && info.state === "missing") problems.push({ program, kind: "install", title: `${name} not installed` });
+    else if (need.needed && info.state === "broken") problems.push({ program, kind: "broken", title: `${name} does not run` });
+    else if (need.needed && info.state === "offpath") problems.push({ program, kind: "offpath", title: `Jobs cannot find ${name}` });
+    else if (need.signIn && info.state === "works" && info.signIn?.state === "signed-out") {
+      problems.push({ program, kind: "signin", title: `${name} not signed in` });
+    }
+  }
+  const latex = data.programs?.latex;
+  if (latex && needs.latex.needed && ["missing", "broken"].includes(latex.state)) {
+    problems.push({ program: "latex", kind: "latex", title: latex.state === "missing" ? "LaTeX not found" : "LaTeX does not run" });
+  }
+  return problems;
+}
+
+// After a role's program under its menu: what Setup found, when the program needs setting up.
+function setupChipSuffix(provider, row) {
+  const store = setupStore(), data = store.data;
+  if (!data || store.missing) return "";
+  const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] : provider;
+  const info = data.programs?.[program];
+  if (!info) return "";
+  if (info.state === "missing") return " · not installed";
+  if (info.state === "broken") return " · does not run";
+  if (info.state === "offpath") return " · not on the jobs' path";
+  if (info.state === "works" && info.signIn?.state === "signed-out" && provider !== "api") return " · not signed in";
+  return "";
+}
+
+// The sidebar badge: how many programs need setting up (read out in words).
+function renderSetupBadge() {
+  const els = setupEls();
+  if (!els.badge) return;
+  const count = setupProblems().length;
+  const text = count ? String(count) : "";
+  if (els.badge.textContent !== text) els.badge.textContent = text;
+  els.badge.hidden = !count;
+  const words = count ? `, ${count} ${count === 1 ? "program needs" : "programs need"} setting up` : "";
+  if (els.words && els.words.textContent !== words) els.words.textContent = words;
+}
+
+// Who uses a program with a problem, for the Overview's notice.
+function setupProblemText(problem, needs) {
+  if (problem.kind === "latex") return "Jobs cannot make the PDF without it.";
+  const need = needs[problem.program];
+  const count = (value) => `${value} ${value === 1 ? "job" : "jobs"}`;
+  if (problem.kind === "signin") {
+    const roles = need.rolesSignIn.length > 0, jobs = Number(need.jobs.signIn || 0);
+    const who = roles && jobs ? `New problems and ${count(jobs)} use` : roles ? "New problems use"
+      : `${count(jobs)} ${jobs === 1 ? "uses" : "use"}`;
+    return `${who} your ${setupWords().logins[problem.program]} login through it.`;
+  }
+  const roles = need.roles.length > 0, jobs = need.jobs.count;
+  return roles && jobs ? `New problems and ${count(jobs)} use it.` : roles ? "New problems use it."
+    : `${count(jobs)} ${jobs === 1 ? "uses" : "use"} it.`;
+}
+
+// The Overview: one line per program that needs setting up, with Open Setup.
+function renderSetupBanner() {
+  const els = setupEls();
+  if (!els.banner || !els.bannerList) return;
+  const needs = setupNeeds();
+  const items = setupProblems(needs).map((problem) => ({ ...problem, text: setupProblemText(problem, needs) }));
+  els.banner.hidden = !items.length;
+  const signature = JSON.stringify(items);
+  if (els.bannerList.dataset.signature === signature) return;
+  els.bannerList.dataset.signature = signature;
+  els.bannerList.replaceChildren(...items.map((item) => {
+    const row = setupElement("li", `attention-item setup-item ${item.kind}`);
+    row.append(setupElement("strong", "", item.title), setupElement("span", "", item.text), setupLink());
+    return row;
+  }));
+}
+
+// Under the role menus and beside Start: one sentence per program the form's selected roles need set up.
+function renderSetupHints() {
+  const els = setupEls();
+  if (!els.modelHint && !els.startHint) return;
+  const needs = setupNeeds(), words = setupWords();
+  const roleNames = (rows) => `the ${setupJoin(rows.map((row) => words.roles[row.role].toLowerCase()))
+    .replace("latex writer", "LaTeX writer")}`;
+  const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
+    const need = needs[problem.program], info = setupStore().data.programs[problem.program], name = words.the[problem.program];
+    if (problem.kind === "latex") {
+      return need.roles.length ? [problem.title === "LaTeX not found" ? "LaTeX was not found, so Writing & polishing cannot make the PDF."
+        : "LaTeX does not run, so Writing & polishing cannot make the PDF."] : [];
+    }
+    if (problem.kind === "signin") {
+      return need.rolesSignIn.length ? [`${name} is not signed in; ${roleNames(need.rolesSignIn)} ${need.rolesSignIn.length === 1 ? "uses" : "use"} `
+        + `your ${words.logins[problem.program]} login through it.`] : [];
+    }
+    if (!need.roles.length) return [];
+    if (problem.kind === "offpath") return [`${name} is installed in ${info.shownOffPath || info.offPath}, but jobs do not find it there.`];
+    const verb = need.roles.length === 1 ? "uses" : "use";
+    return [problem.kind === "install" ? `${name} is not installed on this computer; ${roleNames(need.roles)} ${verb} it.`
+      : `${name} does not run on this computer; ${roleNames(need.roles)} ${verb} it.`];
+  });
+  for (const [element, extra] of [[els.modelHint, ""], [els.startHint, " You can start now: the job retries every minute until it works."]]) {
+    if (!element) continue;
+    const text = sentences.length ? `${sentences.join(" ")}${extra}` : "";
+    if (element.dataset.text !== text) {
+      element.dataset.text = text;
+      element.replaceChildren(...(text ? [`${text} `, setupLink()] : []));
+    }
+    element.hidden = !text;
+  }
+}
+
+// --- The page --------------------------------------------------------------------------------------------------
+
+// A program's state: what the server last checked, else "checking", or "unknown" once a check failed with no
+// earlier result (the page then never keeps saying "Checking…").
+function setupState(info) {
+  const store = setupStore();
+  return info?.state || (store.error && !store.checking ? "unknown" : "checking");
+}
+
+// A program's state as its pill says it: [words, tone].
+function setupPill(program, info, need, task) {
+  if (task && ["running", "waiting"].includes(task.state)) {
+    return [{ install: "Installing…", update: "Updating…", "sign-in": "Signing in…" }[task.action] || "Working…", "running"];
+  }
+  const state = setupState(info);
+  if (state === "checking") return ["Checking…", "stopped"];
+  if (state === "unknown") return ["Could not check", "stopped"];
+  if (program === "latex") {
+    return state === "works" ? ["Found", "done"] : state === "broken" ? ["Does not run", "failed"]
+      : ["Not found", need.needed ? "failed" : "stopped"];
+  }
+  return { works: ["Installed", "done"], broken: ["Does not run", "failed"], offpath: ["Jobs cannot find it", "waiting"],
+    missing: ["Not installed", need.needed ? "failed" : "stopped"] }[state] || ["Could not check", "stopped"];
+}
+
+// "Codex CLI 0.160.0", "Claude Code not installed", "LaTeX found", for the line under the page title.
+function setupMetaPart(program, info, task) {
+  const name = setupWords().names[program];
+  if (task && ["running", "waiting"].includes(task.state)) {
+    return `${name} ${{ install: "installing…", update: "updating…", "sign-in": "signing in…" }[task.action] || "working…"}`;
+  }
+  const state = setupState(info);
+  if (state === "unknown") return `${name} could not be checked`;
+  if (program === "latex") return state === "works" ? "LaTeX found" : state === "broken" ? "LaTeX does not run" : "LaTeX not found";
+  if (state === "works") return `${name} ${(/\d+(?:\.\d+)+/.exec(info.version || "") || [""])[0] || "installed"}`.trim();
+  return `${name} ${{ missing: "not installed", broken: "does not run", offpath: "not on the jobs' path" }[state] || "not checked"}`;
+}
+
+function setupFact(label, content, className = "") {
+  const row = setupElement("div"), term = setupElement("dt", "", label), value = setupElement("dd", className);
+  value.append(...content);
+  row.append(term, value);
+  return row;
+}
+
+function setupMono(text) {
+  return setupElement("span", "setup-mono", text);
+}
+
+function setupNone(text = "—") {
+  return setupElement("span", "setup-none", text);
+}
+
+// Remember a disclosure the user opened or closed, so the next rebuild of the cards keeps it.
+function setupDetails(key, summaryText, open, className = "setup-commands") {
+  const store = setupStore();
+  const details = setupElement("details", className), summary = setupElement("summary", "", summaryText);
+  details.dataset.key = key;
+  setupFocusKey(summary, `${key}:summary`);
+  details.open = key in store.opened ? store.opened[key] : open;
+  // Only your own clicks are remembered (a click on the summary toggles it; Enter and Space click it too).
+  summary.addEventListener("click", () => { store.opened[key] = !details.open; });
+  details.append(summary);
+  return details;
+}
+
+// Commands to copy: a label, the command in a well, Copy; or a link to a vendor's page. ``scope`` (the program)
+// keys their controls for the focus.
+function setupCommandList(rows, help = "", scope = "") {
+  const list = setupElement("div", "setup-command-list");
+  for (const row of rows) {
+    const line = setupElement("div", "setup-command");
+    const body = setupElement("div", "setup-command-body");
+    if (row.command) {
+      body.append(setupElement("code", "", row.command));
+    } else if (row.link && /^https:\/\//.test(row.link)) {
+      const text = setupElement("span", "setup-command-text", `${row.text || "Open"} `);
+      const anchor = setupElement("a", "", row.link.replace(/^https:\/\//, ""));
+      anchor.href = row.link;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      setupFocusKey(anchor, `${scope}:link:${row.link}`);
+      text.append(anchor);
+      body.append(text);
+    }
+    if (row.note) body.append(setupElement("span", "setup-command-note", row.note));
+    line.append(setupElement("span", "setup-command-label", row.label), body);
+    if (row.command) {
+      const copy = setupElement("button", "ghost compact setup-copy", "Copy");
+      copy.type = "button";
+      copy.setAttribute("aria-label", `Copy: ${row.command}`);
+      setupFocusKey(copy, `${scope}:copy:${row.command}`);
+      copy.onclick = () => copyText(copy, row.command);
+      line.append(copy);
+    }
+    list.append(line);
+  }
+  if (help) list.append(setupElement("p", "help setup-command-help", help));
+  return list;
+}
+
+// "What needs it": the New problem roles, the jobs (each a link), the API connections.
+function setupNeedList(program, need, problem) {
+  const list = setupElement("ul", "setup-needs");
+  if (need.roles.length) {
+    list.append(setupElement("li", "", program === "latex" ? "New problem: Writing & polishing"
+      : `New problem: ${setupRoleGroups(need.roles)}`));
+  }
+  const jobs = need.jobs;
+  if (jobs.count) {
+    const item = setupElement("li");
+    const running = Number(jobs.running || 0);
+    const details = setupDetails(`${program}:jobs`, `${jobs.count} ${jobs.count === 1 ? "job" : "jobs"}`
+      + (running ? ` (${running} running now)` : ""), Boolean(problem), "setup-jobs");
+    const rows = setupElement("ul");
+    for (const job of jobs.items || []) {
+      const row = setupElement("li"), link = setupElement("a", "", job.title || job.runId);
+      setupFocusKey(link, `${program}:job:${job.runId}`);
+      const query = new URLSearchParams({ job: job.runId });
+      if (job.batchId) query.set("batch", job.batchId);
+      link.href = `/?${query}`;
+      link.onclick = (event) => {
+        if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        openAttentionJob(job.runId);
+      };
+      row.append(link);
+      if (job.status) row.append(setupElement("span", "setup-job-state", ` · ${job.status}`));
+      rows.append(row);
+    }
+    details.append(rows);
+    item.append(details);
+    list.append(item);
+  }
+  if (need.connections.length) {
+    list.append(setupElement("li", "", `API connections: ${need.connections.map((label) => `“${label}”`).join(", ")} `
+      + "(no sign-in needed)"));
+  }
+  if (!list.children.length) list.append(setupElement("li", "setup-none", "Nothing uses it now."));
+  return list;
+}
+
+// One button of a card; a button that cannot run now says why right under it (never only in a tooltip).
+function setupButton(program, key, label, tone, available, reason, onclick) {
+  const wrap = setupElement("div", "setup-action");
+  const button = setupElement("button", `${tone} compact`, label);
+  button.type = "button";
+  button.dataset.key = `${program}:${key}`;
+  setupFocusKey(button, `${program}:${key}`);
+  button.disabled = !available;
+  // While the programs are checked again the buttons wait, and keep the focus.
+  setupWaiting(button, setupStore().checking > 0);
+  button.onclick = (event) => {
+    if (button.getAttribute("aria-disabled") === "true" || setupStore().checking > 0) return;
+    onclick(event, button);
+  };
+  wrap.append(button);
+  if (!available && reason) {
+    const why = setupElement("p", "help setup-reason", reason);
+    why.id = `setupReason-${program}-${key}`;
+    button.setAttribute("aria-describedby", why.id);
+    wrap.append(why);
+  }
+  return wrap;
+}
+
+function setupProgramCard(program, info, need, task, problem) {
+  const store = setupStore(), data = store.data, words = setupWords();
+  const running = Boolean(task && ["running", "waiting"].includes(task.state));
+  const state = setupState(info);
+  const [pillText, pillTone] = setupPill(program, info, need, task);
+  const signedOut = state === "works" && info.signIn?.state === "signed-out";
+  const tone = !running && signedOut && need.signIn ? "waiting" : pillTone;
+  const card = setupElement("article", `setup-card card tone-${tone}`);
+  card.dataset.program = program;
+  card.tabIndex = -1;  // Where the focus goes when the control that had it is gone.
+  setupFocusKey(card, `${program}:card`);
+  card.setAttribute("role", "listitem");
+  card.setAttribute("aria-labelledby", `setupName-${program}`);
+  const head = setupElement("header", "setup-card-head"), glyph = setupElement("span", "setup-glyph", words.glyphs[program]);
+  glyph.setAttribute("aria-hidden", "true");
+  const title = setupElement("div", "setup-card-title"), heading = setupElement("h2", "", words.names[program]);
+  heading.id = `setupName-${program}`;
+  title.append(heading, setupElement("p", "", words.purposes[program]));
+  head.append(glyph, title, setupElement("span", `job-status tone-${pillTone} setup-pill`, pillText));
+  const facts = setupElement("dl", "setup-facts");
+  const installing = running && task.action === "install";
+  // Version (or why it does not run, or why it could not be checked), then where jobs find it and what made it.
+  facts.append(setupFact("Version", [state === "works" ? setupMono(info.version)
+    : ["broken", "unknown"].includes(state) && info?.problem ? setupElement("span", "setup-problem", info.problem)
+    : setupNone()]));
+  const location = [];
+  if (installing) location.push(setupMono(info?.target || ""), setupElement("span", "setup-sub", "after the install"));
+  else if (["works", "broken"].includes(state)) location.push(setupMono(info.shownPath), setupElement("span", "setup-sub", info.kindText));
+  else if (state === "offpath") location.push(setupMono(`${info.shownOffPath}`), setupElement("span", "setup-sub", "not on TCS Prover's path"));
+  else if (state === "missing") location.push(setupElement("span", "", "Not on this computer"));
+  else location.push(setupNone());
+  facts.append(setupFact("Location", location));
+  // The sign-in, with why it matters here.
+  const signIn = info?.signIn || {};
+  let signLine;
+  if (installing && task.signInAfter) signLine = [setupElement("span", "", "Starts after the install, as you chose.")];
+  else if (state !== "works") signLine = [setupNone(state === "missing" ? "After it is installed" : "—")];
+  else if (signIn.state === "signed-in") signLine = [setupElement("span", "job-status tone-done", "Signed in"), setupElement("span", "", signIn.text)];
+  else if (signIn.state === "signed-out") {
+    const login = words.logins[program];
+    const detail = need.rolesSignIn.length ? `New problems use your ${login} login`
+      : need.jobs.signIn ? `${need.jobs.signIn} ${need.jobs.signIn === 1 ? "job uses" : "jobs use"} your ${login} login`
+      : need.connections.length || need.needed ? "Not needed: API connections need no sign-in." : "";
+    signLine = [setupElement("span", `job-status tone-${need.signIn ? "waiting" : "stopped"}`, "Not signed in"),
+      ...(detail ? [setupElement("span", "", detail)] : [])];
+  } else {
+    signLine = [setupElement("span", "job-status tone-stopped", "Could not check"), ...(signIn.text ? [setupElement("span", "", signIn.text)] : [])];
+  }
+  facts.append(setupFact("Sign-in", signLine, "setup-dd-status"), setupFact("Needed by", [setupNeedList(program, need, problem)]));
+  // The buttons (none while TCS Prover runs as administrator), or the running step.
+  const actions = setupElement("div", "setup-card-actions");
+  const planned = info?.actions || {};
+  if (running) {
+    const busy = setupElement("p", "setup-card-busy");
+    const elapsed = setupMono(setupElapsed(task));
+    elapsed.dataset.elapsed = program;
+    const link = setupElement("a", "", task.action === "sign-in" ? "Sign-in and Stop below" : "Output and Stop below");
+    link.href = `#setupTask-${program}`;
+    setupFocusKey(link, `${program}:busy`);
+    busy.append(elapsed, " · ", link);
+    actions.append(busy);
+  } else if (!data?.elevated) {
+    if (planned.useFolder?.shown) {
+      actions.append(setupButton(program, "use-folder", "Use it for jobs", "primary", planned.useFolder.available, "",
+        (event, button) => useSetupFolder(program, button)));
+    }
+    if (planned.install?.shown) {
+      const primary = need.needed && state === "missing";
+      actions.append(setupButton(program, "install", "Install", primary ? "primary" : "secondary", planned.install.available,
+        planned.install.reason, () => openSetupDialog(program, "install")));
+    }
+    if (planned.update?.shown) {
+      actions.append(setupButton(program, "update", "Update", "secondary", planned.update.available, planned.update.reason,
+        () => openSetupDialog(program, "update")));
+    }
+    if (planned.signIn?.shown) {
+      const label = planned.signIn.label || "Sign in";
+      const tone = label !== "Sign in" ? "ghost" : need.signIn && signedOut ? "primary" : "secondary";
+      actions.append(setupButton(program, "sign-in", label, tone, planned.signIn.available, planned.signIn.reason,
+        () => openSetupDialog(program, "sign-in")));
+    }
+  }
+  // Notes, then the commands to copy; a group is open when the step that is needed has no button that runs.
+  const ways = setupElement("div", "setup-card-ways");
+  for (const note of info?.notes || []) ways.append(setupElement("p", "help setup-note", note));
+  const groups = {};
+  for (const row of info?.commands || []) (groups[row.group] ||= []).push(row);
+  const summaries = { install: planned.install?.shown ? "Other ways to install" : "How to install", update: "How to update",
+    "sign-in": "Other ways to sign in", sandbox: "Install the sandbox tools" };
+  for (const [group, rows] of Object.entries(groups)) {
+    const open = running ? false
+      : group === "install" ? need.needed && ["missing", "broken"].includes(state) && !planned.install?.available
+      : group === "sign-in" ? (need.signIn && signedOut && !planned.signIn?.available) || task?.openCommands === "sign-in"
+      : group === "sandbox";
+    const details = setupDetails(`${program}:${group}`, summaries[group] || group, Boolean(open));
+    details.append(setupCommandList(rows, "", program));
+    ways.append(details);
+  }
+  card.append(head, facts, actions, ways);
+  return card;
+}
+
+function setupLatexCard(info, need, problem) {
+  const words = setupWords();
+  const state = setupState(info);
+  const [pillText, pillTone] = setupPill("latex", info, need, null);
+  const card = setupElement("article", `setup-card card tone-${pillTone}`);
+  card.dataset.program = "latex";
+  card.tabIndex = -1;
+  setupFocusKey(card, "latex:card");
+  card.setAttribute("role", "listitem");
+  card.setAttribute("aria-labelledby", "setupName-latex");
+  const head = setupElement("header", "setup-card-head"), glyph = setupElement("span", "setup-glyph", words.glyphs.latex);
+  glyph.setAttribute("aria-hidden", "true");
+  const title = setupElement("div", "setup-card-title"), heading = setupElement("h2", "", "LaTeX");
+  heading.id = "setupName-latex";
+  title.append(heading, setupElement("p", "", words.purposes.latex));
+  head.append(glyph, title, setupElement("span", `job-status tone-${pillTone} setup-pill`, pillText));
+  const tools = Array.isArray(info?.tools) ? info.tools : [];
+  const facts = setupElement("dl", "setup-facts");
+  const versions = tools.filter((tool) => tool.version).map((tool) => tool.version).join(" · ");
+  facts.append(setupFact("Version", [["broken", "unknown"].includes(state) && info?.problem
+    ? setupElement("span", "setup-problem", info.problem) : versions ? setupMono(versions) : setupNone()]));
+  const found = tools.filter((tool) => tool.path);
+  let where;
+  if (state === "missing" && !found.length) where = [setupElement("span", "", `Not found: ${info.problem}`)];
+  else if (["checking", "unknown"].includes(state)) where = [setupNone()];
+  else {
+    const folders = new Set(found.map((tool) => tool.shownPath.slice(0, tool.shownPath.lastIndexOf("/") + 1)));
+    const text = found.length === 2 && folders.size === 1
+      ? `${found[0].shownPath} and ${found[1].name}` : found.map((tool) => tool.shownPath).join(" and ");
+    where = [setupMono(text)];
+    if (found.some((tool) => !tool.onPath)) where.push(setupElement("span", "setup-sub", "found in a standard TeX folder, not on PATH"));
+    if (state === "missing") where.push(setupElement("span", "setup-sub", info.problem));
+  }
+  facts.append(setupFact("Location", where), setupFact("Needed by", [setupNeedList("latex", need, problem)]));
+  const ways = setupElement("div", "setup-card-ways");
+  const details = setupDetails("latex:install", "How to install", need.needed && ["missing", "broken"].includes(state));
+  details.append(setupCommandList(info?.commands || [], info?.help || "", "latex"));
+  ways.append(details);
+  card.append(head, facts, setupElement("div", "setup-card-actions"), ways);
+  return card;
+}
+
+function setupElapsed(task) {
+  if (!task) return "";
+  const live = ["running", "waiting"].includes(task.state);
+  const seconds = Math.max(0, Math.floor(Number(task.elapsedSeconds || 0) + (live ? (Date.now() - (task.receivedAt || Date.now())) / 1000 : 0)));
+  const hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60), rest = seconds % 60;
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`
+    : `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function renderSetup() {
+  const els = setupEls(), store = setupStore(), data = store.data, words = setupWords();
+  if (!els.panel) return;
+  // The line under the title: each program, and when they were checked ("Could not check" once a first check
+  // failed, never "Checking…" that goes on).
+  const parts = store.checking ? ["Checking…"] : !data ? [store.error ? "Could not check" : "Checking…"] : [
+    ...["codex", "claude", "latex"].map((program) => setupMetaPart(program, data.programs?.[program], store.tasks[program])),
+    `checked ${data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}`];
+  if (store.missing) parts.splice(0, parts.length);
+  const meta = parts.join("|");
+  if (els.meta.dataset.key !== meta) {
+    els.meta.dataset.key = meta;
+    els.meta.replaceChildren(...parts.map((part) => setupElement("span", "", part)));
+  }
+  if (els.check) {
+    // While a check runs Check again waits (and keeps the focus); it is disabled only without a Setup page.
+    els.check.disabled = store.missing;
+    setupWaiting(els.check, store.checking > 0 && !store.missing);
+    if (els.checkText) els.checkText.textContent = store.checking ? "Checking…" : "Check again";
+  }
+  const notice = store.missing ? words.missing : data?.elevated ? data.elevatedText
+    : store.actionError || (store.error ? `TCS Prover could not check the programs: ${store.error.replace(/\.$/, "")}. Click Check again.` : "");
+  if (els.notice.textContent !== notice) els.notice.textContent = notice;
+  els.notice.hidden = !notice;
+  if (data?.limits && els.limits) {
+    const answer = Number(data.limits.answerSeconds || 120);
+    const limits = `Each step's output keeps its newest ${Number(data.limits.keptLines).toLocaleString("en-US")} lines, and each `
+      + `check waits at most ${data.limits.checkSeconds} seconds for a program to answer. Installs, updates and sign-ins `
+      + `have no time limit (in a Codex sign-in, each answer of the Codex CLI must come within ${answer} seconds); `
+      + "Stop ends them.";
+    if (els.limits.textContent !== limits) els.limits.textContent = limits;
+  }
+  els.list.hidden = store.missing;
+  els.tasks.hidden = store.missing;
+  if (store.missing) {
+    els.list.replaceChildren();
+    els.tasks.replaceChildren();
+    store.panels = {};
+    return;
+  }
+  const needs = setupNeeds();
+  const problems = Object.fromEntries(setupProblems(needs).map((problem) => [problem.program, problem]));
+  const steps = Object.fromEntries(["codex", "claude"].map((program) => {
+    const task = store.tasks[program];
+    return [program, task ? [task.id, task.state, task.action, task.signInAfter, task.openCommands] : null];
+  }));
+  const signature = JSON.stringify([data?.programs, data?.elevated, needs, steps, store.checking > 0]);
+  if (els.list.dataset.signature !== signature) {
+    els.list.dataset.signature = signature;
+    // The control with the focus gets it back after the redraw (see setupRestoreFocus).
+    const focused = setupFocusedKey();
+    els.list.replaceChildren(
+      setupProgramCard("codex", data?.programs?.codex, needs.codex, store.tasks.codex, problems.codex),
+      setupProgramCard("claude", data?.programs?.claude, needs.claude, store.tasks.claude, problems.claude),
+      setupLatexCard(data?.programs?.latex, needs.latex, problems.latex));
+    if (focused) setupRestoreFocus(focused);
+  }
+  renderSetupTasks();
+}
+
+// --- Steps: the panel under the cards ----------------------------------------------------------------------------
+
+// A step's latest answer, merged into what the page keeps (the newest lines, as the server keeps them).
+function mergeSetupTask(program, task) {
+  const store = setupStore();
+  const known = store.tasks[program];
+  const kept = Number(task.keptLines || 2000);
+  // The answer holds the lines from (next - their count); a line already shown is never added twice.
+  const start = Number(task.next || 0) - task.lines.length;
+  let lines;
+  if (!known || known.id !== task.id || start > known.next) lines = task.lines.slice(-kept);
+  else lines = known.lines.concat(task.lines.slice(Math.max(0, known.next - start))).slice(-kept);
+  // The sign-in an install was confirmed with keeps the install's result above its own.
+  const before = known?.id === task.id ? known.before
+    : known?.nextTask === task.id ? { title: known.title, result: known.result } : null;
+  store.tasks[program] = { ...task, lines, before, receivedAt: Date.now() };
+  return store.tasks[program];
+}
+
+// Follow one step: its new output every 0.7 s while it runs; once it ends, the status the server checked again,
+// and the sign-in an install was confirmed with.
+async function pollSetupTask(program, id) {
+  const store = setupStore();
+  if (store.inflight[program] === id) return;  // One request per step at a time.
+  clearTimeout(store.polls[program]);
+  store.polls[program] = 0;
+  store.inflight[program] = id;
+  const known = store.tasks[program]?.id === id ? store.tasks[program] : null;
+  let ended = false;
+  try {
+    const { task } = await setupRequest(`/setup/task?id=${encodeURIComponent(id)}&after=${known ? known.next : 0}`);
+    const shown = store.tasks[program];
+    // A newer step of this program that runs is followed already: an older answer does not replace it.
+    if (task && (!shown || shown.id === id || !["running", "waiting"].includes(shown.state))) mergeSetupTask(program, task);
+  } catch (error) {
+    if (error.status === 404) {
+      if (known) {
+        store.tasks[program] = { ...known, state: "stopped", stopping: false,
+          result: { tone: "stopped", text: setupWords().gone, exitCode: null } };
+      }
+      ended = true;
+    } else {
+      store.inflight[program] = "";
+      store.polls[program] = setTimeout(() => pollSetupTask(program, id), 2000);
+      return;
+    }
+  } finally {
+    if (store.inflight[program] === id) store.inflight[program] = "";
+  }
+  const current = store.tasks[program];
+  if (!ended && current?.id === id && ["running", "waiting"].includes(current.state)) {
+    store.polls[program] = setTimeout(() => pollSetupTask(program, id), 700);
+  } else if (current?.id === id) {
+    if (current.nextTask) pollSetupTask(program, current.nextTask);
+    loadSetup("poll");
+  }
+  if (setupOnScreen()) renderSetup();
+}
+
+async function stopSetupTask(program) {
+  const store = setupStore(), task = store.tasks[program];
+  if (!task || !["running", "waiting"].includes(task.state) || task.stopping) return;
+  task.stopping = true;
+  renderSetupTasks();
+  try {
+    const answer = await setupRequest("/setup/stop", { id: task.id });
+    mergeSetupTask(program, answer.task);
+  } catch (error) {
+    task.stopping = false;
+    store.actionError = error.message;
+  }
+  if (!store.polls[program] && store.inflight[program] !== task.id) pollSetupTask(program, task.id);
+  if (setupOnScreen()) renderSetup();
+}
+
+async function sendSetupCode(program, input, button, message) {
+  const store = setupStore(), task = store.tasks[program], text = input.value.trim();
+  if (!task || !text) return;
+  button.disabled = true;
+  try {
+    const answer = await setupRequest("/setup/input", { id: task.id, text });
+    input.value = "";
+    mergeSetupTask(program, answer.task);
+    message.textContent = "Code sent. Waiting for Claude Code…";
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+  renderSetupTasks();
+}
+
+async function useSetupFolder(program, button) {
+  const store = setupStore(), folder = store.data?.programs?.[program]?.actions?.useFolder?.folder;
+  if (!folder || button?.getAttribute("aria-disabled") === "true") return;
+  // The redraw that follows gives the focus to the card's new first button (Use it for jobs is gone then).
+  if (button) setupWaiting(button, true);
+  try {
+    const answer = await setupRequest("/setup/action", { program, action: "use-folder", command: folder });
+    store.data = answer.status;
+    store.actionError = "";
+  } catch (error) {
+    if (error.data?.status) store.data = error.data.status;
+    store.actionError = error.message;
+  }
+  adoptSetupStatus();
+}
+
+// The sign-in part of a step: the link to open (only an https link on the vendor's own host is a link), or the
+// one-time code, and for Claude Code the box for the code its sign-in page may show.
+function setupSignInBox(program, task) {
+  const box = setupElement("div", "setup-signin");
+  box.setAttribute("role", "status");
+  const parts = {};
+  const linkRow = (url, trusted, host, label) => {
+    const row = setupElement("div", "setup-signin-link");
+    if (trusted) {
+      const anchor = setupElement("a", "setup-link-button", label);
+      anchor.href = url;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      row.append(anchor);
+    } else {
+      const warning = setupElement("p", "job-warning", `This link goes to an unexpected address (${host || "unknown"}). `
+        + "Check it before you open it:");
+      row.append(warning, setupElement("code", "setup-signin-url", url));
+    }
+    const copy = setupElement("button", "ghost compact setup-copy", "Copy link");
+    copy.type = "button";
+    copy.onclick = () => copyText(copy, url);
+    row.append(copy);
+    return row;
+  };
+  if (program === "codex" && task.code) {
+    box.append(setupElement("h3", "setup-signin-title", "Sign in with a one-time code"));
+    const first = setupElement("p", "", "1. Open ");
+    if (task.code.trusted) {
+      const anchor = setupElement("a", "", task.code.url);
+      anchor.href = task.code.url;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      first.append(anchor, " on any device and sign in.");
+    } else {
+      first.append(setupElement("code", "", task.code.url), ` on any device and sign in. This address is unexpected `
+        + `(${task.code.host || "unknown"}); check it first.`);
+    }
+    const second = setupElement("p", "setup-code-line", "2. Enter this code: ");
+    const code = setupElement("code", "setup-code", task.code.userCode);
+    const copy = setupElement("button", "ghost compact setup-copy", "Copy");
+    copy.type = "button";
+    copy.onclick = () => copyText(copy, task.code.userCode);
+    second.append(code, copy);
+    box.append(first, second, setupElement("p", "help", "The code expires in 15 minutes. Only enter it if you started "
+      + "this sign-in here; never enter a code someone gave you."));
+  } else if (program === "codex" && task.link) {
+    box.append(setupElement("h3", "setup-signin-title", "Sign in with ChatGPT"),
+      linkRow(task.link.url, task.link.trusted, task.link.host, "Open the ChatGPT sign-in page"),
+      setupElement("p", "", "Waiting for you to finish signing in. TCS Prover notices it by itself."),
+      setupElement("p", "help", "Is TCS Prover running on another computer? Stop this and sign in with a one-time code."));
+  } else if (program === "claude" && task.link) {
+    box.append(setupElement("h3", "setup-signin-title", "Sign in to Claude"),
+      setupElement("p", "", "A sign-in tab may have opened by itself. If not, open the sign-in page:"),
+      linkRow(task.link.url, task.link.trusted, task.link.host, "Open the Claude sign-in page"));
+    const form = setupElement("div", "setup-paste");
+    const label = setupElement("label", "", "If the page shows a code, paste it here");
+    const input = setupElement("input");
+    input.id = `setupCode-${task.id}`;
+    label.htmlFor = input.id;
+    input.type = "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.maxLength = 512;
+    input.setAttribute("autocapitalize", "off");
+    const send = setupElement("button", "secondary compact", "Send code");
+    send.type = "button";
+    const message = setupElement("p", "help setup-paste-message");
+    message.setAttribute("role", "status");
+    send.onclick = () => sendSetupCode(program, input, send, message);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        sendSetupCode(program, input, send, message);
+      }
+    });
+    const row = setupElement("div", "setup-paste-row");
+    row.append(input, send);
+    form.append(label, row, message);
+    box.append(form);
+    parts.input = input;
+    parts.send = send;
+    parts.message = message;
+  }
+  return { box, parts };
+}
+
+// The panel of one program's latest step: built once per step, then updated (the code box keeps what you typed).
+function setupTaskPanel(program, task) {
+  const store = setupStore();
+  let panel = store.panels[program];
+  if (!panel || panel.id !== task.id) {
+    const root = setupElement("section", "setup-task setup-task-wide");
+    root.id = `setupTask-${program}`;
+    root.tabIndex = -1;
+    root.dataset.task = task.id;
+    root.setAttribute("aria-labelledby", `setupTaskTitle-${program}`);
+    const head = setupElement("div", "setup-task-head"), status = setupElement("span", "job-status setup-task-state");
+    const title = setupElement("strong", "", task.title);
+    title.id = `setupTaskTitle-${program}`;
+    status.append(title);
+    const elapsed = setupElement("span", "setup-elapsed");
+    elapsed.dataset.elapsed = program;
+    const stop = setupElement("button", "danger compact setup-stop", "Stop");
+    stop.type = "button";
+    stop.onclick = () => stopSetupTask(program);
+    const hide = setupElement("button", "ghost compact setup-hide", "Hide");
+    hide.type = "button";
+    hide.onclick = () => {
+      store.hidden.add(task.id);
+      renderSetupTasks();
+    };
+    head.append(status, elapsed, stop, hide);
+    const command = setupElement("p", "setup-task-command");
+    command.append(setupElement("span", "visually-hidden", "Command: "), setupElement("code", "", task.command));
+    const before = setupElement("p", "help setup-before");
+    if (task.before?.result?.text) before.textContent = `${task.before.title}: ${task.before.result.text}`;
+    before.hidden = !before.textContent;
+    const signIn = setupElement("div", "setup-signin-slot");
+    const dropped = setupElement("p", "help setup-dropped");
+    const log = setupElement("pre", "setup-log");
+    log.setAttribute("role", "log");
+    log.setAttribute("aria-live", "off");
+    log.setAttribute("aria-label", `Output of ${task.title.charAt(0).toLowerCase()}${task.title.slice(1)}`);
+    log.tabIndex = 0;
+    const result = setupElement("p", "setup-result");
+    result.setAttribute("role", "status");
+    result.tabIndex = -1;  // Where the focus goes when Stop goes away under it.
+    const after = setupElement("div", "setup-result-actions");
+    const again = setupElement("button", "secondary compact", "Try again");
+    again.type = "button";
+    again.onclick = () => openSetupDialog(program, task.action);
+    const copy = setupElement("button", "ghost compact setup-copy", "Copy command");
+    copy.type = "button";
+    copy.onclick = () => copyText(copy, task.command);
+    after.append(again, copy);
+    const note = setupElement("p", "help setup-task-note");
+    root.append(head, before, command, signIn, dropped, log, result, after, note);
+    panel = store.panels[program] = { id: task.id, root, status, elapsed, stop, hide, signIn, dropped, log, result, after,
+      again, note, box: null, boxKey: "", shown: "" };
+  }
+  const live = ["running", "waiting"].includes(task.state);
+  const tone = { running: "running", waiting: "waiting", succeeded: "done", failed: "failed", stopped: "stopped" }[task.state] || "stopped";
+  panel.status.className = `job-status tone-${tone} setup-task-state`;
+  panel.elapsed.textContent = setupElapsed(task);
+  // Stop waits while the step stops (it keeps the focus); when the step has ended and Stop goes away, the focus
+  // goes to the result, or to the panel.
+  const stopHadFocus = document.activeElement === panel.stop;
+  panel.stop.hidden = !live;
+  setupWaiting(panel.stop, Boolean(task.stopping));
+  panel.stop.textContent = task.stopping ? "Stopping…" : "Stop";
+  panel.hide.hidden = live;
+  // The sign-in box, while the sign-in waits for you.
+  const boxKey = live && (task.link || task.code) ? JSON.stringify([task.link, task.code]) : "";
+  if (panel.boxKey !== boxKey) {
+    panel.boxKey = boxKey;
+    panel.box = boxKey ? setupSignInBox(program, task) : null;
+    panel.signIn.replaceChildren(...(panel.box ? [panel.box.box] : []));
+  }
+  if (panel.box?.parts.message && task.input?.message) panel.box.parts.message.textContent = task.input.message;
+  const dropped = Math.max(0, Number(task.next || 0) - task.lines.length);
+  const droppedText = dropped ? `Earlier output: ${dropped.toLocaleString("en-US")} ${dropped === 1 ? "line is" : "lines are"} not kept `
+    + `(the newest ${Number(task.keptLines || 2000).toLocaleString("en-US")} are shown).` : "";
+  if (panel.dropped.textContent !== droppedText) panel.dropped.textContent = droppedText;
+  panel.dropped.hidden = !droppedText;
+  // The output: the newest line stays in view unless you scrolled up.
+  const text = task.lines.length || task.partial ? [...task.lines, ...(task.partial ? [task.partial] : [])].join("\n") : "No output yet.";
+  if (panel.shown !== text) {
+    const log = panel.log, atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
+    panel.shown = text;
+    log.textContent = text;
+    log.classList.toggle("empty", !task.lines.length && !task.partial);
+    if (atEnd) log.scrollTop = log.scrollHeight;
+  }
+  const result = task.result?.text || "";
+  if (panel.result.textContent !== result) panel.result.textContent = result;
+  panel.result.hidden = !result;
+  panel.result.dataset.tone = task.result?.tone || "";
+  if (stopHadFocus && !live) (result ? panel.result : panel.root).focus?.({ preventScroll: true });
+  panel.after.hidden = !(task.result && ["failed", "stopped"].includes(task.result.tone) && task.action !== "use-folder");
+  panel.again.hidden = !setupStore().data?.programs?.[program]?.actions?.[{ install: "install", update: "update",
+    "sign-in": "signIn" }[task.action]]?.available;
+  // Notes under the output, one per line; what comes next stands out.
+  const notes = [];
+  if (live && program === "claude" && task.action === "install") {
+    notes.push(["", "Claude Code's installer shows no progress while it downloads; this can take a few minutes."]);
+  }
+  if (live && task.checking) {
+    notes.push(["", { install: "The installer has ended; TCS Prover is checking the result…",
+      update: "The update has ended; TCS Prover is checking the result…" }[task.action]
+      || "The sign-in has ended; TCS Prover is checking the result…"]);
+  }
+  if (live && task.action === "install" && task.signInAfter) {
+    notes.push(["setup-next", program === "codex" ? "Next: sign in with ChatGPT, once the install succeeds."
+      : "Next: sign in with your Claude account, once the install succeeds."]);
+  }
+  if (task.nextTask) notes.push(["setup-next", "The sign-in you chose has started."]);
+  const noteKey = JSON.stringify(notes);
+  if (panel.note.dataset.key !== noteKey) {
+    panel.note.dataset.key = noteKey;
+    panel.note.replaceChildren(...notes.map(([className, text]) => setupElement("span", `setup-note-line ${className}`.trim(), text)));
+  }
+  panel.note.hidden = !notes.length;
+  return panel.root;
+}
+
+// The panels of the latest step of each program (a finished one stays until hidden, the next step or a restart).
+function renderSetupTasks() {
+  const els = setupEls(), store = setupStore();
+  if (!els.tasks) return;
+  const roots = [];
+  for (const program of ["codex", "claude"]) {
+    const task = store.tasks[program];
+    if (!task || store.hidden.has(task.id)) {
+      delete store.panels[program];
+      continue;
+    }
+    roots.push(setupTaskPanel(program, task));
+  }
+  // Only the panels that changed go in or out: a panel that stays is never moved, so it keeps the focus (for
+  // example in Claude Code's code box while a Codex step starts from another tab).
+  for (const node of [...els.tasks.children]) if (!roots.includes(node)) node.remove();
+  roots.forEach((root, index) => {
+    const current = els.tasks.children[index];
+    if (current !== root) els.tasks.insertBefore(root, current || null);
+  });
+}
+
+// The running steps' clocks, every second.
+function tickSetupElapsed() {
+  const store = setupStore();
+  for (const program of ["codex", "claude"]) {
+    const task = store.tasks[program];
+    if (!task || !["running", "waiting"].includes(task.state)) continue;
+    const text = setupElapsed(task);
+    if (store.panels[program]) store.panels[program].elapsed.textContent = text;
+    for (const node of setupEls().list?.querySelectorAll?.("[data-elapsed]") || []) {
+      if (node.dataset.elapsed === program) node.textContent = text;
+    }
+  }
+}
+
+// --- The confirmation ---------------------------------------------------------------------------------------------
+
+function openSetupDialog(program, action) {
+  const store = setupStore(), els = setupEls();
+  const key = { install: "install", update: "update", "sign-in": "signIn" }[action];
+  const planned = store.data?.programs?.[program]?.actions?.[key];
+  if (!planned?.dialog || !els.dialog) return;
+  // The control that opened it gets the focus back on close, also when the cards were drawn again meanwhile.
+  const opener = setupFocusedKey() || `${program}:${action}`;
+  store.dialog = { program, action, key, option: planned.dialog.options?.[0]?.id || "", command: "", fresh: true,
+    opener };
+  els.dialogError.hidden = true;
+  delete els.dialogOptionList.dataset.key;  // A new dialog draws its options anew.
+  renderSetupDialog();
+  if (!els.dialog.open) els.dialog.showModal();
+  // Enter never starts a step by accident: the focus starts on Cancel.
+  els.dialogCancel.focus();
+}
+
+function renderSetupDialog() {
+  const store = setupStore(), els = setupEls(), current = store.dialog;
+  if (!current) return;
+  const planned = store.data?.programs?.[current.program]?.actions?.[current.key];
+  const dialog = planned?.dialog;
+  if (!dialog) {
+    current.command = "";
+    els.dialogCommand.textContent = "";
+    els.dialogConfirm.disabled = true;
+    els.dialogError.textContent = planned?.reason || "This step is not offered now. Close this and look at the page again.";
+    els.dialogError.hidden = false;
+    return;
+  }
+  els.dialogTitle.textContent = dialog.title;
+  els.dialogLede.textContent = dialog.lede;
+  const options = dialog.options || [];
+  if (options.length && !options.some((option) => option.id === current.option)) current.option = options[0].id;
+  const option = options.find((item) => item.id === current.option);
+  current.command = option ? option.command : dialog.command;
+  els.dialogCommand.textContent = current.command;
+  els.dialogOptions.hidden = !options.length;
+  els.dialogLegend.textContent = dialog.legend || "";
+  // The options are drawn once per set of options: choosing one only changes which is checked and the command,
+  // so the focus stays on the option (arrow keys, a click).
+  const optionKey = JSON.stringify([current.program, current.key, options.map((item) => [item.id, item.label, item.help || ""])]);
+  if (els.dialogOptionList.dataset.key !== optionKey) {
+    els.dialogOptionList.dataset.key = optionKey;
+    els.dialogOptionList.replaceChildren(...options.map((item) => {
+      const label = setupElement("label", "setup-option"), input = setupElement("input");
+      input.type = "radio";
+      input.name = "setupDialogOption";
+      input.value = item.id;
+      input.onchange = () => {
+        const live = setupStore().dialog;
+        if (!live) return;
+        live.option = item.id;
+        renderSetupDialog();
+      };
+      const text = setupElement("span", "setup-option-text");
+      text.append(setupElement("strong", "", item.label));
+      if (item.help) text.append(setupElement("span", "setup-option-help", item.help));
+      label.append(input, text);
+      return label;
+    }));
+  }
+  for (const input of els.dialogOptionList.querySelectorAll("input")) input.checked = input.value === current.option;
+  els.dialogWhat.replaceChildren(...(dialog.what || []).map((line) => setupElement("li", "", line)));
+  els.dialogWarning.textContent = dialog.warning || "";
+  els.dialogWarning.hidden = !dialog.warning;
+  // Install, then sign in under the same confirmation, when something here needs the sign-in.
+  const then = current.action === "install" && Boolean(dialog.checkbox) && setupNeeds()[current.program].signIn;
+  els.dialogThen.hidden = !then;
+  if (then) {
+    els.dialogThenText.textContent = dialog.checkbox.label;
+    if (current.fresh) els.dialogThenInput.checked = dialog.checkbox.checked !== false;
+  }
+  current.fresh = false;
+  els.dialogConfirm.textContent = { install: "Install", update: "Update", "sign-in": dialog.button || "Start sign-in" }[current.action];
+  els.dialogConfirm.disabled = !planned.available;
+  if (!planned.available && planned.reason) {
+    els.dialogError.textContent = planned.reason;
+    els.dialogError.hidden = false;
+  }
+}
+
+async function confirmSetup() {
+  const store = setupStore(), els = setupEls(), current = store.dialog;
+  if (!current || els.dialogConfirm.disabled) return;
+  const body = { program: current.program, action: current.action, command: current.command };
+  if (current.action === "sign-in") body.option = current.option;
+  if (current.action === "install" && !els.dialogThen.hidden) {
+    body.signInAfter = els.dialogThenInput.checked;
+    if (body.signInAfter) body.signInOption = store.data.programs[current.program].actions.install.dialog.checkbox.option;
+  }
+  els.dialogConfirm.disabled = true;
+  els.dialogError.hidden = true;
+  try {
+    const answer = await setupRequest("/setup/action", body);
+    if (els.dialog.open) els.dialog.close();
+    store.dialog = null;
+    if (answer.task) {
+      store.hidden.delete(answer.task.id);
+      mergeSetupTask(current.program, answer.task);
+      pollSetupTask(current.program, answer.task.id);
+    }
+    store.actionError = "";
+    if (setupOnScreen()) renderSetup();
+    store.panels[current.program]?.root?.focus?.({ preventScroll: false });
+    loadSetup("poll");
+  } catch (error) {
+    // A command that changed, or a step that cannot run now: the dialog shows the new status and says why.
+    if (error.data?.status) {
+      store.data = error.data.status;
+      adoptSetupStatus();
+    }
+    if (error.data?.task) {
+      mergeSetupTask(current.program, error.data.task);
+      pollSetupTask(current.program, error.data.task.id);
+    }
+    if (els.dialog.open && store.dialog === current) {
+      renderSetupDialog();
+      // A step the new status no longer offers keeps the dialog's own words (there is nothing to confirm again).
+      if (store.data?.programs?.[current.program]?.actions?.[current.key]?.dialog) {
+        els.dialogError.textContent = error.message;
+      }
+      els.dialogError.hidden = false;
+      // The focus stays in the dialog: on Confirm when it can run now, else on Cancel.
+      if (setupFocusLost() || document.activeElement === els.dialogConfirm) {
+        (els.dialogConfirm.disabled ? els.dialogCancel : els.dialogConfirm).focus();
+      }
+    }
+  }
+}
+
+// Copy a command or a link; "Copied" for 2 s, or how to copy it by hand where the clipboard is unavailable.
+async function copyText(button, text) {
+  const label = button.dataset.label || button.textContent;
+  button.dataset.label = label;
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = "Copied";
+  } catch (_) {
+    button.textContent = "Select the text to copy";
+  }
+  setTimeout(() => { button.textContent = label; }, 2000);
+}
+
+// The page's wiring: Check again, the dialog, links to Setup anywhere on the page, a refresh when the window
+// gets the focus again on Setup (at most every 10 s), the running steps' clocks, and the first read.
+(() => {
+  const els = setupEls(), store = setupStore();
+  if (els.check) els.check.onclick = () => { if (!store.checking) loadSetup(true); };
+  if (els.dialogConfirm) els.dialogConfirm.onclick = confirmSetup;
+  if (els.dialogCopy) els.dialogCopy.onclick = () => copyText(els.dialogCopy, els.dialogCommand.textContent);
+  els.dialog?.addEventListener("close", () => {
+    const opener = store.dialog?.opener || "";
+    store.dialog = null;
+    // The button that opened it may have been drawn again meanwhile (a refusal brings the new status): the focus
+    // goes back to it by its key, or to its card. (Until the browser moves it, the focus may still be on a button
+    // of the closed dialog.)
+    const inDialog = Boolean(document.activeElement && els.dialog.contains?.(document.activeElement));
+    if (opener && (setupFocusLost() || inDialog) && setupOnScreen()) setupRestoreFocus(opener);
+    scheduleSetupPoll();
+  });
+  document.addEventListener("click", (event) => {
+    const link = event.target?.closest?.("a[data-setup-link]");
+    if (!link || event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    openSetup();
+  });
+  window.addEventListener("focus", () => {
+    if (setupOnScreen() && !els.dialog?.open && Date.now() - store.refreshedAt > 10000) loadSetup(true);
+  });
+  setInterval(tickSetupElapsed, 1000);
+  // Every page reads the status once (Setup itself reads it through refresh()), for the badge, the Overview's
+  // notice and the hints.
+  if (!setupOnScreen()) loadSetup();
+})();
 
 // Saved settings: the bar at the top of the New problem card (GET and POST /presets, ui/presets.py).
 // Named sets of this form's settings, kept on this computer; one of them may be the default that

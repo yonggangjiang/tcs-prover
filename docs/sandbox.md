@@ -44,7 +44,9 @@ never a folder that holds your data: every run can read it.
 
 **Private state.** The folder `.tcs-prover/` in the checkout holds the API key
 store, the running-jobs limit (`settings.json`), saved settings, browser session
-keys, private Codex and Claude homes and copies of Claude conversations. No
+keys, private Codex and Claude homes, copies of Claude conversations and the
+program folders the Setup page remembered (`program-folders.json`, which name
+the Codex CLI and Claude Code that jobs run). No
 model sandbox can read or write it: the Claude shell sandbox wherever it runs,
 and on macOS the Codex sandboxes of every role. Sandboxes of API models also
 cannot read your Codex or Claude login files. At startup the server checks this

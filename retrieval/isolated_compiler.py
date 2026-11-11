@@ -45,7 +45,32 @@ class CompilerIsolationError(RuntimeError):
 
 
 class CompilerNotReady(CompilerIsolationError):
-    """The protected toolchain or the sandbox failed its checks; they can pass later, as during a TeX update."""
+    """The protected toolchain or the sandbox failed its checks; they can pass later, as during a TeX update.
+
+    ``kind`` names what failed, so that what a user is told to do fits it (ADVICE):
+    "mactex" (MacTeX is missing, being updated, not protected or damaged: its
+    tools or the fixed test document fail), "sandbox" (macOS's sandbox-exec,
+    perl or sh is missing or not protected, or the sandbox canaries fail or do
+    not finish), "rosetta" (the canaries fail because this Python runs under
+    Rosetta, whose runtime the sandbox does not let them load) or "busy" (the
+    canaries could not start, or the test document could not start or finish,
+    for want of processes, files, memory or time: that passes by itself).
+    """
+
+    def __init__(self, message, kind="mactex"):
+        super().__init__(message)
+        self.kind = kind if kind in ADVICE else "mactex"
+
+
+# What lets a compiler that is not ready pass its checks, by CompilerNotReady.kind ("" when it passes by
+# itself). The checks never loosen meanwhile.
+ADVICE = {
+    "mactex": "Install or repair MacTeX.",
+    "sandbox": "The compiler's macOS sandbox check failed; MacTeX is not the cause.",
+    "rosetta": ("The compiler's macOS sandbox check failed because TCS Prover's Python runs under Rosetta: "
+                "start TCS Prover with a native arm64 Python."),
+    "busy": "",
+}
 
 
 class CompilerRefusal(CompilerIsolationError):
@@ -57,13 +82,13 @@ def supported():
     return sys.platform == "darwin"
 
 
-def _root_owned(path):
+def _root_owned(path, kind="mactex"):
     """Reject writable toolchains, including a writable canonical parent."""
     canonical = Path(path).resolve(strict=True)
     for item in (canonical, *canonical.parents):
         info = item.stat()
         if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise CompilerNotReady(f"Compiler toolchain is not root-owned and protected: {item}")
+            raise CompilerNotReady(f"Compiler toolchain is not root-owned and protected: {item}", kind)
     return canonical
 
 
@@ -77,10 +102,14 @@ def toolchain():
         for path in (latexmk, engine):
             if root not in path.parents or not path.is_file():
                 raise CompilerNotReady("Historical TeX tools must belong to the protected MacTeX distribution.")
-        for executable in ("/usr/bin/sandbox-exec", "/usr/bin/perl", "/bin/sh"):
-            _root_owned(executable)
     except OSError as exc:
         raise CompilerNotReady(f"Historical compilation requires MacTeX and sandbox-exec: {exc}") from exc
+    # macOS's own programs, which the sandbox and latexmk need: no MacTeX installation changes them.
+    try:
+        for executable in ("/usr/bin/sandbox-exec", "/usr/bin/perl", "/bin/sh"):
+            _root_owned(executable, "sandbox")
+    except OSError as exc:
+        raise CompilerNotReady(f"Historical compilation requires MacTeX and sandbox-exec: {exc}", "sandbox") from exc
     # Retain the pdflatex basename: resolving that symlink to pdftex changes
     # TeX's implicit format selection.
     return root, binary_directory, latexmk
@@ -252,7 +281,10 @@ print "TCS_COMPILER_ISOLATED\n";
 '''
         result = _run(profile, ["/usr/bin/perl", "-e", script, str(secret), str(outside / "write.txt"), str(port)], stage, env, 15)
         if result.returncode != 0 or result.stdout.strip() != "TCS_COMPILER_ISOLATED" or (outside / "write.txt").exists():
-            raise CompilerNotReady(f"Compiler sandbox canaries failed (exit {result.returncode}): " + result.stdout[-3000:])
+            # An x86_64 Python (Rosetta) starts the sandbox's programs under Rosetta, whose runtime the
+            # sandbox does not let them load: no MacTeX or sandbox change helps, only a native Python.
+            raise CompilerNotReady(f"Compiler sandbox canaries failed (exit {result.returncode}): " + result.stdout[-3000:],
+                                   "rosetta" if "rosetta error" in result.stdout.lower() else "sandbox")
 
 
 def _regular_file(path, limit=None, keep=None):
@@ -319,9 +351,10 @@ def compile_command(policy, config, argv, directory):
         except subprocess.TimeoutExpired as exc:
             # Its command line holds the whole profile and script: keep the message short.
             raise CompilerNotReady(
-                f"Compiler sandbox canaries did not finish within {exc.timeout:g} seconds.") from exc
+                f"Compiler sandbox canaries did not finish within {exc.timeout:g} seconds.", "sandbox") from exc
         except (subprocess.SubprocessError, OSError) as exc:
-            raise CompilerNotReady(f"Compiler sandbox canaries could not run: {exc}") from exc
+            raise CompilerNotReady(f"Compiler sandbox canaries could not run: {exc}",
+                                   "busy" if getattr(exc, "errno", None) in _RESOURCE_ERRNOS else "sandbox") from exc
         (stage / "latex-source.tex").write_bytes(source)
         # Root-owned latexmk is a Perl script; invoke the system interpreter
         # explicitly and pin its engine. Disable bibliography subprocesses.
@@ -362,7 +395,13 @@ def compile_command(policy, config, argv, directory):
 
 
 def preflight(policy):
-    """Exercise the real compiler without reading or changing any job source."""
+    """Exercise the real compiler without reading or changing any job source.
+
+    Its test document is fixed, so a failure of it is the toolchain's (a TeX
+    update in progress, a damaged installation): CompilerNotReady, like the
+    toolchain and sandbox checks, which can pass later. One that could not
+    start or finish (for want of processes, files, memory or time) is "busy".
+    """
     with tempfile.TemporaryDirectory(prefix="tcs-compiler-preflight-") as folder:
         workspace = Path(folder).resolve()
         (workspace / "latex-source.tex").write_text(
@@ -376,8 +415,12 @@ def preflight(policy):
                   "produces": ["final.pdf"], "log": "latex-compile.log", "timeout": 120}
         result = compile_command(temporary_policy, config, LATEX_ARGV, workspace)
         if result["status"] != "pass":
-            raise CompilerIsolationError("Isolated compiler smoke test failed: " + result["output"][-3000:])
+            # The diagnostic first: an empty output (a compiler that could not start) still names its cause.
+            tail = " ".join(result["output"][-800:].split())
+            busy = result.get("transient") or (result.get("timed_out") and not result.get("runaway"))
+            raise CompilerNotReady(f"Isolated compiler smoke test failed: {result['diagnostic']} {tail}".rstrip(),
+                                   "busy" if busy else "mactex")
         log = (workspace / "final.log").read_text(encoding="utf-8", errors="replace")
         if "undefined references" in log or "Rerun to get cross-references right" in log:
-            raise CompilerIsolationError("Isolated compiler did not stabilize document references.")
+            raise CompilerNotReady("Isolated compiler did not stabilize document references.")
         return result

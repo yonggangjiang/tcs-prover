@@ -1067,7 +1067,7 @@ kbd {
 /* On a job page the batch's "Current batch" badge gives its room to the problem's title. */
 .topbar-path:has(.topbar-title[data-route="job"]) .badge-current { display: none !important; }
 [data-view="models"] #batchNavigation { display: none !important; }
-.topbar-path .breadcrumbs + .topbar-title[data-route="models"]::before { margin-right: 0; color: var(--ink-3); content: "Configure\00a0\00a0/\00a0\00a0"; font-family: var(--font-sans); font-weight: 550; }
+.topbar-path .breadcrumbs + .topbar-title:is([data-route="models"], [data-route="setup"])::before { margin-right: 0; color: var(--ink-3); content: "Configure\00a0\00a0/\00a0\00a0"; font-family: var(--font-sans); font-weight: 550; }
 
 /* The page tools float in one pill at the right: live status, prompts and responses, theme. */
 .topbar-pill {
@@ -4244,4 +4244,353 @@ kbd {
 }
 @media print {
   #authorQuestionForm { display: none !important; }
+}
+
+/* 16. Setup -------------------------------------------------------------------------- */
+/* The Setup page (layout B, the owner's choice): one card per program side by side (the Codex CLI, Claude
+   Code, LaTeX), each with its state on a quiet pill and a short mark on the top edge as the Overview totals
+   have, labelled lines (Version, Location, Sign-in, Needed by), its buttons, then the commands to copy. A
+   step's live output opens full width under the cards. Tokens only, so the four themes follow. */
+.nav-badge-setup { color: var(--waiting); background: rgb(var(--waiting-rgb) / 0.12); }
+.nav-item:is(:hover, [aria-current]) .nav-badge-setup { background: var(--surface); box-shadow: inset 0 0 0 1px rgb(var(--waiting-rgb) / 0.3); }
+@media (min-width: 861px) {
+  :root[data-sidebar="rail"] .nav-item .nav-badge-setup { color: var(--on-tone); background: var(--waiting); box-shadow: 0 0 0 2px var(--sidebar-bg); }
+}
+#setupCheckButton .icon { width: 15px; height: 15px; color: var(--ink-2); }
+.setup-notice { margin: 0 0 var(--space-4); }
+/* Status words after the state glyph, as in the problem table, in the flow of a line. */
+.setup-view .job-status { position: static; flex-basis: auto; order: 0; width: auto; min-height: 20px; margin-bottom: 0; white-space: nowrap; }
+.setup-view .job-status.job-status::before { align-self: center; margin-top: 0; }
+.setup-view .job-status.tone-done.job-status::before { margin-top: -2px; }
+/* A status as a pill (the card heads): the same words and glyph inside the app's quiet pill. */
+.setup-view .job-status.setup-pill {
+  min-height: 24px;
+  padding: 1px 10px 1px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--tint);
+  font-size: var(--text-xs);
+}
+.setup-glyph {
+  display: grid;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--ink-2);
+  background: var(--tint-2);
+  font: 700 var(--text-xs)/1 var(--font-mono);
+}
+.setup-sub { display: block; color: var(--ink-3); font-size: var(--text-xs); line-height: 1.5; }
+.setup-mono {
+  color: var(--ink-2);
+  font: 500 var(--text-xs)/1.5 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.setup-none { color: var(--ink-3); }
+.setup-problem { color: var(--ink); font-size: var(--text-sm); overflow-wrap: anywhere; }
+.setup-needs { display: grid; gap: 4px; margin: 0; padding: 0; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5; list-style: none; }
+
+/* Disclosures: a small chevron, as the critic's disclosures have. */
+:is(.setup-commands, .setup-jobs) > summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+:is(.setup-commands, .setup-jobs) > summary::-webkit-details-marker { display: none; }
+:is(.setup-commands, .setup-jobs) > summary::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  content: "";
+  opacity: 0.8;
+  transform: translateY(-2px) rotate(-45deg);
+  transition: transform var(--medium) var(--ease);
+}
+:is(.setup-commands, .setup-jobs)[open] > summary::before { transform: translateY(-3px) rotate(45deg); }
+:is(.setup-commands, .setup-jobs) > summary:hover { color: var(--ink); }
+.setup-jobs ul { display: grid; gap: 3px; margin: 6px 0 0; padding: 0 0 0 14px; list-style: none; }
+.setup-jobs li { font-size: var(--text-sm); overflow-wrap: anywhere; }
+.setup-job-state { color: var(--ink-3); }
+
+/* Commands to copy: a label, the command in a sunken well, and Copy. */
+.setup-command-list { display: grid; gap: 6px; margin-top: 8px; }
+.setup-command { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 10px; }
+.setup-command-label { grid-column: 1 / -1; color: var(--ink-2); font-size: var(--text-xs); }
+.setup-command-body { min-width: 0; }
+.setup-command-body code {
+  display: block;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--surface-sunken);
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.setup-command-text { font-size: var(--text-sm); }
+.setup-command-note { display: block; margin-top: 3px; color: var(--ink-3); font-size: var(--text-xs); }
+.setup-command-help { margin-top: 4px; font-size: var(--text-xs); }
+.setup-copy { min-width: 64px; }
+
+/* The three cards: side by side, their rows lined up across the cards (head, facts, buttons, commands). */
+.setup-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 14px; }
+.setup-card {
+  --tone: var(--stopped);
+  position: relative;
+  display: grid;
+  grid-row: span 4;
+  grid-template-rows: subgrid;
+  row-gap: 0;
+  min-width: 0;
+  padding: 18px 18px 16px;
+  border-radius: var(--radius-lg);
+}
+.setup-card.tone-done { --tone: var(--done); }
+.setup-card.tone-failed { --tone: var(--failed); }
+.setup-card.tone-waiting { --tone: var(--waiting); }
+.setup-card.tone-running { --tone: var(--running); }
+/* The state's short mark on the top edge, as the Overview totals have. */
+.setup-card::before {
+  position: absolute;
+  top: -1px;
+  left: 18px;
+  width: 26px;
+  height: 3px;
+  border-radius: 0 0 2px 2px;
+  background: var(--tone);
+  content: "";
+}
+.setup-card-head { display: flex; align-items: flex-start; gap: 12px; }
+.setup-card-title { flex: 1 1 auto; min-width: 0; }
+.setup-card-title h2 { font-family: var(--font-item); font-size: var(--text-md); font-weight: 650; letter-spacing: -0.01em; }
+.setup-card-title p { margin-top: 2px; color: var(--ink-3); font-size: var(--text-xs); }
+.setup-card-head .setup-pill { flex: none; margin-top: 4px; }
+.setup-facts { display: grid; align-content: start; gap: 11px; margin: 16px 0 0; padding: 14px 0 0; border-top: 1px solid var(--line); }
+.setup-facts > div { display: grid; grid-template-columns: 5.75rem minmax(0, 1fr); align-items: baseline; gap: 2px 12px; }
+.setup-facts dt {
+  color: var(--ink-3);
+  font: var(--label-weight) var(--label-size)/1.4 var(--font-label);
+  font-variant-caps: var(--label-caps);
+  letter-spacing: calc(var(--label-tracking) * 0.75);
+  text-transform: var(--label-transform);
+}
+.setup-facts dd { min-width: 0; margin: 0; color: var(--ink); font-size: var(--text-sm); line-height: 1.5; }
+.setup-facts dd.setup-dd-status { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+.setup-facts dd.setup-dd-status > span:not(.job-status) { color: var(--ink-2); }
+.setup-card-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; min-height: 30px; margin-top: 16px; }
+/* A Setup button that waits (a check runs, a request is on its way, a step stops) looks disabled and keeps the
+   keyboard focus (app.js setupWaiting). */
+.setup-view button[aria-disabled="true"], .setup-view button[aria-disabled="true"]:hover {
+  border-color: var(--line);
+  color: var(--ink-3);
+  background: var(--tint);
+  box-shadow: none;
+  cursor: not-allowed;
+  transform: none;
+}
+.setup-view .ghost[aria-disabled="true"], .setup-view .ghost[aria-disabled="true"]:hover { border-color: transparent; background: transparent; }
+.setup-view .primary[aria-disabled="true"] { border-radius: var(--radius-primary); }
+.setup-view button[aria-disabled="true"] .icon { color: inherit; }
+.setup-card:focus, .setup-result:focus { outline: none; }
+.setup-card:focus-visible, .setup-result:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.setup-action { display: grid; gap: 4px; max-width: 100%; }
+.setup-action > button { justify-self: start; }
+/* A button that cannot run now says why under it, in words (never only in a tooltip). */
+.setup-reason { max-width: 34ch; margin: 0; font-size: var(--text-xs); }
+.setup-card-busy { margin: 0; color: var(--ink-2); font-size: var(--text-sm); }
+.setup-card-ways { display: grid; align-content: start; gap: 6px; margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.setup-note { margin: 0; font-size: var(--text-xs); overflow-wrap: anywhere; }
+.setup-task-slot { display: grid; gap: 14px; margin-top: 14px; }
+.setup-task-slot:empty { display: none; }
+
+/* The live output of one step: its title and time, Stop, the command, the sign-in, then the log. */
+.setup-task {
+  padding: 14px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-sunken);
+  box-shadow: inset 2px 0 0 var(--running);
+}
+.setup-task:has(.setup-result[data-tone="done"]) { box-shadow: inset 2px 0 0 var(--done); }
+.setup-task:has(.setup-result[data-tone="failed"]) { box-shadow: inset 2px 0 0 var(--failed); }
+.setup-task:has(.setup-result[data-tone="stopped"]) { box-shadow: inset 2px 0 0 var(--stopped); }
+.setup-task:focus { outline: none; }
+.setup-task:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.setup-task-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.setup-task-state strong { font-weight: 650; }
+.setup-elapsed { color: var(--ink-3); font: 500 var(--text-xs)/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
+.setup-elapsed:empty { display: none; }
+.setup-elapsed::before { margin-right: 8px; content: "·"; }
+.setup-stop, .setup-hide { margin-left: auto; }
+.setup-stop + .setup-hide { margin-left: 0; }
+.setup-before { margin: 8px 0 0; font-size: var(--text-xs); }
+.setup-task-command { margin: 8px 0 0; }
+.setup-task-command code { color: var(--ink-3); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.setup-task-command code::before { color: var(--ink-4); content: "$ "; }
+.setup-dropped { margin: 8px 0 0; font-size: var(--text-xs); }
+.setup-log {
+  min-height: 7.5rem;
+  max-height: 18rem;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--console-bg);
+  font: var(--text-xs)/1.65 var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.setup-log.empty { color: var(--ink-3); }
+.setup-log:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.setup-result { margin: 10px 0 0; color: var(--ink); font-size: var(--text-sm); font-weight: 600; }
+.setup-result::before { display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: var(--stopped); content: ""; vertical-align: 1px; }
+.setup-result[data-tone="done"]::before { background: var(--done); }
+.setup-result[data-tone="failed"]::before { background: var(--failed); }
+.setup-result-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.setup-task-note { margin: 8px 0 0; font-size: var(--text-xs); }
+.setup-note-line { display: block; }
+.setup-note-line.setup-next { color: var(--ink); }
+
+/* The sign-in that waits for you: the link to open (or the one-time code), and Claude's code box. */
+.setup-signin {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--tint);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.setup-signin p { margin: 0; font-size: var(--text-sm); }
+.setup-signin .help { font-size: var(--text-xs); }
+.setup-signin-title { margin: 0; font-size: var(--text-base); font-weight: 650; }
+.setup-signin-link { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.setup-signin-url { overflow-wrap: anywhere; font-size: var(--text-xs); }
+.setup-link-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 16px;
+  border: 1px solid var(--primary-bg);
+  border-radius: var(--radius-primary);
+  color: var(--primary-ink);
+  background: var(--primary-bg);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-decoration: none;
+  transition: background-color var(--fast) var(--ease), border-color var(--fast), box-shadow var(--fast);
+}
+.setup-link-button:hover { border-color: var(--primary-bg-hover); color: var(--primary-ink); background: var(--primary-bg-hover); box-shadow: var(--shadow-2); }
+.setup-link-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.setup-code-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.setup-code {
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink-strong);
+  background: var(--surface);
+  font: 650 var(--text-lg)/1.3 var(--font-mono);
+  letter-spacing: 0.08em;
+}
+.setup-paste { display: grid; gap: 6px; max-width: 46rem; }
+.setup-paste label { margin: 0; }
+.setup-paste-row { display: flex; gap: 8px; }
+.setup-paste-row input { flex: 1 1 auto; min-width: 0; font-family: var(--font-mono); font-size: var(--text-sm); }
+.setup-paste-row button { flex: none; white-space: nowrap; }
+.setup-paste-message:empty { display: none; }
+
+/* The confirmation: the exact command, the sign-in choice, what it does, then Cancel and the action. */
+@media (min-width: 600px) { .setup-dialog { width: min(660px, calc(100vw - 32px)); } }
+.setup-dialog-body { display: grid; gap: 10px; }
+.setup-dialog-lede { margin-top: 0; color: var(--ink); }
+.setup-command-block { display: flex; align-items: flex-start; gap: 8px; }
+.setup-command-block pre {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink-strong);
+  background: var(--surface-sunken);
+  font: 500 var(--text-sm)/1.55 var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.setup-command-block .setup-copy { margin-top: 4px; }
+.setup-options { display: grid; gap: 6px; margin: 2px 0 0; padding: 0; border: 0; }
+.setup-options legend { margin-bottom: 6px; padding: 0; font-size: var(--text-sm); font-weight: 650; }
+.setup-option-list { display: grid; gap: 6px; }
+.setup-option { display: flex; align-items: flex-start; gap: 10px; margin: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); cursor: pointer; }
+.setup-option:has(input:checked) { border-color: var(--line-strong); background: var(--tint); box-shadow: inset 2px 0 0 var(--accent); }
+.setup-option-text { display: grid; gap: 2px; }
+.setup-option-text strong { color: var(--ink); font-size: var(--text-sm); }
+.setup-option-help { color: var(--ink-2); font-size: var(--text-xs); font-weight: 400; }
+.setup-what-title {
+  margin-top: 6px;
+  color: var(--eyebrow-ink);
+  font: var(--label-weight) var(--label-size)/1.4 var(--font-label);
+  font-variant-caps: var(--label-caps);
+  letter-spacing: var(--label-tracking);
+  text-transform: var(--label-transform);
+}
+.setup-what { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.setup-what li { position: relative; padding-left: 16px; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5; }
+.setup-what li::before { position: absolute; top: 0.62em; left: 2px; width: 5px; height: 5px; border-radius: 50%; background: var(--ink-4); content: ""; }
+.setup-then { margin-top: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--tint); }
+.setup-dialog-warning, .setup-dialog-error { margin: 0; }
+
+.setup-foot { max-width: 80ch; margin-top: var(--space-5); }
+.setup-foot p + p { margin-top: 6px; }
+
+/* Elsewhere: the Overview's Setup notice, and the hints under the role menus and beside Start. */
+.setup-banner { box-shadow: inset 3px 0 0 var(--waiting); }
+.attention-item a[data-setup-link], .job-attention a[data-setup-link], .job-attention-note a[data-setup-link] {
+  font: inherit;
+  font-weight: 600;
+}
+.setup-hint { margin-top: var(--space-2); padding-left: 10px; box-shadow: inset 2px 0 0 var(--waiting); }
+.setup-hint a, .batches-panel #batchesStatus a { font-weight: 600; }
+.composer > #startSetupHint { margin: 0 0 var(--space-3); }
+[data-view="models"] .composer > #startSetupHint { display: none !important; }
+
+@container main (max-width: 1100px) {
+  .setup-cards { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .setup-card { display: block; grid-row: auto; }
+  .setup-card-actions:empty { display: none; }
+}
+@media (max-width: 599px) {
+  .setup-command-block { flex-direction: column; }
+  .setup-command-block .setup-copy { margin-top: 0; }
+  .setup-facts > div { grid-template-columns: minmax(0, 1fr); }
+  .setup-paste-row { flex-direction: column; }
+  .setup-reason { max-width: none; }
+}
+/* Ink: warnings and running work in ink; Crimson and Ink set the card titles in their title face. */
+:root[data-theme="ink"] .setup-task { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] :is(.setup-banner, .setup-hint, .setup-signin) { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] .setup-card-title h2 { font-family: var(--font-title); font-weight: 600; letter-spacing: 0; }
+:root[data-theme="crimson"] .setup-card-title h2 { font-family: var(--font-title); font-weight: 600; }
+@media (forced-colors: active) {
+  .setup-card::before { background: CanvasText; }
+  .setup-signin, .setup-task { border-color: CanvasText; }
+}
+@media print {
+  .setup-view .setup-card-actions, .setup-stop, .setup-hide { display: none !important; }
 }

@@ -651,6 +651,32 @@ class HeldStopTests(StopCase):
             self.assertTrue(self.app.retry_historical_hold_if_due(time.time() + server.AUTO_RESUME_SECONDS + 1))
         self.assert_still_stopped()
 
+    def test_a_compiler_hold_is_checked_every_minute_and_its_release_never_continues_the_job(self):
+        # Re-run preflight found MacTeX missing; it is installed meanwhile. The hold says the job stays stopped.
+        missing = ("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No such file or directory: "
+                   "'/usr/local/texlive'")
+        self.held(server.retrieval.CompilerRetry(f"Historical compiler preflight failed; no model was started: "
+                                                 f"{missing}."))
+        self.assertTrue(server.compiler_hold(self.app.state["launchHold"]))
+        self.assertAlmostEqual(self.app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+        self.assertEqual(self.app.attention(), {
+            "kind": "compiler", "title": "LaTeX compiler not ready", "retrying": True,
+            "text": f"{missing}. TCS Prover checks again every minute; install or repair MacTeX and the hold is "
+                    "released, but the job stays stopped until you continue it."})
+        self.checks_pass()
+
+        class Inline:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with patch.object(server.threading, "Thread", Inline):
+            self.assertTrue(self.app.retry_historical_hold_if_due(time.time() + server.AUTO_RESUME_SECONDS + 1))
+        self.assert_still_stopped()
+        self.assertIsNone(self.app.attention())
+
 
 class Unresponsive(FakeRunner):
     """A runner that never ends its step: every wait for it runs out."""

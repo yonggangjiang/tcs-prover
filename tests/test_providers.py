@@ -504,7 +504,9 @@ class StoreTests(StoreCase):
                                                      state / "sessions", state / "run-owners", state / "servers",
                                                      state / "last-good-workflows", state / "settings.json",
                                                      state / "new-problem-presets.json",
-                                                     state / "new-problem-presets.lock"])
+                                                     state / "new-problem-presets.lock",
+                                                     # The program folders the Setup page remembered.
+                                                     state / "program-folders.json"])
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex"), "CLAUDE_CONFIG_DIR": str(self.root / "c")}):
             self.assertEqual(providers.user_login_files(), [(self.root / "codex" / "auth.json").resolve(),
                                                             (self.root / "c" / ".credentials.json").resolve()])

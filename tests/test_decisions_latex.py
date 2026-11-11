@@ -737,6 +737,195 @@ class IsolatedRefusalTests(LatexCase):
         self.assertEqual(len(self.prompts), 1)
         self.assertTrue((self.directory / "final.pdf").is_file())
 
+    def test_a_compiler_that_stays_not_ready_keeps_the_step_waiting_a_minute_at_a_time_without_a_limit(self):
+        # Owner decision: the run never holds for the user here. The step stays running, checks the compiler
+        # again every minute however long MacTeX is missing, and never compiles before the checks pass.
+        missing = compiler.CompilerNotReady("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No "
+                                            "such file or directory: '/usr/local/texlive'")
+        with self.isolated([missing] * 45 + [None]), \
+                mock.patch.object(runtime, "structured", side_effect=self.model([GOOD])):
+            state = runtime.execute_workflows([runtime.WORKFLOWS / "clean_up.yaml"], {"source": "Paper"}, {})
+        self.assertEqual(state["outcome"], "pass")
+        waits = [event for event in self.kinds("status", runtime.COMMAND_RETRY_LABEL) if "retryAt" in event]
+        self.assertEqual(len(waits), 45)
+        self.assertTrue(all(event["retryInSeconds"] == 60 and event["failureKind"] == "command" for event in waits))
+        self.assertIn("The isolated compiler is not ready: Historical compilation requires MacTeX", waits[-1]["text"])
+        self.assertAlmostEqual(sum(self.sleeps), 45 * 60)
+        self.assertEqual(self.kinds("workflow_paused"), [])
+        self.assertEqual(len(self.prompts), 1)
+        self.assertTrue((self.directory / "final.pdf").is_file())
+
+    def test_a_failing_test_document_before_launch_is_a_compiler_that_is_not_ready(self):
+        # Its document is fixed: a TeX update in progress or a damaged MacTeX fails it, and that can pass later.
+        cases = {
+            "error": ({"status": "fail", "diagnostic": "Isolated LaTeX command exited with code 1.", "returncode": 1,
+                       "output": "! LaTeX Error: File `article.cls' not found.\n\nType X to quit.\n"},
+                      "Isolated LaTeX command exited with code 1. ! LaTeX Error: File `article.cls' not found. Type X "
+                      "to quit."),
+            # A compiler that could not start has no output; the diagnostic still names the cause.
+            "start": ({"status": "unavailable", "diagnostic": "Isolated compiler could not run: [Errno 35] Resource "
+                       "temporarily unavailable", "returncode": None, "output": "", "transient": True},
+                      "Isolated compiler could not run: [Errno 35] Resource temporarily unavailable"),
+            "timeout": ({"status": "fail", "diagnostic": "Command exceeded 120 seconds.", "returncode": None,
+                         "output": "", "timed_out": True}, "Command exceeded 120 seconds."),
+        }
+        # MacTeX's own failure is MacTeX's to repair; one that could not start or finish passes by itself.
+        kinds = {"error": "mactex", "start": "busy", "timeout": "busy"}
+        for name, (result, words) in cases.items():
+            with self.subTest(name), mock.patch.object(compiler, "compile_command", return_value=result), \
+                    self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler.preflight(self.policy)
+            self.assertEqual(str(raised.exception), f"Isolated compiler smoke test failed: {words}")
+            self.assertEqual(raised.exception.kind, kinds[name])
+
+        def unstable(policy, config, argv, directory):
+            (directory / "final.log").write_text("LaTeX Warning: There were undefined references.\n")
+            return {"status": "pass", "diagnostic": "", "returncode": 0, "output": ""}
+
+        with mock.patch.object(compiler, "compile_command", side_effect=unstable), \
+                self.assertRaisesRegex(compiler.CompilerNotReady, "did not stabilize document references") as raised:
+            compiler.preflight(self.policy)
+        self.assertEqual(raised.exception.kind, "mactex")
+
+        def stable(policy, config, argv, directory):
+            (directory / "final.log").write_text("Output written on final.pdf (1 page).\n")
+            return {"status": "pass", "diagnostic": "", "returncode": 0, "output": ""}
+
+        with mock.patch.object(compiler, "compile_command", side_effect=stable):
+            self.assertEqual(compiler.preflight(self.policy)["status"], "pass")
+
+    def test_each_compiler_cause_names_what_fixes_it(self):
+        # Say plainly what is wrong: MacTeX's folders, tools and test document are MacTeX's to install or repair;
+        # macOS's sandbox-exec, perl and sh and the sandbox's canaries are not; canaries that fail under Rosetta
+        # need a native Python. The checks themselves are the same for every cause.
+        self.assertEqual(compiler.ADVICE["mactex"], "Install or repair MacTeX.")
+        self.assertEqual(compiler.ADVICE["sandbox"], "The compiler's macOS sandbox check failed; MacTeX is not the "
+                                                     "cause.")
+        self.assertEqual(compiler.ADVICE["rosetta"], "The compiler's macOS sandbox check failed because TCS Prover's "
+                                                     "Python runs under Rosetta: start TCS Prover with a native arm64 "
+                                                     "Python.")
+        self.assertEqual(compiler.ADVICE["busy"], "")
+        for kind in ("mactex", "sandbox"):
+            with self.subTest(kind), self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler._root_owned(self.directory, kind)  # The test's folder is not root's.
+            self.assertEqual(raised.exception.kind, kind)
+        self.assertEqual(compiler.CompilerNotReady("Not ready.").kind, "mactex")
+        texlive = self.directory / "texlive"
+        (texlive / "bin").mkdir(parents=True)
+        for name in ("latexmk", "pdflatex"):
+            (texlive / "bin" / name).write_text("")
+        places = {"/usr/local/texlive": texlive, "/Library/TeX/texbin": texlive / "bin"}
+        for missing, kind in (("/usr/local/texlive", "mactex"), ("/Library/TeX/texbin", "mactex"),
+                              ("/usr/bin/sandbox-exec", "sandbox"), ("/usr/bin/perl", "sandbox"), ("/bin/sh", "sandbox")):
+
+            def owned(path, kind="mactex", missing=missing):
+                if str(path) == missing:
+                    raise FileNotFoundError(errno.ENOENT, "No such file or directory", missing)
+                return places.get(str(path), Path(path))
+
+            with self.subTest(missing), mock.patch.object(compiler, "_root_owned", side_effect=owned), \
+                    self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler.toolchain()
+            self.assertEqual(str(raised.exception), "Historical compilation requires MacTeX and sandbox-exec: [Errno 2] "
+                                                    f"No such file or directory: '{missing}'")
+            self.assertEqual(raised.exception.kind, kind)
+        for unprotected, kind in (("/usr/local/texlive", "mactex"), ("/usr/bin/sandbox-exec", "sandbox")):
+
+            def owned(path, kind="mactex", unprotected=unprotected):
+                # As the real check does when the path or a parent is not root's or is writable by others.
+                if str(path) == unprotected:
+                    raise compiler.CompilerNotReady(f"Compiler toolchain is not root-owned and protected: {path}", kind)
+                return places.get(str(path), Path(path))
+
+            with self.subTest(unprotected=unprotected), mock.patch.object(compiler, "_root_owned", side_effect=owned), \
+                    self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler.toolchain()
+            self.assertEqual(raised.exception.kind, kind)
+        # The canaries, as macOS reports them.
+        for output, kind in (("rosetta error: Failed to open libRosettaRuntime\n", "rosetta"),
+                             ("outside read allowed at -e line 9.\n", "sandbox"), ("network allowed at -e line 13.\n",
+                                                                                   "sandbox")):
+            with self.subTest(output), mock.patch.object(compiler, "_run", return_value=subprocess.CompletedProcess(
+                    [], -6 if kind == "rosetta" else 1, output)), self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler.verify_sandbox("(version 1)", self.directory, {})
+            self.assertEqual(raised.exception.kind, kind)
+            self.assertIn(output.strip(), str(raised.exception))
+        # Canaries that do not finish, or cannot start for want of resources (which passes) or of sandbox-exec.
+        tools = (Path("/usr/local/texlive"), Path("/Library/TeX/texbin"), Path("/Library/TeX/texbin/latexmk"))
+        (self.directory / "latex-source.tex").write_text(GOOD)
+        config = {"requires": ["pdflatex"], "env": {"openin_any": "p", "openout_any": "p"}, "produces": ["final.pdf"],
+                  "log": "latex-compile.log", "timeout": 120}
+        for failure, kind in ((subprocess.TimeoutExpired(["/usr/bin/perl"], 15), "sandbox"),
+                              (BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"), "busy"),
+                              (FileNotFoundError(errno.ENOENT, "No such file or directory", "/usr/bin/sandbox-exec"),
+                               "sandbox")):
+            with self.subTest(failure=failure), mock.patch.object(compiler, "supported", return_value=True), \
+                    mock.patch.object(compiler, "toolchain", return_value=tools), \
+                    mock.patch.object(compiler, "_run", side_effect=failure), \
+                    self.assertRaises(compiler.CompilerNotReady) as raised:
+                compiler.compile_command(self.policy, config, compiler.LATEX_ARGV, self.directory)
+            self.assertEqual(raised.exception.kind, kind)
+
+    def test_a_failed_compile_on_a_mactex_that_fails_its_own_test_document_waits_instead_of_ending_the_job(self):
+        # A MacTeX being updated or damaged passes the toolchain and sandbox checks but fails every document. After
+        # a failed compile the fixed test document tells the two apart: the step waits and checks again every minute,
+        # without a repair call, and compiles once MacTeX works again; the source is never blamed for it.
+        damaged = {"status": "fail", "diagnostic": "Isolated LaTeX command exited with code 1.", "returncode": 1,
+                   "output": "! LaTeX Error: File `article.cls' not found.\n\nType X to quit.\n"}
+        results, calls = [damaged, damaged, damaged, damaged, None], []
+
+        def compile_command(policy, config, argv, directory):
+            calls.append("source" if directory == self.directory else "test document")
+            result = results.pop(0)
+            if result is not None:
+                return dict(result)
+            (directory / "final.pdf").write_bytes(b"%PDF-1.5\n%%EOF")
+            return {"status": "pass", "diagnostic": "Isolated LaTeX command exited with code 0.", "returncode": 0,
+                    "output": "Output written on final.pdf"}
+
+        with mock.patch.object(compiler, "compile_command", side_effect=compile_command), \
+                mock.patch.object(runtime, "structured", side_effect=self.model([GOOD])):
+            state = runtime.execute_workflows([runtime.WORKFLOWS / "clean_up.yaml"], {"source": "Paper"}, {})
+        self.assertEqual(state["outcome"], "pass")
+        self.assertEqual(calls, ["source", "test document"] * 2 + ["source"])
+        waits = [event for event in self.kinds("status", runtime.COMMAND_RETRY_LABEL) if "retryAt" in event]
+        self.assertEqual(len(waits), 2)
+        self.assertTrue(all(event["retryInSeconds"] == 60 and event["failureKind"] == "command" for event in waits))
+        self.assertIn("The isolated compiler is not ready: Isolated compiler smoke test failed: Isolated LaTeX command "
+                      "exited with code 1. ! LaTeX Error: File `article.cls' not found. Type X to quit. Install or "
+                      "repair MacTeX.", waits[0]["text"])
+        self.assertEqual(len(self.prompts), 1)  # The writer only: no repair of a source that was never at fault.
+        self.assertEqual(self.kinds("diagnostic", "PDF not compiled"), [])
+        self.assertEqual(self.kinds("workflow_paused"), [])
+        self.assertTrue((self.directory / "final.pdf").is_file())
+
+    def test_a_source_that_fails_on_a_working_compiler_is_still_repaired(self):
+        calls = []
+
+        def compile_command(policy, config, argv, directory):
+            if directory != self.directory:
+                calls.append("test document")
+                (directory / "final.log").write_text("Output written on final.pdf (1 page).\n")
+                return {"status": "pass", "diagnostic": "Isolated LaTeX command exited with code 0.", "returncode": 0,
+                        "output": "Output written on final.pdf"}
+            calls.append("source")
+            if calls.count("source") == 1:
+                return {"status": "fail", "diagnostic": "Isolated LaTeX command exited with code 12.",
+                        "returncode": 12, "output": "This is pdfTeX\n" + UNDEFINED + "\nLatexmk: Errors"}
+            (directory / "final.pdf").write_bytes(b"%PDF-1.5\n%%EOF")
+            return {"status": "pass", "diagnostic": "Isolated LaTeX command exited with code 0.", "returncode": 0,
+                    "output": "Output written on final.pdf"}
+
+        with mock.patch.object(compiler, "compile_command", side_effect=compile_command), \
+                mock.patch.object(runtime, "structured", side_effect=self.model([GOOD, GOOD + " %repaired"])):
+            state = runtime.execute_workflows([runtime.WORKFLOWS / "clean_up.yaml"], {"source": "Paper"}, {})
+        self.assertEqual(state["outcome"], "pass")
+        self.assertEqual(calls, ["source", "test document", "source"])
+        self.assertEqual([event for event in self.kinds("status", runtime.COMMAND_RETRY_LABEL) if "retryAt" in event],
+                         [])
+        self.assertEqual(len(self.prompts), 2)  # The writer and one repair of the source's own error.
+        self.assertIn("Undefined control sequence", self.prompts[1])
+
     def test_an_unsupported_command_is_still_a_visible_stop(self):
         # The step pauses with its input (graph I-002) and, as no retry can change the command, waits for Resume.
         with self.isolated([compiler.CompilerIsolationError("The isolated compiler/command adapter supports only the "

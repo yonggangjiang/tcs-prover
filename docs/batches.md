@@ -95,6 +95,11 @@ computer (`0`, the default, means no limit; saved in `.tcs-prover/settings.json`
 - **Start now** starts a queued job at once, and a job you start or resume
   yourself always starts. A reply of the paused author starts without waiting
   for a slot or for the 2-second spacing, but takes a slot while it is written.
+- The every-minute checks of held web-cutoff jobs start no model and take no
+  slot: they run whatever the limit and the spacing, at most four starting in
+  the same second. A job whose check passed by itself then starts or resumes
+  like an automatic retry, within the limit and the spacing (a prepared one
+  waits as **Queued**); after **Re-run preflight** it starts at once.
 - The queue survives a restart, and a terminal folder run follows the same
   limit.
 - **Notify me in this browser when a job needs attention** shows a browser

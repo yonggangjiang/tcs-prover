@@ -179,6 +179,19 @@ class GatewayTests(_ApiModelRoutes, _GatewayFixture):
         self.assertEqual(self.legacy.calls, [])
         self.assertEqual(self.current.calls, [])
 
+    def test_the_setup_page_loads_but_its_routes_are_not_forwarded(self):
+        # The page says Setup is unavailable here: the jobs protection would see only one controller's jobs.
+        self.assertEqual(self.request('/?setup=1', authenticate=False), (200, b'new assets index.html'))
+        self.assertEqual(self.request('/?setup=1&theme=dark', authenticate=False), (200, b'new assets index.html'))
+        for path in ('/setup', '/setup?refresh=1', '/setup/task?id=s-000000000000'):
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path)[0], 404)
+        for path in ('/setup/action', '/setup/stop', '/setup/input'):
+            with self.subTest(path=path):
+                self.assertIn(self.request(path, method='POST', body={'program': 'codex'})[0], {403, 404})
+        self.assertEqual(self.legacy.calls, [])
+        self.assertEqual(self.current.calls, [])
+
     def test_host_origin_and_gateway_token_are_required(self):
         for options in ({'authenticate': False},
                         {'headers': {'Origin': 'https://example.com'}},

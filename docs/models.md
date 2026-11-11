@@ -14,11 +14,90 @@ API connection; each model offers only the reasoning levels it supports.
 
 | Source | Models | Needs |
 | --- | --- | --- |
-| Codex CLI | `gpt-6.1-sol` (GPT 6.1 Sol, the default), `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | the Codex CLI, signed in with ChatGPT (`codex login`) |
+| Codex CLI | `gpt-6.1-sol` (GPT 6.1 Sol, the default), `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | the Codex CLI, signed in with ChatGPT (on the Setup page, or `codex login`) |
 | Claude Code | `claude-fable-5-1` (Claude Fable 5.1), `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | Claude Code, signed in with your Claude subscription |
 | API connection | the models your endpoint lists | a saved key, and the program for its format installed but not signed in: OpenAI format through the Codex CLI, Anthropic format through Claude Code |
 
-The install commands are in the [README](../README.md#what-you-need-for-models).
+Install and sign in on the [Setup page](#the-setup-page); the commands to run in a
+terminal instead are in the [README](../README.md#what-you-need-for-models).
+
+## The Setup page
+
+**Setup**, first under Configure in the sidebar, shows the programs your models
+run through, and LaTeX, one card each:
+
+| Card | Shows | Buttons |
+| --- | --- | --- |
+| Codex CLI | installed or not, version, location and what installed it, sign-in (ChatGPT or an API key), what needs it | Install, Update, Sign in (in this browser or with a one-time code) |
+| Claude Code | the same, with the account and plan | Install, Update, Sign in (Claude subscription or Anthropic Console) |
+| LaTeX | whether `latexmk` and `pdflatex` are found, and their versions | the install command for your system, to run yourself |
+
+- **Needed by** lists the New problem roles (the form in this tab while it is
+  open, else your default saved settings), the jobs that can still run, and your
+  API connections. API connections need the program installed but no sign-in.
+- Setup checks the programs exactly as jobs find and start them, with no model
+  call: `codex --version`, `codex login status`, `claude --version`, `claude auth
+  status`, `latexmk -v` and `pdflatex --version`. "Signed in" means a login is
+  saved; an expired one shows on the job that needs it, under **Needs your
+  attention**. Each check waits at most 20 seconds; one that does not answer is
+  reported as such, and **Check again** runs the checks again. Opening Setup,
+  **Check again** and coming back to the Setup window (at most every 10
+  seconds) check again. Any other page you open reuses a check younger than 10
+  minutes, and checks again when it is older; a page left open keeps showing
+  its last check (its background reads start no program) until you open Setup
+  or reload it.
+- **Install** runs the vendor's official installer after you confirm the exact
+  command: `curl -fsSL https://chatgpt.com/codex/install.sh | sh` (with
+  `CODEX_NON_INTERACTIVE=1`, as Codex's own updater runs it) or `curl -fsSL
+  https://claude.ai/install.sh | bash`, on Windows the PowerShell installers.
+  You see the live output and can stop it; installs, updates and sign-ins have
+  no time limit (in a Codex sign-in, each answer of the Codex CLI must come
+  within 120 seconds). **Stop** asks the installer to end, and after 10
+  seconds ends it and everything it started; on macOS and Linux, what an
+  install or update leaves running ends with it. A Stop that comes once the
+  installer has finished undoes nothing: the result says so, and the sign-in
+  you chose does not start. **Update** runs the Codex installer again, or
+  `claude update`.
+  **Then sign in** in the Install dialog starts the sign-in once the install
+  works, under the same confirmation.
+- A program you install here is used by new jobs at once, and by jobs already
+  waiting for it: when its folder is not on TCS Prover's PATH, Setup remembers
+  the folder (`.tcs-prover/program-folders.json`, which no model can read or
+  write), and the lookups of jobs use it whenever PATH has no copy. Open a new
+  terminal to use the program yourself. A copy that is installed but not on the
+  path shows **Use it for jobs**, which remembers its folder the same way.
+- Copies installed with Homebrew, npm, WinGet or a Linux package, and commands
+  that are your own scripts, are never changed by Setup: it shows the commands
+  to run yourself. (OpenAI's installer replaces `~/.local/bin/codex`, so Setup
+  does not run it when your own script is there. A program that changed since
+  the last check, for example a script you put there while the dialog was open,
+  is checked again before anything runs, and the step is then refused.)
+- While one of this server's jobs runs a model through a program, its
+  **Update**, a repair install and **Sign in again** (also **Sign in** when the
+  sign-in could not be checked) wait: pause or stop the job, or let it finish.
+  A job whose model calls all wait for that program's sign-in or for it to run
+  again does not count: that step is what it waits for. Installing a missing
+  program and a first sign-in never wait.
+- **Sign in**: Codex gives a ChatGPT link or a one-time code (for TCS Prover on
+  another computer; turn on device code sign-in in ChatGPT's security settings
+  first). Claude Code may open a tab; if the sign-in page shows a code, paste it
+  into the box on the Setup page, which passes it only to Claude Code. Not
+  offered: Claude's `/login`, `claude setup-token` and API-key logins (keys
+  belong in API connections), and there is no Sign out button. A sign-in token
+  in `CLAUDE_CODE_OAUTH_TOKEN` is what Claude jobs use, so Setup then offers no
+  Claude sign-in.
+- Setup never uses administrator rights (it refuses every action when TCS
+  Prover runs as root or administrator), never asks for API keys or tokens,
+  never puts what you type into a command, and keeps its output only on the
+  page until TCS Prover restarts: keys, tokens and sign-in codes are removed,
+  and each step keeps its newest 2,000 lines (the panel says how many earlier
+  lines it dropped).
+- The sidebar's Setup item counts the programs that need setting up for your
+  roles and jobs; the Overview lists them, the role menus and **Start workflow**
+  say so, and a job that waits for a program or a login links to Setup. None of
+  this stops a start: the job retries every minute and continues by itself.
+- Setup is not available through the live gateway; open TCS Prover from its own
+  launch link.
 
 ## What a start checks
 
@@ -29,16 +108,21 @@ Codex CLI models for its proof roles and the native Codex binary, and with
 `sandbox-exec` for its isolated LaTeX compiler (see
 [Web search cutoff](web-cutoff.md#what-a-timestamp-run-checks)). No other
 installed program is checked there. A missing program never stops a start (a
-run with a web cutoff timestamp is the exception: its checks before launch need
-the native Codex binary, and with Writing & polishing on MacTeX; a job that
-fails them is held until you install what is missing and choose **Re-run
-preflight**). The model call that needs the program says so in the activity log
-and is retried every minute, so the job continues by itself once the program is
-installed (see [Retries and what needs you](retries.md)).
+run with a web cutoff timestamp is the exception: a start without the native
+Codex binary is refused, so install it and start again; with Writing &
+polishing on it also needs MacTeX, and a job whose MacTeX is missing or fails
+its checks is held, checked again every minute, and starts or continues by
+itself once MacTeX is installed or repaired). The model call that needs the
+program says so in the activity log and is retried every minute, so the job
+continues by itself once the program is installed (see
+[Retries and what needs you](retries.md)).
 
 Under each role menu a chip names the program, or for an API model its format,
 program and host (for example *API · Anthropic format via Claude Code ·
-gateway.example.com*). It never checks whether the program is installed.
+gateway.example.com*). When the Setup page's last check found that program
+missing, not running, not on the jobs' path or, for a built-in model, not signed
+in, the chip adds it (for example *Claude Code · not installed*) and a hint under
+the menus links to Setup; nothing stops a start.
 
 ## Codex CLI
 
@@ -56,8 +140,8 @@ The four GPT models use your ChatGPT login and offer `low` through `max`.
 
 ## Claude Code
 
-Install Claude Code, run `claude` once and sign in with your Claude
-subscription. Its models offer `low`, `medium`, `high`, `xhigh` and `max` (a
+Install Claude Code and sign in with your Claude subscription on the Setup
+page (or run `claude auth login` in a terminal). Its models offer `low`, `medium`, `high`, `xhigh` and `max` (a
 saved `ultra` runs as `max`) and always run at standard speed.
 Earlier versions of TCS Prover called this program the Claude CLI; the activity
 logs of jobs run then keep that name.

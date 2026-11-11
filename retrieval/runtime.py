@@ -69,6 +69,9 @@ PRIVATE_TEMP_NAME = re.compile(r"(?:author|structured|critic)-(\d+)-[A-Za-z0-9_]
 PUBLIC_EGRESS_CANARY = ("1.1.1.1", 443)
 WINDOWS_ADAPTER = "codex-windows-mxc-v1"
 MACOS_ADAPTER = "codex-macos-seatbelt-v1"
+# The native Codex of the Codex desktop app on macOS: one of the places codex_executable() looks, and a copy the
+# Setup page lists (tests replace it, so a Mac with the app runs them as any other).
+CODEX_APP_BINARY = Path("/Applications/Codex.app/Contents/Resources/codex")
 SETTINGS_READ_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16)
 BUNDLED_SKILLS_FILE = ".bundled-skills.json"
 SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
@@ -194,8 +197,14 @@ def codex_executable(policy, search_path=None):
     if macos and search_path is None:
         # The standard shell shim resets CODEX_HOME and cannot be used for an
         # isolated run. Resolve the installed native payload directly instead.
-        candidates.extend((Path.home() / ".codex/packages/standalone/current/bin/codex",
-                           Path("/Applications/Codex.app/Contents/Resources/codex")))
+        candidates.extend((Path.home() / ".codex/packages/standalone/current/bin/codex", CODEX_APP_BINARY))
+    if search_path is None:
+        # Last, a Codex the Setup page installed outside this process's PATH (its remembered folder), under the
+        # same checks: a native binary outside the run workspace. A waiting job then finds it without a restart.
+        from runner import providers
+        folder = providers.program_folder("codex")
+        if folder:
+            candidates.append(Path(folder) / ("codex" if macos else "codex.exe"))
     for candidate in candidates:
         candidate = candidate.resolve()
         if candidate == workspace or workspace in candidate.parents:

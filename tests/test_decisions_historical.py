@@ -1417,14 +1417,64 @@ class PreflightCauseTests(UIRetrievalFixture):
         self.assertIn('outside-read denial', str(failure))
 
     def test_compiler_failure_names_its_cause(self):
+        # What a Mac whose Python is an x86_64 build sees: the sandbox canaries fail under Rosetta, which
+        # verify_sandbox reports as a compiler that is not ready, of the cause "rosetta" (the hold's own text is
+        # in CompilerHoldTests.test_a_python_under_rosetta_is_named_as_the_cause_through_the_real_check).
         from retrieval import isolated_compiler
         policy_path = self.prepare()
         with mock.patch.object(isolated_compiler, 'supported', return_value=True), \
-                mock.patch.object(isolated_compiler, 'preflight', side_effect=isolated_compiler.CompilerIsolationError(
-                    'Compiler sandbox canaries failed (exit -6): rosetta error')), \
-                mock.patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(ValueError) as caught:
+                mock.patch.object(isolated_compiler, 'preflight', side_effect=isolated_compiler.CompilerNotReady(
+                    ROSETTA, 'rosetta')), \
+                mock.patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(retrieval.CompilerRetry) as caught:
             retrieval.preflight_compiler(policy_path)
-        self.assertIn('rosetta error', str(caught.exception))
+        self.assertEqual(str(caught.exception), f'Historical compiler preflight failed; no model was started: {ROSETTA}.')
+        self.assertEqual(caught.exception.kind, 'rosetta')
+
+    def test_a_compiler_that_is_not_ready_is_checked_again_every_minute(self):
+        # Owner decision: MacTeX missing, being updated or not protected, sandbox-exec missing, or failing sandbox
+        # canaries or test document can all pass later, so the hold is retried like a check that could not finish.
+        from retrieval import isolated_compiler
+        policy_path = self.prepare()
+        for cause, kind in (("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No such file or "
+                             "directory: '/usr/local/texlive'", 'mactex'),
+                            ('Compiler toolchain is not root-owned and protected: /usr/local/texlive/2026', 'mactex'),
+                            ('Compiler sandbox canaries failed (exit 1): outside read allowed', 'sandbox'),
+                            ("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No such file or "
+                             "directory: '/usr/bin/sandbox-exec'", 'sandbox'),
+                            (ROSETTA, 'rosetta'),
+                            ('Isolated compiler smoke test failed: Isolated LaTeX command exited with code 1.',
+                             'mactex')):
+            with self.subTest(cause=cause), mock.patch.object(isolated_compiler, 'supported', return_value=True), \
+                    mock.patch.object(isolated_compiler, 'preflight',
+                                      side_effect=isolated_compiler.CompilerNotReady(cause, kind)), \
+                    mock.patch.object(sys, 'stderr', io.StringIO()) as stderr, \
+                    self.assertRaises(retrieval.CompilerRetry) as caught:
+                retrieval.preflight_compiler(policy_path)
+            self.assertIsInstance(caught.exception, retrieval.PreflightRetry)
+            self.assertEqual(str(caught.exception),
+                             f"Historical compiler preflight failed; no model was started: {cause.rstrip('.')}.")
+            # The cause picks the advice the hold gives (isolated_compiler.ADVICE).
+            self.assertEqual(caught.exception.kind, kind)
+            self.assertIn(cause, stderr.getvalue())
+        # A test document that could not start or finish passes by itself: a check that could not finish,
+        # checked again every minute, with no compiler advice.
+        busy = 'Isolated compiler smoke test failed: Command exceeded 120 seconds.'
+        with mock.patch.object(isolated_compiler, 'supported', return_value=True), \
+                mock.patch.object(isolated_compiler, 'preflight',
+                                  side_effect=isolated_compiler.CompilerNotReady(busy, 'busy')), \
+                mock.patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(retrieval.PreflightRetry) as caught:
+            retrieval.preflight_compiler(policy_path)
+        self.assertNotIsInstance(caught.exception, retrieval.CompilerRetry)
+        # A refused file and a command the adapter does not support are no compiler that becomes ready by itself.
+        for failure in (isolated_compiler.CompilerRefusal('Compiler requires a regular, unlinked file within its size '
+                                                          'limit: final.pdf'),
+                        isolated_compiler.CompilerIsolationError('The isolated compiler/command adapter supports only '
+                                                                 'the built-in LaTeX command.')):
+            with self.subTest(failure=str(failure)), mock.patch.object(isolated_compiler, 'supported', return_value=True), \
+                    mock.patch.object(isolated_compiler, 'preflight', side_effect=failure), \
+                    mock.patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(ValueError) as caught:
+                retrieval.preflight_compiler(policy_path)
+            self.assertNotIsInstance(caught.exception, retrieval.PreflightRetry)
 
 
 class RelocationTests(UIRetrievalFixture):
@@ -1490,6 +1540,7 @@ class HistoricalJobFixture(unittest.TestCase):
         self.codex.chmod(0o700)
         self.manager = object.__new__(server.Server)
         self.manager.runs, self.manager.jobs, self.manager.jobs_lock = self.runs, {}, threading.RLock()
+        self.manager._retry_stop = threading.Event()
         self.launches, self.checks = [], []
         real_prepare = retrieval.prepare_policy
         self.preflight = mock.Mock(side_effect=lambda path: self.checks.append(path))
@@ -1526,6 +1577,11 @@ class HistoricalJobFixture(unittest.TestCase):
         app.state.update(**state)
         app._save_job_settings(app.state)
 
+    def tick(self, now):
+        """One pass of the server's once-a-second retry loop at ``now``; a held job's check runs inline."""
+        with mock.patch.object(server.threading, 'Thread', InlineThread):
+            self.manager._retry_paused_jobs(now)
+
 
 class HeldLaunchTests(HistoricalJobFixture):
     """I-026: a failed launch check holds the job with its cause and is retried every minute."""
@@ -1553,9 +1609,30 @@ class HeldLaunchTests(HistoricalJobFixture):
 
         with mock.patch.object(server.threading, 'Thread', Inline):
             self.assertTrue(app.retry_historical_hold_if_due(time.time() + server.AUTO_RESUME_SECONDS + 1))
-        self.assertEqual(app.state['launchHold'], '')
+        # The check starts nothing itself: the released job joins the queue, which starts it within the
+        # running-jobs limit and the start spacing.
+        self.assertEqual((app.state['launchHold'], app.state['phase'], app.state['launchQueued']),
+                         ('', 'prepared', True))
+        self.assertEqual(self.launches, [])
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 2)
         self.assertEqual(app.state['phase'], 'running')
         self.assertEqual(len(self.launches), 1)
+
+    def test_a_start_without_the_native_codex_binary_is_refused_before_any_job_exists(self):
+        # As docs/models.md says: nothing is held or checked again; install it and start again.
+        missing = retrieval_runtime.IsolationCheckUnavailable(
+            'Historical execution requires an absolute native Mach-O codex binary outside the run workspace; '
+            'script shims are not supported.')
+        with mock.patch.object(retrieval_runtime, 'codex_executable', side_effect=missing):
+            with self.assertRaisesRegex(ValueError, 'requires an absolute native Mach-O codex binary'):
+                self.start()
+            self.assertEqual(self.manager.jobs, {})
+            with self.assertRaisesRegex(ValueError, 'Could not start the job for statement 1: Historical execution '
+                                                    'requires an absolute native Mach-O codex binary'):
+                self.manager.start_direct_batch({'retrievalMode': 'historical', 'retrievalCutoffUtc': UI_CUTOFF,
+                                                 'statements': [{'statement': 'A.'}]})
+        self.assertEqual(self.manager.jobs, {})
+        self.assertEqual(self.launches, [])
 
     def test_a_permanent_failure_waits_for_re_run_preflight(self):
         self.preflight.side_effect = ValueError('Codex login is unavailable. Run codex login before starting '
@@ -1733,9 +1810,11 @@ class MergedServerHookTests(HistoricalJobFixture):
             self.manager.continue_stopped_job(app.state['runId'])
         self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
         self.preflight.side_effect = None
-        with mock.patch.object(server.threading, 'Thread', InlineThread):
-            self.assertTrue(app.retry_historical_hold_if_due(time.time() + server.AUTO_RESUME_SECONDS + 1))
+        # The check every minute releases the hold; the server's retry loop then resumes the job, within the
+        # running-jobs limit and the start spacing, in the same pass when a slot is free.
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 1)
         self.assertEqual((app.state['phase'], app.state['launchHold']), ('running', ''))
+        self.assertFalse(app.state['resumeQueuedAt'])
         argv, options = self.launches[-1]
         self.assertEqual(argv[argv.index('--start-node') + 1], 'author')
         self.assertIn('goal_require_resume=true', argv)
@@ -1775,20 +1854,30 @@ class MergedServerHookTests(HistoricalJobFixture):
         self.assertEqual(self.manager.jobs, {})
 
     def test_a_run_that_passes_its_checks_but_cannot_start_is_held_again_and_retried(self):
+        # Re-run preflight starts the job at once; a start that fails holds it again with the cause.
         self.preflight.side_effect = retrieval.PreflightRetry(self.OFFLINE)
         app = self.start()
         self.preflight.side_effect = None
         with mock.patch.object(server.subprocess, 'Popen', side_effect=OSError('Too many open files')), \
-                mock.patch.object(server.threading, 'Thread', InlineThread):
-            self.assertTrue(app.retry_historical_hold_if_due(time.time() + server.AUTO_RESUME_SECONDS + 1))
+                self.assertRaisesRegex(OSError, 'Too many open files'):
+            self.manager.continue_stopped_job(app.state['runId'])
         self.assertEqual(app.state['phase'], 'prepared')
         self.assertTrue(app.state['launchHold'].startswith(
             'Historical run check passed, but the run did not start: Too many open files.'))
         self.assertTrue(app.state['launchHold'].endswith(server.HISTORICAL_RETRY_SUFFIX))
         self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
         self.assertFalse(app._claims.held())
-        with mock.patch.object(server.threading, 'Thread', InlineThread):
-            self.assertTrue(app.retry_historical_hold_if_due(time.time() + 2 * server.AUTO_RESUME_SECONDS + 2))
+        # The check every minute passes and puts the job in the queue; the queue's start fails the same way,
+        # so the job waits in the queue with the cause and its start is tried again a minute later.
+        now = time.time() + server.AUTO_RESUME_SECONDS + 1
+        with mock.patch.object(server.subprocess, 'Popen', side_effect=OSError('Too many open files')):
+            self.tick(now)
+        self.assertEqual((app.state['phase'], app.state['launchHold'], app.state['launchQueued']),
+                         ('prepared', '', True))
+        self.assertEqual(app.state['launchError'], 'Could not start: Too many open files.')
+        self.assertAlmostEqual(app.state['autoResumeAt'], now + server.AUTO_RESUME_SECONDS, delta=1)
+        self.assertFalse(app._claims.held())
+        self.tick(now + server.AUTO_RESUME_SECONDS + 1)
         self.assertEqual((app.state['phase'], app.state['launchHold']), ('running', ''))
 
     def test_re_run_preflight_checks_the_compiler_only_when_writing_is_selected(self):
@@ -1977,6 +2066,543 @@ class MergedServerHookTests(HistoricalJobFixture):
             'Historical search preflight failed; no model was started: the check did not finish within 30 seconds.'))
         self.assertTrue(retry.endswith('within 30 seconds.' + server.HISTORICAL_RETRY_SUFFIX))
         self.assertEqual(app._historical_hold_text(retrieval.PreflightRetry(retry)), retry)
+
+
+NO_MACTEX = ("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No such file or directory: "
+             "'/usr/local/texlive'")
+# What the compiler's sandbox canaries report when TCS Prover's Python is an x86_64 build running under Rosetta
+# on an Apple silicon Mac (isolated_compiler.verify_sandbox; cause "rosetta").
+ROSETTA = 'Compiler sandbox canaries failed (exit -6): rosetta error: Failed to open libRosettaRuntime'
+LEAKY = 'Compiler sandbox canaries failed (exit 1): outside read allowed'
+NO_SANDBOX_EXEC = ("Historical compilation requires MacTeX and sandbox-exec: [Errno 2] No such file or directory: "
+                   "'/usr/bin/sandbox-exec'")
+# The real check, which HistoricalJobFixture replaces with a stand-in.
+REAL_PREFLIGHT_COMPILER = retrieval.preflight_compiler
+
+
+class CompilerHoldTests(HistoricalJobFixture):
+    """Owner decision: a web-cutoff job held because its isolated LaTeX compiler is not ready (MacTeX missing or
+    being updated, or failing its checks) is checked again every minute, like a check that could not finish, and
+    starts or continues by itself once every check passes. The hold says what is wrong and what fixes it, by the
+    cause. The checks start no model, so neither the running-jobs limit nor the start spacing holds them back;
+    the start or resume after a passing one waits for both. The compiler's checks are faked here; they stay as
+    strict: nothing starts while they fail."""
+
+    HOLD = (f"Historical compiler preflight failed; no model was started: {NO_MACTEX}. Install or repair MacTeX. "
+            "The check runs again every minute.")
+
+    def setUp(self):
+        super().setUp()
+        self.order = []
+        self.preflight.side_effect = lambda path: (self.checks.append(path), self.order.append('policy'))
+
+    def not_ready(self, cause=NO_MACTEX, kind='mactex'):
+        """The compiler check fails as preflight_compiler reports it; by default MacTeX is missing."""
+
+        def check(path):
+            self.order.append('compiler')
+            raise retrieval.CompilerRetry(f'Historical compiler preflight failed; no model was started: {cause}.',
+                                          kind)
+
+        retrieval.preflight_compiler.side_effect = check
+
+    def ready(self):
+        retrieval.preflight_compiler.side_effect = lambda path: self.order.append('compiler')
+
+    def recheck(self, app, after):
+        """The job's own check every minute, ``after`` seconds from now (inline); it starts nothing itself."""
+        with mock.patch.object(server.threading, 'Thread', InlineThread):
+            return app.retry_historical_hold_if_due(time.time() + after)
+
+    def diagnostics(self, app):
+        return [record['text'] for record in app.state['trace'] if record.get('kind') == 'diagnostic']
+
+    def attention(self, then):
+        return {'kind': 'compiler', 'title': 'LaTeX compiler not ready', 'retrying': True,
+                'text': f'{NO_MACTEX}. TCS Prover checks again every minute; install or repair MacTeX and {then}.'}
+
+    def paused(self, app, **checkpoint):
+        app._save_pause({'status': 'paused', 'node': 'author', 'stage': 'solve', 'pauseCause': 'error',
+                         'state': {'statement': 'Prove a harmless identity.'}, 'elapsedSeconds': 5.0,
+                         'autoResumeAt': 0, 'goalThreadId': 'thread-1', 'error': 'Codex exited.', **checkpoint})
+        self.settle(app, phase='paused', stage='solve', activeNode='author', goalThreadId='thread-1',
+                    error='Codex exited.')
+
+    def held(self, app):
+        """Hold ``app`` for its compiler, as a check that finds MacTeX missing does."""
+        with app.lock:
+            app._hold_after_failed_check(retrieval.CompilerRetry(
+                f'Historical compiler preflight failed; no model was started: {NO_MACTEX}.'))
+
+    def stopped(self, app):
+        self.settle(app, phase='done', stage='solve', activeNode='author', manuallyStopped=True, stoppedStage='solve',
+                    error='Stopped.')
+
+    def compiler_checks(self, app):
+        return sum(1 for path in self.compiled if path == app.state['retrievalPolicyPath'])
+
+    def clock(self, start):
+        """The server's clock from now on in this test, at ``start``; the test moves it (``clock[0]``)."""
+        now = [start]
+        patcher = mock.patch.object(server.time, 'time', lambda: now[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return now
+
+    def count_compiler_checks(self):
+        """Record which job each compiler check is for (the stand-in check stays as it is)."""
+        self.compiled = []
+        check = retrieval.preflight_compiler.side_effect
+
+        def counted(path):
+            self.compiled.append(path)
+            return check(path)
+
+        retrieval.preflight_compiler.side_effect = counted
+
+    def test_a_launch_without_mactex_is_held_checked_every_minute_and_starts_by_itself(self):
+        self.not_ready()
+        app = self.start()
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('prepared', self.HOLD))
+        self.assertTrue(server.compiler_hold(app.state['launchHold']))
+        self.assertEqual(self.launches, [])
+        self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+        # The job page and Needs your attention say what is wrong, that it is checked every minute and what
+        # lets the job go on; Re-run preflight still checks at once.
+        row = self.manager.job_list()[0]
+        self.assertEqual(row['needsAttention'], self.attention('the job starts by itself'))
+        self.assertEqual(row['continueStoppedLabel'], 'Re-run preflight')
+        self.assertFalse(app.retry_historical_hold_if_due(time.time()))  # Not due yet.
+        self.order.clear()
+        clock = self.clock(app._hold_retry_at)
+        for minute in (1, 2, 3):
+            # The server's once-a-second loop runs the check when it is due, every minute.
+            self.tick(clock[0] - 1)
+            self.assertEqual(self.order, ['compiler'] * (minute - 1))
+            self.tick(clock[0])
+            self.assertEqual(self.order, ['compiler'] * minute)
+            self.assertEqual(app.state['launchHold'], self.HOLD)
+            self.assertEqual(app._hold_retry_at, clock[0] + server.AUTO_RESUME_SECONDS)
+            clock[0] += server.AUTO_RESUME_SECONDS
+        # The compiler is checked first, so a missing MacTeX starts no Codex sandbox every minute; nothing ran.
+        self.assertEqual(self.order, ['compiler'] * 3)
+        self.assertEqual(self.launches, [])
+        # The activity log names the hold once, not every minute.
+        self.assertEqual(self.diagnostics(app).count(self.HOLD), 1)
+        # MacTeX is installed: the next check passes every check, and the job starts by itself.
+        self.ready()
+        self.tick(clock[0])
+        self.assertEqual(self.order[-2:], ['compiler', 'policy'])
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('running', ''))
+        self.assertEqual(len(self.launches), 1)
+        self.assertFalse(app._hold_retry_at)
+        self.assertIsNone(app.attention())
+
+    def test_re_run_preflight_while_mactex_is_missing_keeps_the_check_every_minute(self):
+        self.not_ready()
+        app = self.start()
+        with self.assertRaises(ValueError) as caught:
+            self.manager.continue_stopped_job(app.state['runId'])
+        self.assertEqual(str(caught.exception), self.HOLD)
+        self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+        self.assertEqual(self.launches, [])
+
+    def test_a_paused_run_held_for_its_compiler_continues_by_itself(self):
+        app = self.start()
+        self.paused(app)
+        with app.lock:
+            app._hold_after_failed_check(retrieval.NeedsAttention('The historical retrieval policy is missing.'))
+        # Re-run preflight: the policy is back, but MacTeX is being updated.
+        self.not_ready()
+        with self.assertRaisesRegex(ValueError, 'Install or repair MacTeX'):
+            self.manager.continue_stopped_job(app.state['runId'])
+        self.assertEqual(app.state['launchHold'], self.HOLD)
+        self.assertEqual(app.attention(), self.attention('the job continues by itself'))
+        self.assertEqual(app.state['autoResumeAt'], 0)
+        self.ready()
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 1)
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('running', ''))
+        argv, options = self.launches[-1]
+        self.assertEqual(argv[argv.index('--start-node') + 1], 'author')
+        self.assertIn('goal_require_resume=true', argv)
+        self.assertEqual(Path(options['cwd']), app.run_dir)
+
+    def test_a_finished_run_held_for_its_compiler_only_has_its_hold_released(self):
+        app = self.start()
+        self.settle(app, phase='done', stage='final', activeNode='latex_editor', resultKind='final', error='')
+        self.held(app)
+        self.assertEqual(app.attention(), self.attention('the hold is released'))
+        self.ready()
+        launches = len(self.launches)
+        self.assertTrue(self.recheck(app, server.AUTO_RESUME_SECONDS + 1))
+        self.assertEqual((app.state['phase'], app.state['launchHold'], len(self.launches)), ('done', '', launches))
+
+    def test_a_job_stopped_by_an_earlier_version_only_has_its_hold_released(self):
+        # An earlier version's Stop ended the job (done, manuallyStopped): its hold says so and nothing restarts it.
+        app = self.start()
+        self.stopped(app)
+        self.held(app)
+        self.assertEqual(app.attention(),
+                         self.attention('the hold is released, but the job stays stopped until you continue it'))
+        self.ready()
+        launches = len(self.launches)
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 1)
+        self.assertEqual((app.state['phase'], app.state['launchHold'], len(self.launches)), ('done', '', launches))
+        self.assertTrue(app.state['manuallyStopped'])
+        self.assertIsNone(app.attention())
+
+    def test_a_used_up_time_limit_only_has_its_hold_released(self):
+        # Re-run preflight keeps such a job paused for the user (it may raise the limit), so its hold promises
+        # no continuation either.
+        app = self.start()
+        self.paused(app, pauseCause='time-limit', elapsedSeconds=7200.0, summaryRequested=True)
+        self.settle(app, thinkingHours=1)
+        self.held(app)
+        self.assertEqual(app.attention(), self.attention('the hold is released'))
+        self.ready()
+        launches = len(self.launches)
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 1)
+        self.assertEqual((app.state['phase'], app.state['launchHold'], len(self.launches)), ('paused', '', launches))
+        self.assertFalse(app.state.get('resumeQueuedAt'))
+
+    def test_a_compiler_failure_no_retry_changes_still_waits_for_re_run_preflight(self):
+        retrieval.preflight_compiler.side_effect = ValueError(
+            'Historical compiler preflight failed; no model was started: The isolated compiler/command adapter '
+            'supports only the built-in LaTeX command.')
+        app = self.start()
+        self.assertTrue(app.state['launchHold'].endswith(server.HISTORICAL_FIX_ADVICE))
+        self.assertFalse(server.compiler_hold(app.state['launchHold']))
+        self.assertFalse(app._hold_retry_at)
+        self.assertIsNone(app.attention())
+
+    def test_a_compiler_that_passes_still_waits_for_the_sandbox_and_login_check(self):
+        # The compiler is checked first while it holds the job; the hold is still released only when the
+        # sandbox and login check that follows passes too.
+        self.not_ready()
+        app = self.start()
+        self.ready()
+        offline = 'Historical search preflight failed; no model was started: Cannot verify public network isolation.'
+
+        def check(path):
+            self.order.append('policy')
+            raise retrieval.PreflightRetry(offline)
+
+        self.preflight.side_effect = check
+        self.order.clear()
+        self.tick(time.time() + server.AUTO_RESUME_SECONDS + 1)
+        self.assertEqual(self.order, ['compiler', 'policy'])
+        self.assertEqual((app.state['phase'], app.state['launchHold']),
+                         ('prepared', offline + server.HISTORICAL_RETRY_SUFFIX))
+        self.assertFalse(app.state.get('launchQueued'))
+        self.assertEqual(self.launches, [])
+        self.assertFalse(server.compiler_hold(app.state['launchHold']))
+        self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+
+    def test_each_cause_says_what_fixes_it(self):
+        # Say plainly what is wrong: only MacTeX's own failures are told to install or repair MacTeX.
+        sandbox = "The compiler's macOS sandbox check failed; MacTeX is not the cause."
+        cases = {
+            'sandbox': (LEAKY, f'{sandbox} The check runs again every minute.',
+                        f"{LEAKY}. {sandbox} TCS Prover checks again every minute, and once the check passes the job "
+                        "starts by itself."),
+            'no sandbox-exec': (NO_SANDBOX_EXEC, f'{sandbox} The check runs again every minute.',
+                                f"{NO_SANDBOX_EXEC}. {sandbox} TCS Prover checks again every minute, and once the "
+                                "check passes the job starts by itself."),
+            'rosetta': (ROSETTA, "The compiler's macOS sandbox check failed because TCS Prover's Python runs under "
+                                 "Rosetta: start TCS Prover with a native arm64 Python. The check runs again every "
+                                 "minute.",
+                        f"{ROSETTA}. TCS Prover's Python runs under Rosetta, which the compiler's macOS sandbox does "
+                        "not allow. TCS Prover checks again every minute; start it with a native arm64 Python "
+                        "(recreate .venv with one) and the job starts by itself."),
+        }
+        for name, (cause, ending, text) in cases.items():
+            with self.subTest(name):
+                self.not_ready(cause, 'rosetta' if name == 'rosetta' else 'sandbox')
+                app = self.start()
+                self.assertEqual(app.state['launchHold'],
+                                 f'Historical compiler preflight failed; no model was started: {cause}. {ending}')
+                self.assertTrue(server.compiler_hold(app.state['launchHold']))
+                self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+                self.assertEqual(app.attention(), {'kind': 'compiler', 'title': 'LaTeX compiler not ready',
+                                                   'retrying': True, 'text': text})
+                self.assertNotIn('install or repair MacTeX', app.attention()['text'].lower())
+                # A stopped job's hold says it stays stopped, whatever the cause.
+                self.stopped(app)
+                self.assertTrue(app.attention()['text'].endswith(
+                    'the hold is released, but the job stays stopped until you continue it.'))
+        self.assertEqual(self.launches, [])
+
+    def test_a_python_under_rosetta_is_named_as_the_cause_through_the_real_check(self):
+        # The real preflight_compiler, with the compiler's own check failing as it does on this Mac.
+        from retrieval import isolated_compiler
+        retrieval.preflight_compiler.side_effect = REAL_PREFLIGHT_COMPILER
+        with mock.patch.object(isolated_compiler, 'supported', return_value=True), \
+                mock.patch.object(isolated_compiler, 'preflight',
+                                  side_effect=isolated_compiler.CompilerNotReady(ROSETTA, 'rosetta')):
+            app = self.start()
+        self.assertEqual(app.state['launchHold'], (
+            f"Historical compiler preflight failed; no model was started: {ROSETTA}. The compiler's macOS sandbox "
+            "check failed because TCS Prover's Python runs under Rosetta: start TCS Prover with a native arm64 Python. "
+            "The check runs again every minute."))
+        self.assertIn('native arm64 Python', app.attention()['text'])
+        self.assertEqual(self.launches, [])
+
+    def test_a_batch_without_mactex_holds_every_job_and_checks_each_every_minute(self):
+        self.not_ready()
+        with self.assertRaises(ValueError) as caught:
+            self.manager.start_direct_batch({'retrievalMode': 'historical', 'retrievalCutoffUtc': UI_CUTOFF,
+                                             'statements': [{'statement': 'A.'}, {'statement': 'B.'}]})
+        self.assertEqual(str(caught.exception), (
+            f'Could not start the historical batch: Historical compiler preflight failed; no model was started: '
+            f'{NO_MACTEX}. The 2 prepared jobs are held and checked again every minute; install or repair MacTeX '
+            'and each starts by itself.'))
+        self.assertEqual(len(self.manager.jobs), 2)
+        for app in self.manager.jobs.values():
+            self.assertEqual(app.state['launchHold'], f'Historical batch launch failed: {self.HOLD}')
+            self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+            self.assertEqual(app.attention(), self.attention('the job starts by itself'))
+        self.assertEqual(self.launches, [])
+        # MacTeX is installed: both checks pass in the same second, and the starts that follow are spaced like
+        # every start the server makes by itself.
+        self.ready()
+        now = time.time() + server.AUTO_RESUME_SECONDS + 1
+        self.tick(now)
+        self.assertEqual(sorted(app.state['phase'] for app in self.manager.jobs.values()), ['prepared', 'running'])
+        self.assertEqual([app.state['launchHold'] for app in self.manager.jobs.values()], ['', ''])
+        self.assertEqual(len(self.launches), 1)
+        self.tick(now + server.AUTO_LAUNCH_SPACING_SECONDS)
+        self.assertEqual([app.state['phase'] for app in self.manager.jobs.values()], ['running', 'running'])
+        self.assertEqual(len(self.launches), 2)
+
+    def test_a_one_job_batch_names_its_one_job(self):
+        self.not_ready()
+        with self.assertRaises(ValueError) as caught:
+            self.manager.start_direct_batch({'retrievalMode': 'historical', 'retrievalCutoffUtc': UI_CUTOFF,
+                                             'statements': [{'statement': 'A.'}]})
+        self.assertEqual(str(caught.exception), (
+            f'Could not start the historical batch: Historical compiler preflight failed; no model was started: '
+            f'{NO_MACTEX}. The 1 prepared job is held and checked again every minute; install or repair MacTeX '
+            'and it starts by itself.'))
+        self.not_ready(ROSETTA, 'rosetta')
+        with self.assertRaises(ValueError) as caught:
+            self.manager.start_direct_batch({'retrievalMode': 'historical', 'retrievalCutoffUtc': UI_CUTOFF,
+                                             'statements': [{'statement': 'B.'}]})
+        self.assertTrue(str(caught.exception).endswith(
+            "The 1 prepared job is held and checked again every minute; TCS Prover's Python runs under Rosetta, which "
+            "the compiler's macOS sandbox does not allow: start TCS Prover with a native arm64 Python and it starts "
+            "by itself."), caught.exception)
+        self.not_ready(LEAKY, 'sandbox')
+        with self.assertRaises(ValueError) as caught:
+            self.manager.start_direct_batch({'retrievalMode': 'historical', 'retrievalCutoffUtc': UI_CUTOFF,
+                                             'statements': [{'statement': 'C.'}, {'statement': 'D.'}]})
+        self.assertTrue(str(caught.exception).endswith(
+            "The 2 prepared jobs are held and checked again every minute; each starts by itself once the compiler's "
+            "macOS sandbox check passes (MacTeX is not the cause)."), caught.exception)
+        # Each held job's own hold and attention entry name the batch's cause with its own advice.
+        sandbox = [app for app in self.manager.jobs.values() if LEAKY in app.state['launchHold']]
+        self.assertEqual(len(sandbox), 2)
+        for app in sandbox:
+            self.assertEqual(app.state['launchHold'], (
+                f"Historical batch launch failed: Historical compiler preflight failed; no model was started: {LEAKY}. "
+                "The compiler's macOS sandbox check failed; MacTeX is not the cause. The check runs again every "
+                "minute."))
+            self.assertEqual(app.attention()['text'], (
+                f"{LEAKY}. The compiler's macOS sandbox check failed; MacTeX is not the cause. TCS Prover checks again "
+                "every minute, and once the check passes the job starts by itself."))
+        rosetta = [app for app in self.manager.jobs.values() if ROSETTA in app.state['launchHold']]
+        self.assertEqual(len(rosetta), 1)
+        self.assertIn('native arm64 Python', rosetta[0].attention()['text'])
+        for app in self.manager.jobs.values():
+            self.assertTrue(server.compiler_hold(app.state['launchHold']), app.state['launchHold'])
+            self.assertAlmostEqual(app._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+        self.assertEqual(self.launches, [])
+
+    def test_hold_checks_take_no_running_slot_and_what_follows_waits_for_one(self):
+        # A hold check starts no model. With the running-jobs limit reached, held jobs are still checked every
+        # minute (a stopped one gets its hold released and stays stopped); a prepared one whose check passes
+        # joins the queue and starts once a slot is free.
+        running = self.start()
+        self.assertEqual(running.state['phase'], 'running')
+        self.manager.installation = {'maxRunningJobs': 1}
+        self.not_ready()
+        waiting, stopped = self.start(), self.start()
+        self.stopped(stopped)
+        self.held(stopped)
+        self.count_compiler_checks()
+        clock = self.clock(max(waiting._hold_retry_at, stopped._hold_retry_at))
+        for minute in range(30):
+            self.tick(clock[0])
+            clock[0] += server.AUTO_RESUME_SECONDS
+        self.assertEqual((self.compiler_checks(waiting), self.compiler_checks(stopped)), (30, 30))
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(self.manager.running_jobs(), 1)
+        # MacTeX is installed while the other job still runs.
+        self.ready()
+        self.count_compiler_checks()
+        now = clock[0]
+        self.tick(now)
+        self.assertEqual((self.compiler_checks(waiting), self.compiler_checks(stopped)), (1, 1))
+        self.assertEqual((stopped.state['phase'], stopped.state['launchHold']), ('done', ''))
+        self.assertTrue(stopped.state['manuallyStopped'])
+        self.assertEqual((waiting.state['phase'], waiting.state['launchHold'], waiting.state['launchQueued']),
+                         ('prepared', '', True))
+        row = next(row for row in self.manager.job_list() if row['runId'] == waiting.state['runId'])
+        self.assertTrue(row['launchQueued'])  # Its card says Queued.
+        self.assertEqual(len(self.launches), 1)
+        self.assertIsNone(waiting.attention())
+        self.assertIn('The job starts as soon as a running slot is free.',
+                      [record for record in waiting.state['trace'] if record.get('label') == 'Historical checks passed'
+                       ][-1]['text'])
+        # The running job finishes: the queued one starts at the next tick.
+        self.settle(running, phase='done', stage='final', activeNode='latex_editor', resultKind='final', error='')
+        clock[0] = now + 1
+        self.tick(clock[0])
+        self.assertEqual(waiting.state['phase'], 'running')
+        self.assertEqual(len(self.launches), 2)
+        self.assertEqual(stopped.state['phase'], 'done')
+
+    def test_hold_checks_never_delay_other_jobs_and_are_spread_over_the_seconds(self):
+        # A job whose automatic resume is due starts in the same second as the due hold checks; the checks
+        # start at most HOLD_CHECKS_PER_SECOND a second, and each held job is still checked every minute.
+        other = self.start()
+        self.paused(other)
+        self.not_ready()
+        held = [self.start() for _ in range(6)]
+        self.count_compiler_checks()
+        clock = self.clock(max(app._hold_retry_at for app in held))
+        checkpoint = json.loads((server.controller_directory(other.run_dir) / server.PAUSE_FILENAME).read_text())
+        other._save_pause({**checkpoint, 'autoResumeAt': clock[0] - 1})
+        other.state['autoResumeAt'] = clock[0] - 1
+        launches = len(self.launches)
+        self.tick(clock[0])
+        self.assertEqual(other.state['phase'], 'running')
+        self.assertEqual(len(self.launches), launches + 1)
+        self.assertEqual(sum(self.compiler_checks(app) for app in held), server.HOLD_CHECKS_PER_SECOND)
+        clock[0] += 1
+        self.tick(clock[0])
+        self.assertEqual([self.compiler_checks(app) for app in held], [1] * 6)
+        # A minute after its own check, each one is checked again.
+        for _ in range(server.AUTO_RESUME_SECONDS - 2):
+            clock[0] += 1
+            self.tick(clock[0])
+        self.assertEqual([self.compiler_checks(app) for app in held], [1] * 6)
+        for _ in range(2):
+            clock[0] += 1
+            self.tick(clock[0])
+        self.assertEqual([self.compiler_checks(app) for app in held], [2] * 6)
+        self.assertEqual(len(self.launches), launches + 1)
+
+    def test_a_paused_job_whose_check_passed_continues_once_a_slot_is_free_also_after_a_restart(self):
+        self.manager.installation = {'maxRunningJobs': 1}
+        app = self.start()
+        self.paused(app)
+        busy = self.start()  # A job you start yourself always starts; it takes the only slot.
+        self.held(app)
+        self.ready()
+        now = time.time() + server.AUTO_RESUME_SECONDS + 1
+        self.tick(now)
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('paused', ''))
+        self.assertTrue(app.state['resumeQueuedAt'])
+        self.assertIn('The job continues as soon as a running slot is free.',
+                      [record for record in app.state['trace'] if record.get('label') == 'Historical checks passed'
+                       ][-1]['text'])
+        launches = len(self.launches)
+        # TCS Prover restarts meanwhile: the job still continues once the slot is free.
+        restored = self.restore(app)
+        self.assertEqual(restored.state['phase'], 'paused')
+        self.assertEqual(restored.state['resumeQueuedAt'], app.state['resumeQueuedAt'])
+        self.manager.jobs[app.state['runId']] = restored
+        self.tick(now + 5)
+        self.assertEqual(len(self.launches), launches)
+        self.settle(busy, phase='done', stage='final', activeNode='latex_editor', resultKind='final', error='')
+        self.tick(now + 10)
+        self.assertEqual(restored.state['phase'], 'running')
+        self.assertFalse(restored.state['resumeQueuedAt'])
+        argv, options = self.launches[-1]
+        self.assertEqual(argv[argv.index('--start-node') + 1], 'author')
+        self.assertEqual(Path(options['cwd']), app.run_dir)
+
+    def test_a_job_stopped_after_its_check_passed_stays_stopped_and_a_failed_resume_is_tried_again(self):
+        self.manager.installation = {'maxRunningJobs': 1}
+        app = self.start()
+        self.paused(app)
+        busy = self.start()
+        self.held(app)
+        self.ready()
+        now = time.time() + server.AUTO_RESUME_SECONDS + 1
+        self.tick(now)
+        self.assertTrue(app.state['resumeQueuedAt'])
+        # The user stops it while it waits for the slot: it stays stopped when the slot frees.
+        checkpoint = json.loads((server.controller_directory(app.run_dir) / server.PAUSE_FILENAME).read_text())
+        app._save_pause({**checkpoint, 'pauseCause': 'stopped'})
+        self.settle(busy, phase='done', stage='final', activeNode='latex_editor', resultKind='final', error='')
+        launches = len(self.launches)
+        self.tick(now + 5)
+        self.assertEqual((app.state['phase'], len(self.launches)), ('paused', launches))
+        self.assertFalse(app.state['resumeQueuedAt'])
+        # Paused again and held, its check passes once more, but its runner cannot start: like every automatic
+        # resume, the failure is reported and the resume tried again a minute later, until it starts.
+        self.paused(app)
+        self.held(app)
+        later = now + server.AUTO_RESUME_SECONDS + 10
+        with mock.patch.object(server.subprocess, 'Popen', side_effect=OSError('Too many open files')):
+            self.tick(later)
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('paused', ''))
+        self.assertEqual(app.state['resumeQueuedAt'], later + server.AUTO_RESUME_SECONDS)
+        self.assertIn('Automatic resume failed: Too many open files. Retrying in 1 minute.', self.diagnostics(app))
+        self.assertFalse(app._claims.held())
+        with mock.patch.object(server.subprocess, 'Popen', side_effect=OSError('Too many open files')):
+            self.tick(later + server.AUTO_RESUME_SECONDS - 1)  # Not due yet.
+        self.assertEqual(app.state['resumeQueuedAt'], later + server.AUTO_RESUME_SECONDS)
+        self.tick(later + server.AUTO_RESUME_SECONDS)
+        self.assertEqual((app.state['phase'], app.state['launchHold']), ('running', ''))
+        self.assertFalse(app.state['resumeQueuedAt'])
+        # A resume whose own check finds a problem no retry fixes holds the job with it instead.
+        self.settle(app, phase='paused', stage='solve', activeNode='author', error='Codex exited.')
+        self.paused(app)
+        self.held(app)
+        with mock.patch.object(retrieval, 'check_run', side_effect=[
+                str(app.state['retrievalPolicyPath']), retrieval.NeedsAttention('The historical policy is missing.')]):
+            self.tick(later + 3 * server.AUTO_RESUME_SECONDS)
+        self.assertEqual(app.state['phase'], 'paused')
+        self.assertTrue(app.state['launchHold'].startswith('Needs attention: The historical policy is missing.'))
+        self.assertFalse(app.state['resumeQueuedAt'])
+
+    def restore(self, app):
+        app._claims.release_all()
+        return server.restore_saved_app(server.App(app.run_dir / 'transcript.jsonl', self.runs))
+
+    def test_a_compiler_hold_found_at_restart_is_checked_at_once_also_one_an_earlier_version_kept(self):
+        self.not_ready()
+        app = self.start()
+        restored = self.restore(app)
+        self.assertEqual(restored.state['launchHold'], self.HOLD)
+        self.assertLessEqual(restored._hold_retry_at, time.time())
+        # An earlier version kept a compiler hold until Re-run preflight: it is checked once at the start, and
+        # a compiler still not ready then has the new hold, checked every minute.
+        old = f'Historical compiler preflight failed; no model was started: {NO_MACTEX}.{server.HISTORICAL_FIX_ADVICE}'
+        restored.state['launchHold'] = old
+        restored._save_job_settings(restored.state)
+        again = self.restore(restored)
+        self.assertEqual(again.state['launchHold'], old)
+        self.assertLessEqual(again._hold_retry_at, time.time())
+        self.assertTrue(self.recheck(again, 0))
+        self.assertEqual(again.state['launchHold'], self.HOLD)
+        self.assertAlmostEqual(again._hold_retry_at, time.time() + server.AUTO_RESUME_SECONDS, delta=5)
+        # So is the hold an earlier version gave every job of a batch whose compiler was not ready.
+        batch = (f'Historical batch launch failed: Historical compiler preflight failed; no model was started: '
+                 f'{NO_MACTEX}.{server.HISTORICAL_FIX_ADVICE}')
+        again.state['launchHold'] = batch
+        again._save_job_settings(again.state)
+        restored = self.restore(again)
+        self.assertEqual(restored.state['launchHold'], batch)
+        self.assertLessEqual(restored._hold_retry_at, time.time())
+        # A hold that no retry fixes, such as a missing login, still waits for Re-run preflight.
+        login = ('Historical search preflight failed: Codex login is unavailable. Run codex login before starting '
+                 f'historical search.{server.HISTORICAL_FIX_ADVICE}')
+        restored.state['launchHold'] = login
+        restored._save_job_settings(restored.state)
+        self.assertFalse(getattr(self.restore(restored), '_hold_retry_at', 0))
 
 
 if __name__ == '__main__':

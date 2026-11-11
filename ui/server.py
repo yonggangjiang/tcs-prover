@@ -29,9 +29,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import workflow_runner as runtime
+from retrieval import isolated_compiler
 from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, providers
-from . import named_batches, ownership, presets, related_works, retrieval
+from . import named_batches, ownership, presets, program_setup, related_works, retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -246,13 +247,38 @@ SETTLED_FIELDS = ("phase", "stage", "activeNode", "error", "autoResumeAt", "outp
 HISTORICAL_PENDING_HOLD = "Historical batch preflight is pending; every run must pass before launch."
 HISTORICAL_RETRY_SUFFIX = " The check runs again every minute."
 HISTORICAL_FIX_ADVICE = " Choose Re-run preflight after fixing it."
+HISTORICAL_COMPILER_HOLD = "Historical compiler preflight failed"
+# The end of a hold whose LaTeX compiler is not ready (retrieval.CompilerRetry), by its cause
+# (CompilerRetry.kind): what fixes it, then that it is checked again every minute. App.attention
+# lists such a job as "LaTeX compiler not ready".
+HISTORICAL_COMPILER_ENDINGS = {kind: f" {advice}{HISTORICAL_RETRY_SUFFIX}"
+                               for kind, advice in isolated_compiler.ADVICE.items() if advice}
 HISTORICAL_RECHECK_HOLDS = ("Historical batch preflight", "Historical batch launch failed",
-                            "Historical search preflight failed", "Historical compiler preflight failed",
+                            "Historical search preflight failed", HISTORICAL_COMPILER_HOLD,
                             "Historical run check", "Needs attention:")
+# Held web-cutoff jobs' checks start no model, so neither the running-jobs limit nor the start
+# spacing applies to them. The server starts at most this many in a second (one pass of its retry
+# loop), as each can start native Codex sandbox probes: jobs held together are checked spread out,
+# and still every minute up to 240 held jobs. The start or resume after a passing check waits for
+# the limit and the spacing like any other.
+HOLD_CHECKS_PER_SECOND = 4
 
 
 def recheckable_hold(text):
     return isinstance(text, str) and text.startswith(HISTORICAL_RECHECK_HOLDS)
+
+
+def compiler_hold_kind(text):
+    """The cause of a hold that waits for the isolated LaTeX compiler to be ready ("mactex", "sandbox",
+    "rosetta"; checked again every minute), or "" for any other hold."""
+    if not recheckable_hold(text):
+        return ""
+    return next((kind for kind, ending in HISTORICAL_COMPILER_ENDINGS.items() if text.endswith(ending)), "")
+
+
+def compiler_hold(text):
+    """Whether a hold waits for the isolated LaTeX compiler to be ready (checked again every minute)."""
+    return bool(compiler_hold_kind(text))
 
 
 def historical_checks(stages):
@@ -2739,7 +2765,7 @@ class App:
             "sourceFile", "apiModels", "replacedRoles", "launchQueued", "queuedAt", "launchError",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
-            "timeLimitHistory", "conventionWarning",
+            "timeLimitHistory", "conventionWarning", "resumeQueuedAt",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
@@ -4290,8 +4316,9 @@ class App:
         model your account cannot use, an endpoint that refuses the requests, a
         removed model, a CLI that is not installed or does not work (also one
         that a paused author's reply waits for), a Codex author whose saved
-        thread ID is missing, or a safety stop. Retries of the causes that can
-        pass by themselves go on meanwhile.
+        thread ID is missing, a safety stop, or a web-cutoff job held for its
+        LaTeX compiler (MacTeX). Retries of the causes that can pass by
+        themselves go on meanwhile.
         """
 
         state = self.state if state is None else state
@@ -4311,6 +4338,9 @@ class App:
             # A web-cutoff check that no retry fixes holds the job (see _historical_hold_text).
             return {"kind": "historical", "title": "Web cutoff check needs attention", "retrying": False,
                     "text": hold.removeprefix("Needs attention:").strip()}
+        if compiler_hold(hold) and phase in {"paused", "prepared", "done"}:
+            return {"kind": "compiler", "title": "LaTeX compiler not ready", "retrying": True,
+                    "text": self._compiler_hold_text(state, hold)}
         for label, kind, title in ((runtime.MODEL_UNAVAILABLE_LABEL, "model", "Model unavailable"),
                                    (runtime.REQUEST_REJECTED_LABEL, "request", "Endpoint refuses the requests")):
             if label in error and phase in {"paused", "done", "input", "reviewed"}:
@@ -4353,10 +4383,87 @@ class App:
             return {"kind": "key", "title": "API key rejected", "retrying": retrying,
                     "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; "
                             "the job continues by itself."}
-        program = runtime.CLI_PROGRAMS.get(name, "the CLI")  # "the Codex CLI", "Claude Code"
+        # The page adds a link to Setup, where the program signs in again (or the terminal command does).
+        command = "codex login" if name == "Codex" else "claude auth login"
         return {"kind": "login", "title": f"{name} login needed", "retrying": retrying,
-                "text": f"Log in to {program} again ({'codex login' if name == 'Codex' else 'claude, then /login'}); "
-                        "the job continues by itself."}
+                "text": f"Sign in again on the Setup page, or run {command} in a terminal; the job continues by itself."}
+
+    def waits_for_setup(self, program):
+        """Whether this job now only waits for ``program``'s own Setup step: every model call of it in progress
+        waits to retry because that program would not start ("… missing or incompatible") or refused its login
+        (a built-in model run through it).
+
+        No model process of this job runs meanwhile, and the retry cannot succeed before Sign in again or the
+        repair it waits for (its alert sends you to Setup for it), so Setup does not hold that step for this job
+        (Server._setup_busy). A job with a model call that runs, or that waits for anything else, still counts.
+        """
+
+        with self.lock:
+            state = self.state
+            phase = state.get("phase")
+            if phase in {"reviewing", "running"}:
+                # The runner reports every call in progress waiting to retry (budgetClock "paused").
+                if getattr(self, "_retry_wait_started", None) is None:
+                    return False
+                waits = [dict(wait) for wait in (getattr(self, "_model_retries", None) or {}).values()]
+            elif phase == "paused" and getattr(self, "worker_token", None) is not None:
+                # A paused author's reply runs one model call in its own runner (see attention()).
+                waits = [{**item["retry"], "stage": "conversation"} for item in getattr(self, "_conversation", [])
+                         if item["kind"] in REPLY_KINDS and item["status"] == "running"
+                         and isinstance(item.get("retry"), dict)]
+            else:
+                return False
+            models = {role: state.get(f"{role}Model") for role in ("review", "author", "critic", "writer")}
+        if not waits:
+            return False
+        for wait in waits:
+            failure = str(wait.get("failure") or "")
+            cli = runtime.missing_cli_failure(failure)
+            if cli:
+                if cli.lower() != program:
+                    return False
+                continue
+            if failure != "authentication failed":
+                return False
+            model = models.get(TRACE_STAGE_ROLES.get(wait.get("stage"), "author"))
+            try:
+                if providers.provider_kind(model) not in {providers.CODEX, providers.CLAUDE} \
+                        or providers.harness(model) != program:
+                    return False
+            except (providers.ProviderError, TypeError, ValueError):
+                return False
+        return True
+
+    def _compiler_hold_text(self, state, hold):
+        """What a compiler hold says under Needs your attention: its cause, what fixes it, the check every
+        minute, and what follows once the check passes, as rerun_historical_preflight does it.
+
+        A prepared job starts and a paused one continues; a stopped job, a used-up time limit, a reply being
+        written and a finished job only have the hold released.
+        """
+
+        kind = compiler_hold_kind(hold)
+        cause = hold.removesuffix(HISTORICAL_COMPILER_ENDINGS[kind])
+        for prefix in ("Historical batch launch failed: ", f"{HISTORICAL_COMPILER_HOLD}; no model was started: "):
+            cause = cause.removeprefix(prefix)
+        phase = state.get("phase")
+        with self.lock:
+            paused_cause = (str(read_pause_object(self.run_dir).get("pauseCause") or "")
+                            if phase == "paused" and self.run_dir else "")
+            stopped = paused_cause == "stopped" or (phase == "done" and bool(state.get("manuallyStopped")))
+            refusal = self.resume_refusal() if phase == "paused" and not stopped else ""
+        then = ("the job starts by itself" if phase == "prepared"
+                else "the hold is released, but the job stays stopped until you continue it" if stopped
+                else "the job continues by itself" if phase == "paused" and not refusal
+                else "the hold is released")
+        if kind == "sandbox":
+            return (f"{cause} The compiler's macOS sandbox check failed; MacTeX is not the cause. TCS Prover "
+                    f"checks again every minute, and once the check passes {then}.")
+        if kind == "rosetta":
+            return (f"{cause} TCS Prover's Python runs under Rosetta, which the compiler's macOS sandbox does not "
+                    "allow. TCS Prover checks again every minute; start it with a native arm64 Python (recreate "
+                    f".venv with one) and {then}.")
+        return f"{cause} TCS Prover checks again every minute; install or repair MacTeX and {then}."
 
     def defer_auto_resume(self, problem, now=None):
         """Report a due automatic resume that could not run; the next try follows after the usual wait."""
@@ -4524,13 +4631,23 @@ class App:
             text = text if text.startswith("Needs attention:") else f"Needs attention: {text}"
         elif not text.startswith("Historical"):
             text = f"Historical search preflight failed: {text}"
-        ending = HISTORICAL_RETRY_SUFFIX if isinstance(exc, retrieval.PreflightRetry) else HISTORICAL_FIX_ADVICE
+        ending = (HISTORICAL_COMPILER_ENDINGS.get(exc.kind, HISTORICAL_RETRY_SUFFIX)
+                  if isinstance(exc, retrieval.CompilerRetry)
+                  else HISTORICAL_RETRY_SUFFIX if isinstance(exc, retrieval.PreflightRetry) else HISTORICAL_FIX_ADVICE)
         return text if text.endswith(ending) else text + ending
 
     def _hold_after_failed_check(self, exc):
-        """Hold this job with the cause; a check that could not finish runs again every minute."""
-        self.state["launchHold"] = self._historical_hold_text(exc)
-        self.state["autoResumeAt"] = 0
+        """Hold this job with the cause; a check that could not finish, or a LaTeX compiler that is not
+        ready, runs again every minute.
+
+        The activity log names a hold once: the same hold again after a check that runs every minute
+        (MacTeX can be missing for days) adds no record.
+        """
+        hold = self._historical_hold_text(exc)
+        repeated = hold == self.state.get("launchHold")
+        self.state["launchHold"] = hold
+        # The hold's release decides again whether the job continues (rerun_historical_preflight).
+        self.state.update(autoResumeAt=0, resumeQueuedAt=0)
         self._hold_retry_at = time.time() + AUTO_RESUME_SECONDS if isinstance(exc, retrieval.PreflightRetry) else 0
         self._save_job_settings(self.state)
         if self.state["phase"] == "paused" and self.run_dir and controlled_path(self.run_dir, PAUSE_FILENAME).exists():
@@ -4540,8 +4657,9 @@ class App:
                 self._save_pause(checkpoint)
             except (OSError, ValueError):
                 pass
-        self.add_trace({"kind": "diagnostic", "stage": self.state.get("stage") or "solve",
-                        "text": self.state["launchHold"]})
+        if not repeated:
+            self.add_trace({"kind": "diagnostic", "stage": self.state.get("stage") or "solve",
+                            "text": self.state["launchHold"]})
         # A held job starts its runner only after a passing check: keep no owner lock meanwhile.
         self._settle_run_claim()
 
@@ -4578,14 +4696,21 @@ class App:
                             "text": "This run's controller folder moved with the checkout; its policy now names "
                                     "the new paths (recorded in the search audit log). The cutoff is unchanged."})
 
-    def rerun_historical_preflight(self):
+    def rerun_historical_preflight(self, automatic=False):
         """Check a held historical job again; once every check passes, release its hold.
 
         A prepared job then starts and a paused one resumes; a stopped one (Stop,
         or a stop of an earlier version) stays stopped until the user chooses
-        Continue, also when the check that passed ran by itself. The checks can
-        take a minute, so they run without the job lock: the job list, this
-        job's page and the server's once-a-second loop never wait for them.
+        Continue, also when the check that passed ran by itself. After an
+        ``automatic`` check (the one every minute) nothing starts here: a
+        prepared job joins the queue and a paused one waits to continue, so the
+        server's retry loop starts it within the running-jobs limit and the
+        start spacing (Server._retry_paused_jobs). The checks can take a
+        minute, so they run without the job lock: the job list, this job's page
+        and the server's once-a-second loop never wait for them. A job held for
+        its LaTeX compiler has the compiler checked first, so a missing MacTeX
+        starts no Codex sandbox every minute; the hold is still released only
+        when every check passes.
         """
         with self.lock:
             if (not self.state.get("retrievalPolicyPath") or not recheckable_hold(self.state.get("launchHold"))
@@ -4598,10 +4723,13 @@ class App:
             stages = saved_workflow_stages(self.state)
         try:
             failure = None
+            compiler_first = stages["writing"] and compiler_hold(hold)
             try:
                 path = retrieval.check_run(policy_path, self.run_dir)
+                if compiler_first:
+                    retrieval.preflight_compiler(path)
                 retrieval.preflight_policy(path)
-                if stages["writing"]:
+                if stages["writing"] and not compiler_first:
                     retrieval.preflight_compiler(path)
             except ValueError as exc:
                 failure = exc
@@ -4613,21 +4741,33 @@ class App:
                 if failure is not None:
                     self._hold_after_failed_check(failure)
                     raise ValueError(self.state["launchHold"]) from failure
+                phase = self.state["phase"]
+                # A reply being written, or a used-up time limit, keeps the job paused for the user; a job the
+                # user stopped waits for Continue.
+                resumes = phase == "paused" and self._pause_cause_locked() != "stopped" and not self.resume_refusal()
+                waits = automatic and (phase == "prepared" or resumes)
                 self.state["launchHold"] = ""
                 self._hold_retry_at = 0
+                if waits and phase == "prepared":
+                    # As after a batch's checks: the queue starts it when a running slot is free.
+                    self.state.update(launchQueued=True, queuedAt=self.state.get("queuedAt") or time.time(),
+                                      launchError="", autoResumeAt=0)
+                elif waits:
+                    self.state["resumeQueuedAt"] = time.time()
                 self._adopt_policy_path_locked(path)
                 self._save_job_settings(self.state)
+                then = (" The job starts as soon as a running slot is free." if waits and phase == "prepared"
+                        else " The job continues as soon as a running slot is free." if waits else "")
                 self.add_trace({"kind": "status", "stage": self.state.get("stage") or "solve",
                                 "label": "Historical checks passed",
-                                "text": f"The {historical_checks(stages)} passed their checks; the hold is released."})
-                phase = self.state["phase"]
+                                "text": f"The {historical_checks(stages)} passed their checks; the hold is "
+                                        f"released.{then}"})
+                if waits:
+                    return self
                 try:
                     if phase == "prepared":
                         self.start_prepared_run()
-                    elif (phase == "paused" and self._pause_cause_locked() != "stopped"
-                          and not self.resume_refusal()):
-                        # A reply being written, or a used-up time limit, keeps the job paused for the user; a
-                        # job the user stopped waits for Continue.
+                    elif resumes:
                         self.resume()
                 except (OSError, ValueError, RuntimeError) as exc:
                     if not self.state.get("launchHold"):
@@ -4644,28 +4784,83 @@ class App:
         return self
 
     def retry_historical_hold_if_due(self, now=None):
-        """Run a historical check that could not finish again, every minute.
+        """Run a historical check that could not finish, or found the LaTeX compiler not ready, again every minute.
 
         The check runs in its own thread: it can take a minute, and the retry
-        loop serves every job.
+        loop serves every job. It starts nothing itself (see
+        rerun_historical_preflight), so it waits for neither a running slot nor
+        the start spacing.
         """
         now = time.time() if now is None else now
         with self.lock:
-            due = getattr(self, "_hold_retry_at", 0)
-            if (not due or now < due or getattr(self, "_hold_check_running", False) or self.has_active_worker()
-                    or self.state["phase"] in ACTIVE_PHASES or not recheckable_hold(self.state.get("launchHold"))):
+            if self.hold_check_due_at() > now or self.has_active_worker() or self.state["phase"] in ACTIVE_PHASES:
                 return False
             # Reserve the next attempt first: a failure must not retry every tick.
             self._hold_retry_at = now + AUTO_RESUME_SECONDS
 
         def check():
             try:
-                self.rerun_historical_preflight()
+                self.rerun_historical_preflight(automatic=True)
             except (OSError, ValueError, RuntimeError):
                 pass  # The hold names the cause; a check that could not finish stays scheduled.
 
         threading.Thread(target=check, daemon=True).start()
         return True
+
+    def hold_check_due_at(self):
+        """When this held web-cutoff job's check runs again by itself, or inf when it does not.
+
+        Also after a manual stop (a stopped job then only gets its hold released,
+        see rerun_historical_preflight), never for a run another process owns.
+        """
+        with self.lock:
+            due = getattr(self, "_hold_retry_at", 0) if recheckable_hold(self.state.get("launchHold")) else 0
+            if (not due or self.hold_check_running() or self.worker_token is not None
+                    or self.state.get("runningElsewhere")):
+                return math.inf
+            return due
+
+    def hold_check_running(self):
+        """Whether this job's held web-cutoff check runs now (by itself or after Re-run preflight)."""
+        with self.lock:
+            return bool(getattr(self, "_hold_check_running", False))
+
+    def resume_after_check_if_due(self, resume, now=None):
+        """Continue a paused job whose held check passed by itself (resumeQueuedAt); return whether it was due.
+
+        The server's retry loop calls it within the running-jobs limit and the
+        start spacing. A job stopped, resumed or held again meanwhile is left
+        as it is. A resume that fails is reported and tried again a minute
+        later, like every automatic resume (a busy workspace or a CLI that is
+        updating passes by itself); one whose check holds the job again names
+        that cause instead.
+        """
+        now = time.time() if now is None else now
+        with self.lock:
+            due = self.state.get("resumeQueuedAt") or 0
+            if not due or now < due:
+                return False
+            self.state["resumeQueuedAt"] = 0
+            if (self.state["phase"] != "paused" or self.state.get("launchHold") or self.has_active_worker()
+                    or self._pause_cause_locked() == "stopped" or self.resume_refusal()):
+                try:
+                    self._save_job_settings(self.state)
+                except (OSError, ValueError):
+                    pass  # Cleared in memory; the next save of the settings records it.
+                return True
+            try:
+                resume()
+            except (OSError, ValueError, RuntimeError) as exc:
+                if not self.state.get("launchHold"):
+                    self.state["resumeQueuedAt"] = now + AUTO_RESUME_SECONDS
+                    try:
+                        self._save_job_settings(self.state)
+                        self.add_trace({"kind": "diagnostic", "stage": self.state.get("stage") or "solve",
+                                        "text": f"Automatic resume failed: {str(exc).rstrip('.')}. Retrying in "
+                                                f"{retry_interval_text()}."})
+                    except OSError:
+                        pass  # The next try is reserved in memory.
+            return True
 
     def _check_launch_models_locked(self, roles=("author", "critic", "writer")):
         """Recheck saved role models before a launch from an idle job.
@@ -4742,12 +4937,14 @@ class App:
                             else "Started a fresh author session in the prepared workspace."})
 
     def occupies_slot(self):
-        """Whether this job counts against the running-jobs limit (a model process runs or is about to)."""
+        """Whether this job counts against the running-jobs limit (a model process runs or is about to).
+
+        A held web-cutoff job's check starts no model: one that runs takes no slot, and the start or
+        resume after a passing check waits for one (see rerun_historical_preflight).
+        """
 
         with self.lock:
-            # A historical check that is running starts or resumes its job once it passes.
-            return (self.state["phase"] in ACTIVE_PHASES or self.worker_token is not None
-                    or getattr(self, "_hold_check_running", False))
+            return self.state["phase"] in ACTIVE_PHASES or self.worker_token is not None
 
     def _queued_review(self):
         """Whether this prepared job's start is its statement review (a folder batch with the review stage)."""
@@ -4803,21 +5000,18 @@ class App:
         """(When the server may start this job by itself, its queue order), or (inf, 0) when it may not.
 
         A paused job is due at its automatic retry (or when the settings it
-        waited for change); a queued job from when it was queued, or at the
-        next try after a failed start; a held historical job when its check
-        runs again.
+        waited for change), or once its held check passed by itself; a queued
+        job from when it was queued, or at the next try after a failed start.
+        A held historical job's check is no start (see hold_check_due_at).
         """
 
         with self.lock:
             if self.worker_token is not None or self.state.get("runningElsewhere"):
                 return math.inf, 0
-            # A held job's check runs again even after a manual stop (a stopped job then
-            # only gets its hold released, see rerun_historical_preflight).
-            check = getattr(self, "_hold_retry_at", 0) if recheckable_hold(self.state.get("launchHold")) else 0
-            if check and not getattr(self, "_hold_check_running", False):
-                return check, 0
             if self.state.get("manuallyStopped"):
                 return math.inf, 0
+            if self.state["phase"] == "paused" and self.state.get("resumeQueuedAt"):
+                return self.state["resumeQueuedAt"], 0
             if self.state["phase"] == "paused":
                 if not self.state.get("autoResumeAt"):
                     try:
@@ -4896,7 +5090,8 @@ class App:
                 self.state["goalThreadId"] = checkpoint["goalThreadId"]
             self.state.update(goalResume=True, elapsedSeconds=checkpoint["elapsedSeconds"],
                               resumedAt=datetime.now(timezone.utc).isoformat(), finishedAt="", error="", autoResumeAt=0,
-                              sessionUnavailable=False, safetyStop=False, settingsProblem=None, waitingForSettings="")
+                              sessionUnavailable=False, safetyStop=False, settingsProblem=None, waitingForSettings="",
+                              resumeQueuedAt=0)
             self._clear_pause_request()
             process = None
             try:
@@ -7814,7 +8009,7 @@ def saved_setting_problem(key, value):
             valid = finite_seconds(value) and runtime.author_hours(value) == value
         except runtime.Error:
             valid = False
-    elif key in {"elapsedSeconds", "queuedAt"}:
+    elif key in {"elapsedSeconds", "queuedAt", "resumeQueuedAt"}:
         valid = finite_seconds(value)
     elif key == "criticRounds":
         try:
@@ -8093,7 +8288,7 @@ def restore_saved_app(app, *, owned=True):
                 "launchHold", "retrievalPolicyPath", "retrievalMode", "retrievalCutoffUtc",
                 "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
                 "authorRepairDelivered",
-                "launchQueued", "queuedAt", "launchError",
+                "launchQueued", "queuedAt", "launchError", "resumeQueuedAt",
             ):
                 if key in settings:
                     if key == "workflowStages":
@@ -8648,11 +8843,14 @@ def restore_saved_app(app, *, owned=True):
         app._chat_final_pass = state["phase"] == "done" and any(
             item["kind"] == "instruction" and not item.get("reply") for item in app._conversation)
     state["settingsWarning"] = " ".join(settings_warnings)
+    hold = str(state.get("launchHold", ""))
     if owned and state.get("retrievalPolicyPath") and (
-            (state["phase"] == "prepared" and state.get("launchHold") == HISTORICAL_PENDING_HOLD)
-            or str(state.get("launchHold", "")).endswith(HISTORICAL_RETRY_SUFFIX)):
+            (state["phase"] == "prepared" and hold == HISTORICAL_PENDING_HOLD) or hold.endswith(HISTORICAL_RETRY_SUFFIX)
+            or (recheckable_hold(hold) and HISTORICAL_COMPILER_HOLD in hold)):
         # A check interrupted by the restart, or one that could not finish:
-        # run it again now instead of holding the job forever.
+        # run it again now instead of holding the job forever. So is a compiler
+        # check, whose hold an earlier version kept until Re-run preflight: one
+        # that finds the compiler still not ready then runs every minute.
         app._hold_retry_at = time.time()
     app.fixed_trace = False
     return app
@@ -8954,6 +9152,8 @@ class Server(ThreadingHTTPServer):
             # Related-work uploads wait here until a job takes them (pruned after a day).
             self.upload_stage = staged_uploads(self.runs)
             self._prune_uploads()
+            # The Setup page (ui/program_setup.py): it starts no process until the page first asks.
+            self.setup = program_setup.SetupTasks(busy=self._setup_busy)
         except BaseException:
             if self.instance is not None:
                 self.instance.release()
@@ -9011,7 +9211,11 @@ class Server(ThreadingHTTPServer):
 
         Jobs that waited longest go first, within the running-jobs limit and at
         most one start every AUTO_LAUNCH_SPACING_SECONDS, so jobs that came due
-        together reach the provider spread out.
+        together reach the provider spread out. The checks of held historical
+        jobs start no model: each runs when it is due (at most
+        HOLD_CHECKS_PER_SECOND start in one pass), whatever the limit and the
+        spacing; the start or resume that follows a passing one waits for both
+        like any other.
         """
 
         now = time.time() if now is None else now
@@ -9030,6 +9234,16 @@ class Server(ThreadingHTTPServer):
                 except Exception as exc:
                     # Reported on that job, which tries again after the usual wait.
                     app.defer_conversation(exc, now)
+            checks = 0
+            for run_id, app in sorted(self.jobs.items(), key=lambda item: item[1].hold_check_due_at()):
+                if self._retry_stop.is_set():
+                    return
+                if checks >= HOLD_CHECKS_PER_SECOND or app.hold_check_due_at() > now:
+                    break  # The others are checked at the next tick, longest-waiting first.
+                try:
+                    checks += app.retry_historical_hold_if_due(now)
+                except Exception as exc:
+                    app.defer_auto_resume(exc, now)
             free = self.free_slots()
             ready = now - getattr(self, "_last_auto_launch", -math.inf) >= AUTO_LAUNCH_SPACING_SECONDS
             for run_id, app in sorted(self.jobs.items(), key=lambda item: item[1].launch_due_at(now)):
@@ -9039,21 +9253,20 @@ class Server(ThreadingHTTPServer):
                     break
                 if not ready or free <= 0:
                     continue  # Still due at the next tick.
-                checking = False
                 try:
                     if app.state["phase"] == "paused":
-                        app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
+                        # A held check that passed by itself continues its job here, within the limit.
+                        if not app.resume_after_check_if_due(lambda: self.resume_paused_job(run_id), now):
+                            app.auto_resume_if_due(lambda: self.resume_paused_job(run_id), now)
                     elif app.state["phase"] == "prepared":
                         app.start_queued_if_due(now)
                     else:
                         app.retry_review_if_due(now)
-                    # A passing check starts or resumes its job (see rerun_historical_preflight).
-                    checking = app.retry_historical_hold_if_due(now)
                 except Exception as exc:
                     # Nothing one job raises may stop the other jobs' retries:
                     # report it on that job, which tries again after the usual wait.
                     app.defer_auto_resume(exc, now)
-                if checking or app.occupies_slot():
+                if app.occupies_slot():
                     free, ready, self._last_auto_launch = free - 1, False, now
 
     def _create_pending_jobs(self, now):
@@ -9092,6 +9305,195 @@ class Server(ThreadingHTTPServer):
     def save_installation_settings(self, body):
         self.installation = save_installation_settings(body)
         return self.installation_settings()
+
+    # --- The Setup page (ui/program_setup.py) -----------------------------------------------------------------------
+
+    # Jobs that can still run, whose programs the Setup page lists under "Needed by" (a statement review you stopped
+    # waits in phase input or reviewed).
+    SETUP_LIVE_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "stopping", "paused"}
+
+    def _setup(self):
+        """The Setup page's state; a Server built without __init__ (some tests) makes it here."""
+
+        setup = getattr(self, "setup", None)
+        if setup is None:
+            setup = self.setup = program_setup.SetupTasks(busy=self._setup_busy)
+        return setup
+
+    @staticmethod
+    def _setup_programs(state):
+        """The programs a job's selected roles run through, and those of them that need a sign-in (built-in models).
+
+        A role whose model cannot be read now (an unknown model, an API model store that cannot be read) is left out.
+        """
+
+        programs, sign_in = set(), set()
+        stages = saved_workflow_stages(state)
+        for stage, role in STAGE_ROLES.items():
+            if not stages.get(stage):
+                continue
+            model = state.get(f"{role}Model")
+            try:
+                program, kind = providers.harness(model), providers.provider_kind(model)
+            except (providers.ProviderError, TypeError, ValueError):
+                continue
+            programs.add(program)
+            if kind in {providers.CODEX, providers.CLAUDE}:
+                sign_in.add(program)
+        return programs, sign_in
+
+    @staticmethod
+    def _setup_title(state):
+        """A job as the Setup page names it: its file, else its statement's first line, else its run ID."""
+
+        text = state.get("sourceFile") or ""
+        if not text:
+            source = state.get("problemDescription") if state.get("problemMode") == "algorithmic" else state.get("draft")
+            text = str(source or "").strip().split("\n", 1)[0].strip()
+        text = text or str(state.get("runId") or "")
+        return text if len(text) <= program_setup.TITLE_CHARS else f"{text[:program_setup.TITLE_CHARS - 1]}…"
+
+    def _setup_busy(self, program):
+        """The titles of this server's jobs that run a model process through ``program`` now (occupies_slot()).
+
+        Update, a repair install and a sign-in that may replace a login wait for them. A job whose every call
+        waits for that program's sign-in or start (App.waits_for_setup) runs none, and waits for that very step:
+        it does not count.
+        """
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        titles = []
+        for app in apps:
+            with app.lock:
+                if not app.occupies_slot():
+                    continue
+                state = dict(app.state)
+            waits = getattr(app, "waits_for_setup", None)
+            if program in self._setup_programs(state)[0] and not (waits is not None and waits(program)):
+                titles.append(self._setup_title(state))
+        return titles
+
+    def _setup_job_status(self, app, state, running):
+        """A job's state in a few words, for its line under "Needed by"."""
+
+        if running:
+            return "running now"
+        try:
+            attention = app.attention(state)
+        except Exception:
+            attention = None
+        if attention:
+            # "· paused", "· usage limit reached", but "· Codex login needed", "· API key rejected": a leading
+            # name (Codex, Claude) or abbreviation (API) keeps its capital.
+            title = str(attention["title"])
+            first = title.split(" ", 1)[0]
+            if first in {"Codex", "Claude"} or first.isupper() or first[1:] != first[1:].lower():
+                return title
+            return title[:1].lower() + title[1:]
+        phase = state.get("phase")
+        if phase == "prepared":
+            return "queued" if state.get("launchQueued") else "ready to start"
+        return {"paused": "paused", "reviewed": "waiting for approval", "input": "stopped",
+                "reviewing": "checking the statement"}.get(phase, phase or "")
+
+    def _setup_job_needs(self):
+        """Per program, the jobs that can still run and use it: {count, running, signIn, items}."""
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        needs = {program: {"count": 0, "running": 0, "signIn": 0, "items": []} for program in program_setup.PROGRAMS}
+        for app in apps:
+            with app.lock:
+                state = dict(app.state)
+                running = app.occupies_slot()
+            phase = state.get("phase")
+            if phase not in self.SETUP_LIVE_PHASES and not (phase in {"input", "reviewed"}
+                                                            and state.get("manuallyStopped")):
+                continue
+            programs, sign_in = self._setup_programs(state)
+            if saved_workflow_stages(state).get("writing"):
+                programs = programs | {"latex"}
+            item = {"runId": state.get("runId") or "", "title": self._setup_title(state), "running": running,
+                    "batchId": self.batch_of(app), "status": self._setup_job_status(app, state, running)}
+            for program in sorted(programs):
+                entry = needs[program]
+                entry["count"] += 1
+                entry["running"] += int(running)
+                entry["signIn"] += int(program in sign_in)
+                entry["items"].append({**item, "signIn": program in sign_in})
+        return needs
+
+    def _setup_defaults(self):
+        """What a fresh New problem form runs: the default saved settings, else the built-in ones, per role."""
+
+        try:
+            listing = presets.listing()
+        except Exception:
+            listing = {}
+        saved = next((row for row in listing.get("presets", [])
+                      if row.get("isDefault") and not row.get("unusable") and isinstance(row.get("settings"), dict)),
+                     None)
+        settings = saved["settings"] if saved else presets.builtin_settings()
+        stages = normalize_workflow_stages(settings.get("workflowStages"))
+        roles = []
+        for stage, role in STAGE_ROLES.items():
+            model = settings.get(f"{role}Model")
+            row = {"role": role, "stage": stage, "on": bool(stages.get(stage)), "model": model or "", "modelLabel": "",
+                   "program": "", "signIn": False, "connection": ""}
+            try:
+                kind = providers.provider_kind(model)
+                row.update(program=providers.harness(model), modelLabel=providers.model_label(model),
+                           signIn=kind in {providers.CODEX, providers.CLAUDE})
+                if kind == providers.API:
+                    entry = providers.api_model(model)
+                    row["connection"] = (entry or {}).get("sourceLabel") or (entry or {}).get("label") or ""
+            except (providers.ProviderError, TypeError, ValueError):
+                pass  # Unknown now (or the store cannot be read): the page leaves the role out.
+            roles.append(row)
+        return {"source": "saved" if saved else "built-in", "name": saved["name"] if saved else "", "roles": roles}
+
+    @staticmethod
+    def _setup_connections():
+        """The saved API connections' labels by the program their format runs through (for information only)."""
+
+        connections = {"codex": [], "claude": []}
+        try:
+            rows = providers.load_api_connections()
+        except (providers.ProviderError, OSError):
+            return connections
+        for row in rows:
+            program = providers.FORMAT_HARNESSES.get(row.get("format"))
+            if program in connections:
+                connections[program].append(row.get("label") or row.get("host") or "")
+        return connections
+
+    def setup_status(self, refresh=False, cached=False):
+        """GET /setup: each program as jobs find it, and what new problems, jobs and API connections need."""
+
+        status = self._setup().status(refresh=refresh, cached=cached)
+        status.update(defaults=self._setup_defaults(), jobs=self._setup_job_needs(),
+                      connections=self._setup_connections())
+        return status
+
+    def setup_action(self, body):
+        """POST /setup/action: start the step the page's dialog confirmed (or remember a folder)."""
+
+        result = self._setup().start(body)
+        if "useFolder" in result:
+            return {"status": self.setup_status(cached=True)}
+        return result
+
+    def setup_task(self, identity, after=0):
+        """GET /setup/task: one step's state and its output after line ``after``."""
+
+        return self._setup().read(identity, after)
+
+    def setup_stop(self, body):
+        return self._setup().stop(body)
+
+    def setup_input(self, body):
+        return self._setup().send_input(body)
 
     def _tick_jobs(self):
         """Keep machine sleep out of working jobs' active time; save transcript lines a failed write kept;
@@ -9155,6 +9557,10 @@ class Server(ThreadingHTTPServer):
         super().shutdown()
 
     def server_close(self):
+        # A running Setup step ends with the server (a short grace, then its whole process tree).
+        setup = getattr(self, "setup", None)
+        if setup is not None:
+            setup.close()
         self._retry_stop.set()
         super().server_close()
         # The owner locks end with this server; runners still alive keep their own copy.
@@ -9596,15 +10002,18 @@ class Server(ThreadingHTTPServer):
             # prepared jobs stay held.
             held = 0
             retrying = isinstance(exc, retrieval.PreflightRetry)
+            # A LaTeX compiler that was not ready, by its cause (retrieval.CompilerRetry.kind).
+            compiler = exc.kind if isinstance(exc, retrieval.CompilerRetry) else ""
             for app in started:
                 try:
-                    # Each held job names the cause and starts once its own checks
-                    # pass: automatically for a check that could not finish.
-                    cause = (retrieval.PreflightRetry if retrying else retrieval.NeedsAttention
-                             if isinstance(exc, retrieval.NeedsAttention) else ValueError)
+                    # Each held job names the cause and starts once its own checks pass: automatically
+                    # for a check that could not finish and for a LaTeX compiler that was not ready.
+                    text = f"Historical batch launch failed: {str(exc).rstrip('.') or type(exc).__name__}."
+                    failure = (retrieval.CompilerRetry(text, compiler) if compiler
+                               else (retrieval.PreflightRetry if retrying else retrieval.NeedsAttention
+                                     if isinstance(exc, retrieval.NeedsAttention) else ValueError)(text))
                     with app.lock:
-                        app._hold_after_failed_check(cause(
-                            f"Historical batch launch failed: {str(exc).rstrip('.') or type(exc).__name__}."))
+                        app._hold_after_failed_check(failure)
                     held += 1
                 except (OSError, ValueError):
                     pass
@@ -9612,9 +10021,21 @@ class Server(ThreadingHTTPServer):
             detail = str(exc).rstrip(".") or type(exc).__name__
             message = f"Could not start {target}: {detail}."
             if held:
-                message += (f" The {held} prepared job{'s are' if held != 1 else ' is'} held"
-                            + ("; each starts once its checks pass, which run again every minute."
-                               if retrying else "; choose Re-run preflight on each after fixing the cause."))
+                message += f" The {held} prepared job{'s are' if held != 1 else ' is'} held"
+                each = "each" if held != 1 else "it"
+                if compiler == "sandbox":
+                    message += (f" and checked again every minute; {each} starts by itself once the compiler's "
+                                "macOS sandbox check passes (MacTeX is not the cause).")
+                elif compiler == "rosetta":
+                    message += (" and checked again every minute; TCS Prover's Python runs under Rosetta, which "
+                                "the compiler's macOS sandbox does not allow: start TCS Prover with a native arm64 "
+                                f"Python and {each} starts by itself.")
+                elif compiler:
+                    message += f" and checked again every minute; install or repair MacTeX and {each} starts by itself."
+                elif retrying:
+                    message += "; each starts once its checks pass, which run again every minute."
+                else:
+                    message += "; choose Re-run preflight on each after fixing the cause."
             raise ValueError(message) from exc
         finally:
             settle_uploads()
@@ -11047,6 +11468,20 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.send(presets.listing())
+        if request.path in {"/setup", "/setup/task"}:
+            # The Setup page (ui/program_setup.py): the programs as jobs find them, and one step's output.
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                if request.path == "/setup":
+                    flag = lambda key: (query.get(key) or [""])[0] == "1"  # noqa: E731
+                    return self.send(self.server.setup_status(refresh=flag("refresh"), cached=flag("cached")))
+                return self.send(self.server.setup_task((query.get("id") or [""])[0],
+                                                        (query.get("after") or ["0"])[0]))
+            except program_setup.SetupRefused as exc:
+                return self.send({"error": str(exc), **exc.body}, status=exc.status)
+            except Exception as exc:  # Setup prints nothing to the terminal: the page says what failed.
+                return self.send({"error": f"Setup failed ({type(exc).__name__})"}, status=500)
         if request.path == "/chat-answer":
             # The whole answer file of one chat message (the chat shows at most MAX_CHAT_ANSWER_CHARS of it).
             if not self.authorized():
@@ -11141,6 +11576,18 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size) or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Expected a JSON object.")
+            # The Setup page's steps belong to this computer, not to one job (ui/program_setup.py): the browser sends a
+            # program, an action and an option from fixed sets, and the command it showed for the stale check.
+            setup_actions = {"/setup/action": self.server.setup_action, "/setup/stop": self.server.setup_stop,
+                             "/setup/input": self.server.setup_input}
+            if request.path in setup_actions:
+                try:
+                    return self.send(setup_actions[request.path](body))
+                except program_setup.SetupRefused as exc:
+                    extra = {"status": self.server.setup_status(cached=True)} if exc.with_status else {}
+                    return self.send({"error": str(exc), **exc.body, **extra}, status=exc.status)
+                except Exception as exc:  # Setup prints nothing to the terminal: the page says what failed.
+                    return self.send({"error": f"Setup failed ({type(exc).__name__})"}, status=500)
             # API models belong to this installation, not to one job; no
             # response ever contains a key.
             api_model_actions = {

@@ -99,12 +99,24 @@ Some causes need you although the job keeps retrying: an expired login, a usage
 limit, an API key the endpoint refuses, or a program that is not installed (or
 does not start), after the same failure three times in a row (also while a
 paused author's reply waits for it). The Overview then lists the job under
-**Needs your attention** with what to do, for example *Codex login needed: Log in
-to the Codex CLI again (codex login)*, *Claude login needed: Log in to Claude
-Code again (claude, then /login)*, or *Claude Code not installed or not working*
-with the call's message. Its card and page say so, and the retries go on, so the
-job continues by itself once that is fixed. **Models & API → Running jobs** can
+**Needs your attention** with what to do, for example *Codex login needed: Sign
+in again on the Setup page, or run codex login in a terminal*, *Claude login
+needed: Sign in again on the Setup page, or run claude auth login in a
+terminal*, or *Claude Code not installed or not working* with the call's
+message; a missing program or a login ends with a link to **Setup**, where it is
+installed or signed in (see [the Setup page](models.md#the-setup-page)). Its
+card and page say so, and the retries go on, so the job continues by itself once
+that is fixed: a program Setup installs is found by the waiting job at its next
+retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
+
+A web-cutoff job held because its isolated LaTeX compiler is not ready (MacTeX
+missing, being updated or damaged, or the compiler's macOS sandbox check
+failing) is listed as *LaTeX compiler not ready*, with what fixes its cause. The
+check runs again every minute, also while the running-jobs limit is reached, and
+the job starts or continues by itself once it passes; a job you stopped only
+has its hold released (see
+[Web search cutoff](web-cutoff.md#what-a-timestamp-run-checks)).
 
 Failures that no retry can fix are not retried: a configuration error (for
 example a missing API key, or a Claude model in a web-cutoff run), a workflow

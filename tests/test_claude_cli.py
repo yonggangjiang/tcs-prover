@@ -511,7 +511,8 @@ class StructuredTests(FakeClaudeCase):
                                   str(state / "claude-homes"), str(state / "claude-transcripts"),
                                   str(state / "sessions"), str(state / "run-owners"), str(state / "servers"),
                                   str(state / "last-good-workflows"), str(state / "settings.json"),
-                                  str(state / "new-problem-presets.json"), str(state / "new-problem-presets.lock")])
+                                  str(state / "new-problem-presets.json"), str(state / "new-problem-presets.lock"),
+                                  str(state / "program-folders.json")])
         self.assertIn(str(Path(start["settings_path"]).parent.parent.resolve()), hidden)
         self.assertEqual((start["settings_mode"], start["settings_dir_mode"]), ("0o600", "0o700"))
         self.assertNotIn("env", start["settings"])

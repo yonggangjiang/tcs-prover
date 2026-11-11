@@ -60,6 +60,22 @@ class PreflightRetry(ValueError):
     """
 
 
+class CompilerRetry(PreflightRetry):
+    """The isolated LaTeX compiler is not ready (isolated_compiler.CompilerNotReady).
+
+    MacTeX is missing, being updated or not protected, sandbox-exec is missing,
+    or the compiler's sandbox canaries or test document fail. Like every
+    PreflightRetry the server checks it again every minute, so the job
+    continues by itself once the cause is fixed; the checks stay as strict.
+    ``kind`` is the cause's CompilerNotReady.kind, which picks the advice
+    (isolated_compiler.ADVICE): "mactex", "sandbox" or "rosetta".
+    """
+
+    def __init__(self, message, kind='mactex'):
+        super().__init__(message)
+        self.kind = kind if kind in isolated_compiler.ADVICE else 'mactex'
+
+
 class NeedsAttention(ValueError):
     """A run held until someone fixes the problem its message names."""
 
@@ -265,6 +281,14 @@ def preflight_policy(policy_path, *, auth_home=None):
 
 
 def preflight_compiler(policy_path):
+    """Exercise the isolated LaTeX compiler before model work.
+
+    A compiler that is not ready raises CompilerRetry, which the server checks
+    again every minute; one that could not finish a check (also a test
+    document that could not start or finish) raises PreflightRetry. The checks
+    themselves never loosen: a web-cutoff run starts only on a compiler that
+    passed every one of them.
+    """
     if not isolated_compiler.supported():
         raise ValueError(PLATFORM_REASON)
     try:
@@ -273,6 +297,10 @@ def preflight_compiler(policy_path):
             subprocess.SubprocessError) as exc:
         message = f'Historical compiler preflight failed; no model was started: {_cause(exc)}.'
         _log(message)
+        if isinstance(exc, isolated_compiler.CompilerNotReady):
+            if exc.kind == 'busy':
+                raise PreflightRetry(message) from exc
+            raise CompilerRetry(message, exc.kind) from exc
         raise (PreflightRetry if _transient(exc) else ValueError)(message) from exc
 
 

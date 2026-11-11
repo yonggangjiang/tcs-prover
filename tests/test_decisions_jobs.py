@@ -669,14 +669,17 @@ class AttentionTests(Isolated):
         attention = login.attention()
         self.assertEqual((attention["kind"], attention["title"], attention["retrying"]),
                          ("login", "Codex login needed", True))
-        self.assertEqual(attention["text"], "Log in to the Codex CLI again (codex login); the job continues by itself.")
+        # The page adds a link to Setup after these words (see tests/test_program_setup_ui.py).
+        self.assertEqual(attention["text"], "Sign in again on the Setup page, or run codex login in a terminal; the job "
+                                            "continues by itself.")
         self.assertGreater(login.state["autoResumeAt"], 0)
         # The Claude program is Claude Code, with no article.
         claude = self.paused_job(reason="Claude author turn failed: 401 Unauthorized: please log in again",
                                  authorModel="claude-opus-5-5")
         self.assertEqual({key: claude.attention()[key] for key in ("kind", "title", "text")},
                          {"kind": "login", "title": "Claude login needed",
-                          "text": "Log in to Claude Code again (claude, then /login); the job continues by itself."})
+                          "text": "Sign in again on the Setup page, or run claude auth login in a terminal; the job "
+                                  "continues by itself."})
         running = server.App(runs=self.runs, load_latest=False)
         running.state.update(phase="running", stage="critic", modelRetry={"failure": "usage limit reached",
                                                                         "stage": "critic", "retryAt": 10**9})
@@ -1293,16 +1296,19 @@ class QueueIntegrationTests(Isolated):
         self.assertEqual(json.loads((second.run_dir / server.REVIEW_INPUT_FILENAME).read_text())["statement"],
                          "Statement B")
 
-    def test_a_running_historical_check_counts_against_the_limit(self):
+    def test_a_historical_check_is_no_start_and_takes_no_slot(self):
+        # A held job's check starts no model: it is due by itself (hold_check_due_at), not as a start, and takes
+        # no running slot while it runs; the start or resume after a passing check waits for a slot.
         app = server.App(runs=self.runs, load_latest=False)
         app._new_run("Exact statement")
         app.state.update(phase="prepared", launchHold=server.HISTORICAL_PENDING_HOLD, runId=app.run_dir.name)
         app._hold_retry_at = 500
-        self.assertEqual(app.launch_due_at(1_000), (500, 0))
+        self.assertEqual(app.hold_check_due_at(), 500)
+        self.assertEqual(app.launch_due_at(1_000)[0], float("inf"))
         self.assertFalse(app.occupies_slot())
         app._hold_check_running = True
-        self.assertTrue(app.occupies_slot())
-        self.assertEqual(app.launch_due_at(1_000)[0], float("inf"))
+        self.assertFalse(app.occupies_slot())
+        self.assertEqual(app.hold_check_due_at(), float("inf"))
 
     def test_a_stopped_jobs_held_check_still_runs_again_every_minute(self):
         # As its hold says: the check runs again after a manual stop too (only the hold is released then),
@@ -1315,14 +1321,14 @@ class QueueIntegrationTests(Isolated):
                          launchHold="Historical search preflight failed: busy." + server.HISTORICAL_RETRY_SUFFIX)
         app._hold_retry_at = 500
         manager.jobs[app.run_dir.name] = app
-        self.assertEqual(app.launch_due_at(1_000), (500, 0))
+        self.assertEqual(app.hold_check_due_at(), 500)
         checks = []
         with mock.patch.object(server.App, "retry_historical_hold_if_due",
                                lambda self, now=None: checks.append((self, now)) or False):
             manager._retry_paused_jobs(now=1_000)
         self.assertEqual(checks, [(app, 1_000)])
         app.state["runningElsewhere"] = "another process"
-        self.assertEqual(app.launch_due_at(2_000)[0], float("inf"))
+        self.assertEqual(app.hold_check_due_at(), float("inf"))
 
     def test_a_settings_check_that_cannot_save_stops_no_other_job(self):
         manager = self.server()

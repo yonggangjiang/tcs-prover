@@ -351,8 +351,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 raise GatewayError('Untrusted local host.', 403)
             path, query = self.parsed_request()
             if path in STATIC:
-                # The page reads job, batch and new; theme previews a light or dark page unsaved.
-                if query and (path != '/' or set(query) - {'job', 'batch', 'new', 'theme'}):
+                # The page reads job, batch, new and setup; theme previews a light or dark page unsaved. The
+                # Setup page itself is not forwarded (its /setup routes answer 404 here, and the page says so).
+                if query and (path != '/' or set(query) - {'job', 'batch', 'new', 'setup', 'theme'}):
                     raise GatewayError('Not found.', 404)
                 filename, kind = STATIC[path]
                 return self.send((self.server.ui_directory / filename).read_bytes(), content_type=kind)

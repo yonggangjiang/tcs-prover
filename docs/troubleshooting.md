@@ -43,13 +43,34 @@ start. A second Ctrl-C stops everything at once.
 
 **A job says a program is missing** ("Codex CLI missing or incompatible",
 "Claude Code is not installed or is not on PATH", or *Claude Code not installed
-or not working* under **Needs your attention**). Install it (see the
+or not working* under **Needs your attention**). Install it on the
+[Setup page](models.md#the-setup-page) (or see the
 [README](../README.md#what-you-need-for-models)). The job retries every minute
 and continues by itself; nothing needs restarting.
 
-**"Codex login needed" or "Claude login needed".** Run `codex login`, or
-`claude` and then `/login`. The job continues by itself. Wait for **Paused**
-before changing a login while an author works.
+**"Codex login needed" or "Claude login needed".** Sign in again on the Setup
+page, or run `codex login` or `claude auth login` in a terminal. The job
+continues by itself. The job that waits for the login never holds **Sign in
+again**; another job that runs a model through that program does: wait for it
+to finish, or pause it.
+
+**Setup shows no Install or Update button.** The command jobs use is your own
+script, or was installed with Homebrew, npm, WinGet or a Linux package: Setup
+never changes those, and shows the commands to run yourself under **How to
+update**, or **How to install** when it offers no Install. A disabled button
+says why under it (a job that uses the program, a missing `curl`). When TCS
+Prover runs with administrator rights (as root, or as a Windows
+administrator), Setup shows no buttons at all, and the notice at the top of the
+page says why: start TCS Prover as your normal user.
+
+**Setup says a program "did not answer within 20 seconds".** Its version or
+sign-in check hung and was stopped. Click **Check again**; if it keeps
+happening, run the same command in a terminal (`codex --version`, `claude auth
+status`) to see what it waits for.
+
+**Setup says "Jobs cannot find it".** The program is installed in its usual
+folder, which is not on the path TCS Prover started with. Click **Use it for
+jobs**: TCS Prover remembers the folder, and jobs find the program at once.
 
 **A usage limit.** The job retries every minute and continues once the limit
 resets. To use fewer at once, set a [running-jobs limit](batches.md#running-jobs).
@@ -79,9 +100,10 @@ set `"cleanupPeriodDays": 365` in `~/.claude/settings.json`.
 ## Jobs
 
 **No PDF.** The job waits at **Compile PDF** with *Waiting to retry a command
-that could not run*: install LaTeX (`latexmk` and `pdflatex`); the job checks
-every minute and continues. A job that ends with "PDF not compiled" has its
-LaTeX source in `final.tex` and says why the compile failed.
+that could not run*: install LaTeX (`latexmk` and `pdflatex`; a web-cutoff run
+needs MacTeX in `/usr/local/texlive`); the job checks every minute and
+continues. A job that ends with "PDF not compiled" has its LaTeX source in
+`final.tex` and says why the compile failed.
 
 **Continue is missing on a job stopped at its time limit.** Less than a minute
 of its limit is left. Open the job and raise the limit (or set 0 for none).
@@ -100,8 +122,18 @@ that process ends.
 checkpoint is rebuilt from the transcript, and unusable settings fall back to the
 defaults.
 
-**A web-cutoff job is held.** It names the cause. Fix it and click **Re-run
-preflight**. See [Web search cutoff](web-cutoff.md#what-a-timestamp-run-checks).
+**A web-cutoff job is held.** It names the cause. *LaTeX compiler not ready*
+under **Needs your attention** means the isolated LaTeX compiler failed its
+checks, and the hold says what fixes it: *Install or repair MacTeX* when MacTeX
+is missing, being updated or damaged, *The compiler's macOS sandbox check
+failed; MacTeX is not the cause* otherwise. A cause that mentions
+`rosetta error` means TCS Prover's Python runs under Rosetta: recreate `.venv`
+with a native (arm64) Python and start TCS Prover again. That check, like one
+that could not finish, runs again every minute, and the job starts or continues
+by itself once it passes (a job you stopped only has its hold released and
+stays stopped until you choose **Continue**). For any other cause, fix it and
+click **Re-run preflight**. See
+[Web search cutoff](web-cutoff.md#what-a-timestamp-run-checks).
 
 **A folder run starts too many jobs.** Set **Models & API → Running jobs**; the
 rest wait in a queue.

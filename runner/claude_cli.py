@@ -162,9 +162,13 @@ def _failure(runtime, name):
 
 
 def executable(runtime):
-    """Find the installed Claude Code, preferring a native binary to a Windows batch launcher."""
+    """Find the installed Claude Code, preferring a native binary to a Windows batch launcher.
 
-    path = shutil.which("claude")
+    PATH first, then the folder the Setup page remembered when it installed
+    Claude Code outside this process's PATH (providers.remembered_program).
+    """
+
+    path = shutil.which("claude") or providers.remembered_program("claude")
     if path and os.name == "nt":
         path = native_windows_executable(path)
     if not path:
@@ -394,6 +398,28 @@ def gateway_environment(model, key):
     return environment
 
 
+def _without_claude_settings(base, keep=()):
+    """``base`` without the agents, every ANTHROPIC_* and every CLAUDE* variable except those in ``keep``."""
+
+    return {name: value for name, value in confinement.without_agents(base).items()
+            if not name.startswith(("ANTHROPIC_", "CLAUDE")) or name in keep}
+
+
+def subscription_environment(base):
+    """The environment Claude Code gets with the user's own login, as every job gives it.
+
+    No ANTHROPIC_* and no CLAUDE* variable except CLAUDE_CONFIG_DIR and
+    CLAUDE_CODE_OAUTH_TOKEN, no agent sockets, and no nonessential traffic.
+    child_environment(api=False) builds on it, and the Setup page checks and
+    signs in with it, so "Signed in" there means signed in for jobs (an
+    ANTHROPIC_API_KEY of the server never counts).
+    """
+
+    environment = _without_claude_settings(base, SUBSCRIPTION_ENVIRONMENT)
+    environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    return environment
+
+
 def child_environment(base, effort, *, api, config=None, temp=None):
     """Start from the runner environment without any inherited Claude/Anthropic setting.
 
@@ -401,13 +427,11 @@ def child_environment(base, effort, *, api, config=None, temp=None):
     (claude_home()); ``temp`` the private temp folder of Bash (bash_temp()),
     which Claude Code makes Bash's TMPDIR, and with it Bash reads no global
     git config. Like every confined process, the CLI is not told where the
-    user's SSH and GPG agents listen (confinement.AGENT_VARIABLES).
+    user's SSH and GPG agents listen (confinement.AGENT_VARIABLES). A
+    subscription model starts from subscription_environment().
     """
 
-    environment = {
-        name: value for name, value in confinement.without_agents(base).items()
-        if not name.startswith(("ANTHROPIC_", "CLAUDE")) or (not api and name in SUBSCRIPTION_ENVIRONMENT)
-    }
+    environment = _without_claude_settings(base) if api else subscription_environment(base)
     if config is not None:
         environment["CLAUDE_CONFIG_DIR"] = str(config)
     # The environment value takes precedence over --effort, so both agree.
