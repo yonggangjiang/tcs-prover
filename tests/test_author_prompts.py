@@ -130,11 +130,14 @@ class AuthorPromptTests(unittest.TestCase):
         for name, text in APPROVED_AUTHOR_PROMPTS.items():
             with self.subTest(prompt=name):
                 self.assertEqual(prompts[name], text)
-        # Only the first prompt, the continuation and the repair ask for the file, and no prompt names a
-        # system: the runner adds the note for a computer that cannot read proof.md (INLINE_PROOF_NOTE).
+        # Only the author's first prompt, continuation and repair, and the coordinator's first prompt and its
+        # answer to a reply that is not a hand-in, ask for the file in their own words (the coordinator's
+        # other prompts repeat its first prompt), and no prompt names a system: the runner adds the note for a
+        # computer that cannot read proof.md (INLINE_PROOF_NOTE).
         for name, text in prompts.items():
             with self.subTest(prompt=name):
-                self.assertEqual("PROOF_FILE: proof.md" in text, name in {"author", "continuation", "repair"})
+                self.assertEqual("PROOF_FILE: proof.md" in text, name in {
+                    "author", "continuation", "repair", "coordinator", "coordinator_report"})
                 for word in ("Windows", "macOS", "Linux"):
                     self.assertNotIn(word, text)
         # That note, and the reason a PROOF_FILE reply is refused there, which the resumed author is told.

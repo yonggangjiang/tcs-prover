@@ -1048,16 +1048,21 @@ def _verified_private_temp(policy, role, environment):
 #   subagent tool; version 2 ignores max_depth. Turning multi_agent off removes the version 1 tools.
 # - features.multi_agent_v2.multi_agent_mode_hint_text replaces the delegation hint (the <multi_agent_mode>
 #   developer message) of the root agent and of its subagents.
-def agent_limits(count, hint=""):
+# - features.multi_agent_v2.default_wait_timeout_ms is how long a wait_agent call of version 2 waits when it
+#   names no timeout (30 s by default); version 1 has no such setting.
+def agent_limits(count, hint="", wait_ms=None):
     """The settings that let one Codex process run at most ``count`` subagents at a time (0: none at all).
 
-    None leaves Codex's own defaults (a workflow node that declares no count).
+    None leaves Codex's own defaults (a workflow node that declares no count). ``wait_ms`` sets the default
+    wait of a process with subagents (the author coordinator's, see workflow_runner.COORDINATOR_WAIT_MS).
     """
     if count is None:
         return {}
     multi_agent_v2 = {"max_concurrent_threads_per_session": count + 1}
     if count and hint:
         multi_agent_v2["multi_agent_mode_hint_text"] = hint
+    if count and wait_ms:
+        multi_agent_v2["default_wait_timeout_ms"] = wait_ms
     limits = {"features": {"multi_agent_v2": multi_agent_v2}}
     if count:
         limits["agents"] = {"max_concurrent_threads_per_session": count, "max_depth": 1}

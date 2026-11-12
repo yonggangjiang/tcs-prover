@@ -192,7 +192,8 @@ class ConversationPromptTests(unittest.TestCase):
         self.assertEqual(len(framed) - len("Is {x} = {y}? {{escaped}}"), 294)
 
     def run_author(self, options, prompts=None, workspace=None):
-        """_execute with the author stage only and a stub goal session; return the session's prompt and options."""
+        """_execute with the author stage only, an author that works alone (Author subagents 0) and a stub goal
+        session; return the session's prompt and options."""
 
         workflow = runtime.load_workflow(WORKFLOW)
         prompts = prompts or workflow["prompts"]
@@ -207,7 +208,7 @@ class ConversationPromptTests(unittest.TestCase):
                 mock.patch.object(claude_cli, "goal_session", side_effect=AssertionError("Claude session started")), \
                 mock.patch.object(runtime, "emit"):
             state = runtime._execute(workflow, {"statement": "Exact statement S."},
-                                     {"workflow_stages": AUTHOR_ONLY, "goal_cwd": str(workspace), **options},
+                                     {"workflow_stages": AUTHOR_ONLY, "author_subagents": 0, "goal_cwd": str(workspace), **options},
                                      prompts)
         self.assertEqual(state["output"], "A complete inline proof.")
         (args, kwargs), = calls
@@ -275,7 +276,7 @@ class ConversationPromptTests(unittest.TestCase):
                     mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=supported), \
                     mock.patch.object(runtime, "goal_session", side_effect=session), \
                     mock.patch.object(claude_cli, "goal_session", side_effect=claude), mock.patch.object(runtime, "emit"):
-                runtime._execute(workflow, dict(state), {"workflow_stages": AUTHOR_ONLY,
+                runtime._execute(workflow, dict(state), {"workflow_stages": AUTHOR_ONLY, "author_subagents": 0,
                                                           "goal_cwd": str(self.directory)}, workflow["prompts"])
                 (args, kwargs), = calls
                 template = workflow["prompts"]["repair"] + ("" if supported else "\n\n" + runtime.INLINE_PROOF_NOTE)
@@ -296,7 +297,7 @@ class ConversationPromptTests(unittest.TestCase):
             yield {"outcome": "done", "output": "A complete inline proof."}
 
         with mock.patch.object(runtime, "goal_session", side_effect=session), mock.patch.object(runtime, "emit"):
-            runtime._execute(workflow, state, {"workflow_stages": AUTHOR_ONLY, "goal_cwd": str(self.directory),
+            runtime._execute(workflow, state, {"workflow_stages": AUTHOR_ONLY, "author_subagents": 0, "goal_cwd": str(self.directory),
                                                "related_works": True}, workflow["prompts"])
         (args, kwargs), = calls
         prompt = args[1]
@@ -321,7 +322,7 @@ class ConversationPromptTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {"TCS_PROVER_RETRIEVAL_MODE": "live"}):
                 os.environ.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
                 runtime._execute(workflow, {"statement": "Exact statement S."},
-                                 {"workflow_stages": AUTHOR_ONLY, "goal_cwd": str(self.directory),
+                                 {"workflow_stages": AUTHOR_ONLY, "author_subagents": 0, "goal_cwd": str(self.directory),
                                   "goal_thread_id": "thread-1", "goal_resume": True, "goal_require_resume": True,
                                   "related_works": True, **({"goal_reanchor": True} if reanchor else {})},
                                  workflow["prompts"])
@@ -361,7 +362,7 @@ class ConversationPromptTests(unittest.TestCase):
                     os.environ.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
                     state = runtime._execute(workflow, {"statement": "Exact statement S.", "handoff_refused": reason,
                                                         **extra},
-                                             {"workflow_stages": AUTHOR_ONLY, "goal_cwd": str(self.directory),
+                                             {"workflow_stages": AUTHOR_ONLY, "author_subagents": 0, "goal_cwd": str(self.directory),
                                               "goal_thread_id": "thread-1", "goal_resume": True,
                                               "goal_require_resume": True, **options}, prompts)
                 self.assertEqual([params["input"][0]["text"] for method, params in double.rpc.calls
@@ -1107,7 +1108,8 @@ class ConversationRetryTests(unittest.TestCase):
         self.assertEqual(self.events, [reply])
 
     def test_a_summary_uses_the_summary_prompt(self):
-        turns = self.run_turn(FakeTurns([], answer="Progress so far."), kind="summary", text="")
+        # The author mode the server passes for a job whose author works alone (a coordinator's: its own prompt).
+        turns = self.run_turn(FakeTurns([], answer="Progress so far."), kind="summary", text="", author_mode="author")
         self.assertEqual(turns.calls[0]["instruction"], SUMMARY_TEXT)
         self.assertEqual(turns.calls[0]["label"], "Progress summary requested")
         reply, = self.records("conversation_reply")

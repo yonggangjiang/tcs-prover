@@ -289,7 +289,8 @@ while True:
         sys.stderr.flush()
         sys.exit(1)
     current["message"] = message
-    run(next_turn(["init", "echo", {"structured": {
+    # Beyond its scripted turns a scenario runs its "default_turn", else one more turn in progress.
+    run(next_turn(SCENARIO.get("default_turn") or ["init", "echo", {"structured": {
         "goal_status": "in_progress", "final_answer": "", "progress_note": "default"}}]))
 '''
 
@@ -826,7 +827,9 @@ class GoalTests(FakeClaudeCase):
             f"Edit(/{run}/.git)", f"Edit(/{run}/.git/**)", f"Edit(/{run}/.aws)", f"Edit(/{run}/.aws/**)",
             f"Edit(/{run}/job-settings.json)", f"Edit(/{run}/pause.json)", f"Edit(/{run}/checked-statement.md)",
             f"Edit(/{run}/prompts)", f"Edit(/{run}/prompts/**)", f"Edit(/{run}/related-works)",
-            f"Edit(/{run}/related-works/**)"])
+            f"Edit(/{run}/related-works/**)",
+            # With the subagent tool no subagent may be a copy of the author's conversation.
+            "Agent(fork)"])
         # Everything else in the run folder stays writable: the proof, notes, new folders.
         argv = start["argv"]
         self.assertIn("Edit(./**)", argv[argv.index("--allowedTools") + 1].split(","))
@@ -841,7 +844,8 @@ class GoalTests(FakeClaudeCase):
         self.assertNotIn("CLAUDE_CODE_TMPDIR", start["env"])
         self.assertEqual(start["settings"]["sandbox"]["filesystem"],
                          {"denyRead": hidden, "denyWrite": [*hidden, *protected]})
-        self.assertEqual(len(start["settings"]["permissions"]["deny"]), 15)
+        # The 15 protected-entry rules, and Agent(fork) for the subagent tool.
+        self.assertEqual(len(start["settings"]["permissions"]["deny"]), 16)
 
     def test_in_progress_turn_is_continued_until_complete(self):
         self.script([["init", "echo", in_progress("Outlined the approach.")], ["init", "echo", complete("Inline proof")]])
@@ -1414,7 +1418,7 @@ class GoalTests(FakeClaudeCase):
         with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=False), \
                 mock.patch.object(runtime, "goal_session", side_effect=AssertionError("Codex session started")):
             state = runtime._execute(workflow, {"statement": "Exact statement S."}, {
-                "author_model": "claude-opus-5-5", "goal_cwd": str(self.run_dir),
+                "author_model": "claude-opus-5-5", "goal_cwd": str(self.run_dir), "author_subagents": 0,
                 "workflow_stages": {"review": False, "author": True, "critic": False, "writing": False}}, prompts)
         first = prompts["author"].replace("[STATEMENT]", "Exact statement S.", 1)
         self.assertEqual(self.texts(), [first + note, prompts["continuation"] + note])
@@ -1430,7 +1434,7 @@ class GoalTests(FakeClaudeCase):
         with mock.patch.object(runtime, "goal_session", side_effect=AssertionError("Codex session started")):
             state = runtime._execute(workflow, {"statement": "Exact statement S.", "handoff_refused": reason}, {
                 "author_model": "claude-opus-5-5", "goal_cwd": str(self.run_dir), "goal_thread_id": thread,
-                "goal_resume": True, "goal_require_resume": True,
+                "goal_resume": True, "goal_require_resume": True, "author_subagents": 0,
                 "workflow_stages": {"review": False, "author": True, "critic": False, "writing": False}}, prompts)
         self.assertEqual(self.texts(), [prompts["reopen"] + "\n\n"
                                         + runtime.render_template(prompts["handoff_refused"], {"reason": reason})])

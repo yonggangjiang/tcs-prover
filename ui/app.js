@@ -142,6 +142,7 @@ const ui = {
   resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
   reviewPromptTab: $("reviewPromptTab"),
   authorPromptTab: $("authorPromptTab"),
+  coordinatorPromptTab: $("coordinatorPromptTab"),
   criticPromptTab: $("criticPromptTab"),
   conventionPromptTab: $("conventionPromptTab"),
   finalPromptTab: $("finalPromptTab"),
@@ -186,6 +187,9 @@ const ui = {
   authorConversation: $("authorConversation"), authorConversationHeading: $("authorConversationHeading"),
   authorConversationNote: $("authorConversationNote"), authorConversationList: $("authorConversationList"),
   conversationSummaryLink: $("conversationSummaryLink"),
+  progressLog: $("progressLog"), progressLogHeading: $("progressLogHeading"), progressLogMeta: $("progressLogMeta"),
+  progressLogText: $("progressLogText"), progressLogNote: $("progressLogNote"), progressLogEmpty: $("progressLogEmpty"),
+  progressLogAlone: $("progressLogAlone"),
   relatedWorksPanel: $("relatedWorksPanel"), relatedWorksHeading: $("relatedWorksHeading"),
   relatedWorksNote: $("relatedWorksNote"), relatedWorksList: $("relatedWorksList"),
   relatedWorksEmpty: $("relatedWorksEmpty"), relatedWorksActions: $("relatedWorksActions"),
@@ -1141,6 +1145,8 @@ function setWorkflowStages(stages = selectedWorkflowStages()) {
   }
   // The convention critic checks the proof the critic accepts.
   if (ui.conventionPromptTab) show(ui.conventionPromptTab, stages.critic);
+  // The coordinator's prompt goes with the Author stage and Author subagents 1 or more.
+  if (typeof showCoordinatorPromptTab === "function") showCoordinatorPromptTab(stages);
   show(ui.criticRoundSetting, stages.critic);
   show(ui.criticCountSetting, stages.critic);
   show(ui.thinkingHoursSetting, stages.author);
@@ -1368,17 +1374,36 @@ function updateModelSummary() {
 }
 
 const promptLabels = {
-  review: "Reviewer prompt", author: "Author prompt",
+  review: "Reviewer prompt", author: "Author prompt", coordinator: "Coordinator prompt",
   critic: "Critic prompt", convention: "Convention critic prompt", final: "Final writer prompt",
 };
 
 const promptHelp = {
   review: "The full request also includes the statement and any revision feedback.",
   author: "Keep exactly one [STATEMENT]. The workflow replaces it with your statement.",
+  coordinator: "This prompt replaces the Author prompt for coordinator jobs (Author subagents 1 or more): the "
+    + "author coordinator follows it to run the author subagents instead of proving the statement itself. Keep "
+    + "exactly one [STATEMENT], which the workflow replaces with your statement. {author_subagents} is the number of "
+    + "author subagents; write any other brace twice: {{ and }}. A model without a subagent tool works alone with the "
+    + "Author prompt instead.",
   critic: "The critic follows these instructions: it starts the independent critics as its subagents, weighs their reports and decides. {count} is the number of independent critics; write any other brace twice: {{ and }}. The workflow adds the statement, and the proof is in proof.md.",
   convention: "The convention critic checks the proof once the critic has accepted it, before writing; its report goes to you and never changes the run. Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.",
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
+
+// Whether the New problem form starts an author coordinator, whose Coordinator prompt is then shown and checked:
+// the Author stage on, Author subagents a whole number of 1 or more, and a server that has the coordinator prompt
+// (an older one lists no default for it and would refuse the edit).
+function coordinatorPromptInUse(stages = selectedWorkflowStages()) {
+  const value = String(ui.authorSubagents?.value ?? "").trim();
+  const count = value === "" ? NaN : Number(value);
+  return stages.author === true && Number.isInteger(count) && count >= 1
+    && typeof state.workflow?.settings?.prompts?.coordinator === "string";
+}
+
+function showCoordinatorPromptTab(stages = selectedWorkflowStages()) {
+  if (ui.coordinatorPromptTab) show(ui.coordinatorPromptTab, coordinatorPromptInUse(stages));
+}
 
 function syncPrompts(source = state) {
   const defaults = source.workflow?.settings?.prompts || {};
@@ -1401,6 +1426,10 @@ function updatePromptHelp() {
   ui.promptEditorHelp.textContent = (isDefault ? "" :
     "This overrides the default for this job only. ")
     + promptHelp[activePrompt]
+    // A coordinator job's author follows the Author prompt only when its model has no subagent tool.
+    + (activePrompt === "author" && coordinatorPromptInUse() ? " With Author subagents 1 or more the author "
+      + "coordinator follows the Coordinator prompt instead; this one is used when the author's model has no "
+      + "subagent tool." : "")
     + " New jobs load defaults from the workflow files; browser edits are not remembered.";
 }
 
@@ -1452,16 +1481,29 @@ async function openPromptEditor() {
 function promptProblem() {
   const stages = selectedWorkflowStages();
   const stage = { final: "writing", convention: "critic" };
-  const enabled = ["review", "author", "critic", "convention", "final"].filter((name) => stages[stage[name] || name]);
+  // The coordinator's prompt counts while the form starts an author coordinator (see coordinatorPromptInUse).
+  const coordinator = coordinatorPromptInUse(stages);
+  const enabled = ["review", "author", "coordinator", "critic", "convention", "final"]
+    .filter((name) => (name === "coordinator" ? coordinator : stages[stage[name] || name]));
   const empty = enabled.find((name) => !promptDrafts[name]?.trim());
   if (empty) return [empty, "Every role prompt must contain instructions."];
-  // Like the workflow's templates: {statement} (or {instructions}) and doubled braces only.
-  const fields = String(promptDrafts.convention || "").replace(/\{\{|\}\}/g, "").match(/\{[^{}]*\}|[{}]/g) || [];
-  if (stages.critic && fields.some((field) => !["{statement}", "{instructions}"].includes(field))) {
+  // Like the workflow's templates: the named fields ({statement} or {instructions}; {author_subagents}) and
+  // doubled braces only.
+  const fields = (text) => String(text || "").replace(/\{\{|\}\}/g, "").match(/\{[^{}]*\}|[{}]/g) || [];
+  if (stages.critic && fields(promptDrafts.convention).some((field) => !["{statement}", "{instructions}"].includes(field))) {
     return ["convention", "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}."];
   }
-  return !stages.author || (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length === 1
-    ? null : ["author", "The author prompt must contain exactly one [STATEMENT]."];
+  if (stages.author && (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length !== 1) {
+    return ["author", "The author prompt must contain exactly one [STATEMENT]."];
+  }
+  if (coordinator && (promptDrafts.coordinator.match(/\[STATEMENT\]/g) || []).length !== 1) {
+    return ["coordinator", "The coordinator prompt must contain exactly one [STATEMENT]."];
+  }
+  if (coordinator && fields(promptDrafts.coordinator).some((field) => field !== "{author_subagents}")) {
+    return ["coordinator", "Write {author_subagents} where the number of author subagents goes, and write any other "
+      + "brace twice: {{ and }}."];
+  }
+  return null;
 }
 
 // The dialog is modal, so its own errors appear inside it, next to the prompt to fix.
@@ -1529,6 +1571,12 @@ function importantEntry(entry) {
       && entry.root !== false && !entry.activityLabel) return true;
   // As on the server: the critic's independent critics requested, started or finished (the progress line reads them).
   if (entry.kind === "status" && entry.root !== false && entry.subagentProgress === true) return true;
+  // As on the server: the author coordinator's subagents started, finished or failed (a few lines per subagent,
+  // which its subagents' own events would otherwise push out of the window), its time checks and its replies that
+  // named no proof file.
+  if (entry.kind === "status" && entry.root !== false && entry.authorSubagent === true) return true;
+  if (entry.kind === "status" && entry.root !== false && entry.stage !== "conversation"
+      && ["Coordinator time check", "Coordinator report"].includes(entry.label)) return true;
   if (entry.kind !== "codex_event" || entry.root === false) return false;
   const event = entry.event || {};
   const item = event.params?.item || event.item || {};
@@ -1536,10 +1584,19 @@ function importantEntry(entry) {
     && ["agentMessage", "agent_message"].includes(item.type);
 }
 
-// Bound routine events while retaining every important event in order.
+// Bound routine events while retaining every important event in order. As on the server (TRACE_LIMIT and
+// SUBAGENT_TRACE_LIMIT): the newest 1,500 records of the job itself and, apart, the newest 300 events of its
+// subagents' own conversations (codex events with root false), so a busy team of subagents never pushes the
+// author coordinator's own records out.
 function retainTrace(entries) {
-  const recent = Math.max(0, entries.length - 1500);
-  return entries.filter((entry, index) => index >= recent || importantEntry(entry));
+  const kept = [], counts = { own: 0, subagents: 0 };
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    const recent = entry.kind === "codex_event" && entry.root === false
+      ? counts.subagents++ < 300 : counts.own++ < 1500;
+    if (recent || importantEntry(entry)) kept.push(entry);
+  }
+  return kept.reverse();
 }
 
 // Convert one raw record into one useful live-timeline card.
@@ -1616,6 +1673,9 @@ function describe(entry) {
       time: entry.time, replace: true, pinned: true,
     };
   }
+  // The author coordinator's own records: its subagents, its time checks, a reply that named no proof file.
+  const coordinatorCard = entry.kind === "status" ? authorCoordinatorCard(entry) : null;
+  if (coordinatorCard) return coordinatorCard;
   if (entry.kind === "status") {
     // A status replaces the previous one of its label, except the progress of the critic's independent
     // critics: every attempt keeps its "N independent critics requested" and "Independent critic i" rows
@@ -1729,6 +1789,57 @@ function describe(entry) {
       label: scopedLabel("Turn completed"),
       text: [params.turn?.status || event.status || "completed", reason].filter(Boolean).join(": "),
       time: entry.time, replace: true,
+    };
+  }
+  return null;
+}
+
+// The author coordinator's status records as tidy rows of the activity log (see describe), or null for any other
+// record. "Author coordinator" keeps them apart from the critic coordinator's rows. Each keeps a row of its own,
+// pinned as on the server:
+// - its subagents (authorSubagent: true): "Author subagent started", "… finished" or "… failed", then the reason
+//   of a failure (the record's text), the assignment's first line as recorded (the subagent's id when there is
+//   none) and how many run now, when the record says;
+// - the hourly time check (label "Coordinator time check"), with the job's working time when it was sent;
+// - a final reply that names no proof file (label "Coordinator report"): TCS Prover does not hand it to the critic
+//   but asks the coordinator to continue, which the row says; the reply itself is the Author row above it (the
+//   record's text, a shortened copy, is kept for the transcript).
+function authorCoordinatorCard(entry) {
+  if (entry.root === false) return null;
+  const text = String(entry.text || "").trim();
+  if (entry.authorSubagent === true) {
+    const states = ["started", "finished", "failed"];
+    const status = states.includes(entry.subagentState) ? entry.subagentState
+      : states.find((name) => String(entry.label || "").endsWith(name)) || "started";
+    const id = String(entry.subagentId ?? "").trim();
+    const task = String(entry.subagentTask ?? "").trim();
+    const running = Number.isInteger(entry.subagentsRunning) && entry.subagentsRunning >= 0
+      ? `${entry.subagentsRunning || "none"} running` : "";
+    const line = [status === "failed" && text !== task ? text : "", task || (id ? `Subagent ${id}` : ""), running]
+      .filter(Boolean).join(" · ");
+    return {
+      key: `author-subagent:${id}:${status}:${entry.time}`, type: "status", label: `Author subagent ${status}`,
+      text: line || text || "No details were recorded.", time: entry.time, replace: true, pinned: true,
+    };
+  }
+  if (entry.label === "Coordinator time check") {
+    // The working time as the time check states it: "45 min", "5 h", "5 h 12 min".
+    const minutes = Number.isFinite(entry.elapsedSeconds) ? Math.floor(entry.elapsedSeconds / 60) : NaN;
+    const elapsed = !(minutes >= 0) ? "" : minutes < 60 ? `${minutes} min`
+      : `${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""}`;
+    return {
+      key: `coordinator-check:${entry.time}`, type: "status",
+      label: `Author coordinator time check${elapsed ? ` · ${elapsed}` : ""}`,
+      text: text || "TCS Prover sent the author coordinator its working time so far.",
+      time: entry.time, replace: true, pinned: true,
+    };
+  }
+  if (entry.label === "Coordinator report") {
+    return {
+      key: `coordinator-report:${entry.time}`, type: "status", label: "Author coordinator report",
+      text: "Not handed to the critic: this reply names no proof file, so TCS Prover asked the coordinator to "
+        + "continue. The reply is the Author row above.",
+      time: entry.time, replace: true, pinned: true,
     };
   }
   return null;
@@ -2413,11 +2524,18 @@ function renderRunOverview() {
     ...(state.sourceFile ? [["Input file", state.sourceFile]] : []),
     ["Statement reviewer", stages.review ? roleRow("review", state.reviewModel, state.reviewEffort || state.reasoningEffort) : "Off"],
     ["Proof author", stages.author ? roleRow("author", state.authorModel, state.authorEffort || state.reasoningEffort,
-      // An older job, from before the Author subagents setting, is not described with it.
+      // An older job, from before the Author subagents setting, is not described with it. With 1 or more, a job
+      // recorded in coordinator mode (authorMode) runs an author coordinator with that many author subagents, unless
+      // its runner said that its model has no subagent tool (authorModeEffective), so its author works alone; one
+      // recorded without the mode (every job from before coordinator mode) gave its author that many subagents.
       state.authorSubagentsRecorded === false ? ""
-        : Number.isInteger(state.authorSubagents) && state.authorSubagents > 0
-          ? ` · up to ${state.authorSubagents} subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
-          : " · no subagents") : "Off"],
+        : !(Number.isInteger(state.authorSubagents) && state.authorSubagents > 0) ? " · works alone"
+        : state.authorMode === "coordinator" && state.authorModeEffective?.mode === "author"
+          ? ` · works alone: ${state.authorModeEffective.modelLabel || "its model"} has no subagent tool (coordinator `
+            + "mode needs one)"
+        : state.authorMode === "coordinator"
+          ? ` · coordinator, up to ${state.authorSubagents} author subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
+          : ` · up to ${state.authorSubagents} subagent${state.authorSubagents === 1 ? "" : "s"} at a time`) : "Off"],
     // The limit now, and every change of it and pause at it (the server's records).
     ["Author time limit", stages.author ? limitSettingText(Number(state.thinkingHours ?? 0)) : "Off"],
     ...(timeLimitHistory().length ? [["Time limit history", timeLimitHistoryLines().join("\n")]] : []),
@@ -3373,8 +3491,13 @@ function renderWorkflow() {
       copy.append(mark);
     }
     const description = document.createElement("span");
+    // A job's author coordinator (authorMode, with 1 or more author subagents) does not build the proof itself; one
+    // whose model has no subagent tool works alone (authorModeEffective).
+    const coordinators = state.runId && state.authorMode === "coordinator" && state.authorModeEffective?.mode !== "author"
+      && Number.isInteger(state.authorSubagents) && state.authorSubagents > 0 ? state.authorSubagents : 0;
     const descriptions = {
-      author: "Explore approaches and build a proof.",
+      author: coordinators ? `Coordinates up to ${coordinators} author subagent${coordinators === 1 ? "" : "s"} and `
+        + "checks that progress keeps growing." : "Explore approaches and build a proof.",
       critic: stages.author === false
         ? "The critic starts independent critics on the supplied work and reports unresolved errors."
         : "The critic starts independent critics on the candidate and decides; rejected proofs return to the author.",
@@ -3838,7 +3961,8 @@ function render(next) {
     ui.feedback.value = state.error && state.reviewFeedback ? state.reviewFeedback : "";
     ui.criticRounds.value = state.criticRounds || 2;
     ui.criticCount.value = state.criticCount || 3;
-    ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents : 0;
+    ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
+      : state.workflow?.settings?.author_subagents?.default ?? 3;
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
     checkEdited();
@@ -3972,7 +4096,9 @@ function render(next) {
   renderWorkflow();
   renderClock();
   renderBatchNavigation();
-  // After the overview is shown, so the chat can scroll to its newest item (it also places the author's question).
+  // After the overview is shown, so the progress log and the chat can scroll to their newest text (the chat also
+  // places the author's question).
+  renderProgressLog();
   renderAuthorConversation();
   renderRelatedWorksPanel();
   if (state.readOnly || state.runningElsewhere) {
@@ -4038,7 +4164,8 @@ function applyComposerSettings(source) {
   ui.criticCount.min = critics.minimum || 1;
   ui.criticCount.max = critics.maximum || 10;
   const subagents = state.workflow?.settings?.author_subagents || {};
-  ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 0;
+  // A source without the setting takes the server's default, else 3 (an author coordinator with three subagents).
+  ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 3;
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
   ui.thinkingHours.value = source.thinkingHours ?? 0;
@@ -4442,6 +4569,98 @@ function renderRelatedWorksPanel() {
   const actions = Boolean(works.available) && !state.readOnly && !state.runningElsewhere;
   show(ui.relatedWorksActions, actions);
   if (!actions) show(ui.relatedNoteForm, false);
+}
+
+// The author coordinator's progress log, for a job recorded in coordinator mode (authorMode) with the Author stage
+// on: memory/progress.md in the author's working folder as the server last read it. The job's state says when it
+// changed and how long it is (state.coordinatorProgress, {updatedAt, truncated, chars, bytes, version}; null until
+// the file exists); its text comes apart (loadProgressLog), when the job page opens and whenever its version changes.
+// The text is set as plain text, never markup. The box opens at the end of the log and stays there as the log grows,
+// unless the reader scrolled up in it. When the server kept only the end of a longer file, a note says so, how large
+// the whole file is and where it is. Written only on change. When the job's runner said that its model has no
+// subagent tool (authorModeEffective), the author works alone and writes no log: one line says so instead.
+let progressLogRun = null;
+// The text on screen ({job, version, asked, text}: its version, and the state's version it was fetched for), the job
+// whose text is being fetched, and when a failed fetch may be tried again.
+let progressLogCopy = null, progressLogLoading = "", progressLogRetryAt = 0;
+function renderProgressLog() {
+  const visible = state.authorMode === "coordinator" && state.workflowStages?.author !== false;
+  show(ui.progressLog, visible);
+  const alone = visible && state.authorModeEffective?.mode === "author";
+  const aloneText = alone ? `The author works alone, without a progress log: ${state.authorModeEffective.modelLabel
+    || "its model"} has no subagent tool (coordinator mode needs one).` : "";
+  if (ui.progressLogAlone.textContent !== aloneText) ui.progressLogAlone.textContent = aloneText;
+  show(ui.progressLogAlone, alone);
+  show(ui.progressLogHeading, !alone);
+  if (!visible || alone) {
+    for (const part of [ui.progressLogMeta, ui.progressLogText, ui.progressLogNote, ui.progressLogEmpty]) show(part, false);
+    progressLogRun = null;
+    return;
+  }
+  const progress = state.coordinatorProgress && typeof state.coordinatorProgress === "object"
+    ? state.coordinatorProgress : null;
+  const job = `${state.batchId || ""}:${state.runId || ""}`;
+  // The job page opened: its text is fetched again (the copy shown meanwhile, when there is one of this job). Each
+  // version the state names is fetched at most once.
+  if (progressLogRun !== job) {
+    progressLogCopy = progressLogCopy?.job === job ? { ...progressLogCopy, version: null, asked: null } : null;
+    progressLogRetryAt = 0;
+  }
+  if (progress && progressLogCopy?.version !== progress.version && progressLogCopy?.asked !== progress.version
+      && progressLogLoading !== job && Date.now() >= progressLogRetryAt) loadProgressLog(job, progress.version);
+  const copy = progress && progressLogCopy?.job === job ? progressLogCopy : null;
+  const text = copy ? copy.text : "";
+  const written = text.trim() !== "";
+  // When the coordinator last changed the file: epoch seconds (or milliseconds), or an ISO time.
+  const raw = progress?.updatedAt;
+  const updated = typeof raw === "number" ? (raw > 1e11 ? raw : raw * 1000) : Date.parse(raw ?? "");
+  const minutes = Number.isFinite(updated) ? Math.floor(Math.max(0, Date.now() - updated) / 60000) : NaN;
+  const ago = !Number.isFinite(minutes) ? "" : minutes < 1 ? "updated just now"
+    : minutes < 60 ? `updated ${minutes} min ago`
+    : minutes < 48 * 60 ? `updated ${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""} ago`
+    : `updated ${Math.floor(minutes / 1440)} days ago`;
+  const meta = ["Written by the author coordinator in memory/progress.md", ago].filter(Boolean).join(" · ");
+  if (ui.progressLogMeta.textContent !== meta) ui.progressLogMeta.textContent = meta;
+  show(ui.progressLogMeta, Boolean(progress));
+  // Not written yet: no file, or a blank one (not while the text of a file is on its way).
+  show(ui.progressLogEmpty, !progress || (copy !== null && !written));
+  const box = ui.progressLogText;
+  show(box, written);
+  // Measured before the text changes: a reader who scrolled up keeps their place; another job opens at the end.
+  const atEnd = progressLogRun !== job || box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  progressLogRun = job;
+  if (box.textContent !== text) box.textContent = text;
+  if (written && atEnd) box.scrollTop = box.scrollHeight;
+  // Of a longer file the server keeps the end: "chars" is how many characters "text" holds (the last 100,000 at
+  // most) and "bytes" the size of the whole file.
+  const workspace = String(state.goalWorkspace || "").replace(/[\\/]+$/, "");
+  const separator = workspace.includes("\\") && !workspace.includes("/") ? "\\" : "/";
+  const where = workspace ? `${workspace}${separator}memory${separator}progress.md`
+    : "memory/progress.md in the author's working folder";
+  const shown = Number.isInteger(progress?.chars) && progress.chars > 0 ? progress.chars : text.length;
+  const size = Number.isInteger(progress?.bytes) && progress.bytes > 0 ? ` (${chatSizeText(progress.bytes)})` : "";
+  const note = written && progress.truncated === true
+    ? `Showing the last ${shown.toLocaleString("en-US")} characters; the whole file${size} is ${where}.` : "";
+  if (ui.progressLogNote.textContent !== note) ui.progressLogNote.textContent = note;
+  show(ui.progressLogNote, Boolean(note));
+}
+
+// Fetch the text of the progress log of ``job`` (the job on screen), whose state names version ``asked``, then draw
+// it. A failed fetch is tried again 10 s later, at a later update; nothing is shown that belongs to another job.
+async function loadProgressLog(job, asked) {
+  progressLogLoading = job;
+  try {
+    const log = await request(jobPath("/progress-log"));
+    if (job !== `${state.batchId || ""}:${state.runId || ""}`) return;
+    progressLogCopy = { job, asked, version: log?.version ?? null,
+      text: typeof log?.text === "string" ? log.text : "" };
+    progressLogRetryAt = 0;
+  } catch (_) {
+    progressLogRetryAt = Date.now() + 10000;
+  } finally {
+    if (progressLogLoading === job) progressLogLoading = "";
+  }
+  renderProgressLog();
 }
 
 // The running author's open question (state.authorQuestion; the server closes it by its rules), in its row
@@ -4858,7 +5077,7 @@ async function startReview(statement, feedback = "") {
   const stages = fromComposer ? selectedWorkflowStages() : workflowStagesFor(state);
   if (!Object.values(stages).some(Boolean)) return showCreateError("Select at least one workflow stage.");
   if (!statement.trim()) return showCreateError("Enter the text for this workflow.");
-  if (stages.author && !validateWorkflowHours()) return;
+  if (stages.author && !(validateWorkflowHours() && validateAuthorSubagents())) return;
   // The composer's related works go with a new problem only; a retried review keeps its job's own.
   const relatedProblem = fromComposer ? composerRelatedWorksProblem(stages) : "";
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
@@ -4952,6 +5171,22 @@ function validateWorkflowHours() {
   const advanced = ui.thinkingHours.closest("details");
   if (advanced) advanced.open = true;
   ui.thinkingHours.focus();
+  return false;
+}
+
+// Author subagents must be a whole number in the field's range (0 to 10): Number() would send an empty field as
+// 0, which silently turns coordinator mode off. Checked, like the time limit, while the Author stage is on.
+function validateAuthorSubagents() {
+  const field = ui.authorSubagents;
+  const value = String(field.value ?? "").trim(), count = Number(value);
+  const min = Number(field.min || 0), max = field.max ? Number(field.max) : 10;
+  if (value !== "" && Number.isInteger(count) && count >= min && count <= max) return true;
+  ui.notice.textContent = `Enter ${min} to ${max} author subagents: 0 for one author working alone, 1 or more for `
+    + "an author coordinator with that many author subagents.";
+  show(ui.notice, true);
+  const advanced = field.closest?.("details");
+  if (advanced) advanced.open = true;
+  field.focus?.();
   return false;
 }
 
@@ -5183,7 +5418,7 @@ async function startFolderBatch(files) {
   const chosen = [...(files || [])];
   // A single job being created also blocks the folder run (and the reverse).
   if (!chosen.length || folderBatchBusy || ui.check.disabled) return;
-  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents()))) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   folderBatchBusy = true;
@@ -5224,7 +5459,7 @@ async function sendFolderBatch(chosen) {
     return;
   }
   // File reading is asynchronous; recheck the current settings before sending.
-  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !validateWorkflowHours())) return;
+  if (!validateRetrievalSettings({ folder: true }) || (selectedWorkflowStages().author && !(validateWorkflowHours() && validateAuthorSubagents()))) return;
   const relatedProblem = composerRelatedWorksProblem(selectedWorkflowStages());
   if (relatedProblem) return showRelatedWorksProblem(relatedProblem);
   // The listed related works go to the folder run's own store, which every one of its jobs sees.
@@ -5388,6 +5623,8 @@ for (const role of ["review", "author", "critic", "writer"]) {
 }
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
+// The Coordinator prompt tab is shown while Author subagents is 1 or more (see coordinatorPromptInUse).
+ui.authorSubagents.oninput = () => showCoordinatorPromptTab();
 ui.retrievalMode.onchange = () => {
   renderRetrievalSettings();
   updateModelSummary();
@@ -8808,7 +9045,7 @@ function presetSignature() {
 function presetFormSettings() {
   const settings = proofJobSettings();
   delete settings.promptOverrides;
-  const builtIn = { authorSubagents: 0, criticCount: 3, criticRounds: 2, thinkingHours: 0,
+  const builtIn = { authorSubagents: 3, criticCount: 3, criticRounds: 2, thinkingHours: 0,
     ...presetStore().builtIn?.settings };
   for (const { key, stage, problem } of presetNumberFields()) {
     if (problem && !settings.workflowStages[stage]) settings[key] = builtIn[key];

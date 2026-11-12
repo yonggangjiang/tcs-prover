@@ -478,9 +478,9 @@ class BatchCatalog:
             return [], False, 0
 
     def state(self, batch_id, run_id, after=None):
-        from .server import (RESUME_MARGIN_SECONDS, controller_note, empty_state, event_node, follow_time_limit,
-                             model_menu_settings, role_model_sources, saved_api_models, saved_time_limit_history,
-                             workflow_graph)
+        from .server import (AUTHOR_MODES, PROGRESS_LOG_FIELDS, PROOF_PROMPTS, RESUME_MARGIN_SECONDS, controller_note,
+                             empty_state, event_node, follow_author_mode, follow_time_limit, model_menu_settings,
+                             role_model_sources, saved_api_models, saved_time_limit_history, workflow_graph)
         directory = self._run(batch_id, run_id)
         state = empty_state()
         state.update(self._summary(directory))
@@ -511,7 +511,16 @@ class BatchCatalog:
                 state[key] = settings[key]
         state['criticCountRecorded'] = _finite_number(settings.get('criticCount'))
         state['authorSubagentsRecorded'] = _finite_number(settings.get('authorSubagents'))
-        for role in ('review', 'author', 'critic', 'final'):
+        # As a restored job: one saved without these is older than the author coordinator, and worked alone.
+        if not state['authorSubagentsRecorded']:
+            state['authorSubagents'] = 0
+        state['authorModeRecorded'] = settings.get('authorMode') in AUTHOR_MODES
+        state['authorMode'] = settings['authorMode'] if state['authorModeRecorded'] else 'author'
+        if state['authorMode'] == 'coordinator':
+            # What the page shows of its progress log but the text, which it fetches apart (progress_log()).
+            log = self._progress_log(directory, settings)
+            state['coordinatorProgress'] = None if log is None else {key: log[key] for key in PROGRESS_LOG_FIELDS}
+        for role in ('review', *PROOF_PROMPTS):
             # Never the current default in place of a saved prompt that is too large to show.
             prompt = (self._too_large(directory, f'prompts/{role}.txt')
                       or self._read(directory, f'prompts/{role}.txt'))
@@ -542,6 +551,8 @@ class BatchCatalog:
         for record in records:
             if rebuild:
                 follow_time_limit(history, record)
+            # How a coordinator's author worked, as its runner last reported it among these recent records.
+            state['authorModeEffective'] = follow_author_mode(state.get('authorModeEffective'), record)
             kind = _text(record.get('kind'))
             # The controller's notes (the paused author's replies, related works) are not workflow steps.
             if isinstance(record.get('stage'), str) and record['stage'] and not controller_note(record):
@@ -608,6 +619,26 @@ class BatchCatalog:
         with self._open(self._run(batch_id, run_id), name) as stream:
             yield stream
 
+    def _progress_log(self, directory, settings):
+        """A saved coordinator job's progress log (server.read_progress_log()), from the author's working folder
+        when that is an existing folder of this catalog (a run moved into a batch folder still names its old
+        place), else from the run's own folder."""
+        from .server import read_progress_log
+
+        workspace = Path(_text(settings.get('goalWorkspace')) or directory)
+        return read_progress_log(workspace if workspace.is_absolute() and self._directory(workspace) else directory)
+
+    def progress_log(self, batch_id, run_id):
+        """A saved job's progress log as GET /progress-log gives it (server.App.progress_log()), read once."""
+        from .server import PROGRESS_LOG_FIELDS
+
+        directory = self._run(batch_id, run_id)
+        settings = self._json(directory, 'job-settings.json', None)
+        log = self._progress_log(directory, settings) if settings.get('authorMode') == 'coordinator' else None
+        if log is None:
+            return {'text': None, 'version': None}
+        return {key: log[key] for key in ('text', *PROGRESS_LOG_FIELDS)}
+
     def response(self, path, batch, job='', query=None):
         """Return a JSON value or a validated download path for a GET route.
 
@@ -625,6 +656,8 @@ class BatchCatalog:
             except (ValueError, TypeError):
                 raise ValueError('Invalid saved transcript position.') from None
             body = self.state(batch, job, after)
+        elif path == '/progress-log':
+            body = self.progress_log(batch, job)
         elif path in {'/transcript', '/download-tex', '/download-pdf'}:
             name = {'/transcript': 'transcript.jsonl', '/download-tex': 'final.tex',
                     '/download-pdf': 'final.pdf'}[path]

@@ -11,8 +11,10 @@ apart.
 
 The workflow rail always shows the whole workflow: Statement reviewer, Proof
 author, Independent critic, Convention critic and Writing & polishing (LaTeX
-editor, Compile PDF). Stages not selected for the run are muted. One mark shows
-where the run is:
+editor, Compile PDF). Stages not selected for the run are muted. For an
+[author coordinator](workflow.md#the-author-coordinator), the Proof author step
+reads *Coordinates up to 3 author subagents and checks that progress keeps
+growing.* One mark shows where the run is:
 
 | Mark | Meaning |
 | --- | --- |
@@ -26,6 +28,16 @@ While the job works, the status card says when the last event arrived (*Last
 activity 2m 05s ago*) and, while something waits to retry, what waits and since
 when: a failed model call, a command that could not run (such as compiling the
 PDF without TeX), or saving a file.
+
+**Run settings**, below the activity log, lists the models and settings the job
+runs with. Its **Proof author** row ends with how the author works:
+*coordinator, up to 3 author subagents at a time* for an
+[author coordinator](workflow.md#the-author-coordinator), or *works alone* with
+**Author subagents** 0. When the model of a coordinator job has no subagent tool,
+its author works alone, and the row says why: *works alone: GPT 5.6 Luna (older)
+has no subagent tool (coordinator mode needs one)*. A job from before
+coordinator mode whose author could start subagents keeps its earlier wording,
+such as *up to 2 subagents at a time*.
 
 ### How jobs are counted
 
@@ -55,6 +67,25 @@ A finished result appears in the output panel. An unfinished run's own text is
 not shown there, since its progress summary says where it stands; it stays in
 `partial-output.md`.
 
+## Progress log
+
+A job with an [author coordinator](workflow.md#the-author-coordinator) shows a
+**Progress log** in its status card, before **Talk to the author**: the
+coordinator's `memory/progress.md`, the log of the team's progress that its
+prompt asks it to keep. A line above it says
+*Written by the author coordinator in memory/progress.md · updated 4 min ago*.
+
+- TCS Prover reads the file again whenever it changes, and the card follows.
+- The log is shown as plain text, never run or rendered (its Markdown stays as
+  written), in a box that stays scrolled to the end as the log grows, unless you
+  scroll up in it.
+- Of a file longer than 100,000 characters the card shows the last 100,000 and
+  says so, with the size of the whole file and where it is.
+- Until the coordinator writes the file, the card says *The coordinator has not
+  written its progress log yet.*
+- With a model that has no subagent tool, the author of a coordinator job works
+  alone and writes no log: one line says so in place of the card.
+
 ## Talk to the author
 
 Every job with an Author stage has a **Talk to the author** card next to its
@@ -70,7 +101,8 @@ author's questions and the progress summaries. **Send** sends a message of 1 to
   under your message once the file has not changed for 2 seconds, and is updated
   if the author changes it. A message the author has taken in shows **Delivered
   to the author**. Nothing waits for an answer; a message that gets none simply
-  stays delivered.
+  stays delivered. An author coordinator of Claude Code takes it in when its
+  running subagents report, since they run in the foreground.
 - **While the job is paused or stopped at the author** (by you, at the time
   limit, after a restart or a failure), the paused author answers in its own
   saved conversation (see [below](#replies-of-the-paused-author)).
@@ -99,7 +131,7 @@ author writes a progress summary in the chat, and **Resume** continues the work.
 While the author is paused or stopped, it writes the summary at once; while it
 is still pausing or stopping, it writes it once it has paused or stopped. Only
 the time limit writes a summary by itself. A live run saves the newest one as
-`progress-summary.md`.
+`progress-summary.md`. An author coordinator writes it from the team's memory.
 
 ### Replies of the paused author
 

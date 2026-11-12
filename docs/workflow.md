@@ -19,8 +19,8 @@ asymptotic goal in the statement.
 
 ```mermaid
 flowchart TD
-    S["Optional statement review"] --> A["Persistent root author"]
-    A -- "continue research" --> A
+    S["Optional statement review"] --> A["Persistent author: a coordinator of author subagents, or one author"]
+    A -- "continue research; hourly time checks" --> A
     A -- "complete candidate" --> C["Critic + its independent critics"]
     C -- "reject: exact bugs and reset rounds" --> A
     C -- "edited pass: next round, read-only at the maximum" --> C
@@ -43,7 +43,7 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| Author subagents | 0 | Subagents the author may start at a time, 0 to 10. 0 gives it no subagent tool. |
+| Author subagents | 3 | 0 to 10. 1 or more: an [author coordinator](#the-author-coordinator) runs up to that many author subagents at a time. 0: one author works alone, with no subagent tool. |
 | Independent critics | 3 | Fresh critics the critic starts on each proof version, 1 to 10. |
 | Maximum consecutive critic rounds | 2 | Edited passes in a row before the final check, 1 to 100. |
 | Time limit in hours | 0 (none) | See [the job page](job-page.md#time-limit-and-progress-summary). |
@@ -53,16 +53,18 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 
 Jobs run in parallel, each in its own folder under `runs/`.
 
-**Prompts.** New jobs read the author, critic and convention critic prompts from
-`workflows/author_critic.yaml` and the LaTeX editor's prompt from
-`workflows/clean_up.yaml` when they start, so an edit applies to the next job
-without a restart. An edit that cannot be read leaves the last readable version
-in use, with a warning on the job page, until the file is fixed.
+**Prompts.** New jobs read the author, author coordinator, critic and
+convention critic prompts from `workflows/author_critic.yaml` and the LaTeX
+editor's prompt from `workflows/clean_up.yaml` when they start, so an edit
+applies to the next job without a restart. An edit that cannot be read leaves
+the last readable version in use, with a warning on the job page, until the
+file is fixed.
 
 - **Edit prompts** (also **Prompts** in the sidebar) shows the current defaults
-  for the reviewer, author, critic, convention critic and final writer. **Apply
-  to this job** changes only the job you are about to start; prompts are never
-  remembered in the browser, carried into the next job or kept in
+  for the reviewer, author, author coordinator (**Coordinator**, shown with
+  **Author subagents** 1 or more), critic, convention critic and final writer.
+  **Apply to this job** changes only the job you are about to start; prompts
+  are never remembered in the browser, carried into the next job or kept in
   [saved settings](saved-settings.md).
 - Continuing a job keeps its saved prompts and workspace. A job saved with the
   earlier default author prompt (the one with separate macOS or Linux and
@@ -98,21 +100,100 @@ Stopping a review is described under
 
 ## The author
 
-One root author conversation works on the statement for the whole run, across
-pauses, restarts, context compaction and critic rejections. Its instructions (the
-`author` prompt in `workflows/author_critic.yaml`) ask it to prove the exact
-statement even when it looks like a hard or long-standing open problem, to think
-deeply and to try substantially different approaches when one stalls. Its goal,
-continuation, reopen, resume and repair prompts repeat that it must not give up.
-None of them asks for research notebooks or a file layout.
+One root author conversation (a Codex goal thread or a Claude Code
+conversation) works on the statement for the whole run, across pauses,
+restarts, context compaction and critic rejections. What it does depends on
+**Author subagents** (`-authorSubagents N` in the terminal), 0 to 10, default 3:
 
-**Author subagents** (`-authorSubagents N` in the terminal) is how many
-subagents the author may start at a time, 0 to 10, default 0. With 1 or more it
-gets a subagent tool limited to that many, and its first prompt ends with "You
-may start up to N independent subagents at a time, for example to explore other
-approaches or to check calculations; you do not need to ask the user." The
-setting is saved with the job, shown in **Run settings**, and kept by resumes,
-continuations and folder runs.
+- **1 or more:** it is an [author coordinator](#the-author-coordinator), which
+  runs up to that many author subagents at a time and does not try to prove the
+  statement itself.
+- **0:** one author works on the proof alone, without a subagent tool. Its
+  instructions (the `author` prompt in `workflows/author_critic.yaml`) ask it to
+  prove the exact statement even when it looks like a hard or long-standing open
+  problem, to think deeply and to try substantially different approaches when
+  one stalls. Its goal, continuation, reopen, resume and repair prompts repeat
+  that it must not give up. None of them asks for research notebooks or a file
+  layout.
+
+The number, and with it the mode (coordinator or one author), is saved when the
+job starts, shown in **Run settings**, and kept by resumes, continuations and
+folder runs. Jobs from before coordinator mode keep working as they did: one
+saved without the number runs one author, and one saved with 1 or more runs its
+author with the `author` prompt, which then ends with "You may start up to N
+independent subagents at a time, for example to explore other approaches or to
+check calculations; you do not need to ask the user."
+
+### The author coordinator
+
+The coordinator does not try to prove the statement itself. Its prompt asks it
+to run the team of author subagents and check the team's health, so that
+progress on the problem grows steadily with the time spent, until the team has
+a complete proof that has been checked. The strategy is its own: how it
+organizes the team and its memory, how it judges progress (there are no fixed
+criteria; it can search the run's whole record in `transcript.jsonl` in its
+working folder), and how it brings the team back to steady progress when
+progress stalls or slows.
+
+- **Prompts.** Its first prompt is the per-job `coordinator` prompt, in place of
+  the `author` prompt (**Coordinator** in **Edit prompts**; `{author_subagents}`
+  is the number of author subagents). Its goal, continuation, reopen,
+  compaction, resume, repair and summary prompts are `coordinator_goal`,
+  `coordinator_continuation`, `coordinator_reopen`, `coordinator_compaction`,
+  `coordinator_resume`, `coordinator_repair` and `coordinator_summary`, and
+  `coordinator_checkin` is its time check. The goal and the continuation point
+  back to the coordinator prompt in one line (Codex repeats the goal in each of
+  its automatic turns); reopen, compaction, resume and repair repeat the whole
+  first prompt under `ORIGINAL COORDINATOR PROMPT`. `coordinator_report`
+  answers a reply that is not a hand-in (below). The chat prompts, the note on a
+  refused submission and the note on related works are the same as one
+  author's.
+- **Author subagents.** It starts them with the program's own subagent tool, at
+  most N at a time. With Codex, the coordinator's delegation hint asks it to
+  start each one fresh with a self-contained assignment, to wait for them up to
+  30 minutes at a time and to close finished ones where it can; with Claude
+  Code they never start as copies of its conversation. Subagents start no
+  subagents of their own. The activity log shows
+  each as **Author subagent started** (with the first line of its assignment),
+  then **Author subagent finished** or **Author subagent failed** (with the
+  reason when it is known), with how many run then. These lines stay listed
+  while the subagents' own events leave the live window.
+- **Memory.** When a coordinator run starts, TCS Prover creates a `memory/`
+  folder in the author's working folder, with owner-only permissions where the
+  system has them; what it already holds is never removed or overwritten.
+  The coordinator keeps the team's memory there as it sees fit; its prompt asks
+  it to keep a log of the team's progress in `memory/progress.md`, which the job
+  page shows as the [progress log](job-page.md#progress-log).
+- **Time checks.** Every hour of the job's working time (the clock of the time
+  limit: carried across resumes, without paused time, sleep or retry waits),
+  TCS Prover sends the coordinator a time check as a live instruction with the
+  elapsed time and the time limit, such as "Elapsed: 5 h 12 min. Time limit: 24
+  h, about 18 h 48 min left." The first comes at 1 hour; a job resumed at 5 h 20
+  min gets its next one at 6 hours. None is sent while the job pauses or stops,
+  or during a progress summary or a reply. The activity log shows each as
+  **Author coordinator time check**, and keeps these lines listed.
+- **Handing in.** A final reply that names no proof file (no `PROOF_FILE`
+  pointer, see below) is not handed to the critic: the activity log shows the
+  reply as the coordinator's own line, then an **Author coordinator report** line
+  that says why it was not handed on (kept listed), and the coordinator gets
+  `coordinator_report`: its reply was kept as a progress report, and a hand-in
+  is the line `PROOF_FILE: proof.md` alone. Where
+  TCS Prover cannot read a proof file (on Windows), the coordinator hands in the
+  proof in its reply, as one author does.
+- **No subagent tool.** With a model that gets no subagent tool (GPT 5.6 Luna,
+  or an Anthropic-format API model in bare mode, see
+  [API connections](models.md#api-connections)), the author of a coordinator
+  job works alone with the `author` prompt instead of coordinating (its progress
+  summaries too), and the activity log, **Run settings** and the place of the
+  progress log say so.
+- **Claude Code** runs the subagents in the foreground: a live instruction, a
+  time check or a chat message reaches a Claude coordinator when its running
+  subagents report. Time checks never pile up meanwhile: the next is written
+  once the coordinator has read the last, with the time of its writing.
+- **Progress summaries** (at the time limit, or with **Summarize progress**) use
+  `coordinator_summary`: from the team's memory, what has been verified, what
+  remains open and why, and the most promising next steps. Like every reply of
+  the paused author, the summary is read-only and starts no subagents.
 
 ### Handing in a proof
 
@@ -214,7 +295,8 @@ reads them and makes the one decision.
 
 ### Subagents: what the program enforces
 
-Only the critic and, with **Author subagents** 1 or more, the author have
+Only the critic and, with **Author subagents** 1 or more, the author (an author
+coordinator, or the author of a job from before coordinator mode) have
 subagents; the statement reviewer, the convention critic, the LaTeX writer and
 the paused author's replies have none. Checked with Codex 0.160 against a local
 stand-in for the model API:
@@ -223,16 +305,26 @@ stand-in for the model API:
 | --- | --- |
 | `features.multi_agent_v2.max_concurrent_threads_per_session` = N + 1 | Version-2 models (GPT 6.x, GPT 5.6 Sol and Terra): at most N subagents at once, counting subagents of subagents ("agent thread limit reached"). A call without subagents gets N = 0, since Codex lists its collaboration tools to these models anyway. |
 | `agents.max_concurrent_threads_per_session` = N, `agents.max_depth` = 1 | Version-1 models (API models and others): at most N subagents at once, and subagents get no subagent tool. |
-| `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking. |
+| `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking; the author coordinator's hint also says that delegating is its task, that waiting for its subagents is part of its work, and that each starts fresh. |
+
+On version-2 models the author coordinator also gets
+`features.multi_agent_v2.default_wait_timeout_ms` = 1800000, so its waits for
+its subagents default to 30 minutes. A web-cutoff run leaves this setting out
+(its isolation check compares every agent setting, and whether Codex reports
+this one has not been checked); there only the hint asks for long waits.
 
 So the program limits how many subagents run at once, not how many in total.
 Only the prompt says that the critic starts exactly that many, and (on version
-2) that subagents start none of their own. Claude Code has no such setting: the
-number is in the prompt only. GPT 5.6 Luna (older) gets no subagent tool, so with
-it the critic reviews alone and **Author subagents** has no effect; the activity
-log says "No subagents with this model". In a web-cutoff run these limits are
-session flags of each Codex process, and the isolation check refuses any other
-agent setting.
+2) that subagents start none of their own. For Claude Code, TCS Prover sets
+Claude Code's own limits in the environment of the critic and of an author
+with subagents: at most N subagents at once, none of their own, no copies of the
+calling conversation, and subagents in the foreground. These are undocumented
+settings of Claude Code, found in its version 2.1.289 (see
+[Developers and operators](developers.md)). GPT 5.6 Luna (older) gets no
+subagent tool, so with it the critic reviews alone and the author of a
+coordinator job works alone; the activity log says "No subagents with this
+model". In a web-cutoff run these limits are session flags of each Codex
+process, and the isolation check refuses any other agent setting.
 
 ### Critics of web-cutoff runs
 

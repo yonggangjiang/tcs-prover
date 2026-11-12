@@ -50,7 +50,7 @@ STATIC = {'/': ('index.html', 'text/html; charset=utf-8'),
 GET_ROUTES = {'/batches': set(), '/jobs': set(), '/state': {'job', 'after'},
               '/transcript': {'job'}, '/download-proof': {'job'}, '/download-source': {'job'},
               '/download-tex': {'job'}, '/download-pdf': {'job'}, '/download-critic-diff': {'job', 'file'},
-              '/chat-answer': {'job', 'id'}}
+              '/chat-answer': {'job', 'id'}, '/progress-log': {'job'}}
 CREATE_ROUTES = {'/review', '/direct', '/direct-batch', '/finalize', '/start-workflow'}
 CONTROL_ROUTES = {'/delete-job', '/resume', '/resume-critic',
                   '/resume-checkpoint', '/continue-stopped', '/approve', '/solve',

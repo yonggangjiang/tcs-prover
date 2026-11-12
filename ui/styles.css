@@ -4093,8 +4093,45 @@ kbd {
 :root[data-theme="ink"] .api-model-form[data-key-state="other-server"] .api-saved-key-row { box-shadow: inset 2px 0 0 var(--ink); }
 
 /* 14. Author conversation and related works ---------------------------------- */
-/* The conversation sits in the now-card, after the recovery block and before the box that asks:
-   each summary or message in a sunken well, the author's words behind an accent rule. */
+/* The author coordinator's progress log sits in the now-card, after the recovery block and before the chat, set off
+   like it by a hairline: a quiet line that says where it comes from, then the file as plain text in a sunken well
+   that keeps its height and scrolls (monospaced, as the raw file it is; its Markdown is never rendered). */
+.progress-log { display: grid; gap: var(--space-2); padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.progress-log h3 {
+  margin: 0;
+  color: var(--ink-3);
+  font: var(--label-weight) var(--label-size)/1.4 var(--font-label);
+  font-variant-caps: var(--label-caps);
+  letter-spacing: var(--label-tracking);
+  text-transform: var(--label-transform);
+}
+.progress-log-meta { margin: 0; color: var(--ink-2); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.progress-log > .help { max-width: 80ch; margin: 0; overflow-wrap: anywhere; }
+.progress-log-text {
+  max-height: 24rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--ink);
+  background: var(--surface-sunken);
+  font: var(--text-sm)/1.6 var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+.progress-log-text:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+@media (max-width: 599px) {
+  .progress-log-text { max-height: 18rem; padding: 8px 10px; font-size: var(--text-xs); }
+}
+@media (forced-colors: active) {
+  .progress-log-text { border-color: CanvasText; }
+}
+
+/* The conversation sits in the now-card, after the recovery block (and a coordinator's progress log) and before the
+   box that asks: each summary or message in a sunken well, the author's words behind an accent rule. */
 .author-conversation { display: grid; gap: var(--space-2); padding-top: var(--space-3); border-top: 1px solid var(--line); }
 .author-conversation h3, .conversation-meta {
   margin: 0;

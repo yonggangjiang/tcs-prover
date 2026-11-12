@@ -330,6 +330,8 @@ class ConversationLaunchTests(PausedAuthorCase):
         self.assertEqual(argv[4:], [
             "--converse", "--author-model", self.app.state["authorModel"],
             "--author-effort", self.app.state["authorEffort"],
+            # The mode the job recorded (a new job's author coordinates): the summary prompt follows it.
+            "--author-mode", self.app.state["authorMode"],
             "--reasoning-effort", self.app.state["reasoningEffort"],
             "--reasoning-summary", self.app.state["reasoningSummary"], "--speed", self.app.state["speedMode"],
             "--thinking-hours", "0",

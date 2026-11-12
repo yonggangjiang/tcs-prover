@@ -171,7 +171,7 @@ assert.equal(roleLines('Independent critic')[0], 'gpt-6-astra · high · max 2 c
 delete state.criticCountRecorded;
 // A job from before the Author subagents setting: its critic ran its independent critics itself, and its author
 // is not described with the setting.
-assert.deepEqual(roleLines('Proof author'), ['gpt-6.1-sol · max · no subagents', "Source: Codex CLI · this computer's Codex login"]);
+assert.deepEqual(roleLines('Proof author'), ['gpt-6.1-sol · max · works alone', "Source: Codex CLI · this computer's Codex login"]);
 state.authorSubagentsRecorded = false;
 renderRunOverview();
 assert.equal(roleLines('Independent critic')[0], 'gpt-6-astra · high · 3 independent critics · max 2 consecutive rounds');

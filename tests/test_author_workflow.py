@@ -29,7 +29,8 @@ class AuthorWorkflowTests(unittest.TestCase):
         yield {'outcome': 'done', 'output': 'Complete candidate'}
 
     def execute(self, options=None):
-        options = options or {}
+        # The author alone (Author subagents 0); the coordinator (1 or more, the default) is tested below.
+        options = {'author_subagents': 0, **(options or {})}
         with patch.object(runtime, 'goal_session', side_effect=self.goal), patch.object(runtime, 'structured') as structured, \
                 patch.object(runtime.proof_handoff, 'file_handoff_supported', return_value=True), patch.object(runtime, 'emit'):
             result = runtime._execute(self.workflow, {'statement': 'Exact statement'}, options, self.workflow['prompts'])

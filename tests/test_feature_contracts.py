@@ -131,7 +131,9 @@ class ServerRunnerContractTests(limit_test.PausedAuthorCase):
         self.assertEqual(request, {"schemaVersion": 1, "id": self.item()["id"], "kind": "summary", "text": "",
                                    "notice": ""})
         call, = self.calls
-        self.assertEqual(call["instruction"], runner_test.SUMMARY_TEXT)
+        # A new job's author is a coordinator (Author subagents 3 by default): its own summary prompt.
+        self.assertEqual(self.app.state["authorMode"], "coordinator")
+        self.assertEqual(call["instruction"], runtime.builtin_workflow("author_critic")["prompts"]["coordinator_summary"])
         self.assertEqual((call["conversation_id"], call["label"], call["attempt"], call["rewind"]),
                          (self.item()["id"], "Progress summary requested", 1, None))
         options = call["options"]

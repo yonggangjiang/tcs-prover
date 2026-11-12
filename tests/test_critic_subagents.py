@@ -205,11 +205,13 @@ class DeclarationTests(unittest.TestCase):
         workflow = runtime.builtin_workflow("author_critic")
         node = workflow["nodes"]["author"]
         self.assertNotIn("features", node)
-        self.assertEqual(node["subagents"], {"option": "author_subagents", "default": 0, "minimum": 0})
+        # The default is 3 (the owner's request of 12 Nov): a new job's author coordinates 3 author subagents.
+        self.assertEqual(node["subagents"], {"option": "author_subagents", "default": 3, "minimum": 0})
         self.assertIn("subagents", node["lifecycle"])
         self.assertEqual(workflow["prompts"]["subagents"], AUTHOR_SUBAGENTS_PROMPT)
-        self.assertEqual(runtime.DEFAULT_AUTHOR_SUBAGENTS, 0)
-        self.assertEqual(runtime.node_features(node, {}), ([], 0))
+        self.assertEqual(runtime.DEFAULT_AUTHOR_SUBAGENTS, 3)
+        self.assertEqual(runtime.node_features(node, {}), (["multi_agent"], 3))
+        self.assertEqual(runtime.node_features(node, {"author_subagents": 0}), ([], 0))
         self.assertEqual(runtime.node_features(node, {"author_subagents": 4}), (["multi_agent"], 4))
         self.assertEqual(runtime.node_features(workflow["nodes"]["critic"], {"critic_count": 2}), (["multi_agent"], 2))
         # The convention critic, the reviewer and the writer never get subagents.
@@ -863,17 +865,18 @@ class AuthorSubagentsSettingTests(unittest.TestCase):
         return argv[argv.index("--author-subagents") + 1]
 
     def test_the_setting_has_its_range_default_and_validation(self):
-        self.assertEqual(server.PUBLIC_GRAPH["settings"]["author_subagents"], {"default": 0, "minimum": 0, "maximum": 10})
-        self.assertEqual(server.empty_state()["authorSubagents"], 0)
+        self.assertEqual(server.PUBLIC_GRAPH["settings"]["author_subagents"], {"default": 3, "minimum": 0, "maximum": 10})
+        self.assertEqual((server.empty_state()["authorSubagents"], server.empty_state()["authorMode"]),
+                         (3, "coordinator"))
         for value, message in ((-1, "Choose 0 to 10 author subagents"), (11, "Choose 0 to 10 author subagents"),
                                (1.5, "must be an integer"), ("two", "must be an integer"), (True, "must be an integer")):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
                 server.App._workflow_options(author_subagents=value, include_review=False)
         self.assertEqual(server.App._workflow_options(author_subagents="4", include_review=False)["authorSubagents"], 4)
-        # Without the author stage it is not used.
+        # Without the author stage it is not used, and there is no author to coordinate.
         options = server.App._workflow_options(author_subagents=99, workflow_stages={
             "review": False, "author": False, "critic": True, "writing": False})
-        self.assertEqual(options["authorSubagents"], 0)
+        self.assertEqual((options["authorSubagents"], options["authorMode"]), (3, "author"))
 
     def test_a_job_saves_it_passes_it_resumes_with_it_and_restores_it(self):
         app = server.App(runs=self.runs, load_latest=False)
@@ -920,18 +923,21 @@ class AuthorSubagentsRunnerTests(CriticCase):
         return launched[0]
 
     def test_without_subagents_the_author_gets_no_tool_and_no_sentence(self):
-        prompt, kwargs = self.run_author({})
+        prompt, kwargs = self.run_author({"author_subagents": 0})
         self.assertEqual(kwargs["features"], [])
         self.assertEqual(kwargs["settings"]["subagents"], 0)
         self.assertNotIn("independent subagents", prompt)
         self.assertNotIn("subagents", kwargs["prompts"])
+        self.assertNotIn("coordinator", kwargs)
 
     def test_with_subagents_the_author_gets_the_tool_its_limit_and_the_sentence(self):
-        prompt, kwargs = self.run_author({"author_subagents": 3})
+        # A job recorded as a single author with subagents (before the coordinator) keeps today's meaning.
+        prompt, kwargs = self.run_author({"author_subagents": 3, "author_mode": "author"})
         self.assertEqual(kwargs["features"], ["multi_agent"])
         self.assertEqual(kwargs["settings"]["subagents"], 3)
         self.assertTrue(prompt.endswith("\n\n" + AUTHOR_SUBAGENTS_PROMPT.format(author_subagents=3)))
         self.assertIn("Task", prompt)
+        self.assertNotIn("coordinator", kwargs)
 
 
 class RetiredPromptTests(unittest.TestCase):

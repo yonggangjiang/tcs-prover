@@ -55,9 +55,11 @@ class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.goal_calls = []
-        def goal(runtime, prompt, **kwargs):
+        def goal(runtime_module, prompt, **kwargs):
             self.goal_calls.append(prompt)
-            self.assertFalse(any(Path.cwd().iterdir()))
+            # The runner makes nothing in the author's folder but the coordinator's memory folder.
+            self.assertEqual([path.name for path in Path.cwd().iterdir()],
+                             [runtime.MEMORY_FOLDER] if kwargs.get('coordinator') else [])
             yield {'outcome': 'done', 'output': PROOF}
         patcher = patch.object(runtime, 'goal_session', side_effect=goal)
         patcher.start()

@@ -574,10 +574,14 @@ class HandoffTests(GraphCase):
         # The resumed author gets the critic's feedback as its first instruction and the reason apart
         # from it; both goal sessions send the reason after the feedback.
         _, launches, _ = self.resume_author(state, "PROOF_FILE: ../outside.md")
-        repair = runtime.render_template(runtime.builtin_workflow("author_critic")["prompts"]["repair"],
-                                         {"solution": "Critic candidate", "bugs": "Lemma 2 fails."})
-        self.assertEqual([(launch["initial_instruction"], launch["handoff_note"]) for launch in launches],
-                         [(repair, self.note(reason))])
+        # The resumed author is a coordinator (Author subagents 3 by default): the feedback is in its words.
+        # It ends with the coordinator's whole first prompt (ORIGINAL COORDINATOR PROMPT).
+        head = runtime.render_template(runtime.builtin_workflow("author_critic")["prompts"]["coordinator_repair"],
+                                       {"solution": "Critic candidate", "bugs": "Lemma 2 fails.", "original_prompt": ""})
+        launch, = launches
+        self.assertEqual(launch["handoff_note"], self.note(reason))
+        self.assertTrue(launch["initial_instruction"].startswith(head))
+        self.assertTrue(launch["initial_instruction"][len(head):].startswith("You are the coordinator of a team"))
 
     def test_a_proof_too_large_for_the_critic_is_retried_like_any_refused_handoff(self):
         proof = PROOF * 10

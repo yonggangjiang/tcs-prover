@@ -64,6 +64,12 @@ it opens, so connections added or removed in another tab count.
 - A saved web search cutoff loads as saved; whether it can run (Statement review
   off, Codex CLI models, a time in the past) is checked when you start, as for
   any job.
+- Saved settings keep the number of author subagents they were saved with,
+  also settings saved before the author coordinator existed: 0 starts one
+  author working alone, 1 or more an
+  [author coordinator](workflow.md#the-author-coordinator) with that many author
+  subagents. The built-in settings use 3, and so do saved settings that hold no
+  number (saved before the setting existed).
 - Terminal runs never read saved settings.
 
 ## Where they are kept

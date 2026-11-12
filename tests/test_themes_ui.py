@@ -477,10 +477,11 @@ class AppearanceStylesheetTests(unittest.TestCase):
         self.assertIn("var(--field-line)", self.rule(".segment input:checked + span")["box-shadow"])
 
     def test_conversation_and_related_works_use_theme_tokens_only(self):
-        # The author conversation and the related-works lists are drawn from the theme tokens alone, so
-        # each of the four themes styles them in light and dark (forced colours use system colours).
-        new = (".author-conversation", ".conversation-", ".steer-buttons", ".limit-hint", ".related-work",
-               ".related-note", ".batch-related")
+        # The author conversation, the author coordinator's progress log and the related-works lists are drawn
+        # from the theme tokens alone, so each of the four themes styles them in light and dark (forced colours
+        # use system colours).
+        new = (".author-conversation", ".conversation-", ".progress-log", ".steer-buttons", ".limit-hint",
+               ".related-work", ".related-note", ".batch-related")
         checked = 0
         for selector, declarations in self.blocks:
             if not any(name in selector for name in new):

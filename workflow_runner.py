@@ -87,6 +87,15 @@ _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 # controller refused its last submission.
 _GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "chat", "related_works", "handoff_refused",
                             "subagents")
+# The lifecycle prompts a goal node's coordinator binding may replace (the author coordinator, see author_mode()),
+# "checkin", its hourly time check, and "report", the answer to a reply that is not a hand-in (the continuation
+# when absent), which only a coordinator binding has. The chat framing (rendered by the
+# controller) and the subagents note of an author that works alone stay the author's.
+_COORDINATOR_LIFECYCLE = (*_GOAL_LIFECYCLE, "reopen", "summary", "conversation", "related_works", "handoff_refused",
+                          "checkin", "report")
+# How the proof author works (--author-mode): "coordinator" runs the node's coordinator binding, "author" the author
+# alone; "auto", the default, runs the coordinator when Author subagents is 1 or more.
+AUTHOR_MODES = ("auto", "coordinator", "author")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -211,6 +220,28 @@ AUTHOR_RESUME_REFUSALS = 3
 # A live instruction the CLI did not accept is offered again at the next
 # turn, or after this long.
 STEER_RETRY_SECONDS = 60
+
+# The author coordinator (see author_mode()). The runner creates MEMORY_FOLDER
+# in its working directory, where its prompt asks it to keep the team's memory
+# and the dated log PROGRESS_LOG, which the job page shows. It gets a time
+# check (its "checkin" prompt, a live instruction) every
+# COORDINATOR_CHECKIN_SECONDS of the job's working time, on the clock of the
+# time limit (see workflow_elapsed()). A final reply that names no proof file
+# is not handed to the critic: its first COORDINATOR_REPORT_CHARS characters
+# are shown as a "Coordinator report" status (the whole reply stays in the
+# activity log as the coordinator's message), and the coordinator continues.
+MEMORY_FOLDER = "memory"
+PROGRESS_LOG = "progress.md"
+COORDINATOR_CHECKIN_SECONDS = 3600
+COORDINATOR_REPORT_CHARS = 1600
+COORDINATOR_CHECKIN_LABEL = "Coordinator time check"
+COORDINATOR_REPORT_LABEL = "Coordinator report"
+# The status records of the author's own subagents (see AuthorSubagents), by
+# state; a started record names the first line of the subagent's assignment,
+# at most AUTHOR_SUBAGENT_TASK_CHARS characters of it.
+AUTHOR_SUBAGENT_LABELS = {"started": "Author subagent started", "finished": "Author subagent finished",
+                          "failed": "Author subagent failed"}
+AUTHOR_SUBAGENT_TASK_CHARS = 200
 
 # Provider messages for a conversation that no longer fits the model's context.
 CONTEXT_WINDOW_MARKERS = (
@@ -752,8 +783,10 @@ def context_cache_arguments():
     ]
 
 
-# The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces.
-PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "convention": "convention_critic", "final": "final"}
+# The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces (the
+# coordinator's is the first prompt of the author coordinator, see author_mode()).
+PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "convention": "convention_critic", "final": "final",
+                       "coordinator": "coordinator"}
 
 
 def prompt_file(path, default):
@@ -2040,6 +2073,22 @@ def output_schema_arguments(model, schema_path):
 # same number.
 SUBAGENT_HINT = ("Multi-agent delegation is allowed for this task: the root agent may start up to {count} independent "
                  "subagent{s} at a time without asking the user. Subagents do not start subagents of their own.")
+# The delegation hint of the author coordinator's Codex app-server (author_limits()), in place of SUBAGENT_HINT;
+# the critic keeps SUBAGENT_HINT.
+COORDINATOR_HINT = ("Multi-agent delegation is the purpose of this task: the root agent is a coordinator that hands "
+                    "the problem-solving to up to {count} subagent{s} at a time without asking the user, and waiting "
+                    "for them is part of its normal work. Start each subagent fresh, without the root's conversation "
+                    "history (set spawn_agent's fork_turns to \"none\", or fork_context to false, where the option "
+                    "exists), with a self-contained assignment; wait for subagents with waits of up to 30 minutes; "
+                    "where close_agent exists, close each finished subagent after recording its outcome. Subagents do "
+                    "not start subagents of their own.")
+# How long a wait for its subagents lasts when the coordinator names no timeout (Codex's own default is 30 s):
+# features.multi_agent_v2.default_wait_timeout_ms, which models of multi-agent version 2 read (Codex 0.160 has the
+# key; version 1 has no such setting). A web-cutoff run does not set it: its audit compares the app-server's
+# agent settings with Codex's effective settings (config/read) exactly, and whether Codex reports this key there
+# has not been verified, so a web-cutoff coordinator waits Codex's default unless it names a longer wait, as
+# its hint (COORDINATOR_HINT) asks.
+COORDINATOR_WAIT_MS = 30 * 60 * 1000
 
 
 # Codex 0.160's multi-agent version of each model (`codex debug models`, checked with its binary against a local
@@ -2073,34 +2122,62 @@ def note_unobservable_subagents(stage, model, count, policy):
               "and whether one of their model calls failed, is not known, so the critic's answer is used as given.")
 
 
-def note_no_subagent_tool(stage, model, count):
-    """Say that ``model`` works without the ``count`` subagents its setting allows, when Codex gives it none."""
+def note_no_subagent_tool(stage, model, count, coordinator=False, bare=False):
+    """Say that ``model`` works without the ``count`` subagents its setting allows, when Codex gives it none.
 
-    if not count or multi_agent_version(model) != 0:
+    With ``coordinator`` the author was to coordinate them and works alone instead (see _execute): the status
+    then says so as the author mode the run has (authorModeEffective "author", with the model's label), which
+    the server shows in place of the job's recorded coordinator mode until a later launch coordinates (see
+    goal_session()). With ``bare`` the cause is Claude Code's --bare mode, which offers no subagent tool
+    (claude_cli.goal_session()).
+    """
+
+    if not count or (not bare and multi_agent_version(model) != 0):
         return
     s = "" if count == 1 else "s"
     who = (f"the critic reviews alone, without its {count} independent critic{s}" if stage == "critic"
+           else f"the author works alone instead of coordinating up to {count} author subagent{s}"
+           if stage == "solve" and coordinator
            else f"the author works without the {count} subagent{s} that Author subagents allows" if stage == "solve"
            else f"this step works without the {count} subagent{s} it may start")
+    label = providers.model_label(chosen_model(model))
+    cause = (f"Claude Code runs {label} in --bare mode here, which offers no subagent tool" if bare
+             else f"{label} gets no subagent tool from Codex")
     emit("status", stage, label="No subagents with this model", noSubagentTool=True, subagentCount=count,
-         text=f"{providers.model_label(chosen_model(model))} gets no subagent tool from Codex, so {who}. "
-              "Choose another model to have them.")
+         **({"authorModeEffective": "author", "modelLabel": label} if coordinator and stage == "solve" else {}),
+         text=f"{cause}, so {who}." + ("" if bare else " Choose another model to have them."))
 
 
-def subagent_limits(features, subagents):
+def subagent_limits(features, subagents, coordinator=None, long_waits=True):
     """The Codex settings that bound one process's subagents (retrieval_runtime.agent_limits()).
 
     A process without the multi_agent feature gets none: Codex 0.160 still lists its collaboration tools to
     models of multi-agent version 2 with multi_agent off, so a session limit of one thread (the root) refuses
     every spawn. With multi_agent, ``subagents`` (1 or more) is the most that may run at once, which the hint
-    states too; None keeps Codex's own limits (a node that declares no number).
+    states too; None keeps Codex's own limits (a node that declares no number). ``coordinator``, the model of
+    the author coordinator, gives COORDINATOR_HINT instead of SUBAGENT_HINT and, for a model of multi-agent
+    version 2 and with ``long_waits`` (not in a web-cutoff run), COORDINATOR_WAIT_MS as its default wait.
     """
     if "multi_agent" not in features:
         return retrieval_runtime.agent_limits(0)
     if subagents is None:
         return {}
-    return retrieval_runtime.agent_limits(subagents, SUBAGENT_HINT.format(count=subagents,
-                                                                           s="" if subagents == 1 else "s"))
+    s = "" if subagents == 1 else "s"
+    if coordinator is not None:
+        return retrieval_runtime.agent_limits(
+            subagents, COORDINATOR_HINT.format(count=subagents, s=s),
+            wait_ms=COORDINATOR_WAIT_MS if long_waits and multi_agent_version(coordinator) == 2 else None)
+    return retrieval_runtime.agent_limits(subagents, SUBAGENT_HINT.format(count=subagents, s=s))
+
+
+def author_limits(features, settings):
+    """subagent_limits() of the author's Codex app-server: a coordinator (``settings["coordinator"]``) gets its own
+    hint and, unless the run is a web-cutoff run (``settings["web_cutoff"]``, see COORDINATOR_WAIT_MS), its
+    default wait; every other author, and every other role, the shared ones."""
+
+    return subagent_limits(features, settings.get("subagents"),
+                           settings["model"] if settings.get("coordinator") else None,
+                           long_waits=not settings.get("web_cutoff"))
 
 
 def structured_tool_arguments(stage, features=(), policy=None, subagents=None):
@@ -2235,6 +2312,205 @@ class SubagentProgress:
         if not self.waited:
             self.waited = True
             self._emit(SUBAGENTS_WAITING_LABEL, waiting=True)
+
+
+def _assignment_line(text):
+    """The first line of a subagent's assignment, at most AUTHOR_SUBAGENT_TASK_CHARS characters of it."""
+
+    line = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+    return line if len(line) <= AUTHOR_SUBAGENT_TASK_CHARS else line[:AUTHOR_SUBAGENT_TASK_CHARS - 1].rstrip() + "…"
+
+
+# Codex's states of a subagent in a collabAgentToolCall item's agentsStates (lowercased, without "_"): the ones
+# that end it, and why one that failed ended (an errored one names its own reason); and the ones of a subagent
+# at work.
+_SUBAGENT_ENDED = {"completed": None, "shutdown": None, "errored": "", "interrupted": "It was interrupted.",
+                   "notfound": "Codex no longer has it."}
+_SUBAGENT_WORKING = {"running", "pendinginit"}
+# The collaboration tools that give a subagent the coordinator started earlier new work (Codex 0.160: send_input of
+# multi-agent version 1, followup_task of version 2), so that one that had ended runs again, and the one that only
+# reopens one it closed (resume_agent, version 1), which works again once it is given work.
+_SUBAGENT_REASSIGNED = {"sendinput", "followuptask"}
+_SUBAGENT_REOPENED = {"resumeagent"}
+
+
+class AuthorSubagents:
+    """The status records of the author's own subagents (AUTHOR_SUBAGENT_LABELS), one session's.
+
+    Every record has authorSubagent: true, subagentId, subagentTask (the first line of the subagent's
+    assignment, see _assignment_line(); "" when unknown), subagentState ("started", "finished" or "failed"),
+    and subagentsRunning, how many of its subagents run after it, while the session saw each of them start; a
+    failed one's text says why, when that is known. A record belongs to one run of a subagent: from its start
+    (a spawn, or new work after it ended) to its end. The transports report what their event streams show:
+    - Codex app-server: the root's collabAgentToolCall items (codex_item()): a completed spawnAgent names each
+      new subagent thread in receiverThreadIds; a sendInput or followupTask that gives one that ended new
+      work, or a running state of one that ended, starts it again (a resumeAgent only reopens it); the
+      agentsStates of later items say when one completed or errored (those of an item that gives a subagent
+      new work or reopens it are neither its start nor its end); one the coordinator closed has ended;
+    - Codex, the root's saved session (CodexRollout, source "session"), which alone shows the subagents of
+      multi-agent version 2: each one's start (named by its task, Codex's agent path such as /root/lemma2,
+      since the session does not hold the assignment) and end;
+    - Claude Code: each Agent (or Task) tool call starts one subagent, and its tool result ends it.
+    Two sources may report the same runs, each in its own order and at its own time: each run is recorded
+    once, when the first source reports it (a source's n-th start of a subagent is its n-th run; an end ends
+    the run that source saw start last, or, from a source that saw none start, the latest one). A subagent
+    that ends without having been seen to start (an earlier attempt started it) is recorded too; from then on
+    the session's count is not known, and its records have none. stopped() ends every run still going when
+    the session's process stops. The saved session is read in a thread of its own: every method takes the
+    lock.
+    """
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.running, self.ended, self.counted = {}, set(), True
+        # The runs recorded of each subagent, and for each (source, subagent) the runs that source saw start
+        # and whether it saw the latest of them end.
+        self.runs, self.seen = {}, {}
+        self.lock = threading.RLock()
+
+    def _record(self, state, identity, task, text):
+        count = {"subagentsRunning": len(self.running)} if self.counted else {}
+        self.emit("status", label=AUTHOR_SUBAGENT_LABELS[state], authorSubagent=True, subagentId=identity,
+                  subagentTask=task, subagentState=state, **count, text=text)
+
+    def started(self, identity, assignment="", source="events", again=False):
+        """Subagent ``identity`` started a run, as ``source`` reports it; ``assignment`` is its task when known.
+
+        ``again``: new work for a subagent that ended, also when this source did not see that end.
+        """
+
+        identity = str(identity)
+        if not identity:
+            return
+        with self.lock:
+            runs, ended = self.seen.get((source, identity), (0, True))
+            if not ended and not again:
+                return  # This source reported this run's start already.
+            self.seen[(source, identity)] = (runs + 1, False)
+            if runs + 1 <= self.runs.get(identity, 0):
+                return  # The other source recorded this run already.
+            self.runs[identity] = runs + 1
+            self.ended.discard(identity)
+            task = self.running[identity] = _assignment_line(assignment)
+            self._record("started", identity, task, task or "The subagent's assignment was not reported.")
+
+    def finished(self, identity, failure=None, source="events"):
+        """One subagent ended its run, as ``source`` reports it; ``failure`` (text, "" when the reason is unknown)
+        says that it failed."""
+
+        identity = str(identity)
+        if not identity:
+            return
+        with self.lock:
+            runs, ended = self.seen.get((source, identity), (0, False))
+            if ended:
+                return  # This source reported this run's end already.
+            self.seen[(source, identity)] = (runs, True)
+            if (runs and runs < self.runs.get(identity, 0)) or identity in self.ended:
+                return  # An earlier run's end, or one the other source recorded already.
+            if failure is None:
+                self._end(identity, "finished", None)
+            else:
+                # A provider failure in plain words, else the first line of the subagent's own message.
+                first = next((line.strip() for line in str(failure).splitlines() if line.strip()), "")
+                self._end(identity, "failed",
+                          _plain_failure(failure) or _clipped(first, 300) or "The reason was not reported.")
+
+    def _end(self, identity, state, text):
+        self.ended.add(identity)
+        if identity not in self.running:
+            self.counted = False
+        task = self.running.pop(identity, "")
+        self._record(state, identity, task, text or task or "The subagent's assignment was not reported.")
+
+    def stopped(self, reason):
+        """The session's process stopped, and with it every subagent still running: each is recorded as
+        failed, with ``reason``."""
+
+        with self.lock:
+            for identity in list(self.running):
+                self._end(identity, "failed", reason)
+
+    def codex_item(self, item):
+        """Follow one completed collabAgentToolCall item of the root thread (Codex app-server)."""
+
+        tool = re.sub(r"[_\s]", "", str(item.get("tool") or "")).lower()
+        receivers = item.get("receiverThreadIds")
+        receivers = [str(value) for value in receivers if value] if isinstance(receivers, list) else []
+        done, prompt = item.get("status") != "failed", item.get("prompt") or ""
+        with self.lock:
+            # The subagents this item gives new work or reopens: their states in it are neither a start nor an end.
+            given = set(receivers) if done and tool in _SUBAGENT_REASSIGNED | _SUBAGENT_REOPENED else set()
+            if done and tool == "spawnagent":
+                for identity in receivers:
+                    self.started(identity, prompt)
+            if done and tool in _SUBAGENT_REASSIGNED:
+                for identity in receivers:
+                    if identity in self.ended:
+                        self.started(identity, prompt, again=True)
+            states = item.get("agentsStates") if isinstance(item.get("agentsStates"), dict) else {}
+            for identity, value in states.items():
+                identity = str(identity)
+                value = value if isinstance(value, dict) else {}
+                status = re.sub(r"[_\s]", "", str(value.get("status") or "")).lower()
+                if identity in given:
+                    continue
+                if status in _SUBAGENT_WORKING:
+                    # At work: a run of its own when this stream saw its last run end.
+                    self.started(identity, prompt if identity in receivers else "")
+                elif status in _SUBAGENT_ENDED and (identity in self.running or status in {"completed", "errored"}):
+                    reason = _SUBAGENT_ENDED[status]
+                    self.finished(identity, None if reason is None
+                                  else str(value.get("message") or "") if status == "errored" else reason)
+            if done and tool == "closeagent":
+                for identity in receivers:
+                    if identity in self.running:
+                        self.finished(identity)
+
+
+class _SessionSubagents:
+    """What CodexRollout reads in the author's saved session about its subagents, for AuthorSubagents (source
+    "session"). A start names the subagent by its task (Codex's agent path), which the session gives."""
+
+    def __init__(self, subagents):
+        self.subagents, self.rollout = subagents, None
+
+    def subagent(self, identity, status, message=""):
+        if status == "started":
+            threads = dict(self.rollout.threads) if self.rollout is not None else {}
+            task = next((path for path, thread in threads.items() if thread == identity), "")
+            self.subagents.started(identity, task, source="session")
+        elif status in ("completed", "failed"):
+            self.subagents.finished(identity, None if status == "completed" else str(message or ""),
+                                    source="session")
+
+
+class TimeChecks:
+    """When the author coordinator gets its next time check (its "checkin" prompt).
+
+    A check is due at every whole ``interval`` (COORDINATOR_CHECKIN_SECONDS) of the job's working time
+    (``elapsed()``, workflow_elapsed()), the first at 1 h. A new runner starts after the working time it
+    starts with, ``start`` (its --elapsed-seconds; without it, the working time now): a job resumed at 5 h
+    20 min gets its next check at 6 h, also when its runner starts at the critic and the author's session
+    begins only after the review, so an hour that passed during the review is not skipped. An attempt that
+    continues an earlier one of the same runner after a model-call failure goes on after that attempt's last
+    check (``last``, a count of intervals, kept in its retry details). Checks that came due while none could
+    be sent are one check, sent with the time of its sending.
+    """
+
+    def __init__(self, elapsed, interval, last=None, start=None):
+        self.elapsed, self.interval = elapsed, interval
+        start = start if isinstance(start, (int, float)) and not isinstance(start, bool) else elapsed()
+        self.last = last if type(last) is int else int(start // interval)
+
+    def due(self):
+        """The working time in seconds when a check is due now, else None."""
+
+        now = self.elapsed()
+        return now if now >= (self.last + 1) * self.interval else None
+
+    def sent(self, elapsed):
+        self.last = max(self.last + 1, int(elapsed // self.interval))
 
 
 class StructuredConversation:
@@ -2424,12 +2700,21 @@ class CodexRollout:
 
     read() reports each new complete record to ``conversation.subagent()``;
     follow() reads every ROLLOUT_POLL_SECONDS in a thread until stop(),
-    which reads once more and says whether the file was found.
+    which reads once more and says whether the file was found. With ``path``
+    (the author's thread, whose app-server names its file) that file is
+    read, from where it ends now: a thread that is reopened keeps the records
+    of its earlier attempts there.
     """
 
-    def __init__(self, home, session_id, conversation):
+    def __init__(self, home, session_id, conversation, path=None):
         self.home, self.session_id, self.conversation = Path(home), session_id, conversation
         self.path, self.offset, self.partial = None, 0, b""
+        if path:
+            self.path = Path(path)
+            try:
+                self.offset = os.stat(self.path).st_size
+            except OSError:
+                pass  # Not written yet: all of it is new.
         self.threads = {}  # agent path -> thread id
         self._stop = threading.Event()
         self._thread = None
@@ -2986,8 +3271,9 @@ def run_structured_attempt(
     and, when the conversation says so, this attempt forks its base (see
     structured()). With an `edit_file` the attempt runs in the writable
     workspace that structured() prepared (see _edit_workspace). With the
-    multi_agent feature, ``subagents`` is the most subagents Codex lets the
-    call run at once (see subagent_limits()); Claude has no such setting.
+    multi_agent feature, ``subagents`` is the most subagents the CLI lets the
+    call run at once (Codex: subagent_limits(); Claude Code: its subagent
+    settings, see claude_cli.SUBAGENT_ENVIRONMENT).
     """
 
     policy = retrieval_policy(features=features)
@@ -3012,6 +3298,7 @@ def run_structured_attempt(
             environment=environment(model), runtime=sys.modules[__name__],
             **({"conversation": conversation} if conversation is not None else {}),
             **({"deadline": deadline} if deadline is not None else {}),
+            **({"subagents": subagents} if subagents and "multi_agent" in features else {}),
         )
 
     if input_files is not None or edit_file is not None:
@@ -3897,14 +4184,14 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
     web-cutoff author gets the private temp folder of its verified
     environment instead (retrieval_runtime.preflight()); the caller removes
     it when the process ends (retrieval_runtime.remove_private_temp()). Its
-    subagent limits (subagent_limits(), from ``features`` and
-    settings["subagents"]) are session flags, which a web-cutoff run's
-    checks verify exactly. ``stage`` ("solve", or "conversation" for a reply
+    subagent limits (author_limits(), from ``features``,
+    settings["subagents"] and settings["coordinator"]) are session flags,
+    which a web-cutoff run's checks verify exactly. ``stage`` ("solve", or "conversation" for a reply
     of the paused author) words the message of a Codex that is not installed
     (missing_cli()).
     """
 
-    limits = subagent_limits(features, settings.get("subagents"))
+    limits = author_limits(features, settings)
     child_environment = retrieval_environment(policy, role, model, inherited=runtime.environment(model),
                                               agent_limits=limits)
     try:
@@ -3987,10 +4274,10 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     run (live_network()). The user's MCP servers, plugins and apps, read
     from Codex's effective settings, and view_image are turned off; settings
     that cannot be read fail the attempt, which is retried. The thread has
-    the subagent limits of its app-server (subagent_limits()).
+    the subagent limits of its app-server (author_limits()).
     """
 
-    limits = subagent_limits(features, settings.get("subagents"))
+    limits = author_limits(features, settings)
 
     thread_options = {
         "model": getattr(runtime, "wire_model", lambda value: value)(model),
@@ -4061,6 +4348,19 @@ def asks_user(item):
     return isinstance(item, dict) and (item.get("delivery") == "async" or bool(item.get("questions")))
 
 
+def names_proof_file(reply):
+    """Whether an author's final reply names a proof file, as proof_handoff.extract_proof_reference() reads it.
+
+    A pointer it cannot use (two different files, a mixed format) counts too: the critic step refuses that
+    submission and tells the author why (see _prepare_node_files).
+    """
+
+    try:
+        return proof_handoff.extract_proof_reference(reply) is not None
+    except proof_handoff.ProofHandoffError:
+        return True
+
+
 def _root_message(message, thread):
     """Whether an app-server message belongs to the root thread `thread`, not to a subagent's thread."""
 
@@ -4081,7 +4381,7 @@ def _root_message(message, thread):
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction="", handoff_note=""):
+                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
     Yield its final answer only after goal completion; accept follow-up feedback
@@ -4115,8 +4415,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     A watcher keeps the session live: a request Codex leaves unanswered for
     RPC_RESPONSE_SECONDS, or a running turn with no event for
     AUTHOR_INACTIVITY_SECONDS followed by an unanswered check, ends the
-    attempt as a failed model call; a turn that ends with the goal still open
-    and no new turn within AUTHOR_CONTINUE_SECONDS is continued.
+    attempt as a failed model call (a root that waits for its subagents
+    while Codex answers the check goes on); a turn that ends with the goal
+    still open and no new turn within AUTHOR_CONTINUE_SECONDS is continued.
+    The root's collabAgentToolCall items become the status records of its
+    subagents (AuthorSubagents).
+
+    With ``coordinator`` the thread is the author coordinator (author_mode()),
+    which its "Goal started" or "Goal resumed" status says (authorModeEffective
+    "coordinator"): its app-server gets the coordinator's hint and, outside a web-cutoff run,
+    its default wait (author_limits()); it gets the "checkin" prompt as a live instruction at
+    each time check (TimeChecks), while a root turn runs and no pause or stop
+    is under way (one that comes due between turns goes with the next turn;
+    one Codex refuses is sent again in the next turn), recorded as a
+    "Coordinator time check" status; and where proof files can be read
+    (proof_handoff.file_handoff_supported()) a final reply that names no
+    proof file (names_proof_file()) is not handed on: it is recorded as a
+    "Coordinator report" status, and the continuation prompt follows. An
+    unexpected failure of the time checks ends them, with a diagnostic that
+    says so; it never stops the watcher.
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     policy = retrieval_policy(directory, features)
@@ -4138,6 +4455,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     settings = dict(settings)
     model = settings["model"]
+    settings["coordinator"] = bool(coordinator)
+    settings["web_cutoff"] = bool(policy)  # Its coordinator keeps Codex's default wait (COORDINATOR_WAIT_MS).
     settings["effort"] = runtime.effective_effort(model, settings["effort"])
     settings["speed"] = runtime.effective_speed(model, settings["speed"])
     summary = settings["summary"] = runtime.reasoning_summary(model, settings["summary"])
@@ -4182,6 +4501,19 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     stalled = {"reason": None}
     # Failures that a retry of the same resume cannot fix.
     final = {"reason": None, "refusal": None}
+    # The status records of the root's own subagents, the reader of its saved session (see AuthorSubagents),
+    # and why the subagents still running end with this attempt (its app-server stops, and they with it).
+    subagents, rollout = AuthorSubagents(emit), None
+    ending = {"reason": "It stopped when the author's Codex session ended."}
+    # The coordinator's time checks (TimeChecks), and the turn in which Codex did not take one: it is sent again
+    # in the next turn.
+    checks = (TimeChecks(lambda: getattr(runtime, "workflow_elapsed", workflow_elapsed)(options),
+                         getattr(runtime, "COORDINATOR_CHECKIN_SECONDS", COORDINATOR_CHECKIN_SECONDS),
+                         continued.get("checked"), options.get("elapsed_seconds"))
+              if coordinator and "checkin" in prompts else None)
+    check_refused = {"turn": None}
+    # Where proof files can be read, a final reply of the coordinator must name one to be handed on.
+    guarded = bool(coordinator) and proof_handoff.file_handoff_supported()
 
     def is_root(message):
         return _root_message(message, thread)
@@ -4226,8 +4558,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             return False
         return True
 
-    def steer(instruction, identity, compaction=False):
-        entry = (identity, instruction, compaction)
+    def steer(instruction, identity, kind="steer"):
+        """Send ``instruction`` into the running turn: a live instruction ("steer"), the re-anchor after a
+        compaction ("compaction") or a time check ("checkin", recorded by its caller)."""
+
+        entry = (identity, instruction, kind)
         sent = []
 
         def register(request):
@@ -4244,12 +4579,36 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             for request in sent:
                 pending_steers.pop(request, None)
             raise
-        if compaction:
+        if kind != "steer":
             state["steered"] = True
-        # The controller recognizes a restored instruction by its command id.
-        emit("request", label="Author context re-anchor after compaction" if compaction
-             else "Live author instruction sent", text=instruction, threadId=thread,
-             **({} if compaction else {"steerId": identity}))
+        if kind == "compaction":
+            emit("request", label="Author context re-anchor after compaction", text=instruction, threadId=thread)
+        elif kind == "steer":
+            # The controller recognizes a restored instruction by its command id.
+            emit("request", label="Live author instruction sent", text=instruction, threadId=thread,
+                 steerId=identity)
+
+    def send_check():
+        """Send the coordinator's time check into the running turn when one is due."""
+
+        elapsed = checks.due()
+        if elapsed is None:
+            return
+        turn, previous = state["turn"], checks.last
+        instruction = checkin_text(prompts["checkin"], elapsed,
+                                   controlled_author_hours(options.get("author_limit_file"),
+                                                           options.get("thinking_hours", DEFAULT_AUTHOR_HOURS)),
+                                   runtime.workflow_remaining(options))
+        checks.sent(elapsed)  # Before the request: Codex may refuse it at once (see the main loop).
+        try:
+            steer(instruction, (previous, turn), "checkin")
+        except (runtime.Error, OSError) as exc:
+            checks.last, check_refused["turn"] = previous, turn
+            emit("diagnostic", text=f"Could not send the time check ({exc}); it is sent again when the next turn "
+                                    "starts.", threadId=thread)
+            return
+        emit("status", label=COORDINATOR_CHECKIN_LABEL, elapsedSeconds=int(elapsed), text=instruction,
+             threadId=thread)
 
     def check(kind):
         probe["at"] = time.monotonic()  # Before sending: the answer may arrive at once.
@@ -4283,6 +4642,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         return None
 
     def watch():
+        nonlocal checks  # An unexpected failure of the time checks ends them (see below).
         pause_started = None
         interrupted_turn = None
         while not stop.wait(0.1):
@@ -4335,6 +4695,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 runtime.stop_process(process)
                 return
             if state["turn"]:
+                if checks is not None and not pausing.is_set() and state["turn"] != check_refused["turn"]:
+                    try:
+                        send_check()
+                    except Exception as exc:  # noqa: BLE001 - the watcher also pauses and ends the author.
+                        checks = None
+                        emit("diagnostic", text=f"The coordinator's time checks stopped: {exc}", threadId=thread)
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
                 if (command and not held_back(command[0])
                         and not any(item[0] == command[0] for item in list(pending_steers.values()))):
@@ -4349,7 +4715,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                      idle_since=None)
         if policy:
             retrieval_runtime.verify_rpc(rpc, policy, retrieval_role, child_environment, allow_runtime_overrides=True,
-                                         agent_limits=subagent_limits(features, settings.get("subagents")))
+                                         agent_limits=author_limits(features, settings))
         if pause_file and Path(pause_file).is_file():
             pausing.set()
             raise runtime.Error("Pause requested.")
@@ -4406,7 +4772,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         _initialize_author_rpc(runtime, rpc, policy=policy, role=retrieval_role, child_environment=child_environment,
-                               api_model=api_model, agent_limits=subagent_limits(features, settings.get("subagents")))
+                               api_model=api_model, agent_limits=author_limits(features, settings))
         thread_options = _author_thread_options(
             runtime, rpc, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
             summary=summary, features=features, classic=classic, emit=emit, environment=child_environment)
@@ -4450,6 +4816,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                 "thread ID; the next attempt asks again.")
         if resumed and thread != options["goal_thread_id"]:
             raise SafetyStop("Codex returned a different thread ID; refusing to continue a replacement conversation.")
+        saved = (result.get("thread") or {}).get("path") if isinstance(result, dict) else None
+        if "multi_agent" in features and isinstance(saved, str) and saved:
+            # The thread's saved session (Codex 0.160 names its file), which alone shows the subagents of
+            # multi-agent version 2: read from its end on, beside the root's collabAgentToolCall items.
+            reader = _SessionSubagents(subagents)
+            rollout = reader.rollout = CodexRollout(codex_home_folder(child_environment), thread, reader, path=saved)
+            rollout.follow()
         rewind = continued.get("rewind") if resumed and isinstance(continued.get("rewind"), dict) else {}
         if isinstance(rewind.get("turn"), str) and rewind["turn"]:
             # The interrupted turn failed before the model produced anything:
@@ -4467,8 +4840,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                      threadId=thread)
         saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed else {}
         goal = {"threadId": thread, "objective": saved_goal.get("objective") or render("goal")}
+        # A coordinator says so with each start: the run's author mode (see note_no_subagent_tool()).
         emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
-             text=f"Thread {thread}")
+             text=f"Thread {thread}", **({"authorModeEffective": "coordinator"} if coordinator else {}))
         if replaced:
             emit("status", label="Conversation replaced", threadId=thread, text=_replacement_notice(replaced))
             instruction = replacement_instruction()
@@ -4499,16 +4873,21 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 continue
             request = message.get("id")
             if request in pending_steers and "method" not in message:
-                identity, instruction, compaction = pending_steers.pop(request)
+                identity, instruction, kind = pending_steers.pop(request)
                 if "error" in message:
                     reason = _provider_message(message["error"]) or "no reason given"
-                    if compaction:
+                    if kind == "compaction":
                         pending_compaction = instruction
                         emit("diagnostic", text=f"Codex did not accept the context re-anchor ({reason}); it is sent "
                                                 "again when the next turn starts.")
+                    elif kind == "checkin":
+                        # Due again, in the next turn.
+                        checks.last, check_refused["turn"] = min(checks.last, identity[0]), identity[1]
+                        emit("diagnostic", text=f"Codex did not accept the time check ({reason}); it is sent again "
+                                                "when the next turn starts.", threadId=thread)
                     else:
                         hold(identity, f"Codex did not accept the live instruction ({reason})")
-                elif not compaction:
+                elif kind == "steer":
                     state["steer"] = identity
                     state["steered"] = True
                     emit("status", label="Author instruction accepted", authorSteerDelivered=identity,
@@ -4518,6 +4897,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 item = params.get("item") if isinstance(params.get("item"), dict) else {}
                 if item.get("type") not in {None, "userMessage", "user_message"}:
                     state["output"] = True  # The model worked in this turn.
+                if method == "item/completed" and item.get("type") in {"collabAgentToolCall", "collab_agent_tool_call"}:
+                    subagents.codex_item(item)
             if method == "turn/started":
                 running, answers = True, []
                 state["turn"], state["idle_since"] = turn.get("id"), None
@@ -4530,7 +4911,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         state.update(output=False, steered=False)
                     state["turn_id"] = state["turn"]
                 if pending_compaction and state["turn"] and not pausing.is_set():
-                    steer(pending_compaction, "retry", True)
+                    steer(pending_compaction, "retry", "compaction")
                     pending_compaction = None
             elif method == "item/completed":
                 item = params.get("item") or {}
@@ -4542,7 +4923,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         state["turn"] = params.get("turnId") or state["turn"]
                         pending_compaction = render("compaction")
                         if state["turn"]:
-                            steer(pending_compaction, key, True)
+                            steer(pending_compaction, key, "compaction")
                             pending_compaction = None
             elif method == "thread/goal/updated":
                 status = (params.get("goal") or {}).get("status")
@@ -4578,7 +4959,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 raise runtime.Error("Author paused at the current turn boundary.")
             if status in {"usageLimited", "budgetLimited"}:
                 raise runtime.Error(f"Author stopped: {status}.")
-            if not running and status == "complete" and answers:
+            if not running and status == "complete" and answers and guarded and not names_proof_file(answers[-1]):
+                # The coordinator's reply names no proof file: a report on its work, never a submission.
+                emit("status", label=COORDINATOR_REPORT_LABEL, threadId=thread,
+                     text=_clipped(answers[-1], getattr(runtime, "COORDINATOR_REPORT_CHARS", COORDINATOR_REPORT_CHARS)))
+                start_turn(render("report" if "report" in prompts else "continuation"))
+                status, running, answers = None, True, []
+            elif not running and status == "complete" and answers:
                 state["active"] = False
                 solution = answers[-1]
                 emit("status", label="Goal complete", threadId=thread, text=f"Thread {thread}")
@@ -4613,6 +5000,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 emit("status", label="Author stopped", text=AUTHOR_STOPPED_TEXT, threadId=thread)
             else:
                 emit("status", label="Author paused", text=str(failure), threadId=thread)
+            ending["reason"] = ("It stopped when the author was stopped." if stopped
+                                else "It stopped when the author paused.")
         else:
             pausing.set()
             # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
@@ -4635,8 +5024,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if limited or final["reason"] or safety or not retryable_failure(failure):
                 emit("status", label="Author stopped for safety" if safety and not limited else "Author paused",
                      text=pause_reason, threadId=thread)
+                if limited:
+                    ending["reason"] = "It stopped at the time limit."
             else:
                 # A model-call failure: the controller resumes this thread after a wait.
+                ending["reason"] = "It stopped when Codex was restarted after a model-call failure."
                 reverted = (state["delivered"] and not state["output"] and not state["steered"]
                             and state["turn_id"] and state["turn_id"] == state["instruction_turn"])
                 final["retry"] = {"thread": thread, "stage": stage, "values": dict(values),
@@ -4644,7 +5036,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "output": state["output"], "rewound": state["rewound"],
                                   "rewind": {"turn": state["turn_id"]} if reverted else None,
                                   "steer": state["steer"], "pending_compaction": pending_compaction,
-                                  "refusal": final["refusal"], "classic_shell": classic or (tools and not policy)}
+                                  "refusal": final["refusal"], "classic_shell": classic or (tools and not policy),
+                                  "checked": checks.last if checks is not None else None}
                 if thread and _context_window_failure(failure):
                     # The same conversation would fail again: continue in a new one.
                     final["retry"].update(
@@ -4664,6 +5057,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             cleanup.join(timeout=1)
         if process:
             runtime.stop_process(process)
+            if rollout is not None:
+                rollout.stop()  # The rest of the saved session.
+            # The subagents ran in the app-server: the activity log says that those still running stopped.
+            subagents.stopped(ending["reason"])
         # A web-cutoff author's private temp folder ends with its app-server.
         retrieval_runtime.remove_private_temp(policy, child_environment)
     if pausing.is_set():
@@ -5753,7 +6150,7 @@ def load_workflow(path):
               "workflow_stage", "skip"}
     specific = {
         "structured": {"instructions", "inputs", "schema", "features", "require", "error", "subagents", "attempts", "provider_options", "request_label", "activity_label", "normalize", "proof_handoff", "edit"},
-        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features", "subagents"},
+        "goal": {"task", "marker", "lifecycle", "resume", "stages", "recovery", "features", "subagents", "coordinator"},
         "command": {"command", "require", "error"},
     }
     for name, node in nodes.items():
@@ -5853,6 +6250,21 @@ def load_workflow(path):
                 isinstance(ref, str) and ref in prompts for ref in lifecycle.values()
             ):
                 raise ValueError(f"Goal node {name} must bind its lifecycle prompts.")
+            if "coordinator" in node:
+                # The author coordinator (see author_mode()): its first prompt, and the lifecycle prompts that
+                # replace the author's; it runs with the node's subagents only.
+                binding = node["coordinator"]
+                bound = binding.get("lifecycle") if isinstance(binding, dict) else None
+                if isinstance(bound, list) and all(isinstance(key, str) for key in bound):
+                    bound = _lifecycle_map(bound)
+                if (not isinstance(binding, dict) or set(binding) != {"prompt", "lifecycle"}
+                        or not isinstance(binding["prompt"], str) or binding["prompt"] not in prompts
+                        or not isinstance(bound, dict) or set(bound) - set(_COORDINATOR_LIFECYCLE)
+                        or not all(isinstance(ref, str) and ref in prompts for ref in bound.values())):
+                    raise ValueError(f"Goal node {name} coordinator needs a prompt and the lifecycle prompts it "
+                                     "replaces.")
+                if "subagents" not in node:
+                    raise ValueError(f"Goal node {name} needs subagents for its coordinator.")
             stages = node["stages"]
             if not isinstance(stages, dict) or set(stages) != {"initial", "resume", "failure"} or not all(isinstance(stage, str) and stage for stage in stages.values()):
                 raise ValueError(f"Invalid goal stages in node {name}.")
@@ -6029,6 +6441,36 @@ def node_features(node, options):
     return features, count
 
 
+def _lifecycle_map(lifecycle):
+    """A lifecycle binding as {key: prompt name} (a YAML list binds each key to the prompt of its own name)."""
+
+    return {key: key for key in lifecycle} if isinstance(lifecycle, list) else dict(lifecycle)
+
+
+def author_mode(node, options):
+    """How a goal node's author works in this run: "coordinator" or "author".
+
+    The author coordinator runs the node's coordinator binding (author_critic.yaml): it delegates the work to
+    its subagents, the node's number of them at a time. The run's ``author_mode`` option says which
+    (AUTHOR_MODES): "auto", the default, runs the coordinator when the node binds one and its number of
+    subagents (subagent_count()) is 1 or more; "author" runs the author alone even then, as the jobs saved
+    before the coordinator did (the server always passes the mode a job recorded at its start).
+    "coordinator" needs that binding and 1 or more subagents. A mode the run cannot have is a
+    ConfigurationError, which no retry changes.
+    """
+
+    mode = options.get("author_mode", "auto")
+    if mode not in AUTHOR_MODES:
+        raise ConfigurationError("Choose auto, coordinator or author as the author mode.")
+    count = subagent_count(node, options)
+    if node.get("coordinator") is None or not count:
+        if mode == "coordinator":
+            raise ConfigurationError("The author coordinator needs Author subagents 1 or more."
+                                     if node.get("coordinator") else "This workflow's author has no coordinator prompts.")
+        return "author"
+    return "author" if mode == "author" else "coordinator"
+
+
 def _settings(node, options):
     role = node.get("role", "")
     return {
@@ -6084,6 +6526,10 @@ def _node_prompt_names(node):
     names.update([instructions] if isinstance(instructions, str) else instructions)
     lifecycle = node.get("lifecycle", {})
     names.update(lifecycle if isinstance(lifecycle, list) else lifecycle.values())
+    if isinstance(node.get("coordinator"), dict):
+        # The author coordinator's first prompt and lifecycle prompts (see author_mode()).
+        names.add(node["coordinator"]["prompt"])
+        names.update(_lifecycle_map(node["coordinator"]["lifecycle"]).values())
     if node.get("recovery"):
         names.add(node["recovery"]["prompt"])
     branches = node.get("next")
@@ -6128,17 +6574,27 @@ def prepare(workflow, options):
             fields = {"original_prompt", "directory", "solution", "bugs", "round", "revision_number", "instruction"} | set(node["resume"])
             if "recovery" in node:
                 _template_parts(prompts[node["recovery"]["prompt"]], fields)
-            lifecycle = node["lifecycle"]
-            if isinstance(lifecycle, list):
-                lifecycle = {key: key for key in lifecycle}
-            for key, reference in lifecycle.items():
+            def lifecycle_fields(key):
                 # Only the paused author's conversation prompt quotes the user's message, the chat framing
-                # the message and its answer file, the note on a refused submission its reason, and the
-                # subagents note their number (the controller renders these with nothing else).
-                _template_parts(prompts[reference], {"reason"} if key == "handoff_refused"
-                                else {"author_subagents"} if key == "subagents"
-                                else {"message", "answer_file"} if key == "chat"
-                                else fields | {"message"} if key == "conversation" else fields)
+                # the message and its answer file, the note on a refused submission its reason, the
+                # subagents note their number and the coordinator's time check the elapsed time and the time
+                # limit (the controller renders these with nothing else).
+                return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
+                        else {"message", "answer_file"} if key == "chat" else {"elapsed", "limit"} if key == "checkin"
+                        else fields | {"message"} if key == "conversation" else fields)
+
+            for key, reference in _lifecycle_map(node["lifecycle"]).items():
+                _template_parts(prompts[reference], lifecycle_fields(key))
+            # The run's author mode, for every goal node: one the run cannot have (a coordinator without a
+            # coordinator binding or without subagents) stops the launch here, before any model starts.
+            if author_mode(node, options) == "coordinator":
+                binding = node["coordinator"]
+                # The coordinator's first prompt: the statement once, and its number of subagents.
+                if options.get("author_input") is None and prompts[binding["prompt"]].count(node["marker"]) != 1:
+                    raise ValueError(f"The coordinator prompt must contain exactly one {node['marker']}.")
+                _template_parts(prompts[binding["prompt"]], {"author_subagents"})
+                for key, reference in _lifecycle_map(binding["lifecycle"]).items():
+                    _template_parts(prompts[reference], lifecycle_fields(key))
     return prompts
 
 
@@ -6186,15 +6642,65 @@ def workflow_remaining(options):
     _after_submission) always finish, so an approved proof is never cut off.
     Their time still counts toward the budget of later author rounds.
     """
-    started = options.setdefault("_workflow_started", _now())
+    options.setdefault("_workflow_started", _now())
     if options.get("_after_submission"):
         return math.inf
     hours = controlled_author_hours(options.get("author_limit_file"),
                                    options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
     if hours == 0:
         return math.inf
-    return max(0.0, hours * 3600 - options.get("elapsed_seconds", 0)
-               - (_now() - started - retry_clock(options).excluded()))
+    return max(0.0, hours * 3600 - workflow_elapsed(options))
+
+
+def workflow_elapsed(options):
+    """The job's working time in seconds, on the clock of the time limit (workflow_remaining()).
+
+    The working time before this runner (--elapsed-seconds, which the server counts across pauses and
+    without machine sleep) plus this runner's time, without its waits to retry a model call.
+    """
+    started = options.setdefault("_workflow_started", _now())
+    return options.get("elapsed_seconds", 0) + (_now() - started - retry_clock(options).excluded())
+
+
+def _clock_text(seconds):
+    """A working time as a time check states it: "45 min", "5 h", "5 h 12 min" (whole minutes, rounded down)."""
+
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
+def checkin_text(template, elapsed, hours, remaining):
+    """The coordinator's time check: ``template`` (its "checkin" prompt) with {elapsed} and {limit} filled in.
+
+    ``hours`` is the job's time limit (0: none) and ``remaining`` the seconds left of it (workflow_remaining()).
+    """
+
+    if not hours:
+        limit = "No time limit."
+    else:
+        left = f"about {_clock_text(remaining)} left" if remaining >= 60 else "less than 1 min left"
+        limit = f"Time limit: {_clock_text(hours * 3600)}, {left}."
+    return render_template(template, {"elapsed": _clock_text(elapsed), "limit": limit})
+
+
+def prepare_memory_folder(directory, stage):
+    """Create MEMORY_FOLDER, the author coordinator's memory, in its working directory ``directory``.
+
+    The folder is owner-only where the system has such permissions. An entry of that name that is already
+    there is left exactly as it is, whatever it holds. A folder that cannot be made is said in a diagnostic;
+    the coordinator can still make it itself.
+    """
+
+    try:
+        os.mkdir(Path(directory) / MEMORY_FOLDER, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        emit("diagnostic", stage, text=f"Could not create the coordinator's {MEMORY_FOLDER} folder ({exc}); the "
+                                       "coordinator can still create it itself.")
 
 
 def _after_submission(options):
@@ -7184,7 +7690,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
              "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
-             "replace": None, "refusal": None, "classic_shell": False}
+             "replace": None, "refusal": None, "classic_shell": False, "checked": None}
     failing_since = None
     with retry_clock(options).call(stage):
         while True:
@@ -7200,6 +7706,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 for key in ("thread", "stage", "values", "steer", "pending_compaction", "anchor"):
                     if retry.get(key):
                         known[key] = retry[key]
+                if type(retry.get("checked")) is int:
+                    known["checked"] = retry["checked"]  # The coordinator's last time check (TimeChecks).
                 # Consecutive identical refusals to reopen the thread; any other outcome resets the count.
                 known["refusal"] = retry.get("refusal")
                 known["classic_shell"] = known["classic_shell"] or bool(retry.get("classic_shell"))
@@ -7238,7 +7746,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 continued = {"stage": known["stage"], "values": known["values"] or {},
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
-                             "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"]}
+                             "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"],
+                             "checked": known["checked"]}
                 if rewind.get("fresh") or known["replace"]:
                     # The conversation's first turn produced nothing (a new
                     # conversation with the same first instruction loses
@@ -7369,59 +7878,94 @@ def _execute(workflow, state, options, prompts):
                 revision = revisions.get(current, 0)
                 if current not in sessions:
                     task = text(evaluate(node["task"], context))
-                    prompt = options.get("author_input")
-                    if prompt is None:
-                        prompt = prompts[node["prompt"]].replace(node["marker"], task, 1)
-                    lifecycle = node["lifecycle"]
-                    if isinstance(lifecycle, list):
-                        lifecycle = {key: key for key in lifecycle}
-                    if options.get("related_works") and "related_works" in lifecycle:
-                        # The run has related works: the first prompt points to them, and
-                        # {original_prompt} carries the pointer into the later prompts.
-                        prompt += "\n\n" + prompts[lifecycle["related_works"]]
+                    lifecycle = _lifecycle_map(node["lifecycle"])
                     features, count = node_features(node, options)
-                    if count and "subagents" in lifecycle:
-                        # The author may start subagents: the first prompt says how many, like the related
-                        # works, and {original_prompt} carries it into the later prompts.
-                        prompt += "\n\n" + render_template(prompts[lifecycle["subagents"]], {"author_subagents": count})
+                    settings = _settings(node, options)
+                    # Claude models (and Anthropic-format API models) run the
+                    # same goal protocol through Claude Code.
+                    claude = providers.harness(settings["model"]) == providers.CLAUDE
                     # Where the author's proof file cannot be read safely, each instruction that asks for
                     # PROOF_FILE is followed by the request for the proof in the reply (INLINE_PROOF_NOTE).
                     inline = "\n\n" + INLINE_PROOF_NOTE if not proof_handoff.file_handoff_supported() else ""
-                    prompt += inline
-                    session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
-                                       for key, ref in lifecycle.items() if key != "subagents"}
                     directory = options.get("goal_cwd") or str(Path.cwd())
-                    recovery = node.get("recovery")
-                    instruction = ""
-                    if recovery and evaluate(recovery["when"], context):
-                        feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
-                        instruction = render_template(prompts[recovery["prompt"]] + inline, {
-                            "original_prompt": prompt, "directory": str(directory),
-                            "instruction": "", "revision_number": 1, **feedback,
-                        })
-                    settings = _settings(node, options)
+
+                    def plan(coordinating, appendix):
+                        """How the author starts: its first prompt, its lifecycle prompts and any recovered critic
+                        feedback, as the author coordinator (``coordinating``, the node's coordinator binding) or
+                        as the author alone, with the subagents note when ``appendix`` says so."""
+
+                        bound = ({**lifecycle, **_lifecycle_map(node["coordinator"]["lifecycle"])} if coordinating
+                                 else lifecycle)
+                        prompt = options.get("author_input")
+                        if prompt is None:
+                            # The coordinator prompt is a template ({author_subagents}), filled in before the
+                            # statement goes in, so that no brace of the statement is read as a field.
+                            first = (render_template(prompts[node["coordinator"]["prompt"]], {"author_subagents": count})
+                                     if coordinating else prompts[node["prompt"]])
+                            prompt = first.replace(node["marker"], task, 1)
+                        if options.get("related_works") and "related_works" in bound:
+                            # The run has related works: the first prompt points to them, and
+                            # {original_prompt} carries the pointer into the later prompts.
+                            prompt += "\n\n" + prompts[bound["related_works"]]
+                        if appendix and count and "subagents" in bound:
+                            # The author may start subagents: the first prompt says how many, like the related
+                            # works, and {original_prompt} carries it into the later prompts.
+                            prompt += "\n\n" + render_template(prompts[bound["subagents"]], {"author_subagents": count})
+                        prompt += inline
+                        session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
+                                           for key, ref in bound.items() if key != "subagents"}
+                        recovery = node.get("recovery")
+                        instruction = ""
+                        if recovery and evaluate(recovery["when"], context):
+                            # The coordinator gets the critic's feedback in its own prompt for the same lifecycle key.
+                            reference = next((bound[key] for key, ref in lifecycle.items() if ref == recovery["prompt"]),
+                                             recovery["prompt"])
+                            feedback = {key: evaluate(expression, context) for key, expression in node["resume"].items()}
+                            instruction = render_template(prompts[reference] + inline, {
+                                "original_prompt": prompt, "directory": str(directory),
+                                "instruction": "", "revision_number": 1, **feedback,
+                            })
+                        return {"prompt": prompt, "prompts": session_prompts, "recovery": instruction, "bound": bound}
+
+                    coordinator, alone, stage_name = author_mode(node, options) == "coordinator", None, node.get("stage", "solve")
                     if count is not None:
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
-                        note_no_subagent_tool(node.get("stage", "solve"), settings["model"], count)
-                    # Claude models (and Anthropic-format API models) run the
-                    # same goal protocol through Claude Code.
-                    session_function = (claude_cli.goal_session
-                                        if providers.harness(settings["model"]) == providers.CLAUDE
-                                        else goal_session)
+                    if coordinator and multi_agent_version(settings["model"]) == 0:
+                        # Codex gives this model no subagent tool: the author works alone, without the subagent
+                        # feature and the subagents note, as with Author subagents 0.
+                        coordinator = False
+                        features = [feature for feature in features if feature != "multi_agent"]
+                        note_no_subagent_tool(stage_name, settings["model"], count, coordinator=True)
+                        start = plan(False, False)
+                    elif coordinator:
+                        start = plan(True, False)
+                        prepare_memory_folder(directory, stage_name)
+                        if claude:
+                            # Claude Code offers no subagent tool in --bare mode, which it learns only as it starts
+                            # (claude_cli.goal_session): the author then works alone like this.
+                            alone = plan(False, False)
+                    else:
+                        start = plan(False, True)
+                        if count is not None:
+                            note_no_subagent_tool(stage_name, settings["model"], count)
+                    prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
+                    if alone is not None:
+                        alone.pop("bound")
                     launch = functools.partial(
-                        session_function, sys.modules[__name__], prompt, prompts=session_prompts,
-                        settings=settings, features=features,
+                        claude_cli.goal_session if claude else goal_session, sys.modules[__name__], prompt,
+                        prompts=session_prompts, settings=settings, features=features,
                         stages=node.get("stages"), node_name=current,
+                        **({"coordinator": True} if coordinator else {}), **({"alone": alone} if alone else {}),
                     )
                     launchers[current] = (launch, instruction)
-                    refused = state.get("handoff_refused")
-                    if "handoff_refused" in lifecycle and isinstance(refused, str) and refused.strip():
+                    refused, bound = state.get("handoff_refused"), start["bound"]
+                    if "handoff_refused" in bound and isinstance(refused, str) and refused.strip():
                         # The controller refused the author's last submission: every attempt until the author
                         # submits again says why, after any critic feedback (launchers keeps the launch
                         # without the note for the revisions after that submission).
                         launch = functools.partial(launch, handoff_note=render_template(
-                            prompts[lifecycle["handoff_refused"]], {"reason": refused}))
+                            prompts[bound["handoff_refused"]], {"reason": refused}))
                     sessions[current] = launch(options=options, initial_instruction=instruction)
                     result = _goal_step(sessions, current, launch, instruction, options, next,
                                         node.get("stage", current))
@@ -7689,8 +8233,9 @@ def run_author_conversation(workflow_path, options, request):
     """One conversation turn of a paused proof author (`--converse`); return the exit code 0.
 
     ``request`` comes from conversation_request(): a progress summary (the
-    YAML ``summary`` prompt) or a reply to the user's message (``conversation``),
-    led by its notice. Only the author node is prepared, so only its model and
+    YAML ``summary`` prompt, the coordinator binding's for an author
+    coordinator, see author_mode()) or a reply to the user's message
+    (``conversation``), led by its notice. Only the author node is prepared, so only its model and
     credentials are checked, and the turn runs outside the time budget: the
     time limit, live-instruction and pause files are dropped. The turn runs in
     the author's saved conversation (author_conversation(), or
@@ -7730,9 +8275,12 @@ def run_author_conversation(workflow_path, options, request):
         if node is None:
             raise WorkflowDefinitionError("The workflow has no goal node for the proof author.")
         prompts = prepare(workflow, options)
-        lifecycle = node["lifecycle"]
-        if isinstance(lifecycle, list):
-            lifecycle = {key: key for key in lifecycle}
+        lifecycle = _lifecycle_map(node["lifecycle"])
+        settings = _settings(node, options)
+        if author_mode(node, options) == "coordinator" and multi_agent_version(settings["model"]) != 0:
+            # The author coordinator's own prompts where its binding replaces the author's (the summary). A Codex
+            # model that gets no subagent tool worked alone, with the author's prompts (see _execute).
+            lifecycle.update(_lifecycle_map(node["coordinator"]["lifecycle"]))
         key = "summary" if kind == "summary" else "conversation"
         if key not in lifecycle:
             raise WorkflowDefinitionError(f"The workflow's author node binds no {key} prompt.")
@@ -7742,7 +8290,6 @@ def run_author_conversation(workflow_path, options, request):
         except ValueError as exc:
             raise WorkflowDefinitionError(str(exc)) from exc
         instruction = f"{request['notice']}\n\n{body}" if request["notice"] else body
-        settings = _settings(node, options)
         try:
             claude = providers.harness(settings["model"]) == providers.CLAUDE
         except providers.StoreUnavailable as exc:
@@ -7825,8 +8372,12 @@ def main(argv=None):
                         help=f"independent critics per critic round: the subagents the critic starts "
                              f"(1 to {MAX_CRITIC_COUNT})")
     parser.add_argument("--author-subagents", type=author_subagents,
-                        help=f"subagents the proof author may start at a time (0 to {MAX_AUTHOR_SUBAGENTS}; "
-                             "0, the default, gives it no subagent tool)")
+                        help=f"subagents the proof author may start at a time (0 to {MAX_AUTHOR_SUBAGENTS}; the "
+                             "workflow's default, 3 in author_critic.yaml; 0 gives it no subagent tool)")
+    parser.add_argument("--author-mode", choices=AUTHOR_MODES,
+                        help="coordinator: the proof author coordinates its subagents (the coordinator prompts); "
+                             "author: it works alone even with subagents; auto, the default: coordinator when "
+                             "--author-subagents is 1 or more")
     parser.add_argument("--thinking-hours", type=author_hours, default=DEFAULT_AUTHOR_HOURS)
     parser.add_argument("--elapsed-seconds", type=prior_elapsed_seconds, default=0)
     parser.add_argument("--author-limit-file")

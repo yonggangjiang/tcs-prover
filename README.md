@@ -75,8 +75,11 @@ and `irm https://claude.ai/install.ps1 | iex`.
 
 1. **Statement review.** A model removes ambiguities and loopholes from your
    statement; you approve the result (**Approve and start**) or send feedback.
-2. **Author.** One persistent author conversation works on the proof, as long
-   as it takes, and hands in a complete proof.
+2. **Author.** By default an author coordinator works on the proof, as long as
+   it takes: it does not prove the statement itself, but runs up to 3 author
+   subagents at a time, keeps the team's memory and a progress log (shown on the
+   job page), checks that progress keeps growing, and hands in a
+   complete proof. With **Author subagents** 0, one author works on it alone.
 3. **Critic.** A critic starts independent critics (3 by default) that hunt for
    bugs, fixes what it can, and sends critical errors back to the author.
 4. **Convention critic.** Checks once that the accepted proof does what you most
@@ -96,8 +99,8 @@ retried every minute, without limit.
 | Guide | What it covers |
 | --- | --- |
 | [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
-| [The workflow](docs/workflow.md) | Statement review, the author, the critic, the convention critic, LaTeX |
-| [The job page](docs/job-page.md) | Status, the chat, Pause, Summary, Stop, the time limit, related works, downloads |
+| [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, the convention critic, LaTeX |
+| [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads |
 | [Batches and folder runs](docs/batches.md) | Batches, running a folder of statements, the running-jobs limit |
 | [Saved settings](docs/saved-settings.md) | Saving and loading New problem settings, and the default, under **Advanced settings** |
 | [Web search cutoff](docs/web-cutoff.md) | Runs with no web access, or with archives from before a date only |

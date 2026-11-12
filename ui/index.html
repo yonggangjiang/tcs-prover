@@ -334,11 +334,13 @@
                         <option value="low">Low</option>
                       </select>
                       <label for="authorSubagents">4 · Subagents</label>
-                      <input id="authorSubagents" type="number" min="0" max="10" step="1" value="0"
+                      <input id="authorSubagents" type="number" min="0" max="10" step="1" value="3"
                         aria-describedby="authorSubagentsHelp">
                       <p id="authorSubagentsHelp" class="help model-setting-help">
-                        How many subagents the author may start at a time, for example to try other approaches
-                        or check calculations (0-10). 0, the default, gives it none.
+                        0: one author works on the proof by itself. 1 or more (default 3): the author is a
+                        coordinator: it does not prove the statement itself, but runs up to this many author
+                        subagents at a time, keeps the team's memory and checks that progress keeps growing; its
+                        progress log appears on the job page.
                       </p>
                       <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                     </div>
@@ -833,6 +835,19 @@
                 </details>
               </div>
               <div id="jobRecovery" class="job-recovery" hidden></div>
+              <!-- The author coordinator's progress log, for coordinator jobs only: memory/progress.md in the author's
+                   working folder, which the server reads (state.coordinatorProgress). app.js sets its text as plain
+                   text, never markup, and keeps the box scrolled to the end unless you scrolled up (renderProgressLog). -->
+              <section id="progressLog" class="progress-log" aria-labelledby="progressLogHeading" hidden>
+                <h3 id="progressLogHeading">Progress log</h3>
+                <p id="progressLogMeta" class="progress-log-meta" hidden></p>
+                <pre id="progressLogText" class="progress-log-text" role="region" aria-labelledby="progressLogHeading"
+                  tabindex="0" hidden></pre>
+                <p id="progressLogNote" class="help progress-log-note" hidden></p>
+                <p id="progressLogEmpty" class="help progress-log-empty" hidden>The coordinator has not written its progress log yet.</p>
+                <!-- In place of the log when the job's model has no subagent tool, so its author works alone. -->
+                <p id="progressLogAlone" class="help progress-log-alone" hidden></p>
+              </section>
               <!-- Talk to the author: your messages and the author's answers, the author's questions and the
                    progress summaries, oldest first (app.js fills it from state.conversation), then the box that
                    sends a message. -->
@@ -1012,6 +1027,10 @@
             aria-selected="true" aria-controls="promptPanel" data-prompt="review">Reviewer</button>
           <button id="authorPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
             aria-selected="false" aria-controls="promptPanel" data-prompt="author">Author</button>
+          <!-- The per-job coordinator prompt: shown while the Author stage is on and Author subagents is 1 or more
+               (app.js showCoordinatorPromptTab). -->
+          <button id="coordinatorPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
+            aria-selected="false" aria-controls="promptPanel" data-prompt="coordinator">Coordinator</button>
           <button id="criticPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
             aria-selected="false" aria-controls="promptPanel" data-prompt="critic">Critic</button>
           <button id="conventionPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"

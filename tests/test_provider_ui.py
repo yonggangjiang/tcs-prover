@@ -675,7 +675,7 @@ renderRunOverview();
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, state.settingsWarning);
 assert.equal(rows()['Settings warning'], state.settingsWarning);
-assert.equal(rows()['Proof author'], "claude-opus-5-5 · max · no subagents\nSource: Claude Code · this computer's Claude login");
+assert.equal(rows()['Proof author'], "claude-opus-5-5 · max · works alone\nSource: Claude Code · this computer's Claude login");
 // Without a catalog nothing is claimed about the connection: the line is what the job recorded, never its URL.
 assert.equal(rows()['Independent critic'], 'gpt-6.1-sol · high · 3 independent critics as subagents · max 2 consecutive rounds\n'
   + 'Source: API connection “Sol via lab gateway” · as this job recorded it · OpenAI format · gateway.lab.example · '
@@ -703,7 +703,7 @@ assert.deepEqual(lines('Independent critic'), ['gpt-6.1-sol · high · 3 indepen
   'Source: API connection “Sol via lab gateway” · not configured now; as this job recorded it · OpenAI format · '
   + 'gateway.lab.example · runs through the Codex CLI · id api:lab-sol']);
 // With a catalog, built-in models are named as the menus name them, and the program as the menus now name it.
-assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · works alone', "Source: Claude Code · this computer's Claude login"]);
 assert.deepEqual(lines('LaTeX writer'), ['GPT 6.1 Sol · max', "Source: Codex CLI · this computer's Codex login"]);
 assert.equal(ui.runSettingsWarning.hidden, false);
 assert.equal(ui.runSettingsWarning.textContent, missing);
@@ -798,7 +798,7 @@ renderRunOverview();
 assert.deepEqual(lines('Statement reviewer'), ['claude-gw · max (Ultra is no longer offered)',
   'Source: API connection “Claude gateway” · Anthropic format · claude.example.com · runs through Claude Code · '
   + 'id api:claude-gw']);
-assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · works alone', "Source: Claude Code · this computer's Claude login"]);
 assert.deepEqual(lines('Independent critic'), ['gpt-6.1-sol · high · 3 independent critics as subagents · max 2 consecutive rounds',
   'Source: API connection “Sol via lab gateway” · OpenAI format · new-gateway.example · runs through the Codex CLI · '
   + 'this job started with gateway.lab.example (OpenAI format, model gpt-6.1-sol) · id api:lab-sol']);
@@ -842,7 +842,7 @@ const earlier = {...state.modelSources};
 state.modelSources = {...earlier, author: {...earlier.author, source: 'Claude CLI', runsThroughLabel: 'the Claude CLI'},
   review: api('api:claude-gw', {runsThroughLabel: 'the Claude CLI'})};
 renderRunOverview();
-assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · no subagents', "Source: Claude Code · this computer's Claude login"]);
+assert.deepEqual(lines('Proof author'), ['Claude Opus 5.5 · max · works alone', "Source: Claude Code · this computer's Claude login"]);
 assert.equal(lines('Statement reviewer')[1], 'Source: API connection “Claude gateway” · Anthropic format · claude.example.com · '
   + 'runs through Claude Code · id api:claude-gw');
 state.modelSources = earlier;
@@ -877,7 +877,7 @@ state.modelSources.author = {model: 'retired-model', kind: 'removed', replacemen
 state.writerModel = 'mystery';
 state.modelSources.writer = {model: 'mystery', kind: 'unknown'};
 renderRunOverview();
-assert.deepEqual(lines('Proof author'), ['retired-model · max · no subagents', 'Source: no longer supported']);
+assert.deepEqual(lines('Proof author'), ['retired-model · max · works alone', 'Source: no longer supported']);
 assert.deepEqual(lines('LaTeX writer'), ['mystery · max', 'Source: unknown model']);
 // An entry for another model (the role changed since) is not used: the catalog and the record are.
 state.writerModel = 'gpt-6.1-sol';

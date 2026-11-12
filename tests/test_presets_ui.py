@@ -73,7 +73,7 @@ elements.retrievalMode = new Select([new Option("Off", "live"), new Option("On",
 const field = (id, value = "", min = "", max = "") => Object.assign(elements[id] = new Element("input"), { value, min, max });
 field("criticRounds", "2", "1", "100");
 field("criticCount", "3", "1", "10");
-field("authorSubagents", "0", "0", "10");
+field("authorSubagents", "3", "0", "10");
 field("thinkingHours", "0", "0");
 field("retrievalCutoffUtc");
 field("presetSaveName");
@@ -1033,8 +1033,9 @@ clickSave();
 assert.equal(ui.presetSaveDialog.open, true);
 await submitSave();
 sent = posts().at(-1).body.settings;
+// The built-in value is the server's (presets.builtin_settings(): the Author subagents default).
 assert.deepEqual([sent.workflowStages.author, sent.thinkingHours, sent.authorSubagents, sent.criticCount],
-  [false, 0, 0, 5]);
+  [false, 0, fixture.listing.builtIn.settings.authorSubagents, 5]);
 // With the stage on, the same field is named and focused before the dialog opens.
 await openFresh();
 edit(ui.criticCount, "");
@@ -1042,6 +1043,23 @@ clickSave();
 assert.equal(ui.presetSaveDialog.open, false);
 assert.deepEqual([ui.notice.textContent, document.activeElement],
   ["Enter 1 to 10 independent critics.", ui.criticCount]);
+""")
+
+    def test_without_the_servers_built_in_settings_a_hidden_field_saves_the_pages_own(self):
+        # A list without built-in settings (an older server): a hidden field that is not valid saves the page's own
+        # built-in value, which for Author subagents is 3, an author coordinator, as the server's default is.
+        self.run_form(r"""
+server.listing = { ...server.listing };
+delete server.listing.builtIn;
+await openFresh();
+edit(ui.thinkingHours, "");
+edit(ui.authorSubagents, "");
+edit(ui.workflowAuthor, false);
+clickSave();
+assert.equal(ui.presetSaveDialog.open, true);
+await submitSave();
+const sent = posts().at(-1).body.settings;
+assert.deepEqual([sent.workflowStages.author, sent.thinkingHours, sent.authorSubagents], [false, 0, 3]);
 """)
 
     def test_a_form_problem_goes_once_the_settings_are_saved_or_loaded(self):

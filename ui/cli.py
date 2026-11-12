@@ -205,13 +205,19 @@ def direct_cli_options(
     speed_mode=DEFAULT_SPEED,
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
+    coordinator_prompt_file=None,
 ):
-    """Load optional prompt files and validate direct-workflow CLI settings."""
+    """Load optional prompt files and validate direct-workflow CLI settings.
+
+    As in every new job, a terminal run's author is a coordinator with 1 or more author subagents and works
+    alone with 0 (see server.recorded_author_mode()).
+    """
 
     prompt_files = {
         "author": author_prompt_file,
         "critic": critic_prompt_file,
         "final": final_prompt_file,
+        "coordinator": coordinator_prompt_file,
     }
     prompts = {
         name: read_utf8(path, f"{name} prompt") if path else None
@@ -232,6 +238,7 @@ def direct_cli_options(
         author_prompt=prompts["author"],
         critic_prompt=prompts["critic"],
         final_prompt=prompts["final"],
+        coordinator_prompt=prompts["coordinator"],
         speed_mode=speed_mode,
         reasoning_summary=reasoning_summary,
         include_review=False,
@@ -251,9 +258,17 @@ def direct_cli_options(
         "author_prompt": options["authorPrompt"],
         "critic_prompt": options["criticPrompt"],
         "final_prompt": options["finalPrompt"],
+        "coordinator_prompt": options["coordinatorPrompt"],
         "speed_mode": options["speedMode"],
         "reasoning_summary": options["reasoningSummary"],
     }
+
+
+def supplied_on_command_line(parser, argv, attribute):
+    """Whether ``argv`` gives the option of ``attribute`` (argparse's own reading, abbreviations included)."""
+
+    probe = parser.parse_args(argv, namespace=argparse.Namespace(**{attribute: _UNSET}))
+    return getattr(probe, attribute) is not _UNSET
 
 
 def research_resume_cli_settings(args, parser, argv):
@@ -284,7 +299,7 @@ def research_resume_cli_settings(args, parser, argv):
     if "reasoningEffort" in options:
         for role in ("author", "critic", "writer"):
             options.setdefault(f"{role}Effort", options["reasoningEffort"])
-    for role in ("author", "critic", "final"):
+    for role in ("author", "critic", "final", "coordinator"):
         path = getattr(args, f"{role}_prompt_file")
         if path:
             options[f"{role}Prompt"] = read_utf8(path, f"{role} prompt")
@@ -702,8 +717,9 @@ def main():
         dest="author_subagents", type=int, default=DEFAULT_AUTHOR_SUBAGENTS,
         metavar="N",
         help=(
-            f"let the proof author start up to N subagents at a time, 0 to {MAX_AUTHOR_SUBAGENTS} "
-            f"(default: {DEFAULT_AUTHOR_SUBAGENTS}, no subagent tool)"
+            f"author subagents, 0 to {MAX_AUTHOR_SUBAGENTS} (default: {DEFAULT_AUTHOR_SUBAGENTS}): with 1 or more "
+            "the proof author is a coordinator that runs up to N author subagents at a time; 0 gives it no "
+            "subagent tool, and it works alone"
         ),
     )
     parser.add_argument(
@@ -763,7 +779,7 @@ def main():
         default=DEFAULT_REASONING_SUMMARY,
         help="public reasoning-summary detail shown in the activity log",
     )
-    for role in ("author", "critic", "final"):
+    for role in ("author", "critic", "final", "coordinator"):
         camel = f"{role}PromptFile"
         parser.add_argument(
             f"-{camel}", f"--{camel}", f"--{role}-prompt-file",
@@ -808,6 +824,7 @@ def main():
                 author_prompt_file=args.author_prompt_file,
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
+                coordinator_prompt_file=args.coordinator_prompt_file,
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:
@@ -867,7 +884,6 @@ def main():
                 resume_settings = {
                     "criticRounds": args.critic_rounds,
                     "criticCount": args.critic_count,
-                    "authorSubagents": args.author_subagents,
                     "thinkingHours": args.thinking_hours,
                     "authorModel": args.author_model,
                     "criticModel": args.critic_model,
@@ -891,6 +907,14 @@ def main():
                     resume_settings["finalPrompt"] = read_utf8(
                         args.final_prompt_file, "final prompt"
                     )
+                if args.coordinator_prompt_file:
+                    resume_settings["coordinatorPrompt"] = read_utf8(
+                        args.coordinator_prompt_file, "coordinator prompt"
+                    )
+                # Author subagents only when given: otherwise the saved job's number, and with it how its author
+                # worked (an author that worked alone stays one), is kept.
+                if supplied_on_command_line(parser, sys.argv[1:], "author_subagents"):
+                    resume_settings["authorSubagents"] = args.author_subagents
                 resume_app = server.start_saved_critic_job(
                     resume_source["run_dir"], resume_settings,
                 )

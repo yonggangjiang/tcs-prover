@@ -52,7 +52,7 @@ import time
 import uuid
 
 from retrieval import runtime as retrieval_runtime
-from runner import confinement, providers
+from runner import confinement, proof_handoff, providers
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 SEARCH_TOOLS = ("WebSearch", "WebFetch")
@@ -77,6 +77,20 @@ SUBAGENT_TOOLS = ("Task", "Agent")
 PARTIAL_SUBAGENT_NOTE = "Everything below is PARTIAL output recovered from the agent before it was cut off."
 SUBAGENT_REFUSALS = ("limit reached", "available agents:", "denied by permission rule",
                      "cannot launch new agents", "inputvalidationerror")
+# A CLI that offers the subagent tool (the critic, and an author with Author subagents 1 or more) gets these
+# settings (child_environment()). They are not documented by Anthropic: read from the Claude Code 2.1.289 bundle,
+# and to be checked again when Claude Code changes (see docs/developers.md). CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+# runs subagents in the foreground (2.1.289 runs them in the background by default, and their results would come
+# back in later turns of their own), so a subagent's result returns in the turn that started it, which is the turn
+# TCS Prover follows; it also keeps Bash commands in the foreground. CLAUDE_CODE_FORK_SUBAGENT=0 turns off "fork"
+# subagents, copies of the caller's whole conversation (on by default in claude -p from 2.1.302), as the deny rule
+# SUBAGENT_DENIED does in the private settings file. With a number of subagents the CLI also gets
+# CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS (at most that many at once; 20 by default) and
+# CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1 (subagents start none of their own; 3 levels by default). With foreground
+# subagents a running Claude coordinator reads a live instruction, a time check or a chat message only once its
+# running subagents have reported.
+SUBAGENT_ENVIRONMENT = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", "CLAUDE_CODE_FORK_SUBAGENT": "0"}
+SUBAGENT_DENIED = ("Agent(fork)",)
 # Pre-approved writes stay inside the working directory; Edit rules cover Write.
 WRITE_RULE = "Edit(./**)"
 # An absolute path that a file rule can spell as it is: none of the characters that Claude Code's
@@ -420,7 +434,7 @@ def subscription_environment(base):
     return environment
 
 
-def child_environment(base, effort, *, api, config=None, temp=None):
+def child_environment(base, effort, *, api, config=None, temp=None, subagent_tool=False, subagents=None):
     """Start from the runner environment without any inherited Claude/Anthropic setting.
 
     ``config`` is the private configuration folder of an API model
@@ -429,6 +443,10 @@ def child_environment(base, effort, *, api, config=None, temp=None):
     git config. Like every confined process, the CLI is not told where the
     user's SSH and GPG agents listen (confinement.AGENT_VARIABLES). A
     subscription model starts from subscription_environment().
+    ``subagent_tool`` says that the CLI offers the subagent tool (Task, see
+    tool_permissions()), and ``subagents`` (1 or more, or None for a node
+    that declares no number) how many subagents may run at once: see
+    SUBAGENT_ENVIRONMENT.
     """
 
     environment = _without_claude_settings(base) if api else subscription_environment(base)
@@ -444,6 +462,12 @@ def child_environment(base, effort, *, api, config=None, temp=None):
     if temp is not None:
         environment["CLAUDE_CODE_TMPDIR"] = str(temp)
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    if subagent_tool:
+        # Set after the filter above, which removed every inherited CLAUDE* variable.
+        environment.update(SUBAGENT_ENVIRONMENT)
+        if subagents:
+            environment["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(subagents)
+            environment["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"] = "1"
     return environment
 
 
@@ -985,7 +1009,7 @@ def subagent_failure(block):
 
 
 def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, activity_label, features,
-                   workspace, environment, runtime=None, conversation=None, deadline=None):
+                   workspace, environment, runtime=None, conversation=None, deadline=None, subagents=None):
     """Run one structured Claude request and return its structured output as JSON text.
 
     workflow_runner.structured() decodes, validates and retries the returned
@@ -1005,6 +1029,10 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     same workspace. A base Claude no longer has raises ConversationUnavailable
     before any request is made. Each persisted session is registered with the
     conversation, which deletes it when the call ends.
+
+    With the multi_agent feature (the critic) the CLI offers the subagent
+    tool, with the settings of SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
+    ``subagents`` (the critic's number) is how many may run at once.
     """
 
     runtime = _runtime_module(runtime)
@@ -1028,7 +1056,9 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
                           f"not offer {', '.join(dropped)}.")
     denied = disallowed_tools()
     temp = bash_temp(tools, workspace, runtime)
+    subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
     settings = PrivateSettings(lambda directory: {
+        **({"permissions": {"deny": list(SUBAGENT_DENIED)}} if subagent_tool else {}),
         **({"sandbox": sandbox_settings(hidden_paths(api), workspace=workspace, temp=temp,
                                         live=choice["live_search"])}
            if "Bash" in tools else {}),
@@ -1037,7 +1067,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     result, code, initialized = None, None, False
     fork = getattr(conversation, "fork_from", None) if conversation is not None else None
     resume = bool(fork)
-    child = child_environment(environment, effort, api=api, config=home, temp=temp)
+    child = child_environment(environment, effort, api=api, config=home, temp=temp, subagent_tool=subagent_tool,
+                              subagents=subagents)
     if conversation is None:
         session_flags = ["--no-session-persistence"]
     else:
@@ -1528,7 +1559,8 @@ def pause_request_cause(path):
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction="", handoff_note=""):
+                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
+                 alone=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
 
     Drop-in replacement for workflow_runner.goal_session: same generator
@@ -1591,7 +1623,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
       again; a conversation that outgrew the model's context
       continues in a new session (``retry`` "replace"); and a running turn
       with no event for AUTHOR_INACTIVITY_SECONDS gets a control request,
-      whose missing answer ends the attempt as a failed model call.
+      whose missing answer ends the attempt as a failed model call;
+    - the root's Agent (or Task) tool calls and their results become the
+      status records of its subagents (workflow_runner.AuthorSubagents); with
+      the subagent tool the CLI gets SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
+    - with ``coordinator`` (the author coordinator, see
+      workflow_runner.author_mode()) the "checkin" prompt is written as a user
+      message at each time check (workflow_runner.TimeChecks) while a turn
+      runs and no pause or stop is under way, one at a time (the next once
+      Claude took the last in: checks that came due meanwhile are one, with
+      the time of its writing; one that comes due between turns goes with the
+      next turn; one given up on, as a live instruction would be, is sent
+      again, and Claude may still take the first copy in), recorded as a
+      "Coordinator time check" status when Claude takes it in;
+      where proof files can be read, a final answer that names no proof file
+      (workflow_runner.names_proof_file()) is recorded as a "Coordinator
+      report" status and continued, never handed on. A CLI that offers no
+      subagent tool (--bare) runs ``alone`` instead: the author's own first
+      prompt, lifecycle prompts and critic feedback ({"prompt", "prompts",
+      "recovery"}), without any of this, and the run says so once.
     """
 
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
@@ -1671,6 +1721,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     retry = None
     safety_stop = False
     environment = copies = None
+    # The status records of the root's own subagents, the coordinator's time checks (start_checks()), the turn in
+    # which a check could not be written (it is sent again in the next turn), and whether a final answer must name
+    # a proof file to be handed on.
+    tracker = getattr(runtime, "AuthorSubagents", None)
+    subagents = tracker(lambda kind, **fields: emit(kind, **fields)) if tracker is not None else None
+    checks, check_failed, guarded = None, {"turn": None}, False
+    # Why the subagents still running end with this attempt (its CLI stops, and they with it).
+    ending = {"reason": "It stopped when the author's Claude Code session ended."}
 
     def scrub(text):
         return redact(text, secret, runtime)
@@ -1747,6 +1805,68 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         # The controller recognizes a restored instruction by its command id.
         emit("request", label="Live author instruction sent", text=instruction, threadId=session, steerId=identity)
 
+    def start_checks(last):
+        """The coordinator's time checks and hand-in guard, once the launch knows whether it coordinates."""
+
+        nonlocal checks, guarded
+        schedule = getattr(runtime, "TimeChecks", None)
+        if coordinator and "checkin" in prompts and schedule is not None:
+            checks = schedule(lambda: runtime.workflow_elapsed(options),
+                              getattr(runtime, "COORDINATOR_CHECKIN_SECONDS", 3600), last,
+                              options.get("elapsed_seconds"))
+        guarded = bool(coordinator) and proof_handoff.file_handoff_supported() and hasattr(runtime, "names_proof_file")
+
+    def stop_checks(failure):
+        """End the time checks after an unexpected failure, and say so: the watcher must keep its other duties."""
+
+        nonlocal checks
+        checks = None
+        emit("diagnostic", text=f"The coordinator's time checks stopped: {failure}", threadId=thread)
+
+    def send_check():
+        """Write the coordinator's time check into the running turn when one is due (under the lock).
+
+        One at a time: Claude takes written input in only at its next step, so while its foreground subagents
+        work (for hours, maybe) every check written would reach it together, each with its own stale time. The
+        next check is written once Claude took this one in, with the time of its writing; it is recorded as a
+        "Coordinator time check" status when Claude takes it in (consumed()).
+        """
+
+        if any(item[0] == "checkin" for item in list(pending.values())):
+            return
+        elapsed = checks.due()
+        if elapsed is None:
+            return
+        hours = runtime.controlled_author_hours(options.get("author_limit_file"),
+                                                options.get("thinking_hours", getattr(runtime, "DEFAULT_AUTHOR_HOURS", 0)))
+        instruction = runtime.checkin_text(prompts["checkin"], elapsed, hours, runtime.workflow_remaining(options))
+        previous = checks.last
+        checks.sent(elapsed)
+        try:
+            # (the last check before it, its working time, its text)
+            send_user(instruction, "checkin", (previous, int(elapsed), instruction))
+        except (OSError, ValueError) as exc:
+            checks.last, check_failed["turn"] = previous, state["turn"]
+            emit("diagnostic", text=f"Could not send the time check ({exc}); it is sent again when the next turn "
+                                    "starts.", threadId=thread)
+
+    def follow_subagents(message):
+        """The root's Agent (or Task) calls and their results: the status records of its subagents."""
+
+        body = message.get("message") if isinstance(message.get("message"), dict) else {}
+        for block in body.get("content") if isinstance(body.get("content"), list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in SUBAGENT_TOOLS:
+                data = block.get("input") if isinstance(block.get("input"), dict) else {}
+                subagents.started(str(block.get("id")),
+                                  scrub_event(str(data.get("prompt") or data.get("description") or "")))
+            elif block.get("type") == "tool_result" and str(block.get("tool_use_id")) in subagents.running:
+                failure = subagent_failure(block)
+                if failure is None and block.get("is_error"):
+                    failure = tool_result_text(block)  # Turned down (a limit, a rule): no subagent ran.
+                subagents.finished(str(block.get("tool_use_id")), None if failure is None else scrub_event(failure))
+
     def consumed(identity):
         """Claude took one of our messages into the conversation; return whether it began a turn.
 
@@ -1783,12 +1903,17 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         began = not state["running"]
         if began:
             begin_turn(f"turn-{uuid.uuid4().hex[:12]}")
-        if item[0] in {"steer", "compaction"} and not unexpected:
+        if item[0] in {"steer", "compaction", "checkin"} and not unexpected:
             state["steered"] = True
         if item[0] == "steer":
             state["steer"] = item[1]
             emit("status", label="Author instruction accepted", authorSteerDelivered=item[1],
                  text="The current conversation has received the live instruction.", threadId=thread)
+        if item[0] == "checkin":
+            # Recorded as Claude takes it in (a copy given up on too: it reached the coordinator after all).
+            _, elapsed, text = item[1]
+            emit("status", label=getattr(runtime, "COORDINATOR_CHECKIN_LABEL", "Coordinator time check"),
+                 elapsedSeconds=elapsed, text=text, threadId=thread)
         return began
 
     def watch():
@@ -1835,6 +1960,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     runtime.stop_process(transport.process)
                 return
             if state["active"] and state["running"] and state["turn"]:
+                if checks is not None and not pausing.is_set() and state["turn"] != check_failed["turn"]:
+                    with lock:
+                        # Rechecked under the lock that ends turns, as for a live instruction below.
+                        if state["active"] and state["running"] and state["turn"] and not pausing.is_set():
+                            try:
+                                send_check()
+                            except Exception as exc:  # noqa: BLE001 - the watcher also pauses and ends the author.
+                                stop_checks(exc)
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
                 if not command:
                     continue
@@ -2039,8 +2172,24 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             emit("status", label="Claude API mode tools",
                  text=f"{reason}, so Anthropic-format API models run Claude Code in --bare mode, which does not "
                       f"offer {', '.join(dropped)}.")
+        subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
+        if coordinator and alone is not None and not subagent_tool:
+            # No subagent tool (--bare): the author works alone, with its own prompts.
+            coordinator = False
+            prompt, prompts = alone["prompt"], alone["prompts"]
+            initial_instruction = alone["recovery"] if initial_instruction else ""
+            values["original_prompt"] = prompt
+            if not continued.get("values"):
+                values["instruction"] = initial_instruction
+            if not alone.get("noted") and hasattr(runtime, "note_no_subagent_tool"):
+                alone["noted"] = True  # Said once per runner: retries reuse this launch.
+                runtime.note_no_subagent_tool(stages["initial"], model, settings.get("subagents"), coordinator=True,
+                                              bare=True)
+        start_checks(continued.get("checked"))
         denied = disallowed_tools()
         protected, protected_paths = protected_settings(directory)
+        if subagent_tool:
+            protected = {"permissions": {"deny": [*protected["permissions"]["deny"], *SUBAGENT_DENIED]}}
         temp = bash_temp(tools, directory, runtime)
         private = PrivateSettings(lambda path: {
             **protected,
@@ -2049,7 +2198,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                if "Bash" in tools else {}),
             **({"env": gateway_environment(model, secret)} if api else {}),
         }, temp=temp)
-        environment = child_environment(inherited, settings["effort"], api=api, config=home, temp=temp)
+        environment = child_environment(inherited, settings["effort"], api=api, config=home, temp=temp,
+                                        subagent_tool=subagent_tool, subagents=settings.get("subagents"))
         try:
             copies = _run_folder(providers.CLAUDE_TRANSCRIPTS, directory, runtime)
         except runtime.Error as exc:
@@ -2127,6 +2277,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                 item = given_up[key] = pending.pop(key)
                                 if item[0] == "compaction":
                                     state["carried"] = item[1]
+                                elif item[0] == "checkin" and checks is not None:
+                                    checks.last = min(checks.last, item[1][0])  # Due again, in the next turn.
                             emit("diagnostic", text="Queued author input was not picked up; a live instruction is "
                                                     "offered again later and a re-anchor leads the next turn.")
                         structured, finished = finished["structured"], None
@@ -2135,7 +2287,18 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         note = structured.get("progress_note") if isinstance(structured, dict) else None
                         record({"method": "thread/goal/updated", "params": {"goal": {
                             "status": {"in_progress": "active"}.get(goal_status, goal_status or "active")}}})
-                        if goal_status == "complete" and isinstance(final, str) and final.strip():
+                        if (goal_status == "complete" and isinstance(final, str) and final.strip() and guarded
+                                and not runtime.names_proof_file(final)):
+                            # The coordinator's answer names no proof file: a report on its work, never a
+                            # submission. The whole answer stays in the activity log.
+                            record(translator.item("completed", {"type": translator.kind("agent"),
+                                                                 "id": f"{thread}:report:{uuid.uuid4().hex[:8]}",
+                                                                 "text": translator.text(final)}))
+                            emit("status", label=getattr(runtime, "COORDINATOR_REPORT_LABEL", "Coordinator report"),
+                                 threadId=thread, text=runtime._clipped(
+                                     final, getattr(runtime, "COORDINATOR_REPORT_CHARS", 1600)))
+                            start_turn(carry(render("report" if "report" in prompts else "continuation")))
+                        elif goal_status == "complete" and isinstance(final, str) and final.strip():
                             # No live instruction is sent while the answer is reviewed.
                             state["active"] = False
                             answer = final
@@ -2238,8 +2401,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                             _REFUSALS.pop(session, None)
                             if thread != session:
                                 thread = session
+                                # A coordinator says so (workflow_runner.note_no_subagent_tool()).
                                 emit("status", label="Goal resumed" if state["resuming"] else "Goal started",
-                                     threadId=thread, text=f"Thread {thread}")
+                                     threadId=thread, text=f"Thread {thread}",
+                                     **({"authorModeEffective": "coordinator"} if coordinator else {}))
                             announce()
                         if not state["running"]:
                             # Queued input started a turn by itself (CLIs without lifecycle messages).
@@ -2264,6 +2429,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if kind in {"assistant", "user"}:
                 for event, root in translator.message(message):
                     record(event, root)
+                if subagents is not None and message.get("parent_tool_use_id") is None:
+                    follow_subagents(message)
                 if (kind == "assistant" and message.get("parent_tool_use_id") is None
                         and not api_error_message(message)):
                     state["output"] = True  # The model worked in this turn.
@@ -2318,8 +2485,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             pausing.set()
             if (stop_cause["value"] or (pause_request_cause(pause_file) if pause_file else "pause")) == "stopped":
                 emit("status", label="Author stopped", text=AUTHOR_STOPPED_TEXT, threadId=thread)
+                ending["reason"] = "It stopped when the author was stopped."
             else:
                 emit("status", label="Author paused", text=str(exc), threadId=thread)
+                ending["reason"] = "It stopped when the author paused."
         else:
             pausing.set()
             # A model this account cannot use, or an endpoint that refuses the request: no retry helps.
@@ -2337,8 +2506,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if limited or safety or not retryable(exc):
                 emit("status", label="Author stopped for safety" if safety and not limited else "Author paused",
                      text=pause_reason, threadId=thread)
+                if limited:
+                    ending["reason"] = "It stopped at the time limit."
             else:
                 # A model-call failure: the controller resumes this session after a wait.
+                ending["reason"] = "It stopped when Claude Code was restarted after a model-call failure."
                 empty = state["delivered"] and not state["output"] and not state["steered"] and thread
                 anchor = state["anchor"]
                 if empty and not anchor and not (state["fresh"] and not state["completed"]):
@@ -2358,7 +2530,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 retry = {"thread": thread, "stage": stage, "values": dict(values),
                          "instruction": state["instruction"] or None, "delivered": state["delivered"],
                          "output": state["output"], "anchor": state["anchor"], "rewind": rewind,
-                         "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered}
+                         "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered,
+                         "checked": checks.last if checks is not None else None}
                 if thread and getattr(runtime, "_context_window_failure", lambda error: False)(exc):
                     # The same conversation would fail again: continue in a new one.
                     repair = pending_repair()
@@ -2372,6 +2545,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if transport is not None:
             # Input already written may have started a turn the CLI is running.
             transport.close(runtime, grace, interrupt=state["running"] or bool(pending))
+        if subagents is not None and hasattr(subagents, "stopped"):
+            # Its subagents ran in the CLI: the activity log says that those still running stopped.
+            subagents.stopped(ending["reason"])
         if thread and environment is not None:
             save_transcript(config_directory(environment), thread, copies)
         if private is not None:

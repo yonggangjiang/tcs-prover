@@ -170,5 +170,66 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("(see [Sandbox and network](sandbox.md#linux-and-windows))", flat(DOCS / "saved-settings.md"))
 
 
+class CoordinatorDocsTests(unittest.TestCase):
+    """What the README and the guides say about the author coordinator (Author subagents 1 or more, the default 3),
+    in the page's own words where they quote it."""
+
+    def test_the_readme_names_the_author_coordinator_in_how_a_run_works(self):
+        text = flat(README)
+        steps = text[text.index("## How a run works"):text.index("## Guides")]
+        self.assertIn("2. **Author.** By default an author coordinator works on the proof, as long as it takes: it does "
+                      "not prove the statement itself, but runs up to 3 author subagents at a time", steps)
+        self.assertIn("With **Author subagents** 0, one author works on it alone.", steps)
+
+    def test_the_workflow_guide_gives_the_default_and_every_part_of_coordinator_mode(self):
+        text = flat(DOCS / "workflow.md")
+        self.assertIn("| Author subagents | 3 | 0 to 10. 1 or more: an [author coordinator](#the-author-coordinator) "
+                      "runs up to that many author subagents at a time. 0: one author works alone", text)
+        self.assertIn("**Author subagents** (`-authorSubagents N` in the terminal), 0 to 10, default 3", text)
+        self.assertNotIn("default 0", text)
+        section = text[text.index("### The author coordinator"):text.index("### Handing in a proof")]
+        for needed in ("per-job `coordinator` prompt", "`{author_subagents}`", "`coordinator_checkin`",
+                       *(f"`coordinator_{name}`" for name in
+                         ("goal", "continuation", "reopen", "compaction", "resume", "repair", "summary")),
+                       "**Author subagent started**", "**Author subagent finished**", "**Author subagent failed**",
+                       "`memory/`", "owner-only permissions", "never removed or overwritten", "`memory/progress.md`",
+                       "[progress log](job-page.md#progress-log)", "Every hour of the job's working time",
+                       "The first comes at 1 hour; a job resumed at 5 h 20 min gets its next one at 6 hours.",
+                       "**Author coordinator time check**", "names no proof file", "**Author coordinator report**",
+                       "GPT 5.6 Luna", "works alone with the `author` prompt instead of coordinating",
+                       "runs the subagents in the foreground", "reaches a Claude coordinator when its running "
+                       "subagents report"):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, section)
+        # Claude Code's own limits are set now: no guide says that only the prompt limits its subagents.
+        self.assertNotIn("Claude Code has no such setting", text)
+        self.assertNotIn("Claude Code has no setting for the number", flat(DOCS / "models.md"))
+
+    def test_the_job_page_guide_describes_the_progress_log_and_the_run_settings_wording(self):
+        text = flat(DOCS / "job-page.md")
+        section = text[text.index("## Progress log"):text.index("## Talk to the author")]
+        for needed in ("before **Talk to the author**", "`memory/progress.md`",
+                       "*Written by the author coordinator in memory/progress.md · updated 4 min ago*",
+                       "plain text, never run or rendered", "stays scrolled to the end as the log grows, unless you "
+                       "scroll up in it", "longer than 100,000 characters",
+                       "*The coordinator has not written its progress log yet.*"):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, section)
+        for needed in ("*coordinator, up to 3 author subagents at a time*", "*works alone*",
+                       "*up to 2 subagents at a time*"):
+            self.assertIn(needed, text)
+        self.assertIn("The built-in settings use 3", flat(DOCS / "saved-settings.md"))
+
+    def test_the_words_the_guides_quote_are_the_pages(self):
+        page = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        app = (ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn(">The coordinator has not written its progress log yet.</p>", page)
+        self.assertIn('"Written by the author coordinator in memory/progress.md"', app)
+        self.assertIn("` · coordinator, up to ${state.authorSubagents} author subagent", app)
+        self.assertIn('" · works alone"', app)
+        for label in ("Author subagent ${status}", "Author coordinator time check", "Author coordinator report"):
+            self.assertIn(label, app)
+
+
 if __name__ == "__main__":
     unittest.main()

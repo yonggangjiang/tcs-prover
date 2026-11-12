@@ -9,8 +9,13 @@ nodes:
     prompt: author
     lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents]
     # The run's Author subagents setting (0 to 10): with 1 or more the author gets the subagent tool, limited to that
-    # many at a time, and the subagents prompt; with 0 it has no subagent tool.
-    subagents: {option: author_subagents, default: 0, minimum: 0}
+    # many at a time; with 0 it has no subagent tool and works alone.
+    subagents: {option: author_subagents, default: 3, minimum: 0}
+    # With Author subagents 1 or more (default 3) the author node runs a coordinator: its first prompt is the per-job
+    # coordinator prompt, and these lifecycle prompts replace the author's; the others stay shared. 0 runs the author alone.
+    coordinator:
+      prompt: coordinator
+      lifecycle: {goal: coordinator_goal, continuation: coordinator_continuation, reopen: coordinator_reopen, compaction: coordinator_compaction, resume: coordinator_resume, repair: coordinator_repair, summary: coordinator_summary, checkin: coordinator_checkin, report: coordinator_report}
     task: state.statement
     marker: '[STATEMENT]'
     resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
@@ -165,9 +170,72 @@ prompts:
   related_works: |-
     RELATED WORKS:
     The user has provided related works for this problem in the related-works folder of your working directory; related-works/INDEX.md lists them. Read what is relevant. The proof you submit must still be complete and self-contained; the critic does not see these files.
-  # Appended to the author's first prompt when the run allows the author subagents (Author subagents 1 or more).
+  # Appended to the first prompt of an author that works alone with Author subagents 1 or more: a job saved before the
+  # author coordinator existed, or a workflow_runner.py run with --author-mode author.
   subagents: |-
     You may start up to {author_subagents} independent subagents at a time, for example to explore other approaches or to check calculations; you do not need to ask the user.
+
+  # EDIT COORDINATOR HERE: the first prompt of the author coordinator (Author subagents 1 or more), a per-job prompt
+  # like the author's. {author_subagents} is the run's Author subagents setting.
+  coordinator: |-
+    You are the coordinator of a team of author subagents working on the statement below. You do not try to prove the statement yourself. Your job is to run and check the healthiness of the team so that progress on solving the problem grows steadily with the time spent, until the team has a complete proof that has been checked.
+
+    The team must solve it, even if it looks like a long-standing open problem. Do not let the team give up because the problem is hard or open.
+
+    YOUR TEAM
+    You can run up to {author_subagents} author subagents at a time. You should provide them with the exact statement to be solved, ask them to think deeply and hard, and try substantially diversified approaches to make sure the progress grows steadily.
+
+    YOUR MEMORY
+    Your conversation will be compacted from time to time, and whatever is not written down is lost, including what your subagents are doing. Keep the team's memory in the memory folder of your working directory, organized as you see fit. You should observe and decide how the memory should be maintained, so that the author team with this memory can make steady progress along the time, instead of circulating or being stuck. Keep a log of the team's progress in memory/progress.md; the user reads it on the job page.
+
+    EXAMINING PROGRESS
+    The whole trajectory of all your and the author team's memory is in transcript.jsonl in your working directory for you to examine the progress (it is large, so search it rather than read it whole). There are no clear criteria on the progress towards an open problem, and you are responsible to use the trajectory and the memory to judge yourself about whether the team is making steady progress towards resolving the problem as time grows (TCS Prover sends you the elapsed time in a time check every hour). If you realize any ill behavior that the progress is blocked or growing slowly with the time, you should examine the prompt, how you organize the team, and the memory of your design, to try to guide the team back to steady progress.
+
+    HANDING IN
+    When the team has a complete proof that has been checked, write it to proof.md and reply with exactly this line and nothing else:
+    PROOF_FILE: proof.md
+    The critic reads only proof.md and the statement, so the proof must be complete and self-contained.
+
+    STATEMENT:
+    [STATEMENT]
+  # The author coordinator's lifecycle prompts (the coordinator binding of the author node); each replaces the
+  # author's prompt of the same lifecycle key. The goal and the continuation point to the coordinator prompt (Codex
+  # repeats the goal in each of its automatic turns); reopen, compaction, resume and repair repeat it.
+  coordinator_goal: |-
+    Coordinate the team as your coordinator prompt says, until the team hands in a complete proof that has been checked.
+  coordinator_continuation: |-
+    Continue coordinating the team as your coordinator prompt says; do not end the work.
+  coordinator_reopen: |-
+    ORIGINAL COORDINATOR PROMPT:
+    {original_prompt}
+  coordinator_compaction: |-
+    ORIGINAL COORDINATOR PROMPT:
+    {original_prompt}
+  coordinator_resume: |-
+    ORIGINAL COORDINATOR PROMPT:
+    {original_prompt}
+  coordinator_repair: |-
+    The critic rejected the proof the team handed in. Save the current candidate below to a file first: it holds the critic's safe fixes, which proof.md does not. Record the critic's findings in your memory and have the team fix every unresolved error in that candidate. If not fixable, resume the solution finding progress using the original prompt.
+
+    CURRENT CANDIDATE:
+    {solution}
+
+    CRITIC BUGS:
+    {bugs}
+
+    ORIGINAL COORDINATOR PROMPT:
+    {original_prompt}
+  coordinator_summary: |-
+    The work is paused. Write a progress summary for the user from the team's memory: what has been verified so far, with precise statements, and where it is written; what remains open or uncertain, and why; and the most promising next steps. Do not continue the work, start subagents or change any files in this turn.
+  # Sent to the working coordinator every hour of the job's working time (a live instruction): {elapsed} is that
+  # time, {limit} the time limit and what is left of it, or that there is none.
+  coordinator_checkin: |-
+    [TIME CHECK FROM TCS PROVER]
+    Elapsed: {elapsed}. {limit}
+  # Sent instead of the continuation when a coordinator's final reply names no proof file (it is kept as a
+  # progress report and never reaches the critic).
+  coordinator_report: |-
+    Your last reply was not handed to the critic: TCS Prover takes a reply as a hand-in only when it is the line PROOF_FILE: proof.md and nothing else, so it was kept as a progress report. If the team's proof is complete and checked, write it to proof.md and reply with exactly that line. Otherwise keep coordinating the team; do not end the work.
 
   # EDIT CRITIC HERE: the critic's instructions. {count} is the run's Independent critics setting.
   critic: |-

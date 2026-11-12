@@ -117,12 +117,14 @@ the entry point.
   file read-only.
 - `subagents` (a number, or `{option, default, minimum}`, 0 to 10) is how many
   subagents the node's model may start at once: the run option decides
-  (`critic_count` for the critic, `author_subagents` for the author), the node
-  gets the `multi_agent` feature exactly when the number is 1 or more, Codex gets
-  its own limits for it (see [The workflow](workflow.md#subagents-what-the-program-enforces)),
-  and a structured node's instructions read it as `{count}`. The author's
-  `subagents` prompt reads it as `{author_subagents}` and is added to its first
-  prompt only when it is 1 or more.
+  (`critic_count` for the critic, `author_subagents` for the author, 3 by
+  default), the node gets the `multi_agent` feature exactly when the number is 1
+  or more, Codex gets its own limits for it (see
+  [The workflow](workflow.md#subagents-what-the-program-enforces)), and a
+  structured node's instructions read it as `{count}`. The author's `subagents`
+  prompt reads it as `{author_subagents}` and is added to the first prompt of an
+  author that works alone with 1 or more (see
+  [The author coordinator](#the-author-coordinator)).
 - A structured node with `proof_handoff` gets the proof snapshot as read-only
   files (the convention critic uses this without `edit`). With `edit` and
   `proof_handoff` its result also has `proofChanged` and `proofDiff` (or, for a
@@ -150,6 +152,28 @@ from `workflow_runner.py` after the first prompt (which `{original_prompt}`
 carries into `resume` and `compaction`), after the `continuation` and `repair`
 prompts and after the recovery prompt; the YAML never names an operating
 system.
+
+**The coordinator binding.** A goal node with `subagents` may also have
+`coordinator: {prompt, lifecycle}`: the first prompt of the author coordinator
+(exactly one `[STATEMENT]`; it may name `{author_subagents}`) and the lifecycle
+prompts that replace the author's of the same key (a mapping, or a list of keys
+that name prompts of their own names). It may bind `goal`, `continuation`,
+`compaction`, `repair`, `resume`, `reopen`, `summary`, `conversation`,
+`related_works`, `handoff_refused` and `checkin`, the hourly time check, which
+only this binding has (it may name `{elapsed}` and `{limit}`); every other prompt
+may name exactly what its author counterpart may, and the prompts it does not
+bind stay the author's (the bundled one leaves `conversation`, `chat`,
+`related_works` and `handoff_refused` shared). The run's `author_mode` option
+(`--author-mode`) chooses: `coordinator` runs the binding and needs it and 1 or
+more subagents (else the run stops with a settings error before any model starts,
+also when the workflow file was edited to drop the binding; a reply turn of the
+paused author fails at once), `author` runs the author alone
+(with its `subagents` note), and `auto`, the default, runs the coordinator when
+the number is 1 or more. Its prompts are
+checked only when it runs. The recovery prompt is the binding's prompt for the
+lifecycle key the node's recovery prompt is bound to (`repair` gives
+`coordinator_repair`), and `INLINE_PROOF_NOTE` follows the coordinator's
+`continuation` and `repair` too.
 
 A complete custom workflow can be as small as this `summarize.yaml`:
 
@@ -185,6 +209,11 @@ Keep custom definitions outside the bundled `workflows/` folder.
 The first runs proof search, criticism and LaTeX; the second LaTeX alone. Both
 skip statement review. `.venv/bin/python workflow_runner.py --help` lists the
 model, reasoning, time-limit, critic-round, critic-count and prompt options.
+`--author-subagents N` (the workflow's default, 3) and `--author-mode
+{auto,coordinator,author}` (default `auto`: a coordinator when N is 1 or more)
+choose how the author works, and `--coordinator-prompt-file` gives the
+coordinator's first prompt, as `--author-prompt-file` gives the author's. The
+server always passes the mode the job recorded.
 `--model` sets the fallback model for any workflow; `--set NAME=VALUE` sets any
 named option and accepts JSON values. Node `role` settings can use options such
 as `editor_model` and `editor_effort`. To run only the author:
@@ -221,8 +250,11 @@ conversation and exits. It reads one JSON request on standard input,
 `{"schemaVersion": 1, "id": "c_0123456789", "kind": "message", "text": "…",
 "notice": ""}` (`kind` is `summary` with an empty `text`, or `message` with 1 to
 12,000 characters; an invalid request exits with status 1), prepares only the
-author, and sends the `summary` or `conversation` prompt, after the notice when
-there is one, as one turn in the saved conversation named by
+author, and sends the `summary` or `conversation` prompt (for an author
+coordinator, `--author-mode coordinator`, the coordinator binding's `summary`,
+unless a Codex model gave it no subagent tool; the server passes `--author-mode
+author` for a coordinator job whose runner said that its author works alone),
+after the notice when there is one, as one turn in the saved conversation named by
 `--set goal_thread_id=…` and `--set goal_cwd=…`. It never starts or replaces a
 conversation, never sets a Codex goal active, runs outside the time budget, and
 retries every failed model call every minute without limit in that
@@ -233,6 +265,161 @@ the request's `conversationId`: the request (**Progress summary requested** or
 notices, `codex_event` records, and then `conversation_reply` with the reply, or
 the status **Author reply failed** (`final: true`) when no retry can help; both
 end with exit status 0.
+
+## The author coordinator
+
+With Author subagents 1 or more (3 by default) the author node runs its
+coordinator binding: one persistent conversation, as for the author, that hands
+the problem-solving to its subagents. What the runner and the server add:
+
+- **The recorded mode.** A job records `authorMode` (`coordinator` or `author`)
+  in its state and `job-settings.json` when it starts, from its own number; one
+  without the Author stage records `author`. A job saved without `authorMode`
+  (every job from before the coordinator) is restored as `author`, one saved
+  without `authorSubagents` with 0, and such a job saves no mode later
+  (`authorModeRecorded` false, kept through every revision of its statement in
+  place), so it stays a single author when it is resumed, revised in place (any
+  number of times) or continued (`App._kept_author_mode`, which also keeps a job
+  revised in place whose author works alone with subagents, as only an older job
+  or a continuation of one does); an older job with 1 or more keeps the author
+  prompt plus the `subagents` note. A continuation keeps an author that worked
+  alone, and a continued coordinator keeps its coordinator
+  prompt as a continued author keeps its author prompt. Every launch and every
+  reply turn of the paused author passes `--author-mode` with the recorded mode.
+- **The coordinator prompt** is a per-job prompt like the author's:
+  `default_prompts()["coordinator"]` (the binding's prompt), `PROMPT_ROLES`
+  (role `author`), `state.coordinatorPrompt`, `prompts/coordinator.txt` and
+  `--coordinator-prompt-file`. The server checks it (exactly one `[STATEMENT]`,
+  no field but `{author_subagents}`) only for a coordinator job; any other job
+  keeps the default.
+- **Launch.** The first prompt is the coordinator prompt with
+  `{author_subagents}` filled in, then the statement, then the related-works block
+  (no `subagents` note); `goal_session(..., coordinator=True)`. The runner creates
+  `memory/` in the author's working folder, owner-only where the system has such
+  permissions; an entry of that name is never removed or replaced, and a folder
+  that cannot be made is said in a diagnostic.
+- **No subagent tool.** A Codex model of multi-agent version 0 (GPT 5.6 Luna)
+  runs the author alone instead: today's author prompts without the `subagents`
+  note and without the `multi_agent` feature, and the status **No subagents with
+  this model** says that the author works alone instead of coordinating. A Claude
+  coordinator gets the same single-author launch as `alone`, which
+  `claude_cli.goal_session` uses when its CLI offers no subagent tool (`--bare`),
+  saying so once per runner. That status carries `authorModeEffective: "author"`
+  and the model's `modelLabel`, and each start of a coordinating author (its
+  **Goal started** or **Goal resumed** status) carries `authorModeEffective:
+  "coordinator"`: the server keeps the latest as `state.authorModeEffective`
+  (`follow_author_mode()`: `{mode: "author", modelLabel, reason}`, or `null` for
+  the recorded mode), in the state only, never in `job-settings.json`; a restart
+  and a saved batch read it from the transcript. Each launch replaces it as its
+  author starts. The page then says that the author works alone (Run settings,
+  and one line in place of the progress log), and the paused author's reply turns
+  get `--author-mode author`, so its summary uses the author's prompt.
+- **Time checks.** Every whole hour of the job's working time
+  (`workflow_elapsed()`, the clock of the time limit: `--elapsed-seconds` plus
+  this runner's time without its retry waits; the server keeps machine sleep out
+  of the elapsed seconds), the first at 1 h, the runner sends the `checkin`
+  prompt as a live instruction (`TimeChecks`): `{elapsed}` reads like `5 h 12 min`
+  or `45 min`, `{limit}` like `Time limit: 24 h, about 18 h 48 min left.` or `No
+  time limit.` A new runner starts after the time it starts with (resumed at 5 h
+  20 min, the next check is at 6 h); a retry after a model-call failure goes on
+  after the failed attempt's last check (`checked` in its retry details). Codex
+  gets it by `turn/steer` while a root turn runs; one that comes due between turns
+  goes with the next turn, and one Codex refuses is sent again in the next turn.
+  Claude Code gets it as a stream-json user message, as a live instruction, one
+  at a time: Claude takes written input in only at its next step (not while its
+  subagents run in the foreground), so no check is written while Claude has not
+  taken in the last one, and the next goes once it has, with the time of its
+  writing; one given up on at the end of a turn (as a live instruction would be)
+  is sent again in the next turn. None is sent while the author pauses or stops,
+  or in a reply turn. Each is a status record **Coordinator time check** with
+  `elapsedSeconds` and the text sent (Claude Code: when Claude takes it in).
+  Checks that came due while none could be sent are one check. An unexpected
+  failure of the time checks ends them with a diagnostic that says so; the
+  author's watcher goes on pausing, stopping and delivering live instructions.
+- **Hand-in guard.** Where proof files can be read
+  (`proof_handoff.file_handoff_supported()`), a final reply of the coordinator
+  that names no proof file (`names_proof_file()`, which counts a pointer
+  `extract_proof_reference()` cannot use, so the critic step refuses it and says
+  why) is not handed to the critic: it is recorded as the status **Coordinator
+  report** (its first `COORDINATOR_REPORT_CHARS`, 1,600, characters; the whole
+  reply stays in the activity log as the coordinator's message), and the
+  `continuation` prompt follows. Elsewhere (Windows) the reply is handed on as
+  today, and `INLINE_PROOF_NOTE` asks for the proof in it.
+- **The author's subagents** (`AuthorSubagents`, for every author with the
+  subagent tool) become status records **Author subagent started**,
+  **Author subagent finished** and **Author subagent failed** with
+  `authorSubagent: true`, `subagentId`, `subagentTask` (the first line of the
+  assignment, at most 200 characters), `subagentState` (`started`, `finished` or
+  `failed`) and `subagentsRunning` (after the event, while the session saw each
+  running subagent start); a failed one's text says why when that is known.
+  Codex: the root's completed `collabAgentToolCall` items (a `spawnAgent`'s
+  `receiverThreadIds`; `agentsStates` `completed` or `shutdown`, `errored`,
+  `interrupted` or `notFound`; a `closeAgent`). Claude Code: the root's Agent
+  (or Task) tool calls and their results (`subagent_failure()`; a call turned down
+  by a limit is a failure with Claude's own words). Whether Codex 0.160's
+  app-server reports a spawn of multi-agent version 2 (the built-in GPT models)
+  as such an item has not been checked; `codex exec` does not.
+- **Codex settings.** The coordinator's app-server (not the critic) gets
+  `COORDINATOR_HINT` as `features.multi_agent_v2.multi_agent_mode_hint_text`
+  instead of `SUBAGENT_HINT`, with the same limits as any author with subagents,
+  and for models of multi-agent version 2
+  `features.multi_agent_v2.default_wait_timeout_ms = 1800000` (30 minutes;
+  Codex's own default is 30 s; version 1 has no such setting). A web-cutoff run's
+  audit (`retrieval_runtime.verify_rpc`) expects these values exactly in Codex's
+  effective settings (`config/read`); whether Codex reports the default wait there
+  has not been verified, so a web-cutoff coordinator does not get it
+  (`COORDINATOR_WAIT_MS`): it waits Codex's default unless it names a longer
+  wait, as its hint asks. The author's inactivity watchdog (30 minutes without an
+  event, then a `thread/goal/get` check) does not end an attempt whose root
+  waits silently for its subagents while the app-server answers the check
+  (tests/test_author_coordinator.py checks this with the scripted app-server).
+- **Claude Code settings.** Claude Code, when it offers the subagent tool (to an
+  author with Author subagents 1 or more, and to the critic), gets
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (subagents run in the foreground, so
+  their results come back in the turn TCS Prover follows; this also keeps Bash
+  commands in the foreground), `CLAUDE_CODE_FORK_SUBAGENT=0` (no copies of the
+  caller's conversation) and, with a number,
+  `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=N` and
+  `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`, set after the filter that removes
+  every inherited `CLAUDE*` variable, and its private settings file denies
+  `Agent(fork)` (`claude_cli.SUBAGENT_ENVIRONMENT`, `SUBAGENT_DENIED`). Anthropic
+  does not document these variables: they were read from the Claude Code
+  2.1.289 bundle, and need checking again whenever Claude Code changes. A known
+  limit of foreground subagents: a live instruction, a time check or a chat
+  message reaches a working Claude coordinator only once its running subagents
+  have reported.
+- **The page's live window.** The events of the subagents' own conversations
+  (`codex_event` records with `root: false`, of the author's subagents and of the
+  critic's) keep a window of their own, the newest `SUBAGENT_TRACE_LIMIT` (300),
+  beside the newest `TRACE_LIMIT` (1,500) other records, so they never push the
+  coordinator's own records out. The window keeps each record's `traceVersion`,
+  so `/state?after=N` returns exactly the records added since N that it still
+  holds, and a full copy's `traceFrom` is the version after which none is
+  missing. The author subagent records, and the coordinator's **Coordinator time
+  check** and **Coordinator report** statuses, are pinned, as the critic's
+  progress is.
+  `transcript.jsonl` keeps every record.
+- **The progress log.** For a coordinator job (also one another process runs,
+  such as a terminal run) the server's tick reads
+  `memory/progress.md` in the author's working folder (`goalWorkspace`, or the run
+  folder) whenever its size or modification time changed (`read_progress_log`,
+  outside the job lock), as safely as a chat answer: a link, a FIFO or a file with
+  a second hard link is never read, the folder is opened without following a link
+  (on Windows a link is refused first), at most the file's last 400,004 bytes are
+  read, decoded as UTF-8 with invalid bytes replaced, line ends normalized and
+  control characters removed. `state.coordinatorProgress` is `null` while there
+  is no such file, else `{updatedAt, truncated, chars, bytes, version}`: the
+  file's modification time (UTC, ISO 8601), whether the file holds more than the
+  text shown, how many characters that text holds (the last 100,000 at most), the
+  size of the whole file in bytes, and a digest of the text that changes when it
+  changes. The text itself is not in `/state` (which the page polls every 0.7 s):
+  `GET /progress-log?job=…` (the same token and job checks as `/chat-answer`;
+  `App.progress_log()`) returns `{text, updatedAt, truncated, chars, bytes,
+  version}`, or `{text: null, version: null}`, and the page fetches it only when
+  the job page opens or the version changes. A file that changes while it is read
+  is read again at the next tick. Saved read-only batches show the same, read
+  once per request (from the run's own folder when the saved working folder is
+  not a folder of the batch catalog, such as a run moved into a batch folder).
 
 ## HTTP API notes
 

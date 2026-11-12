@@ -14,10 +14,17 @@ This sends the whole file to the proof author, like turning off **Statement
 review** and keeping the other three stages on. It starts no web server and
 opens no browser. Without options it uses the built-in defaults (a default saved
 with **Save these settings…** applies only to the web form): 3 independent
-critics per round, no author subagents, at most 2 consecutive edited critic
-passes (then one last review that cannot edit), no time limit, GPT 6.1 Sol at
-Max for every proof role, the built-in prompts, Standard speed and concise
-reasoning summaries.
+critics per round, 3 author subagents (so the author is a coordinator, see
+below), at most 2 consecutive edited critic passes (then one last review that
+cannot edit), no time limit, GPT 6.1 Sol at Max for every proof role, the
+built-in prompts, Standard speed and concise reasoning summaries.
+
+With 1 or more author subagents the proof author is a coordinator: it does not
+prove the statement itself, but runs up to that many author subagents at a time,
+keeps the team's memory in the `memory` folder of its working folder and checks
+that progress keeps growing. Its progress log is
+`memory/progress.md` in the job's folder under `runs/`. With `-authorSubagents 0`
+the author works alone, with no subagent tool.
 
 ## Folders
 
@@ -52,7 +59,7 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | --- | --- | --- |
 | `-criticRounds N` | `2` | Maximum consecutive edited critic passes; then one last critic round that cannot edit must pass the latest solution unchanged or reject it. `1` to `100`. An unchanged pass accepts at once. A rejection returns to the author and resets the count. |
 | `-criticCount N` | `3` | Independent critics the critic starts as its subagents on each proof version before it decides: `1` to `10`. Every round, including the last one that cannot edit, starts this many fresh critics. |
-| `-authorSubagents N` | `0` | Subagents the proof author may start at a time, for example to explore other approaches or check calculations: `0` to `10`. `0` gives it no subagent tool. |
+| `-authorSubagents N` | `3` | Author subagents, `0` to `10`. With `1` or more the proof author is a coordinator that runs up to N author subagents at a time (see above); `0` gives it no subagent tool, and it works alone. |
 | `-thinkingHours HOURS` | `0` | Time limit in hours of the job's active work: `0` (the default) for none, or any positive number. Reaching it stops the proof author; the critic and LaTeX steps after a submission always finish, so an accepted proof is never cut off. Saved work is kept. |
 | `-authorModel MODEL` | `gpt-6.1-sol` | Author model: Codex CLI `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude Code `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or a discovered model's `api:<id>` selection from **Models & API → API connections**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the web page no longer lists them. |
 | `-criticModel MODEL` | `gpt-6.1-sol` | Critic model (it also runs the convention critic); same choices as the author. |
@@ -63,7 +70,8 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 | `-writerEffort LEVEL` | shared effort | Only the LaTeX writer's reasoning. |
 | `-speedMode MODE` | `standard` | `standard`, or `fast` for ChatGPT's accelerated generation (up to 2× on 6.1 Sol and Astra, 1.5× on the other models; Fast can draw credits faster). Fast applies to Codex CLI models only; Claude Code models and API models always run at standard speed. |
 | `-reasoningSummary LEVEL` | `concise` | Public activity-log summaries: `none`, `concise`, or `detailed`. This never shows private chain-of-thought. Claude Code models show Anthropic's summarized thinking for both `concise` and `detailed`; Anthropic-format API models show none. |
-| `-authorPromptFile PATH` | built-in prompt | A UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. |
+| `-authorPromptFile PATH` | built-in prompt | A UTF-8 author prompt; it must contain exactly one `[STATEMENT]`. It is used when the author works alone (`-authorSubagents 0`). |
+| `-coordinatorPromptFile PATH` | built-in prompt | A UTF-8 prompt for the author coordinator (`-authorSubagents` 1 or more): it must contain exactly one `[STATEMENT]`, and `{author_subagents}` stands for the number of author subagents (write any other brace twice, `{{` and `}}`). |
 | `-criticPromptFile PATH` | built-in prompt | A UTF-8 critic prompt. |
 | `-finalPromptFile PATH` | built-in prompt | A UTF-8 LaTeX prompt. |
 | `--verbose-events` | off | Print every public JSONL event (see below). |
@@ -108,7 +116,11 @@ python3 web_ui.py --resume-research runs/YOUR_PREVIOUS_RUN --thinking-hours 24
 
 `--resume-author` is the same option. It opens the continued job in the web
 page and keeps the source job's saved inputs and transcripts. The author keeps
-working in its workspace with its full original assignment; saved settings stay
+working in its workspace with its full original assignment, and the way it
+worked: a coordinator stays a coordinator with its coordinator prompt; a job
+from before the author coordinator keeps its author as it was, with any
+subagents that author may start itself (none when it saved no number); and one
+with `-authorSubagents 0` keeps an author that works alone. Saved settings stay
 unless you override them. Critic and LaTeX checkpoints keep their own files.
 
 If a run has `SOLUTION.md` or `saved-candidate.md` but no checkpoint button,
@@ -119,7 +131,9 @@ python3 web_ui.py --resume-critic runs/2026-08-26_16-33-26_example
 ```
 
 This loads the saved complete proof, checked statement and role prompts into a
-new job in the web page, with fresh critics. An unchanged pass goes on to the
+new job in the web page, with fresh critics. Its author, should the critic send
+the proof back, keeps the saved job's Author subagents and the way that author
+worked, unless you give `-authorSubagents`. An unchanged pass goes on to the
 LaTeX editor; edited passes repeat up to the maximum, then one last round that
 cannot edit must pass the proof unchanged; a rejection returns the candidate and
 the bug report to the author's normal repair loop.
@@ -155,5 +169,6 @@ view; `--help` lists every option. Both views show the public reasoning
 summaries TCS Prover keeps, never private chain-of-thought, and read
 incrementally, so even very large transcripts fit.
 
-To run the workflow files directly with `workflow_runner.py`, see
+To run the workflow files directly with `workflow_runner.py` (which also has
+`--author-mode` to choose how the author works), see
 [Developers and operators](developers.md#running-workflows-directly).

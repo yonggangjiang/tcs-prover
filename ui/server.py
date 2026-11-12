@@ -1,5 +1,6 @@
 """Manage proof jobs and serve the local browser interface."""
 
+import bisect
 import codecs
 import decimal
 import errno
@@ -52,11 +53,31 @@ except Exception:  # noqa: BLE001 - an edited workflow file must never keep the 
     DEFAULT_CRITIC_COUNT = 3
 MAX_CRITIC_COUNT = getattr(runtime, "MAX_CRITIC_COUNT", 10)
 # Subagents the proof author may start at a time (workflow_runner.py --author-subagents); 0 gives it no subagent tool.
+# With 1 or more a new job's author is a coordinator (AUTHOR_MODES): the runner's default (from author_critic.yaml),
+# or 3 when the runner does not define it.
 try:
     DEFAULT_AUTHOR_SUBAGENTS = runtime.DEFAULT_AUTHOR_SUBAGENTS
 except Exception:  # noqa: BLE001 - an edited workflow file must never keep the server from starting.
-    DEFAULT_AUTHOR_SUBAGENTS = 0
+    DEFAULT_AUTHOR_SUBAGENTS = 3
 MAX_AUTHOR_SUBAGENTS = getattr(runtime, "MAX_AUTHOR_SUBAGENTS", 10)
+# How a job's proof author works, recorded when the job starts (authorMode; workflow_runner.py --author-mode):
+# "coordinator", with Author subagents 1 or more, coordinates that many author subagents; "author" works alone. A
+# job saved without it (every job from before the coordinator) is "author", and one saved without authorSubagents
+# has 0, so no older job becomes a coordinator when it is resumed or continued.
+AUTHOR_MODES = ("coordinator", "author")
+# The author coordinator's progress log, which the job page shows (state.coordinatorProgress): the runner's
+# memory/progress.md in the author's working folder. The page gets its last MAX_PROGRESS_LOG_CHARS characters.
+MEMORY_FOLDER = getattr(runtime, "MEMORY_FOLDER", "memory")
+PROGRESS_LOG = getattr(runtime, "PROGRESS_LOG", "progress.md")
+MAX_PROGRESS_LOG_CHARS = 100_000
+PROGRESS_LOG_READ_BYTES = 4 * MAX_PROGRESS_LOG_CHARS + 4
+# What a job's state shows of that log: all but its text, which the page fetches apart (/progress-log,
+# App.progress_log()) when "version" changes.
+PROGRESS_LOG_FIELDS = ("updatedAt", "truncated", "chars", "bytes", "version")
+# The author coordinator's own status records that the page's window keeps (important_record()): its hourly time
+# checks and its replies that named no proof file, a few per hour at most.
+COORDINATOR_RECORD_LABELS = frozenset({getattr(runtime, "COORDINATOR_CHECKIN_LABEL", "Coordinator time check"),
+                                       getattr(runtime, "COORDINATOR_REPORT_LABEL", "Coordinator report")})
 # Long diffs of the critic coordinator's changes, in the run's controller folder (see App.critic_diff).
 CRITIC_DIFFS_FOLDER = "critic-diffs"
 CRITIC_DIFF_NAME = re.compile(r"round-[0-9]+-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.diff")
@@ -543,6 +564,29 @@ def follow_critic_progress(progress, record, critic_count=None):
             "failed": sorted([*progress["failed"], index]) if record.get("failed") is True else progress["failed"]}
 
 
+def follow_author_mode(effective, record):
+    """The way a job's author works as its runner last reported it, after one more transcript record.
+
+    A coordinator job's runner says how its author works when it starts it: a "No subagents with this model"
+    status with authorModeEffective "author" when the model has no subagent tool, so the author works alone
+    (workflow_runner.note_no_subagent_tool()), and authorModeEffective "coordinator" on each "Goal started" or
+    "Goal resumed" status of a coordinating author. The value is {"mode": "author", "modelLabel", "reason"} for
+    the first, None for the second (the job's recorded authorMode holds); a record that says neither leaves it.
+    """
+
+    if (not isinstance(record, dict) or record.get("kind") != "status" or record.get("root") is False
+            or record.get("stage") == "conversation"):
+        return effective
+    mode = record.get("authorModeEffective")
+    if mode == "coordinator":
+        return None
+    if mode == "author":
+        label = record.get("modelLabel")
+        return {"mode": "author", "modelLabel": label if isinstance(label, str) else "",
+                "reason": str(record.get("text") or "")}
+    return effective
+
+
 def saved_time_limit_history(value):
     """The valid events of a saved time-limit history, oldest first ([] when it is damaged)."""
 
@@ -801,13 +845,18 @@ CHAT_CONTROL_CHARACTERS = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _chat_answer_descriptor(workspace, identity):
-    """Open the author's answer to chat message ``identity`` read-only, or return None.
+    """Open the author's answer to chat message ``identity`` read-only, or return None (_author_file_descriptor)."""
 
-    The file is the author's output in a folder it can write: a `chat` entry that is not a real folder,
-    and a link, a FIFO or a file with a second hard link where the answer belongs, are never read.
+    return _author_file_descriptor(Path(workspace) / CHAT_FOLDER, f"answer-{identity}.md")
+
+
+def _author_file_descriptor(folder, name):
+    """Open the file ``name`` of ``folder``, which the author can write, read-only, or return None.
+
+    The file is the author's output in a folder it can write: a ``folder`` entry that is not a real folder,
+    and a link, a FIFO or a file with a second hard link where the file belongs, are never read.
     """
 
-    folder, name = Path(workspace) / CHAT_FOLDER, f"answer-{identity}.md"
     try:
         info = os.lstat(folder)
     except OSError:
@@ -896,6 +945,72 @@ def read_chat_answer(workspace, identity, signature=None):
     text = CHAT_CONTROL_CHARACTERS.sub("", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
     return {"text": text[:MAX_CHAT_ANSWER_CHARS], "bytes": info.st_size,
             "shortened": not whole or len(text) > MAX_CHAT_ANSWER_CHARS, "signature": list(current)}
+
+
+def progress_log_signature(workspace):
+    """(size, mtime_ns) of the author coordinator's progress log in ``workspace``, or None when it is not there."""
+
+    descriptor = _author_file_descriptor(Path(workspace) / MEMORY_FOLDER, PROGRESS_LOG)
+    if descriptor is None:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        return (info.st_size, info.st_mtime_ns)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def read_progress_log(workspace, signature=None):
+    """The author coordinator's progress log as the job page shows it, or None when it cannot be read now.
+
+    The log is memory/progress.md (MEMORY_FOLDER, PROGRESS_LOG) in the author's working folder ``workspace``,
+    opened as a chat answer is (_author_file_descriptor: a link, a FIFO or a file with a second hard link is
+    never read). Of a longer file only its last PROGRESS_LOG_READ_BYTES are read, which hold at least its last
+    MAX_PROGRESS_LOG_CHARS characters; they are decoded as UTF-8 (invalid bytes replaced), with line ends
+    normalized and control characters removed. {"text": its last MAX_PROGRESS_LOG_CHARS characters at most,
+    "chars": how many characters "text" holds, "truncated": whether the file holds more than that, "bytes": the
+    size of the whole file, "updatedAt": its modification time (UTC, ISO 8601), "version": a digest of "text",
+    which changes when it changes, "signature": (size, mtime_ns)}.
+    None: the file is not there, cannot be opened or read now, or changed since ``signature`` or while it was
+    read (the next check reads it again). The text is untrusted model output: shown, never run.
+    """
+
+    descriptor = _author_file_descriptor(Path(workspace) / MEMORY_FOLDER, PROGRESS_LOG)
+    if descriptor is None:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        current = (info.st_size, info.st_mtime_ns)
+        if signature is not None and tuple(signature) != current:
+            return None
+        start = max(0, info.st_size - PROGRESS_LOG_READ_BYTES)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        chunks, size = [], 0
+        while size < PROGRESS_LOG_READ_BYTES:
+            chunk = os.read(descriptor, PROGRESS_LOG_READ_BYTES - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    if (after.st_size, after.st_mtime_ns) != current or size != info.st_size - start:
+        return None  # Written meanwhile: read again at the next check.
+    data = b"".join(chunks)
+    skip = 0
+    while start and skip < min(3, len(data)) and 0x80 <= data[skip] < 0xC0:
+        skip += 1  # A read that starts inside the file begins at a character, not inside one.
+    text = data[skip:].decode("utf-8", errors="replace")
+    text = CHAT_CONTROL_CHARACTERS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    shown = text[-MAX_PROGRESS_LOG_CHARS:]
+    return {"text": shown, "chars": len(shown), "truncated": bool(start) or len(text) > len(shown),
+            "bytes": info.st_size, "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+            "version": hashlib.sha256(shown.encode("utf-8")).hexdigest()[:16], "signature": list(current)}
 
 
 def delivered_repair(record):
@@ -1197,7 +1312,9 @@ def default_prompts():
     """Read workflow prompts at use time, including edits made while serving."""
 
     global _last_default_prompts
-    author_critic = runtime.builtin_workflow("author_critic")["prompts"]
+    workflow = runtime.builtin_workflow("author_critic")
+    author_critic = workflow["prompts"]
+    binding = (workflow["nodes"].get("author") or {}).get("coordinator")
     prompts = {
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
@@ -1205,6 +1322,9 @@ def default_prompts():
         # The convention critic's prompt (its own step after the critic accepts); a template with {statement}.
         "convention": author_critic["convention_critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
+        # The author coordinator's first prompt (its coordinator binding's); a template with {author_subagents}.
+        # A workflow edited to bind none has none, which only a coordinator job needs (see _workflow_options).
+        "coordinator": author_critic.get(binding["prompt"] if isinstance(binding, dict) else "coordinator", ""),
     }
     _last_default_prompts = prompts
     return dict(prompts)  # Callers adjust their copy.
@@ -1274,6 +1394,10 @@ def web_prompt_options(body, roles, source=None):
 
 
 TRACE_LIMIT = 1500
+# The events of the subagents' own conversations (codex_event records with root false: the author's subagents,
+# the critic's independent critics) keep a window of their own, beside TRACE_LIMIT, so a busy team of subagents never
+# pushes the coordinator's own records out of the page's live window. transcript.jsonl keeps every record.
+SUBAGENT_TRACE_LIMIT = 300
 PINNED_KINDS = {
     "request", "review_result", "critic_result", "author_result",
     "final_result", "failure_result", "partial_result", "diagnostic", "error", "convention_result",
@@ -1331,6 +1455,12 @@ def same_convention_warning(saved, warning):
 
     return (isinstance(saved, dict) and isinstance(warning, dict) and saved.get("dismissed") is True
             and saved.get("time") == warning["time"] and saved.get("round") == warning["round"])
+
+
+def subagent_record(record):
+    """Whether a transcript record is an event of a subagent's own conversation (see SUBAGENT_TRACE_LIMIT)."""
+
+    return isinstance(record, dict) and record.get("kind") == "codex_event" and record.get("root") is False
 
 
 def bounded_pinned(pinned):
@@ -1408,6 +1538,13 @@ def important_record(record):
     if kind == "status" and record.get("root") is not False and record.get("subagentProgress") is True:
         # A round's critics (the critic's subagents) requested, started or finished: a few records per
         # attempt, which the job page's progress line reads while the critic's own events fill the window.
+        return True
+    if kind == "status" and record.get("root") is not False and record.get("authorSubagent") is True:
+        # One of the author's subagents started, finished or failed (workflow_runner.AuthorSubagents).
+        return True
+    if (kind == "status" and record.get("root") is not False and record.get("stage") != "conversation"
+            and record.get("label") in COORDINATOR_RECORD_LABELS):
+        # The author coordinator's time check, or a reply of it that named no proof file.
         return True
     if kind != "codex_event" or record.get("root") is False:
         return False
@@ -1596,7 +1733,35 @@ REVIEW_ONLY_GRAPH = {
 WORKFLOW_STAGES = ("review", "author", "critic", "writing")
 STAGE_ROLES = {"review": "review", "author": "author", "critic": "critic", "writing": "writer"}
 ROLE_STAGES = {role: stage for stage, role in STAGE_ROLES.items()}
-PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "convention": "critic", "final": "writer"}
+PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "convention": "critic", "final": "writer",
+                "coordinator": "author"}
+# The per-job prompts of the proof stages, saved as prompts/<name>.txt and passed as --<name>-prompt-file.
+PROOF_PROMPTS = ("author", "critic", "convention", "final", "coordinator")
+
+
+def recorded_author_mode(author_subagents, requested=None):
+    """The authorMode a job records when it starts (AUTHOR_MODES), for its number of author subagents.
+
+    ``requested`` None takes it from the number (coordinator with 1 or more); "author" keeps an author that
+    works alone (an older job and its continuations, or a terminal run's choice); "coordinator" needs 1 or more.
+    """
+
+    if requested not in (None, *AUTHOR_MODES):
+        raise ValueError("Choose coordinator or author as the author mode.")
+    if requested == "coordinator" and not author_subagents:
+        raise ValueError("The author coordinator needs Author subagents 1 or more.")
+    return "author" if requested == "author" or not author_subagents else "coordinator"
+
+
+def saved_author_mode(run_dir):
+    """The authorMode a saved job recorded (its controller's job-settings.json), "author" when it recorded none."""
+
+    try:
+        settings = json.loads(controlled_path(Path(run_dir), JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return "author"
+    mode = settings.get("authorMode") if isinstance(settings, dict) else None
+    return mode if mode in AUTHOR_MODES else "author"
 
 
 def normalize_workflow_stages(value=None):
@@ -1881,10 +2046,22 @@ def empty_state(trace=None, trace_version=0):
         "criticPrompt": prompts["critic"],
         "conventionPrompt": prompts["convention"],
         "finalPrompt": prompts["final"],
+        "coordinatorPrompt": prompts["coordinator"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
         "criticCount": DEFAULT_CRITIC_COUNT,
         # Subagents the proof author may start at a time (0: no subagent tool).
         "authorSubagents": DEFAULT_AUTHOR_SUBAGENTS,
+        # How the proof author works (AUTHOR_MODES), recorded when the job starts.
+        "authorMode": recorded_author_mode(DEFAULT_AUTHOR_SUBAGENTS),
+        # False for a saved job that never recorded its author mode (every job from before the coordinator): it
+        # stays a single author, also when its settings are revised, and saves none (see _save_job_settings).
+        "authorModeRecorded": True,
+        # The author coordinator's progress log as the job page shows it (read_progress_log() without its
+        # signature), or None until the file exists.
+        "coordinatorProgress": None,
+        # How a coordinator job's author works as its runner last reported it (follow_author_mode()): None, as
+        # recorded, or {"mode": "author", ...} when its model has no subagent tool. Kept in the state only.
+        "authorModeEffective": None,
         # False for a saved job that never recorded its number of critics (older jobs): the job page
         # does not credit it with independent critics it may never have run.
         "criticCountRecorded": True,
@@ -2659,6 +2836,9 @@ class App:
         self._chat_seen = {}
         # Read the answer files once more, at once, after the job ended (see collect_chat_answers).
         self._chat_final_pass = False
+        # The author coordinator's progress log as last read (read_progress_log()), whose text the page fetches apart
+        # from the state (progress_log()), and the (size, mtime_ns) it was read at (see collect_progress_log).
+        self._progress_signature = self._progress_log = None
         # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
         self._stop_in_place = False
 
@@ -2756,7 +2936,7 @@ class App:
         keys = (
             "reviewModel", "authorModel", "criticModel", "writerModel",
             "reasoningEffort", "reviewEffort", "authorEffort",
-            "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
+            "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents", "authorMode",
             "thinkingHours", "speedMode", "reasoningSummary",
             "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
             "workflowStages", "originalContent",
@@ -2772,6 +2952,9 @@ class App:
         # Stage outside the writable workspace so a same-UID sandboxed author
         # cannot alter temporary contents before the controller installs them.
         values = {key: options[key] for key in keys if key in options}
+        if options.get("authorModeRecorded") is False:
+            # A job from before the coordinator records no mode, so it stays a single author (see AUTHOR_MODES).
+            values.pop("authorMode", None)
         # Every save records the job's batch, whatever ``options`` holds.
         if self.batch_id:
             values["batch"] = self.batch_id
@@ -2986,7 +3169,8 @@ class App:
             descriptor = open_run_log(self.trace_file, os.O_RDONLY)
             if descriptor is None:
                 return [], 0, []
-            records, pinned, total = deque(maxlen=TRACE_LIMIT), [], 0
+            # The live window as add_trace keeps it, with each record's number (its line, as its traceVersion).
+            own, theirs, pinned, total = deque(maxlen=TRACE_LIMIT), deque(maxlen=SUBAGENT_TRACE_LIMIT), [], 0
             with os.fdopen(descriptor, encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     total += 1
@@ -2995,16 +3179,40 @@ class App:
                             record = json.loads(line)
                             if not readable_record(record):
                                 continue
-                            records.append(record)
+                            (theirs if subagent_record(record) else own).append((total, record))
                             if important_record(record):
                                 pinned.append(record)
                                 if len(pinned) > PINNED_LIMIT + PINNED_SLACK:
                                     pinned = bounded_pinned(pinned)
                     except (ValueError, RecursionError):
                         continue
-            return without_completed_deltas(list(records)), total, bounded_pinned(pinned)
+            entries = sorted([*own, *theirs], key=lambda entry: entry[0])
+            kept = {id(record) for record in without_completed_deltas([record for _, record in entries])}
+            entries = [entry for entry in entries if id(entry[1]) in kept]
+            records = [record for _, record in entries]
+            self._trace_index = (records, [number for number, _ in entries],
+                                 [sum(not subagent_record(record) for record in records),
+                                  sum(subagent_record(record) for record in records)])
+            return records, total, bounded_pinned(pinned)
         except OSError:
             return [], 0, []
+
+    def _trace_index_locked(self):
+        """(versions, counts) of the live window state["trace"]: each record's traceVersion, oldest first, and
+        how many records it holds of the job itself and of subagents (see add_trace).
+
+        A window that was replaced (a new run, a restored job) without its versions holds the newest records
+        without a gap.
+        """
+
+        trace = self.state["trace"]
+        index = getattr(self, "_trace_index", None)
+        if index is None or index[0] is not trace or len(index[1]) != len(trace):
+            version = self.state["traceVersion"]
+            subagents = sum(subagent_record(record) for record in trace)
+            index = self._trace_index = (trace, list(range(version - len(trace) + 1, version + 1)),
+                                         [len(trace) - subagents, subagents])
+        return index[1], index[2]
 
     def retained_trace(self):
         """Combine pinned milestones with the bounded recent-event window."""
@@ -3032,13 +3240,23 @@ class App:
                 line = json.dumps(entry) + "\n"  # A lone surrogate from a JSON escape stays escaped.
             replaced, notice = self._persist_trace(line, durable=entry.get("kind") != "codex_event")
             for added in (entry, notice) if notice else (entry,):
-                self.state["trace"].append(added)
-                self.state["trace"][:] = self.state["trace"][-TRACE_LIMIT:]
+                versions, counts = self._trace_index_locked()
+                trace = self.state["trace"]
+                trace.append(added)
+                self.state["traceVersion"] += 1
+                versions.append(self.state["traceVersion"])
+                # The live window keeps the newest TRACE_LIMIT records of the job itself and, apart, the newest
+                # SUBAGENT_TRACE_LIMIT of its subagents' conversations.
+                subagent = subagent_record(added)
+                counts[subagent] += 1
+                while counts[subagent] > (SUBAGENT_TRACE_LIMIT if subagent else TRACE_LIMIT):
+                    oldest = next(index for index, record in enumerate(trace) if subagent_record(record) == subagent)
+                    del trace[oldest], versions[oldest]
+                    counts[subagent] -= 1
                 if important_record(added):
                     self.pinned.append(added)
                     if len(self.pinned) > PINNED_LIMIT + PINNED_SLACK:
                         self.pinned = bounded_pinned(self.pinned)
-                self.state["traceVersion"] += 1
             self.state["lastActivityAt"] = entry["time"]
             if isinstance(record.get("node"), str) and record["node"]:
                 self.state["activeNode"] = record["node"]
@@ -3046,6 +3264,7 @@ class App:
                 self.state["round"] = record["round"]
             self.state["criticProgress"] = follow_critic_progress(self.state.get("criticProgress"), entry,
                                                                   self.state.get("criticCount"))
+            self.state["authorModeEffective"] = follow_author_mode(self.state.get("authorModeEffective"), entry)
             history = self.state.setdefault("timeLimitHistory", [])
             if follow_time_limit(history, entry) and self.run_dir:
                 # Saved batches read only recent records: the job settings keep the whole history.
@@ -3221,17 +3440,28 @@ class App:
                 and not (self.run_dir / "latex-source.tex").is_symlink()
             )
             trace, version = self.state["trace"], self.state["traceVersion"]
-            first = version - len(trace)
-            if isinstance(after, int) and first <= after <= version:
-                state["trace"], state["traceFrom"] = list(trace[after - first:]), after
+            versions, counts = self._trace_index_locked()
+            # The window holds every record newer than the newest one it left out (``complete``): a full copy
+            # names that version, so the page can take the copy's newest records as the ones it has not seen.
+            oldest = versions[0] - 1 if versions else version
+            complete = version
+            for number in reversed(versions):
+                if number != complete:
+                    break
+                complete -= 1
+            if isinstance(after, int) and oldest <= after <= version:
+                state["trace"], state["traceFrom"] = list(trace[bisect.bisect_right(versions, after):]), after
             else:
-                state["trace"], state["traceFrom"] = self.retained_trace(), first
-            if first > 0:
+                state["trace"], state["traceFrom"] = self.retained_trace(), complete
+            if version - len(trace) > 0:
                 # Older routine events left the live window: say so, and where the rest is.
                 state["traceTruncated"] = True
-                state["traceNotice"] = (f"Showing the latest {len(trace):,} of {version:,} events; every prompt, "
-                                        "result and error stays listed. The complete history is in this job's "
-                                        "transcript.jsonl.")
+                state["traceNotice"] = (
+                    (f"Showing {len(trace):,} of {version:,} events, with only the latest "
+                     f"{SUBAGENT_TRACE_LIMIT:,} of the subagents' own" if counts[1] >= SUBAGENT_TRACE_LIMIT
+                     else f"Showing the latest {len(trace):,} of {version:,} events")
+                    + "; every prompt, result and error stays listed. The complete history is in this job's "
+                      "transcript.jsonl.")
         # Policy metadata can hash the pinned Codex binary: never hold the job
         # lock (and its transcript reader) meanwhile. A policy that no longer
         # loads still shows the cutoff saved with the job.
@@ -3256,6 +3486,22 @@ class App:
                                  "items": items, "batch": batch}
         return state
 
+    def _kept_author_mode(self, requested, source=None, in_place=False):
+        """The author mode a start asks for (see recorded_author_mode()), keeping older single authors single.
+
+        A job revised in place (``in_place``) that never recorded a mode (a job from before the coordinator) or
+        whose author works alone with subagents (only such a job and a continuation of one have that), and a
+        continuation of the saved job ``source`` whose author worked alone, keep an author that works alone;
+        anything else asks for ``requested``.
+        """
+
+        if in_place and (not self.state.get("authorModeRecorded", True)
+                         or (self.state.get("authorMode") == "author" and self.state.get("authorSubagents"))):
+            return "author"
+        if source and saved_author_mode(source) == "author":
+            return "author"
+        return requested
+
     @staticmethod
     def _workflow_options(
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
@@ -3273,9 +3519,13 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
-        workflow_stages=None,
+        workflow_stages=None, coordinator_prompt=None, author_mode=None,
     ):
-        """Normalize and validate settings shared by both input modes."""
+        """Normalize and validate settings shared by both input modes.
+
+        ``author_mode`` is the author mode a start asks for (recorded_author_mode()); the coordinator prompt is
+        checked, and kept, only for a job whose author is a coordinator (else it is the default, unused).
+        """
 
         stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
             "review": include_review, "author": True, "critic": True, "writing": True}
@@ -3293,6 +3543,7 @@ class App:
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
             "critic": critic_prompt, "convention": convention_prompt, "final": final_prompt,
+            "coordinator": coordinator_prompt,
         }
         defaults = default_prompts()
         prompts = {
@@ -3329,7 +3580,9 @@ class App:
             raise ValueError(
                 "Choose Status only, Concise summaries, or Detailed summaries."
             )
-        required_prompts = [prompts[name] for name, role in PROMPT_ROLES.items() if role in role_models]
+        # The coordinator prompt is checked below, with the author mode.
+        required_prompts = [prompts[name] for name, role in PROMPT_ROLES.items()
+                            if role in role_models and name != "coordinator"]
         for name, role in PROMPT_ROLES.items():
             if role not in role_models:
                 prompts[name] = defaults[name]
@@ -3356,6 +3609,21 @@ class App:
             raise ValueError(str(exc)) from exc
         critic_count = valid_critic_count(critic_count) if stages["critic"] else DEFAULT_CRITIC_COUNT
         author_subagents = valid_author_subagents(author_subagents) if stages["author"] else DEFAULT_AUTHOR_SUBAGENTS
+        # A job without the Author stage has no author to coordinate.
+        author_mode = recorded_author_mode(author_subagents, author_mode) if stages["author"] else "author"
+        if author_mode == "coordinator":
+            coordinator = prompts["coordinator"]
+            if not coordinator:
+                raise ValueError("Every role prompt must contain instructions.")
+            if coordinator.count(runtime.MARKER) != 1:
+                raise ValueError(f"The coordinator prompt must contain exactly one {runtime.MARKER}.")
+            try:
+                runtime._template_parts(coordinator, {"author_subagents"})
+            except ValueError as exc:
+                raise ValueError(f"The coordinator prompt cannot be used ({exc}). Write {{author_subagents}} where the "
+                                 "number of author subagents goes, and double any other brace: {{ and }}.") from exc
+        else:
+            prompts["coordinator"] = defaults["coordinator"]
         try:
             if workflow_stages is not None and not stages["author"]:
                 thinking_hours = DEFAULT_THINKING_HOURS
@@ -3393,9 +3661,11 @@ class App:
             "criticPrompt": prompts["critic"],
             "conventionPrompt": prompts["convention"],
             "finalPrompt": prompts["final"],
+            "coordinatorPrompt": prompts["coordinator"],
             "criticRounds": critic_rounds,
             "criticCount": critic_count,
             "authorSubagents": author_subagents,
+            "authorMode": author_mode,
             "thinkingHours": thinking_hours,
             "speedMode": speed_mode,
             "reasoningSummary": reasoning_summary,
@@ -3423,7 +3693,7 @@ class App:
         revise_existing=False,
         workflow_stages=None, original_content=None, source_file=None,
         _prepare_only=False,
-        related_works=None, folder_batch=None,
+        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None,
     ):
         """Start the review and return immediately so the page can poll.
 
@@ -3461,7 +3731,7 @@ class App:
             author_effort = DEFAULT_REASONING_EFFORT
             critic_effort = DEFAULT_REASONING_EFFORT
             writer_effort = DEFAULT_REASONING_EFFORT
-            author_prompt = critic_prompt = final_prompt = convention_prompt = None
+            author_prompt = critic_prompt = final_prompt = convention_prompt = coordinator_prompt = None
             critic_rounds = DEFAULT_CRITIC_ROUNDS
             critic_count = DEFAULT_CRITIC_COUNT
             author_subagents = DEFAULT_AUTHOR_SUBAGENTS
@@ -3488,7 +3758,8 @@ class App:
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=stages,
+            workflow_stages=stages, coordinator_prompt=coordinator_prompt,
+            author_mode=self._kept_author_mode(author_mode, continuation_source, revise_existing),
         )
         options["originalContent"] = str(original_content if original_content is not None else (
             self.state.get("originalContent") or statement if revise_existing else statement))
@@ -3552,11 +3823,14 @@ class App:
             prompt_names = [name for name, role in PROMPT_ROLES.items() if stages[ROLE_STAGES[role]]]
             for name in prompt_names:
                 self._save_prompt(name, options[f"{name}Prompt"])
+            # A job from before the coordinator keeps saving no mode when it is revised in place (AUTHOR_MODES).
+            unrecorded = {"authorModeRecorded": False} if retry and not self.state.get("authorModeRecorded", True) else {}
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
                 "skipStatementReview": False,
                 "statementReviewOnly": review_only,
+                **unrecorded,
             })
             trace = self.state["trace"] if retry or self.fixed_trace else []
             version = self.state["traceVersion"] if retry or self.fixed_trace else 0
@@ -3571,6 +3845,7 @@ class App:
                 "reviewInputRecorded": True,
                 "statementReviewOnly": review_only,
                 **options,
+                **unrecorded,
                 "workflow": workflow_graph(stages),
                 "activeNode": "statement_reviewer",
                 "stage": "review",
@@ -3807,7 +4082,7 @@ class App:
             author_effort=state["authorEffort"], critic_effort=state["criticEffort"],
             writer_effort=state["writerEffort"], review_prompt=state["reviewPrompt"],
             author_prompt=state["authorPrompt"], critic_prompt=state["criticPrompt"],
-            convention_prompt=state.get("conventionPrompt"),
+            convention_prompt=state.get("conventionPrompt"), coordinator_prompt=state.get("coordinatorPrompt"),
             final_prompt=state["finalPrompt"], speed_mode=state["speedMode"],
             reasoning_summary=state["reasoningSummary"], workflow_stages=saved_workflow_stages(state),
             original_content=state.get("originalContent"), source_file=state.get("sourceFile"),
@@ -3934,6 +4209,8 @@ class App:
             "--critic-rounds", str(self.state["criticRounds"]),
             "--critic-count", str(self.state["criticCount"]),
             "--author-subagents", str(self.state.get("authorSubagents", DEFAULT_AUTHOR_SUBAGENTS)),
+            # Always the mode the job recorded, never the runner's own default (see AUTHOR_MODES).
+            "--author-mode", self.state.get("authorMode") if self.state.get("authorMode") in AUTHOR_MODES else "author",
             "--thinking-hours", str(self.state["thinkingHours"]),
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"],
@@ -3951,7 +4228,7 @@ class App:
             ])
         # Rewritten from the controller's copy at every launch: the author can
         # change the run folder's prompts, never the ones the runner reads.
-        for role in ("author", "critic", "convention", "final"):
+        for role in PROOF_PROMPTS:
             if not stages[ROLE_STAGES[PROMPT_ROLES[role]]]:
                 continue
             options.extend([
@@ -4907,7 +5184,7 @@ class App:
             statement = saved_statement(self.run_dir)
             self._check_historical_locked()
             self._check_launch_models_locked()
-            for role in ("author", "critic", "convention", "final"):
+            for role in PROOF_PROMPTS:
                 if not saved_workflow_stages(self.state)[ROLE_STAGES[PROMPT_ROLES[role]]]:
                     continue
                 self._save_prompt(role, self.state[f"{role}Prompt"])
@@ -5320,7 +5597,7 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
         workflow_stages=None, original_content=None,
-        related_works=None, folder_batch=None,
+        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None,
     ):
         """Send a statement directly to the proof author without review.
 
@@ -5354,6 +5631,14 @@ class App:
                                                   != original_template.strip()):
                     raise ValueError("A continued author must keep its original author prompt; start a new job to change it.")
                 author_prompt = original_template
+            saved_coordinator = controlled_path(continuation_source, "prompts/coordinator.txt")
+            if saved_coordinator.is_file() and saved_author_mode(continuation_source) == "coordinator":
+                # A continued coordinator keeps its first prompt, as a continued author does.
+                original_coordinator = read_utf8(saved_coordinator, "saved coordinator prompt")
+                if coordinator_prompt is not None and str(coordinator_prompt).strip() != original_coordinator.strip():
+                    raise ValueError("A continued coordinator must keep its original coordinator prompt; start a new "
+                                     "job to change it.")
+                coordinator_prompt = original_coordinator
         options = self._workflow_options(
             critic_rounds=critic_rounds,
             critic_count=critic_count,
@@ -5374,7 +5659,8 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=stages,
+            workflow_stages=stages, coordinator_prompt=coordinator_prompt,
+            author_mode=self._kept_author_mode(author_mode, continuation_source),
         )
         options["sourceFile"] = source_file
         options["originalContent"] = str(original_content if original_content is not None else statement)
@@ -5394,7 +5680,7 @@ class App:
             )
             if continuation_source:
                 options.update(saved_goal_options(continuation_source))
-            for name in ("author", "critic", "convention", "final"):
+            for name in PROOF_PROMPTS:
                 if not stages[ROLE_STAGES[PROMPT_ROLES[name]]]:
                     continue
                 self._save_prompt(name, options[f"{name}Prompt"])
@@ -5643,7 +5929,7 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
-        workflow_stages=None, original_content=None,
+        workflow_stages=None, original_content=None, coordinator_prompt=None, author_mode=None,
     ):
         """Create a new job that audits one complete saved candidate proof; its critic starts afresh."""
 
@@ -5675,7 +5961,8 @@ class App:
             reasoning_summary=reasoning_summary,
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
-            workflow_stages=workflow_stages,
+            workflow_stages=workflow_stages, coordinator_prompt=coordinator_prompt,
+            author_mode=self._kept_author_mode(author_mode, source_run),
         )
         options["originalContent"] = original_content if original_content is not None else solution
         if options["retrievalMode"] == "historical":
@@ -5697,7 +5984,7 @@ class App:
                 # It shares its source's workspace, and so its folder batch's related works.
                 if saved_folder_batch(source_run):
                     options["folderBatch"] = saved_folder_batch(source_run)
-            for name in ("author", "critic", "convention", "final"):
+            for name in PROOF_PROMPTS:
                 if not options["workflowStages"][ROLE_STAGES[PROMPT_ROLES[name]]]:
                     continue
                 self._save_prompt(name, options[f"{name}Prompt"])
@@ -6986,6 +7273,47 @@ class App:
                 except OSError:
                     pass  # The chat keeps the answer; only its activity record is missing.
 
+    def collect_progress_log(self):
+        """Show the author coordinator's progress log anew when it changed (the server's tick, about once a second).
+
+        A coordinator job (authorMode "coordinator") reads memory/progress.md in its author's working folder
+        (read_progress_log()) whenever its size or modification time changed, outside the job lock; the job's
+        state keeps what the page shows of it but its text (coordinatorProgress: PROGRESS_LOG_FIELDS, None while
+        there is no file), and progress_log() gives the text. A file that could not be read this time (it changed
+        while it was read) is read again at the next check.
+        """
+
+        with self.lock:
+            # Also for a job another process runs (a terminal run): reading the file changes nothing.
+            if self.run_dir is None or self.state.get("authorMode") != "coordinator" or self.state.get("readOnly"):
+                return
+            # A state rebuilt since (a new step of the job) shows no log: it is read again.
+            known = self._progress_signature if self.state.get("coordinatorProgress") is not None else None
+            workspace = self._author_workspace()
+        # The file system is read outside the lock: polls never wait for it.
+        signature = progress_log_signature(workspace)
+        if signature == known:
+            return
+        log = read_progress_log(workspace, signature) if signature is not None else None
+        if signature is not None and log is None:
+            return  # Not readable this time: the next check reads it again.
+        with self.lock:
+            self._progress_signature, self._progress_log = signature, log
+            self.state["coordinatorProgress"] = (None if log is None else
+                                                 {key: log[key] for key in PROGRESS_LOG_FIELDS})
+
+    def progress_log(self):
+        """The author coordinator's progress log as the job page shows it (GET /progress-log): the state's
+        coordinatorProgress with its text, {"text", "updatedAt", "truncated", "chars", "bytes", "version"}, or
+        {"text": None, "version": None} while the job shows none. /state carries only the version, so the page
+        fetches the text (at most MAX_PROGRESS_LOG_CHARS characters) when it changes or the job page opens."""
+
+        with self.lock:
+            shown, log = self.state.get("coordinatorProgress"), self._progress_log
+            if not isinstance(shown, dict) or log is None or log.get("version") != shown.get("version"):
+                return {"text": None, "version": None}
+            return {**shown, "text": log["text"]}
+
     def open_chat_answer(self, identity):
         """The whole answer file of one answered chat message, opened for a download: (binary stream, size)."""
 
@@ -7205,6 +7533,10 @@ class App:
         options = [
             "--converse",
             "--author-model", self.state["authorModel"], "--author-effort", self.state["authorEffort"],
+            # The coordinator's summary prompt for a coordinator job (the turn itself has no subagents), the
+            # author's for one whose author works alone, as its runner reported (follow_author_mode()).
+            "--author-mode", "author" if self.state.get("authorModeEffective")
+            else self.state.get("authorMode") if self.state.get("authorMode") in AUTHOR_MODES else "author",
             "--reasoning-effort", self.state["reasoningEffort"],
             "--reasoning-summary", self.state["reasoningSummary"], "--speed", self.state["speedMode"],
             "--thinking-hours", "0",
@@ -8027,6 +8359,8 @@ def saved_setting_problem(key, value):
             valid = isinstance(value, int) and valid_author_subagents(value) == value
         except ValueError:
             valid = False
+    elif key == "authorMode":
+        valid = value in AUTHOR_MODES
     elif key.endswith(("Model", "Effort")) or key in {
             "speedMode", "reasoningSummary", "problemMode", "goalThreadId", "goalWorkspace",
             "authorSteerDelivered", "resumedAt", "launchError"}:
@@ -8281,7 +8615,7 @@ def restore_saved_app(app, *, owned=True):
             for key in (
                 "reviewModel", "authorModel", "criticModel", "writerModel",
                 "reasoningEffort", "reviewEffort", "authorEffort",
-                "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents",
+                "criticEffort", "writerEffort", "criticRounds", "criticCount", "authorSubagents", "authorMode",
                 "thinkingHours", "speedMode", "reasoningSummary",
                 "problemMode", "skipStatementReview", "statementReviewOnly", "preparedRun",
                 "workflowStages", "originalContent",
@@ -8349,7 +8683,7 @@ def restore_saved_app(app, *, owned=True):
             # Its web-cutoff policy may be among the lost settings: never run it as a live search.
             state["launchHold"] = (f"The saved settings ({JOB_SETTINGS_FILENAME}) of this run cannot be read, so "
                                    "its web-cutoff policy is unknown. Restore them before launch.")
-    for name in ("review", "author", "critic", "convention", "final"):
+    for name in ("review", *PROOF_PROMPTS):
         prompt_path = controlled_path(run_dir, f"prompts/{name}.txt")
         try:
             # A retired default gives way to the current one (see current_prompt).
@@ -8418,6 +8752,13 @@ def restore_saved_app(app, *, owned=True):
         state["workflowStages"][name] for name in ("author", "critic", "writing"))
     state["criticCountRecorded"] = "criticCount" in persisted_settings
     state["authorSubagentsRecorded"] = "authorSubagents" in persisted_settings
+    # A job saved without these is older than the author coordinator: its author works alone, with the number of
+    # subagents it saved (none when it saved no number). It is never resumed or continued as a coordinator.
+    if "authorSubagents" not in persisted_settings:
+        state["authorSubagents"] = 0
+    state["authorModeRecorded"] = "authorMode" in persisted_settings
+    if not state["authorModeRecorded"] or not state["authorSubagents"]:
+        state["authorMode"] = "author"
     state["originalContent"] = state.get("originalContent") or state.get("draft", "")
     state["workflow"] = workflow_graph(state["workflowStages"])
 
@@ -8441,6 +8782,7 @@ def restore_saved_app(app, *, owned=True):
     stop_in_force = False
     for record in _iter_run_records(run_dir):
         follow_time_limit(state["timeLimitHistory"], record)
+        state["authorModeEffective"] = follow_author_mode(state.get("authorModeEffective"), record)
         if controller_note(record):
             continue
         label = record.get("label")
@@ -9042,7 +9384,7 @@ def saved_critic_source(path):
     statement = saved_statement(run_dir)
     defaults = default_prompts()
     prompts = {}
-    for name in ("author", "critic", "convention", "final"):
+    for name in PROOF_PROMPTS:
         prompt_path = controlled_path(run_dir, f"prompts/{name}.txt")
         prompts[name] = current_prompt(name, (
             read_utf8(prompt_path, f"saved {name} prompt")
@@ -9056,6 +9398,7 @@ def saved_critic_source(path):
         "critic_prompt": prompts["critic"],
         "convention_prompt": prompts["convention"],
         "final_prompt": prompts["final"],
+        "coordinator_prompt": prompts["coordinator"],
     }
 
 
@@ -9081,8 +9424,11 @@ def saved_research_source(path):
             settings[f"{role}Model"] = restored_model(saved)
             if settings[f"{role}Model"] != saved:
                 replaced.append(role)
+    # A job saved without its number of author subagents (older than that setting) had none, as when it is
+    # restored: a continuation of it never gets the new default's subagents (see AUTHOR_MODES).
+    settings.setdefault("authorSubagents", 0)
     defaults = default_prompts()
-    for role in ("author", "critic", "convention", "final"):
+    for role in PROOF_PROMPTS:
         path = controlled_path(source, f"prompts/{role}.txt")
         settings[f"{role}Prompt"] = current_prompt(role, (
             read_utf8(path, f"saved {role} prompt") if path.exists()
@@ -9520,7 +9866,8 @@ class Server(ThreadingHTTPServer):
 
     def _tick_jobs(self):
         """Keep machine sleep out of working jobs' active time; save transcript lines a failed write kept;
-        close the author questions whose author no longer waits for them."""
+        close the author questions whose author no longer waits for them; show the authors' chat answers and
+        the coordinators' progress logs."""
 
         slept = self._sleep.slept()
         with self.jobs_lock:
@@ -9534,6 +9881,10 @@ class Server(ThreadingHTTPServer):
                 app.collect_chat_answers()
             except Exception:
                 traceback.print_exc()  # One job's answer files never stop the other jobs' tick.
+            try:
+                app.collect_progress_log()
+            except Exception:
+                traceback.print_exc()  # Nor does one coordinator's progress log.
 
     def _adopt_released_runs(self):
         """Take over each job another process owned, once that process has let it go."""
@@ -9762,8 +10113,7 @@ class Server(ThreadingHTTPServer):
             author_effort=body.get("authorEffort", legacy_effort),
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("review", "author", "critic", "convention", "final"),
-                                 app.state if run_id else None),
+            **web_prompt_options(body, ("review", *PROOF_PROMPTS), app.state if run_id else None),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -9813,7 +10163,7 @@ class Server(ThreadingHTTPServer):
                 "retrievalCutoffUtc")}
             effective_body = {**defaults, **effective_body}
         options = self._direct_options(effective_body)
-        options.update(web_prompt_options(effective_body, ("author", "critic", "convention", "final"), app.state if run_id else None))
+        options.update(web_prompt_options(effective_body, PROOF_PROMPTS, app.state if run_id else None))
         options["workflow_stages"] = stages
         options["original_content"] = app.state.get("originalContent") or content if run_id else content
         options["source_file"] = body.get("sourceFile", app.state.get("sourceFile") if run_id else None)
@@ -9864,7 +10214,7 @@ class Server(ThreadingHTTPServer):
             "author_effort": body.get("authorEffort", legacy_effort),
             "critic_effort": body.get("criticEffort", legacy_effort),
             "writer_effort": body.get("writerEffort", legacy_effort),
-            **web_prompt_options(body, ("author", "critic", "convention", "final")),
+            **web_prompt_options(body, PROOF_PROMPTS),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
@@ -10156,6 +10506,7 @@ class Server(ThreadingHTTPServer):
             ),
             convention_prompt=settings.get("conventionPrompt", source["convention_prompt"]),
             final_prompt=settings.get("finalPrompt", source["final_prompt"]),
+            coordinator_prompt=settings.get("coordinatorPrompt", source.get("coordinator_prompt")),
             speed_mode=settings.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=settings.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -10196,6 +10547,7 @@ class Server(ThreadingHTTPServer):
             critic_prompt=options.get("criticPrompt"),
             convention_prompt=options.get("conventionPrompt"),
             final_prompt=options.get("finalPrompt"),
+            coordinator_prompt=options.get("coordinatorPrompt"),
             speed_mode=options.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=options.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             continuation_source=source["run_dir"], stopped_stage="solve",
@@ -10400,7 +10752,7 @@ class Server(ThreadingHTTPServer):
                 "criticRounds", "criticCount", "authorSubagents", "thinkingHours", "authorModel",
                 "criticModel", "writerModel", "reasoningEffort",
                 "authorEffort", "criticEffort", "writerEffort",
-                "speedMode", "reasoningSummary", "authorPrompt",
+                "speedMode", "reasoningSummary", "authorPrompt", "coordinatorPrompt",
                 "workflowStages", "originalContent",
             )
         }
@@ -10774,6 +11126,7 @@ class Server(ThreadingHTTPServer):
                 critic_prompt=source_state["criticPrompt"],
                 convention_prompt=source_state.get("conventionPrompt"),
                 final_prompt=source_state["finalPrompt"],
+                coordinator_prompt=source_state.get("coordinatorPrompt"),
                 review_only=source_state["statementReviewOnly"],
                 workflow_stages=source_state["workflowStages"],
                 original_content=source_state.get("originalContent"),
@@ -10797,6 +11150,7 @@ class Server(ThreadingHTTPServer):
                 "critic_prompt": source_state["criticPrompt"],
                 "convention_prompt": source_state.get("conventionPrompt"),
                 "final_prompt": source_state["finalPrompt"],
+                "coordinator_prompt": source_state.get("coordinatorPrompt"),
                 "workflow_stages": {**source_state["workflowStages"], "review": False},
                 "original_content": source_state.get("originalContent"),
                 **common,
@@ -11505,6 +11859,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": str(exc), **exc.body}, status=exc.status)
             except Exception as exc:  # Setup prints nothing to the terminal: the page says what failed.
                 return self.send({"error": f"Setup failed ({type(exc).__name__})"}, status=500)
+        if request.path == "/progress-log":
+            # The author coordinator's progress log of one job, whose version /state carries (App.progress_log()).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(self.server.get_job(run_id).progress_log())
+            except ValueError as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/chat-answer":
             # The whole answer file of one chat message (the chat shows at most MAX_CHAT_ANSWER_CHARS of it).
             if not self.authorized():

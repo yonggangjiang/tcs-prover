@@ -34,6 +34,8 @@ let state = {phase: 'input'};
 let promptValues = {review: 'Review.', author: 'Author.'}, promptOverrides = {};
 const ui = new Proxy({}, {get: (target, name) => target[name] ||= new Element()});
 Object.assign(ui.thinkingHours, {value: '0', max: ''});
+// As index.html has it: Start refuses an Author subagents field that holds no whole number.
+Object.assign(ui.authorSubagents, {value: '3', min: '0', max: '10'});
 ui.criticRounds.value = '2';
 ui.check.textContent = 'Start workflow';
 const chooseStages = (values = {}) => {
