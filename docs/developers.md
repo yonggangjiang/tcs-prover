@@ -620,16 +620,26 @@ that every prompt and tool text is the user's to adjust. What the code does:
   (`_author_thread_options(builtin_agents=False)`): one without the
   `multi_agent` feature (an author that works alone, with Author subagents 0 or
   a model that gets no subagent tool, and a coordinator with TCS Prover's team),
-  live or web cutoff, and every reply turn of a paused author. Without it Codex
-  0.160 gives a model of multi-agent version 2 (GPT 6.x) its collaboration tools
-  (`spawn_agent`, `wait_agent`, ...) also with `multi_agent` off and with a
-  web-cutoff run's settings, where a session limit of one thread refuses every
-  spawn. An author with Codex's own subagents keeps them: a web-cutoff
-  coordinator, the coordinator of a job from before TCS Prover's team, and an
-  author of `--author-mode author` with subagents. The setting belongs to the
-  thread, so Codex's effective settings (`config/read`), which a web-cutoff
-  run's audit compares, do not show it (checked with the real Codex). Team
-  members get `-c agents.enabled=false` (see above).
+  live or web cutoff. Without it Codex 0.160 gives a model of multi-agent
+  version 2 (GPT 6.x) its collaboration tools (`spawn_agent`, `wait_agent`, ...)
+  also with `multi_agent` off and with a web-cutoff run's settings, where a
+  session limit of one thread refuses every spawn. An author with Codex's own
+  subagents keeps them: a web-cutoff coordinator, the coordinator of a job from
+  before TCS Prover's team, and an author of `--author-mode author` with
+  subagents. The setting belongs to the thread, so Codex's effective settings
+  (`config/read`), which a web-cutoff run's audit compares, do not show it, and
+  Codex keeps it with the thread for good: once a start or resume of the thread
+  has it, no later `thread/resume`, even with `agents.enabled = true`, offers
+  the thread's model those tools again (both checked with the real Codex). So a
+  reply turn of a paused author (a reply, a progress summary, the time limit's
+  summary) sends no agents setting and leaves the thread's own: none of the
+  tools for an author whose own thread has them off, and, as before, the tools
+  for an author with Codex's own subagents, which a reply turn with them off
+  would take for the rest of the job. A spawn in such a reply turn is refused
+  (`multi_agent` off and a session limit of one thread: Codex 0.160 answered
+  "collab spawn failed: agent thread limit reached"), and the author resumed
+  after it starts its subagents again. Team members get
+  `-c agents.enabled=false` (see above).
 - **Checked with the real Codex 0.160** (the installed binary against a scripted
   model server, no model): it starts the bridge from the settings of
   `thread/start` and of `thread/resume` (a resumed thread gets the new address

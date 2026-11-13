@@ -466,8 +466,10 @@ class CodexConversationTests(unittest.TestCase):
                                   "multi_agent_v2": {"max_concurrent_threads_per_session": 1}})
                 self.assertIn(("-c", "features.multi_agent_v2.max_concurrent_threads_per_session=1"),
                               pairs(command))
-                # And none of Codex's collaboration tools reaches the reply turn: Codex's agents are off.
-                self.assertEqual(resumed["config"]["agents"], {"enabled": False})
+                # Codex's agents setting stays the thread's, as the author's own launches set it: Codex keeps
+                # agents.enabled = false with a thread for good, so a reply turn with it would take Codex's own
+                # subagents from an author that has them for the rest of the job (tests/test_author_coordinator.py).
+                self.assertNotIn("agents", resumed["config"])
                 self.assertIn("config/read", self.methods(double))
                 if platform == "darwin":
                     self.assertNotIn("sandbox", resumed)
@@ -492,8 +494,8 @@ class CodexConversationTests(unittest.TestCase):
         resumed = next(params for method, params in double.rpc.calls if method == "thread/resume")
         self.assertEqual(resumed["sandbox"], "workspace-write")
         self.assertTrue(resumed["config"]["features"]["multi_agent"])
-        # A reply turn starts no subagent of Codex all the same.
-        self.assertEqual(resumed["config"]["agents"], {"enabled": False})
+        # And Codex's agents setting of the thread, as for every reply turn.
+        self.assertNotIn("agents", resumed["config"])
 
     def test_the_reply_is_the_final_answer_or_else_the_last_text(self):
         commentary = goal_test.answer("Reading my notes.", "commentary")
@@ -734,14 +736,11 @@ class HistoricalConversationTests(unittest.TestCase):
         self.assertNotIn("code_mode", argv)
         self.assertEqual(keywords, goal_keywords)
         self.assertEqual(keywords["env"], self.child_environment)
-        # The same historical profile, but no subagent of Codex in the reply turn (a thread setting, which the
-        # audit's config/read does not show), where the coordinator keeps Codex's own.
-        resumed = lambda calls: json.loads(json.dumps(next(params for method, params in calls
-                                                           if method == "thread/resume")))
-        reply_options, author_options = resumed(double.rpc.calls), resumed(goal_double.rpc.calls)
-        self.assertEqual(reply_options["config"].pop("agents"), {"enabled": False})
-        self.assertNotIn("agents", author_options["config"])
-        self.assertEqual(reply_options, author_options)
+        # The same historical profile, Codex's agents setting included: the coordinator keeps Codex's own subagents
+        # after the reply turn (Codex keeps agents.enabled = false with a thread for good).
+        resumed = lambda calls: next(params for method, params in calls if method == "thread/resume")
+        self.assertNotIn("agents", resumed(double.rpc.calls)["config"])
+        self.assertEqual(resumed(double.rpc.calls), resumed(goal_double.rpc.calls))
         self.assertEqual(resumed(double.rpc.calls)["permissions"], retrieval_runtime.PROFILE)
         self.assertNotIn("sandbox", resumed(double.rpc.calls))
         # No turn sandbox policy replaces it (a live run's legacy read-only turn sets one).

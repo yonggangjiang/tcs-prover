@@ -323,8 +323,9 @@ CONVERSATION_MAX_CHARS = 12000
 # A live run's conversation turn is read-only and has no subagents (Codex: a
 # read-only permission profile with multi_agent off; Claude: Read and the run's
 # search tools). False gives it the author's own tools instead. Web-cutoff runs
-# always use the author's audited launch. Either way a Codex turn has Codex's
-# agents off, so none of its collaboration tools (_author_thread_options()).
+# always use the author's audited launch. Either way a Codex turn leaves Codex's
+# agents setting to the thread, as the author's own launches set it
+# (_author_thread_options()).
 CONVERSATION_READ_ONLY = True
 
 # Appended to the pause reason of a Codex author whose saved thread ID is
@@ -4698,15 +4699,19 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     a nonempty ``compact_prompt`` is Codex's compact_prompt setting.
     ``builtin_agents`` False (a process that starts no subagent of Codex:
     an author without the multi_agent feature, such as one that works alone
-    or a coordinator with TCS Prover's team, and every reply turn) turns
-    Codex's agents off in its thread (agents.enabled): without the
-    multi_agent feature, Codex 0.160 still gives a model of multi-agent
-    version 2 its collaboration tools (spawn_agent, wait_agent, ...) and
-    tells it that it is the root of a team that can spawn sub-agents, also
-    with a web-cutoff run's settings (captured with the real Codex against
-    a scripted model server); with agents off it gets neither. A thread
-    setting, it is not among Codex's effective settings (config/read), which
-    a web-cutoff run's audit compares.
+    or a coordinator with TCS Prover's team) turns Codex's agents off in its
+    thread (agents.enabled): without the multi_agent feature, Codex 0.160
+    still gives a model of multi-agent version 2 its collaboration tools
+    (spawn_agent, wait_agent, ...) and tells it that it is the root of a
+    team that can spawn sub-agents, also with a web-cutoff run's settings
+    (captured with the real Codex against a scripted model server); with
+    agents off it gets neither. A thread setting, it is not among Codex's
+    effective settings (config/read), which a web-cutoff run's audit
+    compares. Codex keeps it with the thread for good: no later
+    thread/resume, even with agents.enabled true, offers the thread's model
+    those tools again (captured too). True sends no agents setting, which
+    leaves a resumed thread's own, as a reply turn does
+    (author_conversation()).
     """
 
     limits = author_limits(features, settings)
@@ -4760,8 +4765,7 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     if compact_prompt and compact_prompt.strip():
         thread_options["config"]["compact_prompt"] = compact_prompt
     if not builtin_agents:
-        # No subagent of Codex's own (an author alone, TCS Prover's team, a reply turn): none of its collaboration
-        # tools.
+        # No subagent of Codex's own (an author alone, TCS Prover's team): none of its collaboration tools.
         thread_options["config"]["agents"] = {"enabled": False}
     thread_options["config"]["features"].update(apps=False, plugins=False, view_image=False)
     # The confined profile where Codex supports one, selected exactly as the historical profile is; none of
@@ -5624,8 +5628,12 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
     A live run's turn is read-only and has no subagents
     (CONVERSATION_READ_ONLY); a web-cutoff run's uses the author's audited
     launch and profile, verified at the handshake and again before the turn.
-    No turn gets Codex's collaboration tools: its thread has Codex's agents
-    off (_author_thread_options()).
+    The turn sends no agents setting of Codex, so the thread keeps the one
+    its author's own launches gave it: off for an author that starts no
+    subagent of Codex, on for one that does (Codex keeps agents off with a
+    thread for good, so a turn that turned them off would take Codex's own
+    subagents from that author for the rest of the job; see
+    _author_thread_options()).
     ``rewind`` names a failed empty turn to remove first (thread/revert);
     ``classic`` starts a live run's Codex with the classic shell tool. Every
     record has stage "conversation", node "author" and the conversationId.
@@ -5735,10 +5743,13 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         _initialize_author_rpc(runtime, rpc, policy=policy, role="author", child_environment=child_environment,
                                api_model=api_model,
                                agent_limits=subagent_limits(launch_features, settings.get("subagents")))
+        # No agents setting: Codex keeps agents.enabled = false with the thread for good, so a reply turn with it
+        # would take Codex's own subagents from an author that has them (a web-cutoff coordinator, the coordinator
+        # of a job from before TCS Prover's team, --author-mode author with subagents) for the rest of the job.
         thread_options = _author_thread_options(
             runtime, rpc, directory=directory, policy=policy, role="author", model=model, settings=settings,
             summary=summary, features=launch_features, classic=classic, emit=emit, read_only=restricted,
-            environment=child_environment, goals=not tcs, builtin_agents=False)
+            environment=child_environment, goals=not tcs, builtin_agents=True)
         # Codex's legacy read-only sandbox (no confined profile) gets its network setting with the turn.
         turn_sandbox = ({"sandboxPolicy": legacy_read_only_policy(live_network(directory))}
                         if thread_options.get("sandbox") == "read-only" else {})

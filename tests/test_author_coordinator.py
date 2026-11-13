@@ -6,6 +6,7 @@ against the stand-in CLI of tests/test_claude_cli.py; goal sessions and conversa
 regression could start a CLI. No model is started.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -563,6 +564,14 @@ def collab(tool, receivers=(), prompt=None, states=None, status="completed", **p
         "agentsStates": states or {}}, **params)
 
 
+def keeps_codex_subagent_tools(launches):
+    """Whether Codex 0.160 still offers a thread's model its subagent tools after ``launches``, the params of the
+    thread's thread/start and thread/resume calls in order: one with agents.enabled false takes them for good, also
+    from a later resume with agents.enabled true (captured with the real Codex against a scripted model server)."""
+
+    return not any((params["config"].get("agents") or {}).get("enabled") is False for params in launches)
+
+
 PROMPTS = {**goal_test.PROMPTS, "continuation": "Keep coordinating the team.",
            "checkin": COORDINATOR_PROMPTS["coordinator_checkin"]}
 SETTINGS = {"model": "gpt-6.1-sol", "effort": "high", "speed": "standard", "summary": "concise", "subagents": 3}
@@ -1053,6 +1062,72 @@ class CodexCoordinatorTests(unittest.TestCase):
         # The audit checks exactly these settings, at the start and before every turn.
         self.assertGreaterEqual(len(checked), 3)
         self.assertTrue(all(limits == expected for limits in checked))
+
+    def test_after_a_reply_turn_an_author_with_codex_s_own_subagents_still_has_them(self):
+        # A reply turn of the paused author (a reply, a progress summary, the time limit's summary) sends no agents
+        # setting: Codex keeps agents.enabled = false with the thread for good (keeps_codex_subagent_tools()), so
+        # one would leave a coordinator of a job from before TCS Prover's team or of a web-cutoff run, and an author
+        # of --author-mode author with subagents, without Codex's subagents for the rest of the job. An author alone
+        # has them off from its own start.
+        locked = {"approval_policy": "never", "default_permissions": retrieval_runtime.PROFILE,
+                  "web_search": "disabled", "features": {"multi_agent": True, "shell_tool": True}}
+
+        def web_cutoff(stack):
+            for target, name, value in (
+                    (runtime, "retrieval_policy", mock.Mock(return_value={"isolation": {"workspace": "/run"},
+                                                                          "runId": "P01"})),
+                    (retrieval_runtime, "codex_executable", mock.Mock(return_value="/pinned/codex")),
+                    (retrieval_runtime, "preflight", mock.Mock(side_effect=lambda *args, **kwargs: {
+                        "CODEX_HOME": str(self.directory / "codex-home")})),
+                    (retrieval_runtime, "configuration", mock.Mock(side_effect=lambda policy, role: json.loads(
+                        json.dumps(locked)))),
+                    (retrieval_runtime, "verify_rpc", mock.Mock())):
+                stack.enter_context(mock.patch.object(target, name, value))
+
+        reply_settings = {key: SETTINGS[key] for key in ("model", "effort", "speed", "summary")}
+        for policy, coordinator, features, subagents in (
+                (False, True, ["multi_agent"], 3), (True, True, ["multi_agent"], 3),
+                (False, False, ["multi_agent"], 3), (False, False, [], 0)):
+            with self.subTest(web_cutoff=policy, coordinator=coordinator, subagents=subagents), \
+                    contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {"TCS_PROVER_RETRIEVAL_MODE": "live"}))
+                os.environ.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
+                if policy:
+                    web_cutoff(stack)
+                doubles = []
+                for step in ("start", "reply", "resume"):
+                    if step == "reply":
+                        double = conversation_test.Codex([conversation_test.reply()])
+                        runtime.author_conversation(
+                            double, "Summarize your progress.", settings=reply_settings,
+                            options={"goal_cwd": str(self.directory), "goal_thread_id": "thread-1"}, features=[],
+                            conversation_id=conversation_test.CONVERSATION_ID, label="Progress summary requested")
+                    else:
+                        double = Coordinator([goal_test.success(POINTER)])
+                        session = runtime.goal_session(
+                            double, "Coordinate the team on S.", prompts=PROMPTS,
+                            settings={**SETTINGS, "subagents": subagents}, features=features, coordinator=coordinator,
+                            options={"goal_cwd": str(self.directory), **({} if step == "start" else {
+                                "goal_thread_id": "thread-1", "goal_resume": True, "goal_require_resume": True})})
+                        self.addCleanup(session.close)
+                        self.assertEqual(next(session)["output"], POINTER)
+                    doubles.append(double)
+                launches = [(method, params) for double in doubles for method, params in double.rpc.calls
+                            if method in {"thread/start", "thread/resume"}]
+                self.assertEqual([method for method, _ in launches], ["thread/start", "thread/resume", "thread/resume"])
+                launches = [params for _, params in launches]
+                if features:
+                    # No launch of its thread took them, and it is resumed with them, as at its start.
+                    self.assertTrue(keeps_codex_subagent_tools(launches))
+                    self.assertTrue(launches[2]["config"]["features"]["multi_agent"])
+                    self.assertEqual(launches[2]["config"]["agents"],
+                                     {"max_concurrent_threads_per_session": 3, "max_depth": 1})
+                else:
+                    # Its own start took them.
+                    self.assertEqual(launches[0]["config"]["agents"], {"enabled": False})
+                    self.assertFalse(keeps_codex_subagent_tools(launches[:1]))
+                # The reply turn leaves the thread's own setting.
+                self.assertNotIn("agents", launches[1]["config"])
 
     def test_a_root_that_waits_silently_for_its_subagents_goes_on_while_codex_answers(self):
         # Scaled down: 0.2 s without an event starts a check, which must be answered within 0.5 s.

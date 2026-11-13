@@ -176,8 +176,8 @@ class AuthorTests(network.Folders):
                     self.assertEqual(agent_flags(argv), limit_flags(0))
                     self.assertIn(["--disable", "multi_agent"], pairs(argv))
                     self.assertFalse(resumed["config"]["features"]["multi_agent"])
-                    # Nor any collaboration tool of Codex: its agents are off.
-                    self.assertEqual(resumed["config"]["agents"], {"enabled": False})
+                    # Codex's agents setting stays the thread's, which keeps the author's Codex subagents for later.
+                    self.assertNotIn("agents", resumed["config"])
                     if platform == "darwin":
                         profile = resumed["config"]["permissions"][runtime.PRIVATE_PERMISSIONS]
                         self.assertEqual(profile.get("network"), {"enabled": True} if mode == "live" else None)
