@@ -110,28 +110,43 @@ prompts:
 
     STATEMENT:
     [STATEMENT]
+  # EDIT AUTHOR GOAL HERE: the author's goal: the objective of Codex's goal mode (Goal loop Codex), the
+  # {objective} of goal_continuation (Goal loop TCS Prover) and of Claude Code's goal note. Placeholders of
+  # the lifecycle prompts: {original_prompt} (the first prompt), {directory}, {solution}, {bugs}, {round},
+  # {revision_number} and {instruction}.
   goal: >-
     Prove the exact statement given in the initial prompt with a complete,
     rigorous argument. Do not give up: think deeply and hard, and try
     substantially different approaches until the proof is complete.
+  # EDIT AUTHOR CONTINUATION HERE: sent after an author turn that did not end the goal: TCS Prover's goal
+  # loop places it first in goal_continuation; Codex's goal mode sends it only when Codex does not continue
+  # by itself; Claude Code gets it as it is. Placeholders as for the goal.
   continuation: >-
     Keep working on the same statement and do not give up. Think deeply and
     hard, and try approaches substantially different from the ones that failed;
     I know the statement can be proved. When your proof is complete, write it to
     proof.md and reply with exactly PROOF_FILE: proof.md.
+  # EDIT REOPEN HERE: the first message when a paused, stopped or restarted author's saved conversation is
+  # reopened. Placeholders as for the goal.
   reopen: >-
     Keep working on the same statement and do not give up. Think deeply and
     hard, and try approaches substantially different from the ones that failed.
+  # EDIT COMPACTION HERE: sent into the running turn after the author's conversation was compacted;
+  # {original_prompt} is its first prompt. Placeholders as for the goal.
   compaction: |-
     Continue the same proof task using the conversation summary. Preserve the exact assumptions and requested conclusion.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
+  # EDIT RESUME HERE: the first message of a new conversation that continues the author's work (its saved one
+  # is gone or too long), or after a reply turn compacted it. Placeholders as for the goal.
   resume: |-
     Keep working on the statement below, building on any previous work in this conversation or in your working directory. Do not give up: think deeply and hard, and try substantially different approaches where earlier ones failed.
 
     ORIGINAL AUTHOR PROMPT:
     {original_prompt}
+  # EDIT REPAIR HERE: sent after the critic rejects the proof: {solution} is the critic's candidate (with its
+  # safe fixes), {bugs} its findings, {round} the critic round. Placeholders as for the goal.
   repair: |-
     Fix the unresolved errors the critic found in this candidate, then write the complete corrected proof to proof.md and reply with exactly PROOF_FILE: proof.md. Do not give up on the statement.
 
@@ -140,12 +155,14 @@ prompts:
 
     CRITIC BUGS:
     {bugs}
+  # EDIT REFUSED HAND-IN HERE: {reason} says why the submission was refused.
   # Sent when the author resumes after the controller could not hand its last submission to the critic.
   handoff_refused: |-
     Your last submission was not handed to the critic, so it has not been reviewed:
     {reason}
 
     Fix this and submit the complete proof again.
+  # EDIT PAUSED AUTHOR HERE: the reply prompt has {message}; both may use the placeholders of the goal.
   # The paused author's conversation turns (workflow_runner.py --converse): a
   # progress summary, and a reply to the user's message.
   summary: >-
@@ -159,6 +176,7 @@ prompts:
 
     USER MESSAGE:
     {message}
+  # EDIT CHAT HERE.
   # Sent with every chat message while the author works (a live instruction): {message} is the user's text,
   # {answer_file} where the author writes an answer the message asks for; TCS Prover shows it in the chat.
   chat: |-
@@ -166,10 +184,12 @@ prompts:
     {message}
 
     If this message asks you a question or asks for information, answer it for the user: write your answer, addressed to the user, to the file {answer_file}, then continue your proof work. If it only gives an instruction, follow it; no answer file is needed.
+  # EDIT RELATED WORKS HERE: appended as written.
   # Appended to the author's first prompt when the run has related works.
   related_works: |-
     RELATED WORKS:
     The user has provided related works for this problem in the related-works folder of your working directory; related-works/INDEX.md lists them. Read what is relevant. The proof you submit must still be complete and self-contained; the critic does not see these files.
+  # EDIT SUBAGENTS NOTE HERE: {author_subagents} is their number.
   # Appended to the first prompt of an author that works alone with Author subagents 1 or more: a job saved before the
   # author coordinator existed, or a workflow_runner.py run with --author-mode author.
   subagents: |-
@@ -198,6 +218,7 @@ prompts:
 
     STATEMENT:
     [STATEMENT]
+  # EDIT COORDINATOR LIFECYCLE HERE: placeholders as for the author's lifecycle prompts.
   # The author coordinator's lifecycle prompts (the coordinator binding of the author node); each replaces the
   # author's prompt of the same lifecycle key. The goal and the continuation point to the coordinator prompt (Codex
   # repeats the goal in each of its automatic turns); reopen, compaction, resume and repair repeat it.
@@ -227,11 +248,13 @@ prompts:
     {original_prompt}
   coordinator_summary: |-
     The work is paused. Write a progress summary for the user from the team's memory: what has been verified so far, with precise statements, and where it is written; what remains open or uncertain, and why; and the most promising next steps. Do not continue the work, start subagents or change any files in this turn.
+  # EDIT TIME CHECK HERE.
   # Sent to the working coordinator every hour of the job's working time (a live instruction): {elapsed} is that
   # time, {limit} the time limit and what is left of it, or that there is none.
   coordinator_checkin: |-
     [TIME CHECK FROM TCS PROVER]
     Elapsed: {elapsed}. {limit}
+  # EDIT REPORT ANSWER HERE: placeholders as for the author's lifecycle prompts.
   # Sent instead of the continuation when a coordinator's final reply names no proof file (it is kept as a
   # progress report and never reaches the critic).
   coordinator_report: |-
@@ -306,9 +329,11 @@ prompts:
     Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
     You cannot use this tool to resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
     When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user.
+  # EDIT GOAL TOOL STATUS HERE.
   # The description of update_goal's status argument (complete, blocked or paused). Default: Codex 0.160's.
   goal_tool_update_goal_status: |-
     Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit.
+  # EDIT GOAL TOOL NOTE HERE.
   # The description of update_goal's optional note argument (TCS Prover's own, shown on the job page).
   goal_tool_update_goal_note: |-
     Optional. A short note for the user on the goal's state, for example the blocking condition; it is shown on the job page.
@@ -337,6 +362,7 @@ prompts:
     Your author subagents are TCS Prover team members, each running its own model:
     {members}
     Give a member an assignment with team_assign; each member works on one assignment at a time and starts fresh, knowing only what you write. Use team_wait to wait for reports (up to 30 minutes at a time), team_members to see who is working, team_followup to continue a member's last assignment in its own conversation, and team_stop to stop an assignment. A member's final reply is its report, also saved in the run folder.
+  # EDIT TEAM MEMBER HERE.
   # What a team member receives for an assignment (team_assign) or a follow-up (team_followup): {assignment} is the
   # coordinator's text.
   team_member: |-
@@ -387,6 +413,8 @@ prompts:
     return verdict=pass and an empty bugs string. If no edits are needed, leave proof.md unchanged and leave fixes
     empty. Return only the requested JSON.
 
+  # EDIT FINAL VERIFICATION HERE: added to the critic's instructions in its last round, when proof.md is
+  # read-only. Used as written.
   critic_verify: |-
     FINAL VERIFICATION: this proof has reached the limit of edited critic rounds,
     so this round cannot edit it; proof.md is read-only. Return verdict=pass with
@@ -394,6 +422,8 @@ prompts:
     written. Otherwise return verdict=reject with every bug and its exact
     location in bugs.
 
+  # EDIT CRITIC REQUEST HERE: frames the critic's request: {instructions} (the critic's instructions) and
+  # {statement}.
   critic_input: |
     CRITIC INSTRUCTIONS:
     {instructions}
@@ -401,6 +431,7 @@ prompts:
     STATEMENT:
     {statement}
 
+  # EDIT CONVENTION CRITIC HERE: {statement} is the statement.
   # The convention critic (the convention step): runs once on the accepted proof, before writing; its report is
   # shown to the user and never changes the run's route.
   convention_critic: |-

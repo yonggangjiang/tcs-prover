@@ -4838,6 +4838,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                      "needs; add it to the workflow's prompts or choose Codex's goal loop.")
         if service is None:
             service = own_service = team_module.Service()
+        # The bridge's token never shows in a record (Codex may echo the thread's settings).
+        getattr(runtime, "register_secret", lambda value: None)(service.token)
         if tcs:
             goal_tool = team_module.GoalTool(
                 texts, lambda kind, **fields: emit(kind, threadId=thread, **fields),
@@ -8465,6 +8467,7 @@ def _execute(workflow, state, options, prompts):
                                             and not retrieval_policy(directory, features)):
                         if not services:
                             services.append(team_module.Service())
+                            register_secret(services[0].token)  # Never shown in a record.
                         service = services[0]
                     launch = functools.partial(
                         claude_cli.goal_session if claude else goal_session, sys.modules[__name__], prompt,

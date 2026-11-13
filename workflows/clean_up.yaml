@@ -69,6 +69,8 @@ nodes:
     next: latex_compile
 
 prompts:
+  # EDIT LATEX REPAIR HERE: sent when the paper does not compile: {diagnostic} and {compiler_output}
+  # (also {latex} and {instructions}).
   compilation_repair: |-
     Fix only the LaTeX compilation errors shown below. Make the smallest necessary
     changes to fix the bugs and do not change any content.
@@ -78,6 +80,8 @@ prompts:
 
     COMPILER OUTPUT:
     {compiler_output}
+  # EDIT LATEX TIMEOUT HERE: sent when the paper's compilation does not finish: {diagnostic} and
+  # {compiler_output} (also {latex} and {instructions}).
   compilation_timeout: |-
     The LaTeX compilation below did not finish. Check the source for an infinite loop or
     a runaway computation and fix it with the smallest necessary changes; do not change
@@ -88,6 +92,7 @@ prompts:
 
     COMPILER OUTPUT:
     {compiler_output}
+  # EDIT WRITER HERE: the instructions of the paper writer (Writing step). Used as written.
   final: |-
       Prune the input mathematical proof into a good paper by using the following guidance. Clarity is the
       main concern, not a target length: make the argument easy for a human expert to follow, with enough
@@ -444,6 +449,7 @@ prompts:
         any genuinely unresolved issue as specified above rather than calling it solved.
 
       Produce only the complete revised manuscript in LaTeX.
+  # EDIT WRITER REQUEST HERE: frames the writer's request: {instructions}, {statement} and {solution}.
   solution_input: |-
     {instructions}
 

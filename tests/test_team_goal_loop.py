@@ -202,6 +202,14 @@ class ServiceTests(unittest.TestCase):
         self.provider.release.set()
         self.assertEqual(client.answer(blocked)["result"]["content"][0]["text"], "released")
 
+    def test_a_closed_service_stops_listening_and_its_token_is_never_recorded(self):
+        service = team.Service()
+        service.close()
+        service._thread.join(5)
+        self.assertFalse(service._thread.is_alive())
+        runtime.register_secret(service.token)
+        self.assertNotIn(service.token, runtime.redact(f"token {service.token}"))
+
     def test_a_removed_provider_serves_nothing(self):
         self.service.remove(self.provider)
         self.assertEqual(self.service.names(), [])

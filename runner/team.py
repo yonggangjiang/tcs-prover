@@ -268,6 +268,11 @@ class Service:
     def close(self):
         self._closed.set()
         try:
+            # Wake the accept loop, which a closed listener alone may leave waiting.
+            socket.create_connection(("127.0.0.1", int(self.address.rsplit(":", 1)[1])), timeout=1).close()
+        except OSError:
+            pass
+        try:
             self._listener.close()
         except OSError:
             pass
