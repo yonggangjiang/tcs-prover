@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 from retrieval import runtime as retrieval_runtime
-from runner import claude_cli, confinement, proof_handoff, providers
+from runner import claude_cli, confinement, proof_handoff, providers, records
 from runner import prompt_catalog
 from runner import team as team_module
 from collections import deque
@@ -1182,6 +1182,8 @@ def environment(model=None):
     env["RUST_LOG"] = "error"
     env.pop("LOG_FORMAT", None)
     env.pop("RUST_BACKTRACE", None)
+    # Only TCS Prover writes the job's record (records.RECORD_ENV): no CLI or model command learns where it is.
+    env.pop(records.RECORD_ENV, None)
     return env
 
 
@@ -3555,10 +3557,59 @@ def run_structured_attempt(
     )
 
 
+# The record's labels of each workflow node's model calls: role (as the model-calls list names it) by node name; any
+# other node is named by itself.
+RECORD_ROLES = {"critic": "critic", "convention": "convention critic", "latex_editor": "latex editor",
+                "latex_repair": "latex repair"}
+_RECORD_PROBLEM_SAID = []
+
+
+def _record_codex(environment, policy, **labels):
+    """A Codex process about to start in a live run of a job with a record: (its environment with Codex's trace
+    root, its records.TraceProcess). A web-cutoff process (``policy``) and a job without a record get (environment,
+    None). Recording never stops a model call: a trace folder that cannot be made is said once in the activity
+    log, and the call runs unrecorded."""
+
+    recorder = None if policy else records.recorder()
+    if recorder is None:
+        return environment, None
+    try:
+        return recorder.codex_process(environment, **labels)
+    except Exception as exc:  # noqa: BLE001 - recording never stops a model call.
+        if not _RECORD_PROBLEM_SAID:
+            _RECORD_PROBLEM_SAID.append(True)
+            emit("diagnostic", "model", text=f"A model call could not be recorded ({type(exc).__name__}: {exc}); it "
+                                            "runs unrecorded, and so do later ones that meet the same problem.")
+        return environment, None
+
+
+def _finish_trace(trace):
+    """A Codex process ended: store its trace in the job's record (see records.TraceProcess.finish())."""
+
+    if trace is not None:
+        trace.finish()
+
+
+def _copy_author_thread(environment, thread):
+    """Copy the author's or coordinator's Codex thread (the files that are new or changed, its subagents' included)
+    into the job's record; Codex keeps the thread itself."""
+
+    recorder = records.recorder()
+    if recorder is not None and thread:
+        recorder.copy_codex_thread(codex_home_folder(environment), thread)
+
+
 def _codex_session_deleter(executable, environment):
-    """Remove one persisted Codex session, with its subagent threads (`codex delete --force <id>`)."""
+    """Remove one persisted Codex session, with its subagent threads (`codex delete --force <id>`).
+
+    A job with a record (records.recorder()) first gets a verified copy of the session's files, its subagents'
+    included; a session whose copy fails is kept (the record says why).
+    """
 
     def delete(session_id):
+        recorder = records.recorder()
+        if recorder is not None and not recorder.keep_codex_session(codex_home_folder(environment), session_id):
+            return False
         try:
             result = subprocess.run(
                 [executable, "delete", "--force", session_id], stdin=subprocess.DEVNULL,
@@ -3635,6 +3686,9 @@ def _run_structured_process(
             *([] if policy else ["--ignore-user-config"]), *schema_arguments, "-o", str(answer),
             *([fork] if fork else []), "-",
         ]
+        process_environment, trace = _record_codex(process_environment, policy, model=model, stage=stage,
+                                                   activityLabel=activity_label or "",
+                                                   **({"role": "reviewer"} if stage == "review" else {}))
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -3642,6 +3696,7 @@ def _run_structured_process(
                 errors="replace", env=process_environment,
             )
         except OSError as exc:
+            _finish_trace(trace)
             exc.cli_problem = "Codex"  # The CLI could not be started at all.
             raise
         monitor = RequestMonitor(process, stage, model, effort, timeout=timeout, deadline=deadline,
@@ -3736,6 +3791,7 @@ def _run_structured_process(
             monitor.close()
             if rollout is not None:
                 rollout_found = rollout.stop()
+            _finish_trace(trace)
         if not rollout_found and multi_agent_version(model) == 2:
             emit("diagnostic", stage, activityLabel=activity_label or "",
                  text="Codex's saved session of this attempt could not be read, so whether one of its independent "
@@ -3799,13 +3855,18 @@ class MemberSessions:
             self.items[session_id] = deleter
 
     def discard(self):
+        """Delete every saved session, newest first and twice over: Codex refuses to delete a session that a fork
+        of it (a follow-up or retry) still references, so a chain goes from its newest fork back to its base."""
+
         with self.lock:
             items, self.items = dict(self.items), {}
-        for session_id, deleter in items.items():
-            try:
-                deleter(session_id)
-            except Exception:  # noqa: BLE001 - a session left behind costs disk space only.
-                pass
+        for _ in range(2):
+            for session_id, deleter in reversed(list(items.items())):
+                try:
+                    if deleter(session_id) is not False:
+                        items.pop(session_id)
+                except Exception:  # noqa: BLE001 - a session left behind costs disk space only.
+                    pass
 
 
 def member_problem(error, model):
@@ -3890,11 +3951,13 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             "--json", "--skip-git-repo-check", "--ignore-user-config", "-o", str(answer), *([fork] if fork else []),
             "-",
         ]
+        process_environment, trace = _record_codex(process_environment, None, model=model, stage="solve")
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, encoding="utf-8", errors="replace", env=process_environment,
                                        cwd=str(directory))
         except OSError as exc:
+            _finish_trace(trace)
             exc.cli_problem = "Codex"
             raise
         started(process)
@@ -3933,6 +3996,7 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             code = process.wait()
         finally:
             monitor.close()
+            _finish_trace(trace)
         output = answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
         stopped = monitor.stopped("member")
         if stopped is not None:
@@ -3981,8 +4045,11 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
             emit("diagnostic", stage, node=node_name, text=f"Member {member.number} ({member.label}): {text}",
                  subagentId=identity, subagentMember=member.number, subagentModel=member.label,
                  attempt=retries[identity])
-        return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
-                              compact_prompt=prompts.get("codex_compact_prompt", ""), record=record, retried=retried)
+        with records.labelled(role="member", member=identity, label=f"Member {member.number}", node=node_name,
+                              memberModel=member.label):
+            return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
+                                  compact_prompt=prompts.get("codex_compact_prompt", ""), record=record,
+                                  retried=retried)
 
     def conversation(member, base):
         try:
@@ -4948,7 +5015,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # A live run whose code-mode tool runtime was unavailable uses the classic shell tool.
     classic = bool(continued.get("classic_shell")) and not policy
     thread = None
-    rpc = process = child_environment = None
+    rpc = process = child_environment = trace = None
     stop = threading.Event()
     expired = threading.Event()
     pausing = threading.Event()
@@ -5289,6 +5356,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         argv, child_environment, api_model = _author_app_server(
             runtime, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
             features=features, classic=classic, sandbox=sandbox, goals=not tcs)
+        child_environment, trace = _record_codex(
+            child_environment, policy, role="coordinator" if coordinator else "author", node=node_name,
+            label="Coordinator" if coordinator else "Author", model=model, stage=stage)
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -5611,6 +5681,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             subagents.stopped(ending["reason"])
         # A web-cutoff author's private temp folder ends with its app-server.
         retrieval_runtime.remove_private_temp(policy, child_environment)
+        _finish_trace(trace)
+        if trace is not None and not final.get("retry"):
+            # Pause, Stop, the time limit or the end of the work: the record copies what the thread added.
+            _copy_author_thread(child_environment, thread)
     if pausing.is_set():
         raise WorkflowPaused(pause_reason or "Workflow paused.", reason=pause_reason, thread_id=thread,
                              retry=final.get("retry"), session_unavailable=bool(final["reason"]),
@@ -5670,7 +5744,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
     inactivity = getattr(runtime, "AUTHOR_INACTIVITY_SECONDS", AUTHOR_INACTIVITY_SECONDS)
     probe_limit = getattr(runtime, "AUTHOR_PROBE_SECONDS", AUTHOR_PROBE_SECONDS)
     response_limit = getattr(runtime, "RPC_RESPONSE_SECONDS", RPC_RESPONSE_SECONDS)
-    thread = rpc = process = child_environment = None
+    thread = rpc = process = child_environment = trace = None
     stop = threading.Event()
     # "running" while the turn runs; "turn" is its id, "delivered" whether Codex
     # accepted it and "output" whether the model produced anything in it.
@@ -5730,6 +5804,11 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         argv, child_environment, api_model = _author_app_server(
             runtime, directory=directory, policy=policy, role="author", model=model, settings=settings,
             features=launch_features, classic=classic, sandbox=sandbox, stage="conversation", goals=not tcs)
+        summary_turn = label == CONVERSATION_LABELS["summary"][0]
+        child_environment, trace = _record_codex(
+            child_environment, policy, role="summary" if summary_turn else "reply", node="author",
+            label="Progress summary" if summary_turn else "Reply to the user", model=model, stage="conversation",
+            conversationId=conversation_id)
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -5872,6 +5951,9 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             runtime.stop_process(process)
         # A web-cutoff reply's private temp folder ends with its app-server.
         retrieval_runtime.remove_private_temp(policy, child_environment)
+        _finish_trace(trace)
+        if trace is not None:
+            _copy_author_thread(child_environment, thread or saved)
 
 
 def _replacement_notice(reason):
@@ -8528,8 +8610,10 @@ def _execute(workflow, state, options, prompts):
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision,
                            node_options)
             if node["run"] == "structured":
-                result, raw = _model_call(node, prompts, state, node_options, visits, input_files=input_files,
-                                          verify=verify)
+                with records.labelled(role=RECORD_ROLES.get(current, current), node=current, round=visits,
+                                      label=node.get("activity_label") or node.get("request_label") or current):
+                    result, raw = _model_call(node, prompts, state, node_options, visits, input_files=input_files,
+                                              verify=verify)
             elif node["run"] == "command":
                 config = dict(node["command"])
                 # The time limit stops only the author (I-044): node_options has no deadline, so a
@@ -9073,11 +9157,28 @@ def run_author_conversation(workflow_path, options, request):
             return 0
 
 
+def open_record():
+    """Open the record of the job this process works for (records.RECORD_ENV, set by the server for live runs), store
+    what earlier processes of the job left behind, and say in the activity log when it cannot be written."""
+
+    records.recorder()
+    if records.startup_problem:
+        emit("diagnostic", "workflow", text=records.startup_problem)
+
+
 def main(argv=None):
     configure_standard_streams()
     # A runner killed before its cleanup may have left a key-bearing Claude
     # settings folder behind.
     claude_cli.sweep_stale_settings()
+    try:
+        return _main(argv)
+    finally:
+        # Whatever is still open of the job's record is finished (a process that ended normally has none).
+        records.close()
+
+
+def _main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     parser.add_argument("workflows", nargs="+", help="YAML files, executed in order")
     models = (f"{', '.join(OFFERED_MODELS)}, or an api:<id> model from Advanced settings → API connections "
@@ -9157,6 +9258,7 @@ def main(argv=None):
         # A saved job, script or flag may still say Ultra: it runs as Max, and the log says so once.
         note_retired_efforts([options.get(name) for name in ("effort", "author_effort", "critic_effort",
                                                               "writer_effort")])
+        open_record()
         if converse:
             if len(args.workflows) != 1:
                 raise Error("--converse takes exactly one workflow.")

@@ -4,6 +4,7 @@ import argparse
 import sys
 
 import workflow_runner as runtime
+from runner import records
 
 
 REVIEW_SCHEMA = {
@@ -123,13 +124,15 @@ def review_worker_main(argv):
         statement, _, feedback = sys.stdin.read().partition("\0")
         # The worker runs in the job's run folder, like the workflow runner.
         runtime.note_retired_efforts([args.review_effort])
+        runtime.open_record()
         runtime.check_clis([("review", args.review_model)])
-        review(
-            statement, feedback, args.review_model, args.review_effort,
-            runtime.prompt_file(args.review_prompt_file, REVIEW_PROMPT),
-            speed=args.speed, summary=args.reasoning_summary, thinking_hours=args.thinking_hours,
-            failure_log=runtime.failure_log_path(),
-        )
+        with records.labelled(role="reviewer", node="statement_reviewer", label="Statement review"):
+            review(
+                statement, feedback, args.review_model, args.review_effort,
+                runtime.prompt_file(args.review_prompt_file, REVIEW_PROMPT),
+                speed=args.speed, summary=args.reasoning_summary, thinking_hours=args.thinking_hours,
+                failure_log=runtime.failure_log_path(),
+            )
         return 0
     except KeyboardInterrupt:
         print("\nStopped review.", file=sys.stderr)
@@ -138,3 +141,5 @@ def review_worker_main(argv):
         # ValueError covers settings problems (providers.ProviderError), reported like any other.
         print(f"error: {runtime.redact(exc)}", file=sys.stderr)
         return 1
+    finally:
+        records.close()

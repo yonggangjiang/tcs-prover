@@ -1,0 +1,265 @@
+"""How the runner records a live job's model calls (plan v3 section 1): Codex's trace for every Codex process,
+session copies before every deletion, Claude Code's stream, and the author's sessions when it stops.
+
+Offline: a stand-in Codex CLI (a Python script) writes what Codex 0.160 writes (a trace bundle under
+CODEX_ROLLOUT_TRACE_ROOT, a session file under CODEX_HOME/sessions) and deletes a session on `codex delete`;
+goal sessions run against the scripted app-server double of tests/test_goal_runtime.py.
+"""
+
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+import workflow_runner as runtime
+from runner import providers, records
+
+import test_goal_runtime as goal_test
+
+THREAD = "01a1d4e2-53df-78e1-b1a3-60906592b723"
+SCHEMA = {"type": "object", "properties": {"verdict": {"type": "string"}}, "required": ["verdict"],
+          "additionalProperties": False}
+
+# A stand-in Codex 0.160 for `codex exec --json` and `codex delete --force <id>`: it notes its environment, writes a
+# trace bundle where CODEX_ROLLOUT_TRACE_ROOT says (one request and its response) and its session file, and answers.
+STAND_IN = r"""
+import json, os, sys, time
+argv = sys.argv[1:]
+state = os.environ["TCS_FAKE_STATE"]
+home = os.environ.get("CODEX_HOME")
+if argv[:2] == ["delete", "--force"]:
+    with open(os.path.join(state, "deleted.jsonl"), "a") as out:
+        out.write(json.dumps(argv[2]) + "\n")
+    for folder, _, names in os.walk(os.path.join(home, "sessions")):
+        for name in names:
+            if argv[2] in name:
+                os.unlink(os.path.join(folder, name))
+    sys.exit(0)
+if "exec" not in argv:
+    sys.exit(0)
+sys.stdin.read()
+thread = os.environ.get("TCS_FAKE_THREAD", "01a1d4e2-53df-78e1-b1a3-60906592b723")
+with open(os.path.join(state, "env.jsonl"), "a") as out:
+    out.write(json.dumps({key: os.environ.get(key) for key in ("CODEX_ROLLOUT_TRACE_ROOT", "TCS_PROVER_RECORD")}) + "\n")
+root = os.environ.get("CODEX_ROLLOUT_TRACE_ROOT")
+if root:
+    bundle = os.path.join(root, "trace-00000000-0000-0000-0000-000000000000-" + thread)
+    os.makedirs(os.path.join(bundle, "payloads"))
+    with open(os.path.join(bundle, "manifest.json"), "w") as out:
+        json.dump({"schema_version": 1, "trace_id": "t", "rollout_id": thread, "root_thread_id": thread,
+                   "started_at_unix_ms": 1, "raw_event_log": "trace.jsonl", "payloads_dir": "payloads"}, out, indent=2)
+    with open(os.path.join(bundle, "payloads", "1.json"), "w") as out:
+        json.dump({"model": "gpt-6.1-sol", "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "REQUEST-MARKER"}]}]}, out, indent=2)
+    with open(os.path.join(bundle, "payloads", "2.json"), "w") as out:
+        json.dump({"response_id": "resp_1", "upstream_request_id": None, "token_usage": {"input_tokens": 7},
+                   "output_items": [{"type": "message", "role": "assistant",
+                                     "content": [{"type": "output_text", "text": "ANSWER-MARKER"}]}]}, out, indent=2)
+    ref = lambda n, kind: {"raw_payload_id": "raw_payload:%d" % n, "kind": {"type": kind}, "path": "payloads/%d.json" % n}
+    events = [{"type": "thread_started", "thread_id": thread, "agent_path": "/root", "metadata_payload": None},
+              {"type": "inference_started", "inference_call_id": "i1", "thread_id": thread, "codex_turn_id": "t1",
+               "model": "gpt-6.1-sol", "provider_name": "OpenAI", "request_payload": ref(1, "inference_request")},
+              {"type": "inference_completed", "inference_call_id": "i1", "response_id": "resp_1",
+               "upstream_request_id": None, "response_payload": ref(2, "inference_response")}]
+    with open(os.path.join(bundle, "trace.jsonl"), "w") as out:
+        for number, payload in enumerate(events, 1):
+            out.write(json.dumps({"schema_version": 1, "seq": number, "wall_time_unix_ms": number,
+                                  "rollout_id": thread, "thread_id": thread, "codex_turn_id": "t1",
+                                  "payload": payload}) + "\n")
+folder = os.path.join(home, "sessions", time.strftime("%Y/%m/%d"))
+os.makedirs(folder, exist_ok=True)
+with open(os.path.join(folder, "rollout-%s-%s.jsonl" % (time.strftime("%Y-%m-%dT%H-%M-%S"), thread)), "w") as out:
+    out.write(json.dumps({"type": "session_meta", "payload": {"id": thread, "session_id": thread}}) + "\n")
+    out.write(json.dumps({"type": "response_item", "payload": {"type": "message", "text": "SESSION-MARKER"}}) + "\n")
+print(json.dumps({"type": "thread.started", "thread_id": thread}))
+print(json.dumps({"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": "{}"}}))
+answer = json.dumps({"verdict": "pass"})
+open(argv[argv.index("-o") + 1], "w").write(answer)
+"""
+
+
+class RecordedJob(unittest.TestCase):
+    """A job with a record (records.RECORD_ENV) in a live run, in the test's own folders."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.state = self.root / "fake-state"
+        self.state.mkdir()
+        self.home = self.root / "codex-home"
+        self.record_folder = self.root / "store" / "records" / "run-1"
+        changes = [mock.patch.dict(os.environ, {
+            providers.STORE_ENV: str(self.root / "store" / "api-models.json"),
+            records.RECORD_ENV: str(self.record_folder), "TCS_FAKE_STATE": str(self.state),
+            "CODEX_HOME": str(self.home), "TCS_PROVER_RETRIEVAL_MODE": "live"}),
+            mock.patch.object(records, "_RECORDER", None), mock.patch.object(runtime, "emit", self.emit)]
+        for change in changes:
+            change.start()
+            self.addCleanup(change.stop)
+        os.environ.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
+        self.events = []
+        self.addCleanup(records.close)
+
+    def emit(self, kind, stage, **fields):
+        self.events.append({"kind": kind, "stage": stage, **fields})
+
+    def stand_in(self):
+        fake = self.root / "codex"
+        fake.write_text(f"#!{sys.executable}\n" + STAND_IN)
+        fake.chmod(0o700)
+        patcher = mock.patch.object(runtime, "codex", lambda: str(fake))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+
+    def lines(self, name):
+        try:
+            return [json.loads(line) for line in (self.state / name).read_text().splitlines()]
+        except FileNotFoundError:
+            return []
+
+
+class EnvironmentTests(RecordedJob):
+    def test_no_child_ever_learns_where_the_record_is(self):
+        self.assertNotIn(records.RECORD_ENV, runtime.environment())
+        self.assertNotIn(records.RECORD_ENV, runtime.environment("gpt-6.1-sol"))
+
+    def test_a_live_codex_process_gets_its_own_trace_folder_in_the_record(self):
+        environment, trace = runtime._record_codex({"PATH": "/bin"}, None, role="critic")
+        self.addCleanup(trace.finish)
+        root = Path(environment[records.TRACE_ROOT_ENV])
+        self.assertEqual(root.parent, self.record_folder / "codex-trace")
+        self.assertTrue(root.is_dir())
+        self.assertEqual(json.loads((self.record_folder / "codex" / root.name / "process.json").read_text())["role"],
+                         "critic")
+
+    def test_a_web_cutoff_process_is_never_traced(self):
+        environment, trace = runtime._record_codex({"PATH": "/bin"}, {"_path": "policy.json"}, role="author")
+        self.assertIsNone(trace)
+        self.assertEqual(environment, {"PATH": "/bin"})
+        self.assertFalse((self.record_folder / "codex-trace").exists())
+
+    def test_a_job_without_a_record_traces_nothing(self):
+        with mock.patch.dict(os.environ, {records.RECORD_ENV: ""}):
+            self.assertEqual(runtime._record_codex({"A": "1"}, None), ({"A": "1"}, None))
+
+
+@unittest.skipIf(os.name == "nt", "The stand-in CLI is a POSIX script")
+class StructuredCallTests(RecordedJob):
+    def setUp(self):
+        super().setUp()
+        self.stand_in()
+
+    def test_a_structured_call_is_traced_and_its_session_copied_before_it_is_deleted(self):
+        with records.labelled(role="critic", node="critic", round=2, label="Critic coordinator"):
+            runtime.structured("Check.", SCHEMA, "critic", model="gpt-6.1-sol")
+        root = Path(self.lines("env.jsonl")[0]["CODEX_ROLLOUT_TRACE_ROOT"])
+        self.assertEqual(root.parent, self.record_folder / "codex-trace")
+        self.assertIsNone(self.lines("env.jsonl")[0]["TCS_PROVER_RECORD"])
+        self.assertFalse(root.exists())  # Stored, then removed.
+        record = records.Record(self.record_folder)
+        [call] = record.calls.read()
+        self.assertEqual((call["status"], call["usage"]), ("completed", {"input_tokens": 7}))
+        self.assertEqual(json.loads((self.record_folder / "codex" / call["process"] / "process.json").read_text())
+                         ["round"], 2)
+        # The session was copied before `codex delete` removed it.
+        self.assertEqual(self.lines("deleted.jsonl"), [THREAD])
+        self.assertEqual(list((self.home / "sessions").rglob("*.jsonl")), [])
+        [copy] = (self.record_folder / "sources" / "codex" / THREAD).rglob("*.jsonl.gz")
+        self.assertIn(b"SESSION-MARKER", records.read_source(copy))
+
+    def test_a_session_whose_copy_fails_is_not_deleted(self):
+        with mock.patch.object(records.Recorder, "keep_codex_session", lambda self, home, thread: False):
+            runtime.structured("Check.", SCHEMA, "critic", model="gpt-6.1-sol")
+        self.assertEqual(self.lines("deleted.jsonl"), [])
+        self.assertEqual(len(list((self.home / "sessions").rglob("*.jsonl"))), 1)
+        diagnostics = [event["text"] for event in self.events if event["kind"] == "diagnostic"]
+        self.assertTrue(any("Could not delete the saved CLI session" in text for text in diagnostics))
+
+    def test_without_a_record_nothing_is_traced_or_copied(self):
+        with mock.patch.dict(os.environ, {records.RECORD_ENV: ""}):
+            runtime.structured("Check.", SCHEMA, "critic", model="gpt-6.1-sol")
+        self.assertIsNone(self.lines("env.jsonl")[0]["CODEX_ROLLOUT_TRACE_ROOT"])
+        self.assertEqual(self.lines("deleted.jsonl"), [THREAD])
+        self.assertFalse(self.record_folder.exists())
+
+
+class MemberSessionTests(unittest.TestCase):
+    def test_a_member_s_sessions_go_newest_first_so_a_fork_chain_goes_whole(self):
+        # Codex refuses to delete a session that a later fork still references.
+        alive = ["base", "follow-up", "retry"]
+
+        def deleter(session):
+            if alive.index(session) != len(alive) - 1:
+                return False
+            alive.remove(session)
+            return True
+
+        sessions = runtime.MemberSessions()
+        for session in list(alive):
+            sessions.add(session, deleter)
+        sessions.discard()
+        self.assertEqual(alive, [])
+
+    def test_a_session_that_still_cannot_go_is_tried_twice_only(self):
+        tries = []
+        sessions = runtime.MemberSessions()
+        sessions.add("stuck", lambda session: tries.append(session) or False)
+        sessions.discard()
+        self.assertEqual(tries, ["stuck", "stuck"])
+
+
+class GoalSessionTests(RecordedJob):
+    def setUp(self):
+        super().setUp()
+        self.popen = mock.patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace())
+        self.spawn = self.popen.start()
+        self.addCleanup(self.popen.stop)
+        self.copies = []
+        copy = mock.patch.object(records.Recorder, "copy_codex_thread",
+                                 lambda recorder, home, thread: self.copies.append((Path(home), thread)))
+        copy.start()
+        self.addCleanup(copy.stop)
+        self.directory = self.root / "run"
+        self.directory.mkdir()
+
+    def session(self, scripts, coordinator=False):
+        double = goal_test.Runtime(scripts)
+        session = runtime.goal_session(double, goal_test.PROMPT, prompts=goal_test.PROMPTS,
+                                       settings=goal_test.SETTINGS, options={"goal_cwd": str(self.directory)},
+                                       coordinator=coordinator)
+        self.addCleanup(session.close)
+        return double, session
+
+    def test_the_author_s_app_server_is_traced_and_its_thread_copied_when_it_stops(self):
+        double, session = self.session([goal_test.success("PROOF_FILE: proof.md")], coordinator=True)
+        self.assertEqual(next(session)["outcome"], "done")
+        environment = self.spawn.call_args.kwargs["env"]
+        root = Path(environment[records.TRACE_ROOT_ENV])
+        self.assertEqual(root.parent, self.record_folder / "codex-trace")
+        self.assertEqual(json.loads((self.record_folder / "codex" / root.name / "process.json").read_text())["role"],
+                         "coordinator")
+        self.assertEqual(self.copies, [])
+        session.close()  # The end of the work.
+        self.assertEqual([thread for _, thread in self.copies], ["thread-1"])
+        self.assertFalse(root.exists())
+
+    def test_a_model_call_failure_that_is_retried_copies_nothing_yet(self):
+        double, session = self.session([[runtime.Error("stream disconnected before completion")]])
+        with self.assertRaises(runtime.WorkflowPaused) as paused:
+            next(session)
+        self.assertTrue(paused.exception.retry)
+        self.assertEqual(self.copies, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
