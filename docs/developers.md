@@ -307,8 +307,9 @@ the problem-solving to its subagents. What the runner and the server add:
   runs the author alone instead: today's author prompts without the `subagents`
   note and without the `multi_agent` feature, and the status **No subagents with
   this model** says that the author works alone instead of coordinating. A Claude
-  coordinator with the CLI's own subagents (a job from before TCS Prover's team)
-  gets the same single-author launch as `alone`, which
+  coordinator with the CLI's own subagents (a job from before TCS Prover's team,
+  or a rerun of one that keeps them, `legacyTeam`) gets the same single-author
+  launch as `alone`, which
   `claude_cli.goal_session` uses when its CLI offers no subagent tool (`--bare`),
   saying so once per runner; one with TCS Prover's team keeps its team in
   `--bare` mode too (see TCS Prover's MCP server below). That status carries `authorModeEffective: "author"`
