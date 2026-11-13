@@ -123,6 +123,12 @@ critic's progress line says only that its critics have started.
   run shares; a work removed from the batch stays in a web-cutoff job, as its
   audit log records it.
 - **Progress summaries** stay on the job page only (no `progress-summary.md`).
+- **The job's record** (see [The job page](job-page.md#the-record-of-every-model-call))
+  changes nothing here: no trace and no stream is taken. TCS Prover copies what
+  the run leaves behind, the author's session files from the run's own folder
+  and the URL discovery folders, every 10 minutes while it runs and when it
+  pauses, stops or ends; its one-shot calls (the critic, the convention critic,
+  the LaTeX writer) write no files, and its record says so.
 
 A timestamp run you stop continues with **Continue** in its own folder under the
 same policy and keeps its time budget. Failed timestamp runs, and runs stopped

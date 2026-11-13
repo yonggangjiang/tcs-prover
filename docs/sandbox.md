@@ -54,6 +54,12 @@ folder (it may be a symbolic link to a folder you own, which is then made
 owner-only) and names a folder it cannot use. Copies of a login made for one
 call (web-cutoff runs) are deleted when the call ends.
 
+**Job records.** `.tcs-prover/records/` holds every job's record of its model
+calls (see [The job page](job-page.md#the-record-of-every-model-call)). It is
+not among the entries above (keeping models away from it was left for later):
+on macOS no run's model reads it all the same, as they read nothing of the
+checkout; on Linux and Windows a live run's model could (see below).
+
 ## Claude Code
 
 The proof author's file tools are confined to its run folder, and its shell runs
@@ -124,7 +130,8 @@ and the Claude shell keeps its default reads. Every start of a run says so in
 its activity log: "Run confinement is enforced on macOS only; this run's model
 can read files outside its folder." In particular a Codex role's shell can read
 the API key store there, so store only keys that the models you run with the
-Codex CLI may see.
+Codex CLI may see. The same holds for the job records in
+`.tcs-prover/records/`, which hold every job's model calls.
 
 The Codex author, its replies and progress summary, the critic with its
 subagents, and the LaTeX writer and its repairs follow the same network rule as

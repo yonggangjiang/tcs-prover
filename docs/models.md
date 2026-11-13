@@ -216,6 +216,8 @@ logs of jobs run then keep that name.
 - **Reasoning summaries.** **Concise** and **Detailed** both show Anthropic's
   summarized thinking (Claude has one summary level); **Status only** shows
   none.
+- **The job's record** keeps everything Claude Code prints and a copy of each
+  conversation before TCS Prover deletes it (see [The job page](job-page.md#the-record-of-every-model-call)).
 - **Its own retries.** Claude Code waits out 429 and 529 responses within the
   same request (`CLAUDE_CODE_RETRY_WATCHDOG`); the activity log then shows a
   **Claude API retry** line, for example "status 529, retrying in 32 s (attempt
@@ -247,6 +249,7 @@ type a model id.
 | Request source | Optional `User-Agent` header, so routers that log it can tell your requests apart: up to 200 printable ASCII characters, `TCS-Prover` by default. |
 | Display name | Optional label inside TCS Prover; the host by default. Never sent. |
 | Context window, Max output | Optional token limits for every model of the connection, for models the program does not know: a context window of at least 1,024 tokens, and a max output smaller than it. Runs pass them on: the program keeps the conversation within the window, compacting early enough to leave room for the max output, and Claude Code also asks for at most that much. Empty fields keep the program's defaults. |
+| Web search through this connection | OpenAI-compatible connections only, off unless you turn it on: the Codex CLI's own web search sends each search to the connection's search service (`/alpha/search` under the base URL) with its key. Saving with it on sends one test search; it stays on only if the service answers with a search result, and the form says what the test found. A job keeps the choice it started with; jobs from before keep searching as they did. |
 
 - **Save connection** loads the model catalog first; a failed connection or an
   empty catalog leaves the saved settings as they were. **Load models**
@@ -286,10 +289,11 @@ type a model id.
   some endpoints refuse. Codex (0.160) offers no search tool at all to a model
   it runs as "Responses Lite" (by the name the connection sends: gpt-6.1-sol
   and the other GPT 6 and GPT 5.6 models of Codex's own model list) through an
-  API connection: its own web search comes only with its built-in OpenAI
-  provider, that is, the **Codex CLI** source. A live run whose author or author subagent
-  has such a model says so in the activity log as the author starts (**No web
-  search**), and goes on without web search.
+  API connection, unless the connection's **Web search through this
+  connection** is on: its own web search otherwise comes only with its built-in
+  OpenAI provider, that is, the **Codex CLI** source. A live run whose author or
+  author subagent has such a model says so in the activity log as the author
+  starts (**No web search**), and goes on without web search.
 - **Anthropic format** runs through Claude Code with a private configuration
   folder per run folder under `.tcs-prover/claude-homes/` (`CLAUDE_CONFIG_DIR`),
   so your Claude login, its keychain entry and `~/.claude.json` are never read;
@@ -297,8 +301,10 @@ type a model id.
   drops `CLAUDE_CONFIG_DIR` cannot keep that folder: TCS Prover checks this once
   per run with a `--bare` start that reads no login and makes no request, and
   otherwise runs them in bare mode, where the author has only the sandboxed
-  shell, Read and Edit, and the activity log says why. They show no reasoning
-  summaries, because a gateway may return raw reasoning, which is never shown.
+  shell, Read and Edit, and the activity log says why. With **Concise** or
+  **Detailed** summaries they are asked for Anthropic's summarized thinking,
+  which the job's record keeps; the activity log shows none, because a gateway
+  may return raw reasoning, which is never shown.
 - The program needs no login, only the connection's key. When it is not
   installed, the job still starts, and each model call that needs it fails with
   a message naming the program, the role and the model, for example *Claude Code

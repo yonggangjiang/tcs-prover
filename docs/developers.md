@@ -18,6 +18,7 @@ workflows/
   clean_up.yaml             LaTeX writing: prompts, response shape, logic
 runner/
   providers.py              Model registry and the private API model store
+  records.py                The record of every model call: store, Codex trace ingest, session copies
   claude_cli.py             Claude Code transport for structured roles and the author
   confinement.py            Per-run read/write confinement of model processes (macOS)
   proof_handoff.py          Verified capture of an author's PROOF_FILE
@@ -25,6 +26,7 @@ ui/
   server.py                 HTTP endpoints, job state and process management
   cli.py                    Startup and Markdown file and folder runs
   review.py                 Independent statement review
+  model_calls.py            The record routes: model calls, raw calls, training download, Records list
   batches.py                Saved run folders shown as read-only batches
   named_batches.py          Batches made with New batch (runs/.controller/batches.json)
   presets.py                Saved New problem settings (Advanced settings → Saved settings)
@@ -77,6 +79,9 @@ working folder.
 - `.tcs-prover/`: the private state (see [Sandbox and network](sandbox.md)),
   including `program-folders.json`, the folders the Setup page remembered.
   Setup's own output is kept in memory only.
+- `.tcs-prover/records/<run>/`: the job's record of every model call (see
+  [Job records](#job-records)), kept apart from the run folder: deleting or
+  trashing the job never removes it.
 - Private per-call folders are pruned once they are a day old, beyond the newest
   50 critic snapshots and historical critic sessions and 200 historical
   discovery runs.
@@ -84,7 +89,11 @@ working folder.
   Claude with `--session-id`; retries fork it with `codex exec fork <id>` or
   `claude --resume <id> --fork-session`) only while the call runs, and delete it
   when it ends (`codex delete --force`, which also removes subagent threads, or
-  the Claude transcript files). Until then Codex keeps it under
+  the Claude transcript files), newest first; a job with a record copies each
+  session into it first, and a session whose copy does not read back the same
+  is kept (see [Job records](#job-records)). Team members' sessions go the same
+  way when the team ends, newest first and twice over (Codex refuses to delete a
+  session that a later fork still references). Until then Codex keeps it under
   `$CODEX_HOME/sessions` and its state database (an OpenAI-format API model's
   private Codex home), and Claude under `projects/` in its configuration folder
   (`.tcs-prover/claude-homes/` for Anthropic-format API models, or `~/.claude`
@@ -684,6 +693,142 @@ that every prompt and tool text is the user's to adjust. What the code does:
   members' models that have none; the page shows it like the other
   warnings of the activity log. The provider settings are unchanged.
 
+## Job records
+
+Owner's decisions (13 Nov 2026, plan v3 section 1): keep every model request and
+response locally, organized for training, from the programs' own copies, with
+nothing on the network changed. `runner/records.py` writes a job's record,
+`ui/model_calls.py` reads it.
+
+- **Where.** `<state>/records/<run folder name>/` (`providers.state_directory()`,
+  `.tcs-prover/` by default), owner-only folders and files. The server makes it
+  when a runner, review worker or reply turn of the job first starts and names it
+  in `TCS_PROVER_RECORD` (`records.RECORD_ENV`) for that process; `environment()`
+  removes the variable from every child, so no CLI or model command learns it. A
+  web-cutoff job's processes never get it. Records are never deleted
+  automatically: a deleted or trashed job keeps its record, which only `DELETE
+  /records/<run>` removes. No fence keeps models away from it (the owner's lowest
+  priority): on macOS the confined profile reads no checkout file, so no model
+  reads it; on Linux and Windows a live run's commands could.
+- **Layout.** `manifest.json` (run folder, title, creation time, `webCutoff`);
+  `calls.jsonl` (one line per model request, written when it ends, synced:
+  program, process label, thread, times, model, status `completed`, `failed`,
+  `cancelled`, `interrupted` or `trace format not recognized`, usage, where its
+  request and response are); `items/` (each item's exact JSON once, by the
+  sha256 of its compact JSON, in gzip packs of up to `PACK_BYTES`, 64 MB, with
+  `index.jsonl`; a pack member is written and synced before its index line);
+  `codex/<label>/process.json` (who the process was: role, node, round, label,
+  member, model) and `codex/<label>/<bundle>/` (`payloads.jsonl`, where each
+  trace payload went, and byte copies of the bundle's `manifest.json` and
+  `trace.jsonl` as `.gz`); `claude/<label>.json` and `claude/<label>.jsonl.gz`;
+  `sources/` (copied session files, gzip-compressed unless they already are);
+  `transcript/` (the latest snapshot);
+  `problems.jsonl` (what the record could not do); `.lock` (writers of several
+  processes take it with `flock`, `msvcrt` on Windows).
+- **Codex's trace.** Every Codex process of a live run gets
+  `CODEX_ROLLOUT_TRACE_ROOT=<record>/codex-trace/<label>`
+  (`workflow_runner._record_codex()`): the author's or coordinator's
+  app-server, each reply and summary turn's, every structured `codex exec` call
+  (statement reviewer, critic with its independent critics, which share its
+  bundle, convention critic, LaTeX editor and repair) and every team member's.
+  Codex 0.160 then writes the exact request bodies (system prompt, tools, full
+  input, schema, settings), the output items (encrypted reasoning included),
+  response and request ids, usage, the code cells with each nested tool call's
+  input and result (the search text the model read), and its protocol events.
+  The runner reads the trace every `TRACE_POLL_SECONDS` (5 s) while the
+  process runs and wholly when it ends (`records.TraceIngest`): a request or
+  response payload is stored as its skeleton (the JSON with its `input`,
+  `output_items`, `instructions` and `tools` set to null, keeping their place)
+  plus item references, a request's input as a change to the thread's previous
+  one where it starts the same way; every other payload as one object. Each
+  stored payload is rebuilt from the record (`json.dumps(..., indent=2,
+  ensure_ascii=False)`, which equals serde_json's pretty printer on every
+  payload of the audit's captures) and compared byte for byte; one that differs
+  (a number Python prints differently, such as `1e-7`) is kept whole. Only then
+  is the payload file removed; the bundle goes when its process has ended and
+  the byte copies of its manifest and event log read back. A request that never
+  ended gets status `interrupted`. A bundle whose manifest or events are not of
+  schema version 1 (a later Codex) stays as it is, its requests marked `trace
+  format not recognized`. A process's trace folder is held with a `.claim` lock
+  while it runs; at the next start (`records.store_leftovers()`: every runner,
+  review worker and reply turn of the job, the server for every record when it
+  starts, and each snapshot) the folders nobody holds are stored, so a crash
+  loses nothing that Codex wrote; a bundle written to in the last
+  `LEFTOVER_QUIET_SECONDS` (120 s) waits for a later start, as a Codex process
+  whose runner died may still write it. Codex 0.160 does not trace a local
+  compaction (that of every model it does not compact remotely, so of every API
+  connection's model: core/src/compact.rs, "local compaction streams are left
+  untraced"); the model-calls list shows each one from the copied session file
+  (its `compacted` record, whose message is the summary), as a row of status
+  `not recorded`.
+- **Session copies.** Before TCS Prover deletes a CLI session
+  (`_codex_session_deleter()`, `claude_cli.session_deleter()`: structured calls,
+  their retries' forks and team members), the record copies it
+  (`Recorder.keep_codex_session()`: every segment of the thread, plain or
+  `.zst`, and the subagent threads whose `session_meta` names it as their
+  session or parent, any depth; `keep_claude_session()`:
+  `projects/<project>/<session>.jsonl` with its `subagents/` and
+  `tool-results/`) into `sources/codex/<thread>/` or `sources/claude/` and reads
+  each copy back (copies are gzip-compressed); a session whose copy fails is not
+  deleted. The author's or
+  coordinator's own Codex thread (with its subagents' threads) and Claude
+  session are copied when its session ends without a retry (Pause, Stop, the
+  time limit, the end of the work) and after each reply turn, only the files
+  that are new or grew (the CLIs only append).
+- **Claude Code.** Every stream-json line of every Claude Code process
+  (structured calls, members, the author, reply turns), after the redaction of
+  transcript records (`claude_cli.scrub_record()`), goes to
+  `claude/<label>.jsonl` while the CLI runs and `.jsonl.gz` after
+  (`records.ClaudeStream`). A request is one assistant message: its line in
+  `calls.jsonl` names its stream lines and the user lines sent since the same
+  agent's previous request, and is written once a later line of that agent or
+  the turn's result shows it ended (`interrupted` when the CLI ended without a
+  result after it). The stream gives no per-request output tokens (Claude
+  Code's lines carry the message's starting usage). With **Concise** or
+  **Detailed** summaries every Claude model, an API connection's too, is asked
+  for summarized thinking (`--thinking-display summarized`); only a
+  subscription model's reaches the activity log.
+- **Snapshots** (`records.snapshot()`, by the server's `App._record_snapshot()`):
+  when a runner, review or reply turn ends (a pause, a stop, the time limit, the
+  end of the job) and before the job is deleted, the record gets the
+  transcript's new complete lines (one more gzip member of
+  `transcript/transcript.jsonl.gz`, after a check that the copied part is
+  unchanged, else a whole copy), `job-settings.json` and the controller's
+  `prompts/`.
+- **Web-cutoff runs.** Their isolation is unchanged: nothing is traced or
+  streamed. `records.copy_web_cutoff()` copies the author's session files from
+  the run's bundle (`<codexHome>/author/sessions`) and the discovery folders
+  (`discovery-state/discovery-*`) into `sources/web-cutoff/`, at each snapshot
+  and every `RECORD_COPY_SECONDS` (600 s) while the job runs, well before
+  discovery prunes a folder (a day old at least). Their one-shot calls appear
+  in the model-calls list as rows of status `not recorded` (one per attempt's
+  request record).
+- **Placeholders** (computed by `ui/model_calls.py`, never stored): `kind`,
+  `facts`, `withheldBy`, `why`: `hidden_reasoning` (reasoning tokens; whether
+  the encrypted copy or signature is kept), `token_probabilities` (refused by
+  OpenAI for reasoning models; not offered by Anthropic), `network_only`
+  (per-word arrival times, response headers, moderation notes; Claude Code's
+  request itself), `web_cutoff_one_shot`, `trace_format_not_recognized`,
+  `interrupted`, `compaction_not_traced` (a local compaction, above).
+- **Routes** (the session token like every route; field names in
+  `~/tcs-work/fixes/record-contract.md`): `GET /jobs/<id>/model-calls?offset=&limit=`
+  (time order, `limit` 1 to 1,000, 100 by default), `GET
+  /jobs/<id>/model-calls/<callId>` (what was sent new, what came back, usage,
+  placeholders; a code cell's nested tool calls from the trace), `GET
+  /jobs/<id>/model-calls/<callId>/raw` (the exact request and response), `GET
+  /jobs/<id>/training-record` (a streamed ZIP: `requests.jsonl`, one
+  self-contained example per request with a WebSocket continuation's input
+  expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window
+  with each call's input boundary and outputs and the critic round's outcome;
+  `rounds.jsonl`; the transcript snapshot; `manifest.json`), `GET /records` and
+  `DELETE /records/<run>` (409 while the job's runner, review or reply turn
+  runs). They read the record folder, so a deleted job's record still answers.
+- **Not recorded on this route:** what only the network carries (stream event
+  timing, response headers, moderation metadata, url annotations, the search
+  service's `encrypted_output`), Claude Code's request (system prompt, tools,
+  parameters) and its web search's inner request, and the input of a web-cutoff
+  one-shot call.
+
 ## HTTP API notes
 
 The page reads `model_sources` (source menus) and `model_catalog` (model menus)
@@ -692,6 +837,26 @@ model name. `/api-models` lists `connections`, each with `models` holding the
 wire `id`, the display `label` and the stable selection `modelId`. Saving
 without a model fetches the catalog on the server; model lists sent by a client
 are ignored.
+
+**Web search through a connection.** An OpenAI-format connection's
+`webSearch` (off for every connection saved before it existed) turns on Codex
+0.160's own web search (web.run), which posts each search to `<base
+URL>/alpha/search` with the connection's key and request source. Saving it on
+(`POST /api-models` with `webSearch: true`) first sends one probe search
+(`probe_web_search()`: `{id, model, commands: {search_query: [{q}]}, settings:
+{allowed_callers: ["direct"], external_web_access: true}, max_output_tokens:
+2500}`, the shape Codex sends); it stays on only if the answer is HTTP 2xx with
+a JSON object whose `output` is text, and the connection keeps the result as
+`webSearchCheck` `{ok, at, message}`, which the editor shows. A saved connection
+that stays the same (URL, key, request source, format) is not probed again. A
+new live job records the connections of its models that have it on as
+`apiWebSearch` in its state and `job-settings.json`; every runner of the job
+gets `--set api_web_search=[...]` (the review worker `--api-web-search`), and
+`provider_arguments()` then adds
+`model_providers.tcs_api.supports_standalone_web_search=true`,
+`features.standalone_web_search=true` and
+`suppress_unstable_features_warning=true` (the job's web search is `live`). A
+job from before records none and searches as before.
 
 A test of one model (`POST /api-models/test` with its `api:<id>` selection id
 and wire `model`, or with unsaved settings) sends a request shaped like the ones

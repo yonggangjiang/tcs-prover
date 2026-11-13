@@ -376,3 +376,40 @@ When the compile succeeds, **Download .tex** and **Download PDF** give the job's
 critic accepts it (or, with the critic off, once writing starts), and while the
 LaTeX step runs or waits for TeX, **Download source** gives the current
 `latex-source.tex`.
+
+## The record of every model call
+
+Every job keeps a record of its model calls in `.tcs-prover/records/<run
+folder>/`, apart from its run folder: what was sent to the model and what came
+back, for each request of every role (the statement reviewer, the author or
+coordinator and its replies and progress summaries, the critic and its
+independent critics, the convention critic, the LaTeX writer and its repairs,
+and the coordinator's team members), with its model, tokens, timing and status.
+
+- **What it holds.** For the Codex CLI, Codex's own full trace: each request
+  exactly as sent (its instructions, tools and whole input), each response with
+  OpenAI's encrypted reasoning, the scripts the model ran and the text its web
+  searches returned, stored once per item. For Claude Code, everything Claude
+  Code printed (with keys removed), its summarized thinking included: Claude
+  models are asked for it on API connections too when the job's reasoning
+  summaries are Concise or Detailed. The programs' own session files are copied
+  in before TCS Prover deletes any of them (a session whose copy fails is
+  kept), and the author's when it pauses, stops, reaches its time limit or
+  ends. The record also keeps the job's transcript, settings and prompts each
+  time the job pauses, stops or ends, and before it is deleted.
+- **What it cannot hold** is marked in each call: reasoning the provider never
+  sends (its token count, with the encrypted copy kept), token probabilities
+  (OpenAI refuses them for reasoning models; Anthropic offers none), and
+  details only the network carries (per-word arrival times, response headers,
+  moderation notes). A call cut off when the program was stopped is marked
+  interrupted. Web-cutoff runs keep their isolation as it is: their record has
+  the author's session files and the discovery folders, and their one-shot
+  calls are marked as not recorded.
+- **It outlives the job.** Deleting a job, and emptying the trash, leave its
+  record; nothing deletes a record by itself. TCS Prover's routes list the
+  records (`GET /records`), delete one (`DELETE /records/<run folder>`, refused
+  while the job works), list and show a job's model calls, and give the
+  training download (`GET /jobs/<run folder>/training-record`, a ZIP of every
+  request in full, every item once, each context window, each critic round and
+  the transcript, nothing replaced or left out); the page's views of them are
+  still to come (see [Developers](developers.md#job-records)).
