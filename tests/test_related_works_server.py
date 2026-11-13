@@ -527,6 +527,28 @@ class SharedWorksTests(RelatedWorksCase):
         self.assertEqual(self.share(empty, "later.md")["summary"],
                          "No problem in this batch can take related works now; new problems in this batch get it.")
 
+    def test_a_job_that_cannot_link_the_batchs_works_gets_its_own_copy_and_says_so(self):
+        queued = self.start()
+        queued.state.update(phase="prepared")
+        real_link = os.link
+
+        def refuse(source, target, *args, **kwargs):
+            if "dst_dir_fd" in kwargs and str(source) == "defs.md":
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_link(source, target, *args, **kwargs)
+
+        with patch.object(related_works.os, "link", side_effect=refuse):
+            self.share("", "defs.md")
+            created = self.start()
+        for app in (queued, created):
+            with self.subTest(job=app.state["runId"]):
+                copy = self.folder(app) / "defs.md"
+                self.assertEqual(copy.read_bytes(), self.store_file("defs.md").read_bytes())
+                self.assertNotEqual(inode(copy), inode(self.store_file("defs.md")))
+                diagnostic = next(record for record in app.state["trace"] if record.get("kind") == "diagnostic")
+                self.assertIn("could not be hard-linked into this job's related-works folder", diagnostic["text"])
+                self.assertIn("so this job has its own copy of defs.md", diagnostic["text"])
+
     def test_a_new_problem_takes_its_batchs_works_before_its_author_starts(self):
         named = self.manager.named_batches.create("Graph coloring")["id"]
         self.share(named, "defs.md")
