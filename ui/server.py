@@ -27,14 +27,14 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import workflow_runner as runtime
 from retrieval import isolated_compiler
 from retrieval import runtime as retrieval_runtime
-from runner import claude_cli, prompt_catalog, providers
+from runner import claude_cli, prompt_catalog, providers, records
 from runner import team as team_module
-from . import named_batches, ownership, presets, program_setup, related_works, retrieval
+from . import model_calls, named_batches, ownership, presets, program_setup, related_works, retrieval
 from .review import REVIEW_PROMPT
 
 
@@ -136,6 +136,9 @@ MAX_SOURCE_FILE_CHARS = 255
 # An error-paused author is resumed automatically after the same wait as
 # every other model-call retry (workflow_runner.MODEL_RETRY_SECONDS).
 AUTO_RESUME_SECONDS = runtime.MODEL_RETRY_SECONDS
+# How often a running web-cutoff job's author sessions and discovery folders are copied into its record (seconds):
+# its discovery prunes a folder only once it is a day old (retrieval/historical_codex_discovery.py).
+RECORD_COPY_SECONDS = 600
 # The server starts jobs by itself (automatic resumes, queued folder-batch jobs)
 # at most this often, so jobs that came due together reach the provider spread
 # out instead of in the same second.
@@ -3112,6 +3115,10 @@ class App:
         self._progress_signature = self._progress_log = None
         # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
         self._stop_in_place = False
+        # Whether the activity log said that the job's record could not be made, and when a web-cutoff run's files
+        # were last copied into it (see _record_snapshot).
+        self._record_problem_said = False
+        self._record_copied_at = 0.0
 
     def _latest_trace(self):
         """Find the most recently changed run log, if one exists."""
@@ -4231,6 +4238,7 @@ class App:
 
         try:
             self._review_records(statement, feedback, review_model, reasoning_effort, token)
+            self._record_snapshot()
         except Exception as exc:
             with self.lock:
                 if self.active_token not in (None, token) or self.worker_token not in (None, token):
@@ -4467,14 +4475,91 @@ class App:
         return True
 
     def _retrieval_child_environment(self):
-        """Bind each worker, including independent reviewers, to its saved mode."""
+        """Bind each worker, including independent reviewers, to its saved mode.
+
+        A live run's worker also gets the job's record (records.RECORD_ENV), where it records every model call; a
+        web-cutoff run's never does (its isolation is unchanged; the server copies what it leaves behind).
+        """
         child_environment = os.environ.copy()
         # Never let one parallel job inherit another job's retrieval policy.
         child_environment.pop("TCS_PROVER_RETRIEVAL_POLICY", None)
         child_environment["TCS_PROVER_RETRIEVAL_MODE"] = self.state.get("retrievalMode", "live")
         if self.state.get("retrievalPolicyPath"):
             child_environment["TCS_PROVER_RETRIEVAL_POLICY"] = self.state["retrievalPolicyPath"]
+        child_environment.pop(records.RECORD_ENV, None)
+        record = self._open_record()
+        if record is not None and not self._web_cutoff():
+            child_environment[records.RECORD_ENV] = str(record.folder)
         return child_environment
+
+    def _web_cutoff(self):
+        return bool(self.state.get("retrievalPolicyPath") or self.state.get("retrievalMode") == "historical")
+
+    def _record_title(self):
+        """The first line of the job's statement, as the job list names it (draft.md before the job has one)."""
+
+        source = (self.state.get("problemDescription") if self.state.get("problemMode") == "algorithmic"
+                  else self.state.get("draft")) or ""
+        if not str(source).strip() and self.run_dir:
+            try:
+                source = (self.run_dir / "draft.md").read_text(encoding="utf-8").removeprefix("# Draft problem")
+            except (OSError, UnicodeError):
+                source = ""
+        return str(source).strip().split("\n", 1)[0][:300]
+
+    def _open_record(self):
+        """The job's record (<state>/records/<run folder name>, made when first needed), or None when it cannot be
+        made, which the activity log says once."""
+
+        if not self.run_dir or self.fixed_trace:
+            return None
+        try:
+            return records.Record.create(records.record_folder(self.run_dir.name), title=self._record_title(),
+                                         webCutoff=self._web_cutoff())
+        except (OSError, ValueError, records.RecordError) as exc:
+            if not self._record_problem_said:
+                self._record_problem_said = True
+                try:
+                    self.add_trace({"kind": "diagnostic", "stage": self.state.get("stage") or "solve",
+                                    "text": f"The record of this job's model calls cannot be written ({exc}); its "
+                                            "model calls run unrecorded."})
+                except OSError:
+                    pass
+            return None
+
+    def copy_web_cutoff_if_due(self):
+        """Copy a running web-cutoff job's files into its record every RECORD_COPY_SECONDS, on a thread of its own."""
+
+        if not self._web_cutoff() or self.state["phase"] not in {"running", "pausing", "stopping"}:
+            return
+        if time.monotonic() - self._record_copied_at < RECORD_COPY_SECONDS:
+            return
+        self._record_copied_at = time.monotonic()
+        threading.Thread(target=self._record_snapshot, daemon=True).start()
+
+    def _record_snapshot(self):
+        """Copy the job's transcript, settings and prompt set into its record (records.snapshot()), and a web-cutoff
+        run's author sessions and discovery folders (records.copy_web_cutoff()): when a runner, review or reply turn
+        of the job ends (a pause, a stop, the time limit, the end of the job) and before the job is deleted; a
+        running web-cutoff job also every RECORD_COPY_SECONDS (copy_web_cutoff_if_due()), before its discovery
+        folders are pruned."""
+
+        self._record_copied_at = time.monotonic()
+        record = self._open_record()
+        if record is None or not self.run_dir:
+            return
+        controller = controller_directory(self.run_dir)
+        try:
+            self.flush_trace(force=True)
+            records.snapshot(record, transcript=self.trace_file, job_settings=controller / "job-settings.json",
+                             prompts=controller / "prompts")
+            # What a runner of the job left unfinished (a crash), now that none of its processes runs.
+            records.store_leftovers(record)
+            policy = self.state.get("retrievalPolicyPath")
+            if policy:
+                records.copy_web_cutoff(record, policy)
+        except Exception as exc:  # noqa: BLE001 - the job goes on; the record says what failed.
+            records.note_problem(record, f"The snapshot of the job could not be taken ({type(exc).__name__}: {exc}).")
 
     def _spawn_runner_locked(self, workflows, stdin_text, options):
         """Start one workflow runner for this job and own it: (process, token).
@@ -6455,6 +6540,7 @@ class App:
             self._read_records(process, token)
         except Exception as exc:
             self._read_after_failure(process, token, exc)
+        self._record_snapshot()
         self._settle_run_claim()
 
     def _read_after_failure(self, process, token, failure):
@@ -8112,6 +8198,7 @@ class App:
                                 error=f"The reply was interrupted (exit code {code}); it is requested again in "
                                       f"{retry_interval_text()}.")
             self._save_conversation_locked()
+        self._record_snapshot()
         self._settle_run_claim()
 
     def _conversation_answered_locked(self, item):
@@ -9916,6 +10003,27 @@ def saved_research_source(path):
             "replacedRoles": replaced}
 
 
+def store_record_leftovers():
+    """Store what processes left in the job records when they ended without finishing their part of a record
+    (records.store_leftovers(); a running runner's own folders are skipped, it holds their claims)."""
+
+    root = records.record_root()
+    try:
+        folders = sorted(path for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return
+    for folder in folders:
+        if records.valid_name(folder.name) and records.has_leftovers(folder):
+            try:
+                records.store_leftovers(records.Record(folder))
+            except Exception:  # noqa: BLE001 - one record never stops the others.
+                traceback.print_exc()
+
+
+# The phases in which a job's runner, review or reply turn may write its record (a Records list delete waits).
+RECORD_BUSY_PHASES = {"reviewing", "running", "stopping", "pausing"}
+
+
 class Server(ThreadingHTTPServer):
     """Keep independent jobs alive while browser tabs come and go."""
 
@@ -10366,6 +10474,7 @@ class Server(ThreadingHTTPServer):
                 app.collect_progress_log()
             except Exception:
                 traceback.print_exc()  # Nor does one coordinator's progress log.
+            app.copy_web_cutoff_if_due()
 
     def _adopt_released_runs(self):
         """Take over each job another process owned, once that process has let it go."""
@@ -10388,6 +10497,9 @@ class Server(ThreadingHTTPServer):
             adopted._claims.release_all()
 
     def serve_forever(self, poll_interval=0.5):
+        # What runners left in the job records when they ended without finishing their part (a crash, a kill).
+        threading.Thread(target=store_record_leftovers, daemon=True).start()
+
         # No browser tab or polling request is needed to retry a paused job.
         def retry_loop():
             while not self._retry_stop.wait(1):
@@ -12004,6 +12116,8 @@ class Server(ThreadingHTTPServer):
                     workspace = other.state.get("goalWorkspace")
                     if workspace and Path(workspace).resolve() == folder.resolve():
                         raise ValueError("Stop the continuation using this author workspace before deleting it.")
+                # The record outlives the job: it keeps its last transcript, settings and prompts.
+                app._record_snapshot()
                 trash = self.runs / TRASH_FOLDER
                 trash.mkdir(parents=True, exist_ok=True, mode=0o700)
                 trash.chmod(0o700)
@@ -12622,6 +12736,11 @@ class Handler(BaseHTTPRequestHandler):
             with path.open("rb") as stream:
                 shutil.copyfileobj(stream, self.wfile)
             return
+        if request.path == "/records" or request.path.startswith("/jobs/"):
+            # The job records (ui/model_calls.py; ~/tcs-work/fixes/record-contract.md).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            return self.record_route(request.path, query)
         files = {
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -12633,6 +12752,70 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({"error": "Not found."}, status=404)
         name, kind = files[request.path]
         self.send((UI / name).read_bytes(), kind)
+
+    def record_route(self, path, query):
+        """GET /records, /jobs/<id>/model-calls[/<callId>[/raw]] and /jobs/<id>/training-record."""
+
+        parts = [unquote(part) for part in path.split("/")[1:]]
+        value = lambda key, default: (query.get(key) or [default])[0]  # noqa: E731
+        try:
+            if parts == ["records"]:
+                if query:
+                    return self.send({"error": "Not found."}, status=404)
+                return self.send(model_calls.record_list(lambda name: name in self.server.jobs))
+            if len(parts) == 3 and parts[2] == "model-calls":
+                return self.send(model_calls.call_list(parts[1], value("offset", "0"),
+                                                       value("limit", str(model_calls.DEFAULT_LIMIT))))
+            if len(parts) == 4 and parts[2] == "model-calls" and not query:
+                return self.send(model_calls.call_detail(parts[1], parts[3]))
+            if len(parts) == 5 and parts[2] == "model-calls" and parts[4] == "raw" and not query:
+                return self.send(model_calls.call_raw(parts[1], parts[3]))
+            if len(parts) == 3 and parts[2] == "training-record" and not query:
+                if not records.valid_name(parts[1]) or not records.record_folder(parts[1]).is_dir():
+                    raise model_calls.NotFound("This job has no record.")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{parts[1]}-training-record.zip"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+                self.end_headers()
+                # No length is known before the end: the connection closes after the last byte.
+                self.close_connection = True
+                try:
+                    model_calls.training_record(parts[1], self.wfile)
+                except (OSError, ValueError):
+                    pass  # The download stops; the browser reports it incomplete.
+                return None
+        except model_calls.NotFound as exc:
+            return self.send({"error": str(exc)}, status=404)
+        except (ValueError, OSError) as exc:
+            return self.send({"error": str(exc)}, status=400)
+        return self.send({"error": "Not found."}, status=404)
+
+    def do_DELETE(self):
+        """DELETE /records/<runFolder>: remove one job record (the page asks first)."""
+
+        request = urlsplit(self.path)
+        if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
+            return self.send({"error": "Untrusted local host."}, status=403)
+        if not self.authorized():
+            return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+        parts = [unquote(part) for part in request.path.split("/")[1:]]
+        if len(parts) != 2 or parts[0] != "records" or request.query:
+            return self.send({"error": "Not found."}, status=404)
+        name = parts[1]
+        with self.server.jobs_lock:
+            app = self.server.jobs.get(name)
+        if app is not None and (app.has_active_worker() or app.state["phase"] in RECORD_BUSY_PHASES):
+            return self.send({"error": "The job is working: stop it, or wait for its reply, before deleting its "
+                                       "record."}, status=409)
+        try:
+            return self.send(model_calls.delete_record(name))
+        except model_calls.NotFound as exc:
+            return self.send({"error": str(exc)}, status=404)
+        except (ValueError, OSError) as exc:
+            return self.send({"error": str(exc)}, status=400)
 
     def do_POST(self):
         """Call one workflow action and return its new state."""
