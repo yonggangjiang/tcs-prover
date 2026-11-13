@@ -353,8 +353,17 @@ function batchUrl(batchId) {
 }
 
 function selectedBatch() {
-  return batchCatalog.find(batch => batch.id === currentBatch);
+  return batchCatalog.find(batch => batch.id === currentBatch)
+    || (currentBatch === "__root__" && !currentJob && !composingProblem && batchOptions().create
+      ? EMPTY_DEFAULT_BATCH : undefined);
 }
+
+// The default batch's own page when the list leaves it out. A server that makes batches lists the default batch
+// only while it has problems or shares related works, yet it is always there: its page stays, empty, rather than
+// saying it is gone (after its last shared work is removed, say), and works can still be shared with it there.
+const EMPTY_DEFAULT_BATCH = Object.freeze({ id: "__root__", name: "Default batch", label: "Default batch",
+  folder: "runs", jobCount: 0, counts: {}, startedAt: "", readOnly: false, addProblems: true, attention: [],
+  queued: 0, sharedWorks: { count: 0, names: [] }, current: true, default: true });
 
 // What the last /batches answer said the server offers, kept on the function itself (it exists wherever
 // this part of the file runs): whether it makes batches (an older server or the live gateway does not),

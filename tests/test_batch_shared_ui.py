@@ -36,6 +36,14 @@ const rowsOf = list => list.children.map(row => [row.children[0].textContent,
   ...row.children[1].children.map(node => node.textContent), row.children[2]?.textContent ?? '']);
 """
 
+# The batch page's section, for the batch navigation runner (the real selectedBatch(), selectBatch() and loadJobs()),
+# with what it uses from elsewhere in the page (no backticks: the runner's setup is a template string).
+SHARED_SECTION = ["// Shared with every problem in this batch: the works", "async function addBatchSharedFiles("]
+SHARED_SECTION_STUBS = r"""
+const relatedWorksCount = count => count + ' related work' + (count === 1 ? '' : 's');
+const setNoteForm = () => {}, relatedWorkRow = () => new Element();
+"""
+
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
 class BatchSharedBrowserTests(unittest.TestCase):
@@ -250,6 +258,47 @@ assert(opened >= 2, 'rendered when the page opened and after its first poll');
 await loadJobs();
 assert(sharedRenders > opened, 'rendered again with the next poll');
 """, setup="let sharedRenders = 0; const renderBatchShared = () => { sharedRenders += 1; };")
+
+    def test_the_default_batch_page_stays_when_it_has_no_problem_and_shares_nothing_more(self):
+        self.browser(r"""
+const root = {id: '__root__', label: 'Default batch', default: true, current: true, addProblems: true, jobCount: 0,
+  counts: {}, sharedWorks: {count: 1, names: ['defs.md']}};
+const graph = {id: 'batch_00000000a1', label: 'Graph coloring', named: true, addProblems: true, jobCount: 1,
+  counts: {}, sharedWorks: {count: 0, names: []}};
+const defs = {name: 'defs.md', kind: 'file', sizeText: '4 B', batch: '', sharedFrom: ''};
+const shared = items => ({batch: '__root__', available: true, reason: '', count: items.length, items});
+setResponses({'/batches': {batches: [root, graph], canCreateBatches: true}, '/jobs?batch=__root__': {jobs: []},
+  '/batch-shared-works?batch=__root__': shared([defs])});
+await selectBatch('__root__');
+await new Promise(setImmediate);
+assert.equal(ui.batchShared.hidden, false);
+assert.equal(ui.batchSharedCount.textContent, '1 related work');
+// Its last shared work removed, the default batch (no problem in it) is left off the list of batches ...
+setResponses({'/batches': {batches: [graph], canCreateBatches: true}, '/jobs?batch=__root__': {jobs: []},
+  '/batch-shared-works?batch=__root__': shared([])});
+ui.batchSharedStatus.textContent = 'Removed defs.md. New problems in this batch no longer get it.';
+await loadJobs();
+await new Promise(setImmediate);
+// ... yet its page stays, never said to be gone: what Remove did stays on screen, and works can be shared again.
+assert.equal(ui.notice.textContent, '');
+assert.equal(ui.jobsHeading.textContent, 'Default batch');
+assert.equal(ui.batchProblems.textContent, 'Default batch');
+assert.equal(ui.batchShared.hidden, false);
+assert.equal(ui.batchSharedCount.textContent, '0 related works');
+assert.equal(ui.batchSharedStatus.textContent, 'Removed defs.md. New problems in this batch no longer get it.');
+assert.equal(JSON.stringify([ui.batchActions.hidden, ui.renameBatch.hidden, ui.deleteBatch.hidden]),
+  JSON.stringify([false, true, true]));
+// A batch made with New batch that is gone is still said to be gone, and so is the default batch of a server that
+// makes no batches (an older server, the live gateway).
+for (const [batch, catalog] of [['batch_00000000b2', {batches: [graph], canCreateBatches: true}],
+    ['__root__', {batches: [graph]}]]) {
+  setResponses({'/batches': catalog, '/jobs?batch=__root__': {jobs: []}});
+  ui.notice.textContent = '';
+  await selectBatch(batch);
+  assert.equal(ui.notice.textContent, 'This batch is no longer available. Return to All batches.', batch);
+  assert.equal(ui.notice.hidden, false, batch);
+}
+""", slices=[SHARED_SECTION], setup=SHARED_SECTION_STUBS)
 
     def test_the_new_problem_line_follows_the_author_stage(self):
         self.run_app(related.PANEL, PAGE_SETUP + r"""
