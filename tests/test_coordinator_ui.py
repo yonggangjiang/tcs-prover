@@ -274,7 +274,8 @@ assert.equal(ui.coordinatorPromptTab.hidden, true);
 """)
         # Editing the field updates the tab at once.
         source = APP.read_text(encoding="utf-8")
-        self.assertIn("ui.authorSubagents.oninput = () => showCoordinatorPromptTab();", source)
+        handler = source[source.index("ui.authorSubagents.oninput = () => {"):]
+        self.assertIn("showCoordinatorPromptTab();", handler[:handler.index("};")])
 
     def test_the_coordinator_prompt_is_explained_checked_and_kept_for_its_job(self):
         self.run_app(PROMPTS, PROMPTS_SETUP, r"""

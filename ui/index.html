@@ -333,6 +333,7 @@
                         <option value="medium">Medium</option>
                         <option value="low">Low</option>
                       </select>
+                      <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                       <label for="authorSubagents">4 · Subagents</label>
                       <input id="authorSubagents" type="number" min="0" max="10" step="1" value="3"
                         aria-describedby="authorSubagentsHelp">
@@ -342,7 +343,49 @@
                         subagents at a time, keeps the team's memory and checks that progress keeps growing; its
                         progress log appears on the job page.
                       </p>
-                      <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                      <!-- Which model each author subagent runs (app.js renderTeamModels): shown with 1 or more
+                           subagents; "Choose for each" lists one row per subagent in authorTeamModels below. With a
+                           web cutoff it stays "Same as the coordinator" and the help says why. -->
+                      <label id="authorSubagentModelsLabel" for="authorSubagentModelsMode">5 · Subagent models</label>
+                      <select id="authorSubagentModelsMode" aria-describedby="authorSubagentModelsHelp">
+                        <option value="same" selected>Same as the coordinator</option>
+                        <option value="each">Choose for each</option>
+                      </select>
+                      <p id="authorSubagentModelsHelp" class="help model-setting-help">Every author subagent runs the
+                        coordinator's model and reasoning.</p>
+                      <!-- How the author's turns follow one another: TCS Prover's own loop, whose texts the Prompts
+                           dialog edits, or the Codex CLI's built-in goal mode. -->
+                      <span id="goalLoopLabel" class="model-setting-label">6 · Goal loop</span>
+                      <div id="goalLoopChoice" class="goal-loop-choice" role="radiogroup" aria-labelledby="goalLoopLabel">
+                        <label class="goal-loop-option" for="goalLoopTcs">
+                          <input id="goalLoopTcs" type="radio" name="goalLoop" value="tcs" checked
+                            aria-describedby="goalLoopTcsHelp">
+                          <span class="goal-loop-copy"><span class="goal-loop-name">TCS Prover (editable texts)</span>
+                            <span id="goalLoopTcsHelp" class="goal-loop-help">TCS Prover starts every turn and sends
+                              the continuation itself, with the texts under Edit prompts.</span></span>
+                        </label>
+                        <label class="goal-loop-option" for="goalLoopCodex">
+                          <input id="goalLoopCodex" type="radio" name="goalLoop" value="codex"
+                            aria-describedby="goalLoopCodexHelp">
+                          <span class="goal-loop-copy"><span class="goal-loop-name">Codex built-in</span>
+                            <span id="goalLoopCodexHelp" class="goal-loop-help">The Codex CLI's own goal mode with its
+                              own texts, as before; Claude Code authors always use TCS Prover's loop.</span></span>
+                        </label>
+                      </div>
+                      <p id="goalLoopNote" class="help model-setting-help" hidden></p>
+                    </div>
+                    <!-- Choose for each: one row per author subagent ("Subagent 1" … N) with the roles' Source, Model
+                         and Reasoning menus (app.js renderTeamModels builds the rows). Spans the grid under the
+                         Proof author; hidden unless the author stage is on, with 1 or more subagents, no web cutoff
+                         and Choose for each. -->
+                    <div id="authorTeamSetting" class="model-setting team-models" role="group"
+                      aria-labelledby="authorTeamTitle" aria-describedby="authorTeamHelp" hidden>
+                      <h3 id="authorTeamTitle" class="model-role-title">Proof author · subagent models</h3>
+                      <p id="authorTeamHelp" class="help model-setting-help">Each author subagent runs the model chosen
+                        here; the coordinator gives it assignments through TCS Prover's team tools.</p>
+                      <div class="team-models-head" aria-hidden="true"><span></span><span>1 · Source</span>
+                        <span>2 · Model</span><span>3 · Reasoning</span></div>
+                      <div id="authorTeamRows" class="team-model-rows"></div>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
                       <h3 class="model-role-title">Independent critic</h3>

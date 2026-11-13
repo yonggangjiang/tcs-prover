@@ -122,6 +122,10 @@ const ui = {
   criticRounds: $("criticRounds"),
   criticCount: $("criticCount"),
   authorSubagents: $("authorSubagents"),
+  authorSubagentModelsLabel: $("authorSubagentModelsLabel"), authorSubagentModelsMode: $("authorSubagentModelsMode"),
+  authorSubagentModelsHelp: $("authorSubagentModelsHelp"), authorTeamSetting: $("authorTeamSetting"),
+  authorTeamRows: $("authorTeamRows"), goalLoopTcs: $("goalLoopTcs"), goalLoopCodex: $("goalLoopCodex"),
+  goalLoopNote: $("goalLoopNote"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
@@ -599,7 +603,7 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "thinkingHours", "skipStatementReview", "statementReviewOnly",
+    "authorSubagentModels", "goalLoop", "thinkingHours", "skipStatementReview", "statementReviewOnly",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
@@ -854,6 +858,22 @@ function retrievalSummary(source) {
 
 // When the server tries a job again by itself: an automatic resume after an error pause, the
 // next start of a queued job whose start failed, or the next attempt of a failed model call.
+// One subagent's model as the team's line names it: the menu's name, and "(API)" for an API connection's model
+// ("Lab model (API)").
+function teamModelLabel(model, label = "") {
+  const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === model);
+  const name = label || row?.label || (String(model).startsWith("api:") ? String(model).slice(4) : String(model));
+  const api = row ? row.provider === "api" : String(model).startsWith("api:");
+  return `${String(name).replace(/ — default$/, "")}${api && !/\(API\)$/.test(name) ? " (API)" : ""}`;
+}
+
+// The author's team in words: "coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Lab model (API)",
+// or "coordinator, 3 author subagents: same model as the coordinator" (``labels`` null).
+function teamText(count, labels) {
+  return `coordinator, ${count} author subagent${count === 1 ? "" : "s"}: `
+    + (labels ? labels.join(" · ") : "same model as the coordinator");
+}
+
 function retryText(job) {
   const at = (seconds) => new Date(seconds * 1000).toLocaleTimeString();
   if (job.phase === "paused" && job.autoResumeAt > 0) return `Automatic retry at ${at(job.autoResumeAt)}`;
@@ -1227,7 +1247,9 @@ function cutoffModelMessage(roles = cutoffBlockedRoles()) {
 function renderModelChoices() {
   const cutoff = selectedRetrievalMode() === "historical";
   const catalog = state.workflow?.settings?.model_catalog;
-  const roles = ["review", "author", "critic", "writer"];
+  // The author subagents' rows of "Choose for each" too (hidden, and so never shown, with a web cutoff).
+  const roles = ["review", "author", "critic", "writer",
+    ...(typeof teamRolesShown === "function" ? teamRolesShown() : [])];
   for (const role of roles) {
     const select = ui[`${role}Model`], chip = ui[`${role}ModelProvider`];
     const model = select.value || "", provider = modelProvider(model);
@@ -1291,6 +1313,8 @@ function renderRetrievalSettings() {
       : cutoffModelMessage();
   ui.retrievalConfigurationNotice.textContent = message;
   show(ui.retrievalConfigurationNotice, Boolean(message));
+  // A web cutoff fixes the subagent models to the coordinator's (and the Author stage shows them at all).
+  if (typeof renderTeamModels === "function") renderTeamModels();
   renderModelChoices();
   if (typeof renderComposerRelatedWorks === "function") renderComposerRelatedWorks();
 }
@@ -1607,14 +1631,21 @@ function describe(entry) {
   const item = params.item || event.item || {};
   const activityLabel = entry.activityLabel || "";
   const rawItemId = params.itemId || item.id || "";
-  const itemId = activityLabel && rawItemId
-    ? `${activityLabel}:${rawItemId}` : rawItemId;
   const root = entry.root !== false;
+  // A member of the author's team names itself by its number: "Subagent 2 reasoning". Each of its assignments is a
+  // run of its own whose item ids start again, so they are kept apart by member and assignment.
+  const member = !root && Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1
+    ? entry.subagentMember : null;
+  const scope = [activityLabel, member ? `member ${member}:${entry.subagentId ?? entry.conversationId ?? ""}` : ""]
+    .filter(Boolean).join(":");
+  const itemId = scope && rawItemId ? `${scope}:${rawItemId}` : rawItemId;
   const keyBase = itemId || `${entry.time}:${entry.kind}:${name}`;
   const text = entry.text || "";
-  const scopedLabel = (label) => activityLabel
-    ? `${activityLabel} · ${label}` : label;
-  const turnKey = `${activityLabel ? `${activityLabel}:` : ""}`
+  const scopedLabel = (label) => {
+    const named = member ? label.replace(/^Subagent\b/, `Subagent ${member}`) : label;
+    return activityLabel ? `${activityLabel} · ${named}` : named;
+  };
+  const turnKey = `${scope ? `${scope}:` : ""}`
     + `${params.turn?.id || event.turn_id || entry.time}`;
   // A root message is labelled by who wrote it: the author, else the call's own label (one of
   // the independent critics, their coordinator) or the role of its stage.
@@ -1676,6 +1707,20 @@ function describe(entry) {
   // The author coordinator's own records: its subagents, its time checks, a reply that named no proof file.
   const coordinatorCard = entry.kind === "status" ? authorCoordinatorCard(entry) : null;
   if (coordinatorCard) return coordinatorCard;
+  // The author's update_goal call in TCS Prover's goal loop (a "Goal status" record): the status it reported, its
+  // note, and what TCS Prover does next. Each call keeps its own row.
+  if (entry.kind === "status" && entry.label === "Goal status" && typeof entry.goalStatus === "string") {
+    const status = entry.goalStatus.trim() || "updated";
+    const note = String(entry.note ?? "").trim();
+    const next = status === "complete" ? "TCS Prover takes the author's last message of this turn as its final answer."
+      : ["blocked", "paused"].includes(status)
+        ? `TCS Prover does not stop for a ${status} goal: it records it and sends the continuation.` : "";
+    return {
+      key: `goal-status:${entry.time}:${status}`, type: "status", label: `Goal status · ${status}`,
+      text: [note ? `Note: ${note}` : "", next].filter(Boolean).join("\n") || text || "The author updated its goal.",
+      time: entry.time, replace: true,
+    };
+  }
   if (entry.kind === "status") {
     // A status replaces the previous one of its label, except the progress of the critic's independent
     // critics: every attempt keeps its "N independent critics requested" and "Independent critic i" rows
@@ -1815,10 +1860,17 @@ function authorCoordinatorCard(entry) {
     const task = String(entry.subagentTask ?? "").trim();
     const running = Number.isInteger(entry.subagentsRunning) && entry.subagentsRunning >= 0
       ? `${entry.subagentsRunning || "none"} running` : "";
-    const line = [status === "failed" && text !== task ? text : "", task || (id ? `Subagent ${id}` : ""), running]
-      .filter(Boolean).join(" · ");
+    // A member of TCS Prover's team: its number and model ("Author subagent 2 (Claude Opus 5.5) started").
+    const member = Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1 ? entry.subagentMember : null;
+    const model = String(entry.subagentModel ?? "").trim();
+    const who = [member ? `Author subagent ${member}` : "Author subagent", model ? `(${model})` : ""]
+      .filter(Boolean).join(" ");
+    const report = status !== "started" && String(entry.subagentReport ?? "").trim()
+      ? `report: ${String(entry.subagentReport).trim()}` : "";
+    const line = [status === "failed" && text !== task ? text : "",
+      task || (id && !member ? `Subagent ${id}` : ""), running, report].filter(Boolean).join(" · ");
     return {
-      key: `author-subagent:${id}:${status}:${entry.time}`, type: "status", label: `Author subagent ${status}`,
+      key: `author-subagent:${member ?? ""}:${id}:${status}:${entry.time}`, type: "status", label: `${who} ${status}`,
       text: line || text || "No details were recorded.", time: entry.time, replace: true, pinned: true,
     };
   }
@@ -2389,6 +2441,33 @@ function jobSettingsWarning() {
   return [warning, ...missing].filter(Boolean).join(" ");
 }
 
+// The job's author subagents' models for Run settings: a list of names (each subagent's model chosen), null (all
+// run the coordinator's model), or undefined for a job without TCS Prover's team (authorTeam null: its author works
+// alone, or its subagents are the CLI's own: a job from before the team, or a web-cutoff job). The server's
+// authorTeam names each member's model as the job recorded it ("API connection …" programs get "(API)").
+function jobTeamLabels(job = state) {
+  if (!Array.isArray(job.authorTeam) || !job.authorTeam.length) return undefined;
+  if (!Array.isArray(job.authorSubagentModels) || !job.authorSubagentModels.length) return null;
+  return job.authorSubagentModels.map((item, index) => {
+    const member = job.authorTeam.find((entry) => Number(entry?.member) === index + 1) || {};
+    const api = Boolean(member.connection) || /^API connection/.test(String(member.program || ""))
+      || String(item?.model).startsWith("api:");
+    const name = member.modelLabel || teamModelLabel(item?.model || "");
+    return api && !/\(API\)$/.test(name) ? `${name} (API)` : name;
+  });
+}
+
+function jobTeamText(job = state) {
+  const count = Number.isInteger(job.authorSubagents) ? job.authorSubagents : job.authorTeam.length;
+  return teamText(count, jobTeamLabels(job));
+}
+
+// The job's goal loop in Run settings.
+function jobGoalLoopText(job = state) {
+  return job.goalLoop === "codex" ? "Codex built-in (the Codex CLI's own goal mode)"
+    : "TCS Prover (editable texts; this job runs with the texts saved when it started)";
+}
+
 function renderRunOverview() {
   show(ui.runOverview, state.phase !== "input");
   if (state.phase === "input") return;
@@ -2533,9 +2612,14 @@ function renderRunOverview() {
         : state.authorMode === "coordinator" && state.authorModeEffective?.mode === "author"
           ? ` · works alone: ${state.authorModeEffective.modelLabel || "its model"} has no subagent tool (coordinator `
             + "mode needs one)"
+        // A coordinator with TCS Prover's team names each subagent's model, or says they all run its own.
+        : state.authorMode === "coordinator" && jobTeamLabels() !== undefined
+          ? ` · ${jobTeamText()}`
         : state.authorMode === "coordinator"
           ? ` · coordinator, up to ${state.authorSubagents} author subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
           : ` · up to ${state.authorSubagents} subagent${state.authorSubagents === 1 ? "" : "s"} at a time`) : "Off"],
+    // How the author's turns follow one another (a job from before the setting records none).
+    ...(stages.author && ["tcs", "codex"].includes(state.goalLoop) ? [["Goal loop", jobGoalLoopText()]] : []),
     // The limit now, and every change of it and pause at it (the server's records).
     ["Author time limit", stages.author ? limitSettingText(Number(state.thinkingHours ?? 0)) : "Off"],
     ...(timeLimitHistory().length ? [["Time limit history", timeLimitHistoryLines().join("\n")]] : []),
@@ -3963,6 +4047,10 @@ function render(next) {
     ui.criticCount.value = state.criticCount || 3;
     ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 3;
+    if (typeof applyTeamModels === "function") {
+      applyGoalLoop(state.goalLoop);
+      applyTeamModels(state.authorSubagentModels);
+    }
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
     checkEdited();
@@ -4168,6 +4256,11 @@ function applyComposerSettings(source) {
   ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 3;
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
+  // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's).
+  if (typeof applyTeamModels === "function") {
+    applyGoalLoop(source.goalLoop);
+    applyTeamModels(source.authorSubagentModels);
+  }
   ui.thinkingHours.value = source.thinkingHours ?? 0;
   ui.thinkingHours.min = hours.minimum ?? 0;
   // No maximum: any positive number of hours is a valid limit.
@@ -4940,7 +5033,207 @@ function syncModelMenus() {
     }
     syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(value), value);
   }
+  // The author subagents' choices are kept the same way (an API model that is gone: GPT 6.1 Sol); their menus follow
+  // with the next renderRetrievalSettings (see renderTeamModels), which every caller runs next.
+  if (typeof teamStore === "function") {
+    teamStore().rows.forEach((choice, index) => {
+      const row = catalog.find((item) => item.id === choice.model);
+      if (!row && String(choice.model).startsWith("api:")) {
+        choice.model = "gpt-6.1-sol";
+        replaced.push(teamRole(index));
+      }
+    });
+  }
   return replaced;
+}
+
+// --- Proof author · subagent models -------------------------------------------------------------------------------
+// "5 · Subagent models": "Same as the coordinator" (every author subagent runs the coordinator's model and reasoning;
+// the job setting authorSubagentModels is null) or "Choose for each" (one row per subagent, "Subagent 1" … N, with
+// the roles' Source, Model and Reasoning menus: a list of N {model, effort}). Offered while the Author stage is on
+// with 1 or more author subagents; with a web cutoff it stays "Same as the coordinator" (the server refuses a list)
+// and its help says why. The choices live on a function property, so they exist before this part of the file has
+// run. Changing the number of subagents keeps the rows that remain and adds rows set to the coordinator's model; a
+// number still being typed only hides rows, which the field drops when it is left (its change event).
+function teamStore() {
+  return (teamStore.value ||= { mode: "same", rows: [], loop: "tcs" });
+}
+
+function teamRole(index) {
+  return `member${index + 1}`;
+}
+
+// The number in Author subagents, or null while the field holds no whole number it allows.
+function teamSize() {
+  const field = ui.authorSubagents;
+  const value = String(field?.value ?? "").trim(), count = Number(value);
+  const min = Number(field?.min || 0), max = field?.max ? Number(field.max) : 10;
+  return value !== "" && Number.isInteger(count) && count >= min && count <= max ? count : null;
+}
+
+// Why every subagent must run the coordinator's model now, or "": a web cutoff (the server's words), whose
+// coordinator keeps the CLI's own subagents.
+function teamFixedReason() {
+  return selectedRetrievalMode() === "historical" ? "With a web cutoff, author subagents use the coordinator's model." : "";
+}
+
+// The subagent models the form starts a job with: null for "Same as the coordinator" (also with the Author stage
+// off, no subagents or a web cutoff), else one {model, effort} per subagent.
+function teamModelsSetting(stages = selectedWorkflowStages()) {
+  const store = teamStore(), count = teamSize();
+  if (store.mode !== "each" || !stages.author || !(count >= 1) || teamFixedReason()) return null;
+  return teamRows(count).slice(0, count).map(({ model, effort }) => ({ model, effort }));
+}
+
+// Make the rows at least ``count`` long: new rows take the coordinator's model and reasoning as they are now. Only
+// "Choose for each" makes rows (when it shows them or a job is started); leaving the Author subagents field drops
+// the rows past its number (see its change handler).
+function teamRows(count) {
+  const store = teamStore();
+  if (!Number.isInteger(count) || count < 0) return store.rows;
+  while (store.rows.length < count) {
+    store.rows.push({ model: ui.authorModel.value || "gpt-6.1-sol", effort: ui.authorEffort.value || "max" });
+  }
+  return store.rows;
+}
+
+// A job's, a rerun's or saved settings' subagent models: a list makes "Choose for each" with its rows; anything
+// else "Same as the coordinator". The menus follow with the next renderRetrievalSettings (the callers restore the
+// workflow stages next, which runs it).
+function applyTeamModels(models) {
+  const store = teamStore();
+  const list = Array.isArray(models) ? models.filter((item) => item && typeof item.model === "string" && item.model) : [];
+  store.mode = list.length ? "each" : "same";
+  store.rows = list.map((item) => ({ model: item.model, effort: String(item.effort || "max") }));
+}
+
+// One subagent's row: its name and the three menus, labelled for screen readers (and on narrow screens, where the
+// menus stack), and the chip that says where its model runs.
+function teamRowElement(index) {
+  const role = teamRole(index), number = index + 1;
+  const row = document.createElement("div");
+  row.className = "team-model-row";
+  row.dataset.member = String(number);
+  row.setAttribute("role", "group");
+  const name = document.createElement("span");
+  name.className = "team-member-name";
+  name.id = `${role}Name`;
+  name.textContent = `Subagent ${number}`;
+  row.setAttribute("aria-labelledby", name.id);
+  row.append(name);
+  for (const [part, words] of [["Source", "1 · Source"], ["Model", "2 · Model"], ["Effort", "3 · Reasoning"]]) {
+    const label = document.createElement("label"), select = document.createElement("select");
+    select.id = `${role}${part}`;
+    label.htmlFor = select.id;
+    label.textContent = words;
+    if (part === "Effort") {
+      select.append(...[...ui.authorEffort.options].map((option) => new Option(option.textContent, option.value)));
+    }
+    if (part === "Model") select.setAttribute("aria-describedby", `${role}ModelProvider`);
+    ui[`${role}${part}`] = select;
+    row.append(label, select);
+  }
+  const chip = document.createElement("span");
+  chip.className = "provider-chip";
+  chip.id = `${role}ModelProvider`;
+  ui[`${role}ModelProvider`] = chip;
+  row.append(chip);
+  const store = teamStore();
+  const remember = () => {
+    store.rows[index] = { model: ui[`${role}Model`].value, effort: ui[`${role}Effort`].value };
+  };
+  ui[`${role}Source`].onchange = () => {
+    syncRoleModelMenu(role, ui[`${role}Source`].value);
+    syncEffortChoices(role);
+    remember();
+    renderRetrievalSettings();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  ui[`${role}Model`].onchange = () => {
+    syncEffortChoices(role);
+    remember();
+    renderRetrievalSettings();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  ui[`${role}Effort`].onchange = () => {
+    remember();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  return row;
+}
+
+// Show "5 · Subagent models" while it applies, fixed under a web cutoff, and the rows of "Choose for each".
+function renderTeamModels() {
+  const select = ui.authorSubagentModelsMode;
+  if (!select) return;
+  renderGoalLoop();
+  const store = teamStore(), stages = selectedWorkflowStages(), count = teamSize();
+  const offered = stages.author === true && count !== null && count >= 1;
+  const fixed = teamFixedReason();
+  for (const element of [ui.authorSubagentModelsLabel, select, ui.authorSubagentModelsHelp]) show(element, offered);
+  select.disabled = Boolean(fixed);
+  select.value = fixed ? "same" : store.mode;
+  ui.authorSubagentModelsHelp.textContent = fixed
+    || (store.mode === "each" ? "Choose a model and reasoning for each author subagent below: Codex CLI, Claude Code "
+      + "or an API connection." : "Every author subagent runs the coordinator's model and reasoning.");
+  const each = offered && !fixed && store.mode === "each";
+  show(ui.authorTeamSetting, each);
+  if (!each) return;
+  teamRows(count);
+  const box = ui.authorTeamRows;
+  const shown = [...box.children];
+  while (shown.length > count) shown.pop().remove();
+  for (let index = shown.length; index < count; index += 1) box.append(teamRowElement(index));
+  for (let index = 0; index < count; index += 1) {
+    const role = teamRole(index), choice = store.rows[index];
+    const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === choice.model);
+    syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(choice.model), choice.model);
+    ui[`${role}Effort`].value = choice.effort;
+    syncEffortChoices(role);
+    choice.effort = ui[`${role}Effort`].value;
+  }
+  renderModelChoices();
+}
+
+// The rows on screen ("Subagent 1" … N while "Choose for each" shows them).
+function teamRolesShown() {
+  const count = teamSize();
+  return ui.authorTeamSetting && !ui.authorTeamSetting.hidden && count >= 1
+    ? Array.from({ length: count }, (_, index) => teamRole(index)) : [];
+}
+
+// The goal loop the form starts a job with: "tcs" (TCS Prover's loop, the default) or "codex" (the Codex CLI's
+// built-in goal mode). A web-cutoff job always runs Codex's goal mode (the server records "codex"): the form shows it
+// and keeps the choice made for when the cutoff is off again.
+function selectedGoalLoop() {
+  return teamFixedReason() ? "codex" : teamStore().loop;
+}
+
+// A job's, a rerun's or saved settings' goal loop (else TCS Prover's); the radios follow with renderTeamModels.
+function applyGoalLoop(value) {
+  teamStore().loop = value === "codex" ? "codex" : "tcs";
+}
+
+function renderGoalLoop() {
+  if (!ui.goalLoopTcs) return;
+  const fixed = Boolean(teamFixedReason()), loop = selectedGoalLoop();
+  ui.goalLoopTcs.checked = loop === "tcs";
+  ui.goalLoopCodex.checked = loop === "codex";
+  ui.goalLoopTcs.disabled = fixed;
+  if (ui.goalLoopNote) {
+    ui.goalLoopNote.textContent = fixed ? "Web-cutoff runs use Codex's goal mode." : "";
+    show(ui.goalLoopNote, fixed);
+  }
+}
+
+// The form's team for the Advanced settings summary ({text, chosen}), or null without one (no subagents, or a
+// number still being typed).
+function teamFormText() {
+  const count = teamSize();
+  if (!(count >= 1)) return null;
+  const models = teamModelsSetting();
+  const text = teamText(count, models && models.map((item) => teamModelLabel(item.model)));
+  return { text: `${text[0].toUpperCase()}${text.slice(1)}`, chosen: Boolean(models) };
 }
 
 async function refresh() {
@@ -5154,6 +5447,9 @@ function proofJobSettings() {
     criticRounds: Number(ui.criticRounds.value),
     criticCount: Number(ui.criticCount.value),
     authorSubagents: Number(ui.authorSubagents.value),
+    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop.
+    ...(typeof teamModelsSetting === "function"
+      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop() } : {}),
     thinkingHours: Number(ui.thinkingHours.value),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
@@ -5623,8 +5919,30 @@ for (const role of ["review", "author", "critic", "writer"]) {
 }
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
-// The Coordinator prompt tab is shown while Author subagents is 1 or more (see coordinatorPromptInUse).
-ui.authorSubagents.oninput = () => showCoordinatorPromptTab();
+// The Coordinator prompt tab is shown while Author subagents is 1 or more (see coordinatorPromptInUse), and so are
+// the subagent models; a number still being typed only hides rows, which leaving the field drops (see teamStore).
+ui.authorSubagents.oninput = () => {
+  showCoordinatorPromptTab();
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+ui.authorSubagents.onchange = () => {
+  const count = teamSize();
+  if (count !== null && teamStore().rows.length > count) teamStore().rows.length = count;
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+ui.authorSubagentModelsMode.onchange = () => {
+  teamStore().mode = ui.authorSubagentModelsMode.value === "each" ? "each" : "same";
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+for (const input of [ui.goalLoopTcs, ui.goalLoopCodex]) {
+  input.onchange = () => {
+    if (input.checked) teamStore().loop = input.value === "codex" ? "codex" : "tcs";
+    renderAdvancedSummary();
+  };
+}
 ui.retrievalMode.onchange = () => {
   renderRetrievalSettings();
   updateModelSummary();
@@ -6293,7 +6611,7 @@ const roleNames = { review: "statement reviewer", author: "proof author", critic
 // the default model." or "The statement reviewer and the proof author now use the default model." ``gone``
 // adds why: their selected model is no longer available.
 function defaultModelSentence(roles, gone = false) {
-  const names = roles.map((role) => `the ${roleNames[role] || role}`);
+  const names = roles.map((role) => `the ${roleNames[role] || role.replace(/^member(\d+)$/, "author subagent $1")}`);
   const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
   const one = roles.length === 1;
   return `${list.charAt(0).toUpperCase()}${list.slice(1)} now ${one ? "uses" : "use"} the default model`
@@ -7744,14 +8062,28 @@ function setupFormRoles() {
   const catalog = state?.workflow?.settings?.model_catalog;
   if (!(composingProblem && !currentJob && state.phase === "input" && Array.isArray(catalog))) return null;
   const stages = selectedWorkflowStages();
-  return ["review", "author", "critic", "writer"].map((role) => {
-    const select = ui[`${role}Model`], model = select?.value || "";
+  const entry = (role, model, on, label = "") => {
     const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
     const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
-    const label = row?.label || String(select?.selectedOptions?.[0]?.textContent || model).replace(/ — default$/, "");
-    return { role, on: Boolean(stages[role === "writer" ? "writing" : role]), model, modelLabel: label, program,
+    return { role, on, model, modelLabel: row?.label || String(label || model).replace(/ — default$/, ""), program,
       signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
+  };
+  const rows = ["review", "author", "critic", "writer"].map((role) => {
+    const select = ui[`${role}Model`], model = select?.value || "";
+    return entry(role, model, Boolean(stages[role === "writer" ? "writing" : role]),
+      select?.selectedOptions?.[0]?.textContent);
   });
+  // Each author subagent of "Choose for each" runs its own model, so its program counts like a role's ("member2").
+  const team = typeof teamModelsSetting === "function" ? teamModelsSetting(stages) : null;
+  (team || []).forEach((choice, index) => {
+    rows.push({ ...entry(`member${index + 1}`, choice.model, true), member: index + 1 });
+  });
+  return rows;
+}
+
+// A role's name in Setup's sentences ("Proof author"), or an author subagent's ("Author subagent 2").
+function setupRoleName(row) {
+  return setupWords().roles[row.role] || (row.member ? `Author subagent ${row.member}` : String(row.role));
 }
 
 // Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your saved
@@ -7818,10 +8150,14 @@ function setupRoleGroups(rows) {
     if (!groups.has(row.model)) groups.set(row.model, []);
     groups.get(row.model).push(row);
   }
-  const words = setupWords();
   return [...groups.values()].map((members) => {
     const row = members[0];
-    const names = members.length === 4 ? "all four roles" : setupJoin(members.map((item) => words.roles[item.role]));
+    // The four roles, then the author subagents of the same model by number ("Author subagents 1, 3").
+    const roles = members.filter((item) => !item.member), team = members.filter((item) => item.member);
+    const subagents = team.length > 1 ? `Author subagents ${team.map((item) => item.member).join(", ")}`
+      : team.length ? setupRoleName(team[0]) : "";
+    const names = setupJoin([...(roles.length === 4 ? ["all four roles"] : roles.map(setupRoleName)),
+      ...(subagents ? [subagents] : [])]);
     return row.signIn ? `${names} (${row.modelLabel})`
       : `${names} (API connection “${row.connection || row.modelLabel}”, no sign-in needed)`;
   }).join("; ");
@@ -7925,7 +8261,7 @@ function renderSetupHints() {
   const els = setupEls();
   if (!els.modelHint && !els.startHint) return;
   const needs = setupNeeds(), words = setupWords();
-  const roleNames = (rows) => `the ${setupJoin(rows.map((row) => words.roles[row.role].toLowerCase()))
+  const roleNames = (rows) => `the ${setupJoin(rows.map((row) => setupRoleName(row).toLowerCase()))
     .replace("latex writer", "LaTeX writer")}`;
   const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
     if (problem.kind === "none") return [];  // A role that uses a program gets that program's own line instead.
@@ -9036,7 +9372,8 @@ function presetSignature() {
   return JSON.stringify([selectedWorkflowStages(),
     ...["review", "author", "critic", "writer"].flatMap((role) => [ui[`${role}Model`].value, ui[`${role}Effort`].value]),
     number(ui.authorSubagents), number(ui.criticCount), number(ui.criticRounds), number(ui.thinkingHours),
-    ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings()]);
+    ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings(),
+    ...(typeof teamModelsSetting === "function" ? [teamModelsSetting(), selectedGoalLoop()] : [])]);
 }
 
 // The settings a Save sends: a job's (proofJobSettings) without its prompts. A number field of a stage
@@ -9233,6 +9570,15 @@ function renderAdvancedSummary() {
   const box = $("advancedSummary");
   if (!box) return;
   const chips = [presetStore().summary];
+  // The author's goal loop and its team, while the Author stage is on: quiet with TCS Prover's loop and the
+  // coordinator's model for every subagent (the defaults), marked otherwise.
+  if (typeof teamFormText === "function" && ui.workflowAuthor.checked) {
+    const loop = selectedGoalLoop();
+    chips.push({ text: `Goal loop: ${loop === "codex" ? "Codex built-in" : "TCS Prover"}`,
+      tone: loop === "codex" ? "accent" : "quiet" });
+    const team = teamFormText();
+    if (team) chips.push({ text: team.text, tone: team.chosen ? "accent" : "quiet" });
+  }
   const items = typeof composerRelatedWorks === "function" ? composerRelatedWorks().items : [];
   if (items.length) {
     const failed = items.filter((item) => item.status === "failed").length;

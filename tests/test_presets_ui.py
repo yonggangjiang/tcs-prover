@@ -123,9 +123,11 @@ ui.advancedSettings.append(summary, ui.presetBar, ui.criticCount, ui.thinkingHou
   ui.retrievalCutoffUtc);
 card.append(ui.problem, ui.workflowReview, ui.workflowAuthor, ui.workflowCritic, ui.workflowWriting,
   ui.advancedSettings);
-// The summary of Advanced settings: each chip's words and tone.
-const chips = () => ui.advancedSummary.children.filter((node) => node.className === "advanced-chip")
+// The summary of Advanced settings: each chip's words and tone (allChips), and the chips these tests are about (the
+// author's goal loop and team chips are checked in tests/test_team_page_ui.py).
+const allChips = () => ui.advancedSummary.children.filter((node) => node.className === "advanced-chip")
   .map((chip) => [chip.textContent, chip.dataset.tone]);
+const chips = () => allChips().filter(([text]) => !/^(Goal loop: |Coordinator, \d+ author subagent)/.test(text));
 
 let state = { trace: [], traceVersion: 0, workflow: { nodes: {}, edges: [] } };
 let previousPhase = "", currentJob = "", currentBatch = "", composingProblem = true, composerSeed = null;
@@ -312,7 +314,9 @@ assert.equal(submitted.defaultPrevented, true);
 const [sent] = posts();
 assert.equal(sent.path, "/presets");
 assert.deepEqual(Object.keys(sent.body).sort(), ["makeDefault", "name", "settings"]);
-assert.deepEqual(Object.keys(sent.body.settings).sort(), [...fixture.settingKeys].sort());
+// Saved settings hold the author's subagent models and goal loop too (ui/presets.py keeps them once it knows them).
+assert.deepEqual(Object.keys(sent.body.settings).sort(),
+  [...new Set([...fixture.settingKeys, "authorSubagentModels", "goalLoop"])].sort());
 assert.deepEqual([sent.body.name, sent.body.makeDefault], ["Mine", true]);
 assert.deepEqual([sent.body.settings.criticModel, sent.body.settings.criticCount, sent.body.settings.thinkingHours],
   ["claude-opus-5-5", 5, 24]);
@@ -1276,6 +1280,8 @@ assert.deepEqual(chips(), [["Saved settings: Careful proof", "accent"], ["2 rela
 // The summary names the disclosure button: its chips are read as separate phrases, after the title.
 assert.deepEqual(ui.advancedSummary.children.map((node) => [node.className, node.textContent]),
   [["visually-hidden", ", "], ["advanced-chip", "Saved settings: Careful proof"], ["visually-hidden", ", "],
+    ["advanced-chip", "Goal loop: TCS Prover"], ["visually-hidden", ", "],
+    ["advanced-chip", "Coordinator, 2 author subagents: same model as the coordinator"], ["visually-hidden", ", "],
     ["advanced-chip", "2 related works"]]);
 // One still uploading, one that failed, and the Author stage that reads them turned off.
 list.items = [work("a.pdf", "uploading"), work("Plan.md")];
