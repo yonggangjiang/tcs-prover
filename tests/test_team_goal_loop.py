@@ -197,7 +197,8 @@ class ServiceTests(unittest.TestCase):
     def test_calls_run_side_by_side(self):
         client = self.client()
         blocked = client.start("tools/call", {"name": "block", "arguments": {}})
-        self.assertEqual(client.tool("echo", {"y": 2}), ('echo {"y": 2}', False))
+        # Answered while the first call still waits (it waits up to 20 s).
+        self.assertEqual(client.tool("echo", {"y": 2}, timeout=5), ('echo {"y": 2}', False))
         self.provider.release.set()
         self.assertEqual(client.answer(blocked)["result"]["content"][0]["text"], "released")
 
@@ -326,6 +327,23 @@ class GoalLoopTests(unittest.TestCase):
         self.assertEqual(service.names(), ["update_goal"])
         session.close()
         self.assertEqual(service.names(), [])
+
+    def test_only_a_status_given_in_the_turn_itself_ends_it(self):
+        def done(rpc):
+            double.service.call("update_goal", {"status": "complete"})
+            rpc.messages.extend([goal_test.answer(POINTER), goal_test.completed()])
+
+        double = LoopDouble([done, lambda rpc: rpc.messages.extend([goal_test.answer("Fixing Lemma 2."),
+                                                                     goal_test.completed()]), done])
+        service = double.service = team.Service()
+        self.addCleanup(service.close)
+        session = self.session(double, service=service)
+        self.assertEqual(next(session)["output"], POINTER)
+        # A late call while the critic reviews (no turn runs) belongs to no turn: the repair turn that gives no
+        # status of its own is continued, never handed on.
+        service.call("update_goal", {"status": "complete"})
+        self.assertEqual(session.send({"solution": "Fixed", "bugs": "Gap.", "round": 1})["output"], POINTER)
+        self.assertEqual(len(self.turns(double)), 3)
 
     def test_a_coordinators_report_is_answered_inside_the_goal_continuation(self):
         def report(rpc):
