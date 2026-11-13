@@ -78,9 +78,13 @@ it opens, so connections added or removed in another tab count.
   loads as GPT 6.1 Sol with a note, as a role's does (*Author subagent 2 model
   not available …*).
 - The **Advanced settings** line also names the goal loop (*Goal loop: TCS
-  Prover*) and, with 1 or more author subagents, the team (*Coordinator, 3 author
-  subagents: same model as the coordinator*); either is marked when it is not
-  the default.
+  Prover*, or *TCS Prover (Claude Code author)* for a Proof author that runs
+  through Claude Code, which always uses it) and, with 1 or more author
+  subagents, the team (*Coordinator, 3 author subagents: same model as the
+  coordinator*); either is marked when it is not the default.
+- Settings saved while a web cutoff is on keep the goal loop chosen on the form
+  (the form shows *Codex built-in* then, as a web-cutoff job runs Codex's goal
+  mode): loaded later without the cutoff, they run that loop.
 - Terminal runs never read saved settings.
 
 ## Where they are kept

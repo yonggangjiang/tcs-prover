@@ -300,6 +300,43 @@ assert.deepEqual([composerSeed.settings.goalLoop, composerSeed.settings.goalLoop
   ["codex", false, true]);
 """, extra_slices=[["async function rerunWithStatement(", "// The New problem page, adding to"]])
 
+    def test_a_job_from_before_revised_in_place_shows_its_goal_loop_and_subagents_fixed(self):
+        # A job from before TCS Prover's goal loop and team (or one that kept such a job's settings) sent back to the
+        # form by its statement review: Start revises it in its own folder, where the server keeps Codex's goal mode
+        # and the CLI's own subagents whatever the form says. The form shows them fixed and says why.
+        self.run_form(r"""
+await openFresh();
+const kept = "This job started with the CLI's own author subagents, each running the coordinator's model and "
+  + "reasoning, and keeps them when it is revised; a new problem can use TCS Prover's team.";
+for (const before of [{goalLoopRecorded: false}, {legacyTeam: true}]) {
+  currentJob = "old-job";
+  composingProblem = false;
+  previousPhase = "running";
+  render({...fresh(), runId: "old-job", authorSubagents: 2, goalLoop: "codex", ...before});
+  renderTeamModels();
+  assert.deepEqual([ui.authorSubagentModelsMode.value, ui.authorSubagentModelsMode.disabled,
+    ui.authorSubagentModelsHelp.textContent], ["same", true, kept], JSON.stringify(before));
+  assert.deepEqual([ui.goalLoopTcs.checked, ui.goalLoopTcs.disabled, ui.goalLoopCodex.checked, ui.goalLoopNote.hidden,
+    ui.goalLoopNote.textContent], [false, true, true, false,
+    "This job started with Codex's goal mode and keeps it when it is revised."]);
+  // Nothing on the form can ask for TCS Prover's team for this revision.
+  loop("tcs");
+  choose("each");
+  assert.deepEqual([proofJobSettings().goalLoop, proofJobSettings().authorSubagentModels], ["codex", null]);
+  renderAdvancedSummary();
+  assert.ok(allChips().some(([text]) => text === "Coordinator, up to 2 author subagents at a time (the CLI's own)"),
+    JSON.stringify(allChips()));
+  choose("same");
+  loop("codex");
+}
+// A job of today revised in place keeps its own choices, which the form may change.
+previousPhase = "running";
+render({...fresh(), runId: "old-job", authorSubagents: 2, goalLoop: "tcs", goalLoopRecorded: true});
+renderTeamModels();
+assert.deepEqual([ui.authorSubagentModelsMode.disabled, ui.goalLoopTcs.disabled, proofJobSettings().goalLoop],
+  [false, false, "tcs"]);
+""")
+
     def test_saved_settings_hold_the_team_and_the_goal_loop(self):
         self.run_form(r"""
 await openFresh();
@@ -322,6 +359,18 @@ const settings = presetFormSettings();
 assert.deepEqual([settings.goalLoop, settings.authorSubagentModels.map((item) => item.model)],
   ["tcs", ["gpt-6.1-sol", ui.member2Model.value]]);
 assert.equal("promptOverrides" in settings, false);
+// Saved with a web cutoff on, they keep the loop the form keeps for when the cutoff is off again (the cutoff's job
+// itself runs Codex's goal mode); loaded and with the cutoff off, the job runs that loop.
+ui.retrievalMode.value = "historical";
+ui.retrievalCutoffUtc.value = fixture.cutoff;
+renderRetrievalSettings();
+assert.equal(proofJobSettings().goalLoop, "codex");
+const saved = presetFormSettings();
+assert.equal(saved.goalLoop, "tcs");
+loop("codex");
+applyComposerSettings({...saved, retrievalMode: "live", retrievalCutoffUtc: ""});
+renderRetrievalSettings();
+assert.equal(proofJobSettings().goalLoop, "tcs");
 """)
 
     def test_a_saved_subagent_model_that_was_removed_loads_as_gpt_6_1_sol_with_a_note(self):
@@ -362,6 +411,14 @@ loop("codex");
 renderAdvancedSummary();
 assert.deepEqual(allChips().slice(1), [["Goal loop: Codex built-in", "accent"],
   ["Coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Model A (API)", "accent"]]);
+// A Claude Code author always runs TCS Prover's loop, whatever the choice (kept for a Codex author).
+const coordinator = ui.authorModel.value;
+setChoice(ui.authorModel, "claude-opus-5-5");
+renderAdvancedSummary();
+assert.deepEqual(allChips()[1], ["Goal loop: TCS Prover (Claude Code author)", "quiet"]);
+setChoice(ui.authorModel, coordinator);
+renderAdvancedSummary();
+assert.deepEqual(allChips()[1], ["Goal loop: Codex built-in", "accent"]);
 // Without subagents only the goal loop; with the Author stage off neither.
 count(0);
 renderAdvancedSummary();
@@ -451,6 +508,22 @@ assert.equal(proofAuthor({authorSubagents: 3, authorMode: 'coordinator'}),
 assert.equal(row('Goal loop'), undefined);
 assert.equal(proofAuthor({authorSubagents: 0, authorMode: 'author', goalLoop: 'tcs'}), 'gpt-6.1-sol · max · works alone');
 assert.ok(row('Goal loop'));
+// An author that runs through Claude Code always ran TCS Prover's loop (Claude Code has no goal mode), also in a job
+// from before the setting, which the server restores with Codex built-in, and with an Anthropic-format API model.
+proofAuthor({authorModel: 'claude-opus-5-5', authorSubagents: 0, authorMode: 'author', goalLoop: 'codex'});
+assert.equal(row('Goal loop').children[1].textContent, 'TCS Prover (Claude Code authors always use it)');
+proofAuthor({authorModel: 'claude-opus-5-5', authorSubagents: 0, authorMode: 'author', goalLoop: 'codex',
+  promptSet: {goal: 'Prove S.'}});
+assert.equal(row('Goal loop').children[1].textContent,
+  'TCS Prover (Claude Code authors always use it; this job runs with the texts saved when it started)');
+proofAuthor({authorModel: 'api:gate--m-c', authorSubagents: 0, authorMode: 'author', goalLoop: 'codex',
+  workflow: {...job.workflow, settings: {model_catalog: [{id: 'api:gate--m-c', label: 'Model C', provider: 'api',
+    format: 'anthropic', sourceLabel: 'Gateway', host: 'gate.example'}]}}});
+assert.equal(row('Goal loop').children[1].textContent, 'TCS Prover (Claude Code authors always use it)');
+proofAuthor({authorModel: 'api:lab--m-a', authorSubagents: 0, authorMode: 'author', goalLoop: 'codex',
+  workflow: {...job.workflow, settings: {model_catalog: [{id: 'api:lab--m-a', label: 'Model A', provider: 'api',
+    format: 'openai', sourceLabel: 'Lab', host: 'lab.example'}]}}});
+assert.equal(row('Goal loop').children[1].textContent, "Codex built-in (the Codex CLI's own goal mode)");
 """)
 
     def test_activity_rows_name_each_subagent_and_its_model(self):
@@ -545,8 +618,11 @@ const goal = (goalStatus, note, time = 't1') => describe({kind: 'status', stage:
 assert.deepEqual([goal('blocked', 'Need the constant of Lemma 4.').label, goal('blocked', 'Need the constant of Lemma 4.').text],
   ['Goal status · blocked', 'Note: Need the constant of Lemma 4.\nTCS Prover does not stop for a blocked goal: it '
     + 'records it and sends the continuation.']);
+// What a complete goal leads to is decided when the turn ends (goal_session): the line says when it is not the hand-in.
 assert.deepEqual([goal('complete', '').label, goal('complete', '').text],
-  ['Goal status · complete', "TCS Prover takes the author's last message of this turn as its final answer."]);
+  ['Goal status · complete', "When this turn ends, TCS Prover hands its final reply on as the author's answer. A turn "
+    + "without a final reply, and a coordinator's reply that names no proof file (kept as a report), get the "
+    + "continuation instead."]);
 assert.equal(goal('paused', '').text,
   'TCS Prover does not stop for a paused goal: it records it and sends the continuation.');
 // Each call keeps its row.

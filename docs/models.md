@@ -131,7 +131,10 @@ run through, and LaTeX, one card each:
   form's selected roles only, and a job that waits for a program or a login
   links to Setup from its line under **Needs your attention**, its row and its
   page. None of this stops a start: the job retries every minute and continues
-  by itself.
+  by itself. An author subagent's program is the exception the hint beside
+  **Start workflow** names: until it is set up, the coordinator's assignments to
+  that subagent fail and come back to it with the reason (see
+  [the author's team](workflow.md#the-authors-team)).
 - Setup is not available through the live gateway; open TCS Prover from its own
   launch link.
 

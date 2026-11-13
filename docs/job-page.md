@@ -49,7 +49,10 @@ runs with. Its **Proof author** row ends with how the author works:
 A **Goal loop** row follows: *TCS Prover (editable texts; this job runs with the
 texts saved when it started)* or *Codex built-in (the Codex CLI's own goal mode)*,
 which jobs from before the setting and web-cutoff runs show (see
-[the goal loop](workflow.md#the-goal-loop)). **View this job's prompts**, under
+[the goal loop](workflow.md#the-goal-loop)). A job whose author runs through
+Claude Code (a Claude model, or an API model of the Anthropic format) reads
+*TCS Prover (Claude Code authors always use it)*, whatever loop the job
+recorded, as Claude Code has no goal mode of its own. **View this job's prompts**, under
 the rows, opens every text the job runs with, read-only and grouped as in **Edit
 prompts**, each marked *changed* where it differs from today's default; for a job
 from before every text was saved, the role prompts it saved, with a note.
@@ -62,8 +65,10 @@ read *Subagent 2 reasoning*, *Subagent 2 tool* and *Subagent 2*. The
 coordinator's team tools show as tool activity (*team_assign · completed*). Each
 `update_goal` call of an author in TCS Prover's goal loop is a **Goal status**
 line, such as **Goal status · blocked**, with the author's note and what TCS
-Prover does next: it never stops for a blocked or paused goal, and a complete one
-hands the turn's last message on.
+Prover does next: it never stops for a blocked or paused goal, and when the turn
+of a complete one ends, its final reply is handed on as the author's answer; a
+turn without a final reply, and a coordinator's reply that names no proof file
+(kept as a report), get the continuation instead.
 
 ### How jobs are counted
 

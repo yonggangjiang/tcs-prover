@@ -2106,7 +2106,11 @@ function describe(entry) {
   if (entry.kind === "status" && entry.label === "Goal status" && typeof entry.goalStatus === "string") {
     const status = entry.goalStatus.trim() || "updated";
     const note = String(entry.note ?? "").trim();
-    const next = status === "complete" ? "TCS Prover takes the author's last message of this turn as its final answer."
+    // As goal_session decides when the turn ends: its final reply goes on as the answer, except a coordinator's
+    // reply that names no proof file (kept as a report) and a turn that ends without one.
+    const next = status === "complete" ? "When this turn ends, TCS Prover hands its final reply on as the author's "
+        + "answer. A turn without a final reply, and a coordinator's reply that names no proof file (kept as a "
+        + "report), get the continuation instead."
       : ["blocked", "paused"].includes(status)
         ? `TCS Prover does not stop for a ${status} goal: it records it and sends the continuation.` : "";
     return {
@@ -2857,8 +2861,20 @@ function jobTeamText(job = state) {
   return teamText(count, jobTeamLabels(job));
 }
 
-// The job's goal loop in Run settings.
+// Whether a model source (roleModelSource()) runs through Claude Code: a Claude model, or an API model of the
+// Anthropic format. Claude Code has no goal mode of its own, so such an author always runs TCS Prover's goal loop,
+// whatever loop its job records (every job from before the setting records Codex built-in).
+function runsThroughClaudeCode(source) {
+  return source.kind === "claude" || (source.kind === "api" && source.format === "anthropic");
+}
+
+// The job's goal loop in Run settings: the loop its author ran.
 function jobGoalLoopText(job = state) {
+  const saved = job.promptSet && typeof job.promptSet === "object";
+  if (runsThroughClaudeCode(roleModelSource("author", job.authorModel))) {
+    return `TCS Prover (Claude Code authors always use it${saved
+      ? "; this job runs with the texts saved when it started" : ""})`;
+  }
   return job.goalLoop === "codex" ? "Codex built-in (the Codex CLI's own goal mode)"
     : "TCS Prover (editable texts; this job runs with the texts saved when it started)";
 }
@@ -5482,10 +5498,23 @@ function teamSize() {
   return value !== "" && Number.isInteger(count) && count >= min && count <= max ? count : null;
 }
 
+// Whether the form revises a job in place (a statement review sent back to the form, which Start runs again in the
+// job's own folder) that keeps Codex's goal mode and the CLI's own subagents: a job from before TCS Prover's goal
+// loop and team (goalLoopRecorded false), or one that kept such a job's settings (legacyTeam). The server keeps them
+// for such a job whatever the form says, so the form shows them fixed (a rerun or a new problem can choose TCS
+// Prover's team).
+function revisesLegacyTeamJob() {
+  return Boolean(currentJob) && ["input", "reviewed"].includes(state?.phase)
+    && (state.goalLoopRecorded === false || state.legacyTeam === true);
+}
+
 // Why every subagent must run the coordinator's model now, or "": a web cutoff (the server's words), whose
-// coordinator keeps the CLI's own subagents.
+// coordinator keeps the CLI's own subagents, or a job revised in place that keeps them (revisesLegacyTeamJob).
+// Either way the job runs Codex's goal mode too (selectedGoalLoop).
 function teamFixedReason() {
-  return selectedRetrievalMode() === "historical" ? "With a web cutoff, author subagents use the coordinator's model." : "";
+  return selectedRetrievalMode() === "historical" ? "With a web cutoff, author subagents use the coordinator's model."
+    : revisesLegacyTeamJob() ? "This job started with the CLI's own author subagents, each running the coordinator's "
+      + "model and reasoning, and keeps them when it is revised; a new problem can use TCS Prover's team." : "";
 }
 
 // The subagent models the form starts a job with: null for "Same as the coordinator" (also with the Author stage
@@ -5635,9 +5664,20 @@ function renderGoalLoop() {
   ui.goalLoopCodex.checked = loop === "codex";
   ui.goalLoopTcs.disabled = fixed;
   if (ui.goalLoopNote) {
-    ui.goalLoopNote.textContent = fixed ? "Web-cutoff runs use Codex's goal mode." : "";
+    ui.goalLoopNote.textContent = !fixed ? "" : selectedRetrievalMode() === "historical"
+      ? "Web-cutoff runs use Codex's goal mode." : "This job started with Codex's goal mode and keeps it when it is revised.";
     show(ui.goalLoopNote, fixed);
   }
+}
+
+// Whether the form's Proof author runs through Claude Code (a Claude model, or an API model of the Anthropic
+// format), which has no goal mode of its own: such an author always runs TCS Prover's goal loop (the Goal loop choice
+// is kept for a Codex author). As runsThroughClaudeCode() reads a job's author.
+function formAuthorUsesClaudeCode() {
+  const model = ui.authorModel.value;
+  const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === model);
+  const provider = modelProvider(model);
+  return provider === "claude" || (provider === "api" && row?.format === "anthropic");
 }
 
 // The form's team for the Advanced settings summary ({text, chosen}), or null without one (no subagents, or a
@@ -5645,7 +5685,7 @@ function renderGoalLoop() {
 function teamFormText() {
   const count = teamSize();
   if (!(count >= 1)) return null;
-  if (legacyTeamApplies() && !teamFixedReason()) {
+  if ((legacyTeamApplies() && !teamFixedReason()) || revisesLegacyTeamJob()) {
     // As Run settings name a job's CLI subagents.
     return { text: `Coordinator, up to ${count} author subagent${count === 1 ? "" : "s"} at a time (the CLI's own)`,
       chosen: true };
@@ -8702,26 +8742,42 @@ function renderSetupHints() {
   const needs = setupNeeds(), words = setupWords();
   const roleNames = (rows) => `the ${setupJoin(rows.map((row) => setupRoleName(row).toLowerCase()))
     .replace("latex writer", "LaTeX writer")}`;
+  // Each sentence with the form's rows it is about: a role's, or an author subagent's (row.member).
   const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
     if (problem.kind === "none") return [];  // A role that uses a program gets that program's own line instead.
     const need = needs[problem.program], info = setupStore().data.programs[problem.program], name = words.the[problem.program];
     if (problem.kind === "latex") {
-      return need.roles.length ? [problem.title === "LaTeX not found" ? "LaTeX was not found, so Writing & polishing cannot make the PDF."
-        : "LaTeX does not run, so Writing & polishing cannot make the PDF."] : [];
+      return need.roles.length ? [{ rows: need.roles, text: problem.title === "LaTeX not found"
+        ? "LaTeX was not found, so Writing & polishing cannot make the PDF."
+        : "LaTeX does not run, so Writing & polishing cannot make the PDF." }] : [];
     }
     if (problem.kind === "signin") {
-      return need.rolesSignIn.length ? [`${name} is not signed in; ${roleNames(need.rolesSignIn)} ${need.rolesSignIn.length === 1 ? "uses" : "use"} `
-        + `your ${words.logins[problem.program]} login through it.`] : [];
+      return need.rolesSignIn.length ? [{ rows: need.rolesSignIn, text: `${name} is not signed in; `
+        + `${roleNames(need.rolesSignIn)} ${need.rolesSignIn.length === 1 ? "uses" : "use"} `
+        + `your ${words.logins[problem.program]} login through it.` }] : [];
     }
     if (!need.roles.length) return [];
-    if (problem.kind === "offpath") return [`${name} is installed in ${info.shownOffPath || info.offPath}, but jobs do not find it there.`];
+    if (problem.kind === "offpath") {
+      return [{ rows: need.roles, text: `${name} is installed in ${info.shownOffPath || info.offPath}, but jobs do not `
+        + "find it there." }];
+    }
     const verb = need.roles.length === 1 ? "uses" : "use";
-    return [problem.kind === "install" ? `${name} is not installed on this computer; ${roleNames(need.roles)} ${verb} it.`
-      : `${name} does not run on this computer; ${roleNames(need.roles)} ${verb} it.`];
+    return [{ rows: need.roles, text: problem.kind === "install"
+      ? `${name} is not installed on this computer; ${roleNames(need.roles)} ${verb} it.`
+      : `${name} does not run on this computer; ${roleNames(need.roles)} ${verb} it.` }];
   });
-  for (const [element, extra] of [[els.modelHint, ""], [els.startHint, " You can start now: the job retries every minute until it works."]]) {
+  // Beside Start: a role's model call is retried every minute once the job runs; an author subagent's assignment is
+  // not, as a missing program, login or model is no failure a retry helps: it comes back to the coordinator.
+  const rows = sentences.flatMap((sentence) => sentence.rows);
+  const roles = rows.some((row) => !row.member);
+  const members = [...new Set(rows.filter((row) => row.member).map((row) => row.member))].sort((a, b) => a - b);
+  const assignments = members.length ? `the coordinator's assignments to author subagent${members.length === 1 ? "" : "s"} `
+    + `${setupJoin(members.map(String))} fail and come back to it with the reason` : "";
+  const start = roles ? ` You can start now: the job retries every minute until it works${assignments
+    ? `, and until then ${assignments}` : ""}.` : assignments ? ` You can start now, but until this is fixed ${assignments}.` : "";
+  for (const [element, extra] of [[els.modelHint, ""], [els.startHint, start]]) {
     if (!element) continue;
-    const text = sentences.length ? `${sentences.join(" ")}${extra}` : "";
+    const text = sentences.length ? `${sentences.map((sentence) => sentence.text).join(" ")}${extra}` : "";
     if (element.dataset.text !== text) {
       element.dataset.text = text;
       element.replaceChildren(...(text ? [`${text} `, setupLink()] : []));
@@ -9837,6 +9893,9 @@ function presetFormSettings() {
   delete settings.promptOverrides;
   // A rerun's goal loop and subagents of a job from before are that job's, never saved settings'.
   delete settings.legacyTeam;
+  // The goal loop chosen on the form, which it keeps while a web cutoff runs Codex's goal mode: saved settings
+  // loaded later without the cutoff use it (a web-cutoff job records Codex's goal mode anyway).
+  if ("goalLoop" in settings && typeof teamStore === "function") settings.goalLoop = teamStore().loop;
   const builtIn = { authorSubagents: 3, criticCount: 3, criticRounds: 2, thinkingHours: 0,
     ...presetStore().builtIn?.settings };
   for (const { key, stage, problem } of presetNumberFields()) {
@@ -10028,9 +10087,11 @@ function renderAdvancedSummary() {
   // The author's goal loop and its team, while the Author stage is on: quiet with TCS Prover's loop and the
   // coordinator's model for every subagent (the defaults), marked otherwise.
   if (typeof teamFormText === "function" && ui.workflowAuthor.checked) {
-    const loop = selectedGoalLoop();
-    chips.push({ text: `Goal loop: ${loop === "codex" ? "Codex built-in" : "TCS Prover"}`,
-      tone: loop === "codex" ? "accent" : "quiet" });
+    // A Claude Code author always runs TCS Prover's loop (the choice is kept for a Codex author).
+    const claude = formAuthorUsesClaudeCode();
+    const loop = claude ? "tcs" : selectedGoalLoop();
+    chips.push({ text: `Goal loop: ${loop === "codex" ? "Codex built-in" : "TCS Prover"}${claude
+      ? " (Claude Code author)" : ""}`, tone: loop === "codex" ? "accent" : "quiet" });
     const team = teamFormText();
     if (team) chips.push({ text: team.text, tone: team.chosen ? "accent" : "quiet" });
   }

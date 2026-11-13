@@ -409,6 +409,40 @@ ui.workflowWriting.checked = false;
 assert.equal(setupNeeds().latex.roles.length, 0);
 """, slices=(SETUP,))
 
+    def test_a_problem_of_an_author_subagents_program_says_what_happens_to_its_assignments(self):
+        # A role's model call is retried every minute once the job runs; an author subagent's assignment is not: a
+        # missing program comes back to the coordinator as a failed assignment with the reason (member_problem()).
+        self.run_app(r"""
+responder = () => ({status: 200, body: status()});
+await loadSetup();
+await settle();
+composingProblem = true;
+state = {phase: 'input', workflow: {settings: {model_catalog: [
+  {id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol', provider: 'codex'},
+  {id: 'claude-opus-5-5', label: 'Claude Opus 5.5', provider: 'claude'}]}}};
+for (const role of ['review', 'author', 'critic', 'writer']) ui[role + 'Model'].value = 'gpt-6.1-sol';
+for (const stage of ['workflowReview', 'workflowAuthor', 'workflowCritic', 'workflowWriting']) ui[stage].checked = true;
+// Choose for each: only subagent 2 runs a Claude model, and Claude Code is not installed.
+globalThis.teamModelsSetting = () => [{model: 'gpt-6.1-sol', effort: 'high'}, {model: 'claude-opus-5-5', effort: 'max'},
+  {model: 'gpt-6.1-sol', effort: 'high'}];
+renderSetupHints();
+const problem = 'Claude Code is not installed on this computer; the author subagent 2 uses it.';
+assert.equal(setupEls().startHint.textContent, `${problem} You can start now, but until this is fixed the `
+  + "coordinator's assignments to author subagent 2 fail and come back to it with the reason. Open Setup");
+assert.equal(setupEls().modelHint.textContent, `${problem} Open Setup`);
+// A role on Claude Code too: the job retries every minute, and the subagent's assignments still come back.
+ui.criticModel.value = 'claude-opus-5-5';
+renderSetupHints();
+assert.equal(setupEls().startHint.textContent, 'Claude Code is not installed on this computer; the independent '
+  + 'critic and author subagent 2 use it. You can start now: the job retries every minute until it works, and until '
+  + "then the coordinator's assignments to author subagent 2 fail and come back to it with the reason. Open Setup");
+// A role alone, as before.
+globalThis.teamModelsSetting = () => null;
+renderSetupHints();
+assert.equal(setupEls().startHint.textContent, 'Claude Code is not installed on this computer; the independent '
+  + 'critic uses it. You can start now: the job retries every minute until it works. Open Setup');
+""", slices=(SETUP,))
+
     def test_the_dialog_shows_the_exact_command_and_cancel_sends_nothing(self):
         self.run_app(r"""
 settingUp = true;

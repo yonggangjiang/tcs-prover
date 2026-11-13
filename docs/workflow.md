@@ -170,8 +170,10 @@ who runs those turns:
 - The author ends the goal with TCS Prover's `update_goal` tool, whose
   description is the `goal_tool_update_goal` text (its arguments',
   `goal_tool_update_goal_status` and `goal_tool_update_goal_note`; their
-  defaults are the Codex CLI's). Status *complete* hands the turn's last
-  message on as the final answer, as before. *Blocked* or *paused* is recorded
+  defaults are the Codex CLI's). Status *complete* hands the turn's final
+  reply on as the answer when the turn ends, as before; a turn without a final
+  reply, and a coordinator's reply that names no proof file (kept as a report),
+  get the continuation instead. *Blocked* or *paused* is recorded
   and TCS Prover sends the continuation: it never stops a run for them. Each
   call is a **Goal status** line in the activity log, such as **Goal status ·
   blocked**, with the author's note and what TCS Prover does next.
@@ -193,6 +195,9 @@ who runs those turns:
   the program's own subagents with the coordinator's model, which the help line
   under **Subagent models** says. Choosing **TCS Prover** as the goal loop, or
   **Choose for each**, gives the new job TCS Prover's team, as for any new job.
+- Such a job revised in place (its statement review sent back to the form) keeps
+  them: the form shows **Codex built-in** and **Same as the coordinator** fixed,
+  with a note saying so.
 
 ### The author coordinator
 
