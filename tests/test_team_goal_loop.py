@@ -20,7 +20,7 @@ from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
-from runner import claude_cli, confinement, providers, team
+from runner import claude_cli, confinement, providers, tcs_mcp, team
 
 import test_author_coordinator as coordinator_test
 import test_claude_cli as claude_test
@@ -199,10 +199,42 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(entry["tool_timeout_sec"], team.TOOL_TIMEOUT_SECONDS)
         self.assertGreater(team.TOOL_TIMEOUT_SECONDS, team.WAIT_MINUTES * 60)
         self.assertEqual(entry["tools"], {"echo": {"approval_mode": "approve"}, "block": {"approval_mode": "approve"}})
-        claude = self.service.claude_config()["mcpServers"]["tcs"]
-        self.assertEqual((claude["command"], claude["args"], claude["env"], claude["timeout"]),
-                         (sys.executable, ["-I", str(team.BRIDGE)], self.service.environment(),
-                          team.TOOL_TIMEOUT_SECONDS * 1000))
+
+    def test_claude_code_gets_an_sdk_server_that_the_runner_answers(self):
+        # Claude Code 2.1.289 drops every --mcp-config server but an "sdk" one under --safe-mode; it then sends the
+        # server's messages to the runner as control requests (shapes captured from that binary).
+        self.assertEqual(self.service.claude_config(), {"mcpServers": {"tcs": {
+            "type": "sdk", "name": "tcs", "timeout": team.TOOL_TIMEOUT_SECONDS * 1000, "alwaysLoad": True}}})
+        self.assertNotIn(self.service.token, json.dumps(self.service.claude_config()))
+        initialize = self.service.answer({"method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "claude-code", "title": "Claude Code", "version": "2.1.289"}},
+            "jsonrpc": "2.0", "id": 0})
+        self.assertEqual(initialize["id"], 0)
+        self.assertEqual(initialize["result"]["serverInfo"]["name"], "tcs")
+        self.assertEqual(initialize["result"]["capabilities"], {"tools": {"listChanged": False}})
+        # Claude Code shows a server's instructions to the model: the server gives none, only editable descriptions.
+        self.assertNotIn("instructions", initialize["result"])
+        self.assertIn(initialize["result"]["protocolVersion"], tcs_mcp.VERSIONS)
+        self.assertEqual(self.service.answer({"method": "initialize", "params": {"protocolVersion": "2025-06-18"},
+                                              "jsonrpc": "2.0", "id": 0})["result"]["protocolVersion"], "2025-06-18")
+        self.assertIsNone(self.service.answer({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        self.assertIsNone(self.service.answer({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                               "params": {"requestId": 2, "reason": "AbortError: remote-cancel"}}))
+        listed = self.service.answer({"method": "tools/list", "jsonrpc": "2.0", "id": 1})
+        self.assertEqual([tool["name"] for tool in listed["result"]["tools"]], ["echo", "block"])
+        called = self.service.answer({"method": "tools/call", "params": {
+            "name": "echo", "arguments": {"x": 1}, "_meta": {"claudecode/toolUseId": "toolu_1", "progressToken": 2}},
+            "jsonrpc": "2.0", "id": 2})
+        self.assertEqual(called, {"jsonrpc": "2.0", "id": 2, "result": {
+            "content": [{"type": "text", "text": 'echo {"x": 1}'}], "isError": False}})
+        refused = self.service.answer({"method": "tools/call", "params": {"name": "echo", "arguments": {"refuse": 1}},
+                                       "jsonrpc": "2.0", "id": 3})
+        self.assertEqual(refused["result"], {"content": [{"type": "text", "text": "refused"}], "isError": True})
+        self.assertEqual(self.service.answer({"method": "ping", "jsonrpc": "2.0", "id": 4})["result"], {})
+        self.assertEqual(self.service.answer({"method": "resources/list", "jsonrpc": "2.0", "id": 5})["error"]["code"],
+                         -32601)
+        self.assertEqual(self.service.answer({"jsonrpc": "2.0", "id": 6})["error"]["code"], -32600)
 
     def test_codex_reads_every_tool_up_front_and_no_text_of_the_bridge_itself(self):
         entry = self.service.codex_server()
@@ -696,6 +728,24 @@ class TeamTests(TeamCase):
         self.assertEqual({event["subagentMember"] for event in member_events}, {1, 2, 3})
         self.assertNotIn(API_KEY, json.dumps(self.events))
 
+    def test_a_claude_members_own_retries_of_a_failed_request_are_recorded(self):
+        # Claude Code retries a failed API request inside the member's run (system/api_retry, as 2.1.289 reported it
+        # for a key its endpoint refused, up to 300 times): each retry is a diagnostic of that member.
+        self.scenario.write_text(json.dumps({"turns": [["init", {"emit": {
+            "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 300, "retry_delay_ms": 556,
+            "error_status": 401, "error": "authentication_failed", "uuid": "6b2ac872-87f0-43c4-8efd-2c797872f342"}},
+            {"emit": {"type": "assistant", "parent_tool_use_id": None, "uuid": "m1",
+                      "message": {"content": [{"type": "text", "text": "Lemma A holds."}]}}},
+            {"result": {"result": "Lemma A holds."}}]]}))
+        crew = self.crew([{"model": "claude-opus-5-5", "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertIn("REPORT:\nLemma A holds.", report)
+        retry, = [event for event in self.events if event["kind"] == "diagnostic" and "retry" in event["text"]]
+        self.assertEqual(retry["text"], "Member 1 (Claude Opus 5.5): Claude API retry: status 401, retrying in 0.6 s "
+                                        "(attempt 1 of 300)")
+        self.assertEqual((retry["subagentMember"], retry["subagentModel"]), (1, "Claude Opus 5.5"))
+
     def test_followup_continues_a_members_conversation_and_wrong_calls_are_refused(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}])
         with self.assertRaisesRegex(team.TeamError, "no conversation that can be continued"):
@@ -981,6 +1031,16 @@ class ExecuteTeamTests(unittest.TestCase):
         prompt, kwargs = self.launch({"author_team": "tcs"})
         self.assertEqual([member.model for member in kwargs["team"].members.values()], [runtime.MODEL] * 3)
 
+    def test_a_claude_coordinator_has_no_plan_to_work_alone(self):
+        # Claude Code loads TCS Prover's "sdk" server also with --bare (2.1.289), so the team stays in every mode.
+        prompt, kwargs = self.launch({"author_team": "tcs", "author_model": "claude-opus-5-5"}, claude=True)
+        self.assertIsInstance(kwargs["team"], team.Team)
+        self.assertTrue(kwargs["coordinator"])
+        self.assertNotIn("alone", kwargs)
+        # A Claude coordinator with the CLI's own subagents still has one, for a CLI that offers no subagent tool.
+        prompt, kwargs = self.launch({"author_team": "builtin", "author_model": "claude-opus-5-5"}, claude=True)
+        self.assertIn("alone", kwargs)
+
     def test_jobs_from_before_and_web_cutoff_runs_keep_the_built_in_subagents(self):
         for options, policy in (({}, None), ({"author_team": "builtin"}, None),
                                 ({"author_team": "tcs"}, {"isolation": {"workspace": "/run"}})):
@@ -1103,25 +1163,39 @@ class TextTests(unittest.TestCase):
 
 
 class ClaudeCoordinatorTests(TeamCase):
-    def coordinator(self, crew, turns, texts=TEXTS, **options):
-        self.scenario.write_text(json.dumps({"turns": turns, "secret": claude_test.SECRET}))
+    """A Claude coordinator against the stand-in CLI, which models Claude Code 2.1.289's MCP behaviour as captured
+    from that binary (tests/test_claude_cli.py FAKE_CLAUDE): only an "sdk" server survives --safe-mode, and its
+    messages travel as control requests that goal_session answers."""
+
+    NAMES = [f"mcp__tcs__{name}" for name in team.TEAM_TOOLS]
+
+    def coordinator(self, crew, turns, texts=TEXTS, model="claude-opus-5-5", extra=None, **options):
+        self.scenario.write_text(json.dumps({"turns": turns, "secret": claude_test.SECRET, **(extra or {})}))
         service = team.Service()
         self.addCleanup(service.close)
         session = claude_cli.goal_session(
             runtime, "Coordinate the team on S.", prompts=claude_test.PROMPTS, coordinator=True, texts=texts,
             team=crew, service=service, features=[],
-            settings={"model": "claude-opus-5-5", "effort": "high", "speed": "standard", "summary": "concise",
-                      "subagents": 1},
-            options={"goal_cwd": str(self.run_dir), **options})
+            settings={"model": model, "effort": "high", "speed": "standard", "summary": "concise", "subagents": 1},
+            options={"goal_cwd": str(self.run_dir), "goal_pause_file": str(self.run_dir / "pause-request.json"),
+                     "author_steer_file": str(self.run_dir / "author-steer.json"), **options})
         self.addCleanup(session.close)
-        return session
+        return service, session
+
+    def logged(self, event):
+        return [row for row in map(json.loads, self.claude_log.read_text().splitlines()) if row["event"] == event]
+
+    def results(self):
+        return {row["name"]: row for row in self.logged("mcp_result")}
 
     def test_a_claude_coordinator_gets_the_team_through_tcs_prover_s_server_and_no_agent_tool(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
-        names = [f"mcp__tcs__{name}" for name in team.TEAM_TOOLS]
-        session = self.coordinator(crew, [[{"init": {"extra_tools": names}}, "echo",
-                                           {"structured": {"goal_status": "complete", "final_answer": POINTER,
-                                                           "progress_note": ""}}]])
+        service, session = self.coordinator(crew, [[
+            "init", "echo", {"mcp_call": {"name": "mcp__tcs__team_members"}},
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 1, "assignment": "Lemma A"}}},
+            {"mcp_call": {"name": "mcp__tcs__team_wait", "arguments": {"timeout_minutes": 1}}},
+            {"mcp_call": {"name": "mcp__tcs__update_goal", "arguments": {"status": "complete"}}},
+            {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]])
         with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True):
             self.assertEqual(next(session)["output"], POINTER)
         start, = self.claude_starts()
@@ -1129,29 +1203,139 @@ class ClaudeCoordinatorTests(TeamCase):
         tools = argv[argv.index("--tools") + 1].split(",")
         self.assertFalse({"Task", "Agent"} & set(tools))
         allowed = argv[argv.index("--allowedTools") + 1].split(",")
-        self.assertEqual([tool for tool in allowed if tool.startswith("mcp__")], names)
+        self.assertEqual([tool for tool in allowed if tool.startswith("mcp__")], self.NAMES)
         self.assertNotIn("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", start["env"])
+        # The isolation stays as for every Claude process: --safe-mode, which keeps only an "sdk" server.
+        self.assertIn("--safe-mode", argv)
         self.assertIn("--strict-mcp-config", argv)
-        config_path = Path(argv[argv.index("--mcp-config") + 1])
-        self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
-        config = json.loads(config_path.read_text())
-        self.assertEqual(list(config["mcpServers"]), ["tcs"])
-        # The CLI's side: its MCP client starts the bridge from that file and calls the team tools.
-        client = MCPClient(config["mcpServers"]["tcs"])
-        self.addCleanup(client.close)
-        self.assertEqual([tool["name"] for tool in client.request("tools/list", {})["result"]["tools"]],
-                         list(team.TEAM_TOOLS))
-        self.assertFalse(client.tool("team_assign", {"member": 1, "assignment": "Lemma A"})[1])
-        text, _ = client.tool("team_wait", {"timeout_minutes": 1}, timeout=90)
-        self.assertIn("Report of gpt-6.1-sol: Lemma A", text)
+        self.assertEqual(start["mcp_config"], {"tcs": {"type": "sdk", "name": "tcs",
+                                                       "timeout": team.TOOL_TIMEOUT_SECONDS * 1000,
+                                                       "alwaysLoad": True}})
+        self.assertEqual(start["mcp_dropped"], [])
+        self.assertEqual(start["mcp_config_mode"], "0o600")
+        self.assertNotIn(service.token, json.dumps(start))
+        connected, = self.logged("mcp_connected")
+        self.assertEqual(connected["initialize"]["response"]["mcp_response"]["result"]["serverInfo"]["name"], "tcs")
+        self.assertEqual([tool["name"] for tool in connected["tools"]], list(team.TEAM_TOOLS))
+        self.assertEqual(connected["tools"][1]["description"], TEXTS["team_tool_assign"])
+        results = self.results()
+        self.assertEqual(results["mcp__tcs__team_members"]["content"],
+                         [{"type": "text", "text": "member 1: GPT 6.1 Sol (Codex CLI): idle"}])
+        self.assertIn("Report of gpt-6.1-sol: Lemma A", results["mcp__tcs__team_wait"]["content"][0]["text"])
+        self.assertFalse(results["mcp__tcs__team_wait"]["is_error"])
+        # A Claude coordinator ends its goal with its structured status: it has no update_goal.
+        self.assertEqual(results["mcp__tcs__update_goal"]["content"],
+                         "<tool_use_error>Error: No such tool available: mcp__tcs__update_goal</tool_use_error>")
         self.assertEqual(start["harness"], runtime.render_template(TEXTS["claude_goal_harness"],
                                                                   {"objective": claude_test.PROMPTS["goal"]}))
         session.close()
         self.assertIsNotNone(crew.closed)
-        self.assertFalse(config_path.exists())
+        self.assertFalse(Path(argv[argv.index("--mcp-config") + 1]).exists())
+
+    def test_a_coordinator_whose_cli_offers_no_team_tools_ends_the_attempt(self):
+        # Claude Code starts without a server it cannot load (a dropped or failed one), so the init's tool list is
+        # the check: the attempt ends, to be retried, rather than the coordinator working on without its team.
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        _, session = self.coordinator(crew, [["init", "echo", {"structured": {
+            "goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]],
+            extra={"mcp_unavailable": True})
+        with self.assertRaises(runtime.WorkflowPaused) as caught:
+            next(session)
+        self.assertIsNotNone(caught.exception.retry)
+        self.assertIn("Claude Code did not offer the coordinator its team's tools (mcp__tcs__team_members",
+                      caught.exception.reason)
+        self.assertIn("TCS Prover's MCP server: failed.", caught.exception.reason)
+        self.assertIsNone(crew.closed)  # A retried attempt keeps the team.
+
+    def test_a_refused_call_is_the_tools_error_result(self):
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        _, session = self.coordinator(crew, [[
+            "init", "echo",
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 9, "assignment": "x"}}},
+            {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]])
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True):
+            self.assertEqual(next(session)["output"], POINTER)
+        refused = self.results()["mcp__tcs__team_assign"]
+        self.assertEqual((refused["content"], refused["is_error"]), ("There is no member 9; the members are 1 to 1.",
+                                                                     True))
+
+    def test_a_live_instruction_ends_a_running_team_wait_and_reaches_the_coordinator(self):
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        steer = self.run_dir / "author-steer.json"
+        _, session = self.coordinator(crew, [[
+            "init", "echo",
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 1, "assignment": "Lemma A SLOW"}}},
+            # The instruction comes while the wait runs (the member works for 120 s).
+            {"mcp_call": {"name": "mcp__tcs__team_wait", "arguments": {"timeout_minutes": 1}}},
+            {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]],
+            extra={"after_call": {"mcp__tcs__team_wait": {"path": str(steer), "text": json.dumps(
+                {"queue": [{"id": "steer-1", "instruction": "Try Lemma B first."}]})}}})
+        began = time.monotonic()
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True):
+            self.assertEqual(next(session)["output"], POINTER)
+        self.assertLess(time.monotonic() - began, 60)
+        wait = self.results()["mcp__tcs__team_wait"]["content"][0]["text"]
+        self.assertTrue(wait.startswith("The wait ended early: TCS Prover sent you a live instruction"), wait)
+        self.assertIn('member 1: GPT 6.1 Sol (Codex CLI): working on "Lemma A SLOW"', wait)
+        # Claude Code queued the instruction during the call and took it in after the result.
+        sent = [row["message"] for row in self.logged("input") if row["message"].get("type") == "user"]
+        self.assertEqual(sent[-1]["message"]["content"][0]["text"], "Try Lemma B first.")
+        accepted, = self.labelled("Author instruction accepted")
+        self.assertEqual(accepted["authorSteerDelivered"], "steer-1")
+
+    def test_a_pause_during_a_team_wait_cancels_it_and_stops_the_members(self):
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        pause = self.run_dir / "pause-request.json"
+        _, session = self.coordinator(crew, [[
+            "init", "echo",
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 1, "assignment": "Lemma A SLOW"}}},
+            {"mcp_call": {"name": "mcp__tcs__team_wait", "arguments": {"timeout_minutes": 1}}},
+            {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]],
+            extra={"after_call": {"mcp__tcs__team_wait": {"path": str(pause), "text": "{}"}}})
+        began = time.monotonic()
+        with self.assertRaises(runtime.WorkflowPaused) as caught:
+            next(session)
+        self.assertLess(time.monotonic() - began, 60)  # The member's 120 s run was stopped.
+        self.assertIsNone(caught.exception.retry)
+        self.assertTrue(self.results()["mcp__tcs__team_wait"]["interrupted"])
+        self.assertEqual(crew.closed, "It stopped when the author paused.")
+        failed, = self.labelled("Author subagent failed")
+        self.assertEqual((failed["subagentMember"], failed["text"]), (1, "It stopped when the author paused."))
+        self.assertIn("Author paused", [event.get("label") for event in self.events])
+
+    def test_a_coordinator_in_bare_mode_keeps_its_team(self):
+        # An API model whose claude command drops CLAUDE_CONFIG_DIR runs with --bare, which Claude Code 2.1.289
+        # gives TCS Prover's "sdk" server too: the coordinator keeps its team instead of working alone.
+        model = providers.save_api_model({"format": "anthropic", "baseUrl": "https://gateway.example.com/v1",
+                                          "headerName": "x-api-key", "model": "gateway-claude",
+                                          "apiKey": claude_test.SECRET, "label": "Gateway"})["id"]
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator=model)
+        alone = {"prompt": "Prove S alone.", "prompts": dict(claude_test.PROMPTS), "recovery": ""}
+        self.scenario.write_text(json.dumps({"turns": [[
+            "init", "echo",
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 1, "assignment": "Lemma A"}}},
+            {"mcp_call": {"name": "mcp__tcs__team_wait", "arguments": {"timeout_minutes": 1}}},
+            {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]],
+            "secret": claude_test.SECRET, "drops_config_dir": True}))
+        service = team.Service()
+        self.addCleanup(service.close)
+        session = claude_cli.goal_session(
+            runtime, "Coordinate the team on S.", prompts=claude_test.PROMPTS, coordinator=True, texts=TEXTS,
+            team=crew, service=service, features=[], alone=alone,
+            settings={"model": model, "effort": "high", "speed": "standard", "summary": "concise", "subagents": 1},
+            options={"goal_cwd": str(self.run_dir)})
+        self.addCleanup(session.close)
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True):
+            self.assertEqual(next(session)["output"], POINTER)
+        start, = self.claude_starts()
+        self.assertIn("--bare", start["argv"])
+        sent = [row["message"] for row in self.logged("input") if row["message"].get("type") == "user"]
+        self.assertEqual(sent[0]["message"]["content"][0]["text"], "Coordinate the team on S.")
+        self.assertIn("Report of gpt-6.1-sol: Lemma A", self.results()["mcp__tcs__team_wait"]["content"][0]["text"])
+        self.assertNotIn("No subagents with this model", [event.get("label") for event in self.events])
 
     def test_the_goal_note_is_the_jobs_text(self):
-        session = self.coordinator(None, [["init", "echo", {"structured": {
+        _, session = self.coordinator(None, [["init", "echo", {"structured": {
             "goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]],
             texts={**TEXTS, "claude_goal_harness": "MY NOTE: {objective}"})
         self.assertEqual(next(session)["output"], POINTER)

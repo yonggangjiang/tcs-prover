@@ -1,10 +1,12 @@
 """TCS Prover's MCP server "tcs" (its service in the runner) and the author coordinator's team.
 
-The author or coordinator of a run reaches TCS Prover through one MCP server, named SERVER_NAME, that its CLI starts
-as a stdio process (runner/tcs_mcp.py, a thin bridge). The bridge forwards each request over a local channel to the
-Service of the runner process that started the CLI: a TCP listener on 127.0.0.1 with a random port, which answers
-only requests that carry the random token the bridge received in its environment (from the CLI's settings for that
-server, never from argv). The service holds the tools:
+The author or coordinator of a run reaches TCS Prover through one MCP server, named SERVER_NAME. Codex starts it as
+a stdio process (runner/tcs_mcp.py, a thin bridge), which forwards each request over a local channel to the Service
+of the runner process that started the CLI: a TCP listener on 127.0.0.1 with a random port, which answers only
+requests that carry the random token the bridge received in its environment (from the CLI's settings for that
+server, never from argv). Claude Code reaches the same Service without a bridge: the runner answers the server's
+messages itself on the CLI's stream-json control channel (Service.claude_config(), Service.answer()). The service
+holds the tools:
 - update_goal (GoalTool): how a Codex author or coordinator under TCS Prover's goal loop ends its goal
   (workflow_runner.goal_session());
 - the team tools (Team): team_members, team_assign, team_wait, team_followup and team_stop of the author
@@ -31,7 +33,7 @@ import sys
 import threading
 import time
 
-from runner import providers
+from runner import providers, tcs_mcp
 
 SERVER_NAME = "tcs"
 BRIDGE = Path(__file__).resolve().with_name("tcs_mcp.py")
@@ -286,11 +288,54 @@ class Service:
                 "tools": {name: {"approval_mode": "approve"} for name in names}}
 
     def claude_config(self):
-        """The --mcp-config of a Claude Code CLI with this server (Claude Code 2.1.289: "timeout" in ms per call)."""
+        """The --mcp-config of a Claude Code CLI with this server: an "sdk" server, which the runner answers itself.
 
-        return {"mcpServers": {SERVER_NAME: {"type": "stdio", "command": sys.executable,
-                                             "args": ["-I", str(BRIDGE)], "env": self.environment(),
-                                             "timeout": TOOL_TIMEOUT_SECONDS * 1000}}}
+        Claude Code 2.1.289 drops every --mcp-config server but an "sdk" one under --safe-mode, which every Claude
+        process gets (claude_cli.command_arguments()), so a stdio server (the bridge) would never start. For an
+        "sdk" server the CLI writes each MCP message as a control request {"subtype": "mcp_message", "server_name",
+        "message"} on its stream-json output and takes the answer from a control response {"mcp_response": ...}
+        on its input (claude_cli.goal_session() answers them with answer()). "timeout" is the CLI's limit for one
+        tool call, in ms (the CLI then cancels the call); the CLI has no idle limit for such a server. "alwaysLoad"
+        keeps its tools in every request, never deferred behind Claude Code's tool search (whose own tool the
+        coordinator does not get). All verified against the 2.1.289 binary.
+        """
+
+        return {"mcpServers": {SERVER_NAME: {"type": "sdk", "name": SERVER_NAME,
+                                             "timeout": TOOL_TIMEOUT_SECONDS * 1000, "alwaysLoad": True}}}
+
+    def answer(self, message):
+        """The JSON-RPC answer to one MCP message of a Claude Code CLI (claude_config()), or None for a notification.
+
+        As the bridge (runner/tcs_mcp.py) answers Codex: initialize and ping here, tools/list and tools/call from the
+        tools of this service. A tools/call runs the tool here and may take as long as it does (a team_wait), so the
+        caller answers each one on a thread of its own. The initialize answer carries no "instructions": Claude Code
+        shows a server's instructions to the model in its context (2.1.289), and every text the model reads from this
+        server is an editable tool or argument description.
+        """
+
+        if not isinstance(message, dict) or not isinstance(message.get("method"), str):
+            if isinstance(message, dict) and "id" in message:
+                return {"jsonrpc": "2.0", "id": message.get("id"),
+                        "error": {"code": -32600, "message": "Invalid request."}}
+            return None
+        if "id" not in message:
+            return None  # A notification (initialized, cancelled): nothing to answer.
+        request_id, method = message["id"], message["method"]
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if method == "initialize":
+            requested = params.get("protocolVersion")
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "protocolVersion": requested if requested in tcs_mcp.VERSIONS else tcs_mcp.VERSIONS[-1],
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": "1.0.0"}}}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": self.definitions()}}
+        if method == "tools/call":
+            return {"jsonrpc": "2.0", "id": request_id,
+                    "result": self.call(params.get("name"), params.get("arguments") or {})}
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found."}}
 
     def close(self):
         self._closed.set()
