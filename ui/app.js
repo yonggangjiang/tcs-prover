@@ -358,9 +358,9 @@ function selectedBatch() {
       ? EMPTY_DEFAULT_BATCH : undefined);
 }
 
-// The default batch's own page when the list leaves it out. A server that makes batches lists the default batch
-// only while it has problems or shares related works, yet it is always there: its page stays, empty, rather than
-// saying it is gone (after its last shared work is removed, say), and works can still be shared with it there.
+// The default batch's own page should a list leave it out. A server that makes batches lists the default batch
+// always, also with no problem and nothing shared; were it left out, its page would still stay, empty, rather than
+// saying it is gone (after its last shared work is removed, say), and works could still be shared with it there.
 const EMPTY_DEFAULT_BATCH = Object.freeze({ id: "__root__", name: "Default batch", label: "Default batch",
   folder: "runs", jobCount: 0, counts: {}, startedAt: "", readOnly: false, addProblems: true, attention: [],
   queued: 0, sharedWorks: { count: 0, names: [] }, current: true, default: true });
@@ -537,13 +537,18 @@ function renderBatches(batches) {
   }
   ui.batchesList.dataset.signature = signature;
   ui.batchesList.replaceChildren();
-  if (!batches.length && typeof setupLink === "function") {
-    ui.batchesStatus.replaceChildren("No batches yet. ", setupLink(),
+  // Nothing made yet: no batch, or only the default batch with no problem and nothing shared (a server that makes
+  // batches always lists it). The line leads to Setup first.
+  const unused = batches.every(batch => batch.default && !Number(batch.jobCount || 0)
+    && !Number(batch.sharedWorks?.count || 0));
+  const opening = batches.length ? "No problems yet. " : "No batches yet. ";
+  if (unused && typeof setupLink === "function") {
+    ui.batchesStatus.replaceChildren(opening, setupLink(),
       " to check the programs your models need, then create a problem.");
   } else {
-    ui.batchesStatus.textContent = batches.length ? "" : "No batches yet. Create a problem to get started.";
+    ui.batchesStatus.textContent = unused ? `${opening}Create a problem to get started.` : "";
   }
-  show(ui.batchesStatus, !batches.length);
+  show(ui.batchesStatus, unused);
   for (const batch of batches) {
     const item = document.createElement("li"), link = document.createElement("a");
     item.className = `batch-card${batch.current ? " current" : ""}`;
@@ -599,9 +604,10 @@ function renderBatches(batches) {
     }
     const time = document.createElement("span"), open = document.createElement("span");
     time.className = "batch-card-time";
+    // The default batch with no problem yet has no date to show.
     time.textContent = batch.lastActivityAt ? `Last activity ${localDateTime(batch.lastActivityAt)}`
       : batch.startedAt ? `Started ${localDateTime(batch.startedAt)}`
-      : batch.createdAt ? `Created ${localDateTime(batch.createdAt)}` : "Saved research workspace";
+      : batch.createdAt ? `Created ${localDateTime(batch.createdAt)}` : batch.default ? "" : "Saved research workspace";
     open.className = "batch-card-open"; open.textContent = "Open problems →";
     link.append(top, copy, progress, time, open); item.append(link); ui.batchesList.append(item);
   }

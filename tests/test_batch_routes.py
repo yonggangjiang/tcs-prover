@@ -292,14 +292,21 @@ class NamedBatchRouteTests(unittest.TestCase):
 
     def test_new_batch_answers_with_its_card_and_refuses_a_taken_name(self):
         status, value = self.call('/batches')
-        self.assertEqual((status, value['batches'], value['canCreateBatches'], value['batchesProblem']),
-                         (200, [], True, ''))
+        self.assertEqual((status, value['canCreateBatches'], value['batchesProblem']), (200, True, ''))
+        # Nothing made yet: the default batch alone, listed with no problem and nothing shared.
+        [root] = value['batches']
+        self.assertEqual({key: root[key] for key in ('id', 'label', 'default', 'current', 'addProblems', 'readOnly',
+                                                     'jobCount', 'counts', 'startedAt', 'sharedWorks')},
+                         {'id': '__root__', 'label': 'Default batch', 'default': True, 'current': True,
+                          'addProblems': True, 'readOnly': False, 'jobCount': 0, 'counts': {}, 'startedAt': '',
+                          'sharedWorks': {'count': 0, 'names': []}})
         status, value = self.call('/batches', {'name': '  Graph   coloring '})
         self.assertEqual(status, 200, value)
         batch = value['batch']
         self.assertEqual(batch['name'], 'Graph coloring')
         self.assertRegex(batch['id'], r'^batch_[0-9a-f]{10}$')
-        [card] = value['batches']
+        [root, card] = value['batches']
+        self.assertEqual(root['id'], '__root__')
         self.assertEqual({key: card[key] for key in ('id', 'label', 'named', 'addProblems', 'readOnly', 'jobCount',
                                                      'current', 'createdAt', 'counts')},
                          {'id': batch['id'], 'label': 'Graph coloring', 'named': True, 'addProblems': True,
@@ -315,8 +322,9 @@ class NamedBatchRouteTests(unittest.TestCase):
         status, value = self.call('/batches', {})
         self.assertEqual(status, 200, value)
         self.assertTrue(value['batch']['name'].startswith('Batch · '), value)
-        # Newest first, both empty and both listed; nothing was started.
-        self.assertEqual([card['label'] for card in value['batches']], [value['batch']['name'], 'Graph coloring'])
+        # The default batch, then the newest first, all empty and all listed; nothing was started.
+        self.assertEqual([card['label'] for card in value['batches']],
+                         ['Default batch', value['batch']['name'], 'Graph coloring'])
         self.assertEqual((self.launches, self.http.jobs), ([], {}))
         self.assertEqual([path.name for path in self.runs.iterdir()], [server.CONTROLLER_FOLDER])
 
@@ -420,7 +428,8 @@ class NamedBatchRouteTests(unittest.TestCase):
         other = self.make_batch('Upper bounds')
         status, value = self.call('/batches/rename?' + urlencode({'batch': batch}), {'name': ' LB '})
         self.assertEqual((status, value['batch']['id'], value['batch']['name']), (200, batch, 'LB'))
-        self.assertEqual({card['id']: card['label'] for card in value['batches']}, {batch: 'LB', other: 'Upper bounds'})
+        self.assertEqual({card['id']: card['label'] for card in value['batches']},
+                         {'__root__': 'Default batch', batch: 'LB', other: 'Upper bounds'})
         for path, body, error in (
                 ('/batches/rename?' + urlencode({'batch': batch}), {'name': 'upper BOUNDS'},
                  'There is already a batch named “Upper bounds”. Choose another name.'),
@@ -439,7 +448,7 @@ class NamedBatchRouteTests(unittest.TestCase):
         self.assertEqual((status, value), (200, {'deleted': run_id}))
         status, value = self.call('/batches/delete?' + urlencode({'batch': batch}), {})
         self.assertEqual((status, value['deleted']), (200, batch))
-        self.assertEqual([card['id'] for card in value['batches']], [other])
+        self.assertEqual([card['id'] for card in value['batches']], ['__root__', other])
         saved = json.loads((self.runs / server.CONTROLLER_FOLDER / named_batches.FILENAME).read_text())
         self.assertEqual([row['id'] for row in saved['batches']], [other])
 
@@ -581,7 +590,7 @@ class NamedBatchRouteTests(unittest.TestCase):
         status, value = self.call('/jobs?' + urlencode({'batch': batch}))
         self.assertEqual(sorted(row['runId'] for row in value['jobs']), sorted([source_id, continued_id]))
         status, value = self.call('/batches')
-        self.assertEqual([(card['id'], card['jobCount']) for card in value['batches']], [(batch, 2)])
+        self.assertEqual([(card['id'], card['jobCount']) for card in value['batches']], [('__root__', 0), (batch, 2)])
 
     def test_every_job_made_from_another_keeps_its_batch_while_the_list_cannot_be_read(self):
         batch = self.make_batch('Graph coloring')
@@ -659,7 +668,7 @@ class NamedBatchRouteTests(unittest.TestCase):
         # The batch's card (and so the sidebar and the Overview's totals) counts each apart from paused jobs.
         status, value = self.call('/batches')
         self.assertEqual([(card['id'], card['jobCount'], card['counts']) for card in value['batches']],
-                         [(batch, 2, {'stopped': 1, 'limit': 1})])
+                         [('__root__', 0, {}), (batch, 2, {'stopped': 1, 'limit': 1})])
         # Continue: the same job and run folder reopen the saved conversation, in the same batch.
         self.assertEqual(self.call('/continue-stopped' + query('__root__'), {}),
                          (404, {'error': 'That job is not in this batch.'}))
@@ -674,7 +683,7 @@ class NamedBatchRouteTests(unittest.TestCase):
         self.assertEqual(self.settings(run_id)['batch'], batch)
         status, value = self.call('/batches')
         self.assertEqual([(card['id'], card['jobCount'], card['counts']) for card in value['batches']],
-                         [(batch, 2, {'running': 1, 'limit': 1})])
+                         [('__root__', 0, {}), (batch, 2, {'running': 1, 'limit': 1})])
 
     def test_a_job_made_from_one_an_earlier_version_stopped_joins_its_batch_with_the_current_author_prompt(self):
         # A job an earlier version stopped ended at the stop: Continue proof author makes a new job (the older job
@@ -706,7 +715,8 @@ class NamedBatchRouteTests(unittest.TestCase):
         [row] = value['jobs']
         self.assertEqual((row['continueStoppedLabel'], row['continueStoppedInPlace']), ('Continue proof author', False))
         status, value = self.call('/batches')
-        self.assertEqual([(card['id'], card['counts']) for card in value['batches']], [(batch, {'stopped': 1})])
+        self.assertEqual([(card['id'], card['counts']) for card in value['batches']],
+                         [('__root__', {}), (batch, {'stopped': 1})])
         launches = len(self.launches)
         status, value = self.call('/continue-stopped?' + urlencode({'job': run_id, 'batch': batch}), {})
         self.assertEqual(status, 200, value)
@@ -721,7 +731,7 @@ class NamedBatchRouteTests(unittest.TestCase):
                          (current, str(source.run_dir.resolve())))
         status, value = self.call('/batches')
         self.assertEqual([(card['id'], card['jobCount'], card['counts']) for card in value['batches']],
-                         [(batch, 2, {'running': 1, 'stopped': 1})])
+                         [('__root__', 0, {}), (batch, 2, {'running': 1, 'stopped': 1})])
 
     def test_batch_routes_need_the_launch_token_host_and_origin(self):
         batch = self.make_batch('Kept')

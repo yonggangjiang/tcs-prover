@@ -223,8 +223,9 @@ assert(!ui.newBatch.hidden); assert(!ui.navNewBatchItem.hidden); assert(ui.batch
 const badges = ui.batchesList.children.map(card => card.children[0].children[0].children.slice(1).map(child => child.textContent));
 assert.equal(JSON.stringify(badges), JSON.stringify([[], [], [], ['Previous batch · read-only']]));
 assert.equal(ui.batchesList.children[0].className, 'batch-card current');
+// The default batch with no start date shows none: "Saved research workspace" is a saved batch's.
 const times = ui.batchesList.children.map(card => card.children[0].children[3].textContent);
-assert.equal(JSON.stringify(times), JSON.stringify(['Saved research workspace', 'Started 2026-11-09T09:00:00+00:00',
+assert.equal(JSON.stringify(times), JSON.stringify(['', 'Started 2026-11-09T09:00:00+00:00',
   'Created 2026-11-09T09:00:00+00:00', 'Saved research workspace']));
 for (const [id, actions, rename, remove] of [['__root__', true, false, false], ['batch_00000000a1', true, true, false],
     ['batch_00000000b2', true, true, true], ['old', false, false, false]]) {
@@ -251,6 +252,41 @@ currentBatch = '__root__'; composingProblem = false; renderBatchNavigation();
 assert(!ui.batchActions.hidden);  // The server's own cards still say which batches take problems.
 renderBatches(adoptBatchCatalog({batches: cards.map(({addProblems, ...card}) => card)}));
 assert(ui.batchActions.hidden);
+""")
+
+    def test_the_empty_default_batch_is_listed_and_opens_with_nothing_made_yet(self):
+        self.browser(r"""
+const root = {id: '__root__', name: 'Default batch', label: 'Default batch', folder: 'runs', jobCount: 0, counts: {},
+  startedAt: '', readOnly: false, addProblems: true, attention: [], queued: 0, sharedWorks: {count: 0, names: []},
+  current: true, default: true, runningLimit: 0};
+renderBatches(adoptBatchCatalog({batches: [root], canCreateBatches: true, batchesProblem: ''}));
+// Its card, with no problem and no date, opens its page (where works can be shared with it).
+assert.equal(ui.batchesList.children.length, 1);
+const [card] = ui.batchesList.children, link = card.children[0];
+assert.equal(link.href, '/?batch=__root__');
+assert.equal(link.children[1].children.map(node => node.textContent).join('|'), 'Default batch|0 problems');
+assert.equal(link.children[3].textContent, '');
+// Nothing is made yet, so the line above the list still says how to begin.
+assert(!ui.batchesStatus.hidden);
+assert.equal(ui.batchesStatus.textContent, 'No problems yet. Create a problem to get started.');
+// Once it has a problem or shares a work, or another batch is listed, the line goes.
+for (const batches of [[{...root, jobCount: 1}], [{...root, sharedWorks: {count: 1, names: ['defs.md']}}],
+    [root, {id: 'batch_00000000a1', label: 'Graph coloring', named: true, addProblems: true, jobCount: 0, counts: {},
+            createdAt: '2026-11-09T09:00:00+00:00'}], [root, {id: 'old', label: 'old', readOnly: true, jobCount: 0}]]) {
+  renderBatches(adoptBatchCatalog({batches, canCreateBatches: true, batchesProblem: ''}));
+  assert(ui.batchesStatus.hidden, JSON.stringify(batches));
+  assert.equal(ui.batchesStatus.textContent, '');
+}
+// An empty list (a server that lists no batch) says there is none.
+renderBatches(adoptBatchCatalog({batches: [], canCreateBatches: false}));
+assert(!ui.batchesStatus.hidden);
+assert.equal(ui.batchesStatus.textContent, 'No batches yet. Create a problem to get started.');
+// Its page opens from the card as any batch's does.
+setResponses({'/batches': {batches: [root], canCreateBatches: true, batchesProblem: ''},
+  '/jobs?batch=__root__': {jobs: []}});
+await selectBatch('__root__');
+assert.equal(ui.notice.textContent, '');
+assert.equal(ui.batchProblems.textContent, 'Default batch');
 """)
 
     def test_rename_and_delete_batch_keep_the_dialog_open_on_a_refusal(self):

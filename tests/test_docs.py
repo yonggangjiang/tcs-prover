@@ -279,6 +279,9 @@ class SharedWorksDocsTests(unittest.TestCase):
         self.assertIn("**Shared with a folder run**", text)
         self.assertIn("removes one that has no problems left, with the related works it shares", text)
         self.assertNotIn("Batch related works", text)
+        # The Overview lists the default batch before its first problem, so works can be shared with it first.
+        self.assertIn("and terminal runs. It is always listed, also before its first problem, so you can open it and "
+                      "share related works with it first.", text)
 
     def test_the_other_guides_point_to_it_and_quote_the_page(self):
         job = flat(DOCS / "job-page.md")

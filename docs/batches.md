@@ -7,7 +7,8 @@ see its reasoning and outputs.
 ## Batches
 
 - **Default batch**: problems started with **New problem** (in the sidebar or on
-  the Overview), and terminal runs.
+  the Overview), and terminal runs. It is always listed, also before its first
+  problem, so you can open it and share related works with it first.
 - **Your batches**: **New batch** (on the Overview and in the sidebar) asks for a
   name, which may be left empty for one with the date and time, such as "Batch ·
   10 Nov 14:05", and opens the new batch. Used on the New problem page or on

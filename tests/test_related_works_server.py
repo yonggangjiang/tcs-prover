@@ -798,8 +798,9 @@ class SharedWorksTests(RelatedWorksCase):
         self.share(named, "a.md", "b.md", "c.md", "d.md")
         cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
         self.assertEqual(cards[named]["sharedWorks"], {"count": 4, "names": ["a.md", "b.md", "c.md"]})
-        # The default batch is listed once it shares works, even with no problem yet.
-        self.assertNotIn(server.DEFAULT_BATCH, cards)
+        # The default batch is always listed, also with no problem yet; its card counts what it shares.
+        self.assertEqual((cards[server.DEFAULT_BATCH]["jobCount"], cards[server.DEFAULT_BATCH]["sharedWorks"]),
+                         (0, {"count": 0, "names": []}))
         self.share("", "root.md")
         cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
         self.assertEqual((cards[server.DEFAULT_BATCH]["jobCount"], cards[server.DEFAULT_BATCH]["sharedWorks"]),
