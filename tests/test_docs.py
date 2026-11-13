@@ -154,8 +154,12 @@ class AccuracyTests(unittest.TestCase):
         trouble = flat(DOCS / "troubleshooting.md")
         self.assertIn('- **Request rejected by the API endpoint** (HTTP 400; Claude Code says "API Error: 400" and the '
                       "endpoint's message): the endpoint refuses run requests as invalid.", trouble)
-        self.assertIn("A conversation too long for the model, and a key out of credit, are retried every minute "
-                      "instead.", trouble)
+        # Claude Code's own words after "API Error: 400" for a conversation whose tool calls and results do not match
+        # stay retried too (workflow_runner._CLAUDE_HISTORY_MISMATCH).
+        self.assertIn("A conversation too long for the model, a key out of credit, and Claude Code's own words for a "
+                      "conversation whose tool calls and results do not match (\"API Error: 400 due to tool use "
+                      "concurrency issues\", \"… orphaned tool_result …\", \"… duplicate tool_use ID …\") are retried "
+                      "every minute instead.", trouble)
 
     def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
         # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the

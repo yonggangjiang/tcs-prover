@@ -12,8 +12,11 @@ team member's assignment comes back to the coordinator as a failure with the rea
 
 Everything else stays retried every minute: the same endpoint's 400 for a conversation too long for the model and for a
 key out of credit, which Claude Code words itself (CAPTURED_TOO_LONG, CAPTURED_CREDIT), 429, overload and 5xx, and the
-same "API Error: 400" from a built-in Claude model (the subscription route). The stand-in CLI replays the captured
-lines with its own session ID (tests/test_claude_cli.py); no test starts a model.
+same "API Error: 400" from a built-in Claude model (the subscription route). So does the same endpoint's 400 for a
+conversation whose tool calls and tool results do not pair up: Claude Code reports its own words after "API Error: 400"
+in place of the endpoint's message (CAPTURED_HISTORY, CAPTURED_ORPHANED, CAPTURED_DUPLICATE), a fault in its record of
+the conversation that no setting fixes. The stand-in CLI replays the captured lines with its own session ID
+(tests/test_claude_cli.py); no test starts a model.
 """
 
 import json
@@ -102,6 +105,68 @@ CAPTURED_CREDIT = (
     '"result":"Credit balance is too low","type":"result","duration_ms":33,"uuid":"0660d67f-fd3e-4416-8cab-'
     '6b570fdc0301","queued_turn_count":0,"result_index":0}'
 )
+# The lines of the same structured call when its endpoint answered HTTP 400, invalid_request_error, "messages.1:
+# `tool_use` ids were found without `tool_result` blocks immediately after: toolu_01AbCdEfGhIjKlMn. Each `tool_use`
+# block must have a corresponding `tool_result` block in the next message." (Claude Code sent the request once more
+# first): Claude Code reports its own words in place of the endpoint's message, marked api_error
+# "tool_history_mismatch". Then the results of the same endpoint's "messages.2.content.0: unexpected `tool_use_id`
+# found in `tool_result` blocks: toolu_01AbCdEfGhIjKlMn. ..." and "messages.1.content.1: `tool_use` ids must be unique".
+CAPTURED_HISTORY = (
+    '{"type":"assistant","message":{"diagnostics":null,"id":"d7d62b82-c968-454c-9018-a8f984e925ee","container":null,"'
+    'model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","ty'
+    'pe":"message","usage":{"output_tokens_details":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tok'
+    'ens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_t'
+    'ier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"i'
+    'terations":null,"speed":null,"fallback_credit":null},"content":[{"type":"text","text":"API Error: 400 due to too'
+    'l use concurrency issues."}],"context_management":null},"parent_tool_use_id":null,"session_id":"2b75a1ab-c692-42'
+    '55-ba11-1db3c678bdd6","uuid":"c93723c5-2e77-435f-be85-68061787276f","timestamp":"2026-11-13T23:00:08.648Z","erro'
+    'r":"invalid_request","request_id":"req_fake00000000000000000002","is_api_error_message":true,"api_error":"tool_h'
+    'istory_mismatch"}',
+    '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"2b75a1ab-c692-4255-ba11-1db3c678bdd6","total_co'
+    'st_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":'
+    '0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":'
+    '0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inf'
+    'erence_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":['
+    '],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subag'
+    'ent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_dep'
+    'th":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"de'
+    'pth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","'
+    'api_error_status":400,"api_error":"tool_history_mismatch","result":"API Error: 400 due to tool use concurrency i'
+    'ssues.","type":"result","duration_ms":50,"uuid":"dd59193e-acb1-4cfc-a9fc-cf651f663cad","queued_turn_count":0,"re'
+    'sult_index":0}',
+)
+CAPTURED_ORPHANED = (
+    '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"14a7acf0-0a93-4bf3-9b4d-a5cd47eb2985","total_co'
+    'st_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":'
+    '0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":'
+    '0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inf'
+    'erence_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":['
+    '],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subag'
+    'ent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_dep'
+    'th":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"de'
+    'pth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","'
+    'api_error_status":400,"api_error":"tool_history_mismatch","result":"API Error: 400 orphaned tool_result in conve'
+    'rsation history.","type":"result","duration_ms":33,"uuid":"319d512d-8588-4b0e-979a-f9521fa8f8d9","queued_turn_co'
+    'unt":0,"result_index":0}'
+)
+CAPTURED_DUPLICATE = (
+    '{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"7d39982b-79bf-43c0-808a-b5c79f718e85","total_co'
+    'st_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":'
+    '0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":'
+    '0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inf'
+    'erence_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":['
+    '],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subag'
+    'ent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_dep'
+    'th":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"de'
+    'pth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","'
+    'api_error_status":400,"api_error":"tool_history_mismatch","result":"API Error: 400 duplicate tool_use ID in conv'
+    'ersation history.","type":"result","duration_ms":31,"uuid":"953e151d-66d0-4565-8ce9-d4589819a78b","queued_turn_c'
+    'ount":0,"result_index":0}'
+)
+# Claude Code's text for each of them.
+HISTORY_TEXTS = {CAPTURED_HISTORY[1]: "API Error: 400 due to tool use concurrency issues.",
+                 CAPTURED_ORPHANED: "API Error: 400 orphaned tool_result in conversation history.",
+                 CAPTURED_DUPLICATE: "API Error: 400 duplicate tool_use ID in conversation history."}
 ENDPOINT_MESSAGE = "max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for claude-gw"
 # What the job says for the Anthropic-format connection "Gateway" (the label of claude_test's API model).
 REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid (API Error: 400 "
@@ -117,10 +182,11 @@ def replayed(line):
     return {"emit": message}
 
 
-def refused(*before, result=CAPTURED_400[1], exits=True):
-    """A turn of the stand-in CLI that ends as Claude Code ended the captured one (``result``: its last line)."""
+def refused(*before, result=CAPTURED_400[1], exits=True, message=CAPTURED_400[0]):
+    """A turn of the stand-in CLI that ends as Claude Code ended the captured one (``message``: its report of the
+    failed request, ``result``: its last line)."""
 
-    return ["init", *before, replayed(CAPTURED_400[0]), replayed(result),
+    return ["init", *before, replayed(message), replayed(result),
             *({"stderr": line} for line in CAPTURED_STDERR), *([{"exit": 1}] if exits else [])]
 
 
@@ -157,6 +223,22 @@ class CapturedTextTests(jobs_test.Isolated):
         self.assertIsNone(runtime.settings_failure(runtime.Error(text), "claude-opus-5-5"))
         self.assertIsNone(runtime.member_problem(runtime.Error(text), "claude-opus-5-5"))
         self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+
+    def test_claude_codes_own_words_for_a_conversation_whose_tool_calls_do_not_pair_up_stay_retried(self):
+        model = self.model()
+        for result, words in HISTORY_TEXTS.items():
+            # Nothing of the endpoint's message: Claude Code's words and the API status.
+            self.assertEqual(runner_text(result), f"Claude review failed: {words}\nAPI status 400.")
+            for prefix in ("Claude review failed: ", "Claude author turn failed: ", "Claude reply turn failed: "):
+                text = runner_text(result, prefix)
+                with self.subTest(text=text):
+                    self.assertIsNone(runtime.settings_failure(runtime.Error(text), model))
+                    self.assertIsNone(runtime.member_problem(runtime.Error(text), model))
+                    self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+        # The endpoint's own message after "API Error: 400" still is a request it refuses.
+        self.assertIsInstance(runtime.settings_failure(runtime.Error(
+            "Claude review failed: API Error: 400 messages.1: `tool_use` ids were found without `tool_result` blocks "
+            "immediately after: toolu_01AbCdEfGhIjKlMn.\nAPI status 400."), model), runtime.RequestRejected)
 
     def test_a_conversation_too_long_a_key_out_of_credit_429_overload_and_5xx_stay_retried(self):
         model = self.model()
@@ -202,6 +284,15 @@ class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
         self.assertEqual(result, {"statement": "S", "notes": ""})
         self.assertEqual(len(self.records("start")), 2)
 
+    def test_a_structured_call_refused_for_its_tool_history_is_retried(self):
+        model = self.api_model()
+        self.script([refused(message=CAPTURED_HISTORY[0], result=CAPTURED_HISTORY[1]),
+                     ["init", {"structured": {"statement": "S", "notes": ""}}]])
+        result, _ = runtime.structured("Review.", claude_test.SCHEMA, "review", model=model)
+        self.assertEqual(result, {"statement": "S", "notes": ""})
+        self.assertEqual(len(self.records("start")), 2)
+        self.assertIn(runtime.RETRY_LABEL, self.labels())
+
     def test_the_author_pauses_with_the_message_and_no_retry(self):
         model = self.api_model()
         self.script([refused("echo", exits=False)])
@@ -223,6 +314,19 @@ class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
                                                            f"{ENDPOINT_MESSAGE}"), paused.exception.reason)
         self.assertIsNotNone(paused.exception.retry)
 
+    def test_an_author_refused_for_its_tool_history_is_retried(self):
+        model = self.api_model()
+        self.script([refused("echo", exits=False, message=CAPTURED_HISTORY[0], result=CAPTURED_HISTORY[1])])
+        with mock.patch.object(claude_cli, "sandbox_supported", return_value=True):
+            with self.assertRaises(runtime.WorkflowPaused) as paused:
+                next(self.goal(model=model))
+        self.assertTrue(paused.exception.reason.startswith(
+            "Claude author turn failed: API Error: 400 due to tool use concurrency issues."), paused.exception.reason)
+        self.assertNotIn(runtime.REQUEST_REJECTED_LABEL, paused.exception.reason)
+        self.assertIsNotNone(paused.exception.retry)
+        self.assertFalse([event for event in self.events
+                          if event["kind"] == "status" and event.get("label") == "Author paused"])
+
     def test_a_paused_authors_reply_fails_as_a_settings_problem(self):
         model = self.api_model()
         session = "6a1d2f8e-3c4b-4d5e-8f9a-0b1c2d3e4f50"
@@ -236,6 +340,21 @@ class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
         self.assertEqual((failed["failure"], failed["final"], failed["text"]), ("configuration", True, REJECTED))
         self.assertEqual(len(self.records("start")), 1)
         self.assertFalse([event for event in self.events if event["kind"] == "conversation_reply"])
+
+    def test_a_paused_authors_reply_refused_for_its_tool_history_is_retried(self):
+        model = self.api_model()
+        session = "6a1d2f8e-3c4b-4d5e-8f9a-0b1c2d3e4f51"
+        self.script([refused("echo", exits=False, message=CAPTURED_HISTORY[0], result=CAPTURED_HISTORY[1]),
+                     conversation_test.claude_reply("Reply after a retry.")])
+        code = runtime.run_author_conversation(conversation_test.WORKFLOW, {
+            "author_model": model, "goal_thread_id": session, "goal_cwd": str(self.run_dir)},
+            {"schemaVersion": 1, "id": conversation_test.CONVERSATION_ID, "kind": "message", "text": "Which step?",
+             "notice": ""})
+        self.assertEqual(code, 0)
+        reply, = [event for event in self.events if event["kind"] == "conversation_reply"]
+        self.assertEqual(reply["text"], "Reply after a retry.")
+        self.assertEqual(len(self.records("start")), 2)
+        self.assertFalse([event for event in self.events if event.get("label") == "Author reply failed"])
 
 
 class TeamMemberTests(team_test.TeamCase):
@@ -257,6 +376,20 @@ class TeamMemberTests(team_test.TeamCase):
         self.assertEqual(len(self.claude_starts()), 1)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
                           and "retrying" in event.get("text", "")])
+
+    def test_a_member_refused_for_its_tool_history_is_retried(self):
+        model = self.anthropic_model()
+        self.scenario.write_text(json.dumps({"turns": [
+            refused(message=CAPTURED_HISTORY[0], result=CAPTURED_HISTORY[1]), ["init", {"emit": {
+                "type": "assistant", "parent_tool_use_id": None, "uuid": "m1",
+                "message": {"content": [{"type": "text", "text": "Lemma A holds."}]}}},
+                {"result": {"result": "Lemma A holds."}}]]}))
+        crew = self.crew([{"model": model, "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertIn("REPORT:\nLemma A holds.", report)
+        self.assertNotIn(runtime.REQUEST_REJECTED_LABEL, report)
+        self.assertEqual(len(self.claude_starts()), 2)
 
     def test_a_built_in_claude_member_is_retried(self):
         self.scenario.write_text(json.dumps({"turns": [refused(), ["init", {"emit": {
