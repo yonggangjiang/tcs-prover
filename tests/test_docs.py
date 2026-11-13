@@ -157,6 +157,18 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("A conversation too long for the model, and a key out of credit, are retried every minute "
                       "instead.", trouble)
 
+    def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
+        # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the
+        # multi_agent feature (workflow_runner.structured_limits()); the critic keeps Codex's subagents.
+        developers = flat(DOCS / "developers.md")
+        self.assertIn("A structured call of Codex without subagents (the statement reviewer, the convention critic, "
+                      "and the LaTeX editor and repair) also has Codex's agents off (`-c agents.enabled=false`, "
+                      "`structured_limits()`).", developers)
+        self.assertIn("The critic keeps them for its independent critics.", developers)
+        self.assertIn("| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement "
+                      "reviewer, the convention critic, the LaTeX writer and its repair (a `-c` flag)",
+                      flat(DOCS / "workflow.md"))
+
     def test_python_commands_name_the_checkouts_venv(self):
         # A stock Mac's python3 is 3.9 (no tomllib) and it has no `python`; only web_ui.py switches to the .venv
         # by itself (and the transcript viewer needs nothing newer).

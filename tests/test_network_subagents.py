@@ -85,12 +85,13 @@ class StructuredCallTests(network.Folders):
                             self.assertNotIn(LEGACY_NETWORK, settings)
 
     def test_a_call_without_subagents_reaches_the_internet_in_a_session_of_one_thread(self):
-        # The statement reviewer, the convention critic (read-only) and the LaTeX writer (an edit).
+        # The statement reviewer, the convention critic (read-only) and the LaTeX writer (an edit), with Codex's agents
+        # off (runtime.structured_limits()).
         for mode in ("live", "disabled"):
             for writable in (False, True):
                 with self.subTest(mode=mode, writable=writable), self.mode(mode):
                     command = self.launch("darwin", writable=writable, features=(), subagents=None)
-                    self.assertEqual(agent_flags(command), limit_flags(0))
+                    self.assertEqual(agent_flags(command), [*limit_flags(0), "agents.enabled=false"])
                     self.assertIn(["--disable", "multi_agent"], pairs(command))
                     self.assertEqual(overrides(command).get(NETWORK), '{"enabled"=true}' if mode == "live" else None)
 
