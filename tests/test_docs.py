@@ -220,6 +220,20 @@ class CoordinatorDocsTests(unittest.TestCase):
             self.assertIn(needed, text)
         self.assertIn("The built-in settings use 3", flat(DOCS / "saved-settings.md"))
 
+    def test_the_claude_tools_say_which_author_gets_the_subagent_tool(self):
+        # A Claude coordinator with TCS Prover's team runs without the CLI's subagent tool (_execute removes the
+        # multi_agent feature, so claude_cli.tool_permissions() offers no Task) and with TCS Prover's server; only an
+        # author whose subagents are Claude Code's own gets Task.
+        text = flat(DOCS / "models.md")
+        tools = text[text.index("**Tools.**"):text.index("If Claude Code offers a tool beyond the list")]
+        self.assertIn("an author coordinator with [TCS Prover's team](workflow.md#the-authors-team) gets only TCS "
+                      "Prover's own", tools)
+        self.assertIn("whose subagents are Claude Code's own (a coordinator of a job from before TCS Prover's team, or "
+                      "of a rerun that keeps them, and the author of a job from before coordinator mode), get the "
+                      "subagent tool (Task)", tools)
+        self.assertIn("A coordinator with TCS Prover's team, as every new one is, gets no subagent tool", tools)
+        self.assertNotIn("(an author coordinator, or the author of a job from before coordinator mode)", tools)
+
     def test_the_words_the_guides_quote_are_the_pages(self):
         page = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
         app = (ROOT / "ui" / "app.js").read_text(encoding="utf-8")
