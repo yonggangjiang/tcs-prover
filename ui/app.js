@@ -7041,7 +7041,13 @@ async function loadBatchShared(force = false) {
   batchShared.loading = true;
   try {
     const listing = await request(`/batch-shared-works?batch=${encodeURIComponent(batch)}`);
-    if (batch === batchShared.batch) Object.assign(batchShared, { listing, error: "" });
+    if (batch === batchShared.batch) {
+      // The error an earlier read showed is no longer true; what a change said stays.
+      if (batchShared.error && ui.batchSharedStatus.textContent === batchShared.error) {
+        ui.batchSharedStatus.textContent = "";
+      }
+      Object.assign(batchShared, { listing, error: "" });
+    }
   } catch (error) {
     if (batch === batchShared.batch) batchShared.error = error.message;
   } finally {

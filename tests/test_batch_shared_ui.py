@@ -168,6 +168,30 @@ assert.equal(sent.length, 2);
 assert.deepEqual(rowsOf(ui.batchSharedList), [['MD', 'defs.md', '2.0 KB', 'Remove']]);
 """)
 
+    def test_a_read_of_the_list_that_works_again_takes_back_the_error_it_showed(self):
+        self.run_app(related.PANEL, PAGE_SETUP, r"""
+currentJob = ''; currentBatch = 'batch_00000000a1'; batches = [graph];
+answers['/batch-shared-works'] = listing([defs]);
+renderBatchShared();
+await tick(); await tick();
+// A later read fails (TCS Prover restarting, say): the section says why ...
+answers['/batch-shared-works'] = new Error('Failed to fetch');
+await loadBatchShared(true);
+assert.equal(ui.batchSharedStatus.textContent, 'Failed to fetch');
+// ... until a read works again.
+answers['/batch-shared-works'] = listing([defs, note]);
+await loadBatchShared(true);
+assert.equal(ui.batchSharedStatus.textContent, '');
+assert.equal(ui.batchSharedList.children.length, 2);
+// What a change said stays, through a read that fails and one that works again.
+ui.batchSharedStatus.textContent = 'Added 1 related work.';
+answers['/batch-shared-works'] = new Error('Failed to fetch');
+await loadBatchShared(true);
+answers['/batch-shared-works'] = listing([defs]);
+await loadBatchShared(true);
+assert.equal(ui.batchSharedStatus.textContent, 'Added 1 related work.');
+""")
+
     def test_the_section_shows_only_on_a_live_batch_page_and_says_when_nothing_is_shared(self):
         self.run_app(related.PANEL, PAGE_SETUP, r"""
 currentJob = ''; currentBatch = '__root__';
