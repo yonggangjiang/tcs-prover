@@ -3951,6 +3951,9 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
     """
 
     sessions = MemberSessions()
+    # How many retries of a failed API request each assignment's CLI has reported (by assignment id): each note
+    # carries its number as its attempt, so that only the first two stay pinned on the job page through a long outage.
+    retries = {}
 
     def emit_member(kind, **fields):
         emit(kind, stage, node=node_name, **fields)
@@ -3968,8 +3971,10 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
         def retried(text):
             # The member waits inside its CLI for a failed API request to be retried: say so, as for its own retries
             # (with its assignment's id, like every record of the assignment).
+            retries[identity] = retries.get(identity, 0) + 1
             emit("diagnostic", stage, node=node_name, text=f"Member {member.number} ({member.label}): {text}",
-                 subagentId=identity, subagentMember=member.number, subagentModel=member.label)
+                 subagentId=identity, subagentMember=member.number, subagentModel=member.label,
+                 attempt=retries[identity])
         return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
                               compact_prompt=prompts.get("codex_compact_prompt", ""), record=record, retried=retried)
 

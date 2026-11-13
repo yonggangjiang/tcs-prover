@@ -669,8 +669,12 @@ class Team:
         base = fork_from
         instruction = prompt
         failure = reply = None
+        # The attempts of this assignment so far: its retry notes carry the number of the attempt that failed, so that
+        # only the first two stay pinned on the job page through a long outage (as the runner's own retries).
+        attempts = 0
         while True:
             conversation = self.new_conversation(member, base)
+            attempts += 1
             try:
                 reply = self.attempt(member, instruction, conversation, self._register(member, cancel))
                 if not cancel.is_set():
@@ -700,7 +704,7 @@ class Team:
                                                  + (", continuing its conversation." if worked else
                                                     ", running the assignment again."),
                               subagentMember=member.number, subagentModel=member.label,
-                              subagentId=assignment_id(member.number, count))
+                              subagentId=assignment_id(member.number, count), attempt=attempts)
                     if worked:
                         base = {"session": conversation.session_id, "harness": getattr(conversation, "harness", None)}
                         instruction = self.retry_note

@@ -525,6 +525,19 @@ ingest([record], true);
 assert.deepEqual(ui.timeline.children.map((row) => [row.dataset.type, row._card.label]), [['error', 'No web search']]);
 """)
 
+    def test_a_members_retry_notes_stay_pinned_only_for_the_first_two_attempts(self):
+        # As on the server (test_team_server): through a long outage of a member's model, its retry notes and its
+        # Claude Code's own retry notes stay pinned only for an assignment's first two attempts.
+        records = team_loop.member_retry_records(failures=3, cli_retries=1)
+        self.run_app([*coordinator.ACTIVITY, INGEST], coordinator.ACTIVITY_SETUP
+                     + f"const detailRows = new Map();\nconst records = {json.dumps(records)};\n", r"""
+const notes = (words) => records.filter((record) => record.kind === 'diagnostic' && record.text.includes(words))
+  .map((record) => [record.attempt, importantEntry(record)]);
+assert.deepEqual(notes('a model call failed'), [[1, true], [2, true], [3, false]]);
+assert.deepEqual(notes('Claude API retry'), [[1, true], [2, true], [3, false], [4, false]]);
+assert.ok(records.filter((record) => record.authorSubagent === true).every(importantEntry));
+""")
+
     def test_goal_status_records_say_what_the_author_reported_and_what_happens_next(self):
         self.run_app(coordinator.ACTIVITY, coordinator.ACTIVITY_SETUP, r"""
 const goal = (goalStatus, note, time = 't1') => describe({kind: 'status', stage: 'solve', node: 'author',

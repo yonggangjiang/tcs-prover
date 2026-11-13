@@ -608,6 +608,38 @@ def member_records(assignments, count=2):
     return records
 
 
+def member_retry_records(failures, cli_retries):
+    """The records of one assignment whose model call fails ``failures`` times (the endpoint answers 503) before it
+    works, its CLI reporting ``cli_retries`` retries of a failed API request inside each of its runs, as Claude Code
+    does (runtime.start_team(), with a stand-in for runtime.member_attempt)."""
+
+    records, lock, prompts = [], threading.Lock(), []
+
+    def capture(kind, stage, **fields):
+        with lock:
+            records.append({"kind": kind, "stage": stage, **fields})
+
+    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record, retried=None):
+        prompts.append(prompt)
+        for number in range(cli_retries):
+            retried(f"Claude API retry: status 529, retrying in 35 s (attempt {number + 1} of 300)")
+        if len(prompts) <= failures:
+            raise runtime.Error("503 Service Unavailable: the model is overloaded")
+        return "Lemma A holds."
+
+    with tempfile.TemporaryDirectory() as folder, mock.patch.object(runtime, "emit", side_effect=capture), \
+            mock.patch.object(runtime, "member_attempt", side_effect=attempt), \
+            mock.patch.object(runtime, "MODEL_RETRY_SECONDS", 0.01):
+        crew = runtime.start_team(team.team_members(None, "claude-opus-5-5", "high", 1), prompts=TEXTS,
+                                  directory=folder, settings=MEMBER_SETTINGS, stage="solve", node_name="author")
+        try:
+            crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+            crew.call("team_wait", {"timeout_minutes": 1})
+        finally:
+            crew.close("The test ended.")
+    return records
+
+
 @unittest.skipIf(os.name == "nt", "The stand-in CLIs are POSIX scripts")
 class TeamCase(unittest.TestCase):
     """Stand-in `codex` and `claude` programs on PATH, a run folder and the run's records."""

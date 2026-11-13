@@ -334,6 +334,24 @@ class MemberRecordTests(ServerCase):
                                         ("member-1-2", "started"), ("member-1-2", "finished")])
 
 
+    def test_a_members_retry_notes_stay_pinned_only_for_the_first_two_attempts_of_an_assignment(self):
+        # A long outage of a member's model writes one retry note a minute, and Claude Code one per retry of a failed
+        # API request inside the run (about every 35 s): like the runner's own retries, only the first two of an
+        # assignment stay pinned, so that they never push the team's other lines out of the job page.
+        records = team_loop.member_retry_records(failures=4, cli_retries=1)
+        failed = [record for record in records if record["kind"] == "diagnostic"
+                  and "a model call failed" in record["text"]]
+        retried = [record for record in records if record["kind"] == "diagnostic"
+                   and "Claude API retry" in record["text"]]
+        self.assertEqual([record["attempt"] for record in failed], [1, 2, 3, 4])
+        self.assertEqual([server.important_record(record) for record in failed], [True, True, False, False])
+        self.assertEqual([record["attempt"] for record in retried], [1, 2, 3, 4, 5])
+        self.assertEqual([server.important_record(record) for record in retried], [True, True, False, False, False])
+        self.assertEqual({record["subagentId"] for record in failed + retried}, {"member-1-1"})
+        # The assignment's own lines stay pinned.
+        self.assertTrue(all(server.important_record(record) for record in records if record.get("authorSubagent")))
+
+
 class NoWebSearchTests(ServerCase):
     def test_the_warning_stays_listed_with_the_job_s_other_warnings(self):
         warning = no_web_search.warning_record()
