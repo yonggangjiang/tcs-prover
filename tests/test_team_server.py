@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+from tests import test_no_web_search as no_web_search
 from tests import test_team_goal_loop as team_loop
 import workflow_runner as runtime
 from runner import prompt_catalog, providers
@@ -330,6 +331,21 @@ class MemberRecordTests(ServerCase):
                                       ("member-1-2", "item_1", "Done: Lemma B")])
             self.assertEqual(statuses, [("member-1-1", "started"), ("member-1-1", "finished"),
                                         ("member-1-2", "started"), ("member-1-2", "finished")])
+
+
+class NoWebSearchTests(ServerCase):
+    def test_the_warning_stays_listed_with_the_job_s_other_warnings(self):
+        warning = no_web_search.warning_record()
+        app = self.job()
+        app.add_trace(warning)
+        for index in range(server.TRACE_LIMIT + 10):
+            app.add_trace({"kind": "status", "stage": "solve", "node": "author", "label": "Routine", "text": str(index)})
+        # Routine records pushed it out of the live window; it stays pinned, in the page's trace and after a restart.
+        self.assertNotIn(warning["text"], [record.get("text") for record in app.state["trace"]])
+        for job in (app, self.restored(app)):
+            listed = [record for record in job.retained_trace() if record.get("label") == "No web search"]
+            self.assertEqual([(record["kind"], record["text"]) for record in listed],
+                             [("diagnostic", warning["text"])])
 
 
 class SettingsTests(ServerCase):

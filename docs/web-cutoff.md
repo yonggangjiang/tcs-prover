@@ -13,7 +13,9 @@ critic, the convention critic and the LaTeX editor, including structured
 retries and subagents. The runner sets Codex's
 [`web_search="live"`](https://learn.chatgpt.com/docs/config-file/config-reference)
 for new and resumed sessions, and Claude Code models get the WebSearch and
-WebFetch tools; the models decide when to search.
+WebFetch tools; the models decide when to search. Through an API connection,
+Codex gives some models no search tool at all, which the activity log then
+says (see [How API models run](models.md#how-api-models-run)).
 
 **`-1`** removes the web-search tools and turns off the network of every model
 process. It is not the historical sandbox, and it says nothing about what the

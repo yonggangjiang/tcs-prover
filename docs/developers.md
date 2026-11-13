@@ -533,9 +533,24 @@ that every prompt and tool text is the user's to adjust. What the code does:
   built-in and Same as the coordinator) sends `legacyTeam: true`: the new job
   runs `codex` with the built-in subagents (`legacy_team`), saves its texts like
   any new job, and records `legacyTeam: true` in job-settings.json, so it, its
-  reruns and the jobs made from it keep them too. A web-cutoff coordinator keeps the CLI's
-  built-in subagents with the coordinator's model (status **Built-in
-  subagents**); the server refuses Subagent models with a web cutoff.
+  reruns and the jobs made from it keep them too. A web-cutoff coordinator
+  keeps the CLI's built-in subagents with the coordinator's model (status
+  **Built-in subagents**); the server refuses Subagent models with a web
+  cutoff.
+- **A model without web search.** `codex_web_search_tool()` says whether
+  Codex 0.160 offers a model a web search tool in a live run as TCS Prover
+  starts it: its hosted `web_search` tool never goes to a "Responses Lite"
+  model (`CODEX_CATALOG_LITE`, from Codex 0.160's bundled `models.json`,
+  matched as Codex matches it: by the longest catalog name the model's name
+  starts with, or after one `namespace/`), and its own `web.run` only to its
+  built-in OpenAI provider or a provider that asks for it (named `OpenAI`,
+  `supports_standalone_web_search=true` or an `x-openai-actor-authorization`
+  header, read from `provider_arguments()`, which sets none of them). So a
+  Lite model through an API connection has no search tool. As a live run's
+  author starts, `note_no_web_search()` records one pinned diagnostic **No web
+  search** (`noWebSearch: true`, `models`) naming the author's and the team
+  members' models that have none; the page shows it like the other
+  warnings of the activity log. The provider settings are unchanged.
 
 ## HTTP API notes
 

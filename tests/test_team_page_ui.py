@@ -19,6 +19,7 @@ import unittest
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from tests import test_coordinator_ui as coordinator
 from tests import test_presets_ui as presets_ui
+from tests import test_no_web_search as no_web_search
 from tests import test_team_goal_loop as team_loop
 from tests.test_provider_ui import APP, INDEX, page
 
@@ -508,6 +509,20 @@ assert.deepEqual(rows.filter(([label]) => label.startsWith('Author subagent 2'))
 // A later poll that brings the second assignment's events again replaces only its own rows.
 ingest(records.filter((record) => record.subagentId === 'member-2-2'));
 assert.equal(ui.timeline.children.filter((row) => row._card.label === 'Subagent 2').length, 2);
+""")
+
+    def test_a_model_without_web_search_is_a_pinned_warning_of_the_activity_log(self):
+        record = no_web_search.warning_record()
+        self.run_app([*coordinator.ACTIVITY, INGEST], coordinator.ACTIVITY_SETUP
+                     + f"const detailRows = new Map();\nconst record = {json.dumps(record)};\n", r"""
+const card = describe(record);
+assert.deepEqual([card.type, card.label, card.pinned], ['error', 'No web search', true]);
+assert.equal(card.text, record.text);
+assert.match(card.text, /^Web search is on for this job, but the proof author's model has no web search on its connection: gpt-6.1-sol \(API connection "Lab gateway"\)\./);
+// Kept with the prompts, results and errors when routine events leave the page's window.
+assert.equal(importantEntry(record), true);
+ingest([record], true);
+assert.deepEqual(ui.timeline.children.map((row) => [row.dataset.type, row._card.label]), [['error', 'No web search']]);
 """)
 
     def test_goal_status_records_say_what_the_author_reported_and_what_happens_next(self):

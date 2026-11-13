@@ -1831,6 +1831,71 @@ def provider_arguments(model):
     ]
 
 
+# Codex 0.160's bundled model catalog (codex-rs/models-manager/models.json at tag rust-v0.160.0): whether it runs each
+# model as "Responses Lite" (use_responses_lite). Codex never offers a Lite model its hosted web_search tool
+# (core/src/tools/spec_plan.rs:621-651); gpt-5.5 is its one model that is not Lite. Codex finds a model's entry by the
+# longest catalog name its name starts with, or for "<namespace>/<name>" the same for the part after that one
+# namespace (models-manager/src/manager.rs:855-905); a model it finds none for runs as not Lite
+# (models-manager/src/model_info.rs:98-139). An API connection's model gets this catalog's entry: Codex fetches no
+# model list from a custom provider (manager.rs:539-553).
+CODEX_CATALOG_LITE = {
+    "gpt-6-astra": True, "gpt-6.1-sol": True, "gpt-6-sol": True, "gpt-6-luna": True, "gpt-5.6-sol": True,
+    "gpt-5.6-terra": True, "gpt-5.6-luna": True, "gpt-daybreak-blue-latest": True, "gpt-daybreak-red-latest": True,
+    "codex-auto-review": True, "gpt-5.5": False,
+}
+
+
+def codex_lite_model(name):
+    """Whether Codex 0.160 runs the model ``name`` (the name it sends to its endpoint) as Responses Lite
+    (CODEX_CATALOG_LITE)."""
+
+    def entry(value):
+        return max((slug for slug in CODEX_CATALOG_LITE if value.startswith(slug)), key=len, default=None)
+
+    found = entry(name)
+    namespace, separator, rest = name.partition("/")
+    if (found is None and separator and namespace and "/" not in rest
+            and all(char.isascii() and (char.isalnum() or char in "_-") for char in namespace)):
+        found = entry(rest)
+    return CODEX_CATALOG_LITE.get(found, False)
+
+
+def _provider_runs_codex_search(arguments):
+    """Whether TCS Prover's provider settings ``arguments`` (provider_arguments()) let Codex 0.160 offer its own web
+    search, the web.run tool (ext/web-search/src/extension.rs:42-56): a provider named "OpenAI", one with
+    supports_standalone_web_search=true, or one that sends an x-openai-actor-authorization header."""
+
+    prefix = f"model_providers.{API_PROVIDER}."
+    for argument in arguments:
+        key, _, value = str(argument).partition("=")
+        if ((key == prefix + "name" and value.strip() == '"OpenAI"')
+                or (key == prefix + "supports_standalone_web_search" and value.strip() == "true")
+                or (key == prefix + "http_headers" and "x-openai-actor-authorization" in value.lower())):
+            return True
+    return False
+
+
+def codex_web_search_tool(model):
+    """Whether Codex 0.160 offers ``model`` a web search tool in a live run, as TCS Prover starts it: True, False, or
+    None for a model that Claude Code runs or one that cannot be looked up now.
+
+    Codex has two (its source at tag rust-v0.160.0, and its installed binary against a local stand-in for the model
+    API): the hosted web_search tool, which it never offers to a Responses Lite model (codex_lite_model()), and its
+    own web search (web.run), which it offers only through its built-in OpenAI provider or a provider that asks for it
+    (_provider_runs_codex_search()). A built-in GPT model runs on the built-in provider; an API connection's model on
+    TCS Prover's provider (provider_arguments()), which asks for none of it, so a Lite model there has no search tool.
+    """
+
+    try:
+        if providers.harness(model) != providers.CODEX:
+            return None
+        if model_provider(model) != API_PROVIDER:
+            return True
+        return _provider_runs_codex_search(provider_arguments(model)) or not codex_lite_model(wire_model(model))
+    except (Error, providers.ProviderError):
+        return None
+
+
 def live_network(workspace=None, policy=None):
     """Whether the model processes of a run reach the internet: only in a live run (search mode "live").
 
@@ -2205,6 +2270,55 @@ def note_no_subagent_tool(stage, model, count, coordinator=False, bare=False):
     emit("status", stage, label="No subagents with this model", noSubagentTool=True, subagentCount=count,
          **({"authorModeEffective": "author", "modelLabel": label} if coordinator and stage == "solve" else {}),
          text=f"{cause}, so {who}." + ("" if bare else " Choose another model to have them."))
+
+
+NO_WEB_SEARCH_LABEL = "No web search"
+
+
+def note_no_web_search(stage, node, model, members=(), *, coordinator=False, directory=None):
+    """Warn once, as the author's run starts, when its search is live but Codex gives the author's ``model``, or a
+    team member's (``members``, team.team_members()), no web search tool on the connection it runs through
+    (codex_web_search_tool()); the run goes on without it. Each such model is named once, with who runs it. A pinned
+    diagnostic, shown like the job's other warnings. The provider's settings are not changed here."""
+
+    try:
+        if not live_network(directory):
+            return
+    except Error:
+        return  # The launch itself says what is wrong with the run's search settings.
+    users = {}  # Each model without search: whether the author runs it, and the members that do.
+    for chosen, number in ((model, None), *((member["model"], member["member"]) for member in members)):
+        if codex_web_search_tool(chosen) is False:
+            entry = users.setdefault(chosen, {"author": False, "members": []})
+            if number is None:
+                entry["author"] = True
+            else:
+                entry["members"].append(number)
+    if not users:
+        return
+
+    def runs(entry):
+        roles = [f"the {'author coordinator' if coordinator else 'proof author'}"] if entry["author"] else []
+        numbers = [str(number) for number in entry["members"]]
+        if numbers:
+            listed = ", ".join(numbers[:-1]) + " and " + numbers[-1] if len(numbers) > 1 else numbers[0]
+            roles.append(f"author subagent{'s' if len(numbers) > 1 else ''} {listed}")
+        return (f"{roles[0]}'s model" if entry["author"] + len(entry["members"]) == 1
+                else f"the model of {' and '.join(roles)}")
+
+    named = [(runs(entry), team_module.member_description(chosen)) for chosen, entry in users.items()]
+    if len(named) == 1:
+        whose, found = named[0]
+        start = f"{whose} has no web search on its connection: {found['modelLabel']} ({found['program']})"
+    else:
+        start = "these models have no web search on their connection: " + "; ".join(
+            f"{whose}, {found['modelLabel']} ({found['program']})" for whose, found in named)
+    which = "this model" if len(named) == 1 else "these models"
+    emit("diagnostic", stage, node=node, label=NO_WEB_SEARCH_LABEL, noWebSearch=True,
+         models=[found["modelLabel"] for _, found in named],
+         text=f"Web search is on for this job, but {start}. Codex gives {which} no search tool through an API "
+              f"connection, and web search only through its built-in OpenAI provider (the Codex CLI source). The run "
+              f"goes on without web search.")
 
 
 def subagent_limits(features, subagents, coordinator=None, long_waits=True):
@@ -8412,7 +8526,7 @@ def _execute(workflow, state, options, prompts):
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
                     texts = {name: prompts[name] for name in HARNESS_TEXTS if name in prompts}
-                    crew = None
+                    crew, members = None, []
                     if coordinator and options.get("author_team", "builtin") == "tcs":
                         if retrieval_policy(directory, features):
                             # A web-cutoff run's audited configuration has no place for TCS Prover's server: its
@@ -8468,6 +8582,10 @@ def _execute(workflow, state, options, prompts):
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
                     if alone is not None:
                         alone.pop("bound")
+                    # A live run whose author's model, or a team member's, gets no web search tool from Codex says so
+                    # as it starts (the run goes on without it).
+                    note_no_web_search(stage_name, current, settings["model"], members if crew is not None else (),
+                                       coordinator=coordinator, directory=directory)
                     service = None
                     if crew is not None or (not claude and options.get("goal_loop", "codex") == "tcs"
                                             and not retrieval_policy(directory, features)):
