@@ -8796,9 +8796,11 @@ def run_author_conversation(workflow_path, options, request):
         prompts = prepare(workflow, options)
         lifecycle = _lifecycle_map(node["lifecycle"])
         settings = _settings(node, options)
-        if author_mode(node, options) == "coordinator" and multi_agent_version(settings["model"]) != 0:
+        if author_mode(node, options) == "coordinator" and (multi_agent_version(settings["model"]) != 0
+                                                            or options.get("author_team", "builtin") == "tcs"):
             # The author coordinator's own prompts where its binding replaces the author's (the summary). A Codex
-            # model that gets no subagent tool worked alone, with the author's prompts (see _execute).
+            # model that gets no subagent tool worked alone, with the author's prompts, unless its subagents were
+            # TCS Prover's team (see _execute).
             lifecycle.update(_lifecycle_map(node["coordinator"]["lifecycle"]))
         key = "summary" if kind == "summary" else "conversation"
         if key not in lifecycle:
