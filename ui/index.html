@@ -333,6 +333,7 @@
                         <option value="medium">Medium</option>
                         <option value="low">Low</option>
                       </select>
+                      <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
                       <label for="authorSubagents">4 · Subagents</label>
                       <input id="authorSubagents" type="number" min="0" max="10" step="1" value="3"
                         aria-describedby="authorSubagentsHelp">
@@ -342,7 +343,49 @@
                         subagents at a time, keeps the team's memory and checks that progress keeps growing; its
                         progress log appears on the job page.
                       </p>
-                      <span id="authorModelProvider" class="provider-chip" data-provider="codex">Codex CLI</span>
+                      <!-- Which model each author subagent runs (app.js renderTeamModels): shown with 1 or more
+                           subagents; "Choose for each" lists one row per subagent in authorTeamModels below. With a
+                           web cutoff it stays "Same as the coordinator" and the help says why. -->
+                      <label id="authorSubagentModelsLabel" for="authorSubagentModelsMode">5 · Subagent models</label>
+                      <select id="authorSubagentModelsMode" aria-describedby="authorSubagentModelsHelp">
+                        <option value="same" selected>Same as the coordinator</option>
+                        <option value="each">Choose for each</option>
+                      </select>
+                      <p id="authorSubagentModelsHelp" class="help model-setting-help">Every author subagent runs the
+                        coordinator's model and reasoning.</p>
+                      <!-- How the author's turns follow one another: TCS Prover's own loop, whose texts the Prompts
+                           dialog edits, or the Codex CLI's built-in goal mode. -->
+                      <span id="goalLoopLabel" class="model-setting-label">6 · Goal loop</span>
+                      <div id="goalLoopChoice" class="goal-loop-choice" role="radiogroup" aria-labelledby="goalLoopLabel">
+                        <label class="goal-loop-option" for="goalLoopTcs">
+                          <input id="goalLoopTcs" type="radio" name="goalLoop" value="tcs" checked
+                            aria-describedby="goalLoopTcsHelp">
+                          <span class="goal-loop-copy"><span class="goal-loop-name">TCS Prover (editable texts)</span>
+                            <span id="goalLoopTcsHelp" class="goal-loop-help">TCS Prover starts every turn and sends
+                              the continuation itself, with the texts under Edit prompts.</span></span>
+                        </label>
+                        <label class="goal-loop-option" for="goalLoopCodex">
+                          <input id="goalLoopCodex" type="radio" name="goalLoop" value="codex"
+                            aria-describedby="goalLoopCodexHelp">
+                          <span class="goal-loop-copy"><span class="goal-loop-name">Codex built-in</span>
+                            <span id="goalLoopCodexHelp" class="goal-loop-help">The Codex CLI's own goal mode with its
+                              own texts, as before; Claude Code authors always use TCS Prover's loop.</span></span>
+                        </label>
+                      </div>
+                      <p id="goalLoopNote" class="help model-setting-help" hidden></p>
+                    </div>
+                    <!-- Choose for each: one row per author subagent ("Subagent 1" … N) with the roles' Source, Model
+                         and Reasoning menus (app.js renderTeamModels builds the rows). Spans the grid under the
+                         Proof author; hidden unless the author stage is on, with 1 or more subagents, no web cutoff
+                         and Choose for each. -->
+                    <div id="authorTeamSetting" class="model-setting team-models" role="group"
+                      aria-labelledby="authorTeamTitle" aria-describedby="authorTeamHelp" hidden>
+                      <h3 id="authorTeamTitle" class="model-role-title">Proof author · subagent models</h3>
+                      <p id="authorTeamHelp" class="help model-setting-help">Each author subagent runs the model chosen
+                        here; the coordinator gives it assignments through TCS Prover's team tools.</p>
+                      <div class="team-models-head" aria-hidden="true"><span></span><span>1 · Source</span>
+                        <span>2 · Model</span><span>3 · Reasoning</span></div>
+                      <div id="authorTeamRows" class="team-model-rows"></div>
                     </div>
                     <div id="criticModelSetting" class="model-setting">
                       <h3 class="model-role-title">Independent critic</h3>
@@ -604,11 +647,12 @@
                 </fieldset>
                 <div class="settings-group prompt-setting">
                   <div>
-                    <strong>Role prompts</strong>
-                    <span>Custom prompts override the defaults for this job</span>
+                    <strong>Prompts</strong>
+                    <span id="promptSettingText">Every text the workflow sends its models, including the goal loop and
+                      the team's; edits apply to the next job</span>
                   </div>
-                  <button id="editPromptsButton" class="secondary compact"
-                    type="button">Edit prompts</button>
+                  <button id="editPromptsButton" class="secondary compact" type="button"
+                    aria-haspopup="dialog">Edit prompts</button>
                 </div>
               </div>
             </details>
@@ -982,6 +1026,9 @@
             <details class="run-context">
               <summary>Run settings</summary>
               <dl id="runMetadata" class="run-metadata"></dl>
+              <!-- The texts this job runs with, saved when it started (read-only; app.js openJobPrompts). -->
+              <button id="jobPromptsButton" class="secondary compact job-prompts-button" type="button"
+                aria-haspopup="dialog" hidden>View this job's prompts</button>
             </details>
           </div>
           <div class="job-footer">
@@ -1010,47 +1057,56 @@
     </div>
     </div><!-- .main-column -->
 
-    <!-- Advanced prompt editing stays out of the main problem form. -->
-    <dialog id="promptDialog" class="prompt-dialog" aria-labelledby="promptDialogTitle">
+    <!-- Prompts: every text the workflow sends its models (the server's catalog, GET /prompt-catalog), grouped in a
+         searchable list with collapsible groups beside one text's editor. From New problem each text can be edited for
+         the next job (an edit is a promptOverrides entry by name, checked as the server checks it); an open job shows
+         the texts it runs with, read-only (app.js openPromptEditor). On a narrow screen the list and the text take
+         turns (data-view). -->
+    <dialog id="promptDialog" class="prompt-dialog prompt-catalog-dialog" aria-labelledby="promptDialogTitle"
+      aria-describedby="promptDialogLede" data-view="list">
       <form method="dialog">
         <div class="prompt-dialog-head">
           <div>
-            <p class="eyebrow">Advanced</p>
-            <h2 id="promptDialogTitle">Edit role prompts</h2>
+            <p id="promptDialogEyebrow" class="eyebrow">Advanced</p>
+            <h2 id="promptDialogTitle">Edit prompts</h2>
+            <p id="promptDialogLede" class="prompt-dialog-lede">Every text the next job sends its models, by where it
+              is used. Edits apply to the next job you start from this form.</p>
           </div>
-          <button id="closePromptsButton" class="ghost compact"
-            value="cancel">Close</button>
+          <button id="closePromptsButton" class="ghost compact" value="cancel">Close</button>
         </div>
-        <div id="promptTabs" class="prompt-tabs" role="tablist"
-          aria-label="Choose a role prompt">
-          <button id="reviewPromptTab" type="button" role="tab" class="prompt-tab active"
-            aria-selected="true" aria-controls="promptPanel" data-prompt="review">Reviewer</button>
-          <button id="authorPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
-            aria-selected="false" aria-controls="promptPanel" data-prompt="author">Author</button>
-          <!-- The per-job coordinator prompt: shown while the Author stage is on and Author subagents is 1 or more
-               (app.js showCoordinatorPromptTab). -->
-          <button id="coordinatorPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
-            aria-selected="false" aria-controls="promptPanel" data-prompt="coordinator">Coordinator</button>
-          <button id="criticPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
-            aria-selected="false" aria-controls="promptPanel" data-prompt="critic">Critic</button>
-          <button id="conventionPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
-            aria-selected="false" aria-controls="promptPanel" data-prompt="convention">Convention critic</button>
-          <button id="finalPromptTab" type="button" role="tab" class="prompt-tab" tabindex="-1"
-            aria-selected="false" aria-controls="promptPanel" data-prompt="final">Final writer</button>
-        </div>
-        <div id="promptPanel" role="tabpanel" aria-labelledby="promptEditorLabel">
-          <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>
-          <textarea id="promptEditor" rows="18" spellcheck="false"></textarea>
-          <p id="promptEditorHelp" class="help">
-            The author prompt must contain exactly one [STATEMENT].
-          </p>
-          <p id="promptEditorError" class="notice" role="alert" hidden></p>
+        <p id="promptDialogNote" class="prompt-dialog-note" hidden></p>
+        <div class="prompt-browser">
+          <nav class="prompt-nav" aria-label="Texts">
+            <input id="promptSearch" type="search" autocomplete="off" spellcheck="false" placeholder="Search texts"
+              aria-label="Search the texts by name, use or wording" aria-controls="promptList">
+            <div id="promptList" class="prompt-list"></div>
+            <p id="promptSearchEmpty" class="prompt-search-empty" hidden></p>
+          </nav>
+          <section id="promptPanel" class="prompt-panel" aria-labelledby="promptEditorLabel">
+            <button id="promptBackButton" class="ghost compact prompt-back" type="button">All texts</button>
+            <div class="prompt-panel-head">
+              <div class="prompt-panel-title">
+                <p id="promptEditorGroup" class="prompt-panel-group"></p>
+                <label id="promptEditorLabel" for="promptEditor">Reviewer prompt</label>
+                <code id="promptEditorName" class="prompt-panel-name"></code>
+              </div>
+              <span id="promptEditorState" class="prompt-state" data-state="default">Default</span>
+            </div>
+            <dl class="prompt-facts">
+              <div><dt>When it is used</dt><dd id="promptEditorWhen"></dd></div>
+              <div><dt>Placeholders</dt><dd id="promptEditorFields"></dd></div>
+            </dl>
+            <textarea id="promptEditor" rows="18" spellcheck="false" aria-describedby="promptEditorHelp"></textarea>
+            <p id="promptEditorHelp" class="help"></p>
+            <p id="promptEditorError" class="notice" role="alert" hidden></p>
+          </section>
         </div>
         <div class="prompt-dialog-actions">
-          <button id="resetPromptButton" class="ghost" type="button">
-            Reset to default
-          </button>
-          <button id="savePromptsButton" class="primary" type="button">Apply to this job</button>
+          <p id="promptEditCount" class="prompt-edit-count" role="status"></p>
+          <div class="prompt-dialog-buttons">
+            <button id="resetPromptButton" class="ghost" type="button">Reset to default</button>
+            <button id="savePromptsButton" class="primary" type="button">Apply to the next job</button>
+          </div>
         </div>
       </form>
     </dialog>

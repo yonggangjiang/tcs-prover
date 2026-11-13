@@ -939,22 +939,28 @@ assert.equal(ui.conventionWarning.hidden, true);
 """, slices=(("function renderConventionWarning(", "// Group the recorded critic calls"),))
 
     def test_the_prompt_editor_lists_and_checks_the_convention_prompt(self):
+        # The dialog of an older server without the catalog (the six role prompts); the catalog's own checks are in
+        # tests/test_prompt_catalog_ui.py.
         self.run_page(r"""
 assert.equal(promptLabels.convention, 'Convention critic prompt');
 assert.match(promptHelp.convention, /once the critic has accepted it, before writing/);
-let stages = {review: false, author: true, critic: true, writing: true};
-const selectedWorkflowStages = () => stages;
-promptDrafts = {author: 'Prove [STATEMENT].', critic: 'Check.', final: 'Write.', convention: 'Judge {statement}; {{x}}.'};
+let promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
+state.workflow = {settings: {prompts: {review: 'Review.', author: 'Prove [STATEMENT].', critic: 'Check {count}.',
+  convention: 'Judge {statement}.', final: 'Write.'}}};
+Object.assign(promptStore(), {catalog: legacyPromptCatalog(), groups: ['Statement review', 'Author', 'Critic', 'Writer']});
+assert.equal(promptEntry('convention').label, 'Convention critic prompt');
+assert.equal(promptEntry('convention').group, 'Critic');
+promptDrafts = {convention: 'Judge {statement} and {instructions}; {{x}}.'};
 assert.equal(promptProblem(), null);
 promptDrafts.convention = 'Judge {proof}.';
-assert.deepEqual(promptProblem()[0], 'convention');
+assert.deepEqual(promptProblem(), ['convention',
+  'Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.']);
 promptDrafts.convention = ' ';
 assert.deepEqual(promptProblem(), ['convention', 'Every role prompt must contain instructions.']);
-// Without the critic stage the convention critic does not run: its prompt is not checked.
-stages = {...stages, critic: false};
+// An unedited text is never checked; an edited one always is, as the server checks every edit it is sent.
+promptDrafts = {convention: 'Judge {statement}.'};
 assert.equal(promptProblem(), null);
-""", slices=(("const promptLabels =", "function updatePromptHelp()"),
-             ("// The first draft that cannot be applied", "// The dialog is modal")))
+""", slices=(("const promptLabels =", "function updatePromptHelp()"),))
 
     def test_rerun_opens_the_composer_with_the_suggestion_the_jobs_settings_and_the_author_on(self):
         self.run_page(r"""
@@ -964,7 +970,8 @@ Object.assign(state, {runId: 'job-1', criticModel: 'claude-opus-5-5', criticEffo
   authorSubagents: 2, criticRounds: 4, thinkingHours: 2, retrievalMode: 'live', problemMode: 'critic-resume',
   workflowStages: {review: false, author: false, critic: true, writing: false},
   criticPrompt: 'JOB CRITIC PROMPT', authorPrompt: 'DEFAULT AUTHOR', conventionPrompt: 'DEFAULT CONVENTION'});
-rerunWithStatement('SUGGESTED-TEXT');
+(async () => {
+await rerunWithStatement('SUGGESTED-TEXT');
 assert.equal(composerSeedOpened, 1);
 assert.equal(composerSeed.statement, 'SUGGESTED-TEXT');
 assert.equal(composerSeed.settings.criticModel, 'claude-opus-5-5');
@@ -974,7 +981,8 @@ assert.equal(composerSeed.settings.authorSubagents, 2);
 assert.deepEqual(composerSeed.settings.workflowStages, {review: false, author: true, critic: true, writing: false});
 assert.equal(composerSeed.settings.problemMode, undefined);
 assert.equal(composerSeed.settings.criticPrompt, 'JOB CRITIC PROMPT');
-// It starts nothing: no request is made.
+// It starts nothing: the only request is for the texts' defaults (which this page cannot reach here).
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 """, slices=(("function workflowStagesFor(", "// Read historical mode names"),
              ("const promptLabels =", "function syncPrompts("),
              ("// Settings and statement the composer opens with once", "async function newProblem(")))
@@ -985,7 +993,7 @@ assert.equal(composerSeed.settings.criticPrompt, 'JOB CRITIC PROMPT');
                      "ui.problem.value = seed ? seed.statement :", "setChoice(ui.criticModel, source.criticModel",
                      "ui.criticCount.value = source.criticCount", "ui.authorSubagents.value =",
                      "syncPrompts(source);",
-                     "if (prompt && prompt.trim() !== (defaults[name] || \"\").trim()) promptOverrides[name] = prompt.trim();"):
+                     "if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;"):
             self.assertIn(line, block)
 
     def test_the_markup_and_the_jobs_list(self):
@@ -999,7 +1007,8 @@ assert.equal(composerSeed.settings.criticPrompt, 'JOB CRITIC PROMPT');
         # Near the top of the job view: right after its header, before the panels.
         self.assertLess(markup.index('id="runAttention"'), markup.index('id="conventionWarning"'))
         self.assertLess(markup.index('id="conventionWarning"'), markup.index('id="reviewPanel"'))
-        self.assertIn('data-prompt="convention">Convention critic</button>', markup)
+        # The Prompts dialog lists the convention critic's prompt (the server's catalog, else the role prompts).
+        self.assertIn('convention: "Convention critic prompt"', (server.UI / "app.js").read_text())
         source = (server.UI / "app.js").read_text()
         jobs = source[source.index("function renderJobs("):source.index("function renderJobs(") + 9000]
         self.assertIn('tag.textContent = "Loophole warning";', jobs)

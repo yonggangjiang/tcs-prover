@@ -227,7 +227,10 @@ class CoordinatorDocsTests(unittest.TestCase):
         self.assertIn('"Written by the author coordinator in memory/progress.md"', app)
         self.assertIn("` · coordinator, up to ${state.authorSubagents} author subagent", app)
         self.assertIn('" · works alone"', app)
-        for label in ("Author subagent ${status}", "Author coordinator time check", "Author coordinator report"):
+        # "Author subagent started", or with TCS Prover's team "Author subagent 2 (Claude Opus 5.5) started".
+        self.assertIn('[member ? `Author subagent ${member}` : "Author subagent", model ? `(${model})` : ""]', app)
+        self.assertIn("label: `${who} ${status}`", app)
+        for label in ("Author coordinator time check", "Author coordinator report"):
             self.assertIn(label, app)
 
 

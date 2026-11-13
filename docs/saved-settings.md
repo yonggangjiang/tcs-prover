@@ -24,9 +24,10 @@ which saved settings every new problem opens with.
 ## Save these settings…
 
 **Save these settings…** keeps the form's settings under a name: the selected
-stages, each role's source, model and reasoning, author subagents, independent
-critics, critic rounds, the time limit, the web search cutoff, the generation
-speed and the activity log detail.
+stages, each role's source, model and reasoning, author subagents, the subagent
+models (*Same as the coordinator*, or each author subagent's model and
+reasoning), the goal loop, independent critics, critic rounds, the time limit,
+the web search cutoff, the generation speed and the activity log detail.
 
 - As at Start, the settings of a stage that is off (its model and reasoning, the
   critics and rounds, the author's subagents and time limit) never stop a save:
@@ -70,6 +71,16 @@ it opens, so connections added or removed in another tab count.
   [author coordinator](workflow.md#the-author-coordinator) with that many author
   subagents. The built-in settings use 3, and so do saved settings that hold no
   number (saved before the setting existed).
+- The built-in settings use *Same as the coordinator* for the
+  [subagent models](workflow.md#the-authors-team) and TCS Prover's
+  [goal loop](workflow.md#the-goal-loop), and so do saved settings from before
+  these settings existed. A saved subagent model of a removed API connection
+  loads as GPT 6.1 Sol with a note, as a role's does (*Author subagent 2 model
+  not available …*).
+- The **Advanced settings** line also names the goal loop (*Goal loop: TCS
+  Prover*) and, with 1 or more author subagents, the team (*Coordinator, 3 author
+  subagents: same model as the coordinator*); either is marked when it is not
+  the default.
 - Terminal runs never read saved settings.
 
 ## Where they are kept

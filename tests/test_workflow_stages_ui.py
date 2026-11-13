@@ -69,14 +69,16 @@ restoreWorkflowStages({skipStatementReview:true});
 assert.deepEqual(selectedWorkflowStages(), {review:false,author:true,critic:true,writing:true});
 """)
 
-    def test_turning_off_the_active_prompt_moves_to_an_enabled_stage(self):
+    def test_the_stages_never_change_the_text_the_prompts_dialog_shows(self):
+        # The dialog lists every text whatever the stages (tests/test_prompt_catalog_ui.py), so a stage turned off
+        # leaves the shown text as it is.
         self.run_app(self.STAGES, self.SETUP, r"""
 ui.promptDialog.open = true;
 activePrompt='author';
 setWorkflowStages({review:false,author:false,critic:true,writing:true});
-assert.equal(activePrompt,'critic');
+assert.equal(activePrompt,'author');
 setWorkflowStages({review:false,author:false,critic:false,writing:true});
-assert.equal(activePrompt,'final');
+assert.equal(activePrompt,'author');
 """)
 
     def test_changing_stages_during_create_keeps_duplicate_submissions_blocked(self):

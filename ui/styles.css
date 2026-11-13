@@ -2105,6 +2105,39 @@ kbd {
 .model-setting .provider-chip { grid-column: 1 / -1; align-self: start; justify-self: start; margin-top: 0; }
 .model-setting input[type="number"] { max-width: 6rem; font-family: var(--font-mono); font-size: var(--text-sm); }
 .model-setting .model-setting-help { grid-column: 1 / -1; margin: -4px 0 0; }
+/* A setting named by a span (a radio group's name), placed like the menus' labels. */
+.model-setting > .model-setting-label { align-self: start; padding-top: 1px; color: var(--ink-2); font-size: var(--text-sm);
+  font-weight: 600; }
+/* 6 · Goal loop: two choices, each with one line on what it means. */
+.goal-loop-choice { display: grid; gap: 8px; min-width: 0; }
+.goal-loop-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin: 0;
+  cursor: pointer;
+}
+.goal-loop-copy { display: grid; gap: 2px; min-width: 0; }
+.goal-loop-option .goal-loop-name { color: var(--ink); font-size: var(--text-sm); font-weight: 600; line-height: 1.4; }
+.goal-loop-option .goal-loop-help { color: var(--ink-2); font-size: var(--text-xs); font-weight: 400; line-height: 1.45; }
+/* Proof author · subagent models: under both columns, one row per subagent (its name, then the roles' three menus,
+   then the chip naming where its model runs). */
+.team-models { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr); }
+.team-models-head, .team-model-row {
+  display: grid;
+  grid-template-columns: minmax(6.5rem, 0.55fr) repeat(2, minmax(0, 1.2fr)) minmax(0, 0.9fr);
+  column-gap: 10px;
+  align-items: center;
+}
+.team-models-head { color: var(--ink-3); font-size: var(--text-xs); font-weight: 600; }
+.team-model-rows { display: grid; gap: 10px; }
+.team-model-row { row-gap: 6px; padding-top: 10px; border-top: 1px solid var(--line); }
+.team-model-row > .team-member-name { margin: 0; color: var(--ink); font-size: var(--text-sm); font-weight: 600; }
+/* The menus' labels: read out on wide screens, where the head row names the columns; shown when the menus stack. */
+.team-model-row > label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0);
+  white-space: nowrap; }
+.team-model-row > .provider-chip { grid-column: 2 / -1; justify-self: start; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4) var(--space-5); }
 .field-grid .field { margin-top: 0; }
 .limits-group input[type="number"] { max-width: 160px; font-family: var(--font-mono); }
@@ -3184,6 +3217,194 @@ kbd {
 .prompt-dialog textarea { min-height: min(44vh, 420px); }
 #promptEditorError { margin: var(--space-3) 0 0; }
 .prompt-dialog-actions { display: flex; justify-content: space-between; gap: var(--space-3); }
+/* The Prompts dialog: every text of the catalog, a list of groups beside one text's editor, filling most of the
+   screen so a long text reads comfortably. */
+.prompt-catalog-dialog { width: min(1180px, calc(100vw - 32px)); height: min(900px, calc(100dvh - 48px)); }
+/* A column: the head, the note of an older job, the list and the text (taking the height left), the buttons. */
+.prompt-catalog-dialog form { display: flex; flex-direction: column; height: 100%; gap: var(--space-3); }
+.prompt-catalog-dialog .prompt-browser { flex: 1 1 auto; }
+.prompt-catalog-dialog .prompt-dialog-head { gap: var(--space-4); }
+.prompt-dialog-lede { max-width: 72ch; margin: 6px 0 0; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5; }
+.prompt-dialog-note {
+  margin: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--waiting);
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+  background: var(--tint);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.prompt-browser {
+  display: grid;
+  grid-template-columns: minmax(230px, 290px) minmax(0, 1fr);
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.prompt-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  padding: 10px;
+  border-right: 1px solid var(--line);
+  background: var(--surface-sunken);
+}
+.prompt-nav input[type="search"] { flex: none; font-size: var(--text-sm); }
+.prompt-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin: 0 -4px; padding: 0 4px 4px; }
+.prompt-group + .prompt-group { margin-top: 2px; }
+.prompt-group h3 { margin: 0; font-size: inherit; }
+.prompt-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: transparent;
+  font-size: var(--text-xs);
+  font-weight: 650;
+  letter-spacing: var(--label-tracking);
+  text-align: left;
+  text-transform: uppercase;
+}
+.prompt-group-toggle::before {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border: solid currentColor;
+  border-width: 0 1.5px 1.5px 0;
+  color: var(--ink-3);
+  content: "";
+  transform: rotate(-45deg);
+  transition: transform var(--fast) var(--ease);
+}
+.prompt-group-toggle[aria-expanded="true"]::before { transform: translateY(-2px) rotate(45deg); }
+.prompt-group-toggle:hover { color: var(--ink); background: var(--tint-2); }
+.prompt-group-name { flex: 1 1 auto; min-width: 0; }
+.prompt-group-count { flex: none; color: var(--ink-3); font: 500 var(--text-xs)/1 var(--font-mono); letter-spacing: 0;
+  text-transform: none; }
+.prompt-items { margin: 2px 0 6px; padding: 0; list-style: none; }
+.prompt-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 8px 5px 22px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+  background: transparent;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-align: left;
+}
+.prompt-item:hover { color: var(--ink); background: var(--tint-2); }
+.prompt-item[aria-current="true"] {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-1);
+}
+/* The shown text: a short accent bar at its start, as the selected prompt tab had its underline. */
+.prompt-item[aria-current="true"]::before {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 9px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  content: "";
+}
+.prompt-item-label { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.prompt-item-mark {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--accent-line);
+  border-radius: 9px;
+  color: var(--accent-text);
+  background: var(--accent-wash);
+  font: 600 0.6875rem/1.4 var(--font-mono);
+}
+.prompt-search-empty { margin: 4px 6px; color: var(--ink-2); font-size: var(--text-sm); }
+/* A column whose editor takes the height left (the back button shows on a narrow screen only). */
+.prompt-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 12px;
+  overflow-y: auto;
+}
+.prompt-back { display: none; align-self: flex-start; gap: 8px; padding-left: 4px; }
+.prompt-back::before {
+  width: 6px;
+  height: 6px;
+  border: solid currentColor;
+  border-width: 0 0 1.5px 1.5px;
+  content: "";
+  transform: rotate(45deg);
+}
+.prompt-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+.prompt-panel-title { display: grid; gap: 2px; min-width: 0; }
+.prompt-panel-group { margin: 0; color: var(--ink-3); font: 600 var(--text-xs)/1.3 var(--font-label);
+  letter-spacing: var(--label-tracking); text-transform: uppercase; }
+.prompt-panel-title label { margin: 0; color: var(--ink-strong); font-size: var(--text-md); font-weight: 650; }
+.prompt-panel-name { justify-self: start; padding: 0; color: var(--ink-3); background: none; font-size: var(--text-xs); }
+.prompt-state {
+  flex: none;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink-2);
+  background: var(--tint);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  line-height: 1.5;
+}
+.prompt-state:is([data-state="edited"], [data-state="job"]) { border-color: var(--accent-line); color: var(--accent-text);
+  background: var(--accent-wash); }
+.prompt-facts { display: grid; gap: 6px; margin: 0; }
+.prompt-facts > div { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 10px; }
+.prompt-facts dt { color: var(--ink-3); font-size: var(--text-xs); font-weight: 600; line-height: 1.6; }
+.prompt-facts dd { margin: 0; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5; }
+.prompt-facts dd code { margin: 0 6px 4px 0; display: inline-block; }
+.prompt-catalog-dialog #promptEditor { flex: 1 1 auto; min-height: 10rem; resize: vertical; }
+.prompt-catalog-dialog #promptEditor[readonly] { color: var(--ink-2); background: var(--surface-sunken); }
+.prompt-catalog-dialog #promptEditorHelp { margin: 0; font-size: var(--text-xs); }
+.prompt-catalog-dialog #promptEditorError { margin: 0; }
+.prompt-catalog-dialog .prompt-dialog-actions { align-items: center; }
+.prompt-edit-count { margin: 0; color: var(--ink-2); font-size: var(--text-sm); }
+.prompt-dialog-buttons { display: flex; gap: var(--space-3); margin-left: auto; }
+.job-prompts-button { margin-top: var(--space-3); }
+/* Narrow screens: the list and the text take turns (the dialog's data-view), each the dialog's full width. */
+@media (max-width: 720px) {
+  /* The form grows with the text and the dialog scrolls, so the buttons follow the editor. */
+  .prompt-catalog-dialog { overflow-y: auto; }
+  .prompt-catalog-dialog form { height: auto; min-height: 100%; }
+  .prompt-catalog-dialog .prompt-browser { flex: 1 0 auto; }
+  .prompt-browser { grid-template-columns: minmax(0, 1fr); border: 0; border-radius: 0; overflow: visible; }
+  .prompt-catalog-dialog[data-view="list"] .prompt-panel,
+  .prompt-catalog-dialog[data-view="text"] .prompt-nav { display: none; }
+  .prompt-nav { padding: 0; border-right: 0; background: none; }
+  .prompt-panel { padding: 0; overflow: visible; }
+  .prompt-back { display: inline-flex; }
+  .prompt-facts > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .prompt-catalog-dialog #promptEditor { min-height: 50dvh; }
+  .prompt-catalog-dialog .prompt-dialog-actions { flex-wrap: wrap; }
+  .prompt-dialog-buttons { width: 100%; }
+  .prompt-dialog-buttons > button { flex: 1 1 auto; }
+}
 /* Save settings and Load settings: the prompt dialog's frame, narrower for Save. */
 .preset-dialog { width: min(560px, calc(100vw - 32px)); }
 .preset-load-dialog { width: min(900px, calc(100vw - 32px)); }
@@ -3743,8 +3964,18 @@ kbd {
     background-position: calc(100% - 15px) calc(50% + 1px), calc(100% - 10px) calc(50% + 1px);
   }
   .model-setting { grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); grid-template-rows: none; row-gap: 0; }
-  .model-setting > label { margin-top: 12px; margin-bottom: 4px; }
+  .model-setting > label, .model-setting > .model-setting-label { margin-top: 12px; margin-bottom: 4px; }
   .model-setting .provider-chip { margin-top: 8px; }
+  .model-setting .model-setting-help { margin-top: 6px; }
+  /* Each subagent's menus stack under its name, labelled as the roles' are. */
+  .team-models-head { display: none; }
+  .team-model-rows { gap: 14px; }
+  .team-model-row { grid-template-columns: minmax(0, 1fr); row-gap: 0; padding-top: 12px; }
+  .team-model-row > label {
+    position: static; width: auto; height: auto; overflow: visible; clip: auto; white-space: normal;
+    margin: 12px 0 4px; color: var(--ink-2); font-weight: 600;
+  }
+  .team-model-row > .provider-chip { grid-column: 1 / -1; margin-top: 8px; }
   #problem { height: 10rem; }
   .composer-actions { flex-direction: column; align-items: stretch; }
   .composer-buttons { flex-direction: column-reverse; }

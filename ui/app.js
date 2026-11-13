@@ -122,6 +122,10 @@ const ui = {
   criticRounds: $("criticRounds"),
   criticCount: $("criticCount"),
   authorSubagents: $("authorSubagents"),
+  authorSubagentModelsLabel: $("authorSubagentModelsLabel"), authorSubagentModelsMode: $("authorSubagentModelsMode"),
+  authorSubagentModelsHelp: $("authorSubagentModelsHelp"), authorTeamSetting: $("authorTeamSetting"),
+  authorTeamRows: $("authorTeamRows"), goalLoopTcs: $("goalLoopTcs"), goalLoopCodex: $("goalLoopCodex"),
+  goalLoopNote: $("goalLoopNote"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
@@ -135,17 +139,16 @@ const ui = {
   criticRoundSetting: $("criticRoundSetting"),
   criticCountSetting: $("criticCountSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
-  editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
-  promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
-  promptEditorLabel: $("promptEditorLabel"),
+  editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"), promptSettingText: $("promptSettingText"),
+  promptDialogEyebrow: $("promptDialogEyebrow"), promptDialogTitle: $("promptDialogTitle"),
+  promptDialogLede: $("promptDialogLede"), promptDialogNote: $("promptDialogNote"),
+  promptSearch: $("promptSearch"), promptList: $("promptList"), promptSearchEmpty: $("promptSearchEmpty"),
+  promptBack: $("promptBackButton"), promptEditor: $("promptEditor"), promptEditorGroup: $("promptEditorGroup"),
+  promptEditorLabel: $("promptEditorLabel"), promptEditorName: $("promptEditorName"),
+  promptEditorState: $("promptEditorState"), promptEditorWhen: $("promptEditorWhen"),
+  promptEditorFields: $("promptEditorFields"), promptEditCount: $("promptEditCount"),
   promptEditorHelp: $("promptEditorHelp"), promptError: $("promptEditorError"),
-  resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
-  reviewPromptTab: $("reviewPromptTab"),
-  authorPromptTab: $("authorPromptTab"),
-  coordinatorPromptTab: $("coordinatorPromptTab"),
-  criticPromptTab: $("criticPromptTab"),
-  conventionPromptTab: $("conventionPromptTab"),
-  finalPromptTab: $("finalPromptTab"),
+  resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"), jobPrompts: $("jobPromptsButton"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   jobsHeading: $("jobsHeading"), jobsEmpty: $("jobsEmpty"),
@@ -599,11 +602,16 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "thinkingHours", "skipStatementReview", "statementReviewOnly",
+    "authorSubagentModels", "goalLoop", "goalLoopRecorded", "thinkingHours", "skipStatementReview",
+    "statementReviewOnly", "promptSet",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
   composerSeed = { statement, settings };
+  // The texts' defaults, which the job's texts are compared with to go along as edits (see render).
+  if (typeof loadPromptCatalog === "function") {
+    try { await loadPromptCatalog(); } catch (_) { /* the role prompts are compared with /state's defaults */ }
+  }
   // The new problem joins this job's batch while that batch takes problems, else the default batch.
   await newProblem(typeof selectedBatch === "function" && !state.readOnly && selectedBatch()?.addProblems
     ? currentBatch : "");
@@ -854,6 +862,22 @@ function retrievalSummary(source) {
 
 // When the server tries a job again by itself: an automatic resume after an error pause, the
 // next start of a queued job whose start failed, or the next attempt of a failed model call.
+// One subagent's model as the team's line names it: the menu's name, and "(API)" for an API connection's model
+// ("Lab model (API)").
+function teamModelLabel(model, label = "") {
+  const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === model);
+  const name = label || row?.label || (String(model).startsWith("api:") ? String(model).slice(4) : String(model));
+  const api = row ? row.provider === "api" : String(model).startsWith("api:");
+  return `${String(name).replace(/ — default$/, "")}${api && !/\(API\)$/.test(name) ? " (API)" : ""}`;
+}
+
+// The author's team in words: "coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Lab model (API)",
+// or "coordinator, 3 author subagents: same model as the coordinator" (``labels`` null).
+function teamText(count, labels) {
+  return `coordinator, ${count} author subagent${count === 1 ? "" : "s"}: `
+    + (labels ? labels.join(" · ") : "same model as the coordinator");
+}
+
 function retryText(job) {
   const at = (seconds) => new Date(seconds * 1000).toLocaleTimeString();
   if (job.phase === "paused" && job.autoResumeAt > 0) return `Automatic retry at ${at(job.autoResumeAt)}`;
@@ -1138,15 +1162,7 @@ function setWorkflowStages(stages = selectedWorkflowStages()) {
   for (const [stage, control] of Object.entries({ review: ui.workflowReview, author: ui.workflowAuthor,
     critic: ui.workflowCritic, writing: ui.workflowWriting })) control.checked = stages[stage] === true;
   const roles = { review: stages.review, author: stages.author, critic: stages.critic, writer: stages.writing };
-  const prompts = { review: "review", author: "author", critic: "critic", writer: "final" };
-  for (const [role, enabled] of Object.entries(roles)) {
-    show(ui[`${role}ModelSetting`], enabled);
-    show(ui[`${prompts[role]}PromptTab`], enabled);
-  }
-  // The convention critic checks the proof the critic accepts.
-  if (ui.conventionPromptTab) show(ui.conventionPromptTab, stages.critic);
-  // The coordinator's prompt goes with the Author stage and Author subagents 1 or more.
-  if (typeof showCoordinatorPromptTab === "function") showCoordinatorPromptTab(stages);
+  for (const [role, enabled] of Object.entries(roles)) show(ui[`${role}ModelSetting`], enabled);
   show(ui.criticRoundSetting, stages.critic);
   show(ui.criticCountSetting, stages.critic);
   show(ui.thinkingHoursSetting, stages.author);
@@ -1166,8 +1182,6 @@ function setWorkflowStages(stages = selectedWorkflowStages()) {
     : existingWork ? "Selected stages use the existing work above. Click any stage to turn it on or off."
     : "Click any stage to turn it on or off. Selected stages run from left to right.";
   ui.introDescription.textContent = "Choose the stages for your problem. Review the statement, develop a proof, check it, and polish the writing.";
-  const first = Object.keys(roles).find((role) => roles[role]);
-  if (ui.promptDialog.open && first && !roles[activePrompt === "final" ? "writer" : activePrompt]) selectPrompt(prompts[first]);
   updateModelSummary();
   renderRetrievalSettings();
   if (typeof renderComposerRelatedWorks === "function") renderComposerRelatedWorks();
@@ -1227,7 +1241,9 @@ function cutoffModelMessage(roles = cutoffBlockedRoles()) {
 function renderModelChoices() {
   const cutoff = selectedRetrievalMode() === "historical";
   const catalog = state.workflow?.settings?.model_catalog;
-  const roles = ["review", "author", "critic", "writer"];
+  // The author subagents' rows of "Choose for each" too (hidden, and so never shown, with a web cutoff).
+  const roles = ["review", "author", "critic", "writer",
+    ...(typeof teamRolesShown === "function" ? teamRolesShown() : [])];
   for (const role of roles) {
     const select = ui[`${role}Model`], chip = ui[`${role}ModelProvider`];
     const model = select.value || "", provider = modelProvider(model);
@@ -1291,6 +1307,8 @@ function renderRetrievalSettings() {
       : cutoffModelMessage();
   ui.retrievalConfigurationNotice.textContent = message;
   show(ui.retrievalConfigurationNotice, Boolean(message));
+  // A web cutoff fixes the subagent models to the coordinator's (and the Author stage shows them at all).
+  if (typeof renderTeamModels === "function") renderTeamModels();
   renderModelChoices();
   if (typeof renderComposerRelatedWorks === "function") renderComposerRelatedWorks();
 }
@@ -1373,6 +1391,17 @@ function updateModelSummary() {
   if (typeof renderSetupHints === "function") renderSetupHints();
 }
 
+// --- Prompts: every text the workflow sends its models -----------------------------------------------------------
+// The Prompts dialog lists the server's prompt catalog (GET /prompt-catalog: its groups in order, and per text its
+// name, group, label, when it is used, its placeholders, its current default and whether it may be empty) in a
+// searchable list of collapsible groups beside one text's editor. From New problem any text can be edited for the
+// next job: an edit is a promptOverrides entry by its name, checked on Apply as the server checks it (POST
+// /prompt-catalog/check; the rules below first, which are all an older server without that check has). An open job
+// shows the texts it runs with (state.promptSet, saved when it started), read-only; a job from before that shows the
+// role prompts it saved. A server without the catalog (an older one) offers the six role prompts, as before.
+
+// The six per-job role prompts as an older server lists them (state.workflow.settings.prompts): their names and
+// what they are for, for the dialog without a catalog.
 const promptLabels = {
   review: "Reviewer prompt", author: "Author prompt", coordinator: "Coordinator prompt",
   critic: "Critic prompt", convention: "Convention critic prompt", final: "Final writer prompt",
@@ -1391,62 +1420,57 @@ const promptHelp = {
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
-// Whether the New problem form starts an author coordinator, whose Coordinator prompt is then shown and checked:
-// the Author stage on, Author subagents a whole number of 1 or more, and a server that has the coordinator prompt
-// (an older one lists no default for it and would refuse the edit).
-function coordinatorPromptInUse(stages = selectedWorkflowStages()) {
-  const value = String(ui.authorSubagents?.value ?? "").trim();
-  const count = value === "" ? NaN : Number(value);
-  return stages.author === true && Number.isInteger(count) && count >= 1
-    && typeof state.workflow?.settings?.prompts?.coordinator === "string";
+// The dialog's catalog (the server's, or the six role prompts of an older server: full false), whether it shows a
+// job's texts (readOnly), the groups shown open, the search and the narrow screen's view.
+function promptStore() {
+  return (promptStore.value ||= { catalog: [], groups: [], full: false, readOnly: false, open: new Set(), query: "",
+    checking: false, note: "" });
 }
 
-function showCoordinatorPromptTab(stages = selectedWorkflowStages()) {
-  if (ui.coordinatorPromptTab) show(ui.coordinatorPromptTab, coordinatorPromptInUse(stages));
+// The six role prompts as catalog entries (an older server's defaults, or the role prompts a job saved).
+function legacyPromptCatalog(texts = state.workflow?.settings?.prompts || {}) {
+  const groups = { review: "Statement review", author: "Author", coordinator: "Coordinator", critic: "Critic",
+    convention: "Critic", final: "Writer" };
+  const placeholders = { review: [], author: ["[STATEMENT]"], coordinator: ["[STATEMENT]", "{author_subagents}"],
+    critic: ["{count}"], convention: ["{statement}", "{instructions}"], final: [] };
+  return Object.keys(promptLabels).filter((name) => typeof texts[name] === "string").map((name) => ({
+    name, group: groups[name], label: promptLabels[name], when: promptHelp[name], placeholders: placeholders[name],
+    text: texts[name], emptyAllowed: false }));
 }
 
-function syncPrompts(source = state) {
-  const defaults = source.workflow?.settings?.prompts || {};
-  promptOverrides = {};
-  promptValues = Object.fromEntries(Object.keys(promptLabels).map((name) => [
-    name, savedPrompt(source, name) || defaults[name] || "",
-  ]));
+// A catalog as the page keeps it: entries with a name, in the server's order (an entry it cannot read is left out).
+function adoptPromptCatalog(answer) {
+  const entries = (Array.isArray(answer?.prompts) ? answer.prompts : []).filter((entry) => entry
+    && typeof entry.name === "string" && entry.name && typeof entry.text === "string").map((entry) => ({
+    name: entry.name, group: String(entry.group || "Other"), label: String(entry.label || entry.name),
+    when: String(entry.when || ""), text: entry.text, emptyAllowed: entry.emptyAllowed === true,
+    placeholders: Array.isArray(entry.placeholders) ? entry.placeholders.map(String) : [] }));
+  const groups = Array.isArray(answer?.groups) ? answer.groups.map(String) : [];
+  for (const entry of entries) if (!groups.includes(entry.group)) groups.push(entry.group);
+  return { catalog: entries, groups: groups.filter((group) => entries.some((entry) => entry.group === group)) };
 }
 
-function savedPrompt(source, name) {
-  if (!source.runId) return "";
-  return source[`${name}Prompt`];
-}
-
-function updatePromptHelp() {
-  const defaults = state.workflow?.settings?.prompts || {};
-  const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
-  ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
-    + (isDefault ? "current default" : "this job's prompt");
-  ui.promptEditorHelp.textContent = (isDefault ? "" :
-    "This overrides the default for this job only. ")
-    + promptHelp[activePrompt]
-    // A coordinator job's author follows the Author prompt only when its model has no subagent tool.
-    + (activePrompt === "author" && coordinatorPromptInUse() ? " With Author subagents 1 or more the author "
-      + "coordinator follows the Coordinator prompt instead; this one is used when the author's model has no "
-      + "subagent tool." : "")
-    + " New jobs load defaults from the workflow files; browser edits are not remembered.";
-}
-
-function selectPrompt(name) {
-  if (ui.promptDialog.open && promptDrafts[activePrompt] !== undefined) {
-    promptDrafts[activePrompt] = ui.promptEditor.value;
+// Read the catalog again (the workflow files may have changed since): true with the server's, false when the server
+// has none (an older one: the six role prompts then, from /state), null when the page moved on meanwhile.
+async function loadPromptCatalog() {
+  const job = currentJob, batch = currentBatch, store = promptStore();
+  let answer = null;
+  try {
+    answer = await request("/prompt-catalog");
+  } catch (error) {
+    if (error.status !== 404) throw error;
   }
-  activePrompt = name;
-  ui.promptEditor.value = promptDrafts[name] || "";
-  show(ui.promptError, false);
-  updatePromptHelp();
-  for (const tab of ui.promptTabs.querySelectorAll(".prompt-tab")) {
-    const selected = tab.dataset.prompt === name;
-    tab.classList.toggle("active", selected);
-    tab.setAttribute("aria-selected", String(selected));
-    tab.tabIndex = selected ? 0 : -1;
+  if (job !== currentJob || batch !== currentBatch) return null;
+  if (answer) {
+    Object.assign(store, adoptPromptCatalog(answer), { full: true });
+    return true;
   }
+  const defaults = await currentPromptDefaults();
+  if (!defaults) return null;
+  store.catalog = legacyPromptCatalog(defaults);
+  store.groups = [...new Set(store.catalog.map((entry) => entry.group))];
+  store.full = false;
+  return false;
 }
 
 async function currentPromptDefaults() {
@@ -1458,52 +1482,329 @@ async function currentPromptDefaults() {
   return state.workflow.settings.prompts;
 }
 
-async function openPromptEditor() {
+function promptEntry(name) {
+  return promptStore().catalog.find((entry) => entry.name === name) || null;
+}
+
+// The names a form or a job has texts for: the catalog's, else the six role prompts.
+function promptNames() {
+  const catalog = promptStore().catalog;
+  return catalog.length ? catalog.map((entry) => entry.name) : Object.keys(promptLabels);
+}
+
+// A text's default: the catalog's, or (a server without one) the role prompt /state lists now.
+function promptDefault(name) {
+  const roles = state.workflow?.settings?.prompts || {};
+  const entry = promptEntry(name);
+  return entry && (promptStore().full || typeof roles[name] !== "string") ? entry.text : roles[name] || "";
+}
+
+// The text a job saved (its promptSet, else an older job's role prompt), or "" for the form of a new problem.
+function savedPrompt(source, name) {
+  if (!source.runId) return "";
+  const set = source.promptSet;
+  return set && typeof set === "object" && typeof set[name] === "string" ? set[name] : source[`${name}Prompt`];
+}
+
+// What a text is without an edit on this form: the job's own (a job sent back to the form), else the default.
+function promptBaseline(name, source = state) {
+  const saved = savedPrompt(source, name);
+  return typeof saved === "string" && (saved || promptEntry(name)?.emptyAllowed) ? saved : promptDefault(name);
+}
+
+function syncPrompts(source = state) {
+  promptOverrides = {};
+  promptValues = Object.fromEntries(promptNames().map((name) => [name, promptBaseline(name, source) || ""]));
+  if (typeof renderPromptSetting === "function") renderPromptSetting();
+}
+
+// A template's fields as Python's str.format reads them ({{ and }} are braces), or null when a brace is unpaired.
+function promptTemplateFields(text) {
+  const fields = [];
+  for (let index = 0; index < text.length;) {
+    const char = text[index];
+    if ((char === "{" || char === "}") && text[index + 1] === char) {
+      index += 2;
+    } else if (char === "{") {
+      const end = text.indexOf("}", index + 1);
+      if (end < 0 || text.slice(index + 1, end).includes("{")) return null;
+      fields.push(text.slice(index + 1, end));
+      index = end + 1;
+    } else if (char === "}") {
+      return null;
+    } else {
+      index += 1;
+    }
+  }
+  return fields;
+}
+
+// Why one text cannot be used, or "": as the runner reads it. An empty text only where the catalog allows it; the
+// statement marker exactly once where the text has it; a template (a text with {placeholders}) only its own
+// fields, without conversions or formats, and any other brace written twice. A text without placeholders is sent
+// as it is written, braces included.
+function promptTextProblem(entry, text) {
+  if (!String(text).trim()) {
+    if (entry.emptyAllowed) return "";
+    return promptLabels[entry.name] ? "Every role prompt must contain instructions."
+      : "This text cannot be empty: write it, or reset it to the default.";
+  }
+  if (entry.placeholders.includes("[STATEMENT]") && (String(text).match(/\[STATEMENT\]/g) || []).length !== 1) {
+    const name = { author: "The author prompt", coordinator: "The coordinator prompt" }[entry.name] || "This text";
+    return `${name} must contain exactly one [STATEMENT].`;
+  }
+  const allowed = entry.placeholders.filter((field) => /^\{[^{}]+\}$/.test(field)).map((field) => field.slice(1, -1));
+  if (!allowed.length) return "";
+  const roots = new Set(allowed.map((field) => field.split(".")[0]));
+  const fields = promptTemplateFields(String(text));
+  const valid = fields && fields.every((field) => {
+    const names = field.split(".");
+    return names.every((part) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(part)) && roots.has(names[0]);
+  });
+  if (valid) return "";
+  if (entry.name === "convention") {
+    return "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.";
+  }
+  if (entry.name === "coordinator") {
+    return "Write {author_subagents} where the number of author subagents goes, and write any other brace twice: "
+      + "{{ and }}.";
+  }
+  const listed = allowed.map((field) => `{${field}}`);
+  const names = listed.length > 1 ? `${listed.slice(0, -1).join(", ")} and ${listed.at(-1)}` : listed[0];
+  return `Use only ${names} as placeholders, and write any other brace twice: {{ and }}.`;
+}
+
+// The edits on the form after the dialog's drafts: every text that differs from what it would be without an edit
+// (whitespace at its ends aside). A text left untouched since the dialog opened keeps what it was, even when its
+// default changed meanwhile.
+function promptEditsFromDrafts() {
+  const edits = { ...promptOverrides };
+  for (const [name, draft] of Object.entries(promptDrafts)) {
+    if (draft === promptOriginals[name]) continue;
+    if (String(draft).trim() === String(promptBaseline(name) || "").trim()) delete edits[name];
+    else edits[name] = String(draft);
+  }
+  return edits;
+}
+
+// The first edited text that cannot be used, in the list's order, as [name, explanation], or null.
+function promptProblem() {
+  const edits = promptEditsFromDrafts();
+  for (const name of promptNames()) {
+    if (!(name in edits)) continue;
+    const problem = promptTextProblem(promptEntry(name) || legacyPromptCatalog({ [name]: "" })[0]
+      || { name, label: name, placeholders: [] }, edits[name]);
+    if (problem) return [name, problem];
+  }
+  return null;
+}
+
+// Each text's state: "default", "edited" (an edit for the next job) or, for a job's texts, "job".
+function promptState(name) {
+  if (promptStore().readOnly) {
+    return String(promptDrafts[name] ?? "").trim() === String(promptDefault(name)).trim() ? "default" : "job";
+  }
+  return String(promptDrafts[name] ?? "").trim() === String(promptBaseline(name) || "").trim() ? "default" : "edited";
+}
+
+function promptMatches(entry, query) {
+  if (!query) return true;
+  const text = String(promptDrafts[entry.name] ?? entry.text);
+  return [entry.label, entry.name, entry.group, entry.when, text].some((part) => part.toLowerCase().includes(query));
+}
+
+// The list: one collapsible group per catalog group (open while it holds the shown text or a search matches),
+// each text a button with its state.
+function renderPromptList() {
+  const store = promptStore(), list = ui.promptList;
+  if (!list) return;
+  const query = store.query.trim().toLowerCase();
+  const focused = list.contains?.(document.activeElement) ? document.activeElement.dataset?.prompt
+    || `group:${document.activeElement.dataset?.group}` : "";
+  const sections = [];
+  store.groups.forEach((group, index) => {
+    const entries = store.catalog.filter((entry) => entry.group === group && promptMatches(entry, query));
+    if (!entries.length) return;
+    const open = Boolean(query) || store.open.has(group);
+    const section = document.createElement("section");
+    section.className = "prompt-group";
+    section.dataset.group = group;
+    const heading = document.createElement("h3");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "prompt-group-toggle";
+    toggle.dataset.group = group;
+    toggle.tabIndex = -1;
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.setAttribute("aria-controls", `promptGroup${index}`);
+    const name = document.createElement("span");
+    name.className = "prompt-group-name";
+    name.textContent = group;
+    const edited = entries.filter((entry) => promptState(entry.name) !== "default").length;
+    const count = document.createElement("span");
+    count.className = "prompt-group-count";
+    count.textContent = edited ? `${edited} of ${entries.length} ${store.readOnly ? "changed" : "edited"}`
+      : String(entries.length);
+    toggle.append(name, count);
+    heading.append(toggle);
+    const items = document.createElement("ul");
+    items.className = "prompt-items";
+    items.id = `promptGroup${index}`;
+    items.hidden = !open;
+    for (const entry of entries) {
+      const item = document.createElement("li"), button = document.createElement("button");
+      button.type = "button";
+      button.className = "prompt-item";
+      button.dataset.prompt = entry.name;
+      const current = entry.name === activePrompt;
+      button.setAttribute("aria-current", String(current));
+      button.tabIndex = current && open ? 0 : -1;
+      const label = document.createElement("span");
+      label.className = "prompt-item-label";
+      label.textContent = entry.label;
+      button.append(label);
+      const mark = promptState(entry.name);
+      if (mark !== "default") {
+        const chip = document.createElement("span");
+        chip.className = "prompt-item-mark";
+        chip.dataset.state = mark;
+        chip.textContent = mark === "job" ? "changed" : "edited";
+        button.append(chip);
+      }
+      item.append(button);
+      items.append(item);
+    }
+    section.append(heading, items);
+    sections.push(section);
+  });
+  list.replaceChildren(...sections);
+  // The list is one stop in the tab order (the shown text, else its group, else the first group); the arrow keys
+  // move inside it (see promptListKey).
+  const buttons = [...list.querySelectorAll("button")];
+  const group = promptEntry(activePrompt)?.group;
+  if (!buttons.some((button) => button.tabIndex === 0)) {
+    const stop = buttons.find((button) => button.dataset.group === group && !button.dataset.prompt) || buttons[0];
+    if (stop) stop.tabIndex = 0;
+  }
+  const empty = !sections.length;
+  ui.promptSearchEmpty.textContent = empty ? `No text matches “${store.query.trim()}”.` : "";
+  show(ui.promptSearchEmpty, empty);
+  if (focused) {
+    const target = buttons.find((button) => button.dataset.prompt === focused || `group:${button.dataset.group}` === focused);
+    target?.focus();
+  }
+}
+
+// The shown text's heading, state, use, placeholders and rules, and the count of edits under the list.
+function updatePromptHelp() {
+  const store = promptStore();
+  const entry = promptEntry(activePrompt) || { name: activePrompt, label: promptLabels[activePrompt] || activePrompt,
+    group: "", when: promptHelp[activePrompt] || "", placeholders: [], emptyAllowed: false };
+  const mark = promptState(activePrompt);
+  ui.promptEditorGroup.textContent = entry.group;
+  ui.promptEditorLabel.textContent = entry.label;
+  ui.promptEditorName.textContent = entry.name;
+  ui.promptEditorState.dataset.state = mark;
+  ui.promptEditorState.textContent = store.readOnly
+    ? (mark === "job" ? "This job's text · differs from today's default" : "This job's text · today's default")
+    : mark === "edited" ? "Edited for the next job" : "Default";
+  ui.promptEditorWhen.textContent = entry.when || "Not described by this server.";
+  const fields = entry.placeholders;
+  ui.promptEditorFields.replaceChildren(...(fields.length ? fields.map((field) => {
+    const code = document.createElement("code");
+    code.textContent = field;
+    return code;
+  }) : ["None: the text is sent as written, braces included."]));
+  const template = fields.some((field) => /^\{[^{}]+\}$/.test(field));
+  ui.promptEditorHelp.textContent = [
+    fields.includes("[STATEMENT]") ? "Keep exactly one [STATEMENT]: the workflow puts the statement there." : "",
+    template ? "Write the placeholders as listed; write any other brace twice: {{ and }}." : "",
+    entry.emptyAllowed ? "Leave it empty to use the program's own text." : "",
+    store.readOnly ? "Read-only: a job keeps the texts it started with."
+      : "An edit applies to the next job you start from this form; new problems start from the workflow files' "
+        + "texts again.",
+  ].filter(Boolean).join(" ");
+  const edits = Object.keys(promptEditsFromDrafts()).length;
+  ui.promptEditCount.textContent = store.readOnly ? "Read-only: the texts this job runs with."
+    : edits ? `${edits} text${edits === 1 ? "" : "s"} edited for the next job` : "No text edited: the next job uses the defaults.";
+}
+
+function selectPrompt(name) {
+  const store = promptStore();
+  if (ui.promptDialog.open && promptDrafts[activePrompt] !== undefined && !store.readOnly) {
+    promptDrafts[activePrompt] = ui.promptEditor.value;
+  }
+  activePrompt = name;
+  const entry = promptEntry(name);
+  if (entry) store.open.add(entry.group);
+  ui.promptEditor.value = promptDrafts[name] ?? "";
+  ui.promptEditor.readOnly = store.readOnly;
+  show(ui.promptError, false);
+  ui.promptDialog.dataset.view = "text";
+  updatePromptHelp();
+  renderPromptList();
+}
+
+// Open the dialog: from New problem, editable (the texts with this form's edits); for an open job (``job``), its
+// texts read-only.
+async function openPromptEditor({ job = false } = {}) {
+  const store = promptStore();
   try {
-    const defaults = await currentPromptDefaults();
-    if (!defaults) return;
-    if (!currentJob) promptValues = { ...defaults, ...promptOverrides };
-    else if (!promptValues.review) syncPrompts();
-    promptDrafts = { ...promptValues };
-    promptOriginals = { ...promptValues };
-    const stages = selectedWorkflowStages();
-    activePrompt = ["review", "author", "critic", "writing"].find((name) => stages[name]) || "review";
-    if (activePrompt === "writing") activePrompt = "final";
-    selectPrompt(activePrompt);
+    const full = await loadPromptCatalog();
+    if (full === null) return;
+    store.readOnly = job;
+    store.query = "";
+    if (ui.promptSearch) ui.promptSearch.value = "";
+    let note = "";
+    if (job) {
+      // The job's own texts, each described by the catalog: every text it saved (one the catalog no longer lists
+      // shows under Other), or for a job from before every text was saved, the role prompts it saved.
+      const set = state.promptSet && typeof state.promptSet === "object" ? state.promptSet : null;
+      const saved = set ? Object.keys(set).filter((name) => typeof set[name] === "string")
+        : Object.keys(promptLabels).filter((name) => typeof state[`${name}Prompt`] === "string");
+      const roles = legacyPromptCatalog(Object.fromEntries(saved.map((name) => [name, ""])));
+      const order = promptNames();
+      store.catalog = saved.sort((a, b) => (order.includes(a) ? order.indexOf(a) : order.length)
+        - (order.includes(b) ? order.indexOf(b) : order.length)).map((name) => ({ ...(promptEntry(name)
+        || roles.find((entry) => entry.name === name) || { name, group: "Other", label: name, when: "",
+          placeholders: [], emptyAllowed: true }), text: promptDefault(name) }));
+      store.groups = [...new Set([...store.groups, ...store.catalog.map((entry) => entry.group)])]
+        .filter((group) => store.catalog.some((entry) => entry.group === group));
+      if (!set) {
+        note = "This job started before TCS Prover saved every text with its job: these are the role prompts it "
+          + "saved. Its other texts came from the workflow files each time it started or resumed.";
+      }
+      promptDrafts = Object.fromEntries(store.catalog.map((entry) => [entry.name, String(savedPrompt(state, entry.name))]));
+    } else {
+      promptDrafts = Object.fromEntries(store.catalog.map((entry) => [entry.name,
+        promptOverrides[entry.name] ?? promptBaseline(entry.name) ?? ""]));
+    }
+    promptOriginals = { ...promptDrafts };
+    store.note = note;
+    ui.promptDialogNote.textContent = note;
+    show(ui.promptDialogNote, Boolean(note));
+    ui.promptDialogEyebrow.textContent = job ? "Read-only" : "Advanced";
+    ui.promptDialogTitle.textContent = job ? "This job's prompts" : "Edit prompts";
+    ui.promptDialogLede.textContent = job
+      ? "The texts this job runs with, saved when it started, by where they are used. Edit the texts for a new "
+        + "problem from New problem → Advanced settings → Edit prompts."
+      : "Every text the next job sends its models, by where it is used. Edits apply to the next job you start from "
+        + "this form.";
+    show(ui.resetPrompt, !job);
+    show(ui.savePrompts, !job);
+    // The first stage's own text (the job's: its first one), its group open, and every group with an edit.
+    const stages = job ? workflowStagesFor(state) : selectedWorkflowStages();
+    const preferred = ["review", "author", "critic", "final"].find((name) => promptEntry(name)
+      && stages[{ final: "writing" }[name] || name]) || store.catalog[0]?.name || "review";
+    store.open = new Set(store.catalog.filter((entry) => promptState(entry.name) !== "default")
+      .map((entry) => entry.group));
+    selectPrompt(preferred);
+    ui.promptDialog.dataset.view = "list";
     ui.promptDialog.showModal();
   } catch (error) {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   }
-}
-
-// The first draft that cannot be applied, as [role, explanation].
-function promptProblem() {
-  const stages = selectedWorkflowStages();
-  const stage = { final: "writing", convention: "critic" };
-  // The coordinator's prompt counts while the form starts an author coordinator (see coordinatorPromptInUse).
-  const coordinator = coordinatorPromptInUse(stages);
-  const enabled = ["review", "author", "coordinator", "critic", "convention", "final"]
-    .filter((name) => (name === "coordinator" ? coordinator : stages[stage[name] || name]));
-  const empty = enabled.find((name) => !promptDrafts[name]?.trim());
-  if (empty) return [empty, "Every role prompt must contain instructions."];
-  // Like the workflow's templates: the named fields ({statement} or {instructions}; {author_subagents}) and
-  // doubled braces only.
-  const fields = (text) => String(text || "").replace(/\{\{|\}\}/g, "").match(/\{[^{}]*\}|[{}]/g) || [];
-  if (stages.critic && fields(promptDrafts.convention).some((field) => !["{statement}", "{instructions}"].includes(field))) {
-    return ["convention", "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}."];
-  }
-  if (stages.author && (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length !== 1) {
-    return ["author", "The author prompt must contain exactly one [STATEMENT]."];
-  }
-  if (coordinator && (promptDrafts.coordinator.match(/\[STATEMENT\]/g) || []).length !== 1) {
-    return ["coordinator", "The coordinator prompt must contain exactly one [STATEMENT]."];
-  }
-  if (coordinator && fields(promptDrafts.coordinator).some((field) => field !== "{author_subagents}")) {
-    return ["coordinator", "Write {author_subagents} where the number of author subagents goes, and write any other "
-      + "brace twice: {{ and }}."];
-  }
-  return null;
 }
 
 // The dialog is modal, so its own errors appear inside it, next to the prompt to fix.
@@ -1512,30 +1813,116 @@ function showPromptError(message) {
   show(ui.promptError, true);
 }
 
-function savePrompts() {
+function showPromptProblem(name, message) {
+  if (promptEntry(name)) selectPrompt(name);
+  showPromptError(message);
+  ui.promptEditor.focus();
+}
+
+// Apply: check every edited text (here, then as the server does), then keep the edits for the next job.
+async function savePrompts() {
+  const store = promptStore();
+  if (store.readOnly) {
+    ui.promptDialog.close();
+    return;
+  }
+  if (store.checking) return;
   promptDrafts[activePrompt] = ui.promptEditor.value;
   const problem = promptProblem();
   if (problem) {
-    const [role, message] = problem;
-    selectPrompt(role);
-    showPromptError(message);
-    ui.promptEditor.focus();
+    showPromptProblem(...problem);
     return;
   }
-  promptValues = Object.fromEntries(
-    Object.entries(promptDrafts).map(([name, prompt]) => [name, prompt.trim()])
-  );
-  const defaults = state.workflow?.settings?.prompts || {};
-  // Send only deliberate edits. Unedited roles are resolved on the server at launch.
-  for (const [name, prompt] of Object.entries(promptValues)) {
-    if (prompt === (promptOriginals[name] || "").trim()) continue;
-    const baseline = (
-      savedPrompt(state, name) || defaults[name] || ""
-    ).trim();
-    if (prompt === baseline) delete promptOverrides[name];
-    else promptOverrides[name] = prompt;
+  const edits = promptEditsFromDrafts();
+  // The server's own check (an older server has none: the checks above are its rules).
+  if (store.full && Object.keys(edits).length) {
+    store.checking = true;
+    ui.savePrompts.disabled = true;
+    try {
+      const errors = (await request("/prompt-catalog/check", { promptOverrides: edits }))?.errors || {};
+      const name = promptNames().find((item) => errors[item]) || Object.keys(errors)[0];
+      if (name) {
+        showPromptProblem(name, String(errors[name]));
+        return;
+      }
+    } catch (error) {
+      if (error.status !== 404) {
+        showPromptError(`The texts could not be checked: ${error.message}`);
+        return;
+      }
+    } finally {
+      store.checking = false;
+      ui.savePrompts.disabled = false;
+    }
   }
+  promptOverrides = edits;
+  promptValues = Object.fromEntries(promptNames().map((name) => [name, edits[name] ?? promptBaseline(name) ?? ""]));
+  if (typeof renderPromptSetting === "function") renderPromptSetting();
   ui.promptDialog.close();
+}
+
+// The form's line under Prompts: how many texts the next job runs edited.
+function renderPromptSetting() {
+  const count = Object.keys(promptOverrides).length;
+  if (!ui.promptSettingText) return;
+  ui.promptSettingText.textContent = count
+    ? `${count} text${count === 1 ? "" : "s"} edited for the next job; the others are the workflow files' defaults`
+    : "Every text the workflow sends its models, including the goal loop and the team's; edits apply to the next job";
+}
+
+// The list's keys: Up and Down move between the visible groups and texts, Home and End to the first and the last,
+// Right opens a closed group and Left closes an open one (or goes to the group of a text).
+function promptListKey(event) {
+  const buttons = [...ui.promptList.querySelectorAll("button")].filter((button) => !button.closest("ul")?.hidden);
+  const index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  const current = buttons[index], group = current.dataset.group || promptEntry(current.dataset.prompt)?.group;
+  const store = promptStore();
+  let target = null;
+  if (event.key === "ArrowDown") target = buttons[Math.min(index + 1, buttons.length - 1)];
+  else if (event.key === "ArrowUp") target = buttons[Math.max(index - 1, 0)];
+  else if (event.key === "Home") target = buttons[0];
+  else if (event.key === "End") target = buttons.at(-1);
+  else if (event.key === "ArrowRight" && current.dataset.group && !store.open.has(group) && !store.query) {
+    store.open.add(group);
+    renderPromptList();
+  } else if (event.key === "ArrowLeft" && !store.query) {
+    if (current.dataset.prompt) target = buttons.find((button) => button.dataset.group === group && !button.dataset.prompt);
+    else if (store.open.has(group)) {
+      store.open.delete(group);
+      renderPromptList();
+    }
+  } else return;
+  event.preventDefault();
+  if (target) {
+    for (const button of buttons) button.tabIndex = button === target ? 0 : -1;
+    target.focus();
+  }
+}
+
+function promptListClick(event) {
+  const button = event.target.closest?.("button");
+  if (!button) return;
+  const store = promptStore();
+  if (button.dataset.prompt) {
+    selectPrompt(button.dataset.prompt);
+    // On a narrow screen the text takes the list's place: its editor takes the focus.
+    if (ui.promptDialog.dataset.view === "text" && window.matchMedia?.("(max-width: 720px)").matches) {
+      ui.promptEditor.focus();
+    } else {
+      ui.promptList.querySelector(`button[data-prompt="${CSS.escape(button.dataset.prompt)}"]`)?.focus();
+    }
+  } else if (button.dataset.group && !store.query) {
+    if (store.open.has(button.dataset.group)) store.open.delete(button.dataset.group);
+    else store.open.add(button.dataset.group);
+    renderPromptList();
+    ui.promptList.querySelector(`button.prompt-group-toggle[data-group="${CSS.escape(button.dataset.group)}"]`)?.focus();
+  }
+}
+
+// An open job's texts, read-only (Run settings → View this job's prompts).
+function openJobPrompts() {
+  return openPromptEditor({ job: true });
 }
 
 function clockText(date) {
@@ -1607,14 +1994,21 @@ function describe(entry) {
   const item = params.item || event.item || {};
   const activityLabel = entry.activityLabel || "";
   const rawItemId = params.itemId || item.id || "";
-  const itemId = activityLabel && rawItemId
-    ? `${activityLabel}:${rawItemId}` : rawItemId;
   const root = entry.root !== false;
+  // A member of the author's team names itself by its number: "Subagent 2 reasoning". Each of its assignments is a
+  // run of its own whose item ids start again, so they are kept apart by member and assignment.
+  const member = !root && Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1
+    ? entry.subagentMember : null;
+  const scope = [activityLabel, member ? `member ${member}:${entry.subagentId ?? entry.conversationId ?? ""}` : ""]
+    .filter(Boolean).join(":");
+  const itemId = scope && rawItemId ? `${scope}:${rawItemId}` : rawItemId;
   const keyBase = itemId || `${entry.time}:${entry.kind}:${name}`;
   const text = entry.text || "";
-  const scopedLabel = (label) => activityLabel
-    ? `${activityLabel} · ${label}` : label;
-  const turnKey = `${activityLabel ? `${activityLabel}:` : ""}`
+  const scopedLabel = (label) => {
+    const named = member ? label.replace(/^Subagent\b/, `Subagent ${member}`) : label;
+    return activityLabel ? `${activityLabel} · ${named}` : named;
+  };
+  const turnKey = `${scope ? `${scope}:` : ""}`
     + `${params.turn?.id || event.turn_id || entry.time}`;
   // A root message is labelled by who wrote it: the author, else the call's own label (one of
   // the independent critics, their coordinator) or the role of its stage.
@@ -1676,6 +2070,20 @@ function describe(entry) {
   // The author coordinator's own records: its subagents, its time checks, a reply that named no proof file.
   const coordinatorCard = entry.kind === "status" ? authorCoordinatorCard(entry) : null;
   if (coordinatorCard) return coordinatorCard;
+  // The author's update_goal call in TCS Prover's goal loop (a "Goal status" record): the status it reported, its
+  // note, and what TCS Prover does next. Each call keeps its own row.
+  if (entry.kind === "status" && entry.label === "Goal status" && typeof entry.goalStatus === "string") {
+    const status = entry.goalStatus.trim() || "updated";
+    const note = String(entry.note ?? "").trim();
+    const next = status === "complete" ? "TCS Prover takes the author's last message of this turn as its final answer."
+      : ["blocked", "paused"].includes(status)
+        ? `TCS Prover does not stop for a ${status} goal: it records it and sends the continuation.` : "";
+    return {
+      key: `goal-status:${entry.time}:${status}`, type: "status", label: `Goal status · ${status}`,
+      text: [note ? `Note: ${note}` : "", next].filter(Boolean).join("\n") || text || "The author updated its goal.",
+      time: entry.time, replace: true,
+    };
+  }
   if (entry.kind === "status") {
     // A status replaces the previous one of its label, except the progress of the critic's independent
     // critics: every attempt keeps its "N independent critics requested" and "Independent critic i" rows
@@ -1765,7 +2173,8 @@ function describe(entry) {
     "dynamicToolCall", "webSearch", "web_search",
   ]);
   if (toolTypes.has(item.type)) {
-    const action = item.tool || item.name || item.command || item.type;
+    // TCS Prover's own tools (its MCP server "tcs") by their names: Claude Code calls them mcp__tcs__<name>.
+    const action = String(item.tool || item.name || item.command || item.type).replace(/^mcp__tcs__/, "");
     const status = item.status || (name.includes("completed") ? "completed" : "started");
     return {
       key: `tool:${itemId || keyBase}`, type: "tool",
@@ -1815,10 +2224,17 @@ function authorCoordinatorCard(entry) {
     const task = String(entry.subagentTask ?? "").trim();
     const running = Number.isInteger(entry.subagentsRunning) && entry.subagentsRunning >= 0
       ? `${entry.subagentsRunning || "none"} running` : "";
-    const line = [status === "failed" && text !== task ? text : "", task || (id ? `Subagent ${id}` : ""), running]
-      .filter(Boolean).join(" · ");
+    // A member of TCS Prover's team: its number and model ("Author subagent 2 (Claude Opus 5.5) started").
+    const member = Number.isInteger(entry.subagentMember) && entry.subagentMember >= 1 ? entry.subagentMember : null;
+    const model = String(entry.subagentModel ?? "").trim();
+    const who = [member ? `Author subagent ${member}` : "Author subagent", model ? `(${model})` : ""]
+      .filter(Boolean).join(" ");
+    const report = status !== "started" && String(entry.subagentReport ?? "").trim()
+      ? `report: ${String(entry.subagentReport).trim()}` : "";
+    const line = [status === "failed" && text !== task ? text : "",
+      task || (id && !member ? `Subagent ${id}` : ""), running, report].filter(Boolean).join(" · ");
     return {
-      key: `author-subagent:${id}:${status}:${entry.time}`, type: "status", label: `Author subagent ${status}`,
+      key: `author-subagent:${member ?? ""}:${id}:${status}:${entry.time}`, type: "status", label: `${who} ${status}`,
       text: line || text || "No details were recorded.", time: entry.time, replace: true, pinned: true,
     };
   }
@@ -2389,6 +2805,33 @@ function jobSettingsWarning() {
   return [warning, ...missing].filter(Boolean).join(" ");
 }
 
+// The job's author subagents' models for Run settings: a list of names (each subagent's model chosen), null (all
+// run the coordinator's model), or undefined for a job without TCS Prover's team (authorTeam null: its author works
+// alone, or its subagents are the CLI's own: a job from before the team, or a web-cutoff job). The server's
+// authorTeam names each member's model as the job recorded it ("API connection …" programs get "(API)").
+function jobTeamLabels(job = state) {
+  if (!Array.isArray(job.authorTeam) || !job.authorTeam.length) return undefined;
+  if (!Array.isArray(job.authorSubagentModels) || !job.authorSubagentModels.length) return null;
+  return job.authorSubagentModels.map((item, index) => {
+    const member = job.authorTeam.find((entry) => Number(entry?.member) === index + 1) || {};
+    const api = Boolean(member.connection) || /^API connection/.test(String(member.program || ""))
+      || String(item?.model).startsWith("api:");
+    const name = member.modelLabel || teamModelLabel(item?.model || "");
+    return api && !/\(API\)$/.test(name) ? `${name} (API)` : name;
+  });
+}
+
+function jobTeamText(job = state) {
+  const count = Number.isInteger(job.authorSubagents) ? job.authorSubagents : job.authorTeam.length;
+  return teamText(count, jobTeamLabels(job));
+}
+
+// The job's goal loop in Run settings.
+function jobGoalLoopText(job = state) {
+  return job.goalLoop === "codex" ? "Codex built-in (the Codex CLI's own goal mode)"
+    : "TCS Prover (editable texts; this job runs with the texts saved when it started)";
+}
+
 function renderRunOverview() {
   show(ui.runOverview, state.phase !== "input");
   if (state.phase === "input") return;
@@ -2533,9 +2976,14 @@ function renderRunOverview() {
         : state.authorMode === "coordinator" && state.authorModeEffective?.mode === "author"
           ? ` · works alone: ${state.authorModeEffective.modelLabel || "its model"} has no subagent tool (coordinator `
             + "mode needs one)"
+        // A coordinator with TCS Prover's team names each subagent's model, or says they all run its own.
+        : state.authorMode === "coordinator" && jobTeamLabels() !== undefined
+          ? ` · ${jobTeamText()}`
         : state.authorMode === "coordinator"
           ? ` · coordinator, up to ${state.authorSubagents} author subagent${state.authorSubagents === 1 ? "" : "s"} at a time`
           : ` · up to ${state.authorSubagents} subagent${state.authorSubagents === 1 ? "" : "s"} at a time`) : "Off"],
+    // How the author's turns follow one another (a job from before the setting records none).
+    ...(stages.author && ["tcs", "codex"].includes(state.goalLoop) ? [["Goal loop", jobGoalLoopText()]] : []),
     // The limit now, and every change of it and pause at it (the server's records).
     ["Author time limit", stages.author ? limitSettingText(Number(state.thinkingHours ?? 0)) : "Off"],
     ...(timeLimitHistory().length ? [["Time limit history", timeLimitHistoryLines().join("\n")]] : []),
@@ -2553,6 +3001,9 @@ function renderRunOverview() {
     ["Web search", retrievalSummary(state)],
     ["Conversation", state.goalThreadId ? "Saved · resumes in this workspace" : "Not started"],
   ];
+  // The texts the job runs with: every one (promptSet), or the role prompts a job from before saved.
+  show(ui.jobPrompts, Boolean(state.promptSet && typeof state.promptSet === "object")
+    || ["review", "author", "critic", "final"].some((name) => typeof state[`${name}Prompt`] === "string"));
   const signature = JSON.stringify(metadata);
   if (ui.runMetadata.dataset.signature !== signature) {
     ui.runMetadata.dataset.signature = signature;
@@ -3926,11 +4377,12 @@ function render(next) {
     applyComposerSettings(source);
     syncPrompts(source);
     if (seed) {
-      // The job's own prompts go with the new problem as edits of the defaults.
-      const defaults = state.workflow?.settings?.prompts || {};
+      // The job's own texts go with the new problem as edits of the defaults: every text it saved that differs from
+      // today's default (the role prompts only, for a job from before every text was saved).
       for (const [name, prompt] of Object.entries(promptValues)) {
-        if (prompt && prompt.trim() !== (defaults[name] || "").trim()) promptOverrides[name] = prompt.trim();
+        if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;
       }
+      if (typeof renderPromptSetting === "function") renderPromptSetting();
     }
     // Saved settings (see presetsFormOpened): a fresh form takes the default, when one is saved; a rerun
     // pre-fill and a job sent back to the form keep their own settings.
@@ -3963,6 +4415,10 @@ function render(next) {
     ui.criticCount.value = state.criticCount || 3;
     ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 3;
+    if (typeof applyTeamModels === "function") {
+      applyGoalLoop(state.goalLoopRecorded === false ? undefined : state.goalLoop);
+      applyTeamModels(state.authorSubagentModels);
+    }
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
     checkEdited();
@@ -4168,6 +4624,13 @@ function applyComposerSettings(source) {
   ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 3;
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
+  // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's). A job from
+  // before the setting (goalLoopRecorded false) ran Codex's goal mode without choosing it: a new job from it gets the
+  // default.
+  if (typeof applyTeamModels === "function") {
+    applyGoalLoop(source.goalLoopRecorded === false ? undefined : source.goalLoop);
+    applyTeamModels(source.authorSubagentModels);
+  }
   ui.thinkingHours.value = source.thinkingHours ?? 0;
   ui.thinkingHours.min = hours.minimum ?? 0;
   // No maximum: any positive number of hours is a valid limit.
@@ -4940,7 +5403,207 @@ function syncModelMenus() {
     }
     syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(value), value);
   }
+  // The author subagents' choices are kept the same way (an API model that is gone: GPT 6.1 Sol); their menus follow
+  // with the next renderRetrievalSettings (see renderTeamModels), which every caller runs next.
+  if (typeof teamStore === "function") {
+    teamStore().rows.forEach((choice, index) => {
+      const row = catalog.find((item) => item.id === choice.model);
+      if (!row && String(choice.model).startsWith("api:")) {
+        choice.model = "gpt-6.1-sol";
+        replaced.push(teamRole(index));
+      }
+    });
+  }
   return replaced;
+}
+
+// --- Proof author · subagent models -------------------------------------------------------------------------------
+// "5 · Subagent models": "Same as the coordinator" (every author subagent runs the coordinator's model and reasoning;
+// the job setting authorSubagentModels is null) or "Choose for each" (one row per subagent, "Subagent 1" … N, with
+// the roles' Source, Model and Reasoning menus: a list of N {model, effort}). Offered while the Author stage is on
+// with 1 or more author subagents; with a web cutoff it stays "Same as the coordinator" (the server refuses a list)
+// and its help says why. The choices live on a function property, so they exist before this part of the file has
+// run. Changing the number of subagents keeps the rows that remain and adds rows set to the coordinator's model; a
+// number still being typed only hides rows, which the field drops when it is left (its change event).
+function teamStore() {
+  return (teamStore.value ||= { mode: "same", rows: [], loop: "tcs" });
+}
+
+function teamRole(index) {
+  return `member${index + 1}`;
+}
+
+// The number in Author subagents, or null while the field holds no whole number it allows.
+function teamSize() {
+  const field = ui.authorSubagents;
+  const value = String(field?.value ?? "").trim(), count = Number(value);
+  const min = Number(field?.min || 0), max = field?.max ? Number(field.max) : 10;
+  return value !== "" && Number.isInteger(count) && count >= min && count <= max ? count : null;
+}
+
+// Why every subagent must run the coordinator's model now, or "": a web cutoff (the server's words), whose
+// coordinator keeps the CLI's own subagents.
+function teamFixedReason() {
+  return selectedRetrievalMode() === "historical" ? "With a web cutoff, author subagents use the coordinator's model." : "";
+}
+
+// The subagent models the form starts a job with: null for "Same as the coordinator" (also with the Author stage
+// off, no subagents or a web cutoff), else one {model, effort} per subagent.
+function teamModelsSetting(stages = selectedWorkflowStages()) {
+  const store = teamStore(), count = teamSize();
+  if (store.mode !== "each" || !stages.author || !(count >= 1) || teamFixedReason()) return null;
+  return teamRows(count).slice(0, count).map(({ model, effort }) => ({ model, effort }));
+}
+
+// Make the rows at least ``count`` long: new rows take the coordinator's model and reasoning as they are now. Only
+// "Choose for each" makes rows (when it shows them or a job is started); leaving the Author subagents field drops
+// the rows past its number (see its change handler).
+function teamRows(count) {
+  const store = teamStore();
+  if (!Number.isInteger(count) || count < 0) return store.rows;
+  while (store.rows.length < count) {
+    store.rows.push({ model: ui.authorModel.value || "gpt-6.1-sol", effort: ui.authorEffort.value || "max" });
+  }
+  return store.rows;
+}
+
+// A job's, a rerun's or saved settings' subagent models: a list makes "Choose for each" with its rows; anything
+// else "Same as the coordinator". The menus follow with the next renderRetrievalSettings (the callers restore the
+// workflow stages next, which runs it).
+function applyTeamModels(models) {
+  const store = teamStore();
+  const list = Array.isArray(models) ? models.filter((item) => item && typeof item.model === "string" && item.model) : [];
+  store.mode = list.length ? "each" : "same";
+  store.rows = list.map((item) => ({ model: item.model, effort: String(item.effort || "max") }));
+}
+
+// One subagent's row: its name and the three menus, labelled for screen readers (and on narrow screens, where the
+// menus stack), and the chip that says where its model runs.
+function teamRowElement(index) {
+  const role = teamRole(index), number = index + 1;
+  const row = document.createElement("div");
+  row.className = "team-model-row";
+  row.dataset.member = String(number);
+  row.setAttribute("role", "group");
+  const name = document.createElement("span");
+  name.className = "team-member-name";
+  name.id = `${role}Name`;
+  name.textContent = `Subagent ${number}`;
+  row.setAttribute("aria-labelledby", name.id);
+  row.append(name);
+  for (const [part, words] of [["Source", "1 · Source"], ["Model", "2 · Model"], ["Effort", "3 · Reasoning"]]) {
+    const label = document.createElement("label"), select = document.createElement("select");
+    select.id = `${role}${part}`;
+    label.htmlFor = select.id;
+    label.textContent = words;
+    if (part === "Effort") {
+      select.append(...[...ui.authorEffort.options].map((option) => new Option(option.textContent, option.value)));
+    }
+    if (part === "Model") select.setAttribute("aria-describedby", `${role}ModelProvider`);
+    ui[`${role}${part}`] = select;
+    row.append(label, select);
+  }
+  const chip = document.createElement("span");
+  chip.className = "provider-chip";
+  chip.id = `${role}ModelProvider`;
+  ui[`${role}ModelProvider`] = chip;
+  row.append(chip);
+  const store = teamStore();
+  const remember = () => {
+    store.rows[index] = { model: ui[`${role}Model`].value, effort: ui[`${role}Effort`].value };
+  };
+  ui[`${role}Source`].onchange = () => {
+    syncRoleModelMenu(role, ui[`${role}Source`].value);
+    syncEffortChoices(role);
+    remember();
+    renderRetrievalSettings();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  ui[`${role}Model`].onchange = () => {
+    syncEffortChoices(role);
+    remember();
+    renderRetrievalSettings();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  ui[`${role}Effort`].onchange = () => {
+    remember();
+    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
+  };
+  return row;
+}
+
+// Show "5 · Subagent models" while it applies, fixed under a web cutoff, and the rows of "Choose for each".
+function renderTeamModels() {
+  const select = ui.authorSubagentModelsMode;
+  if (!select) return;
+  renderGoalLoop();
+  const store = teamStore(), stages = selectedWorkflowStages(), count = teamSize();
+  const offered = stages.author === true && count !== null && count >= 1;
+  const fixed = teamFixedReason();
+  for (const element of [ui.authorSubagentModelsLabel, select, ui.authorSubagentModelsHelp]) show(element, offered);
+  select.disabled = Boolean(fixed);
+  select.value = fixed ? "same" : store.mode;
+  ui.authorSubagentModelsHelp.textContent = fixed
+    || (store.mode === "each" ? "Choose a model and reasoning for each author subagent below: Codex CLI, Claude Code "
+      + "or an API connection." : "Every author subagent runs the coordinator's model and reasoning.");
+  const each = offered && !fixed && store.mode === "each";
+  show(ui.authorTeamSetting, each);
+  if (!each) return;
+  teamRows(count);
+  const box = ui.authorTeamRows;
+  const shown = [...box.children];
+  while (shown.length > count) shown.pop().remove();
+  for (let index = shown.length; index < count; index += 1) box.append(teamRowElement(index));
+  for (let index = 0; index < count; index += 1) {
+    const role = teamRole(index), choice = store.rows[index];
+    const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === choice.model);
+    syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(choice.model), choice.model);
+    ui[`${role}Effort`].value = choice.effort;
+    syncEffortChoices(role);
+    choice.effort = ui[`${role}Effort`].value;
+  }
+  renderModelChoices();
+}
+
+// The rows on screen ("Subagent 1" … N while "Choose for each" shows them).
+function teamRolesShown() {
+  const count = teamSize();
+  return ui.authorTeamSetting && !ui.authorTeamSetting.hidden && count >= 1
+    ? Array.from({ length: count }, (_, index) => teamRole(index)) : [];
+}
+
+// The goal loop the form starts a job with: "tcs" (TCS Prover's loop, the default) or "codex" (the Codex CLI's
+// built-in goal mode). A web-cutoff job always runs Codex's goal mode (the server records "codex"): the form shows it
+// and keeps the choice made for when the cutoff is off again.
+function selectedGoalLoop() {
+  return teamFixedReason() ? "codex" : teamStore().loop;
+}
+
+// A job's, a rerun's or saved settings' goal loop (else TCS Prover's); the radios follow with renderTeamModels.
+function applyGoalLoop(value) {
+  teamStore().loop = value === "codex" ? "codex" : "tcs";
+}
+
+function renderGoalLoop() {
+  if (!ui.goalLoopTcs) return;
+  const fixed = Boolean(teamFixedReason()), loop = selectedGoalLoop();
+  ui.goalLoopTcs.checked = loop === "tcs";
+  ui.goalLoopCodex.checked = loop === "codex";
+  ui.goalLoopTcs.disabled = fixed;
+  if (ui.goalLoopNote) {
+    ui.goalLoopNote.textContent = fixed ? "Web-cutoff runs use Codex's goal mode." : "";
+    show(ui.goalLoopNote, fixed);
+  }
+}
+
+// The form's team for the Advanced settings summary ({text, chosen}), or null without one (no subagents, or a
+// number still being typed).
+function teamFormText() {
+  const count = teamSize();
+  if (!(count >= 1)) return null;
+  const models = teamModelsSetting();
+  const text = teamText(count, models && models.map((item) => teamModelLabel(item.model)));
+  return { text: `${text[0].toUpperCase()}${text.slice(1)}`, chosen: Boolean(models) };
 }
 
 async function refresh() {
@@ -5154,6 +5817,9 @@ function proofJobSettings() {
     criticRounds: Number(ui.criticRounds.value),
     criticCount: Number(ui.criticCount.value),
     authorSubagents: Number(ui.authorSubagents.value),
+    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop.
+    ...(typeof teamModelsSetting === "function"
+      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop() } : {}),
     thinkingHours: Number(ui.thinkingHours.value),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
@@ -5623,8 +6289,29 @@ for (const role of ["review", "author", "critic", "writer"]) {
 }
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
-// The Coordinator prompt tab is shown while Author subagents is 1 or more (see coordinatorPromptInUse).
-ui.authorSubagents.oninput = () => showCoordinatorPromptTab();
+// The subagent models show while Author subagents is 1 or more; a number still being typed only hides rows, which
+// leaving the field drops (see teamStore).
+ui.authorSubagents.oninput = () => {
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+ui.authorSubagents.onchange = () => {
+  const count = teamSize();
+  if (count !== null && teamStore().rows.length > count) teamStore().rows.length = count;
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+ui.authorSubagentModelsMode.onchange = () => {
+  teamStore().mode = ui.authorSubagentModelsMode.value === "each" ? "each" : "same";
+  renderTeamModels();
+  renderAdvancedSummary();
+};
+for (const input of [ui.goalLoopTcs, ui.goalLoopCodex]) {
+  input.onchange = () => {
+    if (input.checked) teamStore().loop = input.value === "codex" ? "codex" : "tcs";
+    renderAdvancedSummary();
+  };
+}
 ui.retrievalMode.onchange = () => {
   renderRetrievalSettings();
   updateModelSummary();
@@ -5636,36 +6323,34 @@ ui.retrievalCutoffUtc.oninput = () => {
 for (const control of [ui.workflowReview, ui.workflowAuthor, ui.workflowCritic, ui.workflowWriting]) {
   control.onchange = () => setWorkflowStages();
 }
-ui.editPrompts.onclick = openPromptEditor;
-ui.promptTabs.onclick = (event) => {
-  const tab = event.target.closest("[data-prompt]");
-  if (tab) selectPrompt(tab.dataset.prompt);
+ui.editPrompts.onclick = () => openPromptEditor();
+ui.jobPrompts.onclick = openJobPrompts;
+ui.promptList.onclick = promptListClick;
+ui.promptList.onkeydown = promptListKey;
+ui.promptSearch.oninput = () => {
+  promptStore().query = ui.promptSearch.value;
+  renderPromptList();
 };
-ui.promptTabs.onkeydown = (event) => {
-  const tabs = [...ui.promptTabs.querySelectorAll(".prompt-tab:not([hidden])")];
-  const index = tabs.indexOf(document.activeElement);
-  const next = { ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: tabs.length - 1 }[event.key];
-  if (index < 0 || next === undefined) return;
-  event.preventDefault();
-  const tab = tabs[(next + tabs.length) % tabs.length];
-  tab.focus();
-  selectPrompt(tab.dataset.prompt);
+ui.promptBack.onclick = () => {
+  ui.promptDialog.dataset.view = "list";
+  ui.promptList.querySelector(`button[data-prompt="${CSS.escape(activePrompt)}"]`)?.focus();
 };
-ui.resetPrompt.onclick = async () => {
-  try {
-    const defaults = await currentPromptDefaults();
-    if (!defaults) return;
-    promptDrafts[activePrompt] = defaults[activePrompt] || "";
-    ui.promptEditor.value = promptDrafts[activePrompt];
-    show(ui.promptError, false);
-    updatePromptHelp();
-  } catch (error) {
-    showPromptError(error.message);
-  }
-};
-ui.promptEditor.oninput = () => {
+// Reset to default: the text as the workflow files have it (the catalog read when the dialog opened).
+ui.resetPrompt.onclick = () => {
+  promptDrafts[activePrompt] = promptDefault(activePrompt);
+  ui.promptEditor.value = promptDrafts[activePrompt];
   show(ui.promptError, false);
   updatePromptHelp();
+  renderPromptList();
+};
+// Each keystroke keeps the draft, so the list and the count of edits follow it.
+ui.promptEditor.oninput = () => {
+  if (promptStore().readOnly) return;
+  const before = promptState(activePrompt);
+  promptDrafts[activePrompt] = ui.promptEditor.value;
+  show(ui.promptError, false);
+  updatePromptHelp();
+  if (promptState(activePrompt) !== before) renderPromptList();
 };
 ui.savePrompts.onclick = savePrompts;
 ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
@@ -6293,7 +6978,7 @@ const roleNames = { review: "statement reviewer", author: "proof author", critic
 // the default model." or "The statement reviewer and the proof author now use the default model." ``gone``
 // adds why: their selected model is no longer available.
 function defaultModelSentence(roles, gone = false) {
-  const names = roles.map((role) => `the ${roleNames[role] || role}`);
+  const names = roles.map((role) => `the ${roleNames[role] || role.replace(/^member(\d+)$/, "author subagent $1")}`);
   const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
   const one = roles.length === 1;
   return `${list.charAt(0).toUpperCase()}${list.slice(1)} now ${one ? "uses" : "use"} the default model`
@@ -7744,14 +8429,46 @@ function setupFormRoles() {
   const catalog = state?.workflow?.settings?.model_catalog;
   if (!(composingProblem && !currentJob && state.phase === "input" && Array.isArray(catalog))) return null;
   const stages = selectedWorkflowStages();
-  return ["review", "author", "critic", "writer"].map((role) => {
+  const entry = (role, model, on, label = "") => setupModelRow(catalog, role, model, on, label);
+  const rows = ["review", "author", "critic", "writer"].map((role) => {
     const select = ui[`${role}Model`], model = select?.value || "";
-    const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
-    const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
-    const label = row?.label || String(select?.selectedOptions?.[0]?.textContent || model).replace(/ — default$/, "");
-    return { role, on: Boolean(stages[role === "writer" ? "writing" : role]), model, modelLabel: label, program,
-      signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
+    return entry(role, model, Boolean(stages[role === "writer" ? "writing" : role]),
+      select?.selectedOptions?.[0]?.textContent);
   });
+  // Each author subagent of "Choose for each" runs its own model, so its program counts like a role's ("member2").
+  const team = typeof teamModelsSetting === "function" ? teamModelsSetting(stages) : null;
+  (team || []).forEach((choice, index) => {
+    rows.push({ ...entry(`member${index + 1}`, choice.model, true), member: index + 1 });
+  });
+  return rows;
+}
+
+// One model's row for Setup: what it is, whether its stage is on, the program that runs it (an API model's follows
+// its format) and whether that program must be signed in (a built-in model).
+function setupModelRow(catalog, role, model, on, label = "") {
+  const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
+  const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
+  return { role, on, model, modelLabel: row?.label || String(label || model).replace(/ — default$/, ""), program,
+    signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
+}
+
+// The author subagents of your default saved settings ("Choose for each"), as Setup rows: GET /setup lists the
+// default settings' roles, and the page adds their subagents (with the Author stage on and 1 or more of them).
+function setupDefaultMembers() {
+  const store = typeof presetStore === "function" ? presetStore() : null;
+  const preset = store?.presets?.find((item) => item.id === store.defaultId && !item.unusable);
+  const settings = preset?.settings || {};
+  const catalog = state?.workflow?.settings?.model_catalog;
+  if (!Array.isArray(catalog) || !settings.workflowStages?.author || !(Number(settings.authorSubagents) >= 1)
+    || !Array.isArray(settings.authorSubagentModels)) return [];
+  return settings.authorSubagentModels.map((item, index) => ({
+    ...setupModelRow(catalog, `member${index + 1}`, String(item?.model || ""), true, preset.labels?.[item?.model]),
+    member: index + 1 }));
+}
+
+// A role's name in Setup's sentences ("Proof author"), or an author subagent's ("Author subagent 2").
+function setupRoleName(row) {
+  return setupWords().roles[row.role] || (row.member ? `Author subagent ${row.member}` : String(row.role));
 }
 
 // Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your saved
@@ -7767,7 +8484,8 @@ function setupNeeds() {
   const form = setupFormRoles();
   const active = (rows) => (rows || []).filter((row) => row.on && row.program);
   const formRows = active(form);
-  const defaultRows = data?.defaults?.source === "saved" ? active(data.defaults.roles) : [];
+  const defaultRows = data?.defaults?.source === "saved"
+    ? active([...(data.defaults.roles || []), ...setupDefaultMembers()]) : [];
   const needs = {};
   for (const program of ["codex", "claude", "latex"]) {
     const uses = (rows) => program === "latex" ? rows.filter((row) => row.role === "writer")
@@ -7818,10 +8536,14 @@ function setupRoleGroups(rows) {
     if (!groups.has(row.model)) groups.set(row.model, []);
     groups.get(row.model).push(row);
   }
-  const words = setupWords();
   return [...groups.values()].map((members) => {
     const row = members[0];
-    const names = members.length === 4 ? "all four roles" : setupJoin(members.map((item) => words.roles[item.role]));
+    // The four roles, then the author subagents of the same model by number ("Author subagents 1, 3").
+    const roles = members.filter((item) => !item.member), team = members.filter((item) => item.member);
+    const subagents = team.length > 1 ? `Author subagents ${team.map((item) => item.member).join(", ")}`
+      : team.length ? setupRoleName(team[0]) : "";
+    const names = setupJoin([...(roles.length === 4 ? ["all four roles"] : roles.map(setupRoleName)),
+      ...(subagents ? [subagents] : [])]);
     return row.signIn ? `${names} (${row.modelLabel})`
       : `${names} (API connection “${row.connection || row.modelLabel}”, no sign-in needed)`;
   }).join("; ");
@@ -7925,7 +8647,7 @@ function renderSetupHints() {
   const els = setupEls();
   if (!els.modelHint && !els.startHint) return;
   const needs = setupNeeds(), words = setupWords();
-  const roleNames = (rows) => `the ${setupJoin(rows.map((row) => words.roles[row.role].toLowerCase()))
+  const roleNames = (rows) => `the ${setupJoin(rows.map((row) => setupRoleName(row).toLowerCase()))
     .replace("latex writer", "LaTeX writer")}`;
   const sentences = !needs.codex.form ? [] : setupProblems(needs).flatMap((problem) => {
     if (problem.kind === "none") return [];  // A role that uses a program gets that program's own line instead.
@@ -9004,11 +9726,23 @@ function applyPreset(preset) {
   const missing = [], roles = ["review", "author", "critic", "writer"];
   for (const role of roles) {
     const model = String(settings[`${role}Model`] || "");
-    const listed = (preset.unavailable || []).find((item) => item.role === role);
+    const listed = (preset.unavailable || []).find((item) => item.role === role && !item.member);
     const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
     if (!gone) continue;
     settings[`${role}Model`] = "gpt-6.1-sol";
     missing.push({ role, label: listed?.label || preset.labels?.[model] || model });
+  }
+  // An author subagent's removed API model the same way ("author subagent 2"): the server lists it with its member
+  // number, or the menus no longer have it.
+  if (Array.isArray(settings.authorSubagentModels)) {
+    settings.authorSubagentModels = settings.authorSubagentModels.map((item, index) => {
+      const model = String(item?.model || "");
+      const listed = (preset.unavailable || []).find((entry) => Number(entry.member) === index + 1);
+      const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
+      if (!gone) return item;
+      missing.push({ role: `member${index + 1}`, label: listed?.label || preset.labels?.[model] || model });
+      return { ...item, model: "gpt-6.1-sol" };
+    });
   }
   applyComposerSettings(settings);
   store.current = { kind: "preset", id: preset.id, name: preset.name };
@@ -9018,7 +9752,9 @@ function applyPreset(preset) {
 }
 
 function presetMissingText(missing) {
-  const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer" };
+  const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer",
+    ...Object.fromEntries(missing.filter(({ role }) => /^member\d+$/.test(role))
+      .map(({ role }) => [role, `author subagent ${role.slice(6)}`])) };
   const fallback = "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.";
   if (missing.length === 1) {
     const [{ role, label }] = missing;
@@ -9036,7 +9772,8 @@ function presetSignature() {
   return JSON.stringify([selectedWorkflowStages(),
     ...["review", "author", "critic", "writer"].flatMap((role) => [ui[`${role}Model`].value, ui[`${role}Effort`].value]),
     number(ui.authorSubagents), number(ui.criticCount), number(ui.criticRounds), number(ui.thinkingHours),
-    ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings()]);
+    ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings(),
+    ...(typeof teamModelsSetting === "function" ? [teamModelsSetting(), selectedGoalLoop()] : [])]);
 }
 
 // The settings a Save sends: a job's (proofJobSettings) without its prompts. A number field of a stage
@@ -9233,6 +9970,15 @@ function renderAdvancedSummary() {
   const box = $("advancedSummary");
   if (!box) return;
   const chips = [presetStore().summary];
+  // The author's goal loop and its team, while the Author stage is on: quiet with TCS Prover's loop and the
+  // coordinator's model for every subagent (the defaults), marked otherwise.
+  if (typeof teamFormText === "function" && ui.workflowAuthor.checked) {
+    const loop = selectedGoalLoop();
+    chips.push({ text: `Goal loop: ${loop === "codex" ? "Codex built-in" : "TCS Prover"}`,
+      tone: loop === "codex" ? "accent" : "quiet" });
+    const team = teamFormText();
+    if (team) chips.push({ text: team.text, tone: team.chosen ? "accent" : "quiet" });
+  }
   const items = typeof composerRelatedWorks === "function" ? composerRelatedWorks().items : [];
   if (items.length) {
     const failed = items.filter((item) => item.status === "failed").length;

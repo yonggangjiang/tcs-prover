@@ -31,13 +31,39 @@ PDF without TeX), or saving a file.
 
 **Run settings**, below the activity log, lists the models and settings the job
 runs with. Its **Proof author** row ends with how the author works:
-*coordinator, up to 3 author subagents at a time* for an
-[author coordinator](workflow.md#the-author-coordinator), or *works alone* with
-**Author subagents** 0. When the model of a coordinator job has no subagent tool,
-its author works alone, and the row says why: *works alone: GPT 5.6 Luna (older)
-has no subagent tool (coordinator mode needs one)*. A job from before
-coordinator mode whose author could start subagents keeps its earlier wording,
-such as *up to 2 subagents at a time*.
+
+- An [author coordinator](workflow.md#the-author-coordinator) with
+  [TCS Prover's team](workflow.md#the-authors-team) names each member's model,
+  *coordinator, 3 author subagents: GPT 6.1 Sol · Claude Opus 5.5 · Lab model
+  (API)*, or says *coordinator, 3 author subagents: same model as the
+  coordinator*.
+- A coordinator with the program's own subagents (a web-cutoff run, or a job
+  from before the team) reads *coordinator, up to 3 author subagents at a time*.
+- With **Author subagents** 0 it reads *works alone*. When the model of a
+  coordinator job without the team has no subagent tool, its author works
+  alone, and the row says why: *works alone: GPT 5.6 Luna (older) has no
+  subagent tool (coordinator mode needs one)*. A job from before coordinator
+  mode whose author could start subagents keeps its earlier wording, such as
+  *up to 2 subagents at a time*.
+
+A **Goal loop** row follows: *TCS Prover (editable texts; this job runs with the
+texts saved when it started)* or *Codex built-in (the Codex CLI's own goal mode)*,
+which jobs from before the setting and web-cutoff runs show (see
+[the goal loop](workflow.md#the-goal-loop)). **View this job's prompts**, under
+the rows, opens every text the job runs with, read-only and grouped as in **Edit
+prompts**, each marked *changed* where it differs from today's default; for a job
+from before every text was saved, the role prompts it saved, with a note.
+
+In the activity log, the coordinator's team shows as **Author subagent 2 (Claude
+Opus 5.5) started** (the member's number and model, then the first line of its
+assignment and how many members work), **… finished** with the file of its report,
+or **… failed** with the reason; these lines stay listed. A member's own events
+read *Subagent 2 reasoning*, *Subagent 2 tool* and *Subagent 2*. The
+coordinator's team tools show as tool activity (*team_assign · completed*). Each
+`update_goal` call of an author in TCS Prover's goal loop is a **Goal status**
+line, such as **Goal status · blocked**, with the author's note and what TCS
+Prover does next: it never stops for a blocked or paused goal, and a complete one
+hands the turn's last message on.
 
 ### How jobs are counted
 

@@ -116,134 +116,97 @@ class PromptDefaultsTests(unittest.TestCase):
 class BrowserPromptTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js is needed for browser logic tests")
     def test_stale_storage_and_unedited_roles_never_become_overrides(self):
-        # Exercise the actual prompt editor functions without starting a model or browser.
-        script = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-const app = fs.readFileSync(process.argv[1], 'utf8');
-const functions = app.slice(app.indexOf('const promptLabels ='), app.indexOf('function clockText('));
-const setup = `
-let currentJob = '', currentBatch = '', activePrompt = 'review';
-let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
-const defaults = {review: 'Review', author: 'YAML author [STATEMENT]', critic: 'Critic',
-                  convention: 'Convention critic: {statement}', final: 'Final'};
-let state = {phase: 'input', authorPrompt: 'Old state [STATEMENT]', workflow: {settings: {prompts: defaults}}};
-const localStorage = {getItem: () => JSON.stringify({author: 'Old browser [STATEMENT]'}),
-                      setItem: () => {throw Error('Prompts must not be persisted');}};
-const ui = {promptEditor: {value: '', focus() {this.focused = true;}}, notice: {}, promptEditorLabel: {},
-  promptEditorHelp: {}, promptError: {hidden: true},
-  promptTabs: {querySelectorAll: () => []},
-  promptDialog: {open: false, showModal() {this.open = true;}, close() {this.open = false;}}};
-const show = (element, visible) => { element.hidden = !visible; };
-const selectedProblemMode = () => 'statement';
-let workflowStages = {review: true, author: true, critic: true, writing: true};
-const selectedWorkflowStages = () => workflowStages;
-const jobPath = path => path;
-let diskPrompts = defaults;
-const request = async () => ({workflow: {settings: {prompts: diskPrompts}}});
-`;
-const checks = `
-(async () => {
-  syncPrompts();
-  assert.equal(promptValues.author, defaults.author);
-  await openPromptEditor();
-  ui.promptEditor.value = 'Custom review';
-  savePrompts();
-  assert.deepEqual(promptOverrides, {review: 'Custom review'});
+        # The actual prompt editor functions, without a model or browser, with a server that lists the role prompts
+        # only (no catalog: an older one); the catalog's own checks are in tests/test_prompt_catalog_ui.py.
+        from tests import test_prompt_catalog_ui as dialog
 
-  // Editing YAML with the page still open refreshes unedited roles on reopening.
-  diskPrompts = {...defaults, author: 'Latest YAML [STATEMENT]'};
-  await openPromptEditor();
-  assert.equal(promptDrafts.author, diskPrompts.author);
-  assert.equal(promptDrafts.review, 'Custom review');
+        source = (server.UI / "app.js").read_text(encoding="utf-8")
+        self.assertIn('try { localStorage.removeItem("tcs-prover-role-prompts"); } catch (_) {}', source)
+        self.assertNotIn("localStorage.setItem(\"tcs-prover-role-prompts", source)
+        roles = {"groups": ["Statement review", "Author", "Coordinator", "Critic", "Writer"], "prompts": [
+            dialog.entry("review", "Statement review", "Reviewer prompt", [], "Review"),
+            dialog.entry("author", "Author", "Author prompt", ["[STATEMENT]"], "YAML author [STATEMENT]"),
+            dialog.entry("critic", "Critic", "Critic prompt", ["{count}"], "Critic"),
+            dialog.entry("convention", "Critic", "Convention critic prompt", ["{statement}"],
+                         "Convention critic: {statement}"),
+            dialog.entry("final", "Writer", "Final writer prompt", [], "Final")]}
+        dialog.PromptCatalogBrowserTests.run_app(self, r"""
+server.catalog = false;
+state.authorPrompt = "Old state [STATEMENT]";
+syncPrompts();
+assert.equal(promptValues.author, "YAML author [STATEMENT]");
+await open();
+type("Custom review");
+await apply();
+assert.deepEqual(promptOverrides, {review: "Custom review"});
 
-  // A refresh while the dialog is open must not turn untouched text into an edit.
-  diskPrompts = {...diskPrompts, author: 'Even newer YAML [STATEMENT]'};
-  await currentPromptDefaults();
-  ui.promptEditor.value = 'Another custom review';
-  savePrompts();
-  assert.deepEqual(promptOverrides, {review: 'Another custom review'});
+// Editing YAML with the page still open refreshes unedited roles on reopening.
+catalog.prompts.find((item) => item.name === "author").text = "Latest YAML [STATEMENT]";
+await open();
+assert.equal(promptDrafts.author, "Latest YAML [STATEMENT]");
+assert.equal(promptDrafts.review, "Custom review");
 
-  // Returning home/new job clears all deliberate edits as well as legacy text.
-  syncPrompts();
-  assert.deepEqual(promptOverrides, {});
-  assert.equal(promptValues.author, diskPrompts.author);
-  assert.equal(promptValues.review, defaults.review);
+// A refresh while the dialog is open must not turn untouched text into an edit.
+catalog.prompts.find((item) => item.name === "author").text = "Even newer YAML [STATEMENT]";
+await currentPromptDefaults();
+selectPrompt("review");
+type("Another custom review");
+await apply();
+assert.deepEqual(promptOverrides, {review: "Another custom review"});
 
-  // Historical jobs still display their actual prompt, rather than rewriting history.
-  syncPrompts({...state, runId: 'old-job', authorPrompt: 'Actual saved author [STATEMENT]'});
-  assert.equal(promptValues.author, 'Actual saved author [STATEMENT]');
+// Returning home/new job clears all deliberate edits as well as legacy text.
+syncPrompts();
+assert.deepEqual(promptOverrides, {});
+assert.equal(promptValues.author, "Even newer YAML [STATEMENT]");
+assert.equal(promptValues.review, "Review");
 
-  // Moving between roles preserves the deliberate author edit.
-  syncPrompts();
-  await openPromptEditor();
-  selectPrompt('author');
-  ui.promptEditor.value = 'Custom author [STATEMENT]';
-  selectPrompt('review');
-  selectPrompt('author');
-  assert.equal(ui.promptEditor.value, 'Custom author [STATEMENT]');
-  savePrompts();
-  assert.deepEqual(promptOverrides, {author: 'Custom author [STATEMENT]'});
+// Historical jobs still display their actual prompt, rather than rewriting history.
+syncPrompts({...state, runId: "old-job", authorPrompt: "Actual saved author [STATEMENT]"});
+assert.equal(promptValues.author, "Actual saved author [STATEMENT]");
 
-  // An invalid Apply keeps the modal dialog open and explains why inside it, on the
-  // prompt to fix; the page notice behind the dialog is never used.
-  ui.notice = {};
-  await openPromptEditor();
-  assert.equal(ui.promptError.hidden, true);
-  selectPrompt('author');
-  ui.promptEditor.value = 'No marker here';
-  selectPrompt('review');
-  savePrompts();
-  assert.equal(ui.promptDialog.open, true);
-  assert.equal(ui.promptError.hidden, false);
-  assert.equal(ui.promptError.textContent, 'The author prompt must contain exactly one [STATEMENT].');
-  assert.equal(activePrompt, 'author');
-  assert.equal(ui.promptEditor.focused, true);
-  assert.deepEqual(ui.notice, {});
-  // Editing clears it; an empty prompt on another tab is shown on that tab.
-  ui.promptEditor.oninput?.();
-  ui.promptEditor.value = 'Fixed [STATEMENT]';
-  selectPrompt('critic');
-  assert.equal(ui.promptError.hidden, true);
-  ui.promptEditor.value = '   ';
-  selectPrompt('review');
-  savePrompts();
-  assert.equal(activePrompt, 'critic');
-  assert.equal(ui.promptError.textContent, 'Every role prompt must contain instructions.');
-  assert.equal(ui.promptDialog.open, true);
-  promptDrafts.critic = 'Critic';
-  ui.promptEditor.value = 'Critic';
-  savePrompts();
-  assert.equal(ui.promptDialog.open, false);
-  assert.deepEqual(ui.notice, {});
+// Moving between roles preserves the deliberate author edit.
+syncPrompts();
+await open();
+selectPrompt("author");
+type("Custom author [STATEMENT]");
+selectPrompt("review");
+selectPrompt("author");
+assert.equal(ui.promptEditor.value, "Custom author [STATEMENT]");
+await apply();
+assert.deepEqual(promptOverrides, {author: "Custom author [STATEMENT]"});
 
-  // Disabled roles cannot block editing the enabled stage's prompt.
-  workflowStages = {review: true, author: false, critic: false, writing: false};
-  await openPromptEditor();
-  assert.equal(activePrompt, 'review');
-  promptDrafts.author = 'No statement marker';
-  promptDrafts.critic = '';
-  promptDrafts.final = '';
-  ui.promptEditor.value = 'Review enabled stage';
-  savePrompts();
-  assert.equal(ui.promptDialog.open, false);
-  assert.equal(promptValues.review, 'Review enabled stage');
+// An invalid Apply keeps the modal dialog open and explains why inside it, on the prompt to fix; the page
+// notice behind the dialog is never used.
+ui.notice.textContent = "";
+await open();
+assert.equal(ui.promptError.hidden, true);
+selectPrompt("author");
+type("No marker here");
+selectPrompt("review");
+await apply();
+assert.deepEqual([ui.promptDialog.open, ui.promptError.hidden, ui.promptError.textContent, activePrompt],
+  [true, false, "The author prompt must contain exactly one [STATEMENT].", "author"]);
+assert.equal(ui.promptEditor.focused, true);
+assert.equal(ui.notice.textContent, "");
+// Editing clears it; an empty prompt elsewhere is shown on that prompt.
+type("Fixed [STATEMENT]");
+assert.equal(ui.promptError.hidden, true);
+selectPrompt("critic");
+type("   ");
+selectPrompt("review");
+await apply();
+assert.deepEqual([activePrompt, ui.promptError.textContent, ui.promptDialog.open],
+  ["critic", "Every role prompt must contain instructions.", true]);
+type("Critic");
+await apply();
+assert.equal(ui.promptDialog.open, false);
+assert.equal(ui.notice.textContent, "");
 
-  workflowStages = {review: false, author: false, critic: false, writing: true};
-  await openPromptEditor();
-  assert.equal(activePrompt, 'final');
-})();
-`;
-Promise.resolve(vm.runInNewContext(setup + functions + checks, {assert}))
-  .catch(error => {console.error(error); process.exitCode = 1;});
-"""
-        result = subprocess.run(
-            [shutil.which("node"), "-e", script, str(server.UI / "app.js")],
-            text=True, capture_output=True, timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
+// The dialog opens on the first stage that is on.
+stages = {review: false, author: false, critic: false, writing: true};
+await open();
+assert.equal(activePrompt, "final");
+""", catalog=roles)
 
 
 class SavedSettingsPromptTests(unittest.TestCase):
