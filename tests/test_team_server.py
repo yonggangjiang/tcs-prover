@@ -144,6 +144,10 @@ class JobTests(ServerCase):
         converse = restored._conversation_options_locked()
         self.assertEqual((option(converse, "--goal-loop"), option(converse, "--author-team")), ("codex", "builtin"))
         self.assertNotIn("--prompt-set-file", converse)
+        # Revised in place (its own state), it stays as it was.
+        self.assertTrue(server.saved_team_options(restored.state)["legacy_team"])
+        self.assertTrue(server.web_team_options({"goalLoop": "tcs"}, restored.state)["legacy_team"])
+        self.assertNotIn("goalLoop", self.saved(restored))
         # A job made from it (a continuation of its author's work) keeps them too.
         continued = server.App(runs=self.runs, load_latest=False)
         continued.start_direct_statement(STATEMENT, continuation_source=str(app.run_dir), stopped_stage="solve",

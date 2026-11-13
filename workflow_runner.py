@@ -8408,7 +8408,7 @@ def _execute(workflow, state, options, prompts):
                     if coordinator and options.get("author_team", "builtin") == "tcs":
                         if retrieval_policy(directory, features):
                             # A web-cutoff run's audited configuration has no place for TCS Prover's server: its
-                            # coordinator keeps the CLI's own subagents (docs/workflow.md).
+                            # coordinator keeps the CLI's own subagents (docs/developers.md).
                             emit("status", stage_name, node=current, label="Built-in subagents",
                                  text="Web-cutoff runs keep the CLI's own subagent tool for the coordinator, with "
                                       "the coordinator's model; TCS Prover's team is used in live runs only.")

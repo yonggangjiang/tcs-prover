@@ -340,6 +340,11 @@ class ConversationLaunchTests(PausedAuthorCase):
             "--set", "goal_require_resume=true",
             # The author's private temp folder, in the controller's folder of the run.
             "--set", "run_tmp_dir=" + json.dumps(str(server.controller_directory(self.run) / "tmp")),
+            # How its goal loop ran and who its subagents were (tests/test_team_server.py checks the job's texts).
+            "--goal-loop", self.app.state["goalLoop"],
+            "--author-team", "tcs" if self.app.state["authorTeam"] else "builtin",
+            *(["--prompt-set-file", str(server.controller_directory(self.run) / server.PROMPT_SET_FILENAME)]
+              if self.app.state["promptSet"] else []),
             "--set", "goal_stderr_log=" + json.dumps(str(self.run / server.AUTHOR_STDERR_FILENAME))])
         for absent in ("--author-limit-file", "--author-steer-file", "--start-node", "--elapsed-seconds",
                        "--author-prompt-file", "--state-file"):

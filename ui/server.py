@@ -1424,7 +1424,8 @@ def web_team_options(body, source=None):
     overrides = body.get("promptOverrides") if isinstance(body.get("promptOverrides"), dict) else {}
     saved = (source or {}).get("promptSet") if isinstance((source or {}).get("promptSet"), dict) else {}
     texts = {name: text for name, text in {**saved, **overrides}.items() if name not in PROMPT_ROLES}
-    legacy = source is not None and source.get("goalLoop") not in runtime.GOAL_LOOPS
+    legacy = source is not None and (source.get("goalLoopRecorded") is False
+                                     or source.get("goalLoop") not in runtime.GOAL_LOOPS)
     source = source or {}
     return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
             "author_subagent_models": body.get("authorSubagentModels", source.get("authorSubagentModels")),

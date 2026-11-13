@@ -20,7 +20,7 @@ from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
-from runner import claude_cli, providers, team
+from runner import claude_cli, confinement, providers, team
 
 import test_author_coordinator as coordinator_test
 import test_claude_cli as claude_test
@@ -463,6 +463,11 @@ class TeamCase(unittest.TestCase):
         api = mock.patch.object(runtime, "api_codex_executable", return_value=str(self.bin / "codex"))
         api.start()
         self.addCleanup(api.stop)
+        # Claude's Bash temp folders (confinement.claude_temp(), /tmp by default) go to this test's folder.
+        (self.root / "ct").mkdir()
+        claude_temp = mock.patch.object(confinement, "CLAUDE_TEMP_PARENT", str(self.root / "ct"))
+        claude_temp.start()
+        self.addCleanup(claude_temp.stop)
 
     def capture(self, kind, stage, **fields):
         with self.events_lock:
