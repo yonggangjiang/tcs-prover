@@ -159,6 +159,7 @@ const ui = {
   batchReadOnlyNotice: $("batchReadOnlyNotice"), newProblem: $("newProblemButton"),
   newBatch: $("newBatchButton"), navNewBatchItem: $("navNewBatchItem"), composerBatch: $("composerBatch"),
   composerBatchText: $("composerBatchText"), composerDefaultBatch: $("composerDefaultBatchButton"),
+  composerShared: $("composerShared"),
   batchActions: $("batchActions"), renameBatch: $("renameBatchButton"), deleteBatch: $("deleteBatchButton"),
   newProblemInBatch: $("newProblemInBatchButton"),
   batchDialog: $("batchDialog"), batchDialogTitle: $("batchDialogTitle"), batchNameLabel: $("batchNameLabel"),
@@ -212,6 +213,12 @@ const ui = {
   batchNoteText: $("batchNoteText"), batchSaveNote: $("batchSaveNoteButton"),
   batchCancelNote: $("batchCancelNoteButton"), batchRelatedStatus: $("batchRelatedStatus"),
   batchRelatedFiles: $("batchRelatedFiles"),
+  batchShared: $("batchShared"), batchSharedCount: $("batchSharedCount"), batchSharedList: $("batchSharedList"),
+  batchSharedEmpty: $("batchSharedEmpty"), batchSharedAddFiles: $("batchSharedAddFilesButton"),
+  batchSharedAddNote: $("batchSharedAddNoteButton"), batchSharedNoteForm: $("batchSharedNoteForm"),
+  batchSharedNoteTitle: $("batchSharedNoteTitle"), batchSharedNoteText: $("batchSharedNoteText"),
+  batchSharedSaveNote: $("batchSharedSaveNoteButton"), batchSharedCancelNote: $("batchSharedCancelNoteButton"),
+  batchSharedStatus: $("batchSharedStatus"), batchSharedFiles: $("batchSharedFiles"),
   runLabel: $("runLabel"), runTitle: $("runTitle"),
   runDescription: $("runDescription"), roundBadge: $("roundBadge"),
   runOverview: $("runOverview"), runProblemTitle: $("runProblemTitle"),
@@ -386,6 +393,48 @@ function renderComposerBatch() {
     : loaded ? "The batch this page was adding to is no longer available." : "";
   show(ui.composerBatch, Boolean(ui.composerBatchText.textContent));
   show(ui.composerDefaultBatch, shown && other && loaded);
+  renderComposerShared();
+}
+
+// The card of the batch a new problem joins: the batch the page adds to, else the default batch.
+function composerBatchCard() {
+  return inOtherBatch() ? selectedBatch() : batchCatalog.find((batch) => batch.id === "__root__");
+}
+
+// "a", "a and b", "a, b and c", "a, b, c and 4 more": the first names of a batch's shared works (its card's).
+function sharedNamesText(names, count) {
+  const shown = (names || []).slice(0, 3), more = count - shown.length;
+  if (more > 0) return `${shown.join(", ")} and ${more} more`;
+  return shown.length > 1 ? `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}` : shown.join("");
+}
+
+// The New problem page names the related works its batch shares with every problem, which this problem gets
+// with the Author stage, and opens the batch page in a new window (what is written here stays).
+function renderComposerShared() {
+  const card = composingProblem && !currentJob ? composerBatchCard() : null;
+  const count = card?.addProblems && !card.readOnly ? Number(card.sharedWorks?.count || 0) : 0;
+  show(ui.composerShared, count > 0);
+  const works = `${count} related work${count === 1 ? "" : "s"}`;
+  const where = card?.id === "__root__" ? "the default batch" : `“${card?.label || card?.id}”`;
+  const text = !count ? ""
+    : ui.workflowAuthor.checked ? `This problem also gets the ${works} shared with every problem in ${where}: `
+      + `${sharedNamesText(card.sharedWorks.names, count)}. `
+    : `The ${works} shared with every problem in ${where} ${count === 1 ? "is" : "are"} read by the proof author: `
+      + `with the Author stage off, this problem does not get ${count === 1 ? "it" : "them"}. `;
+  const signature = JSON.stringify([text, card?.id || ""]);
+  if (ui.composerShared.dataset.signature === signature) return;
+  ui.composerShared.dataset.signature = signature;
+  if (!text) {
+    ui.composerShared.replaceChildren();
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = `${batchUrl(card.id)}#${sessionToken}`;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.textContent = "Open the batch page";
+  link.setAttribute("aria-label", "Open the batch page in a new window");
+  ui.composerShared.replaceChildren(text, link);
 }
 
 // Whether the New problem page adds to a batch the server no longer lists (deleted in another tab, say),
@@ -448,6 +497,8 @@ function renderBatchNavigation() {
   show(ui.navNewBatchItem, batchOptions().create);
   renderBatchActions();
   renderComposerBatch();
+  // The batch page's shared related works follow the batch on screen (its card says what it shares).
+  if (typeof renderBatchShared === "function") renderBatchShared();
   show(ui.batchReadOnlyNotice, Boolean(batch?.readOnly || state.readOnly));
   ui.home.textContent = currentBatch ? "Back to problems" : "All batches";
   ui.reviewHome.textContent = ui.home.textContent;
@@ -511,6 +562,16 @@ function renderBatches(batches) {
     count.className = "batch-card-count";
     const total = Number(batch.jobCount || 0);
     count.textContent = `${total} ${total === 1 ? "problem" : "problems"}`;
+    // The related works the batch shares with every problem, on a line of their own under the count.
+    const shared = batch.readOnly ? 0 : Number(batch.sharedWorks?.count || 0);
+    if (shared) {
+      const gap = document.createElement("span"), note = document.createElement("span");
+      gap.className = "visually-hidden";
+      gap.textContent = ", ";
+      note.className = "batch-card-shared";
+      note.textContent = `${shared} shared related work${shared === 1 ? "" : "s"}`;
+      count.append(gap, note);
+    }
     copy.append(title, count);
     const progress = document.createElement("p"); progress.className = "batch-progress";
     // Work that needs the user comes first; transient phases count as running.
@@ -5017,8 +5078,10 @@ function renderRelatedWorksPanel() {
       : ["pausing", "paused"].includes(jobPhase)
         ? "Saved in the author's related-works folder. The author is told about new files with your next message or when the run resumes."
       : "Saved in the author's related-works folder, which related-works/INDEX.md lists.")
-      + (state.folderBatch ? " Works for every problem of this folder run are added under Batch related works on "
-        + "the batch page." : "");
+      + (items.some((item) => item.sharedFrom === "batch") ? " Works marked “from the batch” are shared with every "
+        + "problem in this batch; add or remove them on the batch page." : "")
+      + (state.folderBatch ? " Works for every problem of this folder run are added under Shared with a folder run "
+        + "on the batch page." : "");
   if (ui.relatedWorksNote.textContent !== note) ui.relatedWorksNote.textContent = note;
   show(ui.relatedWorksNote, Boolean(note));
   show(ui.relatedWorksEmpty, !items.length);
@@ -5906,13 +5969,16 @@ function relatedWorkRow(item, remove = null) {
   const label = item.name || work.name || (work.kind === "note" ? "Note" : "File");
   name.textContent = label;
   meta.className = "related-work-meta";
+  // A work a job shares: from its batch (shared with every problem in it), or from its folder run.
+  const shared = work.sharedFrom === "batch" ? "from the batch"
+    : work.sharedFrom === "folderRun" || work.batch ? "from the folder run" : "";
   meta.textContent = item.status === "uploading" ? "uploading…"
     : item.status === "failed" ? `Upload failed: ${item.error}`
-    : work.kind === "note" ? [work.title ? `note “${work.title}”` : "note", work.sizeText,
-      work.batch ? "from the batch" : ""].filter(Boolean).join(" · ")
+    : work.kind === "note" ? [work.title ? `note “${work.title}”` : "note", work.sizeText, shared]
+      .filter(Boolean).join(" · ")
     : [work.sizeText, work.textStatus,
       work.originalName && work.originalName !== work.name && !item.upload ? `uploaded as “${work.originalName}”` : "",
-      work.batch ? "from the batch" : ""].filter(Boolean).join(" · ");
+      shared].filter(Boolean).join(" · ");
   copy.className = "related-work-copy";
   copy.append(name, meta);
   row.append(mark, copy);
@@ -5950,6 +6016,8 @@ function composerRelatedTokens() {
 function renderComposerRelatedWorks() {
   const list = composerRelatedWorks(), items = list.items;
   const author = Boolean(ui.workflowAuthor.checked);
+  // The line about the batch's shared works follows the Author stage too.
+  if (typeof renderComposerShared === "function") renderComposerShared();
   show(ui.relatedWorksField, author || items.length > 0);
   const help = !author && items.length
     ? "Related works are read by the proof author; turn on the Author stage, or remove them."
@@ -6137,6 +6205,10 @@ async function sendFolderBatch(chosen) {
     return showCreateError("That batch no longer exists.");
   }
   const count = statements.length;
+  // What the batch shares with every problem: each job of the run gets it too (with the Author stage).
+  const card = typeof composerBatchCard === "function" ? composerBatchCard() : null;
+  const shared = selectedWorkflowStages().author && card?.addProblems && !card.readOnly
+    ? Number(card.sharedWorks?.count || 0) : 0;
   const question = `Start ${count} parallel job${count === 1 ? "" : "s"}? `
     + "Each runs the selected workflow. All of them share the rate and usage limits of the same CLI "
     + "logins and API keys; jobs beyond the running-jobs limit (Models & API) wait in a queue.\n\n"
@@ -6146,6 +6218,8 @@ async function sendFolderBatch(chosen) {
     + (selectedWorkflowStages().review ? " Statement review will pause each job for your approval." : "")
     + (relatedWorks.length ? ` Every job gets the ${relatedWorks.length} related work`
       + `${relatedWorks.length === 1 ? "" : "s"} listed under Advanced settings.` : "")
+    + (shared ? ` Every job also gets the ${shared} related work${shared === 1 ? "" : "s"} shared with every `
+      + "problem in this batch." : "")
     + (skipped ? `\n\n${skipped}` : "");
   if (!confirm(question)) return;
   const body = { statements, ...proofJobSettings(), ...(relatedWorks.length ? { relatedWorks } : {}) };
@@ -6817,11 +6891,11 @@ function batchRelatedGroup(id, members) {
   files.type = note.type = "button";
   files.className = "secondary compact";
   files.textContent = "Add files…";
-  files.setAttribute("aria-label", `Add files to the batch related works of the folder run of ${run}`);
+  files.setAttribute("aria-label", `Add files for every job of the folder run of ${run}`);
   note.className = "ghost compact";
   note.textContent = "Add a note";
   note.setAttribute("aria-controls", "batchNoteForm");
-  note.setAttribute("aria-label", `Add a note to the batch related works of the folder run of ${run}`);
+  note.setAttribute("aria-label", `Add a note for every job of the folder run of ${run}`);
   files.disabled = note.disabled = batchRelated.busy;
   files.onclick = () => {
     batchRelated.target = id;
@@ -6928,6 +7002,170 @@ async function addBatchNote() {
   }
 }
 
+// Shared with every problem in this batch: the works a live batch's store holds (GET /batch-shared-works, read
+// when the page opens, after each change, and again every 10 seconds while the page polls), each with Remove,
+// then Add files… and Add a note. The server links an added work into every problem of the batch not yet
+// finished and into every new one; a removed one leaves new problems and the problems that have not started.
+// Only a card that names its shared works (sharedWorks) offers the section: an older server or the live gateway
+// sends none.
+const batchShared = { batch: "", listing: null, error: "", loadedAt: 0, loading: false, busy: false, signature: "",
+  cardCount: null };
+
+// The selected batch's card when it can share works: a live batch of this server.
+function sharedBatchCard() {
+  const card = selectedBatch();
+  return card?.sharedWorks && card.addProblems && !card.readOnly && !currentJob && !composingProblem ? card : null;
+}
+
+async function loadBatchShared(force = false) {
+  const card = sharedBatchCard(), batch = currentBatch;
+  if (!card || batchShared.loading) return;
+  // The card's count changed since the last read (a change made here or in another tab): read the list again.
+  const count = Number(card.sharedWorks.count || 0), changed = count !== batchShared.cardCount;
+  if (!force && !changed && batchShared.listing && Date.now() - batchShared.loadedAt < 10000) return;
+  batchShared.cardCount = count;
+  batchShared.loading = true;
+  try {
+    const listing = await request(`/batch-shared-works?batch=${encodeURIComponent(batch)}`);
+    if (batch === batchShared.batch) Object.assign(batchShared, { listing, error: "" });
+  } catch (error) {
+    if (batch === batchShared.batch) batchShared.error = error.message;
+  } finally {
+    batchShared.loading = false;
+    batchShared.loadedAt = Date.now();
+  }
+  if (batch === currentBatch) renderBatchShared();
+}
+
+// Called with each /batches answer on the batch page; elsewhere, and for a saved batch, it only hides.
+function renderBatchShared() {
+  const card = sharedBatchCard();
+  show(ui.batchShared, Boolean(card));
+  if (!card) return;
+  if (batchShared.batch !== card.id) {
+    // Another batch: its own list, status line and an empty note form.
+    Object.assign(batchShared, { batch: card.id, listing: null, error: "", loadedAt: 0, signature: "",
+      cardCount: null });
+    ui.batchSharedStatus.textContent = "";
+    ui.batchSharedNoteTitle.value = ui.batchSharedNoteText.value = "";
+    setNoteForm(ui.batchSharedNoteForm, ui.batchSharedAddNote, false);
+  }
+  loadBatchShared();
+  const listing = batchShared.listing, items = Array.isArray(listing?.items) ? listing.items : [];
+  ui.batchSharedCount.textContent = relatedWorksCount(listing ? Number(listing.count ?? items.length)
+    : Number(card.sharedWorks.count || 0));
+  ui.batchSharedAddFiles.disabled = ui.batchSharedAddNote.disabled = ui.batchSharedSaveNote.disabled = batchShared.busy;
+  show(ui.batchSharedEmpty, Boolean(listing) && !items.length);
+  show(ui.batchSharedList, items.length > 0);
+  if (batchShared.error && !ui.batchSharedStatus.textContent) ui.batchSharedStatus.textContent = batchShared.error;
+  const signature = JSON.stringify([items, batchShared.busy]);
+  if (signature === batchShared.signature) return;
+  batchShared.signature = signature;
+  ui.batchSharedList.replaceChildren(...items.map((item) => {
+    const row = relatedWorkRow(item, () => removeBatchShared(item));
+    row.querySelector(".related-work-remove").disabled = batchShared.busy;
+    return row;
+  }));
+}
+
+function setBatchSharedBusy(busy) {
+  batchShared.busy = busy;
+  renderBatchShared();
+}
+
+// What a change did, from the server's answer: its summary, then any problem it could not reach.
+function sharedOutcome(listing) {
+  return [listing.summary, listing.notice].filter(Boolean).join(" ");
+}
+
+async function shareWithBatch(batch, tokens) {
+  const listing = await request(`/batch-shared-works/add?batch=${encodeURIComponent(batch)}`, { uploads: tokens });
+  if (batch === batchShared.batch) Object.assign(batchShared, { listing, error: "", loadedAt: Date.now() });
+  return listing;
+}
+
+async function addBatchSharedFiles(files) {
+  const chosen = [...(files || [])], batch = currentBatch;
+  if (!chosen.length || batchShared.busy || !sharedBatchCard()) return;
+  const here = () => batch === currentBatch && !currentJob && !composingProblem;
+  setBatchSharedBusy(true);
+  let text = "";
+  try {
+    const { tokens, problems } = await stageRelatedFiles(chosen,
+      (line) => { if (here()) ui.batchSharedStatus.textContent = line; }, here);
+    let added = "";
+    if (tokens.length && !here()) {
+      // Left while the files uploaded: nothing is shared with a batch no longer on screen.
+      tokens.forEach(discardUpload);
+      return;
+    }
+    if (tokens.length) {
+      try {
+        const listing = await shareWithBatch(batch, tokens);
+        added = `Added ${relatedWorksCount(tokens.length)}. ${sharedOutcome(listing)}`;
+      } catch (error) {
+        tokens.forEach(discardUpload);
+        added = error.message;
+      }
+    }
+    text = [added, ...problems].filter(Boolean).join(" ");
+  } finally {
+    setBatchSharedBusy(false);
+    if (here()) ui.batchSharedStatus.textContent = text;
+  }
+}
+
+async function addBatchSharedNote() {
+  const batch = currentBatch, title = ui.batchSharedNoteTitle.value.trim(), text = ui.batchSharedNoteText.value;
+  if (batchShared.busy || !sharedBatchCard()) return;
+  if (!text.trim()) {
+    ui.batchSharedStatus.textContent = "Enter the note's text.";
+    ui.batchSharedNoteText.focus();
+    return;
+  }
+  setBatchSharedBusy(true);
+  ui.batchSharedStatus.textContent = "Adding the note…";
+  let status = "";
+  try {
+    const token = (await request("/uploads/note", { title, text })).upload?.token;
+    try {
+      const listing = await shareWithBatch(batch, [token]);
+      status = `Added ${relatedWorksCount(1)}. ${sharedOutcome(listing)}`;
+      ui.batchSharedNoteTitle.value = ui.batchSharedNoteText.value = "";
+      setNoteForm(ui.batchSharedNoteForm, ui.batchSharedAddNote, false);
+    } catch (error) {
+      discardUpload(token);
+      status = error.message;
+    }
+  } catch (error) {
+    status = error.message;
+  } finally {
+    setBatchSharedBusy(false);
+    if (batch === currentBatch) ui.batchSharedStatus.textContent = status;
+  }
+}
+
+// Remove asks first, saying who keeps the work: it leaves new problems and those that have not started.
+async function removeBatchShared(item) {
+  const batch = currentBatch;
+  if (batchShared.busy || !sharedBatchCard()) return;
+  const question = `Stop sharing ${item.name} with the problems in this batch?\n\nNew problems no longer get it, `
+    + "and problems that have not started lose it. Running, paused and finished problems keep their copy.";
+  if (!confirm(question)) return;
+  setBatchSharedBusy(true);
+  let status = "";
+  try {
+    const listing = await request(`/batch-shared-works/remove?batch=${encodeURIComponent(batch)}`, { name: item.name });
+    if (batch === batchShared.batch) Object.assign(batchShared, { listing, error: "", loadedAt: Date.now() });
+    status = sharedOutcome(listing);
+  } catch (error) {
+    status = error.message;
+  } finally {
+    setBatchSharedBusy(false);
+    if (batch === currentBatch) ui.batchSharedStatus.textContent = status;
+  }
+}
+
 ui.composerAddFiles.onclick = () => {
   ui.composerRelatedFiles.value = "";
   ui.composerRelatedFiles.click();
@@ -6947,6 +7185,15 @@ ui.cancelRelatedNote.onclick = () => setNoteForm(ui.relatedNoteForm, ui.addRelat
 ui.batchRelatedFiles.onchange = () => addBatchRelatedFiles(ui.batchRelatedFiles.files);
 ui.batchSaveNote.onclick = addBatchNote;
 ui.batchCancelNote.onclick = () => setNoteForm(ui.batchNoteForm, null, false);
+ui.batchSharedAddFiles.onclick = () => {
+  ui.batchSharedFiles.value = "";
+  ui.batchSharedFiles.click();
+};
+ui.batchSharedFiles.onchange = () => addBatchSharedFiles(ui.batchSharedFiles.files);
+ui.batchSharedAddNote.onclick = () => setNoteForm(ui.batchSharedNoteForm, ui.batchSharedAddNote,
+  ui.batchSharedNoteForm.hidden);
+ui.batchSharedSaveNote.onclick = addBatchSharedNote;
+ui.batchSharedCancelNote.onclick = () => setNoteForm(ui.batchSharedNoteForm, ui.batchSharedAddNote, false);
 ui.authorLimitHours.addEventListener("input", renderAuthorLimitHint);
 
 // API models (Advanced settings → API connections): one saved key exposes its model catalog.

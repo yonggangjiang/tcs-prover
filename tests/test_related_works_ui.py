@@ -380,7 +380,7 @@ assert.equal(ui.relatedWorksEmpty.hidden, true);
 assert.deepEqual(rowText(ui.relatedWorksList), [
   ['PDF', 'My-Paper.pdf', '1.2 MB · text extracted (12 pages) · uploaded as “My Paper.pdf”'],
   ['NOTE', 'Plan.md', 'note “Plan” · 2.0 KB'],
-  ['PDF', 'shared.pdf', '1.2 MB · text extracted (12 pages) · from the batch']]);
+  ['PDF', 'shared.pdf', '1.2 MB · text extracted (12 pages) · from the folder run']]);
 assert(ui.relatedWorksList.children.every(row => row.children.length === 2), 'nothing can be removed');
 for (const phase of ['pausing', 'paused']) {
   render({...running, phase, relatedWorks: works([pdf])});
@@ -390,8 +390,8 @@ for (const phase of ['pausing', 'paused']) {
 // A job of a folder run says where works for the whole run are added.
 render({...running, folderBatch: 'b_0123456789', relatedWorks: works([pdf])});
 assert.equal(ui.relatedWorksNote.textContent, 'Saved in the author\'s related-works folder. The author is told '
-  + 'about new files at its next step. Works for every problem of this folder run are added under Batch related works '
-  + 'on the batch page.');
+  + 'about new files at its next step. Works for every problem of this folder run are added under Shared with a '
+  + 'folder run on the batch page.');
 // Finished: the list stays, with the reason and no actions; nothing at all without any.
 render({...running, phase: 'done', relatedWorks: works([pdf], {available: false,
   reason: 'This job has finished; continue it to add related works.'})});
