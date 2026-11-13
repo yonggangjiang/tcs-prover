@@ -876,6 +876,21 @@ class CodexStructuredTests(RetryCase):
         self.assertEqual(self.sessions(), {})
         self.assertEqual(self.waits(), 60 * len(FAILURES))
 
+    def test_no_call_or_retry_is_offered_codex_s_goal_tools(self):
+        # Codex 0.160's `codex exec` otherwise offers the call and the subagents it starts Codex's goal tools
+        # (create_goal, get_goal, update_goal), captured with the real Codex against a scripted model server.
+        self.script({"work": "Audit 1 is done.", "fail": FAILURES[5]}, {"answer": VALID})
+        runtime.structured("Review S.", SCHEMA, "review", model="gpt-6.1-sol", effort="high")
+        self.script({"answer": VALID})
+        runtime.structured("Review S.", SCHEMA, "critic", model="gpt-6.1-sol", effort="high",
+                           features=("multi_agent",), subagents=2)
+        execs = self.execs()
+        self.assertEqual(len(execs), 3)
+        self.assertEqual(self.tail(execs[1])[:1], ["fork"])  # A retry passes the call's flags again.
+        for entry in execs:
+            head = entry["argv"][:entry["argv"].index("exec")]
+            self.assertIn(["--disable", "goals"], [head[index:index + 2] for index in range(len(head))])
+
     def test_work_then_failures_fork_the_same_base_and_carry_exactly_one_note(self):
         self.script({"work": "Audit 1 is done.", "fail": FAILURES[5]}, *({"fail": CAPACITY} for _ in range(8)),
                     {"answer": VALID})

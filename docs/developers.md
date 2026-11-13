@@ -129,6 +129,15 @@ the entry point.
   prompt reads it as `{author_subagents}` and is added to the first prompt of an
   author that works alone with 1 or more (see
   [The author coordinator](#the-author-coordinator)).
+- Every structured call of Codex runs without Codex's goals feature
+  (`--disable goals`, `structured_tool_arguments()`): the statement reviewer,
+  the critic with its independent critics, the convention critic, and the LaTeX
+  editor and repair. Codex 0.160's `codex exec` otherwise offers the call and
+  the subagents it starts Codex's goal tools (`create_goal`, `get_goal`,
+  `update_goal`), which start Codex's goal mode inside a one-shot call (checked
+  with the real Codex against a scripted model server). A web-cutoff call gets
+  the same flag; its isolation check (the preflight's `config/read`) is
+  unchanged, and the historical discovery call had the feature off already.
 - A structured node with `proof_handoff` gets the proof snapshot as read-only
   files (the convention critic uses this without `edit`). With `edit` and
   `proof_handoff` its result also has `proofChanged` and `proofDiff` (or, for a

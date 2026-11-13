@@ -340,6 +340,16 @@ class CodexLimitTests(unittest.TestCase):
         self.assertEqual(runtime.subagent_limits(["multi_agent"], 1)["features"]["multi_agent_v2"]
                          ["multi_agent_mode_hint_text"].count("up to 1 independent subagent at a time"), 1)
 
+    def test_no_structured_call_is_offered_codex_s_goal_tools(self):
+        # Codex 0.160's `codex exec` otherwise offers the call and the subagents it starts Codex's goal tools
+        # (create_goal, get_goal, update_goal), captured with the real Codex against a scripted model server.
+        for stage in ("review", "critic", "final"):
+            for features, subagents in (((), None), (("multi_agent", "shell_tool"), 3), (("shell_tool",), None)):
+                for policy in (None, {"mode": "historical"}):
+                    with self.subTest(stage=stage, features=features, policy=bool(policy)):
+                        argv = runtime.structured_tool_arguments(stage, features, policy, subagents)
+                        self.assertIn(["--disable", "goals"], [argv[index:index + 2] for index in range(len(argv))])
+
     def test_every_call_without_subagents_gets_a_session_of_one_thread(self):
         for stage in ("review", "final", "critic"):
             with self.subTest(stage=stage):

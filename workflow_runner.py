@@ -2359,6 +2359,10 @@ def structured_tool_arguments(stage, features=(), policy=None, subagents=None):
     return [
         *retrieval_runtime.native_search_arguments(policy=policy),
         "-c", "features.view_image=false",
+        # A one-shot call has no goal: Codex 0.160's `codex exec` otherwise offers its own goal tools (create_goal,
+        # get_goal, update_goal) to the call and to its subagents (offered in requests captured with the real Codex
+        # against a scripted model server).
+        "--disable", "goals",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
         *retrieval_runtime.agent_limit_arguments(subagent_limits(features, subagents)),
     ]

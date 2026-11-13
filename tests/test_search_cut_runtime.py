@@ -722,6 +722,8 @@ class HistoricalPolicyTests(unittest.TestCase):
         # The writer has no subagents: its check and its process both have the session limit of one thread.
         self.assertEqual(limits[-1], retrieval.agent_limits(0))
         self.assertIn("features.multi_agent_v2.max_concurrent_threads_per_session=1", command)
+        # Nor Codex's goal tools, as every structured call: a flag of the process, which the check never reads.
+        self.assertIn(["--disable", "goals"], [command[index:index + 2] for index in range(command.index("exec"))])
 
         def thread_shell(instance):
             """The shell environment the author's thread/start or thread/resume gives its commands."""
