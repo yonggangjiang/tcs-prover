@@ -526,7 +526,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   settings problem (`member_problem()`: a missing CLI, a failed login, an unknown
   model or connection, an endpoint that refuses the request) goes to the
   coordinator as the report of a failed assignment, and the member is idle.
-  Members are children of the runner: a pause, Stop, the time limit, the end of
+  Claude Code first retries a failed API request inside the member's run
+  (`CLAUDE_CODE_RETRY_WATCHDOG`; Claude Code 2.1.289 retried a refused key up to
+  300 times, about 35 s apart): each retry is a diagnostic of that member
+  ("Member n (model): Claude API retry: ..."), and only the run's end reaches
+  the rules above. Members are children of the runner: a pause, Stop, the time limit, the end of
   the work and a restart stop them (their records say why); a failed model call
   of the coordinator keeps them working, and the next attempt reads their
   reports. Records: **Author subagent started/finished/failed** with

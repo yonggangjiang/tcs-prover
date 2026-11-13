@@ -3707,14 +3707,16 @@ def member_problem(error, model):
     return None
 
 
-def member_attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record):
+def member_attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
+                   retried=None):
     """One attempt of a team member's assignment: a one-shot run of its model in the author's working folder.
 
     Codex models run `codex exec --json` and Claude models `claude -p` (as the critic's calls do), each with the
     author's sandbox: workspace writes in ``directory`` (whose controller files stay read-only), the network rule
     of the author's search mode there, the same environment filtering and credentials, no subagents. The reply is
     the member's final message. ``started(process)`` registers the CLI process (a stop ends it); ``record(event,
-    root)`` receives its public events; ``settings`` holds the job's speed and reasoning summary.
+    root)`` receives its public events; ``retried(text)`` the retries Claude Code makes of a failed API request
+    within the run (claude_cli.run_structured()); ``settings`` holds the job's speed and reasoning summary.
     """
 
     try:
@@ -3732,7 +3734,7 @@ def member_attempt(member, prompt, conversation, started, *, directory, settings
         return claude_cli.run_structured(
             prompt, None, "solve", model, effort, summary, timeout=None, activity_label=None, features=(),
             workspace=Path(directory), environment=environment(model), runtime=sys.modules[__name__],
-            conversation=conversation, role="author", record=record, started=started)
+            conversation=conversation, role="author", record=record, started=started, retried=retried)
     return _codex_member_attempt(prompt, model, effort, summary, directory=directory, conversation=conversation,
                                  record=record, started=started, speed=effective_speed(model, settings.get("speed")),
                                  compact_prompt=compact_prompt)
@@ -3837,8 +3839,13 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
         def record(event, root=False):
             emit("codex_event", stage, node=node_name, event=event, root=False, subagentMember=member.number,
                  subagentModel=member.label, **({"provider": "claude"} if conversation.harness == "claude" else {}))
+
+        def retried(text):
+            # The member waits inside its CLI for a failed API request to be retried: say so, as for its own retries.
+            emit("diagnostic", stage, node=node_name, text=f"Member {member.number} ({member.label}): {text}",
+                 subagentMember=member.number, subagentModel=member.label)
         return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
-                              compact_prompt=prompts.get("codex_compact_prompt", ""), record=record)
+                              compact_prompt=prompts.get("codex_compact_prompt", ""), record=record, retried=retried)
 
     def conversation(member, base):
         try:

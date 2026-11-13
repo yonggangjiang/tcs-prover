@@ -670,6 +670,24 @@ class TeamTests(TeamCase):
         self.assertEqual({event["subagentMember"] for event in member_events}, {1, 2, 3})
         self.assertNotIn(API_KEY, json.dumps(self.events))
 
+    def test_a_claude_members_own_retries_of_a_failed_request_are_recorded(self):
+        # Claude Code retries a failed API request inside the member's run (system/api_retry, as 2.1.289 reported it
+        # for a key its endpoint refused, up to 300 times): each retry is a diagnostic of that member.
+        self.scenario.write_text(json.dumps({"turns": [["init", {"emit": {
+            "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 300, "retry_delay_ms": 556,
+            "error_status": 401, "error": "authentication_failed", "uuid": "6b2ac872-87f0-43c4-8efd-2c797872f342"}},
+            {"emit": {"type": "assistant", "parent_tool_use_id": None, "uuid": "m1",
+                      "message": {"content": [{"type": "text", "text": "Lemma A holds."}]}}},
+            {"result": {"result": "Lemma A holds."}}]]}))
+        crew = self.crew([{"model": "claude-opus-5-5", "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertIn("REPORT:\nLemma A holds.", report)
+        retry, = [event for event in self.events if event["kind"] == "diagnostic" and "retry" in event["text"]]
+        self.assertEqual(retry["text"], "Member 1 (Claude Opus 5.5): Claude API retry: status 401, retrying in 0.6 s "
+                                        "(attempt 1 of 300)")
+        self.assertEqual((retry["subagentMember"], retry["subagentModel"]), (1, "Claude Opus 5.5"))
+
     def test_followup_continues_a_members_conversation_and_wrong_calls_are_refused(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}])
         with self.assertRaisesRegex(team.TeamError, "no conversation that can be continued"):

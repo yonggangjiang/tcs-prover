@@ -1027,7 +1027,7 @@ def subagent_failure(block):
 
 def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, activity_label, features,
                    workspace, environment, runtime=None, conversation=None, deadline=None, subagents=None,
-                   role="structured", record=None, started=None):
+                   role="structured", record=None, started=None, retried=None):
     """Run one structured Claude request and return its structured output as JSON text.
 
     workflow_runner.structured() decodes, validates and retries the returned
@@ -1058,8 +1058,12 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     for an API model and the deny rules that keep its controller files
     read-only, as goal_session() sets them), no liveness heartbeat, and its
     final reply as the answer. ``record(event, root)`` then receives its
-    events instead of the run's records, and ``started(process)`` the CLI
-    process, which a stop of the member ends.
+    events instead of the run's records, ``started(process)`` the CLI
+    process, which a stop of the member ends, and ``retried(text)`` each of the
+    CLI's own retries of a failed API request (api_retry_text()): Claude Code
+    retries one inside the same run (CLAUDE_CODE_RETRY_WATCHDOG; an
+    authentication failure up to 300 times, verified with 2.1.289), which
+    otherwise no record of the member would show.
     """
 
     runtime = _runtime_module(runtime)
@@ -1213,6 +1217,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
                     if retrying and record is None:
                         runtime.emit("status", stage, label=f"{activity_label} · Claude API retry" if activity_label
                                      else "Claude API retry", text=retrying, activityLabel=activity_label or "")
+                    elif retrying and retried is not None:
+                        retried(retrying)
                     # The heartbeat names a retry the CLI waits for, until anything else arrives.
                     monitor.retrying(retrying)
                     if kind in {"assistant", "user"} and message.get("parent_tool_use_id") is None:
