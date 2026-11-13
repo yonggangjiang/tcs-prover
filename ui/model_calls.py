@@ -745,12 +745,13 @@ def training_record(name, stream):
             for entry in rounds:
                 member.write(json.dumps(entry, ensure_ascii=False).encode("utf-8") + b"\n")
         snapshot = record.folder / "transcript"
-        try:
+        if (snapshot / "transcript.jsonl.gz").is_file():
             with archive.open("transcript/transcript.jsonl", "w", force_zip64=True) as member:
-                with gzip.open(snapshot / "transcript.jsonl.gz", "rb") as source:
-                    shutil.copyfileobj(source, member, 1024 * 1024)
-        except (OSError, EOFError):
-            pass
+                try:
+                    with gzip.open(snapshot / "transcript.jsonl.gz", "rb") as source:
+                        shutil.copyfileobj(source, member, 1024 * 1024)
+                except (OSError, EOFError):
+                    pass  # What could be read; the record's problems are not this download's.
         for path in sorted(snapshot.rglob("*")):
             if path.is_file() and path.name not in ("transcript.jsonl.gz", "transcript.json"):
                 archive.write(path, "transcript/" + path.relative_to(snapshot).as_posix())

@@ -346,6 +346,7 @@ class ModelCallViewTests(RecordCase):
         self.assertEqual(requests[1]["response"]["output_items"], [REASONING, ANSWER])
         items = [json.loads(line) for line in archive.read("items.jsonl").splitlines()]
         self.assertIn(REASONING, [item["item"] for item in items])  # Encrypted reasoning as received.
+        self.assertNotIn("transcript/transcript.jsonl", names)  # No snapshot yet: no empty member.
         windows = [json.loads(line) for line in archive.read("trajectories.jsonl").splitlines()]
         self.assertEqual(len(windows), 1)
         self.assertEqual([call["inputEnd"] for call in windows[0]["calls"]], [3, 6])
