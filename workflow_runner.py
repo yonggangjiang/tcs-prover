@@ -7209,20 +7209,26 @@ def prompt_problem(name, text, rule):
     return None
 
 
-def _instructions(node, prompts, values=None):
-    """A node's instructions, in order; with ``values`` (a node with subagents: {count}) each is rendered."""
+def _instructions(node, prompts, values=None, verify=None):
+    """A node's instructions, in order; with ``values`` (a node with subagents: {count}) each is rendered.
+
+    ``verify``, the instruction of a verify-only visit (_model_call()), follows them as written, braces included: a
+    text without placeholders (prompt_rules()), as the Prompts dialog shows and checks it.
+    """
 
     instructions = ""
-    for name in node.get("instructions", []):
-        part = text(prompts[name] if values is None else render_template(prompts[name], values))
+    parts = [text(prompts[name] if values is None else render_template(prompts[name], values))
+             for name in node.get("instructions", [])]
+    for part in [*parts, *([text(prompts[verify])] if verify else [])]:
         if part not in instructions:
             instructions = instructions + "\n\n" + part if instructions else part
     return instructions
 
 
-def _request_prompt(node, prompts, context):
+def _request_prompt(node, prompts, context, verify=None):
     values = {key: evaluate(expression, context) for key, expression in node.get("inputs", {}).items()}
-    values["instructions"] = _instructions(node, prompts, {"count": context["count"]} if "count" in context else None)
+    values["instructions"] = _instructions(node, prompts, {"count": context["count"]} if "count" in context else None,
+                                           verify)
     reference = node["prompt"]
     if isinstance(reference, dict):
         reference = reference["then"] if evaluate(reference["when"], context) else reference["else"]
@@ -7533,17 +7539,15 @@ def _model_call(node, prompts, state, options, visit, input_files=None, verify=N
     edited in place (see EditableFile); with a `proof_handoff`, the result
     also records whether the proof changed and the diff (see _proof_change).
     A `verify` visit (the prompt a repeat
-    branch names) adds that instruction to the node's own instructions only
-    and keeps the file read-only, so the visit can only confirm or reject its
-    text.
+    branch names) adds that instruction, as written, after the node's own
+    instructions only and keeps the file read-only, so the visit can only
+    confirm or reject its text.
     """
-    if verify:
-        node = {**node, "instructions": [*node.get("instructions", []), verify]}
     context = {"state": state, "visit": visit}
     features, count = node_features(node, options)
     if count is not None:
         context["count"] = count
-    prompt = _request_prompt(node, prompts, context)
+    prompt = _request_prompt(node, prompts, context, verify)
     settings = _structured_options(node, options)
     settings.update({key: node[key] for key in ("request_label", "activity_label") if key in node})
     edit, edited = node.get("edit"), None

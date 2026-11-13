@@ -20,7 +20,7 @@ from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
-from runner import claude_cli, proof_handoff, providers
+from runner import claude_cli, prompt_catalog, proof_handoff, providers
 from tests import critic_doubles
 from ui import server
 
@@ -376,6 +376,26 @@ class VerifyRoundTests(GraphCase):
         self.assertEqual([event["outcome"] for event in self.kinds("critic_result")], ["fixed", "fixed", "pass"])
         approval = next(event for event in self.kinds("status") if event.get("label") == "Critic approved")
         self.assertEqual((approval["acceptanceReason"], approval["round"]), ("clean_pass", 3))
+
+    def test_an_edited_verification_is_sent_as_written_braces_included(self):
+        # Final verification is a text without placeholders: the Prompts dialog says it is sent as written and
+        # accepts any brace (prompt_rules()), so the round sends it so, after the critic's own instructions, which
+        # still read {count}. Rendered with {count}, these braces stopped the job at its critic's last round.
+        edited = ("FINAL VERIFICATION: proof.md is read-only. Check every set such as \\{x : x > 0\\}, {x} and "
+                  "a lone } exactly as written.")
+        self.assertEqual(prompt_catalog.problems(runtime, {"critic_verify": edited}), {})
+        calls, attempt, _ = self.scripted([{"write": "P1", "answer": {"verdict": "pass", "bugs": ""}},
+                                           {"answer": {"verdict": "pass", "bugs": ""}}])
+        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
+            state = runtime.execute_workflows([AUTHOR_CRITIC], {"statement": "Task", "solution": PROOF},
+                                              {"start_node": "critic", "critic_rounds": 1,
+                                               "prompt_set": {"critic_verify": edited}})
+        self.assertEqual(state["output"], "P1")
+        verify = calls[1]
+        self.assertIsNone(verify["edit"])
+        self.assertIn(edited, verify["text"])
+        self.assertIn("Spawn exactly 3 fresh independent subagent(s)", verify["text"])
+        self.assertEqual([event["outcome"] for event in self.kinds("critic_result")], ["fixed", "pass"])
 
     def test_a_verification_that_finds_bugs_returns_the_verified_proof_to_the_author(self):
         instructions = []
