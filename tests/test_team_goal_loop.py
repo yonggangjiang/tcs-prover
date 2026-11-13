@@ -267,6 +267,63 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(answers[2]["result"], {"content": [{"type": "text", "text": 'echo {"x": 1}'}],
                                                 "isError": False})
 
+    def test_tool_calls_and_answers_stay_utf_8_where_pipes_use_another_code_page(self):
+        # Python on Windows reads and writes a piped stdin and stdout in the ANSI code page (cp1252, with
+        # surrogateescape), and `python -I` ignores PYTHONUTF8 and PYTHONIOENCODING; Codex reads and writes UTF-8.
+        # The bridge runs here with exactly those streams, and the test writes and reads raw UTF-8 as Codex does.
+        received = []
+
+        class Mirror:
+            def tools(self):
+                return [{"name": "mirror", "description": "Mirror", "inputSchema": {"type": "object"}}]
+
+            def call(self, name, arguments):
+                received.append(arguments.get("text"))
+                return f"Report: {arguments.get('text')} — so x ≤ y."
+
+        mirror = Mirror()
+        self.service.add(mirror)
+        self.addCleanup(self.service.remove, mirror)
+        entry = self.service.codex_server()
+        windows = ("import io, runpy, sys\n"
+                   "sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='cp1252', errors='surrogateescape')\n"
+                   "sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='cp1252', errors='surrogateescape',"
+                   " newline='\\r\\n')\n"
+                   "runpy.run_path(sys.argv[1], run_name='__main__')\n")
+        environment = {**{key: value for key, value in os.environ.items() if key in ("PATH", "HOME", "SYSTEMROOT")},
+                       **entry["env"]}
+        bridge = POPEN([entry["command"], "-I", "-c", windows, entry["args"][-1]], stdin=subprocess.PIPE,
+                       stdout=subprocess.PIPE, env=environment)
+        lines = []
+        reader = threading.Thread(target=lambda: lines.extend(bridge.stdout), daemon=True)
+        reader.start()
+
+        def answer(number, timeout=10):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                for line in list(lines):
+                    message = json.loads(line.decode("utf-8"))  # Strict: what Codex can parse.
+                    if message.get("id") == number:
+                        return message
+                time.sleep(0.05)
+            raise AssertionError(f"no answer to request {number}")
+
+        try:
+            for number, text in enumerate(("Show that x ≤ y for all x in ℝ.", "Only a dash — here."), 1):
+                request = {"jsonrpc": "2.0", "id": number, "method": "tools/call",
+                           "params": {"name": "mirror", "arguments": {"text": text}}}
+                bridge.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+                bridge.stdin.flush()
+                result = answer(number)["result"]
+                self.assertEqual(received[-1:], [text])
+                self.assertEqual(result, {"content": [{"type": "text", "text": f"Report: {text} — so x ≤ y."}],
+                                          "isError": False})
+        finally:
+            bridge.stdin.close()
+            bridge.wait(10)
+            reader.join(5)
+            bridge.stdout.close()
+
     def test_a_call_without_the_token_gets_nothing(self):
         entry = self.service.codex_server()
         client = self.client({**entry, "env": {**entry["env"], team.TOKEN_ENV: "0" * 64}})

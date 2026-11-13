@@ -93,6 +93,13 @@ def handle(message):
 
 
 def main():
+    # MCP's stdio is UTF-8 JSON-RPC whatever the platform's default for pipes: Python on Windows reads and writes a
+    # pipe in the ANSI code page (such as cp1252), and `python -I` ignores PYTHONUTF8 and PYTHONIOENCODING. As
+    # retrieval/historical_search.py does for its stdio server; an answer line ends with "\n" alone.
+    for stream, options in ((sys.stdin, {}), (sys.stdout, {"newline": "\n"})):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace", **options)
     for line in sys.stdin:
         if not line.strip():
             continue
