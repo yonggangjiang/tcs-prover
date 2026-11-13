@@ -8180,8 +8180,9 @@ class App:
                         "text": text, "steerId": steer_id, "relatedWorks": list(names)})
 
     def _announce_related_works_locked(self, names):
-        """The notice rule: running or pausing, a live instruction now; paused, with the next message or at
-        Resume; before the first launch, nothing (the first prompt points to the folder)."""
+        """The notice rule: running or pausing, a live instruction now; paused, or stopping at a step after the
+        statement review (which leaves it paused there), with the next message or at Resume; before the first
+        launch, nothing (the first prompt points to the folder)."""
 
         if not names:
             return ""
@@ -8195,7 +8196,7 @@ class App:
                                 "text": f"The author could not be told about the new related works now ({exc}); "
                                         "it is told with the next message to the paused author or when the run "
                                         "resumes."})
-        elif phase != "paused":
+        elif phase != "paused" and not (phase == "stopping" and self.state.get("stage") != "review"):
             return ""
         self.state["relatedWorksPending"] = [*(self.state.get("relatedWorksPending") or []),
                                              *(name for name in names
@@ -8260,10 +8261,12 @@ class App:
         one another process runs."""
 
         state = self.state
+        # A statement review being stopped returns to its input: its author has not started either.
+        review_stopping = state["phase"] == "stopping" and state.get("stage") == "review"
         return (self.run_dir is not None and not state.get("readOnly") and not state.get("runningElsewhere")
                 and not state.get("retrievalPolicyPath") and state.get("retrievalMode") != "historical"
                 and not state.get("goalThreadId") and not state.get("goalResume")
-                and state["phase"] in {"input", "reviewing", "reviewed", "prepared"}
+                and (state["phase"] in {"input", "reviewing", "reviewed", "prepared"} or review_stopping)
                 and Path(workspace) == self.run_dir.resolve())
 
     def unshare_related_works(self, store_id, names, *, alone=True):
@@ -11203,9 +11206,11 @@ class Server(ThreadingHTTPServer):
                 except ValueError:
                     author = False
                 # A statement review that failed or was stopped runs again in its own job, whose author has yet to
-                # start: it takes them too (and loses a removed one), so its first prompt points to them.
-                review = (app.run_dir is not None and app.state["phase"] == "input" and author and not elsewhere
-                          and not app.state.get("readOnly"))
+                # start: it takes them too (and loses a removed one), so its first prompt points to them. A job
+                # being stopped is about to be one of those, or paused at its step: it takes them as that job
+                # (_announce_related_works_locked).
+                review = (app.run_dir is not None and app.state["phase"] in {"input", "stopping"} and author
+                          and not elsewhere and not app.state.get("readOnly"))
             if problem and not review:
                 if elsewhere and problem == elsewhere:
                     results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": problem})

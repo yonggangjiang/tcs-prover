@@ -527,6 +527,36 @@ class SharedWorksTests(RelatedWorksCase):
         self.assertEqual(self.share(empty, "later.md")["summary"],
                          "No problem in this batch can take related works now; new problems in this batch get it.")
 
+    def test_a_job_being_stopped_counts_as_what_its_stop_leaves(self):
+        # A Stop of the statement review, the critic or a later step takes a moment ("stopping"), then leaves an
+        # unfinished problem: the review back at its input (its author has not started), the step paused for
+        # Continue. A work shared or removed meanwhile is handled as for that problem, never silently skipped.
+        critic = self.start()
+        critic.state.update(phase="stopping", stage="critic", activeNode="critic", goalThreadId="thread-1")
+        review = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True}})
+        review.state.update(phase="stopping")
+        self.assertEqual(review.state["stage"], "review")
+        result = self.share("", "defs.md")
+        for app in (critic, review):
+            with self.subTest(job=app.state["stage"]):
+                self.assertEqual(inode(self.folder(app) / "defs.md"), inode(self.store_file("defs.md")))
+        # The critic's author is told when the job continues; the review's author finds it through its first prompt.
+        self.assertEqual({row["runId"]: row["notice"] for row in result["results"]},
+                         {critic.state["runId"]: "pending", review.state["runId"]: ""})
+        self.assertEqual((critic.state["relatedWorksPending"], review.state["relatedWorksPending"]), (["defs.md"], []))
+        self.assertEqual(self.steers(critic), [])
+        self.assertEqual((result["summary"], result["notice"]),
+                         ("2 problems in this batch got it now, and 1 running or paused author is told. New problems "
+                          "in this batch get it too.", ""))
+        # Removed while they stop: the review, whose author has not started, loses it; the critic's job keeps it.
+        result = self.manager.remove_batch_shared_work("defs.md", "")
+        self.assertFalse(self.folder(review).exists())  # It was its only related work: no folder is left.
+        self.assertEqual((self.folder(critic) / "defs.md").read_bytes(), b"defs.md\n")
+        self.assertIn("Related works removed", self.labels(review))
+        self.assertEqual(result["summary"], "Removed defs.md. New problems in this batch no longer get it. It was taken "
+                                            "out of 1 problem that had not started. 1 problem that has started or has "
+                                            "a web cutoff keeps its copy.")
+
     def test_a_job_that_cannot_link_the_batchs_works_gets_its_own_copy_and_says_so(self):
         queued = self.start()
         queued.state.update(phase="prepared")
