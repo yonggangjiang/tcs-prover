@@ -127,8 +127,10 @@ class StoreTests(StoreCase):
         self.assertEqual(saved["version"], 2)
         entry = saved["models"][0]
         self.assertEqual(set(entry), {"id", "label", "format", "baseUrl", "headerName", "requestSource", "model", "apiKey",
-                                      "createdAt", "updatedAt", "lastTest", "legacyModelId", "availableModels"})
+                                      "createdAt", "updatedAt", "lastTest", "legacyModelId", "availableModels",
+                                      "webSearch"})
         self.assertEqual((entry["headerName"], entry["baseUrl"]), ("Authorization", "https://api.example.com/v1"))
+        self.assertIs(entry["webSearch"], False)  # Web search through a connection is off until turned on.
 
     def test_defaults_ids_and_bearer_prefix(self):
         anthropic = providers.save_api_model({"format": "anthropic", "baseUrl": "https://gw.example.com/v1/",
