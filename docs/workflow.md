@@ -89,11 +89,11 @@ the file is fixed.
 - **Each job keeps its texts.** A new job saves the whole set it runs with (the
   defaults and your edits) in its folders, and beside it which of them you
   edited, and reads its own copy every time it starts, resumes or continues, so
-  later edits of the workflow files never change a job that has started. **Run settings → View this job's prompts**
-  shows them, read-only, each marked when it differs from today's default. A job
-  from before keeps working as it did: it saved only its role prompts (shown
-  there with a note) and reads its other texts from the workflow files each time
-  it starts or resumes.
+  later edits of the workflow files never change a job that has started.
+  **Run settings → View this job's prompts** shows them, read-only, each marked
+  when it differs from today's default. A job from before keeps working as it
+  did: it saved only its role prompts (shown there with a note) and reads its
+  other texts from the workflow files each time it starts or resumes.
 - A job saved with the earlier default author prompt (the one with separate
   macOS or Linux and Windows instructions) gets the current default when it is
   resumed or continued; an author prompt you edited stays as it is.

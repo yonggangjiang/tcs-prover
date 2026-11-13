@@ -275,10 +275,10 @@ type a model id.
   Structured roles return JSON by a prompt contract that is checked and retried
   until valid. Live web search uses the endpoint's hosted search tool, which
   some endpoints refuse. Codex (0.160) offers no search tool at all to a model
-  it runs as "Responses Lite", such as gpt-6.1-sol and the other GPT 6 and
-  GPT 5.6 models (known by the name the connection sends), through an API
-  connection: its own web search comes only with its built-in OpenAI provider,
-  that is, the **Codex CLI** source. A live run whose author or author subagent
+  it runs as "Responses Lite" (by the name the connection sends: gpt-6.1-sol
+  and the other GPT 6 and GPT 5.6 models of Codex's own model list) through an
+  API connection: its own web search comes only with its built-in OpenAI
+  provider, that is, the **Codex CLI** source. A live run whose author or author subagent
   has such a model says so in the activity log as the author starts (**No web
   search**), and goes on without web search.
 - **Anthropic format** runs through Claude Code with a private configuration
