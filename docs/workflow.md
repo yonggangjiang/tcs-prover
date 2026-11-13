@@ -82,15 +82,18 @@ the file is fixed.
   edits apply to the job you are about to start only: they are never remembered
   in the browser, carried into the next new problem or kept in
   [saved settings](saved-settings.md). **Rerun with suggested statement** takes
-  along the job's texts that differ from today's defaults.
+  along the texts that were edited for the job (those that still differ from
+  today's defaults); its other texts were the defaults of its day and give way
+  to today's. A job that saved no record of its edits (one from before) takes
+  along every text it saved that differs from today's defaults.
 - **Each job keeps its texts.** A new job saves the whole set it runs with (the
-  defaults and your edits) in its folders and reads its own copy every time it
-  starts, resumes or continues, so later edits of the workflow files never
-  change a job that has started. **Run settings → View this job's prompts**
-  shows them, read-only, each marked when it differs from today's default. A job
-  from before keeps working as it did: it saved only its role prompts (shown
-  there with a note) and reads its other texts from the workflow files each time
-  it starts or resumes.
+  defaults and your edits) in its folders, and beside it which of them you
+  edited, and reads its own copy every time it starts, resumes or continues, so
+  later edits of the workflow files never change a job that has started.
+  **Run settings → View this job's prompts** shows them, read-only, each marked
+  when it differs from today's default. A job from before keeps working as it
+  did: it saved only its role prompts (shown there with a note) and reads its
+  other texts from the workflow files each time it starts or resumes.
 - A job saved with the earlier default author prompt (the one with separate
   macOS or Linux and Windows instructions) gets the current default when it is
   resumed or continued; an author prompt you edited stays as it is.
@@ -181,6 +184,11 @@ who runs those turns:
   **Run settings** say *Codex built-in*), and so does every run with a
   [web cutoff](web-cutoff.md): the form then shows it and says *Web-cutoff runs
   use Codex's goal mode.*
+- **Rerun with suggested statement** on a job from before this setting keeps
+  what that job ran: **Codex built-in** as the goal loop and, for a coordinator,
+  the program's own subagents with the coordinator's model, which the help line
+  under **Subagent models** says. Choosing **TCS Prover** as the goal loop, or
+  **Choose for each**, gives the new job TCS Prover's team, as for any new job.
 
 ### The author coordinator
 

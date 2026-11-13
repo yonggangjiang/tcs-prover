@@ -436,6 +436,42 @@ assert.deepEqual(promptOverrides, { team_note: "Our team, again: {members}" });
 """)
 
 
+    def test_a_rerun_carries_the_texts_edited_for_the_job_and_todays_other_defaults(self):
+        self.run_app(r"""
+const defaults = Object.fromEntries(fixture.catalog.prompts.map((item) => [item.name, item.text]));
+await loadPromptCatalog();
+// The job ran with every text of its day: the team note was then another default; it edited two texts.
+const edits = { author: "My author. [STATEMENT]", goal_continuation: "Go on: {continuation} {objective}",
+  critic: defaults.critic, retired_text: "A text since removed." };
+const job = { ...state, runId: "job-3", phase: "done", promptEdits: edits, promptSet: { ...defaults,
+  author: edits.author, goal_continuation: edits.goal_continuation, team_note: "YESTERDAY'S TEAM NOTE {members}",
+  retired_text: edits.retired_text } };
+// Rerun with suggested statement: the seed carries the job's texts and the edits saved with them.
+await rerunWithStatement("A clearer statement.");
+assert.deepEqual([composerSeed.settings.promptEdits, composerSeed.settings.promptSet], [undefined, undefined]);
+state = job;
+await rerunWithStatement("A clearer statement.");
+assert.deepEqual([composerSeed.settings.promptEdits, composerSeed.settings.promptSet], [edits, job.promptSet]);
+// The form: only the edits that today's workflow has and that differ from today's default; the team note is today's.
+state = { phase: "input", workflow: job.workflow };
+syncPrompts({ ...state, ...composerSeed.settings });
+seedPromptOverrides(composerSeed.settings);
+assert.deepEqual(promptOverrides, { author: edits.author, goal_continuation: edits.goal_continuation });
+assert.deepEqual([promptValues.team_note, promptValues.author], [defaults.team_note, edits.author]);
+await open();
+selectPrompt("team_note");
+assert.deepEqual([ui.promptEditor.value, ui.promptEditorState.textContent], [defaults.team_note, "Default"]);
+// A job saved before its edits were (no promptEdits): every saved text that differs from today's default, as before.
+const older = { ...job.promptSet };
+syncPrompts({ ...state, runId: "job-4", promptSet: older });
+seedPromptOverrides({ runId: "job-4", promptSet: older });
+assert.deepEqual(promptOverrides, { author: edits.author, goal_continuation: edits.goal_continuation,
+  team_note: "YESTERDAY'S TEAM NOTE {members}" });
+""", extra_slices=[["async function rerunWithStatement(", "// The New problem page, adding to"]],
+                     extra_setup="let composerSeed = null;\nconst newProblem = async () => {};\n"
+                                 "const selectedBatch = () => null;\n")
+
+
 class PromptCatalogMarkupTests(unittest.TestCase):
     def setUp(self):
         self.html = INDEX.read_text(encoding="utf-8")

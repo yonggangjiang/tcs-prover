@@ -119,6 +119,24 @@ class ExecCollabToolCallTests(unittest.TestCase):
         self.assertIn("Assignment: Audit Lemma 2", entry["text"])
         self.assertIsNone(vt.ui_entry(records[2], 20))
 
+    def test_team_members_working_side_by_side_each_show_their_tools(self):
+        def member(event, identity):
+            return {**exec_event(event, stage="solve"), "root": False, "subagentId": identity,
+                    "subagentMember": int(identity.split("-")[1])}
+
+        def command(item_id, text):
+            return {"type": "item.completed", "item": {"id": item_id, "type": "command_execution", "command": text,
+                                                       "status": "completed"}}
+
+        # Each assignment is a `codex exec` of its own, numbering its items from item_0; they run side by side.
+        records = [member({"type": "thread.started", "thread_id": "m1"}, "member-1-1"),
+                   member({"type": "thread.started", "thread_id": "m2"}, "member-2-1"),
+                   member(command("item_0", "grep Lemma notes.md"), "member-1-1"),
+                   member(command("item_0", "ls memory"), "member-2-1")]
+        text = narrative(records)
+        for line in ("grep Lemma notes.md", "ls memory"):
+            self.assertEqual(text.count(line), 1, text)
+
     def test_completed_wait_shows_the_subagent_reports_once(self):
         states = {"t1": {"status": "completed", "message": "Lemma 2 swaps quantifiers."}}
         started = collab("item_1", "wait")

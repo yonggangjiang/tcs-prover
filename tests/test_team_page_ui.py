@@ -11,6 +11,7 @@ program, effort, connection}]), the subagent records' subagentMember and subagen
 fixtures are real (ui/presets.py, ui/server.py and an API connection "Lab key" with its model "Model A"). No server,
 model or CLI is started.
 """
+import json
 import re
 import shutil
 import unittest
@@ -18,11 +19,15 @@ import unittest
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from tests import test_coordinator_ui as coordinator
 from tests import test_presets_ui as presets_ui
+from tests import test_no_web_search as no_web_search
+from tests import test_team_goal_loop as team_loop
 from tests.test_provider_ui import APP, INDEX, page
 
 # The handlers of Author subagents, Subagent models and Goal loop (index.html's controls as app.js wires them).
 HANDLERS = ["// The subagent models show while Author subagents is 1 or more",
             "ui.retrievalMode.onchange = () => {"]
+# How the page puts a job's records into the activity log (with coordinator.ACTIVITY: describe and upsertTimeline).
+INGEST = ["// Keep only exact application prompts", "function completedRunLabel("]
 # Setup's reading of the form (what each program is needed for) and its words.
 SETUP_SLICES = [["function setupWords()", "function setupElement("],
                 ["function setupFormRoles()", "// Whether the built-in settings, which new problems open with"],
@@ -237,11 +242,12 @@ applyComposerSettings({...fresh(), authorSubagents: 2});
 assert.deepEqual([ui.authorSubagentModelsMode.value, ui.authorTeamSetting.hidden, proofJobSettings().goalLoop],
   ["same", true, "tcs"]);
 assert.equal(proofJobSettings().authorSubagentModels, null);
-// A job from before the goal loop setting ran Codex's goal mode without choosing it: a new job from it gets the default.
+// A job from before the goal loop setting ran Codex's goal mode and the CLI's own subagents: a rerun keeps them (see
+// test_a_rerun_of_a_job_from_before_keeps_its_goal_loop_and_subagents).
 applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex", goalLoopRecorded: false});
-assert.equal(proofJobSettings().goalLoop, "tcs");
+assert.deepEqual([proofJobSettings().goalLoop, proofJobSettings().legacyTeam], ["codex", true]);
 applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex", goalLoopRecorded: true});
-assert.equal(proofJobSettings().goalLoop, "codex");
+assert.deepEqual([proofJobSettings().goalLoop, proofJobSettings().legacyTeam], ["codex", undefined]);
 // A job sent back to the form shows its own.
 currentJob = "job-1";
 composingProblem = false;
@@ -249,6 +255,50 @@ previousPhase = "running";
 render({...fresh(), runId: "job-1", authorSubagents: 2, authorSubagentModels: team, goalLoop: "tcs"});
 assert.deepEqual(proofJobSettings().authorSubagentModels, team);
 """)
+
+    def test_a_rerun_of_a_job_from_before_keeps_its_goal_loop_and_subagents(self):
+        self.run_form(r"""
+await openFresh();
+const kept = "As in the job you are rerunning, which started before TCS Prover's team: the author subagents are the "
+  + "coordinator's own CLI subagents, each running the coordinator's model and reasoning. Choose for each, or TCS "
+  + "Prover as the goal loop, for TCS Prover's team.";
+const sent = () => { const settings = proofJobSettings(); return [settings.goalLoop, settings.authorSubagentModels, settings.legacyTeam]; };
+// A job from before (it recorded no goal loop: the server restores it with Codex's goal mode), and a job that kept
+// such a job's settings: the form shows Codex built-in and the CLI's own subagents, and the job starts with them.
+for (const before of [{goalLoopRecorded: false}, {legacyTeam: true}]) {
+  applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex", ...before});
+  renderTeamModels();
+  assert.deepEqual([ui.goalLoopTcs.checked, ui.goalLoopCodex.checked, ui.authorSubagentModelsMode.value], [false, true, "same"]);
+  assert.equal(ui.authorSubagentModelsHelp.textContent, kept);
+  assert.deepEqual(sent(), ["codex", null, true]);
+  renderAdvancedSummary();
+  assert.ok(allChips().some(([text, tone]) => text === "Coordinator, up to 2 author subagents at a time (the CLI's own)"
+    && tone === "accent"), JSON.stringify(allChips()));
+}
+// TCS Prover's loop or a model for each subagent gives TCS Prover's team, as for any new job; back to Codex built-in
+// and Same as the coordinator, the job's own again.
+loop("tcs");
+assert.deepEqual(sent(), ["tcs", null, undefined]);
+assert.equal(ui.authorSubagentModelsHelp.textContent, "Every author subagent runs the coordinator's model and reasoning.");
+loop("codex");
+assert.deepEqual(sent(), ["codex", null, true]);
+choose("each");
+assert.deepEqual([sent()[1].length, sent()[2]], [2, undefined]);
+choose("same");
+assert.deepEqual(sent(), ["codex", null, true]);
+// Saved settings never hold it, and a fresh form or saved settings never get it.
+assert.equal("legacyTeam" in presetFormSettings(), false);
+applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex"});
+assert.deepEqual(sent(), ["codex", null, undefined]);
+// Rerun with suggested statement takes the job's settings along.
+globalThis.promptLabels = {};
+globalThis.newProblem ??= async () => {};
+currentJob = "old-job";
+state = {...state, runId: "old-job", authorSubagents: 2, goalLoop: "codex", goalLoopRecorded: false, legacyTeam: true};
+await rerunWithStatement("A clearer statement.");
+assert.deepEqual([composerSeed.settings.goalLoop, composerSeed.settings.goalLoopRecorded, composerSeed.settings.legacyTeam],
+  ["codex", false, true]);
+""", extra_slices=[["async function rerunWithStatement(", "// The New problem page, adding to"]])
 
     def test_saved_settings_hold_the_team_and_the_goal_loop(self):
         self.run_form(r"""
@@ -440,6 +490,39 @@ assert.equal(toolCall({id: 'c1', type: 'mcpToolCall', server: 'tcs', tool: 'team
   'team_assign · completed');
 assert.equal(toolCall({id: 'c2', type: 'mcpToolCall', name: 'mcp__tcs__team_wait', status: 'completed'}).text,
   'team_wait · completed');
+""")
+
+    def test_two_assignments_of_one_member_keep_their_own_rows(self):
+        # The records the runner makes for two assignments of member 2, one after the other: each run numbers its
+        # items from item_0 again.
+        records = team_loop.member_records([(2, "Lemma A\nProve it."), (2, "Lemma B\nProve it.")])
+        self.run_app([*coordinator.ACTIVITY, INGEST], coordinator.ACTIVITY_SETUP
+                     + f"const detailRows = new Map();\nconst records = {json.dumps(records)};\n", r"""
+ingest(records, true);
+const rows = ui.timeline.children.map((row) => [row._card.label, row._card.text]);
+assert.deepEqual(rows.filter(([label]) => label.startsWith('Subagent 2')), [
+  ['Subagent 2 reasoning', 'About Lemma A.'], ['Subagent 2', 'Done: Lemma A'],
+  ['Subagent 2 reasoning', 'About Lemma B.'], ['Subagent 2', 'Done: Lemma B']]);
+assert.deepEqual(rows.filter(([label]) => label.startsWith('Author subagent 2')).map(([label]) => label), [
+  'Author subagent 2 (GPT 6.1 Sol) started', 'Author subagent 2 (GPT 6.1 Sol) finished',
+  'Author subagent 2 (GPT 6.1 Sol) started', 'Author subagent 2 (GPT 6.1 Sol) finished']);
+// A later poll that brings the second assignment's events again replaces only its own rows.
+ingest(records.filter((record) => record.subagentId === 'member-2-2'));
+assert.equal(ui.timeline.children.filter((row) => row._card.label === 'Subagent 2').length, 2);
+""")
+
+    def test_a_model_without_web_search_is_a_pinned_warning_of_the_activity_log(self):
+        record = no_web_search.warning_record()
+        self.run_app([*coordinator.ACTIVITY, INGEST], coordinator.ACTIVITY_SETUP
+                     + f"const detailRows = new Map();\nconst record = {json.dumps(record)};\n", r"""
+const card = describe(record);
+assert.deepEqual([card.type, card.label, card.pinned], ['error', 'No web search', true]);
+assert.equal(card.text, record.text);
+assert.match(card.text, /^Web search is on for this job, but the proof author's model has no web search on its connection: gpt-6.1-sol \(API connection "Lab gateway"\)\./);
+// Kept with the prompts, results and errors when routine events leave the page's window.
+assert.equal(importantEntry(record), true);
+ingest([record], true);
+assert.deepEqual(ui.timeline.children.map((row) => [row.dataset.type, row._card.label]), [['error', 'No web search']]);
 """)
 
     def test_goal_status_records_say_what_the_author_reported_and_what_happens_next(self):

@@ -78,6 +78,17 @@ class TeamError(ValueError):
     """A refused tool call: its text is the tool's answer."""
 
 
+def assignment_id(number, count):
+    """The id of member ``number``'s ``count``-th assignment (a follow-up counts as one): "member-<n>-<k>".
+
+    Every record of that assignment carries it as subagentId: its status records, its events and its retry notes.
+    Each assignment is a run of its own whose item ids start again (`codex exec --json` numbers them item_0, ...),
+    so the page keeps its rows apart by this id, and a later assignment of the member never replaces them.
+    """
+
+    return f"member-{number}-{count}"
+
+
 def validated_team(value, count=None, check_models=False):
     """The Subagent models setting ``value`` as a list of {"model", "effort"} (copies), or None.
 
@@ -397,6 +408,8 @@ class _Member:
         self.number, self.model, self.effort = entry["member"], entry["model"], entry["effort"]
         self.label, self.program = entry["modelLabel"], entry["program"]
         self.state, self.task, self.since, self.count = "idle", "", None, 0
+        # The id of its current (or last) assignment, assignment_id(); set as an assignment starts.
+        self.assignment = None
         self.thread, self.cancel, self.process = None, threading.Event(), None
         self.stop_reason = None
         # The member's last conversation, which team_followup continues: {"session", "harness"}, or None.
@@ -411,7 +424,8 @@ class Team:
     MemberConversation, ``process(popen)`` registers the CLI so that a stop can end it). A failed attempt is retried
     every ``retry_seconds`` without limit, continuing the member's conversation when the attempt worked in it,
     unless ``configuration(error)`` says only a change of settings can fix it: that failure is reported to the
-    coordinator and the member becomes idle. ``emit(kind, **fields)`` records; ``directory`` is the shared working
+    coordinator and the member becomes idle. ``emit(kind, **fields)`` records (each record of an assignment with its
+    id, assignment_id(), which ``attempt`` finds as ``member.assignment``); ``directory`` is the shared working
     folder, where reports are saved. close() stops every member (each record says why) and ends every wait.
     """
 
@@ -496,7 +510,7 @@ class Team:
 
     def _record(self, member, state, text, **fields):
         self.emit("status", label=MEMBER_LABELS[state], authorSubagent=True,
-                  subagentId=f"member-{member.number}-{member.count}", subagentTask=member.task,
+                  subagentId=member.assignment, subagentTask=member.task,
                   subagentState=state, subagentsRunning=self.running(), subagentMember=member.number,
                   subagentModel=member.label, text=text, **fields)
 
@@ -512,6 +526,8 @@ class Team:
                                 f" on \"{member.task}\"; wait for its report, or stop it with team_stop first.")
             member.state, member.task, member.since = "working", _task_line(assignment), time.time()
             member.count += 1
+            # Fixed until this assignment's report: a new one starts only when the member is idle again.
+            member.assignment = assignment_id(number, member.count)
             member.cancel, member.stop_reason, member.process = threading.Event(), None, None
             prompt = self.render(self.prompts["team_member"], {"assignment": assignment})
             member.thread = threading.Thread(target=self._run, args=(member, member.count, prompt, fork_from),
@@ -628,7 +644,8 @@ class Team:
                     base, instruction = fork_from, prompt
                     self.emit("diagnostic", text=f"Member {member.number} ({member.label}): its conversation could "
                                                  "not be continued, so the assignment runs again from its start.",
-                              subagentMember=member.number, subagentModel=member.label)
+                              subagentMember=member.number, subagentModel=member.label,
+                              subagentId=assignment_id(member.number, count))
                     continue
                 if not cancel.is_set() and self.unavailable(exc):
                     failure = f"its conversation could not be continued ({str(exc).strip()[:300]})"
@@ -645,7 +662,8 @@ class Team:
                                                  f"retrying in {self.retry_seconds:g} s"
                                                  + (", continuing its conversation." if worked else
                                                     ", running the assignment again."),
-                              subagentMember=member.number, subagentModel=member.label)
+                              subagentMember=member.number, subagentModel=member.label,
+                              subagentId=assignment_id(member.number, count))
                     if worked:
                         base = {"session": conversation.session_id, "harness": getattr(conversation, "harness", None)}
                         instruction = self.retry_note

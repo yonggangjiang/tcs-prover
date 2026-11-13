@@ -15,6 +15,8 @@ import unittest
 from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+from tests import test_no_web_search as no_web_search
+from tests import test_team_goal_loop as team_loop
 import workflow_runner as runtime
 from runner import prompt_catalog, providers
 from ui import batches, cli, presets, server
@@ -67,6 +69,13 @@ class ServerCase(unittest.TestCase):
                         if key not in {"goalLoop", "authorSubagentModels", "authorTeam"}}
             path.write_text(json.dumps(settings))
             (folder / server.PROMPT_SET_FILENAME).unlink()
+            (folder / server.PROMPT_EDITS_FILENAME).unlink(missing_ok=True)
+
+    def forget_edits(self, app):
+        """Turn a job into one saved before the texts edited for it were (its texts are saved, its edits not)."""
+
+        for folder in (server.controller_directory(app.run_dir), app.run_dir):
+            (folder / server.PROMPT_EDITS_FILENAME).unlink()
 
 
 class JobTests(ServerCase):
@@ -162,6 +171,43 @@ class JobTests(ServerCase):
         self.assertEqual(continued.state["authorSubagentModels"], MODELS)
         self.assertEqual(continued.state["promptSet"]["team_note"], "Team: {members}")
 
+    def test_a_rerun_of_a_job_from_before_keeps_codex_s_goal_mode_and_the_built_in_subagents(self):
+        old = self.job()
+        self.make_old(old)
+        restored = self.restored(old)
+        self.assertEqual((restored.state["goalLoop"], restored.state["legacyTeam"]), ("codex", True))
+        # The page's rerun of it asks for its goal loop and subagents (legacyTeam), whatever goal loop it sends.
+        for loop in ("codex", "tcs"):
+            with self.subTest(loop=loop):
+                app = self.job({"legacyTeam": True, "goalLoop": loop})
+                argv = self.launches[-1]
+                self.assertEqual((option(argv, "--goal-loop"), option(argv, "--author-team")), ("codex", "builtin"))
+                self.assertEqual((app.state["goalLoop"], app.state["authorTeam"], app.state["legacyTeam"]),
+                                 ("codex", None, True))
+                saved = self.saved(app)
+                self.assertEqual((saved["goalLoop"], saved["legacyTeam"]), ("codex", True))
+                # A new job all the same: it saves the texts it runs with.
+                texts = Path(option(argv, "--prompt-set-file"))
+                self.assertEqual(json.loads(texts.read_text()), app.state["promptSet"])
+        # Restored, resumed, revised or continued, it keeps them, as a job from before does.
+        restored = self.restored(app)
+        self.assertEqual((restored.state["goalLoop"], restored.state["authorTeam"], restored.state["legacyTeam"]),
+                         ("codex", None, True))
+        restored.resume()
+        self.assertEqual(option(self.launches[-1], "--author-team"), "builtin")
+        self.assertTrue(server.web_team_options({"goalLoop": "tcs"}, restored.state)["legacy_team"])
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(app.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual((continued.state["goalLoop"], continued.state["authorTeam"], continued.state["legacyTeam"]),
+                         ("codex", None, True))
+        self.assertEqual(option(self.launches[-1], "--author-team"), "builtin")
+        # Any other job runs TCS Prover's team, and saves no such setting.
+        app = self.job({"goalLoop": "codex"})
+        self.assertEqual((option(self.launches[-1], "--author-team"), app.state["legacyTeam"]), ("tcs", False))
+        self.assertNotIn("legacyTeam", self.saved(app))
+        self.assertFalse(self.restored(app).state["legacyTeam"])
+
     def test_the_subagent_models_are_checked_as_the_role_models_are(self):
         options = server.App._workflow_options
         for models, message in ((MODELS[:2], "Choose a model for each of the 3 author subagents"),
@@ -203,6 +249,105 @@ class JobTests(ServerCase):
                     server.App._workflow_options(include_review=False, prompt_overrides=overrides)
         with self.assertRaisesRegex(ValueError, "Prompt overrides must map prompt names to prompt text"):
             server.web_prompt_options({"promptOverrides": {"team_note": 7}}, server.PROOF_PROMPTS)
+
+
+class PromptEditTests(ServerCase):
+    """The texts edited for a job (promptEdits), saved beside every text it runs with: what a rerun carries."""
+
+    def test_a_job_saves_the_texts_edited_for_it_beside_its_texts(self):
+        defaults = server.prompt_defaults()
+        app = self.job({"promptOverrides": {"goal_continuation": "Go on: {continuation} {objective}",
+                                            "team_note": defaults["team_note"]}},
+                       author_prompt="My author. [STATEMENT]  ", critic_prompt=defaults["critic"])
+        # Each edit as the job keeps it; one that left a text as its default is no edit.
+        edits = {"goal_continuation": "Go on: {continuation} {objective}", "author": "My author. [STATEMENT]"}
+        self.assertEqual(app.state["promptEdits"], edits)
+        self.assertEqual({name: app.state["promptSet"][name] for name in edits}, edits)
+        for folder in (server.controller_directory(app.run_dir), app.run_dir):
+            self.assertEqual(json.loads((folder / server.PROMPT_EDITS_FILENAME).read_text()), edits)
+        restored = self.restored(app)
+        self.assertEqual(restored.state["promptEdits"], edits)
+        # A job without edits saves that it has none.
+        plain = self.job()
+        self.assertEqual(plain.state["promptEdits"], {})
+        self.assertEqual(self.restored(plain).state["promptEdits"], {})
+        # A job whose texts were saved before their edits were, and a job from before: none known.
+        self.forget_edits(app)
+        self.assertIsNone(self.restored(app).state["promptEdits"])
+        self.make_old(plain)
+        self.assertIsNone(self.restored(plain).state["promptEdits"])
+
+    def test_a_job_made_from_another_keeps_its_edits_and_adds_the_requests(self):
+        source = self.job({"promptOverrides": {"team_note": "Team: {members}"}}, author_prompt="Mine. [STATEMENT]")
+        edits = {"team_note": "Team: {members}", "author": "Mine. [STATEMENT]"}
+        # The source ran another default of team_wait's description than today's workflow has.
+        source.state["promptSet"] = {**source.state["promptSet"], "team_tool_wait": "Yesterday's wait."}
+        for folder in (server.controller_directory(source.run_dir), source.run_dir):
+            (folder / server.PROMPT_SET_FILENAME).write_text(json.dumps(source.state["promptSet"]))
+        # A continuation runs the source's texts and keeps its edits.
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(source.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual(continued.state["promptSet"], source.state["promptSet"])
+        self.assertEqual(continued.state["promptEdits"], edits)
+        # A revision of a job keeps its edits and adds the request's.
+        team = server.web_team_options({"promptOverrides": {"goal_continuation": "On: {continuation} {objective}"}},
+                                       source.state)
+        self.assertEqual(team["prompt_edits"], {**edits, "goal_continuation": "On: {continuation} {objective}"})
+        options = server.App._workflow_options(include_review=False, author_prompt=source.state["authorPrompt"],
+                                               **team)
+        self.assertEqual(options["promptEdits"], {**edits, "goal_continuation": "On: {continuation} {objective}"})
+        # Made from a job that saved no edits: none known, so it saves none (a rerun then compares with the defaults).
+        self.forget_edits(source)
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(source.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual(continued.state["promptSet"], source.state["promptSet"])
+        self.assertIsNone(continued.state["promptEdits"])
+        self.assertFalse((server.controller_directory(continued.run_dir) / server.PROMPT_EDITS_FILENAME).exists())
+        self.assertIs(server.web_team_options({}, {**source.state, "promptEdits": None})["prompt_edits"], False)
+
+
+class MemberRecordTests(ServerCase):
+    def test_two_assignments_of_one_member_are_both_listed_with_their_own_ids(self):
+        records = team_loop.member_records([(1, "Lemma A\nProve it."), (1, "Lemma B\nProve it.")])
+        app = self.job()
+        for record in records:
+            app.add_trace(record)
+
+        def listed(trace):
+            events = [(record["subagentId"], record["event"]["item"]["id"], record["event"]["item"]["text"])
+                      for record in trace if record.get("kind") == "codex_event" and record.get("root") is False
+                      and "item" in record["event"]]
+            statuses = [(record["subagentId"], record["subagentState"]) for record in trace
+                        if record.get("authorSubagent") is True]
+            return events, statuses
+
+        # The job's live window, and the job restored from its transcript after a restart.
+        for trace in (app.state["trace"], self.restored(app).state["trace"]):
+            events, statuses = listed(trace)
+            self.assertEqual(events, [("member-1-1", "item_0", "About Lemma A."),
+                                      ("member-1-1", "item_1", "Done: Lemma A"),
+                                      ("member-1-2", "item_0", "About Lemma B."),
+                                      ("member-1-2", "item_1", "Done: Lemma B")])
+            self.assertEqual(statuses, [("member-1-1", "started"), ("member-1-1", "finished"),
+                                        ("member-1-2", "started"), ("member-1-2", "finished")])
+
+
+class NoWebSearchTests(ServerCase):
+    def test_the_warning_stays_listed_with_the_job_s_other_warnings(self):
+        warning = no_web_search.warning_record()
+        app = self.job()
+        app.add_trace(warning)
+        for index in range(server.TRACE_LIMIT + 10):
+            app.add_trace({"kind": "status", "stage": "solve", "node": "author", "label": "Routine",
+                           "text": str(index)})
+        # Routine records pushed it out of the live window; it stays pinned, in the page's trace and after a restart.
+        self.assertNotIn(warning["text"], [record.get("text") for record in app.state["trace"]])
+        for job in (app, self.restored(app)):
+            listed = [record for record in job.retained_trace() if record.get("label") == "No web search"]
+            self.assertEqual([(record["kind"], record["text"]) for record in listed],
+                             [("diagnostic", warning["text"])])
 
 
 class SettingsTests(ServerCase):
@@ -306,13 +451,19 @@ class SetupTests(ServerCase):
 
 class BatchViewTests(ServerCase):
     def test_a_saved_job_in_a_batch_shows_its_loop_team_and_texts(self):
-        app = self.job({"authorSubagentModels": MODELS})
+        app = self.job({"authorSubagentModels": MODELS, "promptOverrides": {"team_note": "Team: {members}"}})
         catalog = batches.BatchCatalog(self.runs) if hasattr(batches, "BatchCatalog") else None
         if catalog is None:
             self.skipTest("no batch catalog class")
         state = catalog.state(batches.ORIGINAL_BATCH, app.run_dir.name)
         self.assertEqual((state["goalLoop"], state["authorSubagentModels"]), ("tcs", MODELS))
         self.assertEqual(state["promptSet"], app.state["promptSet"])
+        # The texts edited for it, which a rerun from the saved batch carries.
+        self.assertEqual(state["promptEdits"], {"team_note": "Team: {members}"})
+        self.assertEqual((state["goalLoopRecorded"], state["legacyTeam"]), (True, False))
         self.make_old(app)
         state = catalog.state(batches.ORIGINAL_BATCH, app.run_dir.name)
         self.assertEqual((state["goalLoop"], state["authorTeam"], state["promptSet"]), ("codex", None, None))
+        self.assertIsNone(state["promptEdits"])
+        # As a restored job from before: a rerun from the saved batch keeps its goal loop and subagents.
+        self.assertEqual((state["goalLoopRecorded"], state["legacyTeam"]), (False, True))
