@@ -240,6 +240,21 @@ class WebCutoffTests(RelatedWorksCase):
         self.assertFalse((app.run_dir / "related-works" / "third.txt").exists())
         self.assertFalse(self.expired(third))
 
+    def test_a_web_cutoff_job_takes_its_batchs_shared_works_audited_and_keeps_them(self):
+        self.manager.add_batch_shared_works([self.upload("defs.md", b"defs")], "")
+        app = self.start(retrievalMode="historical", retrievalCutoffUtc=CUTOFF)
+        self.assertEqual(self.launches[-1][2], ["INDEX.md", "defs.md"])
+        [record] = self.audit(app)
+        [entry] = record["relatedWorks"]
+        self.assertEqual((entry["name"], entry["batch"], entry["sha256"]),
+                         ("defs.md", "default", related_works.hashlib.sha256(b"defs").hexdigest()))
+        retrieval.check_run(app.state["retrievalPolicyPath"], app.run_dir, controller_root=self.root / "controller")
+        # Even before its author starts, a web-cutoff job keeps what its audit log says it was given.
+        app.state.update(phase="prepared")
+        result = self.manager.remove_batch_shared_work("defs.md", "")
+        self.assertEqual((app.run_dir / "related-works" / "defs.md").read_bytes(), b"defs")
+        self.assertTrue(result["summary"].endswith(" 1 problem that has started or has a web cutoff keeps its copy."))
+
 
 class NoticeTests(RelatedWorksCase):
     def setUp(self):
@@ -440,6 +455,384 @@ class FolderBatchTests(RelatedWorksCase):
         self.assertFalse(self.expired(token))
 
 
+class SharedWorksTests(RelatedWorksCase):
+    """Related works a batch shares with every problem in it: the default batch's and a batch made with New batch."""
+
+    def setUp(self):
+        super().setUp()
+        from ui import batches, named_batches
+        self.manager.named_batches = named_batches.NamedBatches(
+            self.runs / server.CONTROLLER_FOLDER / named_batches.FILENAME)
+        self.manager.batch_catalog = batches.BatchCatalog(self.runs)
+
+    def store_file(self, name, batch=""):
+        return server.batch_shared_store(self.runs, batch).root / related_works.FOLDER / name
+
+    def folder(self, app):
+        return app.run_dir / related_works.FOLDER
+
+    def steers(self, app):
+        path = app.run_dir / server.AUTHOR_STEER_FILENAME
+        return [item["instruction"] for item in json.loads(path.read_text())["queue"]] if path.exists() else []
+
+    def share(self, batch="", *names):
+        return self.manager.add_batch_shared_works([self.upload(name, f"{name}\n".encode()) for name in names], batch)
+
+    def test_works_shared_with_a_batch_reach_every_problem_that_can_still_take_them(self):
+        running, paused, queued, waiting, done, authorless, elsewhere, stopped_review = [self.start() for _ in range(8)]
+        running.state.update(goalThreadId="thread-1")
+        self.paused(paused)
+        queued.state.update(phase="prepared")
+        waiting.state.update(phase="reviewed")
+        # A statement review that failed or was stopped runs again in this job: its author has yet to start.
+        stopped_review.state.update(phase="input", error="Review stopped.")
+        done.state.update(phase="done")
+        authorless.state.update(workflowStages={**STAGES, "author": False})
+        elsewhere.state["runningElsewhere"] = "Another TCS Prover process runs this job."
+        named = self.manager.named_batches.create("Graph coloring")["id"]
+        other = self.manager.start_workflow({"content": "Prove T.", "workflowStages": dict(STAGES)}, batch=named)
+        result = self.manager.add_batch_shared_works([self.upload("defs.md", b"# Definitions\n")], "")
+        self.assertEqual((result["batch"], result["added"], result["count"], result["available"]),
+                         ("__root__", ["defs.md"], 1, True))
+        stored = self.store_file("defs.md")
+        self.assertEqual(stored.parent.parent, self.runs / server.CONTROLLER_FOLDER / ".batches" / "default")
+        # One copy, hard-linked into every problem of the batch that can still take related works ...
+        for app in (running, paused, queued, waiting, stopped_review):
+            self.assertEqual(inode(self.folder(app) / "defs.md"), inode(stored))
+        # ... never into a finished one, one without an Author stage, one another process runs, or another batch's.
+        for app in (done, authorless, elsewhere, other):
+            self.assertFalse((self.folder(app) / "defs.md").exists())
+        notices = {row["runId"]: row["notice"] for row in result["results"]}
+        self.assertEqual(notices, {running.state["runId"]: "instruction", paused.state["runId"]: "pending",
+                                   queued.state["runId"]: "", waiting.state["runId"]: "",
+                                   stopped_review.state["runId"]: "", elsewhere.state["runId"]: ""})
+        # Running and paused authors are told as a folder run's additions tell them; the others' first prompt does.
+        notice = related_works.notice_text(["defs.md"])
+        self.assertEqual((self.steers(running), paused.state["relatedWorksPending"]), ([notice], ["defs.md"]))
+        self.assertEqual((self.steers(queued), self.steers(waiting), self.steers(stopped_review)), ([], [], []))
+        self.assertEqual(result["summary"], "5 problems in this batch got it now, and 2 running or paused authors are "
+                                            "told. New problems in this batch get it too.")
+        self.assertEqual(result["notice"], f"Could not add them to every problem: {elsewhere.state['runId']}: Another "
+                                           f"TCS Prover process runs this job.")
+        record = next(record for record in running.state["trace"] if record.get("label") == "Related works added")
+        self.assertEqual((record["text"], record["sharedBatch"], record["relatedWorks"][0]["batch"]),
+                         ("Added defs.md (14 B) to this job's related-works folder: shared with every problem in this "
+                          "batch.", "default", "default"))
+        self.assertNotIn("folderBatch", record)
+        [item] = running.snapshot()["relatedWorks"]["items"]
+        self.assertEqual((item["name"], item["batch"], item["sharedFrom"]), ("defs.md", "default", "batch"))
+        self.assertEqual([item["name"] for item in self.manager.batch_shared_works("")["items"]], ["defs.md"])
+        # With no problem that can take them, the works wait for new ones.
+        empty = self.manager.named_batches.create("Empty")["id"]
+        self.assertEqual(self.share(empty, "later.md")["summary"],
+                         "No problem in this batch can take related works now; new problems in this batch get it.")
+
+    def test_a_job_being_stopped_counts_as_what_its_stop_leaves(self):
+        # A Stop of the statement review, the critic or a later step takes a moment ("stopping"), then leaves an
+        # unfinished problem: the review back at its input (its author has not started), the step paused for
+        # Continue. A work shared or removed meanwhile is handled as for that problem, never silently skipped.
+        critic = self.start()
+        critic.state.update(phase="stopping", stage="critic", activeNode="critic", goalThreadId="thread-1")
+        review = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True}})
+        review.state.update(phase="stopping")
+        self.assertEqual(review.state["stage"], "review")
+        result = self.share("", "defs.md")
+        for app in (critic, review):
+            with self.subTest(job=app.state["stage"]):
+                self.assertEqual(inode(self.folder(app) / "defs.md"), inode(self.store_file("defs.md")))
+        # The critic's author is told when the job continues; the review's author finds it through its first prompt.
+        self.assertEqual({row["runId"]: row["notice"] for row in result["results"]},
+                         {critic.state["runId"]: "pending", review.state["runId"]: ""})
+        self.assertEqual((critic.state["relatedWorksPending"], review.state["relatedWorksPending"]), (["defs.md"], []))
+        self.assertEqual(self.steers(critic), [])
+        self.assertEqual((result["summary"], result["notice"]),
+                         ("2 problems in this batch got it now, and 1 running or paused author is told. New problems "
+                          "in this batch get it too.", ""))
+        # Removed while they stop: the review, whose author has not started, loses it; the critic's job keeps it.
+        result = self.manager.remove_batch_shared_work("defs.md", "")
+        self.assertFalse(self.folder(review).exists())  # It was its only related work: no folder is left.
+        self.assertEqual((self.folder(critic) / "defs.md").read_bytes(), b"defs.md\n")
+        self.assertIn("Related works removed", self.labels(review))
+        self.assertEqual(result["summary"], "Removed defs.md. New problems in this batch no longer get it. It was taken "
+                                            "out of 1 problem that had not started. 1 problem that has started or has "
+                                            "a web cutoff keeps its copy.")
+
+    def test_a_job_that_cannot_link_the_batchs_works_gets_its_own_copy_and_says_so(self):
+        queued = self.start()
+        queued.state.update(phase="prepared")
+        real_link = os.link
+
+        def refuse(source, target, *args, **kwargs):
+            if "dst_dir_fd" in kwargs and str(source) == "defs.md":
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_link(source, target, *args, **kwargs)
+
+        with patch.object(related_works.os, "link", side_effect=refuse):
+            self.share("", "defs.md")
+            created = self.start()
+        for app in (queued, created):
+            with self.subTest(job=app.state["runId"]):
+                copy = self.folder(app) / "defs.md"
+                self.assertEqual(copy.read_bytes(), self.store_file("defs.md").read_bytes())
+                self.assertNotEqual(inode(copy), inode(self.store_file("defs.md")))
+                diagnostic = next(record for record in app.state["trace"] if record.get("kind") == "diagnostic")
+                self.assertIn("could not be hard-linked into this job's related-works folder", diagnostic["text"])
+                self.assertIn("so this job has its own copy of defs.md", diagnostic["text"])
+
+    def test_a_new_problem_takes_its_batchs_works_before_its_author_starts(self):
+        named = self.manager.named_batches.create("Graph coloring")["id"]
+        self.share(named, "defs.md")
+        self.share("", "root.md")
+        app = self.manager.start_workflow({"content": "Prove S.", "workflowStages": dict(STAGES)}, batch=named)
+        argv, cwd, present = self.launches[-1]
+        self.assertEqual((cwd, present), (app.run_dir, ["INDEX.md", "defs.md"]))
+        self.assertIn("related_works=true", argv)
+        self.assertEqual(inode(self.folder(app) / "defs.md"), inode(self.store_file("defs.md", named)))
+        self.assertIn("Related works added", self.labels(app))
+        self.assertEqual(self.steers(app), [])  # Its first prompt points to the folder.
+        root = self.start()
+        self.assertEqual(self.launches[-1][2], ["INDEX.md", "root.md"])
+        # A statement review keeps them for the author; a job without an Author stage gets none.
+        reviewed = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True}},
+                                               batch=named)
+        self.assertEqual(sorted(os.listdir(self.folder(reviewed))), ["INDEX.md", "defs.md"])
+        critic = self.manager.start_workflow({"content": "Prove S. Proof: ...",
+                                              "workflowStages": {**STAGES, "author": False}}, batch=named)
+        self.assertFalse(self.folder(critic).exists())
+        self.assertEqual(self.launches[-1][2], None)
+        self.assertEqual([item["name"] for item in root.snapshot()["relatedWorks"]["items"]], ["root.md"])
+
+    def test_a_folder_run_into_a_batch_takes_the_batchs_works_and_its_own(self):
+        named = self.manager.named_batches.create("Graph coloring")["id"]
+        self.share(named, "defs.md")
+        started = self.manager.start_direct_batch(
+            {"statements": [{"name": name, "statement": f"Prove {name}."} for name in ("a.md", "b.md")],
+             "workflowStages": dict(STAGES), "relatedWorks": [self.upload("run.txt", b"run")]}, batch=named)
+        for app in started:
+            with self.subTest(job=app.state["sourceFile"]):
+                items = app.snapshot()["relatedWorks"]["items"]
+                self.assertEqual([(item["name"], item["sharedFrom"]) for item in items],
+                                 [("run.txt", "folderRun"), ("defs.md", "batch")])
+                self.assertEqual(inode(self.folder(app) / "defs.md"), inode(self.store_file("defs.md", named)))
+
+    def test_removing_a_shared_work_takes_it_only_from_new_problems_and_those_that_have_not_started(self):
+        self.assertEqual(self.share("", "a.txt", "b.txt")["summary"],
+                         "No problem in this batch can take related works now; new problems in this batch get them.")
+        jobs = [self.start() for _ in range(10)]
+        queued, waiting, stopped_review, running, paused, done, cutoff, follower, launching, requeued = jobs
+        queued.state.update(phase="prepared")
+        waiting.state.update(phase="reviewed")
+        stopped_review.state.update(phase="input")
+        running.state.update(goalThreadId="thread-1")
+        self.paused(paused)
+        done.state.update(phase="done", goalThreadId="thread-2")
+        cutoff.state.update(phase="prepared", retrievalPolicyPath=str(self.root / "policy.json"))
+        # A continuation working in another job's workspace keeps what that workspace has.
+        follower.state.update(phase="prepared", goalWorkspace=str(waiting.run_dir))
+        # An author that is starting (no conversation yet), and a queued job whose author ran before, keep it too.
+        self.assertEqual((launching.state["phase"], bool(launching.state.get("goalThreadId"))), ("running", False))
+        requeued.state.update(phase="prepared", goalThreadId="thread-3")
+        result = self.manager.remove_batch_shared_work("a.txt", "")
+        self.assertEqual((result["removed"], [item["name"] for item in result["items"]]), ("a.txt", ["b.txt"]))
+        self.assertEqual(result["summary"], "Removed a.txt. New problems in this batch no longer get it. It was taken "
+                                            "out of 2 problems that had not started. 8 problems that have started or "
+                                            "have a web cutoff keep their copy.")
+        self.assertEqual(result["notice"], "")
+        for app in (queued, stopped_review):
+            with self.subTest(job="unstarted"):
+                self.assertEqual(sorted(os.listdir(self.folder(app))), ["INDEX.md", "b.txt"])
+                self.assertEqual((self.folder(app) / "INDEX.md").read_text().splitlines()[4:], ["1. b.txt: 6 B."])
+                self.assertEqual([item["name"] for item in app.snapshot()["relatedWorks"]["items"]], ["b.txt"])
+                record = next(record for record in app.state["trace"] if record.get("label") == "Related works removed")
+                self.assertEqual((record["text"], record["sharedBatch"]),
+                                 ("Removed a.txt (6 B) from this job's related-works folder: it was removed from the "
+                                  "works shared with every problem in this batch before this job's author started.",
+                                  "default"))
+        # The waiting job shares its workspace with the continuation: both keep it, as every started job does.
+        for app in (waiting, running, paused, done, cutoff, launching, requeued):
+            with self.subTest(job=app.state["runId"]):
+                self.assertEqual((self.folder(app) / "a.txt").read_bytes(), b"a.txt\n")
+                self.assertNotIn("Related works removed", self.labels(app))
+        self.assertEqual(self.labels(running).count("Live instruction queued"), 0)
+        # New problems get what the batch holds now.
+        self.start()
+        self.assertEqual(self.launches[-1][2], ["INDEX.md", "b.txt"])
+        # A new work named like the removed one takes another name, so the jobs that kept a.txt get it too.
+        added = self.share("", "a.txt")
+        self.assertEqual(added["added"], ["a-2.txt"])
+        self.assertEqual(sorted(os.listdir(self.folder(running))), ["INDEX.md", "a-2.txt", "a.txt", "b.txt"])
+        self.assertEqual(self.steers(running), [related_works.notice_text(["a-2.txt"])])
+        with self.assertRaises(ValueError) as refused:
+            self.manager.remove_batch_shared_work("a.txt", "")
+        self.assertEqual(str(refused.exception), "The batch has no related work named a.txt.")
+        for name in ("", None, 7):
+            with self.assertRaises(ValueError):
+                self.manager.remove_batch_shared_work(name, "")
+
+    def test_a_job_made_while_its_batch_changes_is_brought_in_line_when_registered(self):
+        self.share("", "a.txt")
+        store = server.batch_shared_store(self.runs, "")
+        real = server.App._install_new_related_works_locked
+
+        def meanwhile(app, *args, **kwargs):
+            outcome = real(app, *args, **kwargs)
+            # Another tab shares b.txt and removes a.txt now: the batch's jobs do not include this one yet.
+            store.install([self.upload("b.txt", b"b")], self.stage)
+            store.remove("a.txt")
+            return outcome
+
+        with patch.object(server.App, "_install_new_related_works_locked", autospec=True, side_effect=meanwhile):
+            reviewing = self.manager.start_workflow({"content": "Prove S.",
+                                                     "workflowStages": {**STAGES, "review": True}})
+        # Its author has not started: it gets b.txt and loses a.txt, before its first prompt.
+        self.assertEqual(reviewing.state["phase"], "reviewing")
+        self.assertEqual(sorted(os.listdir(self.folder(reviewing))), ["INDEX.md", "b.txt"])
+        self.assertEqual([label for label in self.labels(reviewing) if label.startswith("Related works")],
+                         ["Related works added", "Related works added", "Related works removed"])
+        self.assertEqual(self.steers(reviewing), [])
+        store.install([self.upload("a.txt", b"a")], self.stage)
+        with patch.object(server.App, "_install_new_related_works_locked", autospec=True,
+                          side_effect=lambda app, *args, **kwargs: (real(app, *args, **kwargs),
+                                                                     store.install([self.upload("c.txt", b"c")],
+                                                                                   self.stage),
+                                                                     store.remove("a-2.txt"))[0]):
+            running = self.start()
+        # Its author is already running: it is told about c.txt, and keeps a-2.txt.
+        self.assertEqual(running.state["phase"], "running")
+        self.assertEqual(sorted(os.listdir(self.folder(running))), ["INDEX.md", "a-2.txt", "b.txt", "c.txt"])
+        self.assertEqual(self.steers(running), [related_works.notice_text(["c.txt"])])
+
+    def test_a_batch_store_that_cannot_be_read_as_a_job_is_registered_takes_nothing_from_it(self):
+        self.share("", "a.txt")
+        store = server.batch_shared_store(self.runs, "")
+        real_open, real_settle = related_works._open_path, server.Server._settle_shared_works
+
+        def unreadable(path, *args, **kwargs):
+            if Path(path) == store.root:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(path, *args, **kwargs)
+
+        def settle(manager, app):
+            # The store's record cannot be read for a moment, just as the new job is brought in line with it.
+            with patch.object(related_works, "_open_path", side_effect=unreadable):
+                return real_settle(manager, app)
+
+        with patch.object(server.Server, "_settle_shared_works", autospec=True, side_effect=settle):
+            app = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True}})
+        # A read error is no removal: the job keeps the work it got when it was created, and its log says why
+        # nothing more was checked.
+        self.assertEqual(sorted(os.listdir(self.folder(app))), ["INDEX.md", "a.txt"])
+        self.assertNotIn("Related works removed", self.labels(app))
+        diagnostic = next(record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic")
+        self.assertEqual(diagnostic, "This job's related works could not be brought in line with what its batch "
+                                     "shares: The record of the batch's shared related works cannot be read.")
+
+    def test_a_continuation_that_reopens_its_author_is_told_of_shared_works_its_folder_lacked(self):
+        source = self.start()
+        source.state.update(goalThreadId="thread-1")
+        source._save_job_settings(source.state)
+        source.state.update(phase="done")
+        self.share("", "defs.md")
+        self.assertFalse((self.folder(source) / "defs.md").exists())  # It had finished.
+        follower = server.App(runs=self.runs, load_latest=False)
+        follower.shared_store = server.shared_store_id("")
+        follower.start_direct_statement("Prove S.", workflow_stages=dict(STAGES),
+                                        continuation_source=source.run_dir, stopped_stage="solve")
+        self.assertEqual((follower.state["goalThreadId"], follower.state["goalResume"]), ("thread-1", True))
+        self.assertEqual(inode(self.folder(source) / "defs.md"), inode(self.store_file("defs.md")))
+        self.assertEqual(self.steers(follower), [related_works.notice_text(["defs.md"])])
+        record = next(record for record in follower.state["trace"] if record.get("label") == "Live instruction queued")
+        self.assertEqual(record["relatedWorks"], ["defs.md"])
+
+    def test_a_review_retry_links_its_batchs_works_from_the_batch(self):
+        self.share("", "defs.md")
+        source = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True},
+                                              "relatedWorks": [self.upload("own.txt", b"own")]})
+        with source.lock:
+            source.state.update(phase="input", error="Review failed: offline.")
+        retry = server.App(runs=self.runs, load_latest=False)
+        retry.shared_store = server.shared_store_id("")
+        retry.start_review("Prove S.", workflow_stages={**STAGES, "review": True},
+                           continuation_source=source.run_dir, stopped_stage="review")
+        # Its own copy of the source's work, and the batch's one stored copy of what the batch shares now.
+        self.assertEqual(sorted(os.listdir(self.folder(retry))), ["INDEX.md", "defs.md", "own.txt"])
+        self.assertNotEqual(inode(self.folder(retry) / "own.txt"), inode(self.folder(source) / "own.txt"))
+        self.assertEqual(inode(self.folder(retry) / "defs.md"), inode(self.store_file("defs.md")))
+        self.assertEqual([(item["name"], item["sharedFrom"]) for item in retry.snapshot()["relatedWorks"]["items"]],
+                         [("own.txt", ""), ("defs.md", "batch")])
+
+    def test_a_problem_that_would_pass_the_item_limit_with_its_batchs_works_is_refused_before_anything_starts(self):
+        self.share("", "a.md", "b.md")
+        token = self.upload("own.md")
+        message = ("A job can hold at most 2 related works: the 1 listed here and the 2 shared with every problem in "
+                   "this batch make 3. Remove some here, or some of the batch's on the batch page.")
+        with patch.object(related_works, "MAX_ITEMS", 2):
+            with self.assertRaises(ValueError) as refused:
+                self.start(relatedWorks=[token])
+            self.assertEqual(str(refused.exception), message)
+            with self.assertRaises(ValueError) as refused:
+                self.manager.start_direct_batch({"statements": [{"name": "a.md", "statement": "Prove A."}],
+                                                 "workflowStages": dict(STAGES), "relatedWorks": [token]})
+            self.assertEqual(str(refused.exception), message)
+            # Without the Author stage nothing would be added, so nothing is refused for it either.
+            self.manager.start_direct_batch({"statements": [{"name": "a.md", "statement": "Prove A."}],
+                                             "workflowStages": {**STAGES, "author": False}})
+        self.assertEqual(len(self.manager.jobs), 1)
+        self.assertFalse(self.expired(token))
+        self.assertEqual(self.launches[-1][2], None)
+
+    def test_a_batch_store_that_cannot_be_read_never_stops_a_new_problem(self):
+        self.share("", "a.md")
+        manifest = server.batch_shared_store(self.runs, "").root / related_works.MANIFEST_NAME
+        manifest.write_text(json.dumps({"schemaVersion": 1, "items": [{"name": "a.md", "kind": "file", "size": 5,
+                                                                       "sha256": "0" * 64}, {"broken": True}]}))
+        app = self.start()
+        self.assertEqual(app.state["phase"], "running")
+        self.assertIsNone(self.launches[-1][2])
+        diagnostics = [record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic"]
+        self.assertEqual(diagnostics[0], "The related works shared with every problem in this batch were not added to "
+                                         f"this job: {related_works.DAMAGED}")
+
+    def test_cards_show_what_a_batch_shares_and_delete_batch_removes_it(self):
+        named = self.manager.named_batches.create("Graph coloring")["id"]
+        self.share(named, "a.md", "b.md", "c.md", "d.md")
+        cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
+        self.assertEqual(cards[named]["sharedWorks"], {"count": 4, "names": ["a.md", "b.md", "c.md"]})
+        # The default batch is listed once it shares works, even with no problem yet.
+        self.assertNotIn(server.DEFAULT_BATCH, cards)
+        self.share("", "root.md")
+        cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
+        self.assertEqual((cards[server.DEFAULT_BATCH]["jobCount"], cards[server.DEFAULT_BATCH]["sharedWorks"]),
+                         (0, {"count": 1, "names": ["root.md"]}))
+        store = server.batch_shared_store(self.runs, named)
+        self.assertTrue(store.root.is_dir())
+        self.manager.delete_batch(named)
+        self.assertFalse(store.root.exists())
+        for batch in (named, "batch_0000000000"):
+            with self.subTest(batch=batch), self.assertRaises(ValueError) as refused:
+                self.manager.batch_shared_works(batch)
+            self.assertEqual(str(refused.exception), "That batch no longer exists.")
+        token = self.upload()
+        with self.assertRaises(ValueError):
+            self.manager.add_batch_shared_works([token], named)
+        self.assertFalse(self.expired(token))
+        self.assertFalse(store.root.exists())
+
+    def test_a_saved_batch_shares_nothing(self):
+        saved = self.runs / "earlier" / "2026-01-01_00-00-00_job"
+        saved.mkdir(parents=True)
+        (saved / "job-settings.json").write_text(json.dumps({"preparedRun": True}))
+        (saved / "draft.md").write_text("# Draft problem\n\nOld.\n")
+        self.assertTrue(self.manager.saved_batch("earlier"))
+        for call in (lambda: self.manager.batch_shared_works("earlier"),
+                     lambda: self.manager.add_batch_shared_works([self.upload()], "earlier"),
+                     lambda: self.manager.remove_batch_shared_work("a.md", "earlier")):
+            with self.assertRaises(ValueError) as refused:
+                call()
+            self.assertEqual(str(refused.exception), "Saved batches are read-only.")
+        self.assertFalse((self.runs / server.CONTROLLER_FOLDER / ".batches").exists())
+
+
 class UploadRouteTests(RelatedWorksCase):
     def setUp(self):
         super().setUp()
@@ -527,6 +920,77 @@ class UploadRouteTests(RelatedWorksCase):
         state = self.http.get_job(app.state["runId"]).snapshot()
         self.assertEqual([item["name"] for item in state["relatedWorks"]["items"]], ["paper.txt", "shared.txt"])
         self.assertEqual(state["relatedWorks"]["batch"]["count"], 1)
+
+
+
+class SharedWorksRouteTests(RelatedWorksCase):
+    """The routes of a batch's shared related works, on a server of its own (no model starts)."""
+
+    post = UploadRouteTests.post
+
+    def setUp(self):
+        super().setUp()
+        self.http = server.Server((server.HOST, 0), runs=self.runs)
+        thread = threading.Thread(target=self.http.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.http.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.http.shutdown)
+
+    def get(self, path, token=True):
+        connection = http.client.HTTPConnection(server.HOST, self.http.server_port, timeout=10)
+        try:
+            connection.request("GET", path, headers={"X-TCS-Prover-Token": self.http.token} if token else {})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read() or b"{}")
+        finally:
+            connection.close()
+
+    def call(self, path, body):
+        return self.post(path, json.dumps(body).encode(), content_type="application/json")
+
+    def test_a_batch_shares_lists_and_removes_works_through_its_routes(self):
+        saved = self.runs / "earlier" / "2026-01-01_00-00-00_job"
+        saved.mkdir(parents=True)
+        (saved / "job-settings.json").write_text(json.dumps({"preparedRun": True}))
+        (saved / "draft.md").write_text("# Draft problem\n\nOld.\n")
+        status, value = self.call("/batches", {"name": "Graph coloring"})
+        self.assertEqual(status, 200, value)
+        batch = value["batch"]["id"]
+        self.assertEqual(self.get(f"/batch-shared-works?batch={batch}"),
+                         (200, {"batch": batch, "available": True, "reason": "", "count": 0, "items": []}))
+        status, value = self.call(f"/batch-shared-works/add?batch={batch}", {"uploads": [self.upload("defs.md")]})
+        self.assertEqual(status, 200, value)
+        self.assertEqual((value["added"], value["count"], value["notice"]), (["defs.md"], 1, ""))
+        self.assertEqual(value["summary"], "No problem in this batch can take related works now; new problems in this "
+                                           "batch get it.")
+        cards = {card["id"]: card for card in self.get("/batches")[1]["batches"]}
+        self.assertEqual(cards[batch]["sharedWorks"], {"count": 1, "names": ["defs.md"]})
+        # Without a batch, and as __root__, the routes name the default batch.
+        for query in ("", "?batch=__root__"):
+            status, value = self.get("/batch-shared-works" + query)
+            self.assertEqual((status, value["batch"], value["count"]), (200, "__root__", 0))
+        status, value = self.call("/batch-shared-works/add", {"uploads": [self.upload("root.md")]})
+        self.assertEqual((status, value["batch"], value["added"]), (200, "__root__", ["root.md"]))
+        status, value = self.call(f"/batch-shared-works/remove?batch={batch}", {"name": "defs.md"})
+        self.assertEqual((status, value["removed"], value["count"]), (200, "defs.md", 0))
+        self.assertEqual(value["summary"], "Removed defs.md. New problems in this batch no longer get it.")
+        status, value = self.call(f"/batch-shared-works/remove?batch={batch}", {"name": "defs.md"})
+        self.assertEqual((status, value["error"]), (400, "The batch has no related work named defs.md."))
+        # Saved batches are read-only; a deleted batch is gone; a job is never named here.
+        token = self.upload("late.md")
+        self.assertEqual(self.get("/batch-shared-works?batch=earlier"), (400, {"error": "Saved batches are read-only."}))
+        for path, expected in ((f"/batch-shared-works/add?batch=earlier", (403, "Saved batches are read-only.")),
+                               (f"/batch-shared-works/remove?batch=earlier", (403, "Saved batches are read-only.")),
+                               ("/batch-shared-works/add?batch=batch_0000000000", (403, "That batch no longer exists.")),
+                               (f"/batch-shared-works/add?batch={batch}&job=x", (404, "Not found."))):
+            with self.subTest(path=path):
+                status, value = self.call(path, {"uploads": [token], "name": "root.md"})
+                self.assertEqual((status, value["error"]), expected)
+        self.assertFalse(self.expired(token))
+        self.assertEqual(self.get(f"/batch-shared-works?batch={batch}&job=x"), (404, {"error": "Not found."}))
+        self.assertEqual(self.get(f"/batch-shared-works?batch={batch}", token=False)[0], 403)
+        self.assertEqual(self.call(f"/batch-shared-works/add?batch={batch}", {"uploads": "x"})[0], 400)
 
 
 if __name__ == "__main__":

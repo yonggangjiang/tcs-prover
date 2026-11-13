@@ -1465,6 +1465,11 @@ kbd {
 .composer-batch[hidden] { display: none; }
 /* Its button's words line up with the note's when the button wraps under it (phones). */
 .composer-batch .ghost { margin-inline-start: calc(-1 * var(--space-2)); padding-inline: var(--space-2); }
+/* The related works that batch shares with every problem, which this problem gets too. */
+.composer-shared { max-width: 80ch; margin-top: 4px; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.5;
+  overflow-wrap: anywhere; }
+.composer-shared[hidden] { display: none; }
+.composer-shared a { font-weight: 600; white-space: nowrap; }
 
 /* Overview: six totals, then the batches as a table. */
 .stat-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin: 0 0 var(--space-7); }
@@ -1582,6 +1587,8 @@ kbd {
   text-overflow: ellipsis;
 }
 .batch-card-count { grid-area: count; color: var(--ink-3); font: 500 var(--text-xs)/1.4 var(--font-mono); white-space: nowrap; }
+/* The works a batch shares with every problem, on their own line under its problem count. */
+.batch-card-shared { display: block; color: var(--ink-2); }
 .batch-badge { grid-area: badge; justify-self: start; min-height: 20px; padding: 0 8px; }
 .batch-progress { display: flex; flex-wrap: wrap; grid-area: progress; align-items: center; gap: 4px 16px; margin: 0; }
 .batch-progress:empty::before { color: var(--ink-3); content: "No problems yet"; font-size: var(--text-sm); }
@@ -4505,6 +4512,10 @@ kbd {
 .batch-related-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; }
 .batch-related-head strong { font-size: var(--text-sm); font-weight: 650; }
 .batch-related-group > .help { margin: 0; overflow-wrap: anywhere; }
+/* Shared with every problem in this batch: above the folder runs, its heading beside the count. */
+.batch-shared > .batch-related-head { justify-content: flex-start; }
+.batch-shared > .related-works-list { margin: 4px 0 0; }
+.batch-shared > .help { max-width: 80ch; }
 @media (max-width: 599px) {
   .steer-buttons { justify-content: stretch; }
   .steer-buttons > button { flex: 1 1 auto; }

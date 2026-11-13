@@ -250,6 +250,11 @@ RESTART_PAUSE_CAUSES = {"restart", "interrupted"}
 DEFAULT_BATCH = "__root__"
 # A folder batch ("Run a folder…") shares one related-works store among its jobs.
 FOLDER_BATCH_ID = re.compile(r"b_[0-9a-f]{10}\Z")
+# Every batch of jobs (the default one too) shares related works with every problem in it, from a store of the
+# same kind beside the folder runs' stores: named by the batch's ID, or this name for the default batch.
+DEFAULT_SHARED_STORE = "default"
+# How many of a batch's shared works its card names (the New problem page names them).
+SHARED_NAMES_SHOWN = 3
 # Staged uploads older than a day are removed at most this often (and when the server starts).
 UPLOAD_PRUNE_SECONDS = 3600
 ROLES = ("review", "author", "critic", "writer")
@@ -623,11 +628,39 @@ def related_works_tokens(value):
     return value
 
 
-def related_works_text(entries, *, batch=False):
-    """The text of a "Related works added" record."""
+def shared_store_id(batch_id):
+    """The store of the related works a batch of jobs shares with every problem: the batch's ID, or "default"."""
+
+    if batch_id in ("", None, DEFAULT_BATCH):
+        return DEFAULT_SHARED_STORE
+    if isinstance(batch_id, str) and named_batches.BATCH_ID.match(batch_id):
+        return batch_id
+    raise ValueError("That batch is not available in this TCS Prover session.")
+
+
+def batch_shared_store(runs, batch_id):
+    """The related works shared with every problem in a batch: runs/.controller/.batches/<store ID>."""
+
+    return related_works.BatchStore(related_works.batch_directory(Path(runs) / CONTROLLER_FOLDER,
+                                                                  shared_store_id(batch_id)))
+
+
+def shared_store_key(store_id):
+    """How a record names the store a work is shared from: its folder run ("folderBatch"), or its batch."""
+
+    if not store_id:
+        return {}
+    return {"folderBatch": store_id} if related_works.shared_from(store_id) == "folderRun" else {"sharedBatch": store_id}
+
+
+def related_works_text(entries, *, batch=""):
+    """The text of a "Related works added" record (``batch``: the store the works are shared from, if any)."""
 
     listed = "; ".join(related_works.describe_entry(entry) for entry in entries)
-    where = "the folder batch's related works, linked into this job's" if batch else "the author's"
+    kind = related_works.shared_from(batch) if isinstance(batch, str) else ("folderRun" if batch else "")
+    if kind == "batch":
+        return f"Added {listed} to this job's related-works folder: shared with every problem in this batch."
+    where = "the folder batch's related works, linked into this job's" if kind else "the author's"
     return f"Added {listed} to {where} related-works folder."
 
 
@@ -638,8 +671,50 @@ def related_works_record(entries, *, batch=""):
             "relatedWorks": [{"name": entry["name"], "originalName": entry.get("originalName", ""),
                               "sizeText": related_works.size_text(entry.get("size", 0)),
                               **({"batch": batch} if batch else {})} for entry in entries],
-            "text": related_works_text(entries, batch=bool(batch)),
-            **({"folderBatch": batch} if batch else {})}
+            "text": related_works_text(entries, batch=batch),
+            **shared_store_key(batch)}
+
+
+def related_works_removed_record(entries, store_id):
+    """A "Related works removed" record: works removed from the batch before this job's author started."""
+
+    listed = "; ".join(related_works.describe_entry(entry) for entry in entries)
+    return {"kind": "status", "stage": RELATED_WORKS_STAGE, "label": "Related works removed",
+            "relatedWorks": [{"name": entry["name"], "originalName": entry.get("originalName", ""),
+                              "sizeText": related_works.size_text(entry.get("size", 0)), "batch": store_id}
+                             for entry in entries],
+            "text": f"Removed {listed} from this job's related-works folder: it was removed from the works shared "
+                    "with every problem in this batch before this job's author started.",
+            **shared_store_key(store_id)}
+
+
+def _problems(count):
+    return f"{count} problem{'s' if count != 1 else ''}"
+
+
+def shared_added_summary(count, reached, told):
+    """What adding ``count`` shared works did: how many problems got them now, and how many authors are told."""
+
+    them = "it" if count == 1 else "them"
+    if not reached:
+        return f"No problem in this batch can take related works now; new problems in this batch get {them}."
+    text = f"{_problems(reached)} in this batch got {them} now"
+    if told:
+        text += f", and {told} running or paused author{'s are' if told != 1 else ' is'} told"
+    return text + f". New problems in this batch get {them} too."
+
+
+def shared_removed_summary(name, removed, kept):
+    """What removing the shared work ``name`` did: taken from problems that had not started; the others keep it."""
+
+    text = f"Removed {name}. New problems in this batch no longer get it."
+    if removed:
+        text += f" It was taken out of {_problems(removed)} that had not started."
+    if kept:
+        one = kept == 1
+        text += (f" {_problems(kept)} that {'has' if one else 'have'} started or {'has' if one else 'have'} a web "
+                 f"cutoff keep{'s' if one else ''} {'its' if one else 'their'} copy.")
+    return text
 
 
 def chat_answer_file(identity):
@@ -2999,6 +3074,9 @@ class App:
         # sets it on a new job before the job starts; a saved job reads it from its job settings. It is
         # kept apart from self.state, which many steps rebuild.
         self.batch_id = saved_named_batch(self.run_dir) if self.run_dir else ""
+        # The store of the related works its batch shares with every problem (shared_store_id), which a new job
+        # takes when it is created. Only the server sets it (Server._new_app): a terminal run takes none.
+        self.shared_store = ""
         self.process = None
         self.active_token = None
         self.worker_token = None
@@ -4083,7 +4161,7 @@ class App:
                 folder_batch = folder_batch or (saved_folder_batch(continuation_source) if continuation_source
                                                 else "")
                 works = self._install_new_related_works_locked(tokens, folder_batch, self.run_dir, "",
-                                                               copy_from=continuation_source)
+                                                               copy_from=continuation_source, author=stages["author"])
             else:
                 folder_batch = self.state.get("folderBatch") or ""
             if folder_batch:
@@ -6000,7 +6078,7 @@ class App:
             # Related works are in the author's workspace before anything runs (a web-cutoff run audits them).
             works = self._install_new_related_works_locked(
                 tokens, folder_batch, options.get("goalWorkspace") or self.run_dir,
-                options.get("retrievalPolicyPath", ""))
+                options.get("retrievalPolicyPath", ""), author=stages["author"])
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
@@ -8179,8 +8257,9 @@ class App:
                         "text": text, "steerId": steer_id, "relatedWorks": list(names)})
 
     def _announce_related_works_locked(self, names):
-        """The notice rule: running or pausing, a live instruction now; paused, with the next message or at
-        Resume; before the first launch, nothing (the first prompt points to the folder)."""
+        """The notice rule: running or pausing, a live instruction now; paused, or stopping at a step after the
+        statement review (which leaves it paused there), with the next message or at Resume; before the first
+        launch, nothing (the first prompt points to the folder)."""
 
         if not names:
             return ""
@@ -8194,7 +8273,7 @@ class App:
                                 "text": f"The author could not be told about the new related works now ({exc}); "
                                         "it is told with the next message to the paused author or when the run "
                                         "resumes."})
-        elif phase != "paused":
+        elif phase != "paused" and not (phase == "stopping" and self.state.get("stage") != "review"):
             return ""
         self.state["relatedWorksPending"] = [*(self.state.get("relatedWorksPending") or []),
                                              *(name for name in names
@@ -8213,7 +8292,9 @@ class App:
             if problem:
                 raise ValueError(problem)
             workspace = self._author_workspace()
-        with related_works.workspace_lock(workspace), self.lock:
+        # A job's lock before its workspace's, as everywhere (a new job's creation holds its own, and a
+        # continuation's its source's, while it links shared works into the workspace).
+        with self.lock, related_works.workspace_lock(workspace):
             problem = self.related_works_problem()
             if problem:
                 raise ValueError(problem)
@@ -8226,9 +8307,10 @@ class App:
         return entries
 
     def link_batch_related_works(self, store, names, workspace_run=None):
-        """Link new items of this job's folder batch into its workspace; {"entries", "diagnostic"}.
+        """Link new items of a store this job shares (its folder run's, its batch's) into its workspace.
 
-        ``workspace_run`` names the run recorded as adding them (the job that owns a shared workspace).
+        Returns {"entries", "diagnostic", ...} (BatchStore.link_into). ``workspace_run`` names the run recorded
+        as adding them (the job that owns a shared workspace).
         """
 
         with self.lock:
@@ -8239,20 +8321,59 @@ class App:
                                record=self._related_works_audit(policy))
 
     def batch_related_works_linked(self, batch, entries, diagnostic):
-        """Record items of the folder batch linked into this job's workspace, and tell its author."""
+        """Record items of a shared store (``batch``: its ID) linked into this job's workspace, and tell its author."""
 
         with self.lock:
             if entries:
                 self.add_trace(related_works_record(entries, batch=batch))
             if diagnostic:
-                self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "folderBatch": batch,
+                self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, **shared_store_key(batch),
                                 "text": diagnostic})
             return self._announce_related_works_locked([entry["name"] for entry in entries])
 
-    def _install_new_related_works_locked(self, tokens, folder_batch, workspace, policy_path, copy_from=""):
+    def _author_unstarted_locked(self, workspace):
+        """Whether this job's author has never started, in a workspace of its own: only such a job loses a work
+        removed from its batch. A running, paused or finished job keeps it, and so does a job that reopens another
+        job's conversation or workspace, a web-cutoff job (its audit log lists what it was given), a saved job and
+        one another process runs."""
+
+        state = self.state
+        # A statement review being stopped returns to its input: its author has not started either.
+        review_stopping = state["phase"] == "stopping" and state.get("stage") == "review"
+        return (self.run_dir is not None and not state.get("readOnly") and not state.get("runningElsewhere")
+                and not state.get("retrievalPolicyPath") and state.get("retrievalMode") != "historical"
+                and not state.get("goalThreadId") and not state.get("goalResume")
+                and (state["phase"] in {"input", "reviewing", "reviewed", "prepared"} or review_stopping)
+                and Path(workspace) == self.run_dir.resolve())
+
+    def unshare_related_works(self, store_id, names, *, alone=True):
+        """Take works removed from this job's batch (``names`` in store ``store_id``) out of its related-works folder,
+        while its author has not started; ``alone``: no other job uses its workspace.
+
+        Returns the job's removed entries ([] when it had none of them), or None when it keeps them
+        (_author_unstarted_locked). Its activity log says what was removed.
+        """
+
+        with self.lock:
+            if self.run_dir is None:
+                return None
+            workspace = self._author_workspace()
+            if not alone or not self._author_unstarted_locked(workspace):
+                return None
+            manifest = controller_directory(workspace)
+            removed = related_works.unlink_shared(workspace, manifest, store_id, names, staging=manifest)
+            if removed:
+                self.add_trace(related_works_removed_record(removed, store_id))
+            return removed
+
+    def _install_new_related_works_locked(self, tokens, folder_batch, workspace, policy_path, copy_from="",
+                                          author=True):
         """Put a new job's related works in its workspace before anything runs.
 
-        Returns [(entries, batch ID or ""), ...] and a diagnostic, for the
+        These are its uploads (``tokens``), a review retry's copies of its
+        source's works, its folder run's works and, with an Author stage
+        (``author``), what its batch shares with every problem (self.shared_store).
+        Returns [(entries, store ID or ""), ...] and a diagnostic, for the
         records added once the job's state exists (_record_new_related_works_locked).
         """
 
@@ -8260,9 +8381,13 @@ class App:
         manifest = controller_directory(workspace)
         record = self._related_works_audit(policy_path)
         store = folder_batch_store(self.runs, folder_batch) if folder_batch else None
-        added, diagnostic = [], ""
+        shared = (related_works.BatchStore(related_works.batch_directory(self.runs / CONTROLLER_FOLDER,
+                                                                         self.shared_store))
+                  if author and self.shared_store else None)
+        added, diagnostics = [], []
         if copy_from:
             # "Retry statement review": the new run gets the source's related works (batch ones linked again).
+            # What its batch shares comes from the batch as it is now (below), so a work removed there stays out.
             source = Path(copy_from).resolve()
             saved = saved_goal_workspace(source)
             source_workspace = Path(saved).resolve() if saved else source
@@ -8274,16 +8399,27 @@ class App:
                 copied.extend(entries)
 
             related_works.copy_into(source_workspace, controller_directory(source_workspace), workspace, manifest,
-                                    run_id=self.run_dir.name, batch=store, record=keep)
+                                    run_id=self.run_dir.name, batch=store, record=keep,
+                                    skip={self.shared_store} if self.shared_store else ())
             added.append((copied, ""))
         if tokens:
             added.append((related_works.install(workspace, manifest, tokens, staged_uploads(self.runs),
                                                 run_id=self.run_dir.name, keep_staged=True, record=record), ""))
-        if store is not None:
-            outcome = store.link_into(workspace, manifest, run_id=self.run_dir.name, record=record)
-            added.append((outcome["entries"], folder_batch))
-            diagnostic = outcome["diagnostic"]
-        return [(entries, batch) for entries, batch in added if entries], diagnostic
+        for source_store, store_id in ((store, folder_batch), (shared, self.shared_store)):
+            if source_store is None or (source_store is shared and not shared.count()):
+                continue
+            try:
+                outcome = source_store.link_into(workspace, manifest, run_id=self.run_dir.name, record=record)
+            except related_works.RelatedWorksError as exc:
+                if source_store is not shared:
+                    raise
+                # What the batch shares never stops a new job: it starts without them, and its log says why.
+                diagnostics.append(f"The related works shared with every problem in this batch were not added to "
+                                   f"this job: {exc}")
+                continue
+            added.append((outcome["entries"], store_id))
+            diagnostics.append(outcome["diagnostic"])
+        return [(entries, batch) for entries, batch in added if entries], " ".join(filter(None, diagnostics))
 
     @staticmethod
     def _new_related_works_tokens(value, stages):
@@ -8301,6 +8437,16 @@ class App:
             self.add_trace(related_works_record(entries, batch=batch))
         if diagnostic:
             self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "text": diagnostic})
+        # A job that reopens a saved author conversation gets no first prompt pointing to the folder: the shared
+        # works it lacked, linked into the workspace now, are told as a live instruction at the author's first step.
+        shared = [entry["name"] for entries, batch in added if batch for entry in entries]
+        if shared and self.state.get("goalResume") and self.state.get("goalThreadId"):
+            try:
+                self._queue_related_works_notice_locked(shared)
+            except (OSError, UnicodeError, TypeError, ValueError) as exc:
+                self.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE,
+                                "text": f"The author could not be told about the shared related works linked into "
+                                        f"its folder ({exc})."})
 
     def reset(self):
         """Return to the first screen when no child is active."""
@@ -9969,6 +10115,7 @@ class Server(ThreadingHTTPServer):
             with self.jobs_lock:
                 self._pending_jobs.remove(item)
                 self.jobs[app.state["runId"]] = app
+            self._settle_shared_works(app)
 
     def installation_settings(self):
         """The running-jobs limit, with how many jobs run and wait in the queue now."""
@@ -10339,6 +10486,8 @@ class Server(ThreadingHTTPServer):
         unreadable = (from_job and named is not None and bool(named.problem) and isinstance(batch, str)
                       and named_batches.BATCH_ID.match(batch) is not None)
         app.batch_id = batch if listed or unreadable else ""
+        # It takes the related works its batch shares with every problem when it is created.
+        app.shared_store = shared_store_id(app.batch_id)
         return app
 
     def _run_batch(self, run_dir):
@@ -10383,11 +10532,14 @@ class Server(ThreadingHTTPServer):
                     "attention": [{**row["needsAttention"], "runId": row["runId"], "batchId": batch_id,
                                    "job": row.get("sourceFile") or row["title"] or row["runId"]}
                                   for row in rows if row.get("needsAttention")],
-                    "queued": sum(1 for row in rows if row.get("launchQueued")), **extra}
+                    "queued": sum(1 for row in rows if row.get("launchQueued")),
+                    # The related works it shares with every problem: the card and the New problem page show them.
+                    "sharedWorks": self.batch_shared_summary(batch_id), **extra}
 
         cards = []
-        if groups.get(DEFAULT_BATCH):
-            cards.append(card(DEFAULT_BATCH, named_batches.DEFAULT_NAME, groups[DEFAULT_BATCH], current=True,
+        # The default batch is listed while it has problems, or works it shares with new ones.
+        if groups.get(DEFAULT_BATCH) or self.batch_shared_summary(DEFAULT_BATCH)["count"]:
+            cards.append(card(DEFAULT_BATCH, named_batches.DEFAULT_NAME, groups.get(DEFAULT_BATCH, []), current=True,
                               default=True, runningLimit=getattr(self, "installation", {}).get("maxRunningJobs", 0)))
         for entry in reversed(entries):  # Newest first: the file lists them in the order they were made.
             cards.append(card(entry["id"], entry["name"], groups.get(entry["id"], []), current=False, named=True,
@@ -10409,7 +10561,8 @@ class Server(ThreadingHTTPServer):
         return {"batch": self.named_batches.rename(batch_id, body.get("name")), **self.batch_cards()}
 
     def delete_batch(self, batch_id):
-        """Delete a batch made with New batch that holds no job (nor a folder-run statement waiting for one)."""
+        """Delete a batch made with New batch that holds no job (nor a folder-run statement waiting for one), with
+        the related works it shared with every problem."""
 
         if batch_id == DEFAULT_BATCH:
             raise ValueError("The default batch cannot be deleted.")
@@ -10418,6 +10571,10 @@ class Server(ThreadingHTTPServer):
                     or any(item.get("batch") == batch_id for item in getattr(self, "_pending_jobs", []))):
                 raise ValueError("Only an empty batch can be deleted. Delete its problems first.")
             self.named_batches.delete(batch_id)
+        store = batch_shared_store(self.runs, batch_id)
+        # Under the store's lock, so a share that checked the batch before it went adds nothing afterwards.
+        with related_works.workspace_lock(store.root):
+            shutil.rmtree(store.root, ignore_errors=True)
         return {"deleted": batch_id, **self.batch_cards()}
 
     def start_job(self, body, run_id="", batch=""):
@@ -10461,6 +10618,8 @@ class Server(ThreadingHTTPServer):
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        if not run_id:
+            self._settle_shared_works(app)
         return app
 
     def start_workflow(self, body, run_id="", *, app=None, batch="", _prepare_only=False, _folder_batch=None):
@@ -10490,6 +10649,8 @@ class Server(ThreadingHTTPServer):
                 raise ValueError("Related works are read by the proof author; turn on the Author stage or remove "
                                  "them.")
             self._uploads().peek(tokens)
+            if created:
+                self._check_shared_room(app.shared_store, len(tokens), stages["author"])
         effective_body = {**body, "workflowStages": stages}
         if run_id:
             defaults = {key: app.state[key] for key in (
@@ -10526,6 +10687,9 @@ class Server(ThreadingHTTPServer):
             raise
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        if not run_id:
+            # What its batch shares may have changed while it was made.
+            self._settle_shared_works(app)
         for token in tokens:
             self._uploads().discard(token)
         return app
@@ -10570,6 +10734,7 @@ class Server(ThreadingHTTPServer):
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        self._settle_shared_works(app)
         return app
 
     def start_direct_batch(self, body, run_id="", batch=""):
@@ -10634,6 +10799,9 @@ class Server(ThreadingHTTPServer):
             raise ValueError("Related works are read by the proof author; turn on the Author stage or remove them.")
         if tokens:
             self._uploads().peek(tokens)
+            # Each job holds the run's works and its batch's: refused here rather than at every job's creation.
+            self._check_shared_room(shared_store_id(batch if batch in self._named_batch_ids() else ""), len(tokens),
+                                    normalized["workflowStages"]["author"])
         shared = {key: value for key, value in body.items() if key not in {"statements", "relatedWorks"}}
         # ``current`` indexes the statement being handled; None means a step
         # shared by the whole historical batch.
@@ -10688,6 +10856,7 @@ class Server(ThreadingHTTPServer):
                 started.append(app)
                 with self.jobs_lock:
                     self.jobs[app.state["runId"]] = app
+                self._settle_shared_works(app)
             if historical:
                 # No model has started. Check every role boundary, with bounded
                 # transport timeouts and only two concurrent native probes.
@@ -10854,6 +11023,8 @@ class Server(ThreadingHTTPServer):
         )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        # It shares its source's workspace, which takes what the batch shares and it lacks.
+        self._settle_shared_works(app)
         return app
 
     def start_saved_research_job(self, source_run, settings=None):
@@ -10904,6 +11075,7 @@ class Server(ThreadingHTTPServer):
         self._queue_saved_author_instructions(source["run_dir"], app)
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        self._settle_shared_works(app)
         return app
 
     # --- Related works of a folder batch -------------------------------------------------------------------------
@@ -10977,6 +11149,8 @@ class Server(ThreadingHTTPServer):
             raise ValueError(problem)
         store = folder_batch_store(self.runs, batch_id)
         names = [entry["name"] for entry in store.install(tokens, self._uploads())]
+        # The jobs as they are now: one created while the works were saved links them itself, or here.
+        jobs, _ = self._folder_batch_members(batch_id)
         results, notes, groups = [], [], {}
         for app in jobs:
             with app.lock:
@@ -10995,6 +11169,19 @@ class Server(ThreadingHTTPServer):
                 notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: {skipped.rstrip('.')}")
                 continue
             groups.setdefault(workspace, []).append(app)
+        self._link_store_into(store, batch_id, groups, results, notes)
+        listing = self.batch_related_works(batch_id)
+        return {**listing, "added": names, "results": results,
+                "notice": (f"Could not add them to every job: {'; '.join(notes)}." if notes else "")}
+
+    @staticmethod
+    def _link_store_into(store, store_id, groups, results, notes):
+        """Link what ``store`` holds into each workspace of ``groups`` ({workspace: [jobs]}) once, then record it on
+        every job there and tell its author (the notice rule); each job's row goes to ``results``, and a job that did
+        not get them, or whose author could not be told, to ``notes``."""
+
+        what = "folder batch's new related works" if related_works.shared_from(store_id) == "folderRun" \
+            else "related works newly shared with every problem in this batch"
         for workspace, apps in groups.items():
             # The job whose run folder is the workspace is recorded as adding them.
             owner = next((app for app in apps if app.run_dir.resolve() == Path(workspace)), apps[0])
@@ -11006,9 +11193,9 @@ class Server(ThreadingHTTPServer):
                 for app in apps:
                     results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": str(exc)})
                     try:
-                        app.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, "folderBatch": batch_id,
-                                       "text": f"The folder batch's new related works could not be linked into this "
-                                               f"job's related-works folder: {exc}"})
+                        app.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, **shared_store_key(store_id),
+                                       "text": f"The {what} could not be linked into this job's related-works "
+                                               f"folder: {exc}"})
                     except OSError:
                         pass
                 notes.append(f"{', '.join(app.state.get('sourceFile') or app.state['runId'] for app in apps)}: "
@@ -11017,7 +11204,7 @@ class Server(ThreadingHTTPServer):
             added = [entry["name"] for entry in outcome["entries"]]
             for app in apps:
                 try:
-                    notice = app.batch_related_works_linked(batch_id, outcome["entries"], outcome["diagnostic"])
+                    notice = app.batch_related_works_linked(store_id, outcome["entries"], outcome["diagnostic"])
                 except (OSError, ValueError) as exc:
                     # The files are in its folder; only its record or notice failed. The others go on.
                     results.append({"runId": app.state["runId"], "added": added, "notice": "", "problem": str(exc)})
@@ -11025,9 +11212,176 @@ class Server(ThreadingHTTPServer):
                                  f"folder, but its author could not be told ({str(exc).rstrip('.')})")
                     continue
                 results.append({"runId": app.state["runId"], "added": added, "notice": notice, "problem": ""})
-        listing = self.batch_related_works(batch_id)
-        return {**listing, "added": names, "results": results,
-                "notice": (f"Could not add them to every job: {'; '.join(notes)}." if notes else "")}
+
+    # --- Related works shared with every problem in a batch --------------------------------------------------------
+
+    def _check_shared_room(self, store_id, own, author):
+        """Refuse, before anything is created, a new job whose ``own`` related works and those its batch shares
+        (store ``store_id``) would pass the limit of a job."""
+
+        if not own or not author or not store_id:
+            return
+        shared = related_works.BatchStore(related_works.batch_directory(Path(self.runs) / CONTROLLER_FOLDER,
+                                                                        store_id)).count()
+        if own + shared > related_works.MAX_ITEMS:
+            raise ValueError(f"A job can hold at most {related_works.MAX_ITEMS} related works: the {own} listed here "
+                             f"and the {shared} shared with every problem in this batch make {own + shared}. Remove "
+                             f"some here, or some of the batch's on the batch page.")
+
+    def _shared_batch(self, batch_id):
+        """The live batch a shared-works request names ("" is the default batch); a saved or deleted one is refused."""
+
+        batch_id = batch_id or DEFAULT_BATCH
+        if not self.live_batch(batch_id):
+            raise ValueError("Saved batches are read-only." if self.saved_batch(batch_id)
+                             else "That batch no longer exists.")
+        return batch_id
+
+    def _batch_members(self, batch_id):
+        """The jobs of a batch in this session: the jobs made in it (a job's saved batch, else the default one)."""
+
+        with self.jobs_lock:
+            apps = list(self.jobs.values())
+        return [app for app in apps if (app.batch_id or DEFAULT_BATCH) == batch_id]
+
+    def batch_shared_summary(self, batch_id):
+        """A batch card's view of its shared related works: {"count", "names"} (the first few names)."""
+
+        try:
+            items = batch_shared_store(self.runs, batch_id).listing()
+        except ValueError:
+            items = []
+        return {"count": len(items), "names": [item["name"] for item in items[:SHARED_NAMES_SHOWN]]}
+
+    def batch_shared_works(self, batch_id=""):
+        """The related works a batch shares with every problem in it: {batch, available, reason, count, items}."""
+
+        batch_id = self._shared_batch(batch_id)
+        items = batch_shared_store(self.runs, batch_id).listing()
+        return {"batch": batch_id, "available": True, "reason": "", "count": len(items), "items": items}
+
+    def add_batch_shared_works(self, tokens, batch_id=""):
+        """Share uploads with every problem in a batch: save them once in the batch's store, then link them into every
+        job of the batch that can still take related works (queued, not yet started, running or paused), and into a
+        statement review that failed or was stopped (it runs again in its own job).
+
+        Each running or paused author is told by the usual notice rule; a job created later takes them when it is
+        created. Finished jobs, jobs without an Author stage and saved ones are left as they are; a job another
+        process runs, or whose folder cannot take them, is named in ``notice``. ``summary`` says what happened.
+        """
+
+        tokens = related_works_tokens(tokens)
+        batch_id = self._shared_batch(batch_id)
+        store = batch_shared_store(self.runs, batch_id)
+        with related_works.workspace_lock(store.root):
+            # A batch deleted meanwhile takes nothing (Delete batch removes the store under this lock).
+            self._shared_batch(batch_id)
+            names = [entry["name"] for entry in store.install(tokens, self._uploads())]
+        results, notes, groups = [], [], {}
+        # The jobs as they are now: a job created while the works were saved takes them when it is registered.
+        for app in self._batch_members(batch_id):
+            problem = app.related_works_problem()
+            with app.lock:
+                elsewhere = app.state.get("runningElsewhere") or ""
+                try:
+                    author = saved_workflow_stages(app.state)["author"]
+                except ValueError:
+                    author = False
+                # A statement review that failed or was stopped runs again in its own job, whose author has yet to
+                # start: it takes them too (and loses a removed one), so its first prompt points to them. A job
+                # being stopped is about to be one of those, or paused at its step: it takes them as that job
+                # (_announce_related_works_locked).
+                review = (app.run_dir is not None and app.state["phase"] in {"input", "stopping"} and author
+                          and not elsewhere and not app.state.get("readOnly"))
+            if problem and not review:
+                if elsewhere and problem == elsewhere:
+                    results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": problem})
+                    notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: {problem.rstrip('.')}")
+                continue
+            with app.lock:
+                workspace = str(app._author_workspace())
+            groups.setdefault(workspace, []).append(app)
+        self._link_store_into(store, store.id, groups, results, notes)
+        reached = sum(1 for row in results if row["added"])
+        told = sum(1 for row in results if row["notice"] in {"instruction", "pending"})
+        return {**self.batch_shared_works(batch_id), "added": names, "results": results,
+                "summary": shared_added_summary(len(names), reached, told),
+                "notice": (f"Could not add them to every problem: {'; '.join(notes)}." if notes else "")}
+
+    def remove_batch_shared_work(self, name, batch_id=""):
+        """Stop sharing one work with the problems of a batch.
+
+        New jobs no longer get it, and every job of the batch whose author has not started loses it (its activity
+        log says so). Running, paused and finished jobs keep their copy, as do web-cutoff jobs and jobs that share a
+        workspace with another job. ``summary`` says how many problems lost it and how many keep it.
+        """
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("Name the shared related work to remove.")
+        batch_id = self._shared_batch(batch_id)
+        store = batch_shared_store(self.runs, batch_id)
+        with related_works.workspace_lock(store.root):
+            self._shared_batch(batch_id)
+            store.remove(name)
+        with self.jobs_lock:
+            everyone = list(self.jobs.values())
+        users = {}
+        for app in everyone:
+            with app.lock:
+                if app.run_dir is not None:
+                    workspace = app._author_workspace()
+                    users[workspace] = users.get(workspace, 0) + 1
+        results, notes, removed, kept = [], [], 0, 0
+        for app in self._batch_members(batch_id):
+            with app.lock:
+                workspace = app._author_workspace() if app.run_dir is not None else None
+            if workspace is None or name not in related_works.shared_names(controller_directory(workspace), store.id):
+                continue
+            try:
+                gone = app.unshare_related_works(store.id, [name], alone=users.get(workspace, 0) == 1)
+            except (OSError, ValueError) as exc:
+                results.append({"runId": app.state["runId"], "removed": False, "problem": str(exc)})
+                notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: {str(exc).rstrip('.')}")
+                continue
+            if gone is None:
+                kept += 1
+            elif gone:
+                removed += 1
+            results.append({"runId": app.state["runId"], "removed": bool(gone), "problem": ""})
+        return {**self.batch_shared_works(batch_id), "removed": name, "results": results,
+                "summary": shared_removed_summary(name, removed, kept),
+                "notice": (f"Could not take it out of every problem that had not started: {'; '.join(notes)}."
+                           if notes else "")}
+
+    def _settle_shared_works(self, app):
+        """Bring a job just registered in line with what its batch shares now, which may have changed while it was
+        being made: link what it lacks (its author is told by the notice rule) and, while its author has not
+        started, take out what was removed. A job that cannot take related works is left as it is."""
+
+        store_id = getattr(app, "shared_store", "")
+        if not store_id or app.related_works_problem():
+            return
+        try:
+            store = related_works.BatchStore(related_works.batch_directory(Path(self.runs) / CONTROLLER_FOLDER,
+                                                                           store_id))
+            with app.lock:
+                workspace = app._author_workspace()
+                lacking = {entry["name"] for entry in store.listing()} - related_works.shared_names(
+                    controller_directory(workspace), store_id)
+                if lacking:
+                    outcome = app.link_batch_related_works(store, None)
+                    app.batch_related_works_linked(store_id, outcome["entries"], outcome["diagnostic"])
+                # What the store holds, read strictly: a record that cannot be read now is no removal.
+                gone = related_works.shared_names(controller_directory(workspace), store_id) - store.held()
+                if gone:
+                    app.unshare_related_works(store_id, gone)
+        except (OSError, ValueError) as exc:
+            try:
+                app.add_trace({"kind": "diagnostic", "stage": RELATED_WORKS_STAGE, **shared_store_key(store_id),
+                               "text": f"This job's related works could not be brought in line with what its batch "
+                                       f"shares: {exc}"})
+            except OSError:
+                pass
 
     def _historical_source_job(self, source_run):
         """The registered job of a historical source run, which continues in place."""
@@ -11537,6 +11891,7 @@ class Server(ThreadingHTTPServer):
                 )
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
+        self._settle_shared_works(app)
         return app
 
     def job_list(self, batch=None):
@@ -12088,6 +12443,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.server.batch_related_works(batch or "", run_id))
             except ValueError as exc:
                 return self.send({"error": str(exc)}, status=400)
+        if request.path == "/batch-shared-works":
+            # What a live batch shares with every problem in it (``batch`` names it; none: the default batch).
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            if set(query) - {"batch"}:
+                return self.send({"error": "Not found."}, status=404)
+            try:
+                return self.send(self.server.batch_shared_works(batch or ""))
+            except ValueError as exc:
+                return self.send({"error": str(exc)}, status=400)
         if request.path == "/batches" or (batch is not None and request.path not in {"/", "/app.js", "/styles.css"}):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
@@ -12350,6 +12715,13 @@ class Handler(BaseHTTPRequestHandler):
             if request.path == "/batch-related-works/add":
                 return self.send(self.server.add_batch_related_works(body.get("uploads"), folder_batch or "",
                                                                      run_id))
+            # A live batch's shared related works (``batch`` names it, checked above; none: the default batch).
+            if request.path in {"/batch-shared-works/add", "/batch-shared-works/remove"} and run_id:
+                return self.send({"error": "Not found."}, status=404)
+            if request.path == "/batch-shared-works/add":
+                return self.send(self.server.add_batch_shared_works(body.get("uploads"), batch or ""))
+            if request.path == "/batch-shared-works/remove":
+                return self.send(self.server.remove_batch_shared_work(body.get("name"), batch or ""))
             if request.path == "/delete-job":
                 return self.send(self.server.delete_job(run_id))
             # New batch, and a batch's Rename and Delete batch (``batch`` names it).

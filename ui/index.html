@@ -196,6 +196,9 @@
               <!-- The batch this problem joins (app.js renderComposerBatch). -->
               <p id="composerBatch" class="composer-batch" hidden><span id="composerBatchText"></span>
                 <button id="composerDefaultBatchButton" class="ghost compact" type="button" hidden>Add to the default batch instead</button></p>
+              <!-- The related works that batch shares with every problem, which this problem gets too, and a link to
+                   the batch page in a new window, so what is written here stays (app.js renderComposerShared). -->
+              <p id="composerShared" class="composer-shared" hidden></p>
               <p id="introDescription" class="page-lede">Start with a rough TCS problem. The agent will clarify it,
                 ask for approval, solve it, verify the proof, and produce clean LaTeX.</p>
             </div>
@@ -694,11 +697,46 @@
               <button id="newProblemInBatchButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem in this batch</button>
             </div>
           </div>
-          <!-- Batch related works: each folder run keeps one store that every job of the run sees in
+          <!-- Shared with every problem in this batch: one store per live batch (the default one too) whose works
+               every problem of the batch finds in its related-works folder: new problems when they are created, and
+               problems that can still take related works at once. Remove takes a work from new problems and from
+               problems that have not started. app.js renderBatchShared reads /batch-shared-works. -->
+          <section id="batchShared" class="batch-related-works batch-shared card" aria-labelledby="batchSharedHeading"
+            aria-describedby="batchSharedHelp" hidden>
+            <div class="batch-related-head">
+              <h2 id="batchSharedHeading" class="batch-related-heading">Shared with every problem in this batch</h2>
+              <span id="batchSharedCount" class="chip"></span>
+            </div>
+            <p id="batchSharedHelp" class="help">Every problem in this batch gets these in its related-works folder:
+              new problems when they are created, unfinished ones as soon as you add a work (running and paused authors
+              are told). Remove takes a work from new problems and from problems that have not started; running, paused
+              and finished problems keep their copy.</p>
+            <ul id="batchSharedList" class="related-works-list" aria-labelledby="batchSharedHeading" hidden></ul>
+            <p id="batchSharedEmpty" class="help" hidden>Nothing is shared yet.</p>
+            <div class="related-works-actions">
+              <button id="batchSharedAddFilesButton" class="secondary compact" type="button">Add files…</button>
+              <button id="batchSharedAddNoteButton" class="ghost compact" type="button" aria-expanded="false"
+                aria-controls="batchSharedNoteForm">Add a note</button>
+            </div>
+            <div id="batchSharedNoteForm" class="related-note-form" hidden>
+              <label for="batchSharedNoteTitle">Note title <span>(optional)</span></label>
+              <input id="batchSharedNoteTitle" type="text" maxlength="200" autocomplete="off">
+              <label for="batchSharedNoteText">Note</label>
+              <textarea id="batchSharedNoteText" rows="4"></textarea>
+              <div class="related-note-actions">
+                <button id="batchSharedSaveNoteButton" class="secondary compact" type="button">Add note</button>
+                <button id="batchSharedCancelNoteButton" class="ghost compact" type="button">Cancel</button>
+              </div>
+            </div>
+            <p id="batchSharedStatus" class="help" role="status"></p>
+            <input id="batchSharedFiles" type="file" multiple hidden
+              aria-label="Related works to share with every problem in this batch">
+          </section>
+          <!-- Shared with a folder run: each folder run keeps one store that every job of the run sees in
                its related-works folder. app.js lists the stores named by the folderBatch of the /jobs
                rows and reads each one from /batch-related-works; additions reach every job of that run. -->
           <section id="batchRelatedWorks" class="batch-related-works card" aria-labelledby="batchRelatedWorksHeading" hidden>
-            <h2 id="batchRelatedWorksHeading" class="batch-related-heading">Batch related works</h2>
+            <h2 id="batchRelatedWorksHeading" class="batch-related-heading">Shared with a folder run</h2>
             <p id="batchRelatedWorksHelp" class="help">Shared by every problem of a folder run, including queued ones.
               Running and paused authors are told about new ones.</p>
             <ul id="batchRelatedGroups" class="batch-related-groups"></ul>

@@ -1630,11 +1630,11 @@ class ListingNoticeTests(StoreCase):
         added = rows[0]["addedAt"]
         self.assertEqual(rows, [
             {"name": "Paper.pdf", "originalName": "Paper.pdf", "kind": "file", "title": "", "sizeText": "10 B",
-             "textStatus": "text extracted (4 pages)", "addedAt": added, "batch": ""},
+             "textStatus": "text extracted (4 pages)", "addedAt": added, "batch": "", "sharedFrom": ""},
             {"name": "T.md", "originalName": "", "kind": "note", "title": "T", "sizeText": "10 B", "textStatus": "",
-             "addedAt": added, "batch": ""},
+             "addedAt": added, "batch": "", "sharedFrom": ""},
             {"name": "Odd-name.txt", "originalName": "Odd name.txt", "kind": "file", "title": "", "sizeText": "2.0 KB",
-             "textStatus": "", "addedAt": added, "batch": ""},
+             "textStatus": "", "addedAt": added, "batch": "", "sharedFrom": ""},
         ])
         self.assertEqual(rw.count(self.workspace, self.manifest_dir), 3)
         other, other_manifest = self.job("empty")
@@ -2106,6 +2106,161 @@ class BatchStoreTests(StoreCase):
             workspace, manifest_dir = self.jobs[0]
             self.assertEqual(self.batch.link_into(workspace, manifest_dir, run_id="job")["copied"], [])
         self.assertEqual(inode(self.folder(workspace) / "a.txt"), inode(self.shared("a.txt")))
+
+
+class SharedStoreTests(StoreCase):
+    """A batch's store of works shared with every problem: removing a work, its kept name, and the jobs it leaves."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller = self.runs / ".controller"
+        self.store = rw.BatchStore(rw.batch_directory(self.controller, "batch_00000000a1"))
+        self.jobs = [self.job(f"2026-11-13_09-00-0{n}_shared") for n in range(2)]
+
+    def shared(self, name):
+        return self.store.root / rw.FOLDER / name
+
+    def test_store_ids_say_where_a_work_was_shared_from(self):
+        for store_id, kind in (("b_0123456789", "folderRun"), ("batch_0123456789", "batch"), ("default", "batch"),
+                               ("", ""), (None, "")):
+            with self.subTest(store_id=store_id):
+                self.assertEqual(rw.shared_from(store_id), kind)
+        self.assertEqual(rw.batch_directory(self.controller, "default"), self.controller / ".batches" / "default")
+        folder_run = rw.BatchStore(rw.batch_directory(self.controller, rw.new_batch_id()))
+        folder_run.install(self.tokens(self.upload("run.txt", b"run")), self.stage)
+        self.store.install(self.tokens(self.upload("batch.txt", b"batch")), self.stage)
+        workspace, manifest_dir = self.jobs[0]
+        self.install(self.upload("own.txt", b"own"), workspace=workspace, manifest_dir=manifest_dir)
+        for store in (folder_run, self.store):
+            store.link_into(workspace, manifest_dir, run_id="job")
+        self.assertEqual([(row["name"], row["batch"], row["sharedFrom"]) for row in rw.listing(workspace, manifest_dir)],
+                         [("own.txt", "", ""), ("run.txt", folder_run.id, "folderRun"),
+                          ("batch.txt", self.store.id, "batch")])
+        self.assertEqual(rw.shared_names(manifest_dir, self.store.id), {"batch.txt"})
+        self.assertEqual(rw.shared_names(manifest_dir, "batch_0000000000"), set())
+
+    def test_a_removed_work_leaves_the_store_and_later_jobs_but_not_the_jobs_that_have_it(self):
+        self.store.install(self.tokens(self.upload("a.txt", b"first a"), self.upload("b.txt", b"b")), self.stage)
+        first, first_manifest = self.jobs[0]
+        self.store.link_into(first, first_manifest, run_id="first")
+        removed = self.store.remove("a.txt")
+        self.assertEqual(removed["name"], "a.txt")
+        self.assertTrue(removed["removedAt"])
+        # The store holds only b.txt: its listing, count, INDEX.md and folder say so ...
+        self.assertEqual([row["name"] for row in self.store.listing()], ["b.txt"])
+        self.assertEqual(self.store.count(), 1)
+        self.assertFalse(self.shared("a.txt").exists())
+        self.assertEqual(self.index(self.store.root).splitlines()[4:], ["1. b.txt: 1 B."])
+        # ... and its manifest keeps a.txt's entry, marked removed, so its name stays taken.
+        self.assertEqual([(entry["name"], bool(entry.get("removedAt"))) for entry in self.manifest(self.store.root)["items"]],
+                         [("a.txt", True), ("b.txt", False)])
+        # The job that has it keeps it, bytes and all; a later job gets only what the store holds.
+        self.assertEqual((self.folder(first) / "a.txt").read_bytes(), b"first a")
+        second, second_manifest = self.jobs[1]
+        self.assertEqual([entry["name"] for entry in self.store.link_into(second, second_manifest,
+                                                                           run_id="second")["entries"]], ["b.txt"])
+        with self.assertRaises(rw.RelatedWorksError) as caught:
+            self.store.link_into(second, second_manifest, run_id="second", names=["a.txt"])
+        self.assertEqual(str(caught.exception), "The batch has no related work named a.txt.")
+        # A new work named like the removed one takes another name, so the first job gets it too.
+        [again] = self.store.install(self.tokens(self.upload("a.txt", b"second a")), self.stage)
+        self.assertEqual(again["name"], "a-2.txt")
+        self.assertEqual([entry["name"] for entry in self.store.link_into(first, first_manifest,
+                                                                           run_id="first")["entries"]], ["a-2.txt"])
+        self.assertEqual(((self.folder(first) / "a.txt").read_bytes(), (self.folder(first) / "a-2.txt").read_bytes()),
+                         (b"first a", b"second a"))
+        for name in ("a.txt", "missing.txt"):
+            with self.subTest(name=name), self.assertRaises(rw.RelatedWorksError) as caught:
+                self.store.remove(name)
+            self.assertEqual(str(caught.exception), f"The batch has no related work named {name}.")
+
+    def test_the_item_limit_counts_only_the_works_a_store_holds(self):
+        with patch.object(rw, "MAX_ITEMS", 2):
+            self.store.install(self.tokens(self.upload("a.txt", b"a"), self.upload("b.txt", b"b")), self.stage)
+            self.store.remove("a.txt")
+            self.store.install(self.tokens(self.upload("c.txt", b"c")), self.stage)
+            with self.assertRaises(rw.RelatedWorksError):
+                self.store.install(self.tokens(self.upload("d.txt", b"d")), self.stage)
+        self.assertEqual([row["name"] for row in self.store.listing()], ["b.txt", "c.txt"])
+
+    def test_a_damaged_store_record_refuses_a_removal(self):
+        self.store.install(self.tokens(self.upload("a.txt", b"a")), self.stage)
+        path = self.store.root / rw.MANIFEST_NAME
+        path.write_text("{damaged")
+        with self.assertRaises(rw.RelatedWorksError):
+            self.store.remove("a.txt")
+        self.assertEqual((path.read_text(), self.shared("a.txt").read_bytes()), ("{damaged", b"a"))
+
+    def test_unlink_shared_takes_only_that_stores_works_out_of_a_job(self):
+        other = rw.BatchStore(rw.batch_directory(self.controller, "default"))
+        self.store.install(self.tokens(self.upload("x.txt", b"x"), self.upload("y.md", b"# y\n")), self.stage)
+        other.install(self.tokens(self.upload("x.txt", b"other x")), self.stage)
+        workspace, manifest_dir = self.jobs[0]
+        self.install(self.upload("own.txt", b"own"), workspace=workspace, manifest_dir=manifest_dir)
+        for store in (self.store, other):
+            store.link_into(workspace, manifest_dir, run_id="job")
+        self.assertEqual(sorted(os.listdir(self.folder(workspace))),
+                         ["INDEX.md", "own.txt", "x-2.txt", "x.txt", "y.md"])
+        before = self.tree(workspace)
+        self.assertEqual(rw.unlink_shared(workspace, manifest_dir, self.store.id, ["missing.txt"],
+                                          staging=manifest_dir), [])
+        self.assertEqual(self.tree(workspace), before)
+        gone = rw.unlink_shared(workspace, manifest_dir, self.store.id, ["x.txt"], staging=manifest_dir)
+        self.assertEqual([(entry["name"], entry["batch"], entry["batchName"]) for entry in gone],
+                         [("x.txt", self.store.id, "x.txt")])
+        # Only that store's x.txt: the job's own work and the other store's x.txt (here x-2.txt) stay.
+        self.assertEqual(sorted(os.listdir(self.folder(workspace))), ["INDEX.md", "own.txt", "x-2.txt", "y.md"])
+        self.assertEqual([row["name"] for row in rw.listing(workspace, manifest_dir)], ["own.txt", "y.md", "x-2.txt"])
+        self.assertEqual(self.index(workspace).splitlines()[4:], [
+            "1. own.txt: 3 B.", "2. y.md: 4 B.", '3. x-2.txt: 7 B. Uploaded as "x.txt".'])
+        # The store's copy is untouched: only the job's link went.
+        self.assertEqual(self.shared("x.txt").read_bytes(), b"x")
+        # A job left with no related works keeps no INDEX.md or empty folder.
+        second, second_manifest = self.jobs[1]
+        self.store.link_into(second, second_manifest, run_id="second")
+        rw.unlink_shared(second, second_manifest, self.store.id, ["x.txt", "y.md"], staging=second_manifest)
+        self.assertFalse(self.folder(second).exists())
+        self.assertEqual((rw.listing(second, second_manifest), rw.count(second, second_manifest)), ([], 0))
+
+    def test_unlink_shared_changes_nothing_of_a_damaged_job_record(self):
+        self.store.install(self.tokens(self.upload("x.txt", b"x")), self.stage)
+        workspace, manifest_dir = self.jobs[0]
+        self.store.link_into(workspace, manifest_dir, run_id="job")
+        path = manifest_dir / rw.MANIFEST_NAME
+        path.write_text("{damaged")
+        before = self.tree(workspace)
+        with self.assertRaises(rw.RelatedWorksError) as caught:
+            rw.unlink_shared(workspace, manifest_dir, self.store.id, ["x.txt"], staging=manifest_dir)
+        self.assertEqual(str(caught.exception), rw.DAMAGED)
+        self.assertEqual((path.read_text(), self.tree(workspace)), ("{damaged", before))
+
+    def test_a_work_removed_while_a_job_is_linked_is_left_out_without_a_diagnostic(self):
+        self.store.install(self.tokens(self.upload("a.txt", b"a"), self.upload("b.txt", b"b")), self.stage)
+        workspace, manifest_dir = self.jobs[0]
+        real, reads = rw._read_manifest, []
+
+        def read(folder, strict=True):
+            value = real(folder, strict)
+            if Path(folder) == self.store.root and not reads:
+                reads.append(folder)
+                self.store.remove("a.txt")  # Just after this job read what the store holds.
+            return value
+
+        with patch.object(rw, "_read_manifest", side_effect=read):
+            result = self.store.link_into(workspace, manifest_dir, run_id="job")
+        self.assertEqual(reads, [self.store.root])
+        self.assertEqual(([entry["name"] for entry in result["entries"]], result["skipped"], result["diagnostic"]),
+                         (["b.txt"], [], ""))
+
+    def test_a_review_retry_leaves_out_the_works_of_a_skipped_store(self):
+        self.store.install(self.tokens(self.upload("shared.txt", b"shared")), self.stage)
+        workspace, manifest_dir = self.jobs[0]
+        self.store.link_into(workspace, manifest_dir, run_id="first")
+        self.install(self.upload("own.txt", b"own"), workspace=workspace, manifest_dir=manifest_dir)
+        retry, retry_manifest = self.job("retry")
+        self.assertEqual(rw.copy_into(workspace, manifest_dir, retry, retry_manifest, run_id="retry",
+                                      skip={self.store.id}), 1)
+        self.assertEqual(sorted(os.listdir(self.folder(retry))), ["INDEX.md", "own.txt"])
 
 
 if __name__ == "__main__":

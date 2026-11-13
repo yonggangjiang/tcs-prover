@@ -378,10 +378,10 @@ assert.equal(ui.resume.disabled, false);
 assert.equal(ui.relatedWorksPanel.hidden, false);
 assert.equal(ui.relatedWorksHeading.textContent, 'Related works · 1');
 assert.deepEqual(rowText(ui.relatedWorksList),
-  [['TXT', 'A-paper.txt', '15 B · uploaded as “A paper.txt” · from the batch']]);
+  [['TXT', 'A-paper.txt', '15 B · uploaded as “A paper.txt” · from the folder run']]);
 assert.equal(ui.relatedWorksNote.textContent, "Saved in the author's related-works folder. The author is told "
   + 'about new files with your next message or when the run resumes. Works for every problem of this folder run '
-  + 'are added under Batch related works on the batch page.');
+  + 'are added under Shared with a folder run on the batch page.');
 assert.equal(ui.relatedWorksActions.hidden, false);
 """)
 
