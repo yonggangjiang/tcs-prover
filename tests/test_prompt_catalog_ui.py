@@ -469,11 +469,14 @@ class PromptCatalogMarkupTests(unittest.TestCase):
 
     def test_the_two_views_of_a_narrow_screen(self):
         styles = STYLES.read_text(encoding="utf-8")
-        block = styles[styles.index("@media (max-width: 720px) {\n  .prompt-browser"):]
+        block = styles[styles.index("@media (max-width: 720px) {\n  /* The form grows with the text"):]
         block = block[:block.index("\n}\n")]
         self.assertIn('.prompt-catalog-dialog[data-view="list"] .prompt-panel', block)
         self.assertIn('.prompt-catalog-dialog[data-view="text"] .prompt-nav { display: none; }', block)
         self.assertIn(".prompt-back { display: inline-flex; }", block)
+        # The buttons follow the editor: the form grows and the dialog scrolls.
+        self.assertIn(".prompt-catalog-dialog { overflow-y: auto; }", block)
+        self.assertIn(".prompt-catalog-dialog form { height: auto; min-height: 100%; }", block)
 
 
 if __name__ == "__main__":
