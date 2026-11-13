@@ -555,9 +555,13 @@ _MODEL_UNAVAILABLE = re.compile(
 # Words of a passing condition, which keep a failure retried whatever else it says.
 _PASSING_CONDITION = re.compile(r"capacity|overload|high demand|temporar|\b429\b|rate ?limit|\b5\d\d\b",
                                 re.IGNORECASE)
-# An endpoint that refuses the request itself as malformed for it.
-_REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b",
-                               re.IGNORECASE)
+# An endpoint that refuses the request itself as malformed for it: an OpenAI-format endpoint's 400
+# invalid_request_error as Codex reports it, and an Anthropic-format endpoint's (its invalid_request_error) as Claude
+# Code reports it, "API Error: 400 <the endpoint's message>" (Claude Code 2.1.289, from a fake endpoint). Claude Code
+# words a conversation too long for the model ("Prompt is too long …") and a key out of credit ("Credit balance is too
+# low") otherwise, with no "API Error: 400": both stay retried.
+_REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b|"
+                               r"\bAPI Error: 400\b", re.IGNORECASE)
 
 
 def settings_failure(error, model=None):

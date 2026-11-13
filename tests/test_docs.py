@@ -146,6 +146,17 @@ class AccuracyTests(unittest.TestCase):
         self.assertNotIn("install MacTeX, then choose **Re-run preflight**", checks)
         self.assertNotIn("held until you install what is missing and choose", flat(DOCS / "models.md"))
 
+    def test_claude_codes_api_error_400_is_named_where_a_refused_request_is_described(self):
+        # Owner decision (13 Nov 2026): on an API connection Claude Code's "API Error: 400" pauses as Codex's 400
+        # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried.
+        self.assertIn('(**Request rejected by the API endpoint**; Claude Code reports it as "API Error: 400" with the '
+                      "endpoint's message)", flat(DOCS / "retries.md"))
+        trouble = flat(DOCS / "troubleshooting.md")
+        self.assertIn('- **Request rejected by the API endpoint** (HTTP 400; Claude Code says "API Error: 400" and the '
+                      "endpoint's message): the endpoint refuses run requests as invalid.", trouble)
+        self.assertIn("A conversation too long for the model, and a key out of credit, are retried every minute "
+                      "instead.", trouble)
+
     def test_python_commands_name_the_checkouts_venv(self):
         # A stock Mac's python3 is 3.9 (no tomllib) and it has no `python`; only web_ui.py switches to the .venv
         # by itself (and the transcript viewer needs nothing newer).
