@@ -32,7 +32,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import workflow_runner as runtime
 from retrieval import isolated_compiler
 from retrieval import runtime as retrieval_runtime
-from runner import claude_cli, providers
+from runner import claude_cli, prompt_catalog, providers
+from runner import team as team_module
 from . import named_batches, ownership, presets, program_setup, related_works, retrieval
 from .review import REVIEW_PROMPT
 
@@ -809,11 +810,12 @@ def author_answer_text(questions, answers):
                                                        for index in sorted(given))])
 
 
-def chat_template():
+def chat_template(texts=None):
     """The chat framing of workflows/author_critic.yaml: the prompt its goal node binds as "chat".
 
-    The last readable copy of the file is used while an edit does not load. Raise ValueError, with the
-    reason, when the prompt is not bound or does not name both {message} and {answer_file}.
+    The last readable copy of the file is used while an edit does not load; a job with saved texts (``texts``,
+    its promptSet) uses its own. Raise ValueError, with the reason, when the prompt is not bound or does not name
+    both {message} and {answer_file}.
     """
 
     try:
@@ -828,6 +830,8 @@ def chat_template():
         lifecycle = {key: key for key in lifecycle}
     reference = lifecycle.get("chat") if isinstance(lifecycle, dict) else None
     template = (workflow.get("prompts") or {}).get(reference) if reference else None
+    if reference and isinstance(texts, dict) and isinstance(texts.get(reference), str):
+        template = texts[reference]
     if not isinstance(template, str) or not template.strip():
         raise ValueError("its proof author has no chat prompt")
     try:
@@ -1376,21 +1380,142 @@ def current_prompt(role, text):
 
 
 def web_prompt_options(body, roles, source=None):
-    """Accept only deliberate per-job edits; old browser defaults are ignored."""
+    """Accept only deliberate per-job edits; old browser defaults are ignored.
+
+    ``promptOverrides`` may name any text of the Prompts dialog (prompt_catalog): the per-job role prompts are
+    returned here; the other texts go with web_team_options() and are checked against the catalog when the job is
+    made (_workflow_options).
+    """
 
     overrides = body.get("promptOverrides", {})
     selected = normalize_workflow_stages(body.get("workflowStages")) if "workflowStages" in body else (
         saved_workflow_stages(source) if source else normalize_workflow_stages())
     if not isinstance(overrides, dict) or any(
-        name not in PROMPT_ROLES
-        or (selected[ROLE_STAGES[PROMPT_ROLES[name]]] and not isinstance(value, str))
+        not isinstance(name, str)
+        or (name in PROMPT_ROLES and selected[ROLE_STAGES[PROMPT_ROLES[name]]] and not isinstance(value, str))
+        or (name not in PROMPT_ROLES and not isinstance(value, str))
         for name, value in overrides.items()
     ):
-        raise ValueError("Prompt overrides must map role names to prompt text.")
+        raise ValueError("Prompt overrides must map prompt names to prompt text.")
     return {
         f"{name}_prompt": overrides.get(name, (source or {}).get(f"{name}Prompt"))
         for name in roles
     }
+
+
+# A job's goal loop when it records none: every job from before has Codex's goal mode (workflow_runner.GOAL_LOOPS);
+# new jobs, saved settings and requests without the setting get TCS Prover's.
+DEFAULT_GOAL_LOOP = "tcs"
+LEGACY_GOAL_LOOP = "codex"
+# The texts a job runs with (its promptSet, by catalog name: prompt_catalog), saved at its start in its controller
+# folder and its run folder; every launch passes the controller's copy to the runner (--prompt-set-file).
+PROMPT_SET_FILENAME = "prompts/prompt-set.json"
+
+
+def web_team_options(body, source=None):
+    """The goal loop, the Subagent models and the edited texts other than the role prompts of a request.
+
+    ``source`` is the state of the job a request revises or copies (its settings fill in what the request leaves
+    out); without either, the goal loop is DEFAULT_GOAL_LOOP and every member runs the coordinator's model. A
+    source from before (it recorded no goal loop) keeps Codex's goal mode and the CLI's built-in subagents
+    (``legacy_team``), as such a job keeps its single author.
+    """
+
+    overrides = body.get("promptOverrides") if isinstance(body.get("promptOverrides"), dict) else {}
+    saved = (source or {}).get("promptSet") if isinstance((source or {}).get("promptSet"), dict) else {}
+    texts = {name: text for name, text in {**saved, **overrides}.items() if name not in PROMPT_ROLES}
+    legacy = source is not None and source.get("goalLoop") not in runtime.GOAL_LOOPS
+    source = source or {}
+    return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
+            "author_subagent_models": body.get("authorSubagentModels", source.get("authorSubagentModels")),
+            "prompt_overrides": texts, "legacy_team": legacy}
+
+
+def saved_team_options(state):
+    """web_team_options() of a saved job's own settings (a retry, a rerun, a continuation)."""
+
+    return web_team_options({}, state)
+
+
+def prompt_catalog_listing():
+    """GET /prompt-catalog: every text of the Prompts dialog, grouped, with its current default."""
+
+    entries = prompt_catalog.entries(runtime, REVIEW_PROMPT)
+    present = {entry["group"] for entry in entries}
+    return {"groups": [group for group in prompt_catalog.GROUPS if group in present], "prompts": entries}
+
+
+def prompt_catalog_check(body):
+    """POST /prompt-catalog/check: {"errors": {name: why}} for the edited texts of ``body["promptOverrides"]``."""
+
+    overrides = body.get("promptOverrides") if isinstance(body, dict) else None
+    if not isinstance(overrides, dict):
+        raise ValueError("Send promptOverrides: an object of prompt names and texts.")
+    return {"errors": prompt_catalog.problems(runtime, overrides)}
+
+
+def job_prompt_set(prompts, overrides):
+    """The full set of texts a new job runs with, by catalog name: the current defaults, its role ``prompts``
+    ({role: text}, already checked) and its other edited ``overrides``, which are checked here as the runner checks
+    them. A problem raises ValueError naming the text."""
+
+    problems = prompt_catalog.problems(runtime, overrides or {})
+    if problems:
+        name, problem = next(iter(sorted(problems.items())))
+        raise ValueError(f"The prompt {prompt_catalog.label(name)!r} cannot be used: {problem}")
+    texts = {entry["name"]: entry["text"] for entry in prompt_catalog.entries(runtime, REVIEW_PROMPT)}
+    texts.update(prompts)
+    texts.update(overrides or {})
+    return texts
+
+
+def saved_prompt_set(run_dir):
+    """A saved job's texts (PROMPT_SET_FILENAME in its controller folder), or None for a job from before."""
+
+    try:
+        value = json.loads(controlled_path(Path(run_dir), PROMPT_SET_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or not all(isinstance(name, str) and isinstance(text, str)
+                                              for name, text in value.items()):
+        return None
+    return value
+
+
+def saved_team_state(run_dir):
+    """The goal loop, Subagent models and texts a saved job recorded (its controller's job-settings.json and
+    PROMPT_SET_FILENAME); {} when they cannot be read (a job from before)."""
+
+    try:
+        settings = json.loads(controlled_path(Path(run_dir), JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        settings = {}
+    settings = settings if isinstance(settings, dict) else {}
+    state = {}
+    if settings.get("goalLoop") in runtime.GOAL_LOOPS:
+        state["goalLoop"] = settings["goalLoop"]
+        try:
+            state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
+        except ValueError:
+            state["authorSubagentModels"] = None
+    texts = saved_prompt_set(run_dir)
+    if texts is not None:
+        state["promptSet"] = texts
+    return state
+
+
+def saved_team(value):
+    """A saved authorTeam (a list of member descriptions), or None when it is missing or malformed."""
+
+    if not isinstance(value, list) or not value:
+        return None
+    keys = ("member", "model", "modelLabel", "program", "effort", "connection")
+    members = []
+    for number, entry in enumerate(value, 1):
+        if not isinstance(entry, dict) or entry.get("member") != number or not isinstance(entry.get("model"), str):
+            return None
+        members.append({key: entry.get(key) for key in keys})
+    return members
 
 
 TRACE_LIMIT = 1500
@@ -2053,6 +2178,19 @@ def empty_state(trace=None, trace_version=0):
         "authorSubagents": DEFAULT_AUTHOR_SUBAGENTS,
         # How the proof author works (AUTHOR_MODES), recorded when the job starts.
         "authorMode": recorded_author_mode(DEFAULT_AUTHOR_SUBAGENTS),
+        # Who runs a Codex author's goal loop (workflow_runner.GOAL_LOOPS): a job from before records none and has
+        # Codex's ("codex"), see restore_saved_app.
+        "goalLoop": DEFAULT_GOAL_LOOP,
+        # The Subagent models setting: None ("Same as the coordinator") or one {model, effort} per author subagent.
+        "authorSubagentModels": None,
+        # A coordinator's TCS Prover team ([{member, model, modelLabel, program, effort, connection}]), or None: no
+        # such team (an author alone, a job from before, a web-cutoff coordinator with the built-in subagents).
+        "authorTeam": None,
+        # The texts the job runs with, by Prompts-dialog name (PROMPT_SET_FILENAME), or None for a job from before.
+        "promptSet": None,
+        # False for a saved job that recorded no goal loop (every job from before): it keeps Codex's goal mode and
+        # the built-in subagents, saves none (see _save_job_settings), and a job made from it keeps them too.
+        "goalLoopRecorded": True,
         # False for a saved job that never recorded its author mode (every job from before the coordinator): it
         # stays a single author, also when its settings are revised, and saves none (see _save_job_settings).
         "authorModeRecorded": True,
@@ -2946,15 +3084,26 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "conventionWarning", "resumeQueuedAt",
+            "goalLoop", "authorSubagentModels", "authorTeam",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
         # Stage outside the writable workspace so a same-UID sandboxed author
         # cannot alter temporary contents before the controller installs them.
         values = {key: options[key] for key in keys if key in options}
+        texts = options.get("promptSet")
+        if isinstance(texts, dict) and texts != getattr(self, "_saved_prompt_set", None):
+            # The texts this job runs with (PROMPT_SET_FILENAME), saved once they change: at its start.
+            self._save_controlled(PROMPT_SET_FILENAME,
+                                  json.dumps(texts, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            self._saved_prompt_set = dict(texts)
         if options.get("authorModeRecorded") is False:
             # A job from before the coordinator records no mode, so it stays a single author (see AUTHOR_MODES).
             values.pop("authorMode", None)
+        if options.get("goalLoopRecorded") is False:
+            # A job from before the goal loop records none, so it and the jobs made from it keep Codex's goal mode.
+            for key in ("goalLoop", "authorSubagentModels", "authorTeam"):
+                values.pop(key, None)
         # Every save records the job's batch, whatever ``options`` holds.
         if self.batch_id:
             values["batch"] = self.batch_id
@@ -3503,6 +3652,24 @@ class App:
         return requested
 
     @staticmethod
+    def _team_settings(team_options, source=None, current=None):
+        """The goal-loop, team and text keywords of _workflow_options for a start.
+
+        ``team_options`` (web_team_options() of the request, or saved_team_options() of a saved job) when given;
+        else those of ``current`` (this job's state, revised in place) or of the saved job ``source`` (a run folder
+        the new job continues), where a job from before keeps Codex's goal mode and the built-in subagents; else
+        the defaults.
+        """
+
+        if team_options is not None:
+            return dict(team_options)
+        if current is not None:
+            return saved_team_options(current)
+        if source:
+            return saved_team_options(saved_team_state(source))
+        return {}
+
+    @staticmethod
     def _workflow_options(
         critic_rounds=DEFAULT_CRITIC_ROUNDS,
         critic_count=DEFAULT_CRITIC_COUNT,
@@ -3520,11 +3687,21 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
         workflow_stages=None, coordinator_prompt=None, author_mode=None,
+        goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None, prompt_overrides=None, legacy_team=False,
     ):
         """Normalize and validate settings shared by both input modes.
 
         ``author_mode`` is the author mode a start asks for (recorded_author_mode()); the coordinator prompt is
         checked, and kept, only for a job whose author is a coordinator (else it is the default, unused).
+
+        ``goal_loop`` is who runs a Codex author's goal loop (runtime.GOAL_LOOPS; a web-cutoff job always records
+        "codex": its audited configuration has no place for TCS Prover's server). ``author_subagent_models`` is
+        the Subagent models setting (team.validated_team(): None, every member runs the coordinator's model, or one
+        {model, effort} per author subagent); it applies to a coordinator with the Author stage on, a web-cutoff
+        job refuses a list, and elsewhere it is not kept. A coordinator's team is recorded as authorTeam (None: no
+        TCS Prover team; a web-cutoff coordinator keeps the CLI's built-in subagents). ``legacy_team`` (a job made
+        from a job from before) keeps Codex's goal mode and the built-in subagents. ``prompt_overrides`` are the
+        edited texts other than the role prompts; with them the job records promptSet, every text it runs with.
         """
 
         stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
@@ -3637,9 +3814,32 @@ class App:
             retrieval_mode, retrieval_cutoff_utc, models=selected_models)
         if search_options["retrievalMode"] == "historical" and (not stages["author"] or stages["review"]):
             raise ValueError("Historical search requires Proof author enabled and Statement review disabled.")
+        if goal_loop not in runtime.GOAL_LOOPS:
+            raise ValueError("Choose TCS Prover or Codex as the goal loop.")
+        historical = search_options["retrievalMode"] == "historical"
+        if historical or legacy_team:
+            goal_loop = LEGACY_GOAL_LOOP
+        team_models, author_team = None, None
+        coordinating = stages["author"] and author_mode == "coordinator"
+        if coordinating and historical and author_subagent_models is not None:
+            raise ValueError("With a web cutoff, author subagents use the coordinator's model.")
+        if coordinating and not historical and not legacy_team:
+            try:
+                team_models = team_module.validated_team(author_subagent_models, author_subagents, check_models=True)
+            except providers.StoreUnavailable as exc:
+                raise ValueError(str(exc)) from exc
+            author_team = team_module.team_members(team_models, author_model, author_effort, author_subagents)
+            if team_models:
+                # Each member's model needs its key (or its CLI) like a role's, and an API model's snapshot.
+                selected_models = [*selected_models, *(entry["model"] for entry in team_models)]
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
+        prompt_set = job_prompt_set({name: prompts[name] for name in PROMPT_ROLES}, prompt_overrides)
         return {
+            "goalLoop": goal_loop,
+            "authorSubagentModels": team_models,
+            "authorTeam": author_team,
+            "promptSet": prompt_set,
             **search_options,
             **({"apiModels": api_models} if api_models else {}),
             "workflowStages": stages,
@@ -3693,7 +3893,7 @@ class App:
         revise_existing=False,
         workflow_stages=None, original_content=None, source_file=None,
         _prepare_only=False,
-        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None,
+        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None, team_options=None,
     ):
         """Start the review and return immediately so the page can poll.
 
@@ -3760,6 +3960,8 @@ class App:
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
             workflow_stages=stages, coordinator_prompt=coordinator_prompt,
             author_mode=self._kept_author_mode(author_mode, continuation_source, revise_existing),
+            **self._team_settings(team_options, continuation_source,
+                                  self.state if revise_existing and self.run_dir else None),
         )
         options["originalContent"] = str(original_content if original_content is not None else (
             self.state.get("originalContent") or statement if revise_existing else statement))
@@ -3825,6 +4027,9 @@ class App:
                 self._save_prompt(name, options[f"{name}Prompt"])
             # A job from before the coordinator keeps saving no mode when it is revised in place (AUTHOR_MODES).
             unrecorded = {"authorModeRecorded": False} if retry and not self.state.get("authorModeRecorded", True) else {}
+            if retry and not self.state.get("goalLoopRecorded", True):
+                # A job from before keeps Codex's goal mode, the built-in subagents and the live workflow's texts.
+                unrecorded.update(goalLoopRecorded=False, promptSet=None)
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
@@ -4195,6 +4400,28 @@ class App:
             self.add_trace({"kind": "diagnostic", "stage": stage, "text": runtime.workflow_warnings()})
         return process, token
 
+    def _team_runner_options(self, conversation=False):
+        """The runner options of the job's goal loop, its coordinator's team and its saved texts.
+
+        A job from before passes Codex's goal mode and the built-in subagents (no authorTeam), and no texts: its
+        runner reads the live workflow, as before. A job with texts gets them rewritten from its state (the
+        controller's copy) at every launch, like its role prompts.
+        """
+
+        loop = self.state.get("goalLoop") if self.state.get("goalLoop") in runtime.GOAL_LOOPS else LEGACY_GOAL_LOOP
+        team = self.state.get("authorTeam")
+        options = ["--goal-loop", loop, "--author-team", "tcs" if team else "builtin"]
+        models = self.state.get("authorSubagentModels")
+        if team and models and not conversation:
+            options.extend(["--author-subagent-models", json.dumps(models, separators=(",", ":"))])
+        texts = self.state.get("promptSet")
+        if isinstance(texts, dict):
+            path = self._save_controlled(PROMPT_SET_FILENAME,
+                                         json.dumps(texts, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            self._saved_prompt_set = dict(texts)
+            options.extend(["--prompt-set-file", str(path)])
+        return options
+
     def _proof_options_locked(self):
         """Resolve the same proof settings for new and recovered candidates."""
 
@@ -4226,6 +4453,7 @@ class App:
                 f"--{role}-model", self.state[f"{role}Model"],
                 f"--{role}-effort", self.state[f"{role}Effort"],
             ])
+        options.extend(self._team_runner_options())
         # Rewritten from the controller's copy at every launch: the author can
         # change the run folder's prompts, never the ones the runner reads.
         for role in PROOF_PROMPTS:
@@ -5541,6 +5769,7 @@ class App:
             "--speed", self.state["speedMode"],
             "--final-prompt-file", str(self._save_prompt("final", self.state["finalPrompt"])),
             "--set", "workflow_stages=" + json.dumps({"review": False, "author": False, "critic": False, "writing": True}),
+            *self._team_runner_options(conversation=True),
         ]
 
     def _launch_final_locked(self, source):
@@ -5597,7 +5826,7 @@ class App:
         retrieval_mode="live", retrieval_cutoff_utc="",
         _prepare_only=False,
         workflow_stages=None, original_content=None,
-        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None,
+        related_works=None, folder_batch=None, coordinator_prompt=None, author_mode=None, team_options=None,
     ):
         """Send a statement directly to the proof author without review.
 
@@ -5661,6 +5890,7 @@ class App:
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
             workflow_stages=stages, coordinator_prompt=coordinator_prompt,
             author_mode=self._kept_author_mode(author_mode, continuation_source),
+            **self._team_settings(team_options, continuation_source),
         )
         options["sourceFile"] = source_file
         options["originalContent"] = str(original_content if original_content is not None else statement)
@@ -5929,7 +6159,7 @@ class App:
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
-        workflow_stages=None, original_content=None, coordinator_prompt=None, author_mode=None,
+        workflow_stages=None, original_content=None, coordinator_prompt=None, author_mode=None, team_options=None,
     ):
         """Create a new job that audits one complete saved candidate proof; its critic starts afresh."""
 
@@ -5963,6 +6193,7 @@ class App:
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
             workflow_stages=workflow_stages, coordinator_prompt=coordinator_prompt,
             author_mode=self._kept_author_mode(author_mode, source_run),
+            **self._team_settings(team_options, source_run),
         )
         options["originalContent"] = original_content if original_content is not None else solution
         if options["retrievalMode"] == "historical":
@@ -7152,7 +7383,7 @@ class App:
         identity = "c_" + secrets.token_hex(5)
         answer_file = chat_answer_file(identity)
         try:
-            template = chat_template()
+            template = chat_template(self.state.get("promptSet"))
         except ValueError as exc:
             raise ValueError(f"The chat prompt of workflows/author_critic.yaml cannot be used ({exc}); the message "
                              "was not sent.") from exc
@@ -7545,6 +7776,9 @@ class App:
             "--set", "goal_cwd=" + json.dumps(self.state.get("goalWorkspace") or str(self.run_dir)),
             "--set", "goal_require_resume=true",
             "--set", "run_tmp_dir=" + json.dumps(str(self._controller_directory() / RUN_TMP_FOLDER)),
+            # How its goal loop ran (a thread of TCS Prover's loop has no Codex goal) and the job's texts (its
+            # summary and reply prompts).
+            *self._team_runner_options(conversation=True),
         ]
         if not historical:
             options.extend(["--set", "goal_stderr_log=" + json.dumps(str(self.run_dir / AUTHOR_STDERR_FILENAME))])
@@ -8671,6 +8905,16 @@ def restore_saved_app(app, *, owned=True):
                 state["folderBatch"] = settings["folderBatch"]
             # Kept below only when the author continues after this restart.
             state["authorQuestion"] = saved_author_question(settings.get("authorQuestion"))
+            # Who runs the goal loop and the coordinator's team; a job from before has Codex's goal mode and the
+            # CLI's built-in subagents (no authorTeam). A malformed value of the run folder's copy keeps that.
+            if settings.get("goalLoop") in runtime.GOAL_LOOPS:
+                state["goalLoop"] = settings["goalLoop"]
+                persisted_settings.add("goalLoop")
+                state["authorTeam"] = saved_team(settings.get("authorTeam"))
+                try:
+                    state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
+                except ValueError:
+                    state["authorSubagentModels"] = None
             saved_warning = settings.get("conventionWarning")
     except FileNotFoundError:
         pass
@@ -8692,6 +8936,11 @@ def restore_saved_app(app, *, owned=True):
             ).strip())
         except (OSError, UnicodeError):
             pass
+    # The texts the job runs with (None for a job from before, which runs the live workflow's).
+    state["promptSet"] = saved_prompt_set(run_dir)
+    app._saved_prompt_set = state["promptSet"]
+    if "goalLoop" not in persisted_settings:
+        state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False)
 
     direct_statement = False
     try:
@@ -9695,10 +9944,12 @@ class Server(ThreadingHTTPServer):
 
         programs, sign_in = set(), set()
         ahead = cls._setup_stages_ahead(state)
-        for stage, role in STAGE_ROLES.items():
+        # The coordinator's team members run their own models in the author stage, each counted like a role's.
+        members = [("author", entry.get("model")) for entry in state.get("authorTeam") or []
+                   if isinstance(entry, dict)]
+        for stage, model in [*((stage, state.get(f"{role}Model")) for stage, role in STAGE_ROLES.items()), *members]:
             if stage not in ahead:
                 continue
-            model = state.get(f"{role}Model")
             try:
                 program, kind = providers.harness(model), providers.provider_kind(model)
             except (providers.ProviderError, TypeError, ValueError):
@@ -10114,6 +10365,7 @@ class Server(ThreadingHTTPServer):
             critic_effort=body.get("criticEffort", legacy_effort),
             writer_effort=body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, ("review", *PROOF_PROMPTS), app.state if run_id else None),
+            team_options=web_team_options(body, app.state if run_id else None),
             speed_mode=body.get("speedMode", DEFAULT_SPEED),
             reasoning_summary=body.get(
                 "reasoningSummary", DEFAULT_REASONING_SUMMARY
@@ -10164,6 +10416,7 @@ class Server(ThreadingHTTPServer):
             effective_body = {**defaults, **effective_body}
         options = self._direct_options(effective_body)
         options.update(web_prompt_options(effective_body, PROOF_PROMPTS, app.state if run_id else None))
+        options["team_options"] = web_team_options(effective_body, app.state if run_id else None)
         options["workflow_stages"] = stages
         options["original_content"] = app.state.get("originalContent") or content if run_id else content
         options["source_file"] = body.get("sourceFile", app.state.get("sourceFile") if run_id else None)
@@ -10215,6 +10468,7 @@ class Server(ThreadingHTTPServer):
             "critic_effort": body.get("criticEffort", legacy_effort),
             "writer_effort": body.get("writerEffort", legacy_effort),
             **web_prompt_options(body, PROOF_PROMPTS),
+            "team_options": web_team_options(body),
             "speed_mode": body.get("speedMode", DEFAULT_SPEED),
             "reasoning_summary": body.get("reasoningSummary", DEFAULT_REASONING_SUMMARY),
             **({"workflow_stages": normalize_workflow_stages(body["workflowStages"])} if "workflowStages" in body else {}),
@@ -10283,7 +10537,9 @@ class Server(ThreadingHTTPServer):
             validation_options.update(review_model=body.get("reviewModel", DEFAULT_REVIEW_MODEL),
                                       review_effort=body.get("reviewEffort", DEFAULT_REVIEW_EFFORT),
                                       **web_prompt_options(body, ("review",)))
-        normalized = App._workflow_options(include_review=False, **validation_options)
+        team_options = validation_options.pop("team_options", None)
+        normalized = App._workflow_options(include_review=False, **validation_options,
+                                           **App._team_settings(team_options))
         options.update(retrieval_mode=normalized["retrievalMode"], retrieval_cutoff_utc=normalized["retrievalCutoffUtc"])
         historical = normalized["retrievalMode"] == "historical"
         if historical and len(statements) > 10:
@@ -11840,6 +12096,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
             return self.send(self.server.installation_settings())
+        if request.path == "/prompt-catalog":
+            # Every text of the Prompts dialog with its group, label, use, placeholders and current default.
+            if not self.authorized():
+                return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)
+            try:
+                return self.send(prompt_catalog_listing())
+            except (ValueError, OSError) as exc:
+                return self.send({"error": f"The workflow's prompts cannot be read: {exc}"}, status=500)
         if request.path == "/presets":
             # The saved New problem settings (ui/presets.py), read again whenever the page asks.
             if not self.authorized():
@@ -11992,6 +12256,9 @@ class Handler(BaseHTTPRequestHandler):
                     # server): keyRequired makes the page show its key field.
                     return self.send({"error": str(exc), "keyRequired": True}, status=400)
                 return self.send(result)
+            # The Prompts dialog's check of edited texts, as a launch checks them (no job).
+            if request.path == "/prompt-catalog/check":
+                return self.send(prompt_catalog_check(body))
             # Staged uploads belong to no job until one takes them.
             if request.path == "/uploads/note":
                 return self.send({"upload": self.server._uploads().note(body.get("title"), body.get("text"))})

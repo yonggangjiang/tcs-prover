@@ -19,6 +19,7 @@ from .current_run import CurrentRunError, select_current_dashboard
 from .review import review_worker_main
 from .server import (
     App, Server, AUTO_LAUNCH_SPACING_SECONDS, AUTO_RESUME_SECONDS, DEFAULT_AUTHOR_MODEL, DEFAULT_AUTHOR_SUBAGENTS,
+    DEFAULT_GOAL_LOOP,
     DEFAULT_CRITIC_COUNT, MAX_AUTHOR_SUBAGENTS,
     DEFAULT_CRITIC_MODEL, DEFAULT_CRITIC_ROUNDS, DEFAULT_REASONING_EFFORT, DEFAULT_REASONING_SUMMARY,
     DEFAULT_SPEED, DEFAULT_THINKING_HOURS, DEFAULT_WRITER_MODEL, HOST,
@@ -205,12 +206,14 @@ def direct_cli_options(
     speed_mode=DEFAULT_SPEED,
     reasoning_summary=DEFAULT_REASONING_SUMMARY,
     author_prompt_file=None, critic_prompt_file=None, final_prompt_file=None,
-    coordinator_prompt_file=None,
+    coordinator_prompt_file=None, goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None,
 ):
     """Load optional prompt files and validate direct-workflow CLI settings.
 
     As in every new job, a terminal run's author is a coordinator with 1 or more author subagents and works
-    alone with 0 (see server.recorded_author_mode()).
+    alone with 0 (see server.recorded_author_mode()). ``goal_loop`` and ``author_subagent_models`` (a JSON list
+    of {"model", "effort"}, or None: every member runs the coordinator's model) are the Goal loop and Subagent
+    models settings.
     """
 
     prompt_files = {
@@ -242,6 +245,9 @@ def direct_cli_options(
         speed_mode=speed_mode,
         reasoning_summary=reasoning_summary,
         include_review=False,
+        goal_loop=goal_loop,
+        author_subagent_models=json.loads(author_subagent_models) if isinstance(author_subagent_models, str)
+        else author_subagent_models,
     )
     return {
         "critic_rounds": options["criticRounds"],
@@ -261,6 +267,8 @@ def direct_cli_options(
         "coordinator_prompt": options["coordinatorPrompt"],
         "speed_mode": options["speedMode"],
         "reasoning_summary": options["reasoningSummary"],
+        "team_options": {"goal_loop": options["goalLoop"], "author_subagent_models": options["authorSubagentModels"],
+                         "prompt_overrides": {}},
     }
 
 
@@ -723,6 +731,24 @@ def main():
         ),
     )
     parser.add_argument(
+        "-authorSubagentModels", "--authorSubagentModels", "--author-subagent-models",
+        dest="author_subagent_models", metavar="JSON", default=None,
+        help=(
+            "the model of each author subagent: a JSON list of exactly N entries {\"model\": MODEL, \"effort\": "
+            "EFFORT} (N = --author-subagents), any model the role menus offer; omitted: every author subagent runs "
+            "the author's model"
+        ),
+    )
+    parser.add_argument(
+        "-goalLoop", "--goalLoop", "--goal-loop",
+        dest="goal_loop", choices=runtime.GOAL_LOOPS, default=DEFAULT_GOAL_LOOP,
+        help=(
+            f"who runs a Codex author's goal loop (default: {DEFAULT_GOAL_LOOP}): tcs, TCS Prover (it starts every "
+            "turn, with the editable goal continuation, and the model ends its goal with update_goal); codex, "
+            "Codex's built-in goal mode"
+        ),
+    )
+    parser.add_argument(
         "-thinkingHours", "--thinkingHours", "--thinking-hours",
         dest="thinking_hours", type=float, default=DEFAULT_THINKING_HOURS,
         metavar="HOURS",
@@ -825,6 +851,8 @@ def main():
                 critic_prompt_file=args.critic_prompt_file,
                 final_prompt_file=args.final_prompt_file,
                 coordinator_prompt_file=args.coordinator_prompt_file,
+                goal_loop=args.goal_loop,
+                author_subagent_models=args.author_subagent_models,
                 verbose_events=args.verbose_events,
             )
         except (OSError, TypeError, ValueError) as exc:

@@ -28,6 +28,7 @@ import time
 import uuid
 from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, confinement, proof_handoff, providers
+from runner import prompt_catalog
 from runner import team as team_module
 from collections import deque
 from contextlib import contextmanager
@@ -8936,7 +8937,9 @@ def main(argv=None):
             if path:
                 options["prompts"][name] = prompt_file(path, None)
         if options.get("prompt_set_file"):
-            options["prompt_set"] = prompt_set(options.pop("prompt_set_file"))
+            # By the Prompts dialog's names (prompt_catalog), as the server saves them.
+            options["prompt_set"] = {prompt_catalog.workflow_name(name): text
+                                     for name, text in prompt_set(options.pop("prompt_set_file")).items()}
         for setting in options.pop("settings"):
             key, separator, value = setting.partition("=")
             if not separator or not key:

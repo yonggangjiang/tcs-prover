@@ -520,6 +520,22 @@ class BatchCatalog:
             # What the page shows of its progress log but the text, which it fetches apart (progress_log()).
             log = self._progress_log(directory, settings)
             state['coordinatorProgress'] = None if log is None else {key: log[key] for key in PROGRESS_LOG_FIELDS}
+        # Who ran the goal loop and the coordinator's team, and the texts the job ran with, as a restored job shows
+        # them: a job from before had Codex's goal mode and no TCS Prover team, and saved no texts.
+        from .server import LEGACY_GOAL_LOOP, PROMPT_SET_FILENAME, saved_team
+        from runner import team as team_module
+        import workflow_runner
+        if settings.get('goalLoop') in workflow_runner.GOAL_LOOPS:
+            state['goalLoop'] = settings['goalLoop']
+            state['authorTeam'] = saved_team(settings.get('authorTeam'))
+            try:
+                state['authorSubagentModels'] = team_module.validated_team(settings.get('authorSubagentModels'))
+            except ValueError:
+                state['authorSubagentModels'] = None
+        else:
+            state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None)
+        texts = self._json(directory, PROMPT_SET_FILENAME, None)
+        state['promptSet'] = texts if texts and all(isinstance(value, str) for value in texts.values()) else None
         for role in ('review', *PROOF_PROMPTS):
             # Never the current default in place of a saved prompt that is too large to show.
             prompt = (self._too_large(directory, f'prompts/{role}.txt')

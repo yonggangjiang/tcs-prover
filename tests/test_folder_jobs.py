@@ -131,7 +131,9 @@ class FolderBatchTests(unittest.TestCase):
             ({"statements": good, "thinkingHours": -1}, "hours"),
             ({"statements": good, "speedMode": "warp"}, "speed"),
             ({"statements": good, "promptOverrides": {"author": "No marker."}}, "STATEMENT"),
-            ({"statements": good, "promptOverrides": {"bogus": "x"}}, "Prompt overrides"),
+            ({"statements": good, "promptOverrides": {"bogus": "x"}}, "bogus.*no prompt of this name"),
+            ({"statements": good, "promptOverrides": {"goal_continuation": "{nope}"}}, "Goal continuation.*nope"),
+            ({"statements": good, "promptOverrides": {"author": 7}}, "Prompt overrides"),
         )
         for body, message in invalid:
             with self.subTest(body=str(body)[:120]):
