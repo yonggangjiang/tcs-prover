@@ -1498,6 +1498,55 @@ class TextTests(unittest.TestCase):
         self.assertIn("author", prompt_catalog.problems(runtime, {"author": "No marker"}))
         self.assertIn("nothing", prompt_catalog.problems(runtime, {"nothing": "x"}))
 
+    def test_the_reply_turns_and_the_related_works_note_are_checked_as_the_code_fills_them_in(self):
+        # The paused author's reply turns fill in the reply's {message} and nothing in a progress summary (which is
+        # still a template), and the related works note is appended to the first prompt as written: the Prompts
+        # dialog lists and checks exactly that, and so does a launch, so no accepted text fails in a reply turn.
+        from runner import prompt_catalog
+        from ui.review import REVIEW_PROMPT
+        entries = {entry["name"]: entry for entry in prompt_catalog.entries(runtime, REVIEW_PROMPT)}
+        names = ("summary", "coordinator_summary", "conversation", "related_works")
+        self.assertEqual([entries[name]["placeholders"] for name in names], [[], [], ["{message}"], []])
+        self.assertEqual([entries[name]["template"] for name in names], [True, True, True, False])
+        self.assertEqual([entries[name]["template"] for name in ("critic", "critic_verify", "team_tool_wait")],
+                         [True, False, False])
+        workflow = runtime.load_workflow(WORKFLOW)
+        for name, text in (("summary", "Summarize your progress on {original_prompt}."),
+                           ("summary", "A lone { brace."), ("coordinator_summary", "Summarize round {round}."),
+                           ("conversation", "Reply to {message} in round {round}.")):
+            with self.subTest(name=name, text=text):
+                self.assertIn(name, prompt_catalog.problems(runtime, {name: text}))
+                with mock.patch.object(runtime, "require_model_credentials"), self.assertRaises(ValueError):
+                    runtime.prepare(workflow, {"author_subagents": 3, "author_mode": "coordinator",
+                                               "prompt_set": {name: text}})
+        accepted = {"summary": "Summarize the sets {{x}} you used.", "coordinator_summary": "Summarize {{it}}.",
+                    "related_works": "RELATED WORKS: see {directory}/related-works, the set {{x}} and a lone }."}
+        self.assertEqual(prompt_catalog.problems(runtime, accepted), {})
+        with mock.patch.object(runtime, "require_model_credentials"):
+            prompts = runtime.prepare(workflow, {"author_subagents": 3, "author_mode": "coordinator",
+                                                 "prompt_set": accepted})
+        self.assertEqual(prompts["related_works"], accepted["related_works"])
+
+    def test_an_accepted_summary_is_sent_in_a_reply_turn(self):
+        sent, records = [], []
+
+        def session(module, instruction, **kwargs):
+            sent.append(instruction)
+            return {"reply": "Here is the summary.", "threadId": "t-1"}
+
+        for mode, name in (({"author_subagents": 0}, "summary"),
+                           ({"author_subagents": 3, "author_team": "tcs"}, "coordinator_summary")):
+            with self.subTest(name=name), mock.patch.object(runtime, "author_conversation", side_effect=session), \
+                    mock.patch.object(runtime, "emit", side_effect=lambda *args, **fields: records.append(fields)), \
+                    mock.patch.object(runtime, "require_model_credentials"):
+                code = runtime.run_author_conversation(
+                    WORKFLOW, {"author_model": "gpt-6.1-sol", "prompt_set": {name: "Summarize the sets {{x}}."},
+                               **mode}, {"kind": "summary", "id": "c_0123456789", "text": "", "notice": ""})
+                self.assertEqual(code, 0)
+                self.assertEqual(sent[-1], "Summarize the sets {x}.")
+                self.assertEqual((records[-1].get("conversationKind"), records[-1].get("text")),
+                                 ("summary", "Here is the summary."))
+
     def test_a_compaction_summary_reaches_codex_only_when_it_is_written(self):
         service = team.Service()
         self.addCleanup(service.close)

@@ -152,9 +152,12 @@ class ConversationPromptTests(unittest.TestCase):
                 return runtime.prepare(workflow, {})
 
         self.assertIn("{message}", prepared(lambda definition: None)["conversation"])
-        for name in ("summary", "related_works", "resume", "reopen", "repair"):
+        for name in ("summary", "resume", "reopen", "repair"):
             with self.subTest(prompt=name), self.assertRaisesRegex(ValueError, "Unknown prompt input: 'message'"):
                 prepared(lambda definition: definition["prompts"].update({name: "Quote {message}."}))
+        # The related works note is appended to the first prompt as written: its braces are plain text.
+        self.assertEqual(prepared(lambda definition: definition["prompts"].update(
+            related_works="Quote {message}."))["related_works"], "Quote {message}.")
         # The recovery prompt is no conversation prompt either.
         with self.assertRaisesRegex(ValueError, "Unknown prompt input: 'message'"):
             prepared(lambda definition: definition["prompts"].update(repair="Repair {bugs} for {message}."))

@@ -77,8 +77,12 @@ the file is fixed.
   when a job starts, and shows a problem on its text: a text with placeholders
   may use only those, with any other brace written twice (`{{` and `}}`); a text
   with `[STATEMENT]` keeps exactly one; no text may be empty except the Codex
-  compaction summary, whose empty default leaves Codex's own; a text without
-  placeholders (a tool description) is sent as written, braces included. The
+  compaction summary, whose empty default leaves Codex's own. The progress
+  summaries (**Progress summary**, **Coordinator progress summary**) have no
+  placeholders but are filled in like the others, so a brace is written twice
+  there too, and **Reply to a message** has only `{message}`; any other text
+  without placeholders (a tool description, **Final verification**, **Related
+  works**) is sent as written, braces included. The
   edits apply to the job you are about to start only: they are never remembered
   in the browser, carried into the next new problem or kept in
   [saved settings](saved-settings.md). **Rerun with suggested statement** takes

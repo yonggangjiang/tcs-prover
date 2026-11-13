@@ -7119,14 +7119,15 @@ def prepare(workflow, options):
             if "recovery" in node:
                 _template_parts(prompts[node["recovery"]["prompt"]], fields)
             def lifecycle_fields(key):
-                # Only the paused author's conversation prompt quotes the user's message, the chat framing
-                # the message and its answer file, the note on a refused submission its reason, the
-                # subagents note their number and the coordinator's time check the elapsed time and the time
-                # limit (the controller renders these with nothing else).
+                # What the code fills each lifecycle prompt in with (_lifecycle_fields()); None: used as written.
                 return _lifecycle_fields(key, fields)
 
+            def check(key, reference):
+                if lifecycle_fields(key) is not None:
+                    _template_parts(prompts[reference], lifecycle_fields(key))
+
             for key, reference in _lifecycle_map(node["lifecycle"]).items():
-                _template_parts(prompts[reference], lifecycle_fields(key))
+                check(key, reference)
             # The run's author mode, for every goal node: one the run cannot have (a coordinator without a
             # coordinator binding or without subagents) stops the launch here, before any model starts.
             if author_mode(node, options) == "coordinator":
@@ -7136,16 +7137,25 @@ def prepare(workflow, options):
                     raise ValueError(f"The coordinator prompt must contain exactly one {node['marker']}.")
                 _template_parts(prompts[binding["prompt"]], {"author_subagents"})
                 for key, reference in _lifecycle_map(binding["lifecycle"]).items():
-                    _template_parts(prompts[reference], lifecycle_fields(key))
+                    check(key, reference)
     return prompts
 
 
 def _lifecycle_fields(key, fields):
-    """The placeholders of the lifecycle prompt bound to ``key`` (prepare()), from a goal node's ``fields``."""
+    """The placeholders of the lifecycle prompt bound to ``key`` (prepare()), from a goal node's ``fields``.
+
+    They are what the code fills the prompt in with: the goal's ``fields`` for the prompts of the goal session, and
+    for the others only their own. The note on a refused submission gets its reason, the subagents note their
+    number, the chat framing the message and its answer file, and the coordinator's time check the elapsed time and
+    the time limit. The paused author's reply turns (run_author_conversation()) fill in the reply's {message} and
+    nothing in the progress summary, which is still a template (a brace is written twice). None: the related works
+    note, which is appended to the first prompt as written.
+    """
 
     return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
             else {"message", "answer_file"} if key == "chat" else {"elapsed", "limit"} if key == "checkin"
-            else fields | {"message"} if key == "conversation" else fields)
+            else {"message"} if key == "conversation" else set() if key == "summary"
+            else None if key == "related_works" else fields)
 
 
 def prompt_rules(workflow):

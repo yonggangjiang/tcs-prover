@@ -143,10 +143,12 @@ def _placeholders(rule):
 
 
 def entries(runtime, review_prompt):
-    """The catalog: [{name, group, label, when, placeholders, text, emptyAllowed}] with the current default texts.
+    """The catalog: [{name, group, label, when, placeholders, template, text, emptyAllowed}] with the current defaults.
 
     ``runtime`` is workflow_runner (its built-in workflows, read as a launch reads them, and prompt_rules());
-    ``review_prompt`` the statement reviewer's default instructions.
+    ``review_prompt`` the statement reviewer's default instructions. ``template`` says whether the text is filled
+    in like a template, where a brace that is not a placeholder is written twice: true for every text with
+    placeholders and for the progress summaries, which have none; false for a text used as written, braces included.
     """
 
     texts, rules, order = {REVIEW: review_prompt}, {REVIEW: (None, None)}, []
@@ -163,7 +165,7 @@ def entries(runtime, review_prompt):
     return [{"name": name, "group": described.get(name, ("Other", name, "A prompt of the workflow."))[0],
              "label": described.get(name, ("Other", name, ""))[1],
              "when": described.get(name, ("Other", name, "A prompt of the workflow."))[2],
-             "placeholders": _placeholders(rules[name]), "text": texts[name],
+             "placeholders": _placeholders(rules[name]), "template": rules[name][0] is not None, "text": texts[name],
              "emptyAllowed": name in runtime.EMPTY_ALLOWED_PROMPTS}
             for name in [*listed, *others]]
 

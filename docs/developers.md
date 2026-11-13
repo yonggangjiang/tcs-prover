@@ -449,8 +449,14 @@ that every prompt and tool text is the user's to adjust. What the code does:
   prompt that may be, passes nothing), `team_note` (`{members}`), `team_member`
   (`{assignment}`) and one description per team tool and argument
   (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
-  checks it; `runner/prompt_catalog.py` names, groups and describes every text
-  for the Prompts dialog (`GET /prompt-catalog`, `POST /prompt-catalog/check`).
+  checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
+  turn fills in `{message}` and nothing in a progress summary; the related works
+  note and a verify-only round's instruction are used as written);
+  `runner/prompt_catalog.py` names, groups and describes every text for the
+  Prompts dialog (`GET /prompt-catalog`, `POST /prompt-catalog/check`), each
+  entry's `template` saying whether it is filled in (a brace that is no
+  placeholder written twice: every text with placeholders, and the progress
+  summaries, which have none).
 - **Each job keeps its texts.** A new job records `promptSet` (every catalog
   text after the user's edits) in `prompts/prompt-set.json` of its controller
   and run folders; every launch rewrites the controller's copy from the job's

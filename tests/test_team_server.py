@@ -440,7 +440,8 @@ class CatalogRouteTests(unittest.TestCase):
         self.assertEqual(listing["groups"][:6], ["Statement review", "Author", "Coordinator", "Goal loop", "Team",
                                                   "Team tools"])
         entry = next(item for item in listing["prompts"] if item["name"] == "goal_continuation")
-        self.assertEqual(set(entry), {"name", "group", "label", "when", "placeholders", "text", "emptyAllowed"})
+        self.assertEqual(set(entry), {"name", "group", "label", "when", "placeholders", "template", "text",
+                                      "emptyAllowed"})
         self.assertEqual((entry["group"], entry["placeholders"]),
                          ("Goal loop", ["{continuation}", "{elapsed}", "{limit}", "{objective}"]))
         self.assertEqual(entry["text"], runtime.builtin_workflow("author_critic")["prompts"]["goal_continuation"])

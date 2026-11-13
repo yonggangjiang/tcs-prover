@@ -1444,7 +1444,9 @@ function adoptPromptCatalog(answer) {
     && typeof entry.name === "string" && entry.name && typeof entry.text === "string").map((entry) => ({
     name: entry.name, group: String(entry.group || "Other"), label: String(entry.label || entry.name),
     when: String(entry.when || ""), text: entry.text, emptyAllowed: entry.emptyAllowed === true,
-    placeholders: Array.isArray(entry.placeholders) ? entry.placeholders.map(String) : [] }));
+    placeholders: Array.isArray(entry.placeholders) ? entry.placeholders.map(String) : [],
+    // A template without placeholders (the progress summaries): filled in, so a brace is written twice.
+    template: entry.template === true }));
   const groups = Array.isArray(answer?.groups) ? answer.groups.map(String) : [];
   for (const entry of entries) if (!groups.includes(entry.group)) groups.push(entry.group);
   return { catalog: entries, groups: groups.filter((group) => entries.some((entry) => entry.group === group)) };
@@ -1563,9 +1565,9 @@ function promptTemplateFields(text) {
 }
 
 // Why one text cannot be used, or "": as the runner reads it. An empty text only where the catalog allows it; the
-// statement marker exactly once where the text has it; a template (a text with {placeholders}) only its own
-// fields, without conversions or formats, and any other brace written twice. A text without placeholders is sent
-// as it is written, braces included.
+// statement marker exactly once where the text has it; a template (a text with {placeholders}, or one the catalog
+// marks as a template without any) only its own fields, without conversions or formats, and any other brace written
+// twice. Any other text without placeholders is sent as it is written, braces included.
 function promptTextProblem(entry, text) {
   if (!String(text).trim()) {
     if (entry.emptyAllowed) return "";
@@ -1577,9 +1579,12 @@ function promptTextProblem(entry, text) {
     return `${name} must contain exactly one [STATEMENT].`;
   }
   const allowed = entry.placeholders.filter((field) => /^\{[^{}]+\}$/.test(field)).map((field) => field.slice(1, -1));
-  if (!allowed.length) return "";
+  if (!allowed.length && entry.template !== true) return "";
   const roots = new Set(allowed.map((field) => field.split(".")[0]));
   const fields = promptTemplateFields(String(text));
+  if (!allowed.length) {
+    return fields && !fields.length ? "" : "This text has no placeholders: write every brace twice: {{ and }}.";
+  }
   const valid = fields && fields.every((field) => {
     const names = field.split(".");
     return names.every((part) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(part)) && roots.has(names[0]);
@@ -1733,15 +1738,18 @@ function updatePromptHelp() {
     : mark === "edited" ? "Edited for the next job" : "Default";
   ui.promptEditorWhen.textContent = entry.when || "Not described by this server.";
   const fields = entry.placeholders;
+  // A template without placeholders (entry.template: the progress summaries) is filled in all the same.
+  const bare = !fields.length && entry.template === true;
   ui.promptEditorFields.replaceChildren(...(fields.length ? fields.map((field) => {
     const code = document.createElement("code");
     code.textContent = field;
     return code;
-  }) : ["None: the text is sent as written, braces included."]));
+  }) : [bare ? "None." : "None: the text is sent as written, braces included."]));
   const template = fields.some((field) => /^\{[^{}]+\}$/.test(field));
   ui.promptEditorHelp.textContent = [
     fields.includes("[STATEMENT]") ? "Keep exactly one [STATEMENT]: the workflow puts the statement there." : "",
-    template ? "Write the placeholders as listed; write any other brace twice: {{ and }}." : "",
+    template ? "Write the placeholders as listed; write any other brace twice: {{ and }}."
+      : bare ? "Write every brace twice: {{ and }}." : "",
     entry.emptyAllowed ? "Leave it empty to use the program's own text." : "",
     store.readOnly ? "Read-only: a job keeps the texts it started with."
       : "An edit applies to the next job you start from this form; new problems start from the workflow files' "

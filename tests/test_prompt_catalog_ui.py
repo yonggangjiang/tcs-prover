@@ -5,8 +5,9 @@ without the catalog (the six role prompts, as before).
 
 The checks cut ui/app.js into slices by marker text and run them in Node's vm with the small fake DOM of
 tests/test_provider_ui.py, against a catalog shaped as the build contract says: {groups, prompts: [{name, group,
-label, when, placeholders, text, emptyAllowed}]}, placeholders written as in the text ("{objective}", "[STATEMENT]"),
-an empty list for a text sent as written. No server, model or CLI is involved.
+label, when, placeholders, template, text, emptyAllowed}]}, placeholders written as in the text ("{objective}",
+"[STATEMENT]"), an empty list for a text sent as written or for a template without placeholders (template true, the
+progress summaries). No server, model or CLI is involved.
 """
 import json
 import re
@@ -24,9 +25,10 @@ SLICES = [["// --- Prompts: every text the workflow sends its models", "function
 GROUPS = ["Statement review", "Author", "Coordinator", "Goal loop", "Team", "Team tools", "Critic", "Writer", "Other"]
 
 
-def entry(name, group, label, placeholders, text, when="", empty=False):
+def entry(name, group, label, placeholders, text, when="", empty=False, template=None):
     return {"name": name, "group": group, "label": label, "when": when or f"When {label} is used.",
-            "placeholders": placeholders, "text": text, "emptyAllowed": empty}
+            "placeholders": placeholders, "text": text, "emptyAllowed": empty,
+            **({"template": template} if template is not None else {})}
 
 
 CATALOG = {"groups": GROUPS, "prompts": [
@@ -327,6 +329,43 @@ await apply();
 assert.equal(ui.promptDialog.open, false);
 assert.deepEqual(promptOverrides, { team_note: "{{team}}: {members}", final: "Write it in LaTeX." });
 """)
+
+    def test_a_template_without_placeholders_asks_for_every_brace_twice(self):
+        # The progress summaries are filled in with no placeholder (the catalog's template: true), so a brace is
+        # written twice there; the related works note is appended as written (template false), braces included.
+        catalog = {"groups": GROUPS, "prompts": [
+            *CATALOG["prompts"],
+            entry("summary", "Author", "Progress summary", [], "Write a progress summary.", template=True),
+            entry("related_works", "Author", "Related works", [], "RELATED WORKS: see related-works/INDEX.md.",
+                  template=False)]}
+        self.run_app(r"""
+await open();
+selectPrompt("summary");
+assert.deepEqual(fields(), ["None."]);
+assert.equal(ui.promptEditorHelp.textContent.split(" An edit")[0], "Write every brace twice: {{ and }}.");
+selectPrompt("related_works");
+assert.deepEqual(fields(), ["None: the text is sent as written, braces included."]);
+assert.match(ui.promptEditorHelp.textContent, /^An edit applies to the next job/);
+const refused = async (name, text, message) => {
+  selectPrompt(name);
+  type(text);
+  await apply();
+  assert.deepEqual([ui.promptDialog.open, activePrompt, ui.promptError.hidden, ui.promptError.textContent],
+    [true, name, false, message], text);
+};
+for (const text of ["Summarize your progress on {original_prompt}.", "A lone { brace.", "A lone } brace."]) {
+  await refused("summary", text, "This text has no placeholders: write every brace twice: {{ and }}.");
+}
+assert.equal(requests.filter((item) => item.path === "/prompt-catalog/check").length, 0);
+selectPrompt("summary");
+type("Summarize the sets {{x}} you used.");
+selectPrompt("related_works");
+type("RELATED WORKS: see {directory} and a lone }.");
+await apply();
+assert.equal(ui.promptDialog.open, false);
+assert.deepEqual(promptOverrides, { summary: "Summarize the sets {{x}} you used.",
+  related_works: "RELATED WORKS: see {directory} and a lone }." });
+""", catalog=catalog)
 
     def test_untouched_texts_never_become_edits_and_defaults_are_read_at_every_opening(self):
         self.run_app(r"""
