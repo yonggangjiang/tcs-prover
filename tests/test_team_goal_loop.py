@@ -35,8 +35,9 @@ TEXTS = {name: text for name, text in runtime.load_workflow(WORKFLOW)["prompts"]
          if name in runtime.HARNESS_TEXTS}
 
 # A stand-in `codex` for a team member's `codex exec --json`: it logs its call, reports a saved session and answers
-# from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a failure: SLOW (works until stopped), FAIL-ONCE (a model-call
-# failure after some work, once per run folder), NOLOGIN (a login the CLI refuses).
+# from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a
+# failure: SLOW (works until stopped), FAIL-ONCE (a model-call failure after some work, once per run folder), NOLOGIN
+# (a login the CLI refuses).
 FAKE_CODEX = r'''
 import json, os, sys, time, uuid
 argv = sys.argv[1:]

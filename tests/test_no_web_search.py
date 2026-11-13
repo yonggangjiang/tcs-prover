@@ -160,8 +160,8 @@ class WarningTests(Case):
         # Same as the coordinator: its model, named once.
         _, warnings = self.run_author(author_model=other, author_team="tcs", author_subagents=3)
         warning, = warnings
-        self.assertIn('but the model of the author coordinator and author subagents 1, 2 and 3 has no web search on its '
-                      'connection: gpt-6.1-sol (API connection "Other gateway").', warning["text"])
+        self.assertIn('but the model of the author coordinator and author subagents 1, 2 and 3 has no web search on '
+                      'its connection: gpt-6.1-sol (API connection "Other gateway").', warning["text"])
 
     def test_no_warning_when_the_model_can_search_or_the_run_does_not_search(self):
         for name, options in (

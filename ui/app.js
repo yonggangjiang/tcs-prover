@@ -1531,7 +1531,8 @@ function seedPromptOverrides(settings) {
       const text = edits[name];
       if (typeof text === "string" && text.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = text;
     }
-    promptValues = Object.fromEntries(promptNames().map((name) => [name, promptOverrides[name] ?? promptDefault(name)]));
+    promptValues = Object.fromEntries(promptNames().map((name) => [name,
+      promptOverrides[name] ?? promptDefault(name)]));
   } else {
     for (const [name, prompt] of Object.entries(promptValues)) {
       if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;

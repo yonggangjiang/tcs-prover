@@ -187,7 +187,8 @@ class JobTests(ServerCase):
                 saved = self.saved(app)
                 self.assertEqual((saved["goalLoop"], saved["legacyTeam"]), ("codex", True))
                 # A new job all the same: it saves the texts it runs with.
-                self.assertEqual(json.loads(Path(option(argv, "--prompt-set-file")).read_text()), app.state["promptSet"])
+                texts = Path(option(argv, "--prompt-set-file"))
+                self.assertEqual(json.loads(texts.read_text()), app.state["promptSet"])
         # Restored, resumed, revised or continued, it keeps them, as a job from before does.
         restored = self.restored(app)
         self.assertEqual((restored.state["goalLoop"], restored.state["authorTeam"], restored.state["legacyTeam"]),
@@ -339,7 +340,8 @@ class NoWebSearchTests(ServerCase):
         app = self.job()
         app.add_trace(warning)
         for index in range(server.TRACE_LIMIT + 10):
-            app.add_trace({"kind": "status", "stage": "solve", "node": "author", "label": "Routine", "text": str(index)})
+            app.add_trace({"kind": "status", "stage": "solve", "node": "author", "label": "Routine",
+                           "text": str(index)})
         # Routine records pushed it out of the live window; it stays pinned, in the page's trace and after a restart.
         self.assertNotIn(warning["text"], [record.get("text") for record in app.state["trace"]])
         for job in (app, self.restored(app)):
