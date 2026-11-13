@@ -6085,6 +6085,8 @@ class App:
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
             workflow_stages={"review": False, "author": False, "critic": False, "writing": True},
+            # A continuation of a stopped job runs with that job's texts (its LaTeX repair, writer request ...).
+            **self._team_settings(None, continuation_source),
         )
         options["originalContent"] = source
         if options["retrievalMode"] == "historical":
@@ -6164,6 +6166,8 @@ class App:
             include_review=False,
             retrieval_mode=retrieval_mode, retrieval_cutoff_utc=retrieval_cutoff_utc,
             workflow_stages={"review": False, "author": False, "critic": False, "writing": True},
+            # A continuation of a stopped job runs with that job's texts (its LaTeX repair, writer request ...).
+            **self._team_settings(None, continuation_source),
         )
         options["originalContent"] = solution
         if options["retrievalMode"] == "historical":

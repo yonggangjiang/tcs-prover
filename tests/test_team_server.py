@@ -308,6 +308,33 @@ class PromptEditTests(ServerCase):
         self.assertIs(server.web_team_options({}, {**source.state, "promptEdits": None})["prompt_edits"], False)
 
 
+    def test_writing_continuations_of_a_stopped_job_run_its_texts(self):
+        # Retry LaTeX compilation and Retry LaTeX editor make a job that runs only the writer: like every other
+        # continuation it runs the stopped job's texts (here its edited LaTeX repair and writer request) and keeps
+        # its edits, and its launch passes them to the runner.
+        defaults = server.prompt_defaults()
+        edits = {"compilation_repair": defaults["compilation_repair"] + "\nAlways keep the amsthm environments.",
+                 "solution_input": defaults["solution_input"] + "\nKeep it short."}
+        source = self.job({"promptOverrides": edits})
+        self.assertEqual(source.state["promptEdits"], edits)
+        for start in ("final", "latex"):
+            with self.subTest(start=start):
+                continued = server.App(runs=self.runs, load_latest=False)
+                if start == "final":
+                    continued.start_final_resume(STATEMENT, "Proof.", continuation_source=str(source.run_dir))
+                else:
+                    continued.start_latex_only(f"Theorem. {STATEMENT}\n\nProof. P.",
+                                               continuation_source=str(source.run_dir), stopped_stage="final")
+                self.assertEqual({name: continued.state["promptSet"][name] for name in edits}, edits)
+                self.assertEqual(continued.state["promptEdits"], edits)
+                texts = json.loads(Path(option(self.launches[-1], "--prompt-set-file")).read_text())
+                self.assertEqual({name: texts[name] for name in edits}, edits)
+        # A writer job of its own (no job to continue) runs today's texts, as before.
+        alone = server.App(runs=self.runs, load_latest=False)
+        alone.start_latex_only(f"Theorem. {STATEMENT}\n\nProof. P.")
+        self.assertEqual(alone.state["promptSet"]["compilation_repair"], defaults["compilation_repair"])
+
+
 class MemberRecordTests(ServerCase):
     def test_two_assignments_of_one_member_are_both_listed_with_their_own_ids(self):
         records = team_loop.member_records([(1, "Lemma A\nProve it."), (1, "Lemma B\nProve it.")])
