@@ -52,10 +52,11 @@ which jobs from before the setting and web-cutoff runs show (see
 [the goal loop](workflow.md#the-goal-loop)). A job whose author runs through
 Claude Code (a Claude model, or an API model of the Anthropic format) reads
 *TCS Prover (Claude Code authors always use it)*, whatever loop the job
-recorded, as Claude Code has no goal mode of its own. **View this job's prompts**, under
-the rows, opens every text the job runs with, read-only and grouped as in **Edit
-prompts**, each marked *changed* where it differs from today's default; for a job
-from before every text was saved, the role prompts it saved, with a note.
+recorded, as Claude Code has no goal mode of its own. **View this job's
+prompts**, under the rows, opens every text the job runs with, read-only and
+grouped as in **Edit prompts**, each marked *changed* where it differs from
+today's default; for a job from before every text was saved, the role prompts it
+saved, with a note.
 
 In the activity log, the coordinator's team shows as **Author subagent 2 (Claude
 Opus 5.5) started** (the member's number and model, then the first line of its

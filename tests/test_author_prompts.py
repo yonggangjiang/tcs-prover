@@ -289,9 +289,11 @@ class AuthorPromptTests(unittest.TestCase):
 
         self.assertIn("{reason}", prepared()["handoff_refused"])
         for name in ("goal", "continuation", "compaction", "resume", "repair", "reopen", "summary",
-                     "conversation", "related_works"):
+                     "conversation"):
             with self.subTest(prompt=name), self.assertRaisesRegex(ValueError, "Unknown prompt input: 'reason'"):
                 prepared(**{name: "Why: {reason}."})
+        # The related works note is appended to the first prompt as written: its braces are plain text.
+        self.assertEqual(prepared(related_works="Why: {reason}.")["related_works"], "Why: {reason}.")
         # The controller renders the note with the reason alone, so no other value can appear in it.
         for field in ("message", "solution", "bugs", "original_prompt", "instruction"):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, f"Unknown prompt input: '{field}'"):
