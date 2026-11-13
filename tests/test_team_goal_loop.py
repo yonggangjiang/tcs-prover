@@ -6,9 +6,11 @@ client: they start the real bridge (runner/tcs_mcp.py) exactly as the CLI's sett
 Team members run stand-in `codex` and `claude` programs (no model). No real CLI is started.
 """
 
+import contextlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1100,6 +1102,148 @@ class ReportBudgetTests(unittest.TestCase):
         self.assertIn("The report could not be saved", head)
         self.assertTrue(text.endswith("\n[The report is cut here at 20,000 characters; it could not be saved.]"))
         self.assertNotIn("team/member-1/1-report.md", text)
+
+
+class ReportNumberingTests(unittest.TestCase):
+    """Each runner of a job (after a pause and resume, a restart, a resume after the time limit) makes a team of its
+    own in the same working folder: its assignments continue each member's numbering there, so an earlier runner's
+    report file, which the coordinator was told about, and the rows of its assignment are never replaced."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.directory = Path(folder.name).resolve()
+        self.records = []
+
+    def team(self, attempt):
+        crew = team.Team(team.team_members(None, "gpt-6.1-sol", "high", 2), prompts=TEXTS, directory=self.directory,
+                         attempt=attempt, configuration=lambda error, member: None,
+                         emit=lambda kind, **fields: self.records.append({"kind": kind, **fields}),
+                         render=runtime.render_template, retry_note="")
+        self.addCleanup(crew.close, "The test ended.")
+        return crew
+
+    @staticmethod
+    def done(member, prompt, conversation, process):
+        return "Done: " + prompt.splitlines()[0]
+
+    def test_a_later_runners_team_numbers_its_assignments_after_the_earlier_runners(self):
+        first = self.team(self.done)
+        first.call("team_assign", {"member": 1, "assignment": "Lemma A: the base case"})
+        self.assertIn("Report file: team/member-1/1-report.md", first.call("team_wait", {"timeout_minutes": 1}))
+        first.close("It stopped when the author paused.")
+        second = self.team(self.done)  # The runner of the resumed job.
+        second.call("team_assign", {"member": 1, "assignment": "Lemma B: the induction step"})
+        self.assertIn("Report file: team/member-1/2-report.md", second.call("team_wait", {"timeout_minutes": 1}))
+        folder = self.directory / "team" / "member-1"
+        self.assertEqual((folder / "1-report.md").read_text(), "Done: Lemma A: the base case")
+        self.assertEqual((folder / "2-report.md").read_text(), "Done: Lemma B: the induction step")
+        self.assertEqual([record["subagentId"] for record in self.records if record.get("subagentState") == "started"],
+                         ["member-1-1", "member-1-2"])
+        # A member without an earlier assignment starts at 1.
+        second.call("team_assign", {"member": 2, "assignment": "Lemma C"})
+        self.assertIn("Report file: team/member-2/1-report.md", second.call("team_wait", {"timeout_minutes": 1}))
+
+    def test_an_assignment_takes_its_number_as_it_starts(self):
+        # A runner that ends before the report (killed with its members) leaves the assignment's empty report file,
+        # so the next runner's first assignment takes the next number.
+        release = threading.Event()
+
+        def held(member, prompt, conversation, process):
+            release.wait(20)
+            return "Late report."
+
+        first = self.team(held)
+        self.addCleanup(release.set)  # Before the team closes: its member then ends at once.
+        first.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        reserved = self.directory / "team" / "member-1" / "1-report.md"
+        self.assertEqual(reserved.read_text(), "")
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(reserved.stat().st_mode), 0o600)
+        second = self.team(self.done)
+        second.call("team_assign", {"member": 1, "assignment": "Lemma B"})
+        self.assertIn("Report file: team/member-1/2-report.md", second.call("team_wait", {"timeout_minutes": 1}))
+
+    def test_numbering_never_reads_through_a_link(self):
+        # A link in place of the member's folder (the model shares the working folder) is not followed to find
+        # numbers: its target's files are not the member's reports.
+        outside = self.directory / "outside"
+        outside.mkdir()
+        (outside / "7-report.md").write_text("Not a report of this job.")
+        (self.directory / "team").mkdir()
+        (self.directory / "team" / "member-1").symlink_to(outside, target_is_directory=True)
+        self.assertEqual(team.highest_report(self.directory, 1), 0)
+        with self.assertRaises((OSError, ValueError)):
+            team.reserve_report(self.directory, 1, 1)
+        self.assertEqual(sorted(path.name for path in outside.iterdir()), ["7-report.md"])
+
+
+class WindowsInfo:
+    """lstat information as Windows gives it for a junction: a folder with the mount-point reparse tag."""
+
+    def __init__(self, info):
+        self._info = info
+        self.st_mode = stat.S_IFDIR | 0o700
+        self.st_file_attributes = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        self.st_reparse_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+    def __getattr__(self, name):
+        return getattr(self._info, name)
+
+
+@unittest.skipIf(os.name == "nt", "Simulates Windows with POSIX links")
+class SaveReportWindowsTests(unittest.TestCase):
+    """save_report() where files cannot be opened relative to a folder without following links (Windows: no
+    O_NOFOLLOW). A junction, which Path.is_symlink() does not report, is refused like any link, and a report is always
+    a new file: an earlier file or link of its name is removed first, never truncated or written through."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = Path(folder.name).resolve()
+        self.directory, self.outside = root / "run", root / "outside"
+        self.directory.mkdir()
+        self.outside.mkdir()
+
+    def windows(self):
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            info = real(path, *args, **kwargs)
+            return WindowsInfo(info) if stat.S_ISLNK(info.st_mode) else info
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(os, "O_NOFOLLOW", 0))
+        stack.enter_context(mock.patch.object(os, "lstat", lstat))
+        stack.enter_context(mock.patch.object(Path, "lstat", lambda path: lstat(path)))
+        return stack
+
+    def test_a_junction_in_place_of_the_members_folder_is_refused(self):
+        (self.directory / "team").mkdir()
+        (self.directory / "team" / "member-1").symlink_to(self.outside, target_is_directory=True)
+        for windows in (True, False):
+            with self.subTest(windows=windows), (self.windows() if windows else contextlib.ExitStack()):
+                if windows:
+                    self.assertFalse((self.directory / "team" / "member-1").is_symlink())  # As Windows says.
+                with self.assertRaises((OSError, ValueError)):
+                    team.save_report(self.directory, 1, 1, "The member's report.")
+                self.assertEqual(list(self.outside.iterdir()), [])
+
+    def test_a_planted_hard_link_is_replaced_and_its_target_kept(self):
+        kept = self.outside / "notes.md"
+        for windows in (True, False):
+            with self.subTest(windows=windows), (self.windows() if windows else contextlib.ExitStack()):
+                kept.write_text("Keep me.")
+                folder = self.directory / "team" / "member-1"
+                folder.mkdir(parents=True, exist_ok=True)
+                planted = folder / "2-report.md"
+                if planted.exists():
+                    planted.unlink()
+                os.link(kept, planted)
+                path = team.save_report(self.directory, 1, 2, "The member's report.")
+                self.assertEqual(path.read_text(), "The member's report.")
+                self.assertEqual(kept.read_text(), "Keep me.")
+                self.assertEqual(os.stat(path).st_nlink, 1)
 
 
 class ExecuteTeamTests(unittest.TestCase):

@@ -22,10 +22,12 @@ Pause, Stop, the time limit and a restart stop them with the coordinator (Team.c
 """
 
 from collections import deque
+import contextlib
 import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import stat
@@ -67,6 +69,11 @@ MEMBER_LABELS = {"started": "Author subagent started", "finished": "Author subag
                  "failed": "Author subagent failed"}
 TASK_CHARS = 200
 TEAM_FOLDER = "team"
+# A report's file name in its member's folder (team/member-<n>/<k>-report.md): k is the assignment's number.
+REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
+# A Windows reparse point whose tag has this bit names another file: a symlink, a junction or a similar link, which
+# lstat does not follow and Path.is_symlink() does not report for a junction (as ui/related_works.py tests links).
+NAME_SURROGATE_TAG = 0x20000000
 # The start of the report of a stopped assignment; {reason} says who stopped it.
 STOPPED_REPORT = "This assignment was stopped. {reason}"
 # How long after an attention (Team.attention()) a team_wait that starts still ends at once: the coordinator may
@@ -525,9 +532,17 @@ class Team:
                 raise TeamError(f"Member {number} is {'stopping' if member.state == 'stopping' else 'working'}"
                                 f" on \"{member.task}\"; wait for its report, or stop it with team_stop first.")
             member.state, member.task, member.since = "working", _task_line(assignment), time.time()
-            member.count += 1
+            # Numbered after every report of the member in the working folder: each runner of a job (after a pause
+            # and resume, a restart, a resume after the time limit) has a team of its own, whose assignments must
+            # never take an earlier one's numbers, its report files and its rows on the job page.
+            member.count = max(member.count, highest_report(self.directory, number)) + 1
             # Fixed until this assignment's report: a new one starts only when the member is idle again.
             member.assignment = assignment_id(number, member.count)
+            try:
+                # Its report file, empty until the report: the number stays taken if the runner ends first.
+                reserve_report(self.directory, number, member.count)
+            except (OSError, ValueError):
+                pass  # The report is saved, or why it could not be, when the assignment ends.
             member.cancel, member.stop_reason, member.process = threading.Event(), None, None
             prompt = self.render(self.prompts["team_member"], {"assignment": assignment})
             member.thread = threading.Thread(target=self._run, args=(member, member.count, prompt, fork_from),
@@ -689,7 +704,7 @@ class Team:
         else:
             text, state = str(reply or ""), "finished"
         path, problem = self._save(member.number, count, text)
-        relative = f"{TEAM_FOLDER}/member-{member.number}/{count}-report.md"
+        relative = f"{TEAM_FOLDER}/member-{member.number}/{report_name(count)}"
         with self.cond:
             member.state, member.process, member.thread = "idle", None, None
             closing = self.closed is not None
@@ -723,47 +738,131 @@ def _report_text(report, share):
     return f"{report['head']}\n{report['where']}\nREPORT:\n{text}"
 
 
-def save_report(directory, number, count, text):
-    """Write one report file under ``directory``, owner-only, refusing any link on the way; return its path."""
+def report_name(count):
+    """The file name of a member's ``count``-th report."""
+
+    return f"{count}-report.md"
+
+
+def _linked(info):
+    """Whether lstat information describes a link: a symlink, or a Windows junction or other name-surrogate link."""
+
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        and getattr(info, "st_reparse_tag", 0) & NAME_SURROGATE_TAG)
+
+
+class _MemberFolder:
+    """A member's report folder, team/member-<n> under the working folder, reached without following any link.
+
+    Where the system opens files relative to an open folder (``descriptor``, POSIX) every name is used there, so a
+    link put in place of a folder after the walk is never followed; elsewhere (Windows) each part of ``path`` was
+    checked with lstat, a junction included.
+    """
+
+    def __init__(self, descriptor=None, path=None):
+        self.descriptor, self.path = descriptor, path
+
+    def _target(self, name):
+        return (name, {"dir_fd": self.descriptor}) if self.descriptor is not None else (self.path / name, {})
+
+    def names(self):
+        return os.listdir(self.descriptor if self.descriptor is not None else self.path)
+
+    def unlink(self, name):
+        target, where = self._target(name)
+        os.unlink(target, **where)  # Never follows a link: a planted link is removed itself.
+
+    def create(self, name):
+        """A new owner-only file of that name, opened for writing; FileExistsError when the name is taken."""
+
+        target, where = self._target(name)
+        return os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, **where)
+
+
+@contextlib.contextmanager
+def _member_folder(directory, number, create=True):
+    """The _MemberFolder of member ``number`` under ``directory``; ``create`` makes missing folders, owner-only.
+
+    A part that is a link, a junction or no folder raises ValueError (or OSError where the system refuses to follow
+    it), so nothing is ever read or written through a link.
+    """
 
     parts = (TEAM_FOLDER, f"member-{number}")
-    name = f"{count}-report.md"
-    data = text.encode("utf-8")
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow and getattr(os, "O_DIRECTORY", 0) and os.open in os.supports_dir_fd:
         folder = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             for part in parts:
-                try:
-                    os.mkdir(part, 0o700, dir_fd=folder)
-                except FileExistsError:
-                    pass
+                if create:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=folder)
+                    except FileExistsError:
+                        pass
                 inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=folder)
                 os.close(folder)
                 folder = inner
-            try:
-                os.unlink(name, dir_fd=folder)  # A file (or link) of that name planted earlier; unlink never follows.
-            except FileNotFoundError:
-                pass
-            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600, dir_fd=folder)
+            yield _MemberFolder(descriptor=folder)
         finally:
             os.close(folder)
     else:
         path = Path(directory)
         for part in parts:
             path = path / part
-            try:
-                os.mkdir(path, 0o700)
-            except FileExistsError:
-                if path.is_symlink() or not path.is_dir():
-                    raise ValueError(f"{path} is not a folder")
-        target = path / name
-        if target.is_symlink():
-            target.unlink()
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o600)
+            if create:
+                try:
+                    os.mkdir(path, 0o700)
+                    continue
+                except FileExistsError:
+                    pass
+            info = os.lstat(path)
+            if _linked(info) or not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"{path} is not a folder")
+        yield _MemberFolder(path=path)
+
+
+def highest_report(directory, number):
+    """The highest k of member ``number``'s report files <k>-report.md under ``directory``, else 0.
+
+    These are its assignments of the job's earlier runners; a folder that is missing, or that cannot be reached
+    without following a link, has none.
+    """
+
+    try:
+        with _member_folder(directory, number, create=False) as folder:
+            names = folder.names()
+    except (OSError, ValueError):
+        return 0
+    return max((int(found.group(1)) for found in map(REPORT_FILE.fullmatch, names) if found), default=0)
+
+
+def reserve_report(directory, number, count):
+    """Create the empty report file of member ``number``'s ``count``-th assignment as the assignment starts.
+
+    Its number then stays taken when the runner ends before the report (highest_report()); save_report() replaces
+    the file. A name already taken raises FileExistsError.
+    """
+
+    with _member_folder(directory, number) as folder:
+        os.close(folder.create(report_name(count)))
+
+
+def save_report(directory, number, count, text):
+    """Write one report file under ``directory``, owner-only, refusing any link on the way; return its path."""
+
+    name = report_name(count)
+    data = text.encode("utf-8")
+    with _member_folder(directory, number) as folder:
+        try:
+            # Its reservation (reserve_report()), or a file or link of that name planted earlier: removed first, so
+            # the report is a new file and nothing is truncated or written through a link.
+            folder.unlink(name)
+        except FileNotFoundError:
+            pass
+        descriptor = folder.create(name)
     with os.fdopen(descriptor, "wb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError("the report file is not a plain file")
         stream.write(data)
-    return Path(directory, *parts, name)
+    return Path(directory, TEAM_FOLDER, f"member-{number}", name)
