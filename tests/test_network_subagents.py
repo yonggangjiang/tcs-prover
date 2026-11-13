@@ -150,8 +150,11 @@ class AuthorTests(network.Folders):
                         self.assertEqual(config["features"]["multi_agent"], bool(count))
                         self.assertEqual(config["features"]["multi_agent_v2"]["max_concurrent_threads_per_session"],
                                          count + 1)
+                        # Codex's own limits for its subagents; an author alone has Codex's agents off (none of its
+                        # collaboration tools).
                         self.assertEqual(config.get("agents"),
-                                         {"max_concurrent_threads_per_session": count, "max_depth": 1} if count else None)
+                                         {"max_concurrent_threads_per_session": count, "max_depth": 1} if count
+                                         else {"enabled": False})
                         if platform == "darwin":
                             profile = config["permissions"][runtime.PRIVATE_PERMISSIONS]
                             self.assertEqual(profile.get("network"), {"enabled": True} if mode == "live" else None)
@@ -173,7 +176,8 @@ class AuthorTests(network.Folders):
                     self.assertEqual(agent_flags(argv), limit_flags(0))
                     self.assertIn(["--disable", "multi_agent"], pairs(argv))
                     self.assertFalse(resumed["config"]["features"]["multi_agent"])
-                    self.assertNotIn("agents", resumed["config"])
+                    # Nor any collaboration tool of Codex: its agents are off.
+                    self.assertEqual(resumed["config"]["agents"], {"enabled": False})
                     if platform == "darwin":
                         profile = resumed["config"]["permissions"][runtime.PRIVATE_PERMISSIONS]
                         self.assertEqual(profile.get("network"), {"enabled": True} if mode == "live" else None)
