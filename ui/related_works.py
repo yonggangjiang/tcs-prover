@@ -1413,19 +1413,47 @@ def _staged_source(root, token):
             yield folder
 
 
-def listing(workspace, manifest_dir):
+def listing(workspace, manifest_dir, shares=None):
     """The related works of a workspace (or batch store) for display, oldest first; never raises.
 
     ``batch`` is the ID of the store an item is shared from, or "", and
     ``sharedFrom`` says which kind of store that is (shared_from()). A
-    store's removed works are left out.
+    store's removed works are left out. ``shares``, for a job's list
+    (store_shares()), gives the names a batch's store shares now: a work the
+    job has from a batch that no longer shares it (removed there after the
+    job kept its copy) is marked ``noLongerShared``. A store whose record
+    cannot be read marks none.
     """
+
+    held = {}
+
+    def no_longer_shared(entry):
+        store_id = entry.get("batch", "")
+        if shares is None or shared_from(store_id) != "batch" or not entry.get("batchName"):
+            return False
+        if store_id not in held:
+            held[store_id] = shares(store_id)
+        return held[store_id] is not None and entry["batchName"] not in held[store_id]
 
     return [{"name": entry["name"], "originalName": entry.get("originalName", ""), "kind": entry["kind"],
              "title": entry.get("title", ""), "sizeText": size_text(entry["size"]), "textStatus": text_status(entry),
              "addedAt": entry.get("addedAt", ""), "batch": entry.get("batch", ""),
-             "sharedFrom": shared_from(entry.get("batch", ""))}
+             "sharedFrom": shared_from(entry.get("batch", "")),
+             **({"noLongerShared": True} if no_longer_shared(entry) else {})}
             for entry in _active(_read_manifest(manifest_dir, strict=False)[1])]
+
+
+def store_shares(controller_root):
+    """``shares`` for listing(): the names the batch store ``store_id`` under ``controller_root`` shares now
+    (BatchStore.held()), or None when its record cannot be read. A store that is gone shares none."""
+
+    def shares(store_id):
+        try:
+            return BatchStore(batch_directory(controller_root, store_id)).held()
+        except ValueError:  # RelatedWorksError included.
+            return None
+
+    return shares
 
 
 def count(workspace, manifest_dir):

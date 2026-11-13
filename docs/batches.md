@@ -90,7 +90,9 @@ The Overview's batch card counts them (*2 shared related works*).
   their copy.* A work added later under the same name is saved under a new
   name (`notation-2.md`), so the problems that kept the first one get both.
 - **A problem's own list** marks each shared work **from the batch** (and a
-  folder run's works **from the folder run**); its own works stay its own.
+  folder run's works **from the folder run**); its own works stay its own. A
+  work removed here that the problem kept is marked **from the batch, no
+  longer shared**.
 - **Web-cutoff jobs** get them as local inputs like any related work: each is
   recorded in the run's audit log when the job gets it, and **Remove** never
   takes one away.

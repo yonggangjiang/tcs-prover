@@ -247,6 +247,29 @@ assert.equal(ui.relatedWorksNote.textContent, "Saved in the author's related-wor
 // Without a work from its batch the job says nothing of it.
 render({...running, relatedWorks: works([pdf])});
 assert.doesNotMatch(ui.relatedWorksNote.textContent, /from the batch/);
+// A work removed from the batch's shared works that the job kept says so, and the note says what that means; the
+// works still shared keep "from the batch".
+const kept = {...fromBatch, name: 'old.md', originalName: 'old.md', noLongerShared: true};
+render({...running, relatedWorks: works([kept, fromBatch, {...note, batch: 'default', sharedFrom: 'batch',
+  noLongerShared: true}])});
+assert.deepEqual(rowText(ui.relatedWorksList), [
+  ['MD', 'old.md', '2.0 KB · from the batch, no longer shared'],
+  ['MD', 'defs.md', '2.0 KB · from the batch'],
+  ['NOTE', 'Plan.md', 'note “Plan” · 2.0 KB · from the batch, no longer shared']]);
+assert.equal(ui.relatedWorksNote.textContent, "Saved in the author's related-works folder. The author is told about "
+  + 'new files at its next step. Works marked “from the batch” are shared with every problem in this batch; add or '
+  + 'remove them on the batch page. Works marked “from the batch, no longer shared” were removed from the batch\'s '
+  + 'shared works; this job keeps its copy.');
+// With only works the batch no longer shares, the note does not say that works from the batch are shared.
+render({...running, relatedWorks: works([pdf, kept])});
+assert.equal(ui.relatedWorksNote.textContent, "Saved in the author's related-works folder. The author is told about "
+  + 'new files at its next step. Works marked “from the batch, no longer shared” were removed from the batch\'s '
+  + 'shared works; this job keeps its copy.');
+// A folder run's works are never marked so.
+render({...running, relatedWorks: works([{...fromRun, noLongerShared: true}])});
+assert.deepEqual(rowText(ui.relatedWorksList), [
+  ['PDF', 'survey.pdf', '1.2 MB · text extracted (12 pages) · from the folder run']]);
+assert.doesNotMatch(ui.relatedWorksNote.textContent, /no longer shared/);
 """)
 
     def test_the_new_problem_page_names_what_its_batch_shares_and_links_to_the_batch_page(self):

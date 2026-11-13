@@ -3763,8 +3763,10 @@ class App:
         if state["retrieval"]["mode"] == "historical":
             state["retrievalMode"] = "historical"
             state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
-        # Read from the manifests without the job lock (listing never raises).
-        items = related_works.listing(workspace, controller_directory(workspace)) if workspace else []
+        # Read from the manifests without the job lock (listing never raises). A work from the batch that the batch
+        # no longer shares (removed there after this job kept its copy) is marked so.
+        shares = related_works.store_shares(self.runs / CONTROLLER_FOLDER)
+        items = related_works.listing(workspace, controller_directory(workspace), shares) if workspace else []
         batch = None
         if folder_batch:
             try:

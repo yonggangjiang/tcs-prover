@@ -5138,8 +5138,10 @@ function renderRelatedWorksPanel() {
       : ["pausing", "paused"].includes(jobPhase)
         ? "Saved in the author's related-works folder. The author is told about new files with your next message or when the run resumes."
       : "Saved in the author's related-works folder, which related-works/INDEX.md lists.")
-      + (items.some((item) => item.sharedFrom === "batch") ? " Works marked “from the batch” are shared with every "
-        + "problem in this batch; add or remove them on the batch page." : "")
+      + (items.some((item) => item.sharedFrom === "batch" && !item.noLongerShared) ? " Works marked “from the batch” "
+        + "are shared with every problem in this batch; add or remove them on the batch page." : "")
+      + (items.some((item) => item.sharedFrom === "batch" && item.noLongerShared) ? " Works marked “from the batch, "
+        + "no longer shared” were removed from the batch's shared works; this job keeps its copy." : "")
       + (state.folderBatch ? " Works for every problem of this folder run are added under Shared with a folder run "
         + "on the batch page." : "");
   if (ui.relatedWorksNote.textContent !== note) ui.relatedWorksNote.textContent = note;
@@ -6077,8 +6079,10 @@ function relatedWorkRow(item, remove = null) {
   const label = item.name || work.name || (work.kind === "note" ? "Note" : "File");
   name.textContent = label;
   meta.className = "related-work-meta";
-  // A work a job shares: from its batch (shared with every problem in it), or from its folder run.
-  const shared = work.sharedFrom === "batch" ? "from the batch"
+  // A work a job shares: from its batch (shared with every problem in it, or no longer: removed there after the job
+  // kept its copy), or from its folder run.
+  const shared = work.sharedFrom === "batch" && work.noLongerShared ? "from the batch, no longer shared"
+    : work.sharedFrom === "batch" ? "from the batch"
     : work.sharedFrom === "folderRun" || work.batch ? "from the folder run" : "";
   meta.textContent = item.status === "uploading" ? "uploading…"
     : item.status === "failed" ? `Upload failed: ${item.error}`

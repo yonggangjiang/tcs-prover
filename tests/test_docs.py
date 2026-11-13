@@ -269,6 +269,7 @@ class SharedWorksDocsTests(unittest.TestCase):
                        "New problems no longer get it", "problems whose author has not started",
                        "**Related works removed**", "stopped and finished problems keep their copy",
                        "as do web-cutoff problems", "saved under a new name", "**from the batch**",
+                       "A work removed here that the problem kept is marked **from the batch, no longer shared**",
                        "**from the folder run**", "recorded in the run's audit log", "**Remove** never takes one away",
                        "New terminal runs do not get them", "Deleting a batch deletes what it shares",
                        "200 works per batch", "a start that would pass it is refused before any job is created",
@@ -287,6 +288,8 @@ class SharedWorksDocsTests(unittest.TestCase):
         job = flat(DOCS / "job-page.md")
         for needed in ("[shares related works](batches.md#shared-related-works)", "**Open the batch page**",
                        "**from the batch**", "**from the folder run**", "**Related works removed**",
+                       "A work removed from the batch's shared works that this job kept is marked **from the batch, no "
+                       "longer shared**",
                        "every other job keeps its copy", "200 works per job (shared ones included)"):
             with self.subTest(needed=needed):
                 self.assertIn(needed, job)
@@ -299,7 +302,8 @@ class SharedWorksDocsTests(unittest.TestCase):
         for needed in ('class="batch-related-heading">Shared with every problem in this batch</h2>',
                        'class="batch-related-heading">Shared with a folder run</h2>'):
             self.assertIn(needed, page)
-        for needed in ('"from the batch"', '"from the folder run"', '"Open the batch page"',
+        for needed in ('"from the batch"', '"from the batch, no longer shared"', '"from the folder run"',
+                       '"Open the batch page"',
                        "shared related work${shared === 1"):
             self.assertIn(needed, app)
         self.assertIn('"label": "Related works removed"', server)
