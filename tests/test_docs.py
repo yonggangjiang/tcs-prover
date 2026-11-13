@@ -234,5 +234,57 @@ class CoordinatorDocsTests(unittest.TestCase):
             self.assertIn(label, app)
 
 
+
+class SharedWorksDocsTests(unittest.TestCase):
+    """What the guides say about the related works a batch shares with every problem, in the page's own words."""
+
+    def test_the_batches_guide_gives_every_rule_of_shared_related_works(self):
+        text = flat(DOCS / "batches.md")
+        section = text[text.index("## Shared related works"):text.index("## Run a folder")]
+        for needed in ("the default batch, a batch made with **New batch**, and the batch a folder run goes into",
+                       "**Shared with every problem in this batch**", "**Add files…**", "**Add a note**",
+                       "**Remove**", "*2 shared related works*", "as hard links to one stored copy",
+                       "when it is created, before anything runs", "**New problem in this batch**",
+                       "**Run a folder…** into the batch", "a rerun into it",
+                       "every problem of the batch that can still take related works",
+                       "Running and paused authors are told",
+                       "Finished problems keep what they had and get no new works",
+                       "the author is told about the works its folder lacked",
+                       "**Open the batch page** (in a new window, so what you wrote stays)",
+                       "With the Author stage off it says the problem does not get them",
+                       "New problems no longer get it", "problems whose author has not started",
+                       "**Related works removed**", "stopped and finished problems keep their copy",
+                       "as do web-cutoff problems", "saved under a new name", "**from the batch**",
+                       "**from the folder run**", "recorded in the run's audit log", "**Remove** never takes one away",
+                       "New terminal runs do not get them", "Deleting a batch deletes what it shares",
+                       "200 works per batch", "`runs/.controller/.batches/<batch ID>/`",
+                       "`default` for the default batch"):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, section)
+        self.assertIn("**Shared with a folder run**", text)
+        self.assertIn("removes one that has no problems left, with the related works it shares", text)
+        self.assertNotIn("Batch related works", text)
+
+    def test_the_other_guides_point_to_it_and_quote_the_page(self):
+        job = flat(DOCS / "job-page.md")
+        for needed in ("[shares related works](batches.md#shared-related-works)", "**Open the batch page**",
+                       "**from the batch**", "**from the folder run**", "**Related works removed**",
+                       "every other job keeps its copy", "200 works per job (shared ones included)"):
+            with self.subTest(needed=needed):
+                self.assertIn(needed, job)
+        self.assertIn("This includes what the job's batch or folder run shares", flat(DOCS / "web-cutoff.md"))
+        self.assertIn("`runs/.controller/.batches/<ID>/`", flat(DOCS / "developers.md"))
+        self.assertIn("related works shared with every problem in a batch", flat(README))
+        page = " ".join((ROOT / "ui" / "index.html").read_text(encoding="utf-8").split())
+        app = (ROOT / "ui" / "app.js").read_text(encoding="utf-8")
+        server = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
+        for needed in ('class="batch-related-heading">Shared with every problem in this batch</h2>',
+                       'class="batch-related-heading">Shared with a folder run</h2>'):
+            self.assertIn(needed, page)
+        for needed in ('"from the batch"', '"from the folder run"', '"Open the batch page"',
+                       "shared related work${shared === 1"):
+            self.assertIn(needed, app)
+        self.assertIn('"label": "Related works removed"', server)
+
 if __name__ == "__main__":
     unittest.main()

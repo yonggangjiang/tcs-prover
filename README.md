@@ -104,7 +104,7 @@ retried every minute, without limit.
 | [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
 | [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, the convention critic, LaTeX |
 | [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads |
-| [Batches and folder runs](docs/batches.md) | Batches, running a folder of statements, the running-jobs limit |
+| [Batches and folder runs](docs/batches.md) | Batches, related works shared with every problem in a batch, running a folder of statements, the running-jobs limit |
 | [Saved settings](docs/saved-settings.md) | Saving and loading New problem settings, and the default, under **Advanced settings** |
 | [Web search cutoff](docs/web-cutoff.md) | Runs with no web access, or with archives from before a date only |
 | [Sandbox and network](docs/sandbox.md) | What a run's models can read, write and reach |

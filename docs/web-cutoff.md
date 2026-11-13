@@ -117,7 +117,9 @@ critic's progress line says only that its critics have started.
 - **Related works** are accepted as in live runs. They are local inputs in the
   isolated author's own workspace, read with its normal access, and each one is
   recorded in the audit log (name, size, SHA-256, time and kind), so the cutoff
-  audit shows what you supplied.
+  audit shows what you supplied. This includes what the job's batch or folder
+  run shares; a work removed from the batch stays in a web-cutoff job, as its
+  audit log records it.
 - **Progress summaries** stay on the job page only (no `progress-summary.md`).
 
 A timestamp run you stop continues with **Continue** in its own folder under the

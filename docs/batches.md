@@ -19,8 +19,8 @@ see its reasoning and outputs.
   instead** changes that and keeps what you wrote). The problem, or every job of
   a **Run a folder…** started there, goes into that batch.
 - **Rename** renames one of your batches; **Delete batch** removes one that has
-  no problems left. A name has at most 200 characters, and there is no limit on
-  the number of batches.
+  no problems left, with the related works it shares. A name has at most 200
+  characters, and there is no limit on the number of batches.
 - **Previous batches**: folders under `runs/` that hold the runs of an earlier
   setup, marked **Previous batch · read-only**. Opening one never resumes its
   jobs or changes its files, and no problem can be added to it.
@@ -32,7 +32,8 @@ in its batch. [Saved settings](saved-settings.md) never include the batch, so
 loading or saving them never changes where the problem goes.
 
 Jobs in every batch run, pause, resume, continue and retry the same way, share
-the running-jobs limit and survive restarts. Every job's folder stays directly
+the running-jobs limit and survive restarts. Every batch can also give all its
+problems the same [related works](#shared-related-works). Every job's folder stays directly
 under `runs/` whatever its batch: the batch is recorded in the job's
 `job-settings.json` (`"batch"`) and the names of your batches in
 `runs/.controller/batches.json`, so renaming or deleting a batch never moves a
@@ -42,6 +43,62 @@ deleted until the file is repaired and TCS Prover is started again; jobs made
 from those problems meanwhile return to their batch with them. Page links
 include the batch, so equal problem names in different batches stay apart; a
 link that names a batch its job is not in opens the job in its own batch.
+
+## Shared related works
+
+A batch can share related works, such as a common definition, notation or
+background paper, with every problem in it: the default batch, a batch made
+with **New batch**, and the batch a folder run goes into. On the batch page,
+**Shared with every problem in this batch** lists them with **Add files…**,
+**Add a note** (an optional title and the text) and **Remove** on each work.
+The Overview's batch card counts them (*2 shared related works*).
+
+- **Who gets them.** Every problem of the batch with an Author stage finds them
+  in its `related-works/` folder, beside its own
+  [related works](job-page.md#related-works), as hard links to one stored copy
+  (no extra disk space; where a hard link is impossible, that job gets its own
+  copy and its activity log says so).
+  - A new problem gets what the batch shares when it is created, before
+    anything runs: **New problem in this batch**, **Run a folder…** into the
+    batch, a rerun into it, and a job made from another job of the batch.
+  - A work you add reaches at once every problem of the batch that can still
+    take related works: in statement review or waiting for approval, queued or
+    prepared, running, paused, stopped or at its time limit. Running and paused
+    authors are told as about any added work: a running author at its next
+    step, a paused one with your next message or at **Resume**.
+  - Finished problems keep what they had and get no new works. A job made from
+    one of them gets what the batch shares then; if it reopens the saved author
+    conversation, the author is told about the works its folder lacked.
+- **The New problem page** says it in one line under the batch it adds to:
+  *This problem also gets the 2 related works shared with every problem in
+  “Graph coloring”: definitions.md and background.pdf.*, with **Open the batch
+  page** (in a new window, so what you wrote stays). With the Author stage off
+  it says the problem does not get them. The **Run a folder…** question says
+  that every job gets them.
+- **Remove** asks first, then stops sharing the work. New problems no longer
+  get it, and problems whose author has not started (in statement review or
+  waiting for approval, queued or prepared, or a stopped statement review) lose
+  it; their activity log says **Related works removed**. Running, paused,
+  stopped and finished problems keep their copy, as do web-cutoff problems and
+  jobs that continue another job's work.
+  The batch page says what each change did, for example *Removed notation.md.
+  New problems in this batch no longer get it. It was taken out of 1 problem
+  that had not started. 2 problems that have started or have a web cutoff keep
+  their copy.* A work added later under the same name is saved under a new
+  name (`notation-2.md`), so the problems that kept the first one get both.
+- **A problem's own list** marks each shared work **from the batch** (and a
+  folder run's works **from the folder run**); its own works stay its own.
+- **Web-cutoff jobs** get them as local inputs like any related work: each is
+  recorded in the run's audit log when the job gets it, and **Remove** never
+  takes one away.
+- New terminal runs do not get them (a saved job continued from the terminal
+  does, as on the page). Saved (read-only) batches share none. Deleting a batch
+  deletes what it shares.
+- The limits of related works apply: 64 MB per file, 2,000,000 characters per
+  note, 200 works per batch, and at most 200 related works in each job, its own
+  and shared ones together. They are stored once in
+  `runs/.controller/.batches/<batch ID>/` (`default` for the default batch),
+  outside every job's folder, and the stored files are read-only.
 
 ## Run a folder
 
@@ -75,9 +132,11 @@ outside every job's folder, and every job finds them in its own `related-works/`
 folder as hard links to that one copy (no extra disk space; where a hard link is
 impossible, that job gets its own copy and its activity log says so). While the
 run's jobs can still take related works, the batch page lists the run under
-**Batch related works**: **Add files…** and **Add a note** there add works to
+**Shared with a folder run**: **Add files…** and **Add a note** there add works to
 every job of the run, queued ones included, and each running or paused author is
 told about them. A job of the run can still add works of its own on its page.
+Every job of the run also gets what its batch [shares](#shared-related-works)
+with every problem.
 
 To run a folder from the terminal, see [Terminal runs](terminal.md#folders).
 

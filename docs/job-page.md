@@ -326,15 +326,25 @@ do, so the proof must still be complete and self-contained.
   running or has failed (remove it first), or while the Author stage is off,
   and the refusal opens **Advanced settings** on the list. With **Run a
   folder…** they go to every job of the folder run (see
-  [Batches and folder runs](batches.md#run-a-folder)).
+  [Batches and folder runs](batches.md#run-a-folder)). When the batch the
+  problem joins [shares related works](batches.md#shared-related-works) with
+  every problem, one line under the batch's name says which ones this problem
+  gets too, with **Open the batch page**, where they are added and removed.
 - **On the job page**, **Related works · N** lists them; **Add files…** and
   **Add a note** add more while the job is reviewing, prepared, running, pausing
   or paused (other jobs only list them). The author is told once, without being
   interrupted: in its first prompt, by a live instruction while it works, or
   with your next message or **Resume** while it is paused.
-- Works are only ever added: the page cannot remove or download them, and a
-  saved file is never overwritten. The author reads them but cannot change them
-  (except Codex on Linux and Windows, whose legacy sandbox can write there).
+- The list marks the works its batch shares with every problem **from the
+  batch**, and those of its folder run **from the folder run**; the note above
+  the list says where they are managed (the batch page). The others are the
+  job's own.
+- Works are only ever added to a job: its page cannot remove or download them,
+  and a saved file is never overwritten. The one exception: a work removed from
+  the batch's shared works also leaves the jobs whose author has not started
+  (their activity log says **Related works removed**); every other job keeps
+  its copy. The author reads them but cannot change them (except Codex on Linux
+  and Windows, whose legacy sandbox can write there).
 - They are saved in `related-works/` of the author's working folder, listed in
   `related-works/INDEX.md` (oldest first, with sizes, page counts and text
   copies). A continuation that shares the workspace shares them, and a retried
@@ -345,9 +355,9 @@ do, so the proof must still be complete and self-contained.
   characters and 2 GB of memory (two at a time). An encrypted PDF, one without a
   text layer (there is no OCR), or one over a limit keeps no text copy, and its
   row says why.
-- **Limits:** 64 MB per file, 200 works per job, 2,000,000 characters per note,
-  and a one-line title of at most 200 characters. Each is a refusal with its
-  reason, never a silent cut.
+- **Limits:** 64 MB per file, 200 works per job (shared ones included),
+  2,000,000 characters per note, and a one-line title of at most 200
+  characters. Each is a refusal with its reason, never a silent cut.
 - Web-cutoff runs accept them as local inputs in the isolated author's own
   workspace (the sandbox is not widened), and record each one in the audit log
   (name, size, SHA-256, time and kind).

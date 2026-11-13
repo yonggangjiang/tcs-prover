@@ -68,6 +68,10 @@ working folder.
   author's private temp folder `tmp/`.
 - `runs/.controller/batches.json`: the names of batches made with New batch
   (owner-only).
+- `runs/.controller/.batches/<ID>/`: the related works a folder run (`b_…`) or a
+  batch (its ID, `default` for the default batch) shares: one read-only copy,
+  hard-linked into its jobs' `related-works/`, and its manifest, which keeps a
+  removed work's entry so its name is never used again.
 - `runs/.uploads`: staged related-work uploads, removed after 24 hours.
 - `runs/.trash/`: deleted jobs, kept for 30 days.
 - `.tcs-prover/`: the private state (see [Sandbox and network](sandbox.md)),
@@ -668,7 +672,7 @@ restarted original controller is found again through its launch status file.
   features cannot turn on historical search through the new page.
 - The gateway cannot make batches: its pages show no **New batch** or **New
   problem in this batch**, and every job of the new controller appears in its
-  card.
+  card. Its cards name no shared related works, so its pages show none.
 - The gateway does not forward the Setup page: `/?setup=1` loads, its `/setup`
   routes answer 404, and the page says to open TCS Prover from its own launch
   link (a step's jobs protection sees only one controller's jobs).
