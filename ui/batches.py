@@ -527,13 +527,15 @@ class BatchCatalog:
         import workflow_runner
         if settings.get('goalLoop') in workflow_runner.GOAL_LOOPS:
             state['goalLoop'] = settings['goalLoop']
+            state['legacyTeam'] = settings.get('legacyTeam') is True
             state['authorTeam'] = saved_team(settings.get('authorTeam'))
             try:
                 state['authorSubagentModels'] = team_module.validated_team(settings.get('authorSubagentModels'))
             except ValueError:
                 state['authorSubagentModels'] = None
         else:
-            state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None)
+            state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False,
+                         legacyTeam=True)
         texts = self._json(directory, PROMPT_SET_FILENAME, None)
         state['promptSet'] = texts if texts and all(isinstance(value, str) for value in texts.values()) else None
         # The texts edited for it, which a rerun carries (None: it saved none; {} is a saved "none edited").

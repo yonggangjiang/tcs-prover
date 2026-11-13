@@ -1422,15 +1422,18 @@ def web_team_options(body, source=None):
 
     ``source`` is the state of the job a request revises or copies (its settings fill in what the request leaves
     out); without either, the goal loop is DEFAULT_GOAL_LOOP and every member runs the coordinator's model. A
-    source from before (it recorded no goal loop) keeps Codex's goal mode and the CLI's built-in subagents
-    (``legacy_team``), as such a job keeps its single author.
+    source from before (it recorded no goal loop), or one that kept such a job's settings (legacyTeam), keeps Codex's
+    goal mode and the CLI's built-in subagents (``legacy_team``), as such a job keeps its single author. A request
+    with ``legacyTeam`` true asks for them too: the page's rerun of such a job, whose form keeps its goal loop and
+    subagents.
     """
 
     overrides = body.get("promptOverrides") if isinstance(body.get("promptOverrides"), dict) else {}
     saved = (source or {}).get("promptSet") if isinstance((source or {}).get("promptSet"), dict) else {}
     texts = {name: text for name, text in {**saved, **overrides}.items() if name not in PROMPT_ROLES}
-    legacy = source is not None and (source.get("goalLoopRecorded") is False
-                                     or source.get("goalLoop") not in runtime.GOAL_LOOPS)
+    legacy = body.get("legacyTeam") is True or (source is not None and (
+        source.get("goalLoopRecorded") is False or source.get("goalLoop") not in runtime.GOAL_LOOPS
+        or source.get("legacyTeam") is True))
     # What was edited (_workflow_options' prompt_edits): for a job made from another one, the texts edited for that
     # one and those the request edits now, or False when that one recorded none; a new job's are what it is given.
     edits = None
@@ -1536,6 +1539,7 @@ def saved_team_state(run_dir):
     state = {}
     if settings.get("goalLoop") in runtime.GOAL_LOOPS:
         state["goalLoop"] = settings["goalLoop"]
+        state["legacyTeam"] = settings.get("legacyTeam") is True
         try:
             state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
         except ValueError:
@@ -2238,6 +2242,10 @@ def empty_state(trace=None, trace_version=0):
         # False for a saved job that recorded no goal loop (every job from before): it keeps Codex's goal mode and
         # the built-in subagents, saves none (see _save_job_settings), and a job made from it keeps them too.
         "goalLoopRecorded": True,
+        # True for a job that runs Codex's goal mode and the CLI's built-in subagents as a job from before does: such
+        # a job (goalLoopRecorded False), and one made from it or from a rerun of it (web_team_options); a job made
+        # from it keeps them, and the page's rerun of it carries them.
+        "legacyTeam": False,
         # False for a saved job that never recorded its author mode (every job from before the coordinator): it
         # stays a single author, also when its settings are revised, and saves none (see _save_job_settings).
         "authorModeRecorded": True,
@@ -3131,7 +3139,7 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "conventionWarning", "resumeQueuedAt",
-            "goalLoop", "authorSubagentModels", "authorTeam",
+            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
@@ -3155,8 +3163,10 @@ class App:
             values.pop("authorMode", None)
         if options.get("goalLoopRecorded") is False:
             # A job from before the goal loop records none, so it and the jobs made from it keep Codex's goal mode.
-            for key in ("goalLoop", "authorSubagentModels", "authorTeam"):
+            for key in ("goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam"):
                 values.pop(key, None)
+        if values.get("legacyTeam") is not True:
+            values.pop("legacyTeam", None)  # Saved only by a job that keeps a job from before's goal loop and team.
         # Every save records the job's batch, whatever ``options`` holds.
         if self.batch_id:
             values["batch"] = self.batch_id
@@ -3901,6 +3911,7 @@ class App:
             "goalLoop": goal_loop,
             "authorSubagentModels": team_models,
             "authorTeam": author_team,
+            "legacyTeam": bool(legacy_team),
             "promptSet": prompt_set,
             "promptEdits": None if prompt_edits is False else job_prompt_edits(prompt_edits, defaults_texts),
             **search_options,
@@ -8973,6 +8984,7 @@ def restore_saved_app(app, *, owned=True):
             if settings.get("goalLoop") in runtime.GOAL_LOOPS:
                 state["goalLoop"] = settings["goalLoop"]
                 persisted_settings.add("goalLoop")
+                state["legacyTeam"] = settings.get("legacyTeam") is True
                 state["authorTeam"] = saved_team(settings.get("authorTeam"))
                 try:
                     state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
@@ -9006,7 +9018,8 @@ def restore_saved_app(app, *, owned=True):
     state["promptEdits"] = saved_prompt_edits(run_dir) if state["promptSet"] is not None else None
     app._saved_prompt_edits = state["promptEdits"]
     if "goalLoop" not in persisted_settings:
-        state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False)
+        state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False,
+                     legacyTeam=True)
 
     direct_statement = False
     try:

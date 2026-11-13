@@ -170,6 +170,42 @@ class JobTests(ServerCase):
         self.assertEqual(continued.state["authorSubagentModels"], MODELS)
         self.assertEqual(continued.state["promptSet"]["team_note"], "Team: {members}")
 
+    def test_a_rerun_of_a_job_from_before_keeps_codex_s_goal_mode_and_the_built_in_subagents(self):
+        old = self.job()
+        self.make_old(old)
+        restored = self.restored(old)
+        self.assertEqual((restored.state["goalLoop"], restored.state["legacyTeam"]), ("codex", True))
+        # The page's rerun of it asks for its goal loop and subagents (legacyTeam), whatever goal loop it sends.
+        for loop in ("codex", "tcs"):
+            with self.subTest(loop=loop):
+                app = self.job({"legacyTeam": True, "goalLoop": loop})
+                argv = self.launches[-1]
+                self.assertEqual((option(argv, "--goal-loop"), option(argv, "--author-team")), ("codex", "builtin"))
+                self.assertEqual((app.state["goalLoop"], app.state["authorTeam"], app.state["legacyTeam"]),
+                                 ("codex", None, True))
+                saved = self.saved(app)
+                self.assertEqual((saved["goalLoop"], saved["legacyTeam"]), ("codex", True))
+                # A new job all the same: it saves the texts it runs with.
+                self.assertEqual(json.loads(Path(option(argv, "--prompt-set-file")).read_text()), app.state["promptSet"])
+        # Restored, resumed, revised or continued, it keeps them, as a job from before does.
+        restored = self.restored(app)
+        self.assertEqual((restored.state["goalLoop"], restored.state["authorTeam"], restored.state["legacyTeam"]),
+                         ("codex", None, True))
+        restored.resume()
+        self.assertEqual(option(self.launches[-1], "--author-team"), "builtin")
+        self.assertTrue(server.web_team_options({"goalLoop": "tcs"}, restored.state)["legacy_team"])
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(app.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual((continued.state["goalLoop"], continued.state["authorTeam"], continued.state["legacyTeam"]),
+                         ("codex", None, True))
+        self.assertEqual(option(self.launches[-1], "--author-team"), "builtin")
+        # Any other job runs TCS Prover's team, and saves no such setting.
+        app = self.job({"goalLoop": "codex"})
+        self.assertEqual((option(self.launches[-1], "--author-team"), app.state["legacyTeam"]), ("tcs", False))
+        self.assertNotIn("legacyTeam", self.saved(app))
+        self.assertFalse(self.restored(app).state["legacyTeam"])
+
     def test_the_subagent_models_are_checked_as_the_role_models_are(self):
         options = server.App._workflow_options
         for models, message in ((MODELS[:2], "Choose a model for each of the 3 author subagents"),
@@ -406,7 +442,10 @@ class BatchViewTests(ServerCase):
         self.assertEqual(state["promptSet"], app.state["promptSet"])
         # The texts edited for it, which a rerun from the saved batch carries.
         self.assertEqual(state["promptEdits"], {"team_note": "Team: {members}"})
+        self.assertEqual((state["goalLoopRecorded"], state["legacyTeam"]), (True, False))
         self.make_old(app)
         state = catalog.state(batches.ORIGINAL_BATCH, app.run_dir.name)
         self.assertEqual((state["goalLoop"], state["authorTeam"], state["promptSet"]), ("codex", None, None))
         self.assertIsNone(state["promptEdits"])
+        # As a restored job from before: a rerun from the saved batch keeps its goal loop and subagents.
+        self.assertEqual((state["goalLoopRecorded"], state["legacyTeam"]), (False, True))

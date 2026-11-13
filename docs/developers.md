@@ -528,7 +528,12 @@ that every prompt and tool text is the user's to adjust. What the code does:
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
   restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
   codex --author-team builtin` and no texts, also after a revision in place, and a
-  continuation of it keeps them. A web-cutoff coordinator keeps the CLI's
+  continuation of it keeps them. Its state says `legacyTeam: true`, and the
+  page's rerun of it (app.js `legacyTeamApplies()`, while the form keeps Codex
+  built-in and Same as the coordinator) sends `legacyTeam: true`: the new job
+  runs `codex` with the built-in subagents (`legacy_team`), saves its texts like
+  any new job, and records `legacyTeam: true` in job-settings.json, so it, its
+  reruns and the jobs made from it keep them too. A web-cutoff coordinator keeps the CLI's
   built-in subagents with the coordinator's model (status **Built-in
   subagents**); the server refuses Subagent models with a web cutoff.
 

@@ -602,7 +602,7 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "authorSubagentModels", "goalLoop", "goalLoopRecorded", "thinkingHours", "skipStatementReview",
+    "authorSubagentModels", "goalLoop", "goalLoopRecorded", "legacyTeam", "thinkingHours", "skipStatementReview",
     "statementReviewOnly", "promptSet", "promptEdits",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
@@ -4432,8 +4432,9 @@ function render(next) {
     ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 3;
     if (typeof applyTeamModels === "function") {
-      applyGoalLoop(state.goalLoopRecorded === false ? undefined : state.goalLoop);
+      applyGoalLoop(state.goalLoop);
       applyTeamModels(state.authorSubagentModels);
+      applyLegacyTeam(state.legacyTeam === true || state.goalLoopRecorded === false);
     }
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
@@ -4641,11 +4642,12 @@ function applyComposerSettings(source) {
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
   // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's). A job from
-  // before the setting (goalLoopRecorded false) ran Codex's goal mode without choosing it: a new job from it gets the
-  // default.
+  // before the setting (goalLoopRecorded false), and one that kept its settings (legacyTeam), ran Codex's goal mode
+  // and the CLI's own subagents: a rerun of it keeps them (see legacyTeamApplies).
   if (typeof applyTeamModels === "function") {
-    applyGoalLoop(source.goalLoopRecorded === false ? undefined : source.goalLoop);
+    applyGoalLoop(source.goalLoop);
     applyTeamModels(source.authorSubagentModels);
+    applyLegacyTeam(source.legacyTeam === true || source.goalLoopRecorded === false);
   }
   ui.thinkingHours.value = source.thinkingHours ?? 0;
   ui.thinkingHours.min = hours.minimum ?? 0;
@@ -5442,7 +5444,21 @@ function syncModelMenus() {
 // run. Changing the number of subagents keeps the rows that remain and adds rows set to the coordinator's model; a
 // number still being typed only hides rows, which the field drops when it is left (its change event).
 function teamStore() {
-  return (teamStore.value ||= { mode: "same", rows: [], loop: "tcs" });
+  return (teamStore.value ||= { mode: "same", rows: [], loop: "tcs", legacy: false });
+}
+
+// A rerun's settings of a job from before TCS Prover's goal loop and team (state.goalLoopRecorded false), or of one
+// that kept them (state.legacyTeam): that job ran Codex's goal mode and the CLI's own subagents, each with the
+// coordinator's model, and the rerun keeps them while the form keeps Codex built-in as the goal loop and "Same as the
+// coordinator" (the job then starts with legacyTeam, see proofJobSettings). Choosing TCS Prover's loop or a model for
+// each subagent gives TCS Prover's team, as for any new job.
+function applyLegacyTeam(value) {
+  teamStore().legacy = value === true;
+}
+
+function legacyTeamApplies() {
+  const store = teamStore();
+  return store.legacy && selectedGoalLoop() === "codex" && store.mode !== "each";
 }
 
 function teamRole(index) {
@@ -5561,7 +5577,10 @@ function renderTeamModels() {
   select.value = fixed ? "same" : store.mode;
   ui.authorSubagentModelsHelp.textContent = fixed
     || (store.mode === "each" ? "Choose a model and reasoning for each author subagent below: Codex CLI, Claude Code "
-      + "or an API connection." : "Every author subagent runs the coordinator's model and reasoning.");
+      + "or an API connection." : legacyTeamApplies() ? "As in the job you are rerunning, which started before TCS "
+      + "Prover's team: the author subagents are the coordinator's own CLI subagents, each running the coordinator's "
+      + "model and reasoning. Choose for each, or TCS Prover as the goal loop, for TCS Prover's team."
+      : "Every author subagent runs the coordinator's model and reasoning.");
   const each = offered && !fixed && store.mode === "each";
   show(ui.authorTeamSetting, each);
   if (!each) return;
@@ -5617,6 +5636,11 @@ function renderGoalLoop() {
 function teamFormText() {
   const count = teamSize();
   if (!(count >= 1)) return null;
+  if (legacyTeamApplies() && !teamFixedReason()) {
+    // As Run settings name a job's CLI subagents.
+    return { text: `Coordinator, up to ${count} author subagent${count === 1 ? "" : "s"} at a time (the CLI's own)`,
+      chosen: true };
+  }
   const models = teamModelsSetting();
   const text = teamText(count, models && models.map((item) => teamModelLabel(item.model)));
   return { text: `${text[0].toUpperCase()}${text.slice(1)}`, chosen: Boolean(models) };
@@ -5833,9 +5857,11 @@ function proofJobSettings() {
     criticRounds: Number(ui.criticRounds.value),
     criticCount: Number(ui.criticCount.value),
     authorSubagents: Number(ui.authorSubagents.value),
-    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop.
+    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop; a rerun of a job from
+    // before TCS Prover's team keeps that job's (see legacyTeamApplies).
     ...(typeof teamModelsSetting === "function"
-      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop() } : {}),
+      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop(),
+        ...(legacyTeamApplies() ? { legacyTeam: true } : {}) } : {}),
     thinkingHours: Number(ui.thinkingHours.value),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
@@ -6325,6 +6351,8 @@ ui.authorSubagentModelsMode.onchange = () => {
 for (const input of [ui.goalLoopTcs, ui.goalLoopCodex]) {
   input.onchange = () => {
     if (input.checked) teamStore().loop = input.value === "codex" ? "codex" : "tcs";
+    // A rerun's CLI subagents follow the goal loop (see legacyTeamApplies).
+    renderTeamModels();
     renderAdvancedSummary();
   };
 }
@@ -9798,6 +9826,8 @@ function presetSignature() {
 function presetFormSettings() {
   const settings = proofJobSettings();
   delete settings.promptOverrides;
+  // A rerun's goal loop and subagents of a job from before are that job's, never saved settings'.
+  delete settings.legacyTeam;
   const builtIn = { authorSubagents: 3, criticCount: 3, criticRounds: 2, thinkingHours: 0,
     ...presetStore().builtIn?.settings };
   for (const { key, stage, problem } of presetNumberFields()) {

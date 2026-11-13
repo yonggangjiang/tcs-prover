@@ -184,6 +184,11 @@ who runs those turns:
   **Run settings** say *Codex built-in*), and so does every run with a
   [web cutoff](web-cutoff.md): the form then shows it and says *Web-cutoff runs
   use Codex's goal mode.*
+- **Rerun with suggested statement** on a job from before this setting keeps
+  what that job ran: **Codex built-in** as the goal loop and, for a coordinator,
+  the program's own subagents with the coordinator's model, which the help line
+  under **Subagent models** says. Choosing **TCS Prover** as the goal loop, or
+  **Choose for each**, gives the new job TCS Prover's team, as for any new job.
 
 ### The author coordinator
 
