@@ -444,8 +444,8 @@ class GoalLoopTests(unittest.TestCase):
         start = next(params for method, params in double.rpc.calls if method == "thread/start")
         self.assertFalse(start["config"]["features"]["goals"])
         self.assertEqual(start["config"]["mcp_servers"]["tcs"]["enabled_tools"], ["update_goal"])
-        # An author without TCS Prover's team keeps Codex's agents setting as before.
-        self.assertNotIn("agents", start["config"])
+        # An author that works alone gets none of Codex's collaboration tools.
+        self.assertEqual(start["config"]["agents"], {"enabled": False})
         # No goal request of Codex's goal mode.
         self.assertEqual([method for method, _ in double.rpc.calls if method.startswith("thread/goal/")], [])
         first, second, third = self.turns(double)
@@ -560,6 +560,36 @@ class GoalLoopTests(unittest.TestCase):
         self.addCleanup(session.close)
         next(session)
         self.assertIn("thread/goal/set", [method for method, _ in double.rpc.calls])
+
+    def test_only_an_author_with_codex_s_own_subagents_gets_codex_s_collaboration_tools(self):
+        # Codex 0.160 gives a model of multi-agent version 2 its collaboration tools also without the multi_agent
+        # feature (captured with the real Codex against a scripted model server): an author or coordinator that
+        # starts no subagent of Codex has Codex's agents off in its thread, whoever runs its goal loop.
+        settings = {"model": "gpt-6.1-sol", "effort": "high", "speed": "standard", "summary": "concise"}
+        for loop, features, subagents, agents in (
+                ("tcs", [], 0, {"enabled": False}), ("codex", [], 0, {"enabled": False}),
+                ("codex", ["multi_agent"], 2, {"max_concurrent_threads_per_session": 2, "max_depth": 1}),
+                ("tcs", ["multi_agent"], 2, {"max_concurrent_threads_per_session": 2, "max_depth": 1})):
+            with self.subTest(loop=loop, features=features):
+                def complete(rpc):
+                    if loop == "tcs":
+                        service.call("update_goal", {"status": "complete"})
+                        rpc.messages.extend([goal_test.answer(POINTER), goal_test.completed()])
+                    else:
+                        rpc.messages.extend(goal_test.success(POINTER))
+
+                service = team.Service()
+                self.addCleanup(service.close)
+                double = LoopDouble([complete])
+                session = runtime.goal_session(
+                    double, "Prove S exactly.", prompts=GOAL_PROMPTS, settings={**settings, "subagents": subagents},
+                    features=features, texts=TEXTS, service=service,
+                    options={"goal_cwd": str(self.directory), "goal_loop": loop})
+                self.addCleanup(session.close)
+                self.assertEqual(next(session)["output"], POINTER)
+                start = next(params for method, params in double.rpc.calls if method == "thread/start")
+                # Codex's own subagents keep their limits and nothing else.
+                self.assertEqual(start["config"].get("agents"), agents)
 
     def test_a_workflow_without_the_goal_texts_says_what_is_missing(self):
         double = LoopDouble([])

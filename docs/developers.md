@@ -606,6 +606,21 @@ that every prompt and tool text is the user's to adjust. What the code does:
   as it starts (`team.reserve_report()`), so a later runner of the job (after a
   pause, a restart or the time limit, each with a team of its own) never takes
   an earlier one's numbers, even when that runner ended before the report.
+- **Codex's own subagent tools.** A Codex author or coordinator that starts no
+  subagent of Codex has `agents.enabled = false` in its thread settings
+  (`_author_thread_options(builtin_agents=False)`): one without the
+  `multi_agent` feature (an author that works alone, with Author subagents 0 or
+  a model that gets no subagent tool, and a coordinator with TCS Prover's team),
+  live or web cutoff, and every reply turn of a paused author. Without it Codex
+  0.160 gives a model of multi-agent version 2 (GPT 6.x) its collaboration tools
+  (`spawn_agent`, `wait_agent`, ...) also with `multi_agent` off and with a
+  web-cutoff run's settings, where a session limit of one thread refuses every
+  spawn. An author with Codex's own subagents keeps them: a web-cutoff
+  coordinator, the coordinator of a job from before TCS Prover's team, and an
+  author of `--author-mode author` with subagents. The setting belongs to the
+  thread, so Codex's effective settings (`config/read`), which a web-cutoff
+  run's audit compares, do not show it (checked with the real Codex). Team
+  members get `-c agents.enabled=false` (see above).
 - **Checked with the real Codex 0.160** (the installed binary against a scripted
   model server, no model): it starts the bridge from the settings of
   `thread/start` and of `thread/resume` (a resumed thread gets the new address

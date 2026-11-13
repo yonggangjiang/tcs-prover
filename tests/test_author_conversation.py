@@ -466,6 +466,8 @@ class CodexConversationTests(unittest.TestCase):
                                   "multi_agent_v2": {"max_concurrent_threads_per_session": 1}})
                 self.assertIn(("-c", "features.multi_agent_v2.max_concurrent_threads_per_session=1"),
                               pairs(command))
+                # And none of Codex's collaboration tools reaches the reply turn: Codex's agents are off.
+                self.assertEqual(resumed["config"]["agents"], {"enabled": False})
                 self.assertIn("config/read", self.methods(double))
                 if platform == "darwin":
                     self.assertNotIn("sandbox", resumed)
@@ -490,6 +492,8 @@ class CodexConversationTests(unittest.TestCase):
         resumed = next(params for method, params in double.rpc.calls if method == "thread/resume")
         self.assertEqual(resumed["sandbox"], "workspace-write")
         self.assertTrue(resumed["config"]["features"]["multi_agent"])
+        # A reply turn starts no subagent of Codex all the same.
+        self.assertEqual(resumed["config"]["agents"], {"enabled": False})
 
     def test_the_reply_is_the_final_answer_or_else_the_last_text(self):
         commentary = goal_test.answer("Reading my notes.", "commentary")
@@ -730,9 +734,14 @@ class HistoricalConversationTests(unittest.TestCase):
         self.assertNotIn("code_mode", argv)
         self.assertEqual(keywords, goal_keywords)
         self.assertEqual(keywords["env"], self.child_environment)
-        # The same historical profile.
-        resumed = lambda calls: next(params for method, params in calls if method == "thread/resume")
-        self.assertEqual(resumed(double.rpc.calls), resumed(goal_double.rpc.calls))
+        # The same historical profile, but no subagent of Codex in the reply turn (a thread setting, which the
+        # audit's config/read does not show), where the coordinator keeps Codex's own.
+        resumed = lambda calls: json.loads(json.dumps(next(params for method, params in calls
+                                                           if method == "thread/resume")))
+        reply_options, author_options = resumed(double.rpc.calls), resumed(goal_double.rpc.calls)
+        self.assertEqual(reply_options["config"].pop("agents"), {"enabled": False})
+        self.assertNotIn("agents", author_options["config"])
+        self.assertEqual(reply_options, author_options)
         self.assertEqual(resumed(double.rpc.calls)["permissions"], retrieval_runtime.PROFILE)
         self.assertNotIn("sandbox", resumed(double.rpc.calls))
         # No turn sandbox policy replaces it (a live run's legacy read-only turn sets one).
@@ -745,6 +754,28 @@ class HistoricalConversationTests(unittest.TestCase):
         self.assertTrue(all(params["overrides"] and params["environment"] == self.child_environment
                             for method, params in double.rpc.calls if method == "verify_rpc"))
         self.assertIsNone(double.rpc.stderr_log)
+
+    def test_a_web_cutoff_author_alone_has_codex_s_agents_off_and_a_coordinator_keeps_its_own(self):
+        # Codex 0.160 gives a model of multi-agent version 2 its collaboration tools also with a web-cutoff run's
+        # settings and multi_agent off; the thread's agents setting takes them away, and Codex's effective settings
+        # (config/read), which the audit compares, do not show it (both checked with the real Codex).
+        for features, agents in (([], {"enabled": False}), (["multi_agent"], None)):
+            with self.subTest(features=features):
+                def author(double):
+                    session = runtime.goal_session(double, "Prove S.", prompts=goal_test.PROMPTS, settings=SETTINGS,
+                                                   options={"goal_cwd": str(self.directory)}, features=features)
+                    self.assertEqual(next(session)["outcome"], "done")
+                    session.close()
+
+                # An author alone passes its subagent limits (one thread) to the check.
+                with mock.patch.object(retrieval_runtime, "preflight",
+                                       side_effect=lambda *args, **kwargs: dict(self.child_environment)):
+                    double, argv, _, checks = self.launch(author)
+                start = next(params for method, params in double.rpc.calls if method == "thread/start")
+                self.assertEqual(start["config"].get("agents"), agents)
+                self.assertEqual(start["permissions"], retrieval_runtime.PROFILE)
+                self.assertEqual(argv[:2], ["/pinned/codex", "--strict-config"])
+                self.assertEqual(checks[:2], ["author", "author"])  # Verified as before, at launch and before the turn.
 
     def test_claude_never_converses_for_a_web_cutoff_run(self):
         with mock.patch.object(claude_cli, "SessionProcess", side_effect=AssertionError("Claude started")):
