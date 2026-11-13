@@ -1414,6 +1414,8 @@ kbd {
 /* The Overview's warning that the list of batches cannot be read (a notice above the table): it names the
    file, whose long path may wrap anywhere. */
 .batches-problem { font-size: var(--text-sm); overflow-wrap: anywhere; }
+/* The Overview's line for loading and for nothing made yet sits above the table: a gap keeps it off the table. */
+.batches-panel #batchesStatus { margin-bottom: var(--space-3); }
 
 /* Page head: title, a monospaced meta line, and the page's actions at the right. */
 .page-head {

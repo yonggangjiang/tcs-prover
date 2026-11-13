@@ -538,15 +538,16 @@ function renderBatches(batches) {
   ui.batchesList.dataset.signature = signature;
   ui.batchesList.replaceChildren();
   // Nothing made yet: no batch, or only the default batch with no problem and nothing shared (a server that makes
-  // batches always lists it). The line leads to Setup first.
+  // batches always lists it). The line, above the table, leads to Setup first. The default batch's row says it has
+  // no problems yet, so only an empty list's line opens by saying there is no batch.
   const unused = batches.every(batch => batch.default && !Number(batch.jobCount || 0)
     && !Number(batch.sharedWorks?.count || 0));
-  const opening = batches.length ? "No problems yet. " : "No batches yet. ";
+  const opening = batches.length ? [] : ["No batches yet. "];
   if (unused && typeof setupLink === "function") {
-    ui.batchesStatus.replaceChildren(opening, setupLink(),
+    ui.batchesStatus.replaceChildren(...opening, setupLink(),
       " to check the programs your models need, then create a problem.");
   } else {
-    ui.batchesStatus.textContent = unused ? `${opening}Create a problem to get started.` : "";
+    ui.batchesStatus.textContent = unused ? `${opening.join("")}Create a problem to get started.` : "";
   }
   show(ui.batchesStatus, unused);
   for (const batch of batches) {

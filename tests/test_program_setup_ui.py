@@ -951,9 +951,11 @@ assert.equal(settingUp, true);
 renderBatches([]);
 assert.equal(ui.batchesStatus.textContent, 'No batches yet. Open Setup to check the programs your models need, then create a problem.');
 // So does one that lists only the default batch, with no problem and nothing shared (as a new installation's does).
+// The default batch's row says it has no problems yet; the line does not say it again.
 renderBatches([{id: '__root__', label: 'Default batch', default: true, current: true, jobCount: 0, counts: {},
   sharedWorks: {count: 0, names: []}}]);
-assert.equal(ui.batchesStatus.textContent, 'No problems yet. Open Setup to check the programs your models need, then create a problem.');
+assert.equal(ui.batchesStatus.textContent, 'Open Setup to check the programs your models need, then create a problem.');
+assert.equal(ui.batchesStatus.children[0].dataset.setupLink, '');
 assert.equal(ui.batchesStatus.hidden, false);
 """, slices=(PAGES, OUTCOME, [JOB_PAGE[0], JOB_PAGE[1], "jobPageAttention"], SETUP),
             setup="const refresh = async () => {}; const localDateTime = (v) => v;")

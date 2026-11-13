@@ -169,10 +169,12 @@
           <!-- Why the list of batches made with New batch cannot be read (app.js renderBatches): a warning above
                the table, whose rows then hold those batches' problems in the default batch. -->
           <p id="batchesProblem" class="notice batches-problem" role="status" hidden></p>
+          <!-- Loading, or nothing made yet (app.js renderBatches): a line above the table, never between its heading
+               row and its rows (nothing made yet, the table lists the default batch's row). -->
+          <p id="batchesStatus" class="help" role="status">Loading batches…</p>
           <div class="table-head batch-table-head" aria-hidden="true">
             <span>Batch</span><span>Problems by status</span><span>Activity</span>
           </div>
-          <p id="batchesStatus" class="help" role="status">Loading batches…</p>
           <ol id="batchesList" class="batches-list"></ol>
         </section>
 

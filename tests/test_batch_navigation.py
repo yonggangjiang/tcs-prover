@@ -266,9 +266,12 @@ const [card] = ui.batchesList.children, link = card.children[0];
 assert.equal(link.href, '/?batch=__root__');
 assert.equal(link.children[1].children.map(node => node.textContent).join('|'), 'Default batch|0 problems');
 assert.equal(link.children[3].textContent, '');
-// Nothing is made yet, so the line above the list still says how to begin.
+// Its row says it has no problems yet (its empty progress, which the page fills with "No problems yet") ...
+assert.equal(link.children[2].className, 'batch-progress');
+assert.equal(link.children[2].children.length, 0);
+// ... so the line above the table, which still says how to begin as nothing is made yet, does not say it again.
 assert(!ui.batchesStatus.hidden);
-assert.equal(ui.batchesStatus.textContent, 'No problems yet. Create a problem to get started.');
+assert.equal(ui.batchesStatus.textContent, 'Create a problem to get started.');
 // Once it has a problem or shares a work, or another batch is listed, the line goes.
 for (const batches of [[{...root, jobCount: 1}], [{...root, sharedWorks: {count: 1, names: ['defs.md']}}],
     [root, {id: 'batch_00000000a1', label: 'Graph coloring', named: true, addProblems: true, jobCount: 0, counts: {},
@@ -688,10 +691,21 @@ class BatchMarkupTests(unittest.TestCase):
         html = (ROOT / 'ui/index.html').read_text()
         warning = html.index('id="batchesProblem"')
         self.assertLess(warning, html.index('batch-table-head'))
-        self.assertLess(html.index('batch-table-head'), html.index('id="batchesStatus"'))
+        self.assertLess(warning, html.index('id="batchesStatus"'))
         tag = html[html.rindex('<', 0, warning):html.index('>', warning)]
         self.assertIn('class="notice batches-problem"', tag)
         self.assertIn('hidden', tag)
+
+    def test_the_status_line_sits_above_the_table_never_between_its_heading_row_and_its_rows(self):
+        # Nothing made yet, the line shows while the table lists the default batch's row (and so its heading row).
+        html = (ROOT / 'ui/index.html').read_text()
+        line, head, rows = (html.index(marker) for marker in ('id="batchesStatus"', 'batch-table-head',
+                                                               'id="batchesList"'))
+        self.assertLess(line, head)
+        self.assertLess(head, rows)
+        # With a gap under it, off the table's top edge.
+        self.assertIn('.batches-panel #batchesStatus { margin-bottom: var(--space-3); }',
+                      (ROOT / 'ui/styles.css').read_text())
 
 
 if __name__ == '__main__':
