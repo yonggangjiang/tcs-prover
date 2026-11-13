@@ -21,7 +21,7 @@ from tests import test_presets_ui as presets_ui
 from tests.test_provider_ui import APP, INDEX, page
 
 # The handlers of Author subagents, Subagent models and Goal loop (index.html's controls as app.js wires them).
-HANDLERS = ["// The Coordinator prompt tab is shown while Author subagents is 1 or more",
+HANDLERS = ["// The subagent models show while Author subagents is 1 or more",
             "ui.retrievalMode.onchange = () => {"]
 # Setup's reading of the form (what each program is needed for) and its words.
 SETUP_SLICES = [["function setupWords()", "function setupElement("],
@@ -29,7 +29,7 @@ SETUP_SLICES = [["function setupWords()", "function setupElement("],
                 ["function setupJoin(", "// The programs that need setting up"]]
 
 FORM_SETUP = r"""
-const showCoordinatorPromptTab = () => {};
+
 // The Proof author's subagent controls as index.html has them.
 elements.authorSubagentModelsMode = new Select([new Option("Same as the coordinator", "same"),
   new Option("Choose for each", "each")]);

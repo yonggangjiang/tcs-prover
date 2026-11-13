@@ -32,32 +32,13 @@ SUBAGENTS_HELP = (
 SUBAGENTS_REFUSAL = ("Enter 0 to 10 author subagents: 0 for one author working alone, 1 or more for an author "
                      "coordinator with that many author subagents.")
 
-# The stage switches with the Prompts dialog (its tabs, help and Apply checks) and the rerun's settings.
+# The stage switches, the Prompts dialog and the rerun's settings (their markers; the dialog's checks run with the
+# harness of tests/test_prompt_catalog_ui.py).
 PROMPTS = [
     ["function selectedWorkflowStages()", "function selectedRetrievalMode()"],
     ["const promptLabels =", "function clockText("],
     ["async function rerunWithStatement(", "// The New problem page, adding to"],
 ]
-PROMPTS_SETUP = r"""
-const defaults = {review: 'Review.', author: 'Author. [STATEMENT]', coordinator: 'Coordinate {author_subagents}. [STATEMENT]',
-  critic: 'Critic {count}.', convention: 'Convention {statement}.', final: 'Final.'};
-let state = {phase: 'input', workflow: {settings: {prompts: {...defaults}}}};
-let currentJob = '', currentBatch = '', activePrompt = 'review', composerSeed = null;
-let promptValues = {}, promptDrafts = {}, promptOriginals = {}, promptOverrides = {};
-const ui = new Proxy({}, {get: (target, name) => target[name] ||= new Element()});
-ui.authorSubagents.value = '3';
-ui.promptDialog.showModal = function () { this.open = true; };
-ui.promptDialog.close = function () { this.open = false; };
-const show = (element, visible) => { element.hidden = !visible; };
-const updateModelSummary = () => {}, renderRetrievalSettings = () => {};
-const jobPath = path => path;
-const request = async () => ({workflow: state.workflow});
-const selectedBatch = () => null;
-let opened = 0;
-const newProblem = async () => { opened += 1; };
-const stages = (author = true) => ({review: true, author, critic: true, writing: true});
-"""
-
 # Run settings: the job header and its rows (as tests/test_run_overview.py runs them).
 OVERVIEW = [
     ["function retrievalConfiguration(", "function renderJobs("],
@@ -158,13 +139,13 @@ class CoordinatorMarkupTests(unittest.TestCase):
         text = re.search(r'<p id="authorSubagentsHelp"[^>]*>(.*?)</p>', self.html, re.S).group(1)
         self.assertEqual(" ".join(text.split()), SUBAGENTS_HELP)
 
-    def test_the_prompts_dialog_has_a_coordinator_tab_after_the_author_tab(self):
-        tabs = self.html[self.html.index('id="promptTabs"'):self.html.index('id="promptPanel"')]
-        self.assertEqual(re.findall(r'data-prompt="(\w+)"', tabs),
-                         ["review", "author", "coordinator", "critic", "convention", "final"])
-        tab = re.search(r'<button id="coordinatorPromptTab"[^>]*>([^<]*)</button>', tabs)
-        self.assertEqual(tab.group(1), "Coordinator")
-        self.assertIn('role="tab"', tab.group(0))
+    def test_the_prompts_dialog_lists_the_coordinator_prompt_in_its_own_group(self):
+        # The dialog lists the server's catalog (tests/test_prompt_catalog_ui.py); without one, the role prompts,
+        # the coordinator's in a Coordinator group after the Author's.
+        source = APP.read_text(encoding="utf-8")
+        self.assertIn('coordinator: "Coordinator prompt"', source)
+        self.assertIn('const groups = { review: "Statement review", author: "Author", coordinator: "Coordinator"', source)
+        self.assertNotIn("coordinatorPromptTab", self.html)
 
     def test_the_progress_log_follows_the_status_and_comes_before_the_chat(self):
         start = self.html.index('<div class="run-now card">')
@@ -251,87 +232,70 @@ for (const [value, count] of [['0', 0], [' 3 ', 3], ['10', 10]]) {
 }
 """ % {"refusal": SUBAGENTS_REFUSAL})
 
-    def test_the_coordinator_tab_shows_with_the_author_stage_and_one_or_more_author_subagents(self):
-        self.run_app(PROMPTS, PROMPTS_SETUP, r"""
-setWorkflowStages(stages());
-assert.equal(ui.coordinatorPromptTab.hidden, false);
-for (const value of ['0', '', '1.5', 'many']) {
-  ui.authorSubagents.value = value;
-  showCoordinatorPromptTab();
-  assert.equal(ui.coordinatorPromptTab.hidden, true, JSON.stringify(value));
+    def test_the_coordinator_prompt_is_listed_whatever_the_number_of_author_subagents(self):
+        # Every text is listed, so the coordinator's is there with 0 author subagents and with the Author stage off.
+        from tests import test_prompt_catalog_ui as dialog
+        dialog.PromptCatalogBrowserTests.run_app(self, r"""
+for (const author of [true, false]) {
+  stages = {review: true, author, critic: true, writing: true};
+  await open();
+  assert.ok(groupNames().includes("Coordinator"));
+  selectPrompt("coordinator");
+  assert.deepEqual([ui.promptEditorGroup.textContent, ui.promptEditorLabel.textContent], ["Coordinator", "Coordinator prompt"]);
+  ui.promptDialog.close();
 }
-ui.authorSubagents.value = '1';
-showCoordinatorPromptTab();
-assert.equal(ui.coordinatorPromptTab.hidden, false);
-setWorkflowStages(stages(false));
-assert.equal(ui.coordinatorPromptTab.hidden, true, 'the Author stage is off');
-setWorkflowStages(stages());
-assert.equal(ui.coordinatorPromptTab.hidden, false);
-// A server without the coordinator prompt (an older one, which would refuse the edit) shows no tab.
-delete state.workflow.settings.prompts.coordinator;
-showCoordinatorPromptTab();
-assert.equal(ui.coordinatorPromptTab.hidden, true);
 """)
-        # Editing the field updates the tab at once.
-        source = APP.read_text(encoding="utf-8")
-        handler = source[source.index("ui.authorSubagents.oninput = () => {"):]
-        self.assertIn("showCoordinatorPromptTab();", handler[:handler.index("};")])
 
     def test_the_coordinator_prompt_is_explained_checked_and_kept_for_its_job(self):
-        self.run_app(PROMPTS, PROMPTS_SETUP, r"""
-setWorkflowStages(stages());
-await openPromptEditor();
-assert.equal(ui.promptDialog.open, true);
-assert.equal(promptDrafts.coordinator, defaults.coordinator);
-selectPrompt('coordinator');
-assert.equal(ui.promptEditorLabel.textContent, 'Coordinator prompt — current default');
-assert.equal(ui.promptEditorHelp.textContent, 'This prompt replaces the Author prompt for coordinator jobs (Author '
+        from tests import test_prompt_catalog_ui as dialog
+        dialog.PromptCatalogBrowserTests.run_app(self, r"""
+// An older server without the catalog: the role prompts, the coordinator's explained as before.
+server.catalog = false;
+await open();
+selectPrompt("coordinator");
+assert.equal(ui.promptEditorLabel.textContent, "Coordinator prompt");
+assert.equal(ui.promptEditorState.textContent, "Default");
+assert.equal(ui.promptEditorWhen.textContent, 'This prompt replaces the Author prompt for coordinator jobs (Author '
   + 'subagents 1 or more): the author coordinator follows it to run the author subagents instead of proving the '
   + 'statement itself. Keep exactly one [STATEMENT], which the workflow replaces with your statement. '
   + '{author_subagents} is the number of author subagents; write any other brace twice: {{ and }}. A model without a '
-  + 'subagent tool works alone with the Author prompt instead. New jobs load defaults from the workflow files; '
-  + 'browser edits are not remembered.');
-// The Author tab says when it still applies; with 0 author subagents it is the author's only prompt.
-selectPrompt('author');
-assert(ui.promptEditorHelp.textContent.includes(' With Author subagents 1 or more the author coordinator follows the '
-  + "Coordinator prompt instead; this one is used when the author's model has no subagent tool."));
-ui.authorSubagents.value = '0';
-selectPrompt('author');
-assert.doesNotMatch(ui.promptEditorHelp.textContent, /Coordinator/);
-ui.authorSubagents.value = '3';
+  + 'subagent tool works alone with the Author prompt instead.');
+assert.deepEqual(fields(), ["[STATEMENT]", "{author_subagents}"]);
 // Apply checks it as the server does: one [STATEMENT], {author_subagents} and doubled braces only.
-const marker = 'The coordinator prompt must contain exactly one [STATEMENT].';
-const braces = 'Write {author_subagents} where the number of author subagents goes, and write any other brace '
-  + 'twice: {{ and }}.';
-for (const [text, message] of [['  ', 'Every role prompt must contain instructions.'], ['No marker.', marker],
-    ['[STATEMENT] and [STATEMENT]', marker], ['Run {count} of them. [STATEMENT]', braces],
-    ['The set {x : x > 0}. [STATEMENT]', braces], ['A lone } brace. [STATEMENT]', braces]]) {
-  selectPrompt('coordinator');
-  ui.promptEditor.value = text;
-  selectPrompt('review');
-  savePrompts();
+const marker = "The coordinator prompt must contain exactly one [STATEMENT].";
+const braces = "Write {author_subagents} where the number of author subagents goes, and write any other brace "
+  + "twice: {{ and }}.";
+for (const [text, message] of [["  ", "Every role prompt must contain instructions."], ["No marker.", marker],
+    ["[STATEMENT] and [STATEMENT]", marker], ["Run {count} of them. [STATEMENT]", braces],
+    ["The set {x : x > 0}. [STATEMENT]", braces], ["A lone } brace. [STATEMENT]", braces]]) {
+  selectPrompt("coordinator");
+  type(text);
+  selectPrompt("review");
+  await apply();
   assert.deepEqual([ui.promptDialog.open, activePrompt, ui.promptError.hidden, ui.promptError.textContent],
-    [true, 'coordinator', false, message], text);
+    [true, "coordinator", false, message], text);
 }
-const edited = 'Run up to {author_subagents} of them; the set {{x : x > 0}} is open. [STATEMENT]';
-ui.promptEditor.value = edited;
-savePrompts();
+const edited = "Run up to {author_subagents} of them; the set {{x : x > 0}} is open. [STATEMENT]";
+type(edited);
+await apply();
 assert.equal(ui.promptDialog.open, false);
 assert.deepEqual(promptOverrides, {coordinator: edited});
 
 // A coordinator job shows the coordinator prompt saved with it; a job saved without one shows the default.
-syncPrompts({...state, runId: 'coordinated', coordinatorPrompt: 'Saved coordinator. [STATEMENT]'});
-assert.equal(promptValues.coordinator, 'Saved coordinator. [STATEMENT]');
-syncPrompts({...state, runId: 'older'});
-assert.equal(promptValues.coordinator, defaults.coordinator);
-// Rerun with suggested statement takes the job's coordinator prompt and its number of author subagents along.
-state = {...state, runId: 'coordinated', authorSubagents: 3, authorMode: 'coordinator',
-  coordinatorPrompt: 'Saved coordinator. [STATEMENT]'};
-await rerunWithStatement('A clearer statement.');
+syncPrompts({...state, runId: "coordinated", coordinatorPrompt: "Saved coordinator. [STATEMENT]"});
+assert.equal(promptValues.coordinator, "Saved coordinator. [STATEMENT]");
+syncPrompts({...state, runId: "older"});
+assert.equal(promptValues.coordinator, roleDefaults().coordinator);
+// Rerun with suggested statement takes the job's texts and its number of author subagents along.
+state = {...state, runId: "coordinated", authorSubagents: 3, authorMode: "coordinator",
+  coordinatorPrompt: "Saved coordinator. [STATEMENT]", promptSet: {coordinator: "Saved coordinator. [STATEMENT]"}};
+await rerunWithStatement("A clearer statement.");
 assert.equal(opened, 1);
-assert.deepEqual([composerSeed.settings.authorSubagents, composerSeed.settings.coordinatorPrompt],
-  [3, 'Saved coordinator. [STATEMENT]']);
-""")
+assert.deepEqual([composerSeed.settings.authorSubagents, composerSeed.settings.coordinatorPrompt,
+  composerSeed.settings.promptSet], [3, "Saved coordinator. [STATEMENT]", {coordinator: "Saved coordinator. [STATEMENT]"}]);
+""", extra_slices=[["async function rerunWithStatement(", "// The New problem page, adding to"]],
+            extra_setup="let composerSeed = null, opened = 0;\nconst newProblem = async () => { opened += 1; };\n"
+                        "const selectedBatch = () => null;\n")
 
     def test_run_settings_name_the_author_coordinator_or_say_the_author_works_alone(self):
         self.run_app(OVERVIEW, OVERVIEW_SETUP, r"""

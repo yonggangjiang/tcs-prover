@@ -139,17 +139,16 @@ const ui = {
   criticRoundSetting: $("criticRoundSetting"),
   criticCountSetting: $("criticCountSetting"),
   thinkingHoursSetting: $("thinkingHoursSetting"),
-  editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"),
-  promptTabs: $("promptTabs"), promptEditor: $("promptEditor"),
-  promptEditorLabel: $("promptEditorLabel"),
+  editPrompts: $("editPromptsButton"), promptDialog: $("promptDialog"), promptSettingText: $("promptSettingText"),
+  promptDialogEyebrow: $("promptDialogEyebrow"), promptDialogTitle: $("promptDialogTitle"),
+  promptDialogLede: $("promptDialogLede"), promptDialogNote: $("promptDialogNote"),
+  promptSearch: $("promptSearch"), promptList: $("promptList"), promptSearchEmpty: $("promptSearchEmpty"),
+  promptBack: $("promptBackButton"), promptEditor: $("promptEditor"), promptEditorGroup: $("promptEditorGroup"),
+  promptEditorLabel: $("promptEditorLabel"), promptEditorName: $("promptEditorName"),
+  promptEditorState: $("promptEditorState"), promptEditorWhen: $("promptEditorWhen"),
+  promptEditorFields: $("promptEditorFields"), promptEditCount: $("promptEditCount"),
   promptEditorHelp: $("promptEditorHelp"), promptError: $("promptEditorError"),
-  resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"),
-  reviewPromptTab: $("reviewPromptTab"),
-  authorPromptTab: $("authorPromptTab"),
-  coordinatorPromptTab: $("coordinatorPromptTab"),
-  criticPromptTab: $("criticPromptTab"),
-  conventionPromptTab: $("conventionPromptTab"),
-  finalPromptTab: $("finalPromptTab"),
+  resetPrompt: $("resetPromptButton"), savePrompts: $("savePromptsButton"), jobPrompts: $("jobPromptsButton"),
   homeLink: $("homeLink"), home: $("homeButton"), reviewHome: $("reviewHomeButton"),
   jobsPanel: $("jobsPanel"), jobsList: $("jobsList"), jobsCount: $("jobsCount"),
   jobsHeading: $("jobsHeading"), jobsEmpty: $("jobsEmpty"),
@@ -603,11 +602,15 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "authorSubagentModels", "goalLoop", "thinkingHours", "skipStatementReview", "statementReviewOnly",
+    "authorSubagentModels", "goalLoop", "thinkingHours", "skipStatementReview", "statementReviewOnly", "promptSet",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
   composerSeed = { statement, settings };
+  // The texts' defaults, which the job's texts are compared with to go along as edits (see render).
+  if (typeof loadPromptCatalog === "function") {
+    try { await loadPromptCatalog(); } catch (_) { /* the role prompts are compared with /state's defaults */ }
+  }
   // The new problem joins this job's batch while that batch takes problems, else the default batch.
   await newProblem(typeof selectedBatch === "function" && !state.readOnly && selectedBatch()?.addProblems
     ? currentBatch : "");
@@ -1158,15 +1161,7 @@ function setWorkflowStages(stages = selectedWorkflowStages()) {
   for (const [stage, control] of Object.entries({ review: ui.workflowReview, author: ui.workflowAuthor,
     critic: ui.workflowCritic, writing: ui.workflowWriting })) control.checked = stages[stage] === true;
   const roles = { review: stages.review, author: stages.author, critic: stages.critic, writer: stages.writing };
-  const prompts = { review: "review", author: "author", critic: "critic", writer: "final" };
-  for (const [role, enabled] of Object.entries(roles)) {
-    show(ui[`${role}ModelSetting`], enabled);
-    show(ui[`${prompts[role]}PromptTab`], enabled);
-  }
-  // The convention critic checks the proof the critic accepts.
-  if (ui.conventionPromptTab) show(ui.conventionPromptTab, stages.critic);
-  // The coordinator's prompt goes with the Author stage and Author subagents 1 or more.
-  if (typeof showCoordinatorPromptTab === "function") showCoordinatorPromptTab(stages);
+  for (const [role, enabled] of Object.entries(roles)) show(ui[`${role}ModelSetting`], enabled);
   show(ui.criticRoundSetting, stages.critic);
   show(ui.criticCountSetting, stages.critic);
   show(ui.thinkingHoursSetting, stages.author);
@@ -1186,8 +1181,6 @@ function setWorkflowStages(stages = selectedWorkflowStages()) {
     : existingWork ? "Selected stages use the existing work above. Click any stage to turn it on or off."
     : "Click any stage to turn it on or off. Selected stages run from left to right.";
   ui.introDescription.textContent = "Choose the stages for your problem. Review the statement, develop a proof, check it, and polish the writing.";
-  const first = Object.keys(roles).find((role) => roles[role]);
-  if (ui.promptDialog.open && first && !roles[activePrompt === "final" ? "writer" : activePrompt]) selectPrompt(prompts[first]);
   updateModelSummary();
   renderRetrievalSettings();
   if (typeof renderComposerRelatedWorks === "function") renderComposerRelatedWorks();
@@ -1397,6 +1390,17 @@ function updateModelSummary() {
   if (typeof renderSetupHints === "function") renderSetupHints();
 }
 
+// --- Prompts: every text the workflow sends its models -----------------------------------------------------------
+// The Prompts dialog lists the server's prompt catalog (GET /prompt-catalog: its groups in order, and per text its
+// name, group, label, when it is used, its placeholders, its current default and whether it may be empty) in a
+// searchable list of collapsible groups beside one text's editor. From New problem any text can be edited for the
+// next job: an edit is a promptOverrides entry by its name, checked on Apply as the server checks it (POST
+// /prompt-catalog/check; the rules below first, which are all an older server without that check has). An open job
+// shows the texts it runs with (state.promptSet, saved when it started), read-only; a job from before that shows the
+// role prompts it saved. A server without the catalog (an older one) offers the six role prompts, as before.
+
+// The six per-job role prompts as an older server lists them (state.workflow.settings.prompts): their names and
+// what they are for, for the dialog without a catalog.
 const promptLabels = {
   review: "Reviewer prompt", author: "Author prompt", coordinator: "Coordinator prompt",
   critic: "Critic prompt", convention: "Convention critic prompt", final: "Final writer prompt",
@@ -1415,62 +1419,57 @@ const promptHelp = {
   final: "The request adds the supplied writing for this editor to polish into LaTeX.",
 };
 
-// Whether the New problem form starts an author coordinator, whose Coordinator prompt is then shown and checked:
-// the Author stage on, Author subagents a whole number of 1 or more, and a server that has the coordinator prompt
-// (an older one lists no default for it and would refuse the edit).
-function coordinatorPromptInUse(stages = selectedWorkflowStages()) {
-  const value = String(ui.authorSubagents?.value ?? "").trim();
-  const count = value === "" ? NaN : Number(value);
-  return stages.author === true && Number.isInteger(count) && count >= 1
-    && typeof state.workflow?.settings?.prompts?.coordinator === "string";
+// The dialog's catalog (the server's, or the six role prompts of an older server: full false), whether it shows a
+// job's texts (readOnly), the groups shown open, the search and the narrow screen's view.
+function promptStore() {
+  return (promptStore.value ||= { catalog: [], groups: [], full: false, readOnly: false, open: new Set(), query: "",
+    checking: false, note: "" });
 }
 
-function showCoordinatorPromptTab(stages = selectedWorkflowStages()) {
-  if (ui.coordinatorPromptTab) show(ui.coordinatorPromptTab, coordinatorPromptInUse(stages));
+// The six role prompts as catalog entries (an older server's defaults, or the role prompts a job saved).
+function legacyPromptCatalog(texts = state.workflow?.settings?.prompts || {}) {
+  const groups = { review: "Statement review", author: "Author", coordinator: "Coordinator", critic: "Critic",
+    convention: "Critic", final: "Writer" };
+  const placeholders = { review: [], author: ["[STATEMENT]"], coordinator: ["[STATEMENT]", "{author_subagents}"],
+    critic: ["{count}"], convention: ["{statement}", "{instructions}"], final: [] };
+  return Object.keys(promptLabels).filter((name) => typeof texts[name] === "string").map((name) => ({
+    name, group: groups[name], label: promptLabels[name], when: promptHelp[name], placeholders: placeholders[name],
+    text: texts[name], emptyAllowed: false }));
 }
 
-function syncPrompts(source = state) {
-  const defaults = source.workflow?.settings?.prompts || {};
-  promptOverrides = {};
-  promptValues = Object.fromEntries(Object.keys(promptLabels).map((name) => [
-    name, savedPrompt(source, name) || defaults[name] || "",
-  ]));
+// A catalog as the page keeps it: entries with a name, in the server's order (an entry it cannot read is left out).
+function adoptPromptCatalog(answer) {
+  const entries = (Array.isArray(answer?.prompts) ? answer.prompts : []).filter((entry) => entry
+    && typeof entry.name === "string" && entry.name && typeof entry.text === "string").map((entry) => ({
+    name: entry.name, group: String(entry.group || "Other"), label: String(entry.label || entry.name),
+    when: String(entry.when || ""), text: entry.text, emptyAllowed: entry.emptyAllowed === true,
+    placeholders: Array.isArray(entry.placeholders) ? entry.placeholders.map(String) : [] }));
+  const groups = Array.isArray(answer?.groups) ? answer.groups.map(String) : [];
+  for (const entry of entries) if (!groups.includes(entry.group)) groups.push(entry.group);
+  return { catalog: entries, groups: groups.filter((group) => entries.some((entry) => entry.group === group)) };
 }
 
-function savedPrompt(source, name) {
-  if (!source.runId) return "";
-  return source[`${name}Prompt`];
-}
-
-function updatePromptHelp() {
-  const defaults = state.workflow?.settings?.prompts || {};
-  const isDefault = ui.promptEditor.value.trim() === (defaults[activePrompt] || "").trim();
-  ui.promptEditorLabel.textContent = `${promptLabels[activePrompt]} — `
-    + (isDefault ? "current default" : "this job's prompt");
-  ui.promptEditorHelp.textContent = (isDefault ? "" :
-    "This overrides the default for this job only. ")
-    + promptHelp[activePrompt]
-    // A coordinator job's author follows the Author prompt only when its model has no subagent tool.
-    + (activePrompt === "author" && coordinatorPromptInUse() ? " With Author subagents 1 or more the author "
-      + "coordinator follows the Coordinator prompt instead; this one is used when the author's model has no "
-      + "subagent tool." : "")
-    + " New jobs load defaults from the workflow files; browser edits are not remembered.";
-}
-
-function selectPrompt(name) {
-  if (ui.promptDialog.open && promptDrafts[activePrompt] !== undefined) {
-    promptDrafts[activePrompt] = ui.promptEditor.value;
+// Read the catalog again (the workflow files may have changed since): true with the server's, false when the server
+// has none (an older one: the six role prompts then, from /state), null when the page moved on meanwhile.
+async function loadPromptCatalog() {
+  const job = currentJob, batch = currentBatch, store = promptStore();
+  let answer = null;
+  try {
+    answer = await request("/prompt-catalog");
+  } catch (error) {
+    if (error.status !== 404) throw error;
   }
-  activePrompt = name;
-  ui.promptEditor.value = promptDrafts[name] || "";
-  show(ui.promptError, false);
-  updatePromptHelp();
-  for (const tab of ui.promptTabs.querySelectorAll(".prompt-tab")) {
-    const selected = tab.dataset.prompt === name;
-    tab.classList.toggle("active", selected);
-    tab.setAttribute("aria-selected", String(selected));
-    tab.tabIndex = selected ? 0 : -1;
+  if (job !== currentJob || batch !== currentBatch) return null;
+  if (answer) {
+    Object.assign(store, adoptPromptCatalog(answer), { full: true });
+    return true;
   }
+  const defaults = await currentPromptDefaults();
+  if (!defaults) return null;
+  store.catalog = legacyPromptCatalog(defaults);
+  store.groups = [...new Set(store.catalog.map((entry) => entry.group))];
+  store.full = false;
+  return false;
 }
 
 async function currentPromptDefaults() {
@@ -1482,52 +1481,329 @@ async function currentPromptDefaults() {
   return state.workflow.settings.prompts;
 }
 
-async function openPromptEditor() {
+function promptEntry(name) {
+  return promptStore().catalog.find((entry) => entry.name === name) || null;
+}
+
+// The names a form or a job has texts for: the catalog's, else the six role prompts.
+function promptNames() {
+  const catalog = promptStore().catalog;
+  return catalog.length ? catalog.map((entry) => entry.name) : Object.keys(promptLabels);
+}
+
+// A text's default: the catalog's, or (a server without one) the role prompt /state lists now.
+function promptDefault(name) {
+  const roles = state.workflow?.settings?.prompts || {};
+  const entry = promptEntry(name);
+  return entry && (promptStore().full || typeof roles[name] !== "string") ? entry.text : roles[name] || "";
+}
+
+// The text a job saved (its promptSet, else an older job's role prompt), or "" for the form of a new problem.
+function savedPrompt(source, name) {
+  if (!source.runId) return "";
+  const set = source.promptSet;
+  return set && typeof set === "object" && typeof set[name] === "string" ? set[name] : source[`${name}Prompt`];
+}
+
+// What a text is without an edit on this form: the job's own (a job sent back to the form), else the default.
+function promptBaseline(name, source = state) {
+  const saved = savedPrompt(source, name);
+  return typeof saved === "string" && (saved || promptEntry(name)?.emptyAllowed) ? saved : promptDefault(name);
+}
+
+function syncPrompts(source = state) {
+  promptOverrides = {};
+  promptValues = Object.fromEntries(promptNames().map((name) => [name, promptBaseline(name, source) || ""]));
+  if (typeof renderPromptSetting === "function") renderPromptSetting();
+}
+
+// A template's fields as Python's str.format reads them ({{ and }} are braces), or null when a brace is unpaired.
+function promptTemplateFields(text) {
+  const fields = [];
+  for (let index = 0; index < text.length;) {
+    const char = text[index];
+    if ((char === "{" || char === "}") && text[index + 1] === char) {
+      index += 2;
+    } else if (char === "{") {
+      const end = text.indexOf("}", index + 1);
+      if (end < 0 || text.slice(index + 1, end).includes("{")) return null;
+      fields.push(text.slice(index + 1, end));
+      index = end + 1;
+    } else if (char === "}") {
+      return null;
+    } else {
+      index += 1;
+    }
+  }
+  return fields;
+}
+
+// Why one text cannot be used, or "": as the runner reads it. An empty text only where the catalog allows it; the
+// statement marker exactly once where the text has it; a template (a text with {placeholders}) only its own
+// fields, without conversions or formats, and any other brace written twice. A text without placeholders is sent
+// as it is written, braces included.
+function promptTextProblem(entry, text) {
+  if (!String(text).trim()) {
+    if (entry.emptyAllowed) return "";
+    return promptLabels[entry.name] ? "Every role prompt must contain instructions."
+      : "This text cannot be empty: write it, or reset it to the default.";
+  }
+  if (entry.placeholders.includes("[STATEMENT]") && (String(text).match(/\[STATEMENT\]/g) || []).length !== 1) {
+    const name = { author: "The author prompt", coordinator: "The coordinator prompt" }[entry.name] || "This text";
+    return `${name} must contain exactly one [STATEMENT].`;
+  }
+  const allowed = entry.placeholders.filter((field) => /^\{[^{}]+\}$/.test(field)).map((field) => field.slice(1, -1));
+  if (!allowed.length) return "";
+  const roots = new Set(allowed.map((field) => field.split(".")[0]));
+  const fields = promptTemplateFields(String(text));
+  const valid = fields && fields.every((field) => {
+    const names = field.split(".");
+    return names.every((part) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(part)) && roots.has(names[0]);
+  });
+  if (valid) return "";
+  if (entry.name === "convention") {
+    return "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}.";
+  }
+  if (entry.name === "coordinator") {
+    return "Write {author_subagents} where the number of author subagents goes, and write any other brace twice: "
+      + "{{ and }}.";
+  }
+  const listed = allowed.map((field) => `{${field}}`);
+  const names = listed.length > 1 ? `${listed.slice(0, -1).join(", ")} and ${listed.at(-1)}` : listed[0];
+  return `Use only ${names} as placeholders, and write any other brace twice: {{ and }}.`;
+}
+
+// The edits on the form after the dialog's drafts: every text that differs from what it would be without an edit
+// (whitespace at its ends aside). A text left untouched since the dialog opened keeps what it was, even when its
+// default changed meanwhile.
+function promptEditsFromDrafts() {
+  const edits = { ...promptOverrides };
+  for (const [name, draft] of Object.entries(promptDrafts)) {
+    if (draft === promptOriginals[name]) continue;
+    if (String(draft).trim() === String(promptBaseline(name) || "").trim()) delete edits[name];
+    else edits[name] = String(draft);
+  }
+  return edits;
+}
+
+// The first edited text that cannot be used, in the list's order, as [name, explanation], or null.
+function promptProblem() {
+  const edits = promptEditsFromDrafts();
+  for (const name of promptNames()) {
+    if (!(name in edits)) continue;
+    const problem = promptTextProblem(promptEntry(name) || legacyPromptCatalog({ [name]: "" })[0]
+      || { name, label: name, placeholders: [] }, edits[name]);
+    if (problem) return [name, problem];
+  }
+  return null;
+}
+
+// Each text's state: "default", "edited" (an edit for the next job) or, for a job's texts, "job".
+function promptState(name) {
+  if (promptStore().readOnly) {
+    return String(promptDrafts[name] ?? "").trim() === String(promptDefault(name)).trim() ? "default" : "job";
+  }
+  return String(promptDrafts[name] ?? "").trim() === String(promptBaseline(name) || "").trim() ? "default" : "edited";
+}
+
+function promptMatches(entry, query) {
+  if (!query) return true;
+  const text = String(promptDrafts[entry.name] ?? entry.text);
+  return [entry.label, entry.name, entry.group, entry.when, text].some((part) => part.toLowerCase().includes(query));
+}
+
+// The list: one collapsible group per catalog group (open while it holds the shown text or a search matches),
+// each text a button with its state.
+function renderPromptList() {
+  const store = promptStore(), list = ui.promptList;
+  if (!list) return;
+  const query = store.query.trim().toLowerCase();
+  const focused = list.contains?.(document.activeElement) ? document.activeElement.dataset?.prompt
+    || `group:${document.activeElement.dataset?.group}` : "";
+  const sections = [];
+  store.groups.forEach((group, index) => {
+    const entries = store.catalog.filter((entry) => entry.group === group && promptMatches(entry, query));
+    if (!entries.length) return;
+    const open = Boolean(query) || store.open.has(group);
+    const section = document.createElement("section");
+    section.className = "prompt-group";
+    section.dataset.group = group;
+    const heading = document.createElement("h3");
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "prompt-group-toggle";
+    toggle.dataset.group = group;
+    toggle.tabIndex = -1;
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.setAttribute("aria-controls", `promptGroup${index}`);
+    const name = document.createElement("span");
+    name.className = "prompt-group-name";
+    name.textContent = group;
+    const edited = entries.filter((entry) => promptState(entry.name) !== "default").length;
+    const count = document.createElement("span");
+    count.className = "prompt-group-count";
+    count.textContent = edited ? `${edited} of ${entries.length} ${store.readOnly ? "changed" : "edited"}`
+      : String(entries.length);
+    toggle.append(name, count);
+    heading.append(toggle);
+    const items = document.createElement("ul");
+    items.className = "prompt-items";
+    items.id = `promptGroup${index}`;
+    items.hidden = !open;
+    for (const entry of entries) {
+      const item = document.createElement("li"), button = document.createElement("button");
+      button.type = "button";
+      button.className = "prompt-item";
+      button.dataset.prompt = entry.name;
+      const current = entry.name === activePrompt;
+      button.setAttribute("aria-current", String(current));
+      button.tabIndex = current && open ? 0 : -1;
+      const label = document.createElement("span");
+      label.className = "prompt-item-label";
+      label.textContent = entry.label;
+      button.append(label);
+      const mark = promptState(entry.name);
+      if (mark !== "default") {
+        const chip = document.createElement("span");
+        chip.className = "prompt-item-mark";
+        chip.dataset.state = mark;
+        chip.textContent = mark === "job" ? "changed" : "edited";
+        button.append(chip);
+      }
+      item.append(button);
+      items.append(item);
+    }
+    section.append(heading, items);
+    sections.push(section);
+  });
+  list.replaceChildren(...sections);
+  // The list is one stop in the tab order (the shown text, else its group, else the first group); the arrow keys
+  // move inside it (see promptListKey).
+  const buttons = [...list.querySelectorAll("button")];
+  const group = promptEntry(activePrompt)?.group;
+  if (!buttons.some((button) => button.tabIndex === 0)) {
+    const stop = buttons.find((button) => button.dataset.group === group && !button.dataset.prompt) || buttons[0];
+    if (stop) stop.tabIndex = 0;
+  }
+  const empty = !sections.length;
+  ui.promptSearchEmpty.textContent = empty ? `No text matches “${store.query.trim()}”.` : "";
+  show(ui.promptSearchEmpty, empty);
+  if (focused) {
+    const target = buttons.find((button) => button.dataset.prompt === focused || `group:${button.dataset.group}` === focused);
+    target?.focus();
+  }
+}
+
+// The shown text's heading, state, use, placeholders and rules, and the count of edits under the list.
+function updatePromptHelp() {
+  const store = promptStore();
+  const entry = promptEntry(activePrompt) || { name: activePrompt, label: promptLabels[activePrompt] || activePrompt,
+    group: "", when: promptHelp[activePrompt] || "", placeholders: [], emptyAllowed: false };
+  const mark = promptState(activePrompt);
+  ui.promptEditorGroup.textContent = entry.group;
+  ui.promptEditorLabel.textContent = entry.label;
+  ui.promptEditorName.textContent = entry.name;
+  ui.promptEditorState.dataset.state = mark;
+  ui.promptEditorState.textContent = store.readOnly
+    ? (mark === "job" ? "This job's text · differs from today's default" : "This job's text · today's default")
+    : mark === "edited" ? "Edited for the next job" : "Default";
+  ui.promptEditorWhen.textContent = entry.when || "Not described by this server.";
+  const fields = entry.placeholders;
+  ui.promptEditorFields.replaceChildren(...(fields.length ? fields.map((field) => {
+    const code = document.createElement("code");
+    code.textContent = field;
+    return code;
+  }) : ["None: the text is sent as written, braces included."]));
+  const template = fields.some((field) => /^\{[^{}]+\}$/.test(field));
+  ui.promptEditorHelp.textContent = [
+    fields.includes("[STATEMENT]") ? "Keep exactly one [STATEMENT]: the workflow puts the statement there." : "",
+    template ? "Write the placeholders as listed; write any other brace twice: {{ and }}." : "",
+    entry.emptyAllowed ? "Leave it empty to use the program's own text." : "",
+    store.readOnly ? "Read-only: a job keeps the texts it started with."
+      : "An edit applies to the next job you start from this form; new problems start from the workflow files' "
+        + "texts again.",
+  ].filter(Boolean).join(" ");
+  const edits = Object.keys(promptEditsFromDrafts()).length;
+  ui.promptEditCount.textContent = store.readOnly ? "Read-only: the texts this job runs with."
+    : edits ? `${edits} text${edits === 1 ? "" : "s"} edited for the next job` : "No text edited: the next job uses the defaults.";
+}
+
+function selectPrompt(name) {
+  const store = promptStore();
+  if (ui.promptDialog.open && promptDrafts[activePrompt] !== undefined && !store.readOnly) {
+    promptDrafts[activePrompt] = ui.promptEditor.value;
+  }
+  activePrompt = name;
+  const entry = promptEntry(name);
+  if (entry) store.open.add(entry.group);
+  ui.promptEditor.value = promptDrafts[name] ?? "";
+  ui.promptEditor.readOnly = store.readOnly;
+  show(ui.promptError, false);
+  ui.promptDialog.dataset.view = "text";
+  updatePromptHelp();
+  renderPromptList();
+}
+
+// Open the dialog: from New problem, editable (the texts with this form's edits); for an open job (``job``), its
+// texts read-only.
+async function openPromptEditor({ job = false } = {}) {
+  const store = promptStore();
   try {
-    const defaults = await currentPromptDefaults();
-    if (!defaults) return;
-    if (!currentJob) promptValues = { ...defaults, ...promptOverrides };
-    else if (!promptValues.review) syncPrompts();
-    promptDrafts = { ...promptValues };
-    promptOriginals = { ...promptValues };
-    const stages = selectedWorkflowStages();
-    activePrompt = ["review", "author", "critic", "writing"].find((name) => stages[name]) || "review";
-    if (activePrompt === "writing") activePrompt = "final";
-    selectPrompt(activePrompt);
+    const full = await loadPromptCatalog();
+    if (full === null) return;
+    store.readOnly = job;
+    store.query = "";
+    if (ui.promptSearch) ui.promptSearch.value = "";
+    let note = "";
+    if (job) {
+      // The job's own texts, each described by the catalog: every text it saved (one the catalog no longer lists
+      // shows under Other), or for a job from before every text was saved, the role prompts it saved.
+      const set = state.promptSet && typeof state.promptSet === "object" ? state.promptSet : null;
+      const saved = set ? Object.keys(set).filter((name) => typeof set[name] === "string")
+        : Object.keys(promptLabels).filter((name) => typeof state[`${name}Prompt`] === "string");
+      const roles = legacyPromptCatalog(Object.fromEntries(saved.map((name) => [name, ""])));
+      const order = promptNames();
+      store.catalog = saved.sort((a, b) => (order.includes(a) ? order.indexOf(a) : order.length)
+        - (order.includes(b) ? order.indexOf(b) : order.length)).map((name) => ({ ...(promptEntry(name)
+        || roles.find((entry) => entry.name === name) || { name, group: "Other", label: name, when: "",
+          placeholders: [], emptyAllowed: true }), text: promptDefault(name) }));
+      store.groups = [...new Set([...store.groups, ...store.catalog.map((entry) => entry.group)])]
+        .filter((group) => store.catalog.some((entry) => entry.group === group));
+      if (!set) {
+        note = "This job started before TCS Prover saved every text with its job: these are the role prompts it "
+          + "saved. Its other texts came from the workflow files each time it started or resumed.";
+      }
+      promptDrafts = Object.fromEntries(store.catalog.map((entry) => [entry.name, String(savedPrompt(state, entry.name))]));
+    } else {
+      promptDrafts = Object.fromEntries(store.catalog.map((entry) => [entry.name,
+        promptOverrides[entry.name] ?? promptBaseline(entry.name) ?? ""]));
+    }
+    promptOriginals = { ...promptDrafts };
+    store.note = note;
+    ui.promptDialogNote.textContent = note;
+    show(ui.promptDialogNote, Boolean(note));
+    ui.promptDialogEyebrow.textContent = job ? "Read-only" : "Advanced";
+    ui.promptDialogTitle.textContent = job ? "This job's prompts" : "Edit prompts";
+    ui.promptDialogLede.textContent = job
+      ? "The texts this job runs with, saved when it started, by where they are used. Edit the texts for a new "
+        + "problem from New problem → Advanced settings → Edit prompts."
+      : "Every text the next job sends its models, by where it is used. Edits apply to the next job you start from "
+        + "this form.";
+    show(ui.resetPrompt, !job);
+    show(ui.savePrompts, !job);
+    // The first stage's own text (the job's: its first one), its group open, and every group with an edit.
+    const stages = job ? workflowStagesFor(state) : selectedWorkflowStages();
+    const preferred = ["review", "author", "critic", "final"].find((name) => promptEntry(name)
+      && stages[{ final: "writing" }[name] || name]) || store.catalog[0]?.name || "review";
+    store.open = new Set(store.catalog.filter((entry) => promptState(entry.name) !== "default")
+      .map((entry) => entry.group));
+    selectPrompt(preferred);
+    ui.promptDialog.dataset.view = "list";
     ui.promptDialog.showModal();
   } catch (error) {
     ui.notice.textContent = error.message;
     show(ui.notice, true);
   }
-}
-
-// The first draft that cannot be applied, as [role, explanation].
-function promptProblem() {
-  const stages = selectedWorkflowStages();
-  const stage = { final: "writing", convention: "critic" };
-  // The coordinator's prompt counts while the form starts an author coordinator (see coordinatorPromptInUse).
-  const coordinator = coordinatorPromptInUse(stages);
-  const enabled = ["review", "author", "coordinator", "critic", "convention", "final"]
-    .filter((name) => (name === "coordinator" ? coordinator : stages[stage[name] || name]));
-  const empty = enabled.find((name) => !promptDrafts[name]?.trim());
-  if (empty) return [empty, "Every role prompt must contain instructions."];
-  // Like the workflow's templates: the named fields ({statement} or {instructions}; {author_subagents}) and
-  // doubled braces only.
-  const fields = (text) => String(text || "").replace(/\{\{|\}\}/g, "").match(/\{[^{}]*\}|[{}]/g) || [];
-  if (stages.critic && fields(promptDrafts.convention).some((field) => !["{statement}", "{instructions}"].includes(field))) {
-    return ["convention", "Keep {statement} where the statement goes, and write any other brace twice: {{ and }}."];
-  }
-  if (stages.author && (promptDrafts.author?.match(/\[STATEMENT\]/g) || []).length !== 1) {
-    return ["author", "The author prompt must contain exactly one [STATEMENT]."];
-  }
-  if (coordinator && (promptDrafts.coordinator.match(/\[STATEMENT\]/g) || []).length !== 1) {
-    return ["coordinator", "The coordinator prompt must contain exactly one [STATEMENT]."];
-  }
-  if (coordinator && fields(promptDrafts.coordinator).some((field) => field !== "{author_subagents}")) {
-    return ["coordinator", "Write {author_subagents} where the number of author subagents goes, and write any other "
-      + "brace twice: {{ and }}."];
-  }
-  return null;
 }
 
 // The dialog is modal, so its own errors appear inside it, next to the prompt to fix.
@@ -1536,30 +1812,116 @@ function showPromptError(message) {
   show(ui.promptError, true);
 }
 
-function savePrompts() {
+function showPromptProblem(name, message) {
+  if (promptEntry(name)) selectPrompt(name);
+  showPromptError(message);
+  ui.promptEditor.focus();
+}
+
+// Apply: check every edited text (here, then as the server does), then keep the edits for the next job.
+async function savePrompts() {
+  const store = promptStore();
+  if (store.readOnly) {
+    ui.promptDialog.close();
+    return;
+  }
+  if (store.checking) return;
   promptDrafts[activePrompt] = ui.promptEditor.value;
   const problem = promptProblem();
   if (problem) {
-    const [role, message] = problem;
-    selectPrompt(role);
-    showPromptError(message);
-    ui.promptEditor.focus();
+    showPromptProblem(...problem);
     return;
   }
-  promptValues = Object.fromEntries(
-    Object.entries(promptDrafts).map(([name, prompt]) => [name, prompt.trim()])
-  );
-  const defaults = state.workflow?.settings?.prompts || {};
-  // Send only deliberate edits. Unedited roles are resolved on the server at launch.
-  for (const [name, prompt] of Object.entries(promptValues)) {
-    if (prompt === (promptOriginals[name] || "").trim()) continue;
-    const baseline = (
-      savedPrompt(state, name) || defaults[name] || ""
-    ).trim();
-    if (prompt === baseline) delete promptOverrides[name];
-    else promptOverrides[name] = prompt;
+  const edits = promptEditsFromDrafts();
+  // The server's own check (an older server has none: the checks above are its rules).
+  if (store.full && Object.keys(edits).length) {
+    store.checking = true;
+    ui.savePrompts.disabled = true;
+    try {
+      const errors = (await request("/prompt-catalog/check", { promptOverrides: edits }))?.errors || {};
+      const name = promptNames().find((item) => errors[item]) || Object.keys(errors)[0];
+      if (name) {
+        showPromptProblem(name, String(errors[name]));
+        return;
+      }
+    } catch (error) {
+      if (error.status !== 404) {
+        showPromptError(`The texts could not be checked: ${error.message}`);
+        return;
+      }
+    } finally {
+      store.checking = false;
+      ui.savePrompts.disabled = false;
+    }
   }
+  promptOverrides = edits;
+  promptValues = Object.fromEntries(promptNames().map((name) => [name, edits[name] ?? promptBaseline(name) ?? ""]));
+  if (typeof renderPromptSetting === "function") renderPromptSetting();
   ui.promptDialog.close();
+}
+
+// The form's line under Prompts: how many texts the next job runs edited.
+function renderPromptSetting() {
+  const count = Object.keys(promptOverrides).length;
+  if (!ui.promptSettingText) return;
+  ui.promptSettingText.textContent = count
+    ? `${count} text${count === 1 ? "" : "s"} edited for the next job; the others are the workflow files' defaults`
+    : "Every text the workflow sends its models, including the goal loop and the team's; edits apply to the next job";
+}
+
+// The list's keys: Up and Down move between the visible groups and texts, Home and End to the first and the last,
+// Right opens a closed group and Left closes an open one (or goes to the group of a text).
+function promptListKey(event) {
+  const buttons = [...ui.promptList.querySelectorAll("button")].filter((button) => !button.closest("ul")?.hidden);
+  const index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  const current = buttons[index], group = current.dataset.group || promptEntry(current.dataset.prompt)?.group;
+  const store = promptStore();
+  let target = null;
+  if (event.key === "ArrowDown") target = buttons[Math.min(index + 1, buttons.length - 1)];
+  else if (event.key === "ArrowUp") target = buttons[Math.max(index - 1, 0)];
+  else if (event.key === "Home") target = buttons[0];
+  else if (event.key === "End") target = buttons.at(-1);
+  else if (event.key === "ArrowRight" && current.dataset.group && !store.open.has(group) && !store.query) {
+    store.open.add(group);
+    renderPromptList();
+  } else if (event.key === "ArrowLeft" && !store.query) {
+    if (current.dataset.prompt) target = buttons.find((button) => button.dataset.group === group && !button.dataset.prompt);
+    else if (store.open.has(group)) {
+      store.open.delete(group);
+      renderPromptList();
+    }
+  } else return;
+  event.preventDefault();
+  if (target) {
+    for (const button of buttons) button.tabIndex = button === target ? 0 : -1;
+    target.focus();
+  }
+}
+
+function promptListClick(event) {
+  const button = event.target.closest?.("button");
+  if (!button) return;
+  const store = promptStore();
+  if (button.dataset.prompt) {
+    selectPrompt(button.dataset.prompt);
+    // On a narrow screen the text takes the list's place: its editor takes the focus.
+    if (ui.promptDialog.dataset.view === "text" && window.matchMedia?.("(max-width: 720px)").matches) {
+      ui.promptEditor.focus();
+    } else {
+      ui.promptList.querySelector(`button[data-prompt="${CSS.escape(button.dataset.prompt)}"]`)?.focus();
+    }
+  } else if (button.dataset.group && !store.query) {
+    if (store.open.has(button.dataset.group)) store.open.delete(button.dataset.group);
+    else store.open.add(button.dataset.group);
+    renderPromptList();
+    ui.promptList.querySelector(`button.prompt-group-toggle[data-group="${CSS.escape(button.dataset.group)}"]`)?.focus();
+  }
+}
+
+// An open job's texts, read-only (Run settings → View this job's prompts).
+function openJobPrompts() {
+  return openPromptEditor({ job: true });
 }
 
 function clockText(date) {
@@ -2637,6 +2999,9 @@ function renderRunOverview() {
     ["Web search", retrievalSummary(state)],
     ["Conversation", state.goalThreadId ? "Saved · resumes in this workspace" : "Not started"],
   ];
+  // The texts the job runs with: every one (promptSet), or the role prompts a job from before saved.
+  show(ui.jobPrompts, Boolean(state.promptSet && typeof state.promptSet === "object")
+    || ["review", "author", "critic", "final"].some((name) => typeof state[`${name}Prompt`] === "string"));
   const signature = JSON.stringify(metadata);
   if (ui.runMetadata.dataset.signature !== signature) {
     ui.runMetadata.dataset.signature = signature;
@@ -4010,11 +4375,12 @@ function render(next) {
     applyComposerSettings(source);
     syncPrompts(source);
     if (seed) {
-      // The job's own prompts go with the new problem as edits of the defaults.
-      const defaults = state.workflow?.settings?.prompts || {};
+      // The job's own texts go with the new problem as edits of the defaults: every text it saved that differs from
+      // today's default (the role prompts only, for a job from before every text was saved).
       for (const [name, prompt] of Object.entries(promptValues)) {
-        if (prompt && prompt.trim() !== (defaults[name] || "").trim()) promptOverrides[name] = prompt.trim();
+        if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;
       }
+      if (typeof renderPromptSetting === "function") renderPromptSetting();
     }
     // Saved settings (see presetsFormOpened): a fresh form takes the default, when one is saved; a rerun
     // pre-fill and a job sent back to the form keep their own settings.
@@ -5919,10 +6285,9 @@ for (const role of ["review", "author", "critic", "writer"]) {
 }
 ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
-// The Coordinator prompt tab is shown while Author subagents is 1 or more (see coordinatorPromptInUse), and so are
-// the subagent models; a number still being typed only hides rows, which leaving the field drops (see teamStore).
+// The subagent models show while Author subagents is 1 or more; a number still being typed only hides rows, which
+// leaving the field drops (see teamStore).
 ui.authorSubagents.oninput = () => {
-  showCoordinatorPromptTab();
   renderTeamModels();
   renderAdvancedSummary();
 };
@@ -5954,36 +6319,34 @@ ui.retrievalCutoffUtc.oninput = () => {
 for (const control of [ui.workflowReview, ui.workflowAuthor, ui.workflowCritic, ui.workflowWriting]) {
   control.onchange = () => setWorkflowStages();
 }
-ui.editPrompts.onclick = openPromptEditor;
-ui.promptTabs.onclick = (event) => {
-  const tab = event.target.closest("[data-prompt]");
-  if (tab) selectPrompt(tab.dataset.prompt);
+ui.editPrompts.onclick = () => openPromptEditor();
+ui.jobPrompts.onclick = openJobPrompts;
+ui.promptList.onclick = promptListClick;
+ui.promptList.onkeydown = promptListKey;
+ui.promptSearch.oninput = () => {
+  promptStore().query = ui.promptSearch.value;
+  renderPromptList();
 };
-ui.promptTabs.onkeydown = (event) => {
-  const tabs = [...ui.promptTabs.querySelectorAll(".prompt-tab:not([hidden])")];
-  const index = tabs.indexOf(document.activeElement);
-  const next = { ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: tabs.length - 1 }[event.key];
-  if (index < 0 || next === undefined) return;
-  event.preventDefault();
-  const tab = tabs[(next + tabs.length) % tabs.length];
-  tab.focus();
-  selectPrompt(tab.dataset.prompt);
+ui.promptBack.onclick = () => {
+  ui.promptDialog.dataset.view = "list";
+  ui.promptList.querySelector(`button[data-prompt="${CSS.escape(activePrompt)}"]`)?.focus();
 };
-ui.resetPrompt.onclick = async () => {
-  try {
-    const defaults = await currentPromptDefaults();
-    if (!defaults) return;
-    promptDrafts[activePrompt] = defaults[activePrompt] || "";
-    ui.promptEditor.value = promptDrafts[activePrompt];
-    show(ui.promptError, false);
-    updatePromptHelp();
-  } catch (error) {
-    showPromptError(error.message);
-  }
-};
-ui.promptEditor.oninput = () => {
+// Reset to default: the text as the workflow files have it (the catalog read when the dialog opened).
+ui.resetPrompt.onclick = () => {
+  promptDrafts[activePrompt] = promptDefault(activePrompt);
+  ui.promptEditor.value = promptDrafts[activePrompt];
   show(ui.promptError, false);
   updatePromptHelp();
+  renderPromptList();
+};
+// Each keystroke keeps the draft, so the list and the count of edits follow it.
+ui.promptEditor.oninput = () => {
+  if (promptStore().readOnly) return;
+  const before = promptState(activePrompt);
+  promptDrafts[activePrompt] = ui.promptEditor.value;
+  show(ui.promptError, false);
+  updatePromptHelp();
+  if (promptState(activePrompt) !== before) renderPromptList();
 };
 ui.savePrompts.onclick = savePrompts;
 ui.approve.onclick = () => act("/approve", { statement: ui.proposed.value });
