@@ -162,7 +162,7 @@ prompts:
     {reason}
 
     Fix this and submit the complete proof again.
-  # EDIT PAUSED AUTHOR HERE: the reply prompt has {message}; both may use the placeholders of the goal.
+  # EDIT PAUSED AUTHOR HERE: the reply prompt has {message} and no other placeholder; the summary has none. Write any other brace twice.
   # The paused author's conversation turns (workflow_runner.py --converse): a
   # progress summary, and a reply to the user's message.
   summary: >-
