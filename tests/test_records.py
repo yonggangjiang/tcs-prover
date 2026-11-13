@@ -228,6 +228,16 @@ class TraceIngestTests(RecordCase):
         self.assertEqual(listing["calls"][0]["placeholderKinds"], ["trace_format_not_recognized"])
         self.assertIn("their format is not recognized", " ".join(listing["recordState"]["problems"]))
 
+    def test_a_manifest_of_another_schema_version_alone_keeps_the_bundle_raw(self):
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), [ANSWER])
+        manifest = json.loads((bundle.folder / "manifest.json").read_text())
+        (bundle.folder / "manifest.json").write_text(json.dumps({**manifest, "schema_version": 2}, indent=2))
+        self.ingest(bundle)
+        self.assertTrue((bundle.folder / "payloads" / "2.json").is_file())
+        self.assertEqual([call["status"] for call in self.record.calls.read()], ["trace format not recognized"])
+
     def test_a_running_process_is_stored_as_it_goes(self):
         bundle = Bundle(self.trace)
         bundle.thread_started()
