@@ -301,10 +301,10 @@ class Service:
         Sol and GPT 5.5 among them): the model then sees neither the tools nor their descriptions up front, only a
         code-mode model's hint to search ALL_TOOLS, or a direct model's tool_search tool. A code-mode model (GPT
         6.x) would call them from a script of its exec tool (tools.mcp__tcs__<name>), whose cell yields after 30 s,
-        so a 30-minute team_wait took dozens of model calls of Codex's wait tool. Omitted from both, every model
-        gets the namespace mcp__tcs, each tool under its own name (update_goal, team_wait, ...), and calls a tool
-        directly, one model call however long the tool runs (captured with the real Codex against a scripted model
-        server).
+        so a running team_wait took a model call of Codex's wait tool every few seconds (16 for a wait of 200 s).
+        Omitted from both, every model gets the namespace mcp__tcs, each tool under its own name (update_goal,
+        team_wait, ...), and calls a tool directly, one model call however long the tool runs (captured with the
+        real Codex against a scripted model server).
         """
 
         names = self.names()

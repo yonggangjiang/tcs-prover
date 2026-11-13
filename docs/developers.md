@@ -540,7 +540,7 @@ that every prompt and tool text is the user's to adjust. What the code does:
   deferred but in code mode, a code-mode model (GPT 6.x) calls each tool from a
   script of its `exec` tool (`tools.mcp__tcs__<name>`), whose cell yields after
   30 s, so it waits on a running `team_wait` with Codex's `wait` tool: 16 model
-  calls for a wait of 200 s, dozens for 30 minutes. Kept out of both, every
+  calls for a wait of 200 s in a capture. Kept out of both, every
   model gets the namespace `mcp__tcs` with each tool under its own name
   (`update_goal`, `team_members`, `team_assign`, `team_wait`, `team_followup`,
   `team_stop`; GPT 6.1 Sol in its request's `additional_tools`, GPT 5.5 and an
