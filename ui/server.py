@@ -322,8 +322,10 @@ WAITING_PHASES = {"paused", "reviewed", "prepared"}
 # (streamed, with one tool and a JSON answer, at the configured effort) and
 # follows no redirect; a minimal one follows only when that one is refused.
 API_TEST_TIMEOUT_SECONDS = 30
-# The search a connection's web search switch sends once when it is turned on (probe_web_search()).
+# The search a connection's web search switch sends once when it is turned on (probe_web_search()), and the most of
+# its answer that is read: a longer answer is not judged (the switch stays off, saying why).
 WEB_SEARCH_PROBE_QUERY = "TCS Prover web search check"
+WEB_SEARCH_PROBE_MAX_BYTES = 4 * 1024 * 1024
 API_TEST_PROMPT = "Reply with OK."
 API_TEST_MAX_TOKENS = 16
 API_TEST_MAX_RESPONSE_BYTES = 256 * 1024
@@ -2897,7 +2899,7 @@ def probe_web_search(entry, model, timeout=None):
         connection.request("POST", parts.path.rstrip("/") + "/alpha/search", body=body, headers=headers)
         response = connection.getresponse()
         status = response.status
-        data = response.read(API_TEST_MAX_RESPONSE_BYTES)
+        data = response.read(WEB_SEARCH_PROBE_MAX_BYTES + 1)
     except Exception as exc:  # Network, TLS or protocol failure.
         failure = _api_test_failure(exc, timeout)
     finally:
@@ -2905,6 +2907,9 @@ def probe_web_search(entry, model, timeout=None):
     now = datetime.now(timezone.utc).isoformat()
     if failure:
         return {"ok": False, "at": now, "message": f"The probe search could not reach the search service: {failure}"}
+    if len(data) > WEB_SEARCH_PROBE_MAX_BYTES:
+        return {"ok": False, "at": now, "message": "The probe search's answer is longer than "
+                                                   f"{WEB_SEARCH_PROBE_MAX_BYTES // (1024 * 1024)} MiB; it was not read."}
     text = data.decode("utf-8", "replace")
     try:
         value = json.loads(text)

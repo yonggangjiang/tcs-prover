@@ -121,6 +121,12 @@ class ConnectionSwitchTests(SwitchCase):
                 self.assertIn(words, connection["webSearchCheck"]["message"])
                 self.assertFalse(providers.api_connection(connection["id"], cached=False)["webSearch"])
 
+    def test_an_answer_too_long_to_read_leaves_it_off_and_says_so(self):
+        with mock.patch.object(server, "WEB_SEARCH_PROBE_MAX_BYTES", 16):
+            connection = self.save(webSearch=True)
+        self.assertFalse(connection["webSearch"])
+        self.assertIn("longer than", connection["webSearchCheck"]["message"])
+
     def test_an_anthropic_connection_never_has_it(self):
         entry = providers._validated_connection({"format": "anthropic", "baseUrl": "https://gateway.example.com",
                                                  "apiKey": "sk-ant-0000000000000000", "webSearch": True})

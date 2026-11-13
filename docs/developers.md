@@ -823,6 +823,10 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   `rounds.jsonl`; the transcript snapshot; `manifest.json`), `GET /records` and
   `DELETE /records/<run>` (409 while the job's runner, review or reply turn
   runs). They read the record folder, so a deleted job's record still answers.
+  `recordState.problems` shows the newest `PROBLEMS_SHOWN` (50) distinct
+  sentences of `problems.jsonl`, which keeps them all. A subagent's session file
+  is recognized by its first line (its `session_meta`), of which at most
+  `SESSION_META_BYTES` (4 MiB; Codex 0.160 writes about 25 KB) are read.
 - **Not recorded on this route:** what only the network carries (stream event
   timing, response headers, moderation metadata, url annotations, the search
   service's `encrypted_output`), Claude Code's request (system prompt, tools,
@@ -846,7 +850,9 @@ URL>/alpha/search` with the connection's key and request source. Saving it on
 (`probe_web_search()`: `{id, model, commands: {search_query: [{q}]}, settings:
 {allowed_callers: ["direct"], external_web_access: true}, max_output_tokens:
 2500}`, the shape Codex sends); it stays on only if the answer is HTTP 2xx with
-a JSON object whose `output` is text, and the connection keeps the result as
+a JSON object whose `output` is text (at most `WEB_SEARCH_PROBE_MAX_BYTES`, 4
+MiB, of the answer is read; a longer one is refused, saying so), and the
+connection keeps the result as
 `webSearchCheck` `{ok, at, message}`, which the editor shows. A saved connection
 that stays the same (URL, key, request source, format) is not probed again. A
 new live job records the connections of its models that have it on as

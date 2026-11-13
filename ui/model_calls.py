@@ -19,6 +19,8 @@ from runner import records
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+# recordState.problems shows the newest this many distinct sentences of the record's problems.jsonl (which keeps all).
+PROBLEMS_SHOWN = 50
 # Stages of a web-cutoff run's one-shot calls (structured `codex exec --ephemeral`), whose request records stand in for
 # calls the record cannot hold; the author's own stages are not one-shot calls.
 AUTHOR_STAGES = ("solve", "repair", "failure", "conversation")
@@ -224,7 +226,7 @@ def _problems(record):
         processes = len({line.get("process") for line in unrecognized})
         problems.append(f"Raw trace files of {processes} Codex process{'es' if processes != 1 else ''} were kept: "
                         "their format is not recognized.")
-    return problems[-50:]
+    return problems[-PROBLEMS_SHOWN:]
 
 
 def _rows(record, summaries=False):
