@@ -711,6 +711,31 @@ class TeamCase(unittest.TestCase):
         self.assertEqual(len(reports), count, reports)
         return reports
 
+    def held_member(self):
+        """Members that finish only when the returned event is set (runtime.member_attempt's own arguments)."""
+
+        release = threading.Event()
+
+        def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
+                    retried=None):
+            release.wait(30)
+            return "Done: " + prompt.splitlines()[0]
+
+        patch = mock.patch.object(runtime, "member_attempt", side_effect=attempt)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(release.set)
+        return release
+
+    def finish(self, crew, release):
+        """Let the members finish; then a team_wait that an ended attempt left running would have taken the reports."""
+
+        release.set()
+        deadline = time.monotonic() + 20
+        while crew.running() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.3)
+
 
 class TeamTests(TeamCase):
     def test_a_codex_coordinator_under_tcs_runs_a_team_of_a_codex_a_claude_and_an_api_member(self):
@@ -1002,6 +1027,39 @@ class TeamTests(TeamCase):
         self.assertIsNone(crew.closed)
         report, = self.collect(crew, 1)  # The next attempt reads the report.
         self.assertIn("Report of gpt-6.1-sol: Lemma A", report)
+
+    def test_a_wait_of_a_failed_attempt_takes_neither_the_reports_nor_an_attention_of_the_next(self):
+        # team-decisions item 5: the coordinator's model call fails while its team_wait runs. The attempt ends (Codex
+        # and its bridge stop with it) and the team works on for the next attempt, which must get the report and the
+        # live instructions and time checks that end its own waits.
+        release = self.held_member()
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}])
+        waits = {}
+
+        def failing(rpc):
+            crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+            waits["thread"] = threading.Thread(target=lambda: waits.setdefault("dead", crew.call("team_wait", {})),
+                                               daemon=True)
+            waits["thread"].start()
+            time.sleep(0.3)
+            rpc.messages.append(runtime.Error("stream disconnected before completion"))
+
+        double, session = self.coordinator(crew, [failing])
+        with self.assertRaises(runtime.WorkflowPaused) as caught:
+            next(session)
+        self.assertIsNotNone(caught.exception.retry)
+        self.assertIsNone(crew.closed)
+        waits["thread"].join(5)
+        self.assertEqual(waits.get("dead"), team.RELEASED_WAIT)
+        # A time check of the next attempt ends that attempt's wait, not the ended one's.
+        crew.attention("a time check")
+        early = threading.Thread(target=lambda: waits.setdefault("next", crew.call("team_wait", {})), daemon=True)
+        early.start()
+        early.join(5)
+        self.assertTrue(waits.get("next", "").startswith("The wait ended early: TCS Prover sent you a time check"),
+                        waits.get("next"))
+        self.finish(crew, release)
+        self.assertIn("Done: Lemma A", crew.call("team_wait", {"timeout_minutes": 1}))
 
     def test_a_live_instruction_or_a_time_check_ends_a_running_wait_early(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}])
@@ -1571,6 +1629,23 @@ class ClaudeCoordinatorTests(TeamCase):
         failed, = self.labelled("Author subagent failed")
         self.assertEqual((failed["subagentMember"], failed["text"]), (1, "It stopped when the author paused."))
         self.assertIn("Author paused", [event.get("label") for event in self.events])
+
+    def test_a_wait_of_a_failed_attempt_leaves_the_report_to_the_next_one(self):
+        # team-decisions item 5, Claude Code: the CLI ends (a failed model call) while the runner answers its
+        # team_wait; the attempt is retried with the team working on, and the next attempt's team_wait gets the report.
+        release = self.held_member()
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        _, session = self.coordinator(crew, [[
+            "init", "echo",
+            {"mcp_call": {"name": "mcp__tcs__team_assign", "arguments": {"member": 1, "assignment": "Lemma A"}}},
+            {"mcp_call": {"name": "mcp__tcs__team_wait", "arguments": {"timeout_minutes": 1}}},
+            {"stderr": "fatal: connection reset"}, {"exit": 3}]], extra={"control_seconds": 1})
+        with self.assertRaises(runtime.WorkflowPaused) as caught:
+            next(session)
+        self.assertIsNotNone(caught.exception.retry)
+        self.assertIsNone(crew.closed)
+        self.finish(crew, release)
+        self.assertIn("Done: Lemma A", crew.call("team_wait", {"timeout_minutes": 1}))
 
     def test_a_coordinator_in_bare_mode_keeps_its_team(self):
         # An API model whose claude command drops CLAUDE_CONFIG_DIR runs with --bare, which Claude Code 2.1.289

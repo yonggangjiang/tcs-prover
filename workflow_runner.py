@@ -5565,6 +5565,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             # Pause, stop, the time limit or the end of the work: the members stop with the coordinator. A failed
             # model call keeps them working for the next attempt, which reads their reports.
             team.close(ending["reason"])
+        elif team is not None:
+            # A team_wait that this attempt's CLI was running ends without taking those reports (or an attention):
+            # its caller is gone, and they are the next attempt's. The team left the service above, so no late call
+            # of this attempt starts another.
+            team.release_waits()
         if rpc and thread and state["active"] and not tcs:
             def pause():
                 try:

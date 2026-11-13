@@ -79,6 +79,10 @@ STOPPED_REPORT = "This assignment was stopped. {reason}"
 # How long after an attention (Team.attention()) a team_wait that starts still ends at once: the coordinator may
 # have called it just before TCS Prover sent its instruction, which then waits for the call to end.
 ATTENTION_SECONDS = 10
+# The answer of a team_wait that Team.release_waits() ended: its caller's attempt is over (the CLI that called it
+# stopped), so it takes nothing, and the next attempt's team_wait gets the reports.
+RELEASED_WAIT = ("This wait ended because the coordinator's session restarted after a failed model call; no report "
+                 "was taken. Call team_wait again for the reports.")
 
 
 class TeamError(ValueError):
@@ -450,6 +454,8 @@ class Team:
         self.cond = threading.Condition()
         self.done = deque()
         self.attention_reason = None  # (reason, time.monotonic()) of the latest attention
+        # Raised by release_waits(): a team_wait that began before ends without taking a report or an attention.
+        self.wait_generation = 0
         self.closed = None
 
     # The tools, as the coordinator's CLI lists them.
@@ -584,9 +590,13 @@ class Team:
             raise TeamError(f"timeout_minutes must be 1 to {WAIT_MINUTES}.")
         deadline = time.monotonic() + minutes * 60
         with self.cond:
+            generation = self.wait_generation
             if self.attention_reason is not None and time.monotonic() - self.attention_reason[1] > ATTENTION_SECONDS:
                 self.attention_reason = None  # It reached the coordinator before this wait began.
             while True:
+                if self.wait_generation != generation:
+                    # Its caller's attempt ended (release_waits()): what it would take is the next attempt's.
+                    return RELEASED_WAIT
                 if self.done:
                     reports = list(self.done)
                     self.done.clear()
@@ -605,6 +615,18 @@ class Team:
                 if left <= 0:
                     return f"No assignment finished within {minutes:g} minutes.\n" + self.listing()
                 self.cond.wait(min(left, 5))
+
+    def release_waits(self):
+        """End every running team_wait without taking a report or an attention, and leave the team working.
+
+        The coordinator's attempt that called them ended in a failed model call, its CLI with it; the next attempt
+        of the same coordinator collects the reports with a team_wait of its own (goal_session's cleanup calls this
+        when it keeps the team for that attempt).
+        """
+
+        with self.cond:
+            self.wait_generation += 1
+            self.cond.notify_all()
 
     def attention(self, reason):
         """End a running team_wait early: TCS Prover sends the coordinator ``reason`` (a live instruction, ...)."""
