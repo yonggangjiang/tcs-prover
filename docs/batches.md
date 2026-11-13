@@ -19,8 +19,9 @@ see its reasoning and outputs.
   instead** changes that and keeps what you wrote). The problem, or every job of
   a **Run a folder…** started there, goes into that batch.
 - **Rename** renames one of your batches; **Delete batch** removes one that has
-  no problems left, with the related works it shares. A name has at most 200
-  characters, and there is no limit on the number of batches.
+  no problems left, with the related works it shares (its question says how
+  many). A name has at most 200 characters, and there is no limit on the number
+  of batches.
 - **Previous batches**: folders under `runs/` that hold the runs of an earlier
   setup, marked **Previous batch · read-only**. Opening one never resumes its
   jobs or changes its files, and no problem can be added to it.

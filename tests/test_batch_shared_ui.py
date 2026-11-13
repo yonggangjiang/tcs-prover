@@ -261,6 +261,22 @@ renderComposerRelatedWorks();
 assert.equal(composerSharedRenders, 1);
 """)
 
+    def test_delete_batch_says_the_works_it_shares_go_with_it(self):
+        self.run_app(related.PANEL + [["async function deleteCurrentBatch(", "function adoptJob("]], PAGE_SETUP + r"""
+let batchCatalog = [];
+const adoptBatchCatalog = value => value.batches || [];
+const selectBatch = async () => {};
+""", r"""
+currentJob = ''; currentBatch = graph.id; confirmAnswer = false;
+for (const [count, said] of [[2, '\n\nThe 2 related works it shares are deleted with it.'],
+    [1, '\n\nThe 1 related work it shares is deleted with it.'], [0, '']]) {
+  batches = [{...graph, jobCount: 0, sharedWorks: {count, names: []}}];
+  await deleteCurrentBatch();
+  assert.equal(questions.at(-1), 'Delete the empty batch “Graph coloring”?' + said);
+}
+assert.equal(sent.length, 0);
+""")
+
     def test_a_batch_card_counts_its_shared_works(self):
         self.browser(r"""
 renderBatches([{id: 'batch_00000000a1', label: 'Graph coloring', named: true, addProblems: true, jobCount: 3,

@@ -746,10 +746,12 @@ async function saveBatchDialog(event) {
   }
 }
 
-// Delete batch: only an empty batch made with New batch; the page then returns to the Overview.
+// Delete batch: only an empty batch made with New batch, with what it shares; the page then returns to the Overview.
 async function deleteCurrentBatch() {
-  const batch = selectedBatch();
-  if (!batch?.named || !confirm(`Delete the empty batch “${batch.label || batch.id}”?`)) return;
+  const batch = selectedBatch(), shared = Number(batch?.sharedWorks?.count || 0);
+  if (!batch?.named || !confirm(`Delete the empty batch “${batch.label || batch.id}”?`
+    + (shared ? `\n\nThe ${shared} related work${shared === 1 ? " it shares is" : "s it shares are"} deleted with it.`
+      : ""))) return;
   try {
     batchCatalog = adoptBatchCatalog(await request(`/batches/delete?batch=${encodeURIComponent(batch.id)}`, {}));
     await selectBatch("");
