@@ -322,7 +322,8 @@ await selectBatch('__root__');
 await new Promise(setImmediate);
 assert.equal(ui.batchShared.hidden, false);
 assert.equal(ui.batchSharedCount.textContent, '1 related work');
-// Its last shared work removed, the default batch (no problem in it) is left off the list of batches ...
+// Its last shared work removed, should a list leave out the default batch (no problem in it; the server lists it
+// always) ...
 setResponses({'/batches': {batches: [graph], canCreateBatches: true}, '/jobs?batch=__root__': {jobs: []},
   '/batch-shared-works?batch=__root__': shared([])});
 ui.batchSharedStatus.textContent = 'Removed defs.md. New problems in this batch no longer get it.';
