@@ -187,9 +187,10 @@ saved `ultra` runs as `max`) and always run at standard speed.
 Earlier versions of TCS Prover called this program the Claude CLI; the activity
 logs of jobs run then keep that name.
 
-- **Tools.** Every Claude process gets an explicit tool list and no MCP servers,
-  user settings, skills, plugins, hooks or `CLAUDE.md`, and never waits for a
-  permission prompt (see [Sandbox and network](sandbox.md#claude-code)).
+- **Tools.** Every Claude process gets an explicit tool list and no MCP servers
+  (an author coordinator gets only TCS Prover's own, which gives it its team's
+  tools), user settings, skills, plugins, hooks or `CLAUDE.md`, and never waits
+  for a permission prompt (see [Sandbox and network](sandbox.md#claude-code)).
   Web-search tools follow the job's search mode. Only the critic, and an author
   with **Author subagents** 1 or more (an author coordinator, or the author of
   a job from before coordinator mode), get the subagent tool (Task); TCS Prover

@@ -307,9 +307,11 @@ the problem-solving to its subagents. What the runner and the server add:
   runs the author alone instead: today's author prompts without the `subagents`
   note and without the `multi_agent` feature, and the status **No subagents with
   this model** says that the author works alone instead of coordinating. A Claude
-  coordinator gets the same single-author launch as `alone`, which
+  coordinator with the CLI's own subagents (a job from before TCS Prover's team)
+  gets the same single-author launch as `alone`, which
   `claude_cli.goal_session` uses when its CLI offers no subagent tool (`--bare`),
-  saying so once per runner. That status carries `authorModeEffective: "author"`
+  saying so once per runner; one with TCS Prover's team keeps its team in
+  `--bare` mode too (see TCS Prover's MCP server below). That status carries `authorModeEffective: "author"`
   and the model's `modelLabel`, and each start of a coordinating author (its
   **Goal started** or **Goal resumed** status) carries `authorModeEffective:
   "coordinator"`: the server keeps the latest as `state.authorModeEffective`
@@ -471,14 +473,31 @@ that every prompt and tool text is the user's to adjust. What the code does:
   server. Claude Code authors always ran TCS Prover's loop; their harness note
   is `claude_goal_harness` and their continuation the role's, as before.
 - **TCS Prover's MCP server.** `runner/tcs_mcp.py` is a stdio MCP server (standard
-  library only, started by the runner's own interpreter with `-I`) that the author's CLI starts from its
-  settings: Codex's thread settings `mcp_servers.tcs` (kept on while the user's
+  library only, started by the runner's own interpreter with `-I`) that Codex
+  starts from its thread settings `mcp_servers.tcs` (kept on while the user's
   servers are off, `required`, `tool_timeout_sec` 2,400, every tool
-  `approval_mode: approve`), Claude Code's `--mcp-config` file in the private
-  settings folder (`timeout` 2,400,000 ms, the tools pre-approved in
-  `--allowedTools`, `--strict-mcp-config` kept). Its environment holds the
-  address of the runner's `team.Service` (127.0.0.1, a random port) and a random
-  token; every request carries the token, and the service answers nothing else.
+  `approval_mode: approve`). Its environment holds the address of the runner's
+  `team.Service` (127.0.0.1, a random port) and a random token; every request
+  carries the token, and the service answers nothing else. Claude Code gets no
+  bridge: its `--mcp-config` file in the private settings folder names an `sdk`
+  server (`{"type": "sdk", "name": "tcs", "timeout": 2400000, "alwaysLoad":
+  true}`, so its tools are never deferred behind Claude Code's tool search),
+  whose MCP messages the CLI writes as stream-json control requests
+  (`mcp_message`) that `claude_cli.goal_session` answers from the same service
+  (`Service.answer()`, each tool call on a thread of its own, without the
+  bridge's server `instructions`, which Claude Code would show the model beside
+  the editable tool descriptions); an init message
+  that lists not every team tool ends the attempt, which is retried, so a
+  coordinator never works on without its team. Verified against Claude Code 2.1.289
+  with a scripted Anthropic endpoint: under `--safe-mode`, which every Claude
+  process keeps, it drops every other kind of `--mcp-config` server (a stdio
+  server never starts); it loads an `sdk` one, also with `--bare`, before its
+  first request, names its tools `mcp__tcs__<tool>` in its init message and to
+  the model, runs them only when `--allowedTools` names them (under
+  `--permission-prompts none` any other is refused at once), queues a user
+  message written during a call until the call's result, cancels a running call
+  on an interrupt (`notifications/cancelled`) and ends one that outlives
+  `timeout`; the stand-in CLI of tests/test_claude_cli.py follows these shapes.
   The service runs the tools of the providers added to it: `GoalTool` and `Team`.
 - **The team** (`--author-team tcs`, the coordinator of every new live job).
   `_execute` builds `team.team_members()` from `--author-subagent-models` (one

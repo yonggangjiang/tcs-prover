@@ -8,7 +8,9 @@ messages as documented on goal_session().
 
 Isolation, verified against Claude Code 2.1.289 (see tests/test_claude_cli.py):
 - an explicit --tools list, so product tools (artifacts, workflows, cron,
-  skills, remote triggers, ...) are never offered, and no MCP servers;
+  skills, remote triggers, ...) are never offered, and no MCP servers but
+  TCS Prover's own for a coordinator's team, which this process answers
+  itself (an "sdk" server, see goal_session());
 - --restricted confines Read/Write/Edit to the working directory and ignores
   user, project and local settings files; deny rules keep them off the run
   folder's protected entries (protected_settings());
@@ -67,8 +69,10 @@ SANDBOX_ALL_HOSTS = ("*",)
 BARE_TOOLS = ("Bash", "Read", "Edit")
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 SUBAGENT_TOOLS = ("Task", "Agent")
-# How Claude Code names a tool of TCS Prover's MCP server "tcs" (runner/team.py) in --allowedTools and its init.
-TEAM_TOOL_PREFIX = "mcp__tcs__"
+# TCS Prover's MCP server (runner/team.py SERVER_NAME), and how Claude Code names one of its tools in --allowedTools,
+# in its init message and to the model.
+TEAM_SERVER = "tcs"
+TEAM_TOOL_PREFIX = f"mcp__{TEAM_SERVER}__"
 # Subagent outcomes, verified against Claude Code 2.1.289: a subagent that an
 # API error (rate limit, overload, server error) cut off after some work
 # returns that work as an ordinary tool result headed by the error and this
@@ -692,7 +696,8 @@ def command_arguments(executable_path, model, effort, tools, allowed, settings_p
     """Common flags of every Claude role; ``denied`` are tools an earlier CLI offered unasked.
 
     ``mcp_config`` is the file of TCS Prover's own MCP server (the coordinator's team, team.Service.claude_config());
-    without it the CLI gets none.
+    without it the CLI gets none. --safe-mode keeps the user's customizations off and, in Claude Code 2.1.289, drops
+    every --mcp-config server that is not an "sdk" server, which TCS Prover's is.
     """
 
     return [
@@ -1679,8 +1684,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     A coordinator with ``team`` (workflow_runner._execute: TCS Prover's team in
     place of the Agent tool) gets TCS Prover's MCP server with its team tools
     (--mcp-config with that server only, its tools pre-approved), served by
-    ``service`` or by one of this session; in --bare mode, which may load no
-    such server, it works ``alone`` as above. A live instruction or time check
+    ``service`` or by one of this session. It is an "sdk" server
+    (team.Service.claude_config()): the CLI writes each of its MCP messages as
+    a control request, which this session answers (answer_server(), each tool
+    call on a thread of its own), because Claude Code drops every other kind
+    of --mcp-config server under --safe-mode. It loads in --bare mode too, so
+    such a coordinator never works ``alone``. A live instruction or time check
     written to it ends a running team_wait early (team.Team.attention()), and
     an end that is not retried stops the team's members.
     """
@@ -1964,6 +1973,47 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  elapsedSeconds=elapsed, text=text, threadId=thread)
         return began
 
+    def answer_server(message):
+        """Answer one control request of the CLI for TCS Prover's MCP server (an "sdk" server, see
+        team.Service.claude_config()); any other control request is left unanswered, as before.
+
+        A tool call runs on a thread of its own (a team_wait may wait up to 30 minutes) and its answer goes to the
+        CLI that asked, under the transport's write lock: a CLI that has ended since (a pause, a stop, a relaunch)
+        no longer waits for it.
+        """
+
+        request = message.get("request") if isinstance(message.get("request"), dict) else {}
+        identity = message.get("request_id")
+        if request.get("subtype") != "mcp_message" or not isinstance(identity, str):
+            return
+        asker = transport
+
+        def send(response):
+            try:
+                asker.send({"type": "control_response", "response": {"request_id": identity, **response}})
+            except (OSError, ValueError):
+                pass  # The CLI has ended: nobody waits for this answer.
+
+        if service is None or team is None or request.get("server_name") != TEAM_SERVER:
+            send({"subtype": "error", "error": f"There is no MCP server {str(request.get('server_name'))[:80]!r}."})
+            return
+
+        def run():
+            rpc = request.get("message")
+            try:
+                answer = service.answer(rpc)
+            except Exception as exc:  # noqa: BLE001 - the CLI must get an answer, or its call would wait forever.
+                answer = {"jsonrpc": "2.0", "id": rpc.get("id") if isinstance(rpc, dict) else None,
+                          "error": {"code": -32603, "message": f"TCS Prover could not answer: {exc}"}}
+            if answer is None:  # A notification gets the empty answer Claude Code expects.
+                answer = {"jsonrpc": "2.0", "result": {}, "id": 0}
+            send({"subtype": "success", "response": {"mcp_response": answer}})
+
+        if isinstance(request.get("message"), dict) and request["message"].get("method") == "tools/call":
+            threading.Thread(target=run, name="tcs-claude-call", daemon=True).start()
+        else:
+            run()
+
     def watch():
         pause_started = None
         interrupted_turn = None
@@ -2221,12 +2271,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  text=f"{reason}, so Anthropic-format API models run Claude Code in --bare mode, which does not "
                       f"offer {', '.join(dropped)}.")
         subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
-        if coordinator and alone is not None and (bare if team is not None else not subagent_tool):
-            # No subagent tool (--bare), or no MCP server there for the team: the author works alone, with its own
-            # prompts.
-            if team is not None:
-                team.close("It stopped when the author began working alone.")
-                team = None
+        if coordinator and alone is not None and team is None and not subagent_tool:
+            # No subagent tool (--bare): the author works alone, with its own prompts. A coordinator with TCS
+            # Prover's team keeps it in --bare mode too, which loads its "sdk" server (Claude Code 2.1.289).
             coordinator = False
             prompt, prompts = alone["prompt"], alone["prompts"]
             initial_instruction = alone["recovery"] if initial_instruction else ""
@@ -2448,6 +2495,16 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     surprise = unexpected_tools(message, tools_expected or tools)
                     if surprise:
                         raise surprise_failure(surprise, denied, runtime, "the author was stopped")
+                    if tools_expected is not None and isinstance(message.get("tools"), list):
+                        # A coordinator without its team's tools could only work alone, unseen: end the attempt.
+                        missing = [name for name in tools_expected
+                                   if name.startswith(TEAM_TOOL_PREFIX) and name not in message["tools"]]
+                        if missing:
+                            servers = message.get("mcp_servers") if isinstance(message.get("mcp_servers"), list) else []
+                            status = next((str(server.get("status")) for server in servers if isinstance(server, dict)
+                                           and server.get("name") == TEAM_SERVER), "not loaded")
+                            raise runtime.Error(f"Claude Code did not offer the coordinator its team's tools "
+                                                f"({', '.join(missing)}); TCS Prover's MCP server: {status}.")
                     with lock:
                         if not state["initialized"]:
                             reported = str(message.get("session_id") or "").lower()
@@ -2505,6 +2562,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 response = message.get("response") if isinstance(message.get("response"), dict) else {}
                 if response.get("subtype") == "error" and response.get("request_id") != activity["probe"]:
                     emit("diagnostic", text=scrub(f"Claude rejected a control request: {response.get('error')}"))
+                continue
+            if kind == "control_request":
+                answer_server(message)
                 continue
             if kind != "result":
                 continue

@@ -33,6 +33,15 @@ SCHEMA = {"type": "object", "properties": {"statement": {"type": "string"}, "not
 # Claude Code it keeps a transcript per persisted session (user and assistant
 # messages linked by parentUuid) under $CLAUDE_CONFIG_DIR/projects, copies it
 # for --fork-session and branches it at --resume-session-at.
+# Its MCP servers follow Claude Code 2.1.289 as captured from that binary against
+# a scripted Anthropic endpoint: under --safe-mode every --mcp-config server but
+# an "sdk" one is dropped; an "sdk" server is reached with control requests
+# {"subtype": "mcp_message", "server_name", "message"} on stdout, answered by
+# control responses {"mcp_response": ...} on stdin (which the CLI echoes),
+# connected before the init message, whose tool list then names its tools
+# mcp__<server>__<tool>. A tool call ("mcp_call") runs only when --allowedTools
+# names it; user input that arrives meanwhile is queued and taken in after its
+# result, and an interrupt cancels it (notifications/cancelled).
 FAKE_CLAUDE = r'''
 import json, os, select, sys, time, uuid
 
@@ -68,6 +77,17 @@ if harness_path:
     record["harness"] = open(harness_path, encoding="utf-8").read()
     record["harness_path"] = harness_path
     record["harness_mode"] = oct(os.stat(harness_path).st_mode & 0o777)
+mcp_option = option("--mcp-config")
+try:
+    mcp_servers = json.loads(mcp_option if mcp_option.lstrip().startswith("{") else open(mcp_option).read())["mcpServers"]
+except (AttributeError, OSError, ValueError, KeyError, TypeError):
+    mcp_servers = {}
+record["mcp_config"] = mcp_servers
+if mcp_option and not mcp_option.lstrip().startswith("{"):
+    record["mcp_config_mode"] = oct(os.stat(mcp_option).st_mode & 0o777)
+# Like Claude Code 2.1.289: "--mcp-config: 1 server ignored (safe mode)" for every server that is not an "sdk" one.
+record["mcp_dropped"] = sorted(name for name, entry in mcp_servers.items()
+                               if "--safe-mode" in argv and entry.get("type") != "sdk")
 log(record)
 session = option("--session-id") or option("--resume")
 tools = [tool for tool in (option("--tools") or "").split(",") if tool]
@@ -98,6 +118,10 @@ def remember(kind, identity, error=False, text=None):
 
 def write(message):
     message.setdefault("session_id", session)
+    write_raw(message)
+
+
+def write_raw(message):
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
 
@@ -111,9 +135,21 @@ def result(**fields):
 
 
 unread = bytearray()
+held = []  # Input read while waiting for a control response, read again later.
+mcp = {"connected": False, "servers": [], "tools": {}, "next": 2}
+
+
+class Aborted(Exception):
+    """An interrupt ended the turn (its result is written)."""
 
 
 def read_line(timeout):
+    if held:
+        return held.pop(0)
+    return read_input(timeout)
+
+
+def read_input(timeout):
     # Unbuffered: select() cannot see lines a buffered readline() already took from the pipe.
     deadline = time.time() + timeout
     while b"\n" not in unread:
@@ -140,14 +176,145 @@ def echo(message):
            "isReplay": True, "parent_tool_use_id": None})
 
 
+def control(request, queued=None, after=None):
+    """Ask the host one control request and wait for its response (None: no answer; "interrupted")."""
+
+    request_id = str(uuid.uuid4())
+    write_raw({"type": "control_request", "request_id": request_id, "request": request})
+    if after:
+        # A file the scenario writes while the request waits (a live instruction, a pause request).
+        open(after["path"], "w").write(after["text"])
+    deadline = time.time() + SCENARIO.get("control_seconds", 30)
+    while time.time() < deadline:
+        message = read_input(max(0.05, deadline - time.time()))
+        if message == "":
+            return None
+        if not message:
+            continue
+        if message.get("type") == "control_response":
+            if (message.get("response") or {}).get("request_id") == request_id:
+                write_raw(message)  # Claude Code echoes the responses it takes.
+                return message["response"]
+            continue
+        if message.get("type") == "control_request":
+            if (message.get("request") or {}).get("subtype") == "interrupt" and queued is not None:
+                return ("interrupted", message)
+            write({"type": "control_response", "response": {"subtype": "success", "request_id": message["request_id"],
+                                                            "response": {"still_queued": []}}})
+            continue
+        if message.get("type") == "user" and queued is not None:
+            # Queued: taken in after the tool's result, in the same turn.
+            queued.append(message)
+            write({"type": "command_lifecycle", "command_uuid": message.get("uuid"), "state": "queued"})
+            continue
+        held.append(message)
+    log({"event": "control_unanswered", "request": request})
+    return None
+
+
+def connect_mcp():
+    """The "sdk" servers of --mcp-config, connected before the init message (once per process)."""
+
+    if mcp["connected"]:
+        return
+    mcp["connected"] = True
+    for name, entry in mcp_servers.items():
+        if entry.get("type") != "sdk":
+            continue
+        answer = control({"subtype": "mcp_message", "server_name": name, "message": {
+            "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                                               "clientInfo": {"name": "claude-code", "version": "2.1.289"}},
+            "jsonrpc": "2.0", "id": 0}})
+        control({"subtype": "mcp_message", "server_name": name,
+                 "message": {"jsonrpc": "2.0", "method": "notifications/initialized"}})
+        listed = control({"subtype": "mcp_message", "server_name": name,
+                          "message": {"method": "tools/list", "jsonrpc": "2.0", "id": 1}})
+        result_value = (((listed or {}).get("response") or {}).get("mcp_response") or {}).get("result") or {}
+        log({"event": "mcp_connected", "server": name, "initialize": answer, "tools": result_value.get("tools")})
+        if not isinstance(result_value.get("tools"), list) or SCENARIO.get("mcp_unavailable"):
+            mcp["servers"].append({"name": name, "status": "failed", "source": "sdk"})
+            continue
+        for tool in result_value["tools"]:
+            mcp["tools"][f"mcp__{name}__{tool['name']}"] = (name, tool["name"])
+        mcp["servers"].append({"name": name, "status": "connected", "source": "sdk"})
+
+
+def call_mcp(call):
+    """The model calls an MCP tool: its tool_use, the tools/call control request, then its tool_result."""
+
+    name, arguments = call["name"], call.get("arguments", {})
+    identity = call.get("id") or "toolu_" + uuid.uuid4().hex[:20]
+    answered = str(uuid.uuid4())
+    remember("assistant", answered)
+    write({"type": "assistant", "parent_tool_use_id": None, "uuid": answered,
+           "message": {"content": [{"type": "tool_use", "id": identity, "name": name, "input": arguments}]}})
+    allowed = [rule for rule in (option("--allowedTools") or "").split(",") if rule]
+    queued = []
+    if name not in mcp["tools"]:
+        content, error = f"<tool_use_error>Error: No such tool available: {name}</tool_use_error>", True
+    elif name not in allowed and name.rsplit("__", 1)[0] not in allowed:
+        content, error = ("Permission for this tool use was denied. It requires approval, and this session has no "
+                          "approval surface"), True
+    else:
+        server, tool = mcp["tools"][name]
+        number = mcp["next"]
+        mcp["next"] += 1
+        response = control({"subtype": "mcp_message", "server_name": server, "message": {
+            "method": "tools/call", "params": {"name": tool, "arguments": arguments, "_meta": {
+                "claudecode/toolUseId": identity, "progressToken": number}}, "jsonrpc": "2.0", "id": number}},
+            queued=queued, after=SCENARIO.get("after_call", {}).get(name))
+        if isinstance(response, tuple):
+            # Interrupted: Claude Code cancels the call and ends the turn as aborted.
+            write_raw({"type": "control_request", "request_id": str(uuid.uuid4()), "request": {
+                "subtype": "mcp_message", "server_name": server, "message": {
+                    "jsonrpc": "2.0", "method": "notifications/cancelled",
+                    "params": {"requestId": number, "reason": "AbortError: remote-cancel"}}}})
+            write({"type": "control_response", "response": {"subtype": "success",
+                                                            "request_id": response[1]["request_id"],
+                                                            "response": {"still_queued": []}}})
+            log({"event": "mcp_result", "name": name, "interrupted": True})
+            write({"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "The user doesn't want to proceed with this tool use. The tool use "
+                 "was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what "
+                 "you are doing and wait for the user to tell you how to proceed.", "is_error": True,
+                 "tool_use_id": identity}]}})
+            write({"type": "user", "parent_tool_use_id": None, "message": {"role": "user", "content": [
+                {"type": "text", "text": "[Request interrupted by user for tool use]"}]}})
+            result(subtype="error_during_execution", is_error=True, result=None, terminal_reason="aborted_tools")
+            raise Aborted()
+        rpc = ((response or {}).get("response") or {}).get("mcp_response") or {}
+        if "result" in rpc:
+            parts = [part.get("text", "") for part in rpc["result"].get("content") or [] if part.get("type") == "text"]
+            error = bool(rpc["result"].get("isError"))
+            content = "\n".join(parts) if error else [{"type": "text", "text": "\n".join(parts)}]
+        else:
+            content, error = str((rpc.get("error") or {}).get("message") or "MCP error"), True
+    log({"event": "mcp_result", "name": name, "content": content, "is_error": error})
+    write({"type": "user", "parent_tool_use_id": None, "uuid": str(uuid.uuid4()), "message": {"role": "user", "content": [
+        {"type": "tool_result", "content": content, "tool_use_id": identity, **({"is_error": True} if error else {})}]}})
+    for message in queued:
+        echo(message)
+        write({"type": "command_lifecycle", "command_uuid": message.get("uuid"), "state": "started"})
+
+
 def run(directives):
+    try:
+        perform(directives)
+    except Aborted:
+        pass
+
+
+def perform(directives):
     for directive in directives:
         if directive == "init" or (isinstance(directive, dict) and "init" in directive):
             details = directive["init"] if isinstance(directive, dict) else {}
+            connect_mcp()
             write({"type": "system", "subtype": "init", "model": option("--model"),
                    "tools": tools + (["StructuredOutput"] if "--json-schema" in argv else [])
-                   + details.get("extra_tools", []),
+                   + details.get("extra_tools", []) + sorted(mcp["tools"]), "mcp_servers": mcp["servers"],
                    **({"session_id": details["session_id"]} if "session_id" in details else {})})
+        elif "mcp_call" in directive:
+            call_mcp(directive["mcp_call"])
         elif directive == "echo":
             echo(current["message"])
         elif "emit" in directive:

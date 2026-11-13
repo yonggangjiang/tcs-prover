@@ -8435,12 +8435,10 @@ def _execute(workflow, state, options, prompts):
                             features = [feature for feature in features if feature != "multi_agent"]
                             note = team_module.team_note(texts["team_note"], members, render_template)
                     if crew is not None:
+                        # Claude Code keeps the team's MCP server in --bare mode too (claude_cli.goal_session), so a
+                        # Claude coordinator never needs the plan of an author alone.
                         start = plan(True, False, note)
                         prepare_memory_folder(directory, stage_name)
-                        if claude:
-                            # Claude Code's --bare mode may load no MCP server (claude_cli.goal_session): the author
-                            # then works alone like this.
-                            alone = plan(False, False)
                     elif coordinator and multi_agent_version(settings["model"]) == 0:
                         # Codex gives this model no subagent tool: the author works alone, without the subagent
                         # feature and the subagents note, as with Author subagents 0.
