@@ -4,7 +4,10 @@ Every role (statement reviewer, proof author, critic, LaTeX writer) runs through
 one of two programs on your computer: the **Codex CLI** (the default) or
 **Claude Code**. They provide the author's conversation and every model call.
 GPT 6.1 Sol at Max reasoning and Standard speed is the default for every role,
-and the critic's choice also covers the convention critic.
+and the critic's choice also covers the convention critic. The author
+coordinator's subagents run the coordinator's model, or with **Subagent models →
+Choose for each** a model of their own each, from the same sources (see
+[the author's team](workflow.md#the-authors-team)).
 
 Choose per role under **Advanced settings** on the New problem page, or on
 **Models & API** in the sidebar: a **Source**, then a **Model**, then its
@@ -157,7 +160,10 @@ missing, not running, not on the jobs' path or, for a built-in model, not signed
 in, the chip adds it (for example *Claude Code · not installed*) and a hint under
 the menus links to Setup; nothing stops a start. Only the model you chose for a
 role of a selected stage gets this note: the **Source** menus offer every source
-without marks.
+without marks. Each author subagent of **Choose for each** counts like a role:
+its row's chip says the same, the hint names it (*Claude Code is not installed on
+this computer; the author subagent 2 uses it.*), and the Setup page counts its
+program as needed (an API connection's program installed, without a sign-in).
 
 ## Codex CLI
 

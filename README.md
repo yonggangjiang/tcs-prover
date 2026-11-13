@@ -80,6 +80,9 @@ and `irm https://claude.ai/install.ps1 | iex`.
    subagents at a time, keeps the team's memory and a progress log (shown on the
    job page), checks that progress keeps growing, and hands in a
    complete proof. With **Author subagents** 0, one author works on it alone.
+   Each subagent can run a model of its own (Codex CLI, Claude Code or an API
+   key), and TCS Prover runs the author's turns itself; **Edit prompts** shows
+   every text it sends, editable for the next job.
 3. **Critic.** A critic starts independent critics (3 by default) that hunt for
    bugs, fixes what it can, and sends critical errors back to the author.
 4. **Convention critic.** Checks once that the accepted proof does what you most

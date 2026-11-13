@@ -9709,6 +9709,15 @@ function applyPreset(preset) {
     settings[`${role}Model`] = "gpt-6.1-sol";
     missing.push({ role, label: listed?.label || preset.labels?.[model] || model });
   }
+  // An author subagent's removed API model the same way ("author subagent 2").
+  if (Array.isArray(settings.authorSubagentModels) && Array.isArray(catalog)) {
+    settings.authorSubagentModels = settings.authorSubagentModels.map((item, index) => {
+      const model = String(item?.model || "");
+      if (!model.startsWith("api:") || catalog.some((row) => row.id === model)) return item;
+      missing.push({ role: `member${index + 1}`, label: preset.labels?.[model] || model });
+      return { ...item, model: "gpt-6.1-sol" };
+    });
+  }
   applyComposerSettings(settings);
   store.current = { kind: "preset", id: preset.id, name: preset.name };
   store.note = missing.length ? presetMissingText(missing) : "";
@@ -9717,7 +9726,9 @@ function applyPreset(preset) {
 }
 
 function presetMissingText(missing) {
-  const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer" };
+  const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer",
+    ...Object.fromEntries(missing.filter(({ role }) => /^member\d+$/.test(role))
+      .map(({ role }) => [role, `author subagent ${role.slice(6)}`])) };
   const fallback = "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.";
   if (missing.length === 1) {
     const [{ role, label }] = missing;

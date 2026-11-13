@@ -269,6 +269,21 @@ assert.deepEqual([settings.goalLoop, settings.authorSubagentModels.map((item) =>
 assert.equal("promptOverrides" in settings, false);
 """)
 
+    def test_a_saved_subagent_model_that_was_removed_loads_as_gpt_6_1_sol_with_a_note(self):
+        self.run_form(r"""
+await openFresh();
+const settings = {...fixture.listing.presets.find((item) => item.name === "Careful proof").settings, authorSubagents: 2,
+  authorSubagentModels: [{model: "api:gone--m-0123456789abcdef", effort: "high"}, {model: "claude-opus-5-5", effort: "max"}],
+  goalLoop: "codex"};
+applyPreset({id: "p-team", name: "Team", settings, labels: {"api:gone--m-0123456789abcdef": "Gone model"}, unavailable: []});
+assert.deepEqual(proofJobSettings().authorSubagentModels, [{model: "gpt-6.1-sol", effort: "high"},
+  {model: "claude-opus-5-5", effort: "max"}]);
+assert.equal(proofJobSettings().goalLoop, "codex");
+assert.equal(presetStore().note, "Author subagent 1 model not available (Gone model), so the author subagent 1 uses "
+  + "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.");
+assert.equal(presetStore().warning, true);
+""")
+
     def test_the_summary_of_advanced_settings_names_the_goal_loop_and_the_team(self):
         self.run_form(r"""
 await openFresh();
