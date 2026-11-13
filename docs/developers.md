@@ -213,7 +213,12 @@ model, reasoning, time-limit, critic-round, critic-count and prompt options.
 {auto,coordinator,author}` (default `auto`: a coordinator when N is 1 or more)
 choose how the author works, and `--coordinator-prompt-file` gives the
 coordinator's first prompt, as `--author-prompt-file` gives the author's. The
-server always passes the mode the job recorded.
+server always passes the mode the job recorded. `--goal-loop {tcs,codex}` (default
+`tcs`), `--author-team {tcs,builtin}` (default `tcs`), `--author-subagent-models
+JSON` and `--prompt-set-file PATH` are described in
+[TCS Prover's goal loop and team](#tcs-provers-goal-loop-and-team); options
+given through the Python API without them keep Codex's goal mode and the
+built-in subagents.
 `--model` sets the fallback model for any workflow; `--set NAME=VALUE` sets any
 named option and accepts JSON values. Node `role` settings can use options such
 as `editor_model` and `editor_effort`. To run only the author:
@@ -420,6 +425,100 @@ the problem-solving to its subagents. What the runner and the server add:
   is read again at the next tick. Saved read-only batches show the same, read
   once per request (from the run's own folder when the saved working folder is
   not a folder of the batch catalog, such as a run moved into a batch folder).
+
+## TCS Prover's goal loop and team
+
+Owner's request (13 Nov 2026): choose the coordinator's and each subagent's model
+(Codex, Claude, CLI or API), and simulate Codex's goal mode and subagent tools so
+that every prompt and tool text is the user's to adjust. What the code does:
+
+- **Every text is in the workflow.** `workflows/author_critic.yaml` holds, beside
+  the role and lifecycle prompts, TCS Prover's own texts with "EDIT … HERE"
+  comments (`workflow_runner.HARNESS_TEXTS` lists them with their placeholders):
+  `goal_continuation` (`{continuation}`, `{objective}`, `{elapsed}`, `{limit}`;
+  default: Codex 0.160's `goals/continuation.md`, extracted with `strings` from
+  the installed binary, its token lines replaced by time lines and `update_goal`
+  named `mcp__tcs__update_goal` as the model sees it), `goal_tool_update_goal`
+  with `_status` and `_note` (Codex 0.160's `update_goal` description and status
+  argument; the note is TCS Prover's), `claude_goal_harness` (`{objective}`; the
+  former `claude_cli.GOAL_HARNESS_PROMPT`, which stays the fallback of a workflow
+  without it), `codex_compact_prompt` (Codex's `compact_prompt`; empty, the only
+  prompt that may be, passes nothing), `team_note` (`{members}`), `team_member`
+  (`{assignment}`) and one description per team tool and argument
+  (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
+  checks it; `runner/prompt_catalog.py` names, groups and describes every text
+  for the Prompts dialog (`GET /prompt-catalog`, `POST /prompt-catalog/check`).
+- **Each job keeps its texts.** A new job records `promptSet` (every catalog
+  text after the user's edits) in `prompts/prompt-set.json` of its controller
+  and run folders; every launch rewrites the controller's copy from the job's
+  state and passes `--prompt-set-file` (catalog names; the runner maps
+  `convention` to `convention_critic`), reply turns and the writer included, and
+  chat messages use the job's `chat` text. A job from before has no `promptSet`
+  (`goalLoopRecorded: false`) and reads the live workflow, as before.
+- **The goal loop** (`goal_session`, `--goal-loop`). `codex` is Codex's goal mode,
+  unchanged. `tcs` starts the app-server with `--disable goals` and sends no
+  `thread/goal/*` request: TCS Prover starts every turn and, after one that did
+  not end the goal, at once sends `goal_continuation` with the continuation
+  prompt first (the coordinator's report answer after a reply the hand-in guard
+  kept). The model ends its goal with `update_goal` (`team.GoalTool`): `complete`
+  with a final reply in the same turn hands that reply on; `blocked` and
+  `paused` are recorded as **Goal status** (`goalStatus`, `note`) and the work
+  goes on. The liveness probe is `config/read`. Pause, Stop, the time limit,
+  resume, live instructions, chat, time checks, the compaction re-anchor, the
+  hand-in guard and the retries are as before. Reply turns of a `tcs` thread
+  reopen it without the goals feature. Web-cutoff runs always use `codex`: their
+  audited configuration (retrieval/runtime.py) has no place for TCS Prover's
+  server. Claude Code authors always ran TCS Prover's loop; their harness note
+  is `claude_goal_harness` and their continuation the role's, as before.
+- **TCS Prover's MCP server.** `runner/tcs_mcp.py` is a stdio MCP server (standard
+  library only, started by the runner's own interpreter with `-I`) that the author's CLI starts from its
+  settings: Codex's thread settings `mcp_servers.tcs` (kept on while the user's
+  servers are off, `required`, `tool_timeout_sec` 2,400, every tool
+  `approval_mode: approve`), Claude Code's `--mcp-config` file in the private
+  settings folder (`timeout` 2,400,000 ms, the tools pre-approved in
+  `--allowedTools`, `--strict-mcp-config` kept). Its environment holds the
+  address of the runner's `team.Service` (127.0.0.1, a random port) and a random
+  token; every request carries the token, and the service answers nothing else.
+  The service runs the tools of the providers added to it: `GoalTool` and `Team`.
+- **The team** (`--author-team tcs`, the coordinator of every new live job).
+  `_execute` builds `team.team_members()` from `--author-subagent-models` (one
+  `{model, effort}` per author subagent; none: the coordinator's model and
+  effort), appends `team_note` to the coordinator's first prompt after the
+  related works, and removes the CLI's subagent tool (no `multi_agent`; a model
+  with no Codex subagent tool, such as GPT 5.6 Luna, still coordinates). Tools:
+  `team_members`, `team_assign(member, assignment)`, `team_wait(timeout_minutes)`
+  (1 to 30, default 30; returns at once when no member works and no report
+  waits, else when an assignment finishes or fails, with every report since the
+  last wait, each cut at 20,000 characters with a note naming its file; it ends
+  early when TCS Prover sends a live instruction or a time check, or one came in
+  the 10 s before it began), `team_followup(member, message)` (continues the
+  member's last conversation; refused while it works or without one) and
+  `team_stop(member)`. Each assignment is a one-shot run (`member_attempt()`):
+  `codex exec --json` (persisted session, `exec fork` for a follow-up or retry,
+  `--disable multi_agent`, `--ignore-user-config`, `-a never`, the author's
+  confined profile on macOS or `-s workspace-write` with the run's network rule
+  elsewhere, the agent variables removed) or `claude -p` (`run_structured` with
+  `role="author"`: the author's tools without Agent, its deny rules and Bash
+  sandbox, no `--json-schema`) in the author's working folder. The input is
+  `team_member` with the assignment; the final reply is the report, saved
+  owner-only and never through a link as `team/member-<n>/<k>-report.md`. A
+  failed model call is retried every minute without limit, continuing the
+  member's conversation when the attempt worked (`AUTHOR_RETRY_NOTE`); a
+  settings problem (`member_problem()`: a missing CLI, a failed login, an unknown
+  model or connection, an endpoint that refuses the request) goes to the
+  coordinator as the report of a failed assignment, and the member is idle.
+  Members are children of the runner: a pause, Stop, the time limit, the end of
+  the work and a restart stop them (their records say why); a failed model call
+  of the coordinator keeps them working, and the next attempt reads their
+  reports. Records: **Author subagent started/finished/failed** with
+  `subagentMember`, `subagentModel` and `subagentReport`, and the members'
+  `codex_event` records (`root: false`).
+- **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
+  restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
+  codex --author-team builtin` and no texts, also after a revision in place, and a
+  continuation of it keeps them. A web-cutoff coordinator keeps the CLI's
+  built-in subagents with the coordinator's model (status **Built-in
+  subagents**); the server refuses Subagent models with a web cutoff.
 
 ## HTTP API notes
 
