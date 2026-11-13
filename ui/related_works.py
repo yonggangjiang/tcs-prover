@@ -12,7 +12,13 @@ A folder batch keeps one physical copy of its related works in its own store
 (BatchStore, under the controller folder), hard-linked into the related-works/
 folder of every job of the batch; each job's INDEX.md lists the batch's items
 and the job's own. Every job's link reaches that one copy, so a store file
-whose bytes no longer match what was added is not given to later jobs.
+whose bytes no longer match what was added is not given to later jobs. A
+batch of jobs (the default batch, or one made with New batch) keeps the works
+it shares with every problem in a store of the same kind. A work can be
+removed from a store: the store keeps its entry, marked removed, so no later
+work takes its name (jobs that keep the removed work have it under that
+name), and only jobs whose author has not started lose their link
+(unlink_shared).
 """
 
 from __future__ import annotations
@@ -87,6 +93,9 @@ KINDS = ("file", "note")
 CONTENT_NAME, TEXT_NAME, ITEM_NAME = "content", "text", "item.json"
 TOKEN = re.compile(r"[A-Za-z0-9_-]{24}\Z")
 BATCH_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+# The store of a folder run ("Run a folder…", new_batch_id()); every other store holds the works one batch of jobs
+# shares with all its problems.
+FOLDER_RUN_ID = re.compile(r"b_[0-9a-f]{10}\Z")
 SAVED_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 RESERVED_STEMS = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)),
@@ -899,7 +908,7 @@ def _valid_entry(entry):
     return (isinstance(entry, dict) and _valid_name(entry.get("name")) and entry.get("kind") in KINDS
             and _count(entry.get("size")) and _sha256(entry.get("sha256"))
             and all(isinstance(entry.get(key, ""), str)
-                    for key in (*TEXT_KEYS, "addedAt", "addedIn", "batch", "batchName"))
+                    for key in (*TEXT_KEYS, "addedAt", "addedIn", "batch", "batchName", "removedAt"))
             and all(_count(entry.get(key, 0)) for key in ("pages", "chars", "textSize"))
             and (entry.get("textName", "") == ""
                  or (_valid_name(entry["textName"]) and _sha256(entry.get("textSha256")))))
@@ -934,6 +943,20 @@ def _read_manifest(manifest_dir, strict=True):
         if strict:
             raise RelatedWorksError(DAMAGED) from exc
         return None, []
+
+
+def _active(entries):
+    """The entries of works still held: a batch store keeps a removed work's entry (``removedAt``) for its name."""
+
+    return [entry for entry in entries if not entry.get("removedAt")]
+
+
+def shared_from(store_id):
+    """Where a job's related work came from, by the store that shares it: "folderRun", "batch", or "" (its own)."""
+
+    if not isinstance(store_id, str) or not store_id:
+        return ""
+    return "folderRun" if FOLDER_RUN_ID.match(store_id) else "batch"
 
 
 def _write_manifest(manifest_dir, entries):
@@ -999,7 +1022,7 @@ def _check_room(existing, new):
 def check_room(manifest_dir, extra):
     """Refuse, before anything is written, ``extra`` more items for a workspace or store that cannot hold them."""
 
-    _check_room(len(_read_manifest(manifest_dir)[1]), extra)
+    _check_room(len(_active(_read_manifest(manifest_dir)[1])), extra)
 
 
 def _template(entry):
@@ -1244,6 +1267,8 @@ def _add(workspace, manifest_dir, old, plans, *, run_id, staging, problem=NOT_PL
     manifest, so the manifest only ever lists finished files; ``record``
     runs last. A failure removes the files this call placed, restores
     INDEX.md and the manifest, and raises "Could not add the related works: ...".
+    The names of removed works a store keeps (``old``) stay taken; INDEX.md
+    lists only the works held.
     """
 
     raw, entries = old
@@ -1279,7 +1304,7 @@ def _add(workspace, manifest_dir, old, plans, *, run_id, staging, problem=NOT_PL
                 if prepare is not None:
                     prepare(folder, new)
                 index_changed = True
-                _write_index(folder, entries + new, staging)
+                _write_index(folder, _active(entries + new), staging)
                 manifest_changed = True
                 _write_manifest(manifest_dir, entries + new)
                 if record is not None:
@@ -1296,7 +1321,7 @@ def _add(workspace, manifest_dir, old, plans, *, run_id, staging, problem=NOT_PL
                 if index_changed:
                     try:
                         if entries:
-                            _write_index(folder, entries, staging)
+                            _write_index(folder, _active(entries), staging)
                         else:
                             folder.unlink(INDEX_NAME)
                     except (OSError, RelatedWorksError):
@@ -1319,7 +1344,7 @@ def _install(workspace, manifest_dir, tokens, stage, *, run_id, keep_staged, rec
     with workspace_lock(workspace):
         items = stage.peek(tokens)
         old = _read_manifest(manifest_dir)
-        _check_room(len(old[1]), len(items))
+        _check_room(len(_active(old[1])), len(items))
         try:
             root = stage._folder()
         except OSError:
@@ -1391,19 +1416,29 @@ def _staged_source(root, token):
 def listing(workspace, manifest_dir):
     """The related works of a workspace (or batch store) for display, oldest first; never raises.
 
-    ``batch`` is the ID of the batch an item is shared with, or "".
+    ``batch`` is the ID of the store an item is shared from, or "", and
+    ``sharedFrom`` says which kind of store that is (shared_from()). A
+    store's removed works are left out.
     """
 
     return [{"name": entry["name"], "originalName": entry.get("originalName", ""), "kind": entry["kind"],
              "title": entry.get("title", ""), "sizeText": size_text(entry["size"]), "textStatus": text_status(entry),
-             "addedAt": entry.get("addedAt", ""), "batch": entry.get("batch", "")}
-            for entry in _read_manifest(manifest_dir, strict=False)[1]]
+             "addedAt": entry.get("addedAt", ""), "batch": entry.get("batch", ""),
+             "sharedFrom": shared_from(entry.get("batch", ""))}
+            for entry in _active(_read_manifest(manifest_dir, strict=False)[1])]
 
 
 def count(workspace, manifest_dir):
     """How many related works a workspace (or batch store) holds; never raises."""
 
-    return len(_read_manifest(manifest_dir, strict=False)[1])
+    return len(_active(_read_manifest(manifest_dir, strict=False)[1]))
+
+
+def shared_names(manifest_dir, store_id):
+    """The names in store ``store_id`` of the works a workspace has from that store; never raises."""
+
+    return {entry.get("batchName", "") for entry in _read_manifest(manifest_dir, strict=False)[1]
+            if entry.get("batch") == store_id} - {""}
 
 
 def notice_text(names):
@@ -1443,7 +1478,7 @@ def describe_entry(entry):
 
 
 def copy_into(source_workspace, source_manifest_dir, target_workspace, target_manifest_dir, *, run_id, batch=None,
-              record=None):
+              record=None, skip=()):
     """Copy one run's related works into another run's workspace (a "Retry statement review"); return how many.
 
     Only regular files named in the source manifest are copied, never links,
@@ -1451,12 +1486,16 @@ def copy_into(source_workspace, source_manifest_dir, target_workspace, target_ma
     skipped. Items of ``batch`` (a BatchStore) are hard-linked from the batch
     store instead, so the new job keeps sharing them, under the same checks
     as BatchStore.link_into: a store file whose bytes changed is skipped.
+    Items shared from a store named in ``skip`` are left out: the new job
+    takes what that store holds now from the store itself.
     """
 
-    entries = _read_manifest(source_manifest_dir, strict=False)[1]
+    entries = [entry for entry in _read_manifest(source_manifest_dir, strict=False)[1]
+               if not entry.get("batch") or entry["batch"] not in skip]
     if not entries:
         return 0
-    shared = {} if batch is None else {entry["name"]: entry for entry in _read_manifest(batch.root, strict=False)[1]}
+    shared = {} if batch is None else {entry["name"]: entry
+                                       for entry in _active(_read_manifest(batch.root, strict=False)[1])}
 
     def linked(entry):
         return batch is not None and entry.get("batch") == batch.id and entry.get("batchName") in shared
@@ -1484,10 +1523,56 @@ def copy_into(source_workspace, source_manifest_dir, target_workspace, target_ma
                 plans.append(_Plan(entry["name"], lambda: nullcontext(source), _files(entry), _template(entry),
                                    link=False, optional=True,
                                    extra={key: entry[key] for key in ("batch", "batchName") if entry.get(key)}))
-        _check_room(len(old[1]), len(plans))
+        _check_room(len(_active(old[1])), len(plans))
         added = _add(target_workspace, target_manifest_dir, old, plans, run_id=run_id, staging=target_manifest_dir,
                      record=record)
     return len(added)
+
+
+def unlink_shared(workspace, manifest_dir, store_id, names, *, staging):
+    """Take the works shared from store ``store_id`` under ``names`` (their names in the store) out of a workspace.
+
+    For a job whose author has not started (the caller decides): its
+    manifest stops listing them first, then INDEX.md, then their files go
+    (each only a link to the store's copy, or the job's own copy of it).
+    A job left with no related works keeps no INDEX.md or empty folder.
+    Returns the job's entries removed; a damaged record changes nothing.
+    """
+
+    names = set(names)
+    with workspace_lock(workspace):
+        _, entries = _read_manifest(manifest_dir)
+        gone = [entry for entry in entries if entry.get("batch") == store_id and entry.get("batchName") in names]
+        if not gone:
+            return []
+        kept = [entry for entry in entries if not (entry.get("batch") == store_id and entry.get("batchName") in names)]
+        try:
+            _write_manifest(manifest_dir, kept)
+        except OSError as exc:
+            raise RelatedWorksError(f"Could not remove the related works: {exc}") from exc
+        try:
+            with _Folder.at(workspace) as top, top.child(FOLDER, problem=NOT_PLAIN) as folder:
+                if kept:
+                    _write_index(folder, kept, staging)
+                else:
+                    try:
+                        folder.unlink(INDEX_NAME)
+                    except FileNotFoundError:
+                        pass
+                for entry in gone:
+                    for name in (entry["name"], entry.get("textName")):
+                        if name:
+                            try:
+                                folder.unlink(name)
+                            except FileNotFoundError:
+                                pass
+                folder.sync()
+                if not kept:
+                    _remove_empty(top)
+        except (OSError, RelatedWorksError) as exc:
+            raise RelatedWorksError(f"The related works were taken off this job's list, but its related-works folder "
+                                    f"could not be updated: {exc}") from exc
+    return gone
 
 
 # --- Folder batches ----------------------------------------------------------------------------------------------
@@ -1511,12 +1596,15 @@ def _listed(names):
 
 
 class BatchStore:
-    """The related works of one folder batch: one physical copy, hard-linked into every job of the batch.
+    """Related works shared by many jobs: one physical copy, hard-linked into every job that gets them.
 
-    The copy lives in <root>/related-works, with its own INDEX.md, and the
-    manifest in <root>/related-works.json. The root's name is the batch ID;
-    each job entry linked from the store records it as "batch", and the
-    item's name in the store as "batchName".
+    A folder run ("Run a folder…") has one for its jobs, and a batch of jobs
+    one for every problem in it. The copy lives in <root>/related-works,
+    with its own INDEX.md, and the manifest in <root>/related-works.json.
+    The root's name is the store's ID; each job entry linked from the store
+    records it as "batch", and the item's name in the store as "batchName".
+    A removed work's entry stays in the manifest, marked "removedAt", so its
+    name is never given to a later work.
     """
 
     def __init__(self, root):
@@ -1558,6 +1646,41 @@ class BatchStore:
     def count(self):
         return count(self.root, self.root)
 
+    def remove(self, name):
+        """Remove the work ``name`` from the store; return its entry, marked "removedAt".
+
+        The manifest marks it removed first, so no job gets it from then on;
+        then the store's own files go and its INDEX.md lists what is left.
+        Every job's link keeps the bytes it has: only the caller takes the
+        work out of the jobs that should lose it (unlink_shared). A damaged
+        manifest refuses before anything changes.
+        """
+
+        with workspace_lock(self.root):
+            _, entries = _read_manifest(self.root)
+            position = next((index for index, entry in enumerate(entries)
+                             if entry["name"] == name and not entry.get("removedAt")), None)
+            if position is None:
+                raise RelatedWorksError(f"The batch has no related work named {name}.")
+            removed = {**entries[position], "removedAt": _now()}
+            entries = [*entries[:position], removed, *entries[position + 1:]]
+            try:
+                _write_manifest(self.root, entries)
+            except OSError as exc:
+                raise RelatedWorksError(f"Could not remove the related work: {exc}") from exc
+            try:
+                with _open_path(self.root / FOLDER) as folder:
+                    for file_name in (removed["name"], removed.get("textName")):
+                        if file_name:
+                            try:
+                                folder.unlink(file_name)
+                            except FileNotFoundError:
+                                pass
+                    _write_index(folder, _active(entries), self.root)
+            except (OSError, RelatedWorksError):
+                pass  # The manifest decides: a store file left behind is never linked again, and its name stays taken.
+        return removed
+
     def link_into(self, workspace, manifest_dir, *, run_id, names=None, record=None):
         """Hard-link the batch's related works that one job lacks (or only ``names``) into its related-works/.
 
@@ -1573,7 +1696,7 @@ class BatchStore:
         are as for install(); the batch store itself is never changed.
         """
 
-        shared = _read_manifest(self.root)[1]
+        shared = _active(_read_manifest(self.root)[1])
         if names is not None:
             names = list(names)
             known = {entry["name"] for entry in shared}
@@ -1595,6 +1718,10 @@ class BatchStore:
                 added = _add(workspace, manifest_dir, old, plans, run_id=run_id, staging=manifest_dir, record=record)
         copied = [entry["name"] for entry, reason in added if reason]
         skipped = [plan.base for plan in plans if plan.skipped]
+        if skipped:
+            # A work removed from the store while this job was being linked is no damaged copy: say nothing of it.
+            held = {entry["name"] for entry in _active(_read_manifest(self.root, strict=False)[1])}
+            skipped = [name for name in skipped if name in held]
         sentences = []
         if copied:
             reasons = "; ".join(dict.fromkeys(reason for _, reason in added if reason))
