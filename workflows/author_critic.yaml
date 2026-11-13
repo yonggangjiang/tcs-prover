@@ -266,8 +266,8 @@ prompts:
   # coordinator_continuation, or coordinator_report after a reply that names no proof file), placed first;
   # {objective} the rendered goal (goal or coordinator_goal); {elapsed} the job's working time ("5 h 12 min");
   # {limit} its time limit and what is left of it ("10 h, about 4 h 48 min left"), or "none". Default: Codex 0.160's
-  # own continuation text (goals/continuation.md), with its token lines replaced by the time lines and its
-  # update_goal named as the model sees TCS Prover's tool (mcp__tcs__update_goal).
+  # own continuation text (goals/continuation.md), with its token lines replaced by the time lines; its update_goal
+  # is the name the model sees for TCS Prover's tool (update_goal, in the namespace mcp__tcs).
   goal_continuation: |-
     {continuation}
 
@@ -305,15 +305,15 @@ prompts:
     - Treat tests, manifests, verifiers, green checks, and search results as evidence only after confirming they cover the relevant requirement.
     - Treat uncertain or indirect evidence as not achieved; gather stronger evidence or continue the work.
     - The audit must prove completion, not merely fail to find obvious remaining work.
-    Do not rely on intent, partial progress, memory of earlier work, or a plausible final answer as proof of completion. Marking the goal complete is a claim that the full objective has been finished and can withstand requirement-by-requirement scrutiny. Only mark the goal achieved when current evidence proves every requirement has been satisfied and no required work remains. If the evidence is incomplete, weak, indirect, merely consistent with completion, or leaves any requirement missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call mcp__tcs__update_goal with status "complete" so usage accounting is preserved. If the achieved goal has a token budget, report the final consumed token budget to the user after mcp__tcs__update_goal succeeds.
+    Do not rely on intent, partial progress, memory of earlier work, or a plausible final answer as proof of completion. Marking the goal complete is a claim that the full objective has been finished and can withstand requirement-by-requirement scrutiny. Only mark the goal achieved when current evidence proves every requirement has been satisfied and no required work remains. If the evidence is incomplete, weak, indirect, merely consistent with completion, or leaves any requirement missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call update_goal with status "complete" so usage accounting is preserved. If the achieved goal has a token budget, report the final consumed token budget to the user after update_goal succeeds.
     Blocked audit:
-    - Do not call mcp__tcs__update_goal with status "blocked" the first time a blocker appears.
+    - Do not call update_goal with status "blocked" the first time a blocker appears.
     - Only use status "blocked" when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic goal continuations.
-    - If the user resumes a goal that was previously marked "blocked", treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, call mcp__tcs__update_goal with status "blocked" again.
+    - If the user resumes a goal that was previously marked "blocked", treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, call update_goal with status "blocked" again.
     - Use status "blocked" only when you are truly at an impasse and cannot make meaningful progress without user input or an external-state change.
-    - Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; call mcp__tcs__update_goal with status "blocked".
+    - Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; call update_goal with status "blocked".
     - Never use status "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
-    Call mcp__tcs__update_goal only after the completion or blocked audit passes, or when the user explicitly requests pausing this goal. For a requested pause, use status "paused", report the returned status, and stop goal work; never pause on your own initiative. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
+    Call update_goal only after the completion or blocked audit passes, or when the user explicitly requests pausing this goal. For a requested pause, use status "paused", report the returned status, and stop goal work; never pause on your own initiative. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
   # EDIT GOAL TOOL HERE: the description of the update_goal tool (TCS Prover's MCP server "tcs") with which a Codex
   # author or coordinator under TCS Prover's goal loop ends its goal: status complete hands its turn's final reply on
   # (as Codex's goal mode does); blocked and paused are recorded and the next turn follows (TCS Prover never stops by

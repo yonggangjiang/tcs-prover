@@ -444,8 +444,8 @@ that every prompt and tool text is the user's to adjust. What the code does:
   comments (`workflow_runner.HARNESS_TEXTS` lists them with their placeholders):
   `goal_continuation` (`{continuation}`, `{objective}`, `{elapsed}`, `{limit}`;
   default: Codex 0.160's `goals/continuation.md`, extracted with `strings` from
-  the installed binary, its token lines replaced by time lines and `update_goal`
-  named `mcp__tcs__update_goal` as the model sees it), `goal_tool_update_goal`
+  the installed binary, its token lines replaced by time lines; its `update_goal`
+  is the name the model sees for TCS Prover's tool), `goal_tool_update_goal`
   with `_status` and `_note` (Codex 0.160's `update_goal` description and status
   argument; the note is TCS Prover's), `claude_goal_harness` (`{objective}`; the
   former `claude_cli.GOAL_HARNESS_PROMPT`, which stays the fallback of a workflow
@@ -498,11 +498,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   that Codex
   starts from its thread settings `mcp_servers.tcs` (kept on while the user's
   servers are off, `required`, `tool_timeout_sec` 2,400, every tool
-  `approval_mode: approve`, `omit_tools_from: ["deferred"]`). Its environment
-  holds the address of the runner's `team.Service` (127.0.0.1, a random port)
-  and a random token; every request carries the token, and the service answers
-  nothing else. Claude Code gets no bridge: its `--mcp-config` file in the
-  private settings folder names an `sdk` server (`{"type": "sdk", "name": "tcs",
+  `approval_mode: approve`, `omit_tools_from: ["deferred", "code_mode"]`). Its
+  environment holds the address of the runner's `team.Service` (127.0.0.1, a
+  random port) and a random token; every request carries the token, and the
+  service answers nothing else. Claude Code gets no bridge: its `--mcp-config`
+  file in the private settings folder names an `sdk` server (`{"type": "sdk", "name": "tcs",
   "timeout": 2400000, "alwaysLoad": true}`, so its tools are never deferred
   behind Claude Code's tool search), whose MCP messages the CLI writes as
   stream-json control requests (`mcp_message`) that `claude_cli.goal_session`
@@ -528,11 +528,20 @@ that every prompt and tool text is the user's to adjust. What the code does:
   search (GPT 6.1 Sol, GPT 5.5): a code-mode model then reads only that some
   tools are omitted and must search `ALL_TOOLS` for them, a direct model sees
   them only through `tool_search`, and neither reads their descriptions. Not
-  deferred, a code-mode model (GPT 6.1 Sol) finds each tool in its `exec` tool's
-  description and calls it from its script as `tools.mcp__tcs__<name>`, as it
-  calls Codex's own `update_goal`, and a direct model (GPT 5.5) gets the
-  namespace `mcp__tcs` with each tool; the app-server reports every call as an
-  `mcpToolCall` item (`server` "tcs", `tool` the bare name).
+  deferred but in code mode, a code-mode model (GPT 6.x) calls each tool from a
+  script of its `exec` tool (`tools.mcp__tcs__<name>`), whose cell yields after
+  30 s, so it waits on a running `team_wait` with Codex's `wait` tool: 16 model
+  calls for a wait of 200 s, dozens for 30 minutes. Kept out of both, every
+  model gets the namespace `mcp__tcs` with each tool under its own name
+  (`update_goal`, `team_members`, `team_assign`, `team_wait`, `team_followup`,
+  `team_stop`; GPT 6.1 Sol in its request's `additional_tools`, GPT 5.5 and an
+  API model that Codex does not know in its `tools`) and calls it directly, a
+  function call naming that namespace and the tool, one model call however long
+  the tool runs; Codex refuses a call of the flattened name
+  (`mcp__tcs__team_members`: "unsupported call"). So every default text names
+  each tool by its own name. The app-server reports every call as an
+  `mcpToolCall` item (`server` "tcs", `tool` the tool's name), which the job
+  page shows as "team_wait · completed".
 - **The team** (`--author-team tcs`, the coordinator of every new live job).
   `_execute` builds `team.team_members()` from `--author-subagent-models` (one
   `{model, effort}` per author subagent; none: the coordinator's model and
@@ -607,9 +616,13 @@ that every prompt and tool text is the user's to adjust. What the code does:
   `team_wait` and reaches the model as its next user message), and
   `turn/interrupt` ends the turn, the members stopping with it; `codex exec fork`
   continues a member's conversation; `compact_prompt` (thread setting or `-c`)
-  is the prompt of a compaction. A code-mode model's `exec` call yields after
-  30 s while `team_wait` runs (Codex's default), and the model then waits on the
-  cell with Codex's `wait` tool (10 s per call unless it asks for longer).
+  is the prompt of a compaction. With the tools direct (GPT 6.1 Sol, GPT 5.5), a
+  `team_wait` is one model call however long it runs: a live instruction, a time
+  check, Pause and Stop end a pending one at once, Codex answers the runner's
+  inactivity check (`config/read`) while it runs, and a resumed goal, a
+  compaction and a reply turn work as before. (Called from code mode, the `exec`
+  cell yielded after 30 s while `team_wait` ran, and the model waited on it with
+  Codex's `wait` tool, 10 s per call unless it asked for longer.)
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
   restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
   codex --author-team builtin` and no texts, also after a revision in place, and a

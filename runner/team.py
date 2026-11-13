@@ -39,7 +39,8 @@ from runner import providers, tcs_mcp
 
 SERVER_NAME = "tcs"
 BRIDGE = Path(__file__).resolve().with_name("tcs_mcp.py")
-# How Codex (0.160) and Claude Code (2.1.289) name a tool of this MCP server to the model.
+# How Claude Code (2.1.289) names a tool of this MCP server to the model. Codex (0.160) gives the model each tool
+# under its own name in the namespace mcp__tcs (Service.codex_server()).
 TOOL_PREFIX = f"mcp__{SERVER_NAME}__"
 GOAL_TOOL = "update_goal"
 TEAM_TOOLS = ("team_members", "team_assign", "team_wait", "team_followup", "team_stop")
@@ -295,18 +296,21 @@ class Service:
     def codex_server(self):
         """The mcp_servers entry of a Codex thread's settings for this server (approval "never" runs its tools).
 
-        Its tools are never deferred (omit_tools_from "deferred"). Codex 0.160 defers every MCP tool of a model
-        that supports tool search (GPT 6.1 Sol and GPT 5.5 among them): the model then sees neither the tools nor
-        their descriptions up front, only a code-mode model's hint to search ALL_TOOLS, or a direct model's
-        tool_search tool (captured with the real Codex against a scripted model server). Not deferred, a code-mode
-        model reads each tool as tools.mcp__tcs__<name> in its exec tool's description, as it reads Codex's own
-        update_goal there, and a direct model gets the namespace mcp__tcs with every tool.
+        Its tools are direct tools of every model: never deferred and never inside code mode (omit_tools_from
+        "deferred" and "code_mode"). Codex 0.160 defers every MCP tool of a model that supports tool search (GPT 6.1
+        Sol and GPT 5.5 among them): the model then sees neither the tools nor their descriptions up front, only a
+        code-mode model's hint to search ALL_TOOLS, or a direct model's tool_search tool. A code-mode model (GPT
+        6.x) would call them from a script of its exec tool (tools.mcp__tcs__<name>), whose cell yields after 30 s,
+        so a 30-minute team_wait took dozens of model calls of Codex's wait tool. Omitted from both, every model
+        gets the namespace mcp__tcs, each tool under its own name (update_goal, team_wait, ...), and calls a tool
+        directly, one model call however long the tool runs (captured with the real Codex against a scripted model
+        server).
         """
 
         names = self.names()
         return {"command": sys.executable, "args": ["-I", str(BRIDGE)], "env": self.environment(),
                 "required": True, "tool_timeout_sec": TOOL_TIMEOUT_SECONDS, "enabled_tools": names,
-                "omit_tools_from": ["deferred"],
+                "omit_tools_from": ["deferred", "code_mode"],
                 "tools": {name: {"approval_mode": "approve"} for name in names}}
 
     def claude_config(self):

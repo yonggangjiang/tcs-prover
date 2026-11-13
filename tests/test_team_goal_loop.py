@@ -6,10 +6,12 @@ client: they start the real bridge (runner/tcs_mcp.py) exactly as the CLI's sett
 Team members run stand-in `codex` and `claude` programs (no model). No real CLI is started.
 """
 
+import ast
 import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -240,11 +242,13 @@ class ServiceTests(unittest.TestCase):
                          -32601)
         self.assertEqual(self.service.answer({"jsonrpc": "2.0", "id": 6})["error"]["code"], -32600)
 
-    def test_codex_reads_every_tool_up_front_and_no_text_of_the_bridge_itself(self):
+    def test_codex_gives_every_tool_up_front_as_a_direct_tool_and_no_text_of_the_bridge_itself(self):
         entry = self.service.codex_server()
         # Codex 0.160 defers the MCP tools of a model with tool search (GPT 6.1 Sol, GPT 5.5): unlisted in the exec
-        # tool's description or behind tool_search, their descriptions unseen. Never deferred, they are listed.
-        self.assertEqual(entry["omit_tools_from"], ["deferred"])
+        # tool's description or behind tool_search, their descriptions unseen. And a code-mode model (GPT 6.x) calls
+        # them from its exec tool, whose cell yields every 30 s: a model call of Codex's wait tool each time while a
+        # team_wait runs. Never deferred and never in code mode, every model gets them as direct tools.
+        self.assertEqual(entry["omit_tools_from"], ["deferred", "code_mode"])
         environment = {**{key: value for key, value in os.environ.items() if key in ("PATH", "HOME", "SYSTEMROOT")},
                        **entry["env"]}
         bridge = POPEN([entry["command"], *entry["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
@@ -1462,8 +1466,15 @@ class TextTests(unittest.TestCase):
         self.assertIn("<objective>\n{objective}\n</objective>", text)
         self.assertIn("Budget:\n- Time spent pursuing goal: {elapsed}\n- Time limit: {limit}\nWork from evidence:", text)
         self.assertNotIn("Token", text.replace("token budget", ""))
-        self.assertEqual(text.count("mcp__tcs__update_goal"), 6)
-        self.assertNotIn(" update_goal", text.replace("mcp__tcs__update_goal", ""))
+        # Codex's sentences on update_goal as Codex wrote them: TCS Prover's tool has that name for the model.
+        for sentence in ('If the objective is achieved, call update_goal with status "complete" so usage accounting '
+                         'is preserved.', "report the final consumed token budget to the user after update_goal "
+                         "succeeds.", '- Do not call update_goal with status "blocked" the first time a blocker '
+                         'appears.', 'call update_goal with status "blocked" again.',
+                         'leaving the goal active; call update_goal with status "blocked".',
+                         "Call update_goal only after the completion or blocked audit passes"):
+            self.assertIn(sentence, text)
+        self.assertEqual(text.count("update_goal"), 6)
         self.assertTrue(text.endswith("Do not mark a goal complete merely because the budget is nearly exhausted or "
                                       "because you are stopping work."))
         self.assertTrue(TEXTS["goal_tool_update_goal"].startswith("Update the existing goal.\nSet status to `paused`"))
@@ -1472,6 +1483,37 @@ class TextTests(unittest.TestCase):
         self.assertEqual(runtime.render_template(TEXTS["claude_goal_harness"], {"objective": "Prove S."}),
                          claude_cli.GOAL_HARNESS_PROMPT.replace("[OBJECTIVE]", "Prove S."))
         self.assertEqual(TEXTS["team_member"], "{assignment}\n\nYour final reply is your report to the coordinator.")
+
+    def test_every_text_names_tcs_prover_s_tools_as_codex_shows_them_to_the_model(self):
+        # Codex 0.160 gives every model (GPT 6.1 Sol, GPT 5.5 and a model it does not know) TCS Prover's tools in the
+        # namespace mcp__tcs, each under the name the server lists, and refuses a call of the flattened name
+        # mcp__tcs__<name> ("unsupported call"; captured with the real Codex against a scripted model server). So
+        # the default texts and the tools' answers name each tool by that name, and never otherwise.
+        crew = team.Team([], prompts=TEXTS, directory=".", attempt=None, configuration=None, emit=None, render=None,
+                         retry_note="")
+        listed = {tool["name"] for provider in (team.GoalTool(TEXTS, None, None, None), crew)
+                  for tool in provider.tools()}
+        self.assertEqual(listed, {"update_goal", "team_members", "team_assign", "team_wait", "team_followup",
+                                  "team_stop"})
+        named = re.compile(r"\b(?:mcp__\w+|update_goal|team_[a-z]+)\b")
+        found = {}
+        for name in runtime.HARNESS_TEXTS:
+            for tool in named.findall(TEXTS[name]):
+                self.assertIn(tool, listed, f"{name} names {tool}")
+                found.setdefault(tool, name)
+        # The answers of the tools: the texts of runner/team.py, its docstrings and the prompts' names aside.
+        tree = ast.parse(Path(team.__file__).read_text(encoding="utf-8"))
+        docstrings = {id(node.body[0].value) for node in ast.walk(tree)
+                      if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)) and node.body
+                      and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)}
+        answers = [node.value for node in ast.walk(tree)
+                   if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+                   and node.value not in runtime.HARNESS_TEXTS]
+        self.assertTrue(any("Collect its report with team_wait." in answer for answer in answers))
+        for tool in named.findall("\n".join(answers)):
+            self.assertIn(tool, listed)
+        # Every tool is named somewhere the coordinator or the author reads.
+        self.assertEqual(set(found), listed)
 
     def test_edits_are_checked_as_the_runner_checks_them(self):
         from runner import prompt_catalog

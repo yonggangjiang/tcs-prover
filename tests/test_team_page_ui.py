@@ -563,6 +563,15 @@ assert.equal(toolCall({id: 'c1', type: 'mcpToolCall', server: 'tcs', tool: 'team
   'team_assign · completed');
 assert.equal(toolCall({id: 'c2', type: 'mcpToolCall', name: 'mcp__tcs__team_wait', status: 'completed'}).text,
   'team_wait · completed');
+// The items of the coordinator's direct calls as the real Codex 0.160 recorded them: each tool by its own name.
+assert.equal(toolCall({type: 'mcpToolCall', id: 'act-wait1-13', server: 'tcs', tool: 'team_wait',
+  status: 'completed', arguments: {timeout_minutes: 2}, error: null, durationMs: 2080,
+  result: {content: [{type: 'text', text: 'Member 1 (gpt-6.1-sol) finished the assignment.'}]}}).text,
+  'team_wait · completed');
+assert.equal(toolCall({type: 'mcpToolCall', id: 'act-complete-28', server: 'tcs', tool: 'update_goal',
+  status: 'completed', arguments: {status: 'complete'}}).text, 'update_goal · completed');
+assert.equal(toolCall({type: 'mcpToolCall', id: 'act-busy-9', server: 'tcs', tool: 'team_assign', status: 'failed',
+  arguments: {member: 1, assignment: 'busy check'}}).text, 'team_assign · failed');
 """)
 
     def test_two_assignments_of_one_member_keep_their_own_rows(self):
