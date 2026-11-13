@@ -1,6 +1,7 @@
 """Independent statement checking, including its isolated worker entry point."""
 
 import argparse
+import json
 import sys
 
 import workflow_runner as runtime
@@ -119,12 +120,15 @@ def review_worker_main(argv):
     parser.add_argument("--reasoning-summary", choices=runtime.REASONING_SUMMARIES, default=runtime.DEFAULT_REASONING_SUMMARY)
     parser.add_argument("--review-prompt-file")
     parser.add_argument("--thinking-hours", type=runtime.author_hours, default=runtime.DEFAULT_AUTHOR_HOURS)
+    parser.add_argument("--api-web-search", type=json.loads, default=None,
+                        help="the API connections (a JSON list of ids) whose own search service the job searches through")
     args = parser.parse_args(argv)
     try:
         statement, _, feedback = sys.stdin.read().partition("\0")
         # The worker runs in the job's run folder, like the workflow runner.
         runtime.note_retired_efforts([args.review_effort])
         runtime.open_record()
+        runtime.set_web_search(args.api_web_search)
         runtime.check_clis([("review", args.review_model)])
         with records.labelled(role="reviewer", node="statement_reviewer", label="Statement review"):
             review(

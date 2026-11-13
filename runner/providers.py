@@ -568,8 +568,14 @@ def _validated_connection(values, existing=None, *, require_key=True):
         key = ""
     else:
         key = _api_key(supplied_key)
+    # Web search through the connection's own search service (<base>/alpha/search): an OpenAI-format connection
+    # only, off unless saved on (the server turns it on only after a probe search answered, see
+    # ui.server.probe_web_search).
+    web_search = values.get("webSearch", existing.get("webSearch", False))
+    if not isinstance(web_search, bool):
+        raise ProviderError("Web search through this connection must be on or off.")
     return {"format": api_format, "baseUrl": base_url, "headerName": header, "requestSource": source, "apiKey": key,
-            **_token_limits(values, existing)}
+            **_token_limits(values, existing), "webSearch": web_search and api_format == OPENAI_FORMAT}
 
 
 def _validated(values, existing=None, *, require_key=True):
@@ -616,6 +622,7 @@ def _stored(entry):
         {"id": result["model"], "label": result["model"]}]))
     for field in ("createdAt", "updatedAt"):
         result[field] = entry.get(field) if isinstance(entry.get(field), str) else ""
+    result["webSearchCheck"] = _search_check(entry.get("webSearchCheck"))
     test = entry.get("lastTest")
     old_header = entry.get("headerName", result["headerName"])
     same_auth = isinstance(old_header, str) and old_header.lower() == result["headerName"].lower()
@@ -660,6 +667,16 @@ def _resolve_api_model(entries, model_id):
             if row["modelId"] == model_id:
                 return {**entry, "sourceId": entry["id"], "id": model_id, "model": row["id"]}
     return None
+
+
+def _search_check(value):
+    """The saved result of a connection's probe search ({ok, at, message}), or None."""
+
+    if not isinstance(value, dict):
+        return None
+    message = value.get("message")
+    return {"ok": value.get("ok") is True, "at": value.get("at") if isinstance(value.get("at"), str) else "",
+            "message": (message if isinstance(message, str) else "")[:MAX_TEST_MESSAGE_CHARS]}
 
 
 def _last_test(value):
@@ -792,6 +809,7 @@ def public_api_model(entry):
         "updatedAt": entry.get("updatedAt", ""),
         "sourceId": entry.get("sourceId", entry["id"]), "sourceLabel": entry["label"],
         "contextWindow": entry.get("contextWindow"), "maxOutputTokens": entry.get("maxOutputTokens"),
+        "webSearch": entry.get("webSearch") is True, "webSearchCheck": entry.get("webSearchCheck"),
     }
 
 
@@ -1033,11 +1051,12 @@ def save_api_connection(values, discovered_models, reserved=(), *, legacy_model=
                 if requested:
                     raise ProviderError("That API connection id is already in use.")
                 identity, number = f"{base}-{number}", number + 1
+        check = values.get("webSearchCheck", (existing or {}).get("webSearchCheck"))
         entry = {**connection, "id": identity, "label": label, "availableModels": choices,
                  "legacyModelId": existing.get("legacyModelId", True) if existing else legacy_model is not None,
                  "model": existing["model"] if existing else legacy_model or choices[0]["id"],
                  "createdAt": (existing or {}).get("createdAt") or now, "updatedAt": now,
-                 "lastTest": None}
+                 "lastTest": None, "webSearchCheck": _search_check(check)}
         _write_store(_with_entry(rows, entry))
         return public_api_connection(entry)
 

@@ -7323,6 +7323,7 @@ const apiUi = {
   label: $("apiModelName"), result: $("apiModelTestResult"),
   contextWindow: $("apiModelContextWindow"), maxOutput: $("apiModelMaxOutput"), problem: $("apiModelsProblem"),
   cancel: $("apiModelCancelButton"), test: $("apiModelTestButton"), save: $("apiModelSaveButton"),
+  webSearch: $("apiModelWebSearch"), webSearchLine: $("apiModelWebSearchLine"), webSearchHelp: $("apiModelWebSearchHelp"),
 };
 const apiFormats = {
   openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1", key: "sk-…",
@@ -7493,10 +7494,12 @@ function apiModelRow(connection) {
   return item;
 }
 
-// "1,000,000-token context · 64,000 max output", for the limits a connection's models have.
+// "1,000,000-token context · 64,000 max output · web search", for the limits a connection's models have and
+// whether jobs search through it.
 function apiLimitsText(connection) {
   return [connection.contextWindow && `${Number(connection.contextWindow).toLocaleString("en-US")}-token context`,
-    connection.maxOutputTokens && `${Number(connection.maxOutputTokens).toLocaleString("en-US")} max output`]
+    connection.maxOutputTokens && `${Number(connection.maxOutputTokens).toLocaleString("en-US")} max output`,
+    connection.webSearch && "web search"]
     .filter(Boolean).join(" · ");
 }
 // An entry of the store that cannot be used (edited by hand, or saved by another version): what is
@@ -7598,6 +7601,8 @@ function renderApiForm() {
   }
   show(apiUi.cancel, Boolean(editing));
   apiUi.formatHelp.textContent = format.help;
+  show(apiUi.webSearchLine, selectedApiFormat() === "openai");
+  show(apiUi.webSearchHelp, selectedApiFormat() === "openai");
   apiUi.baseUrl.placeholder = format.baseUrl;
   show(apiUi.key, key.shown);
   apiUi.key.disabled = !key.shown;
@@ -7638,6 +7643,7 @@ function resetApiForm() {
   for (const field of [apiUi.baseUrl, apiUi.key, apiUi.requestSource, apiUi.label, apiUi.contextWindow, apiUi.maxOutput]) {
     field.value = "";
   }
+  apiUi.webSearch.checked = false;
   renderApiForm();
 }
 function apiMissingKeyText(key) {
@@ -7655,6 +7661,10 @@ function apiFormValues() {
   // A key goes only from the shown field (adding, Replace key, another server); without one the
   // controller keeps the saved key.
   if (key.shown && apiKey) values.apiKey = apiKey;
+  // Web search through the connection (OpenAI-compatible only) goes when on, which the controller checks with
+  // one test search, or off to turn off the edited connection's.
+  const search = values.format === "openai" && apiUi.webSearch.checked;
+  if (search || apiModelEditing?.webSearch) values.webSearch = search;
   // Token limits go when given, or empty to clear the ones the edited connection has.
   for (const [field, name] of [[apiUi.contextWindow, "contextWindow"], [apiUi.maxOutput, "maxOutputTokens"]]) {
     const value = field.value.trim();
@@ -7712,8 +7722,17 @@ async function saveApiModel() {
   } catch (error) { failure = error.message; keyRequired = Boolean(error.keyRequired); }
   setApiBusy(false); renderApiForm(); restoreApiFocus(apiUi.save);
   if (keyRequired) askApiKey();
-  showApiResult(saved ? "ok" : "error", saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
-    saved ? "Choose this key under Source in any role, then choose a model." : failure);
+  // Asked for web search: what the test search found (it stays off when the service did not answer).
+  const search = saved && values.webSearch ? apiWebSearchText(saved) : "";
+  showApiResult(saved ? (search && !saved.webSearch ? "error" : "ok") : "error",
+    saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
+    saved ? [search, "Choose this key under Source in any role, then choose a model."].filter(Boolean).join(" ") : failure);
+}
+// What a saved connection's web search switch says after the save: on, or off and why (its test search's result).
+function apiWebSearchText(connection) {
+  const check = connection.webSearchCheck;
+  if (connection.webSearch) return `Web search through this connection is on${check?.message ? `: ${check.message}` : "."}`;
+  return `Web search through this connection stays off${check?.message ? `: ${check.message}` : "."}`;
 }
 async function refreshApiConnection(connection, button) {
   if (apiModelBusy) return;
@@ -7796,6 +7815,7 @@ function editApiModel(connection) {
   apiUi.label.value = connection.label === connection.host ? "" : connection.label;
   apiUi.contextWindow.value = connection.contextWindow ? String(connection.contextWindow) : "";
   apiUi.maxOutput.value = connection.maxOutputTokens ? String(connection.maxOutputTokens) : "";
+  apiUi.webSearch.checked = Boolean(connection.webSearch);
   clearApiResult(); renderApiForm(); renderApiModels(); apiUi.baseUrl.focus();
 }
 for (const input of apiUi.formats) input.onchange = () => { noteApiFormEdit(); renderApiForm(); };
@@ -7803,6 +7823,7 @@ apiUi.baseUrl.oninput = () => { noteApiFormEdit(); renderApiForm(); };
 apiUi.key.oninput = apiUi.requestSource.oninput = noteApiFormEdit;
 // The Test lists the models; the display name and the token limits only matter when saving.
 apiUi.label.oninput = apiUi.contextWindow.oninput = apiUi.maxOutput.oninput = () => { apiSaveEdits += 1; };
+apiUi.webSearch.onchange = () => { apiSaveEdits += 1; };
 // Replace key shows the empty key field; Keep saved key hides it again (and drops what was typed);
 // Use saved URL puts the edited connection's base URL back, so the saved key applies again.
 apiUi.replaceKey.onclick = () => {

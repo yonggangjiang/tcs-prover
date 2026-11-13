@@ -504,6 +504,16 @@
                         <label class="segment"><input id="apiModelFormatAnthropic" type="radio" name="apiModelFormat" value="anthropic"><span>Anthropic</span></label>
                       </div>
                       <p id="apiModelFormatHelp" class="help api-format-help">Runs through the Codex CLI with the Responses API. The Codex CLI must be installed on this computer (see Setup), but needs no login. Models load automatically when you save.</p>
+                      <!-- OpenAI-compatible connections only (app.js renderApiForm). Saving with it on sends one test
+                           search to the connection's search service (ui/server.py probe_web_search). -->
+                      <label id="apiModelWebSearchLine" class="toggle-line api-web-search" for="apiModelWebSearch">
+                        <input id="apiModelWebSearch" type="checkbox" aria-describedby="apiModelWebSearchHelp">
+                        <span>Web search through this connection</span>
+                      </label>
+                      <p id="apiModelWebSearchHelp" class="help api-web-search-help">Codex's own web search sends its
+                        searches to this connection's search service (<code>/alpha/search</code> under the base URL),
+                        with its key. When you save with this on, TCS Prover sends one test search; it stays on only
+                        if the service answers. Each job keeps the choice it started with.</p>
                       <details class="api-optional-settings">
                         <summary>Optional source, name and token limits</summary>
                         <div class="api-model-fields">

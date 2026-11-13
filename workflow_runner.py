@@ -1795,11 +1795,20 @@ def inherited_openai_base_url_arguments(overrides=None, environment=None):
     return ["-c", "openai_base_url=" + quoted]
 
 
+# The API connections (their ids) whose own search service this job's Codex models search through: the job's
+# apiWebSearch, which the server passes as --set api_web_search=[...] (the review worker: --api-web-search). A job
+# that recorded none searches as before.
+API_WEB_SEARCH = frozenset()
+
+
 def provider_arguments(model):
     """Define an isolated custom provider for an OpenAI-format API model.
 
     The endpoint and request source come from the API model store; the key stays in
-    the child environment (environment()). Built-in models need no flags.
+    the child environment (environment()). Built-in models need no flags. A connection the job searches through
+    (API_WEB_SEARCH) gets Codex 0.160's own web search (web.run, which posts each search to <base URL>/alpha/search
+    with the connection's key): supports_standalone_web_search=true, the standalone_web_search feature for models that
+    are not Responses Lite, and suppress_unstable_features_warning=true, as that feature is still under development.
     """
 
     if model_provider(model) != API_PROVIDER or providers.harness(model) != providers.CODEX:
@@ -1832,6 +1841,9 @@ def provider_arguments(model):
         # endpoint). Both settings drop it; either alone suffices.
         "-c", "shell_environment_policy.ignore_default_excludes=false",
         "-c", f'shell_environment_policy.exclude=["{API_TOKEN_ENV}","OPENAI_API_KEY"]',
+        *(["-c", f"model_providers.{API_PROVIDER}.supports_standalone_web_search=true",
+           "-c", "features.standalone_web_search=true", "-c", "suppress_unstable_features_warning=true"]
+          if entry.get("sourceId", entry["id"]) in API_WEB_SEARCH else []),
     ]
 
 
@@ -9157,6 +9169,17 @@ def run_author_conversation(workflow_path, options, request):
             return 0
 
 
+def set_web_search(connections):
+    """The API connections this job searches through (API_WEB_SEARCH), from the job's recorded list."""
+
+    global API_WEB_SEARCH
+    if connections is None:
+        return
+    if not isinstance(connections, list) or not all(providers.is_api_id(value) for value in connections):
+        raise Error("api_web_search must be a list of API connection ids.")
+    API_WEB_SEARCH = frozenset(connections)
+
+
 def open_record():
     """Open the record of the job this process works for (records.RECORD_ENV, set by the server for live runs), store
     what earlier processes of the job left behind, and say in the activity log when it cannot be written."""
@@ -9259,6 +9282,7 @@ def _main(argv=None):
         note_retired_efforts([options.get(name) for name in ("effort", "author_effort", "critic_effort",
                                                               "writer_effort")])
         open_record()
+        set_web_search(options.get("api_web_search"))
         if converse:
             if len(args.workflows) != 1:
                 raise Error("--converse takes exactly one workflow.")

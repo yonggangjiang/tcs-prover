@@ -322,6 +322,8 @@ WAITING_PHASES = {"paused", "reviewed", "prepared"}
 # (streamed, with one tool and a JSON answer, at the configured effort) and
 # follows no redirect; a minimal one follows only when that one is refused.
 API_TEST_TIMEOUT_SECONDS = 30
+# The search a connection's web search switch sends once when it is turned on (probe_web_search()).
+WEB_SEARCH_PROBE_QUERY = "TCS Prover web search check"
 API_TEST_PROMPT = "Reply with OK."
 API_TEST_MAX_TOKENS = 16
 API_TEST_MAX_RESPONSE_BYTES = 256 * 1024
@@ -2870,6 +2872,52 @@ def _api_test_exchange(entry, effort, timeout):
     return status, location, b"".join(chunks).decode("utf-8", "replace"), kind, ""
 
 
+def probe_web_search(entry, model, timeout=None):
+    """One probe search through an OpenAI-format connection's own search service: {ok, at, message}.
+
+    Codex 0.160 sends its web search (web.run) to <base URL>/alpha/search when the provider asks for it
+    (supports_standalone_web_search=true): a POST with the connection's key and request source, the body
+    {id, model, commands, settings, max_output_tokens}; a valid answer is a JSON object whose "output" is text, which
+    the model reads (codex-api/src/search.rs; ~/tcs-work/fixes/alpha-search-map.json). The probe sends one such
+    search ({"search_query": [{"q": WEB_SEARCH_PROBE_QUERY}]}) and checks the answer.
+    """
+
+    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
+    parts = urlsplit(entry["baseUrl"])
+    body = json.dumps({"id": f"tcs-prover-search-check-{secrets.token_hex(8)}", "model": model,
+                       "commands": {"search_query": [{"q": WEB_SEARCH_PROBE_QUERY}]},
+                       "settings": {"allowed_callers": ["direct"], "external_web_access": True},
+                       "max_output_tokens": 2500}).encode()
+    headers = {**_api_connection_headers(entry), "Content-Length": str(len(body))}
+    connection = (http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                              context=ssl.create_default_context())
+                  if parts.scheme == "https" else http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout))
+    status, data, failure = None, b"", ""
+    try:
+        connection.request("POST", parts.path.rstrip("/") + "/alpha/search", body=body, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        data = response.read(API_TEST_MAX_RESPONSE_BYTES)
+    except Exception as exc:  # Network, TLS or protocol failure.
+        failure = _api_test_failure(exc, timeout)
+    finally:
+        connection.close()
+    now = datetime.now(timezone.utc).isoformat()
+    if failure:
+        return {"ok": False, "at": now, "message": f"The probe search could not reach the search service: {failure}"}
+    text = data.decode("utf-8", "replace")
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if status is not None and 200 <= status < 300 and isinstance(value, dict) and isinstance(value.get("output"), str):
+        return {"ok": True, "at": now, "message": f"The probe search answered ({len(value['output']):,} characters)."}
+    excerpt = runtime.redact(" ".join(text.split()))[:200]
+    why = (f"HTTP {status}" if status is None or not 200 <= status < 300
+           else "its answer is not a search result (a JSON object with an \"output\" text)")
+    return {"ok": False, "at": now, "message": f"The probe search failed: {why}" + (f": {excerpt}" if excerpt else ".")}
+
+
 def _api_test_outcome(status, location, text, kind, streamed):
     """(ok, model or "", message) of one Test exchange."""
 
@@ -3224,7 +3272,7 @@ class App:
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
             "timeLimitHistory", "conventionWarning", "resumeQueuedAt",
-            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam",
+            "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam", "apiWebSearch",
         )
         # The solver rechecks historical settings while UI events persist
         # thread/steering state. Readers must never observe a truncated JSON.
@@ -3986,6 +4034,11 @@ class App:
                 selected_models = [*selected_models, *(entry["model"] for entry in team_models)]
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
+        # The API connections whose own search service the job's Codex models search through (in a live run; the
+        # job keeps this choice: providers.api_model()'s webSearch, turned on in the connection's editor).
+        web_search = sorted({entry.get("sourceId", entry["id"]) for entry in map(providers.api_model, selected_models)
+                             if entry is not None and entry.get("webSearch")}) if search_options.get(
+            "retrievalMode") == "live" else []
         defaults_texts = prompt_defaults()
         prompt_set = job_prompt_set({name: prompts[name] for name in PROMPT_ROLES}, prompt_overrides, defaults_texts)
         if prompt_edits is None:
@@ -4000,6 +4053,7 @@ class App:
             "promptSet": prompt_set,
             "promptEdits": None if prompt_edits is False else job_prompt_edits(prompt_edits, defaults_texts),
             **search_options,
+            "apiWebSearch": web_search,
             **({"apiModels": api_models} if api_models else {}),
             "workflowStages": stages,
             "reviewModel": review_model,
@@ -4294,6 +4348,8 @@ class App:
                     "--review-prompt-file",
                     str(controlled_path(self.run_dir, "prompts/review.txt")),
                     "--thinking-hours", str(self.state["thinkingHours"]),
+                    *(["--api-web-search", json.dumps(self.state["apiWebSearch"])]
+                      if self.state.get("apiWebSearch") else []),
                 ],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -4638,16 +4694,21 @@ class App:
         return process, token
 
     def _team_runner_options(self, conversation=False):
-        """The runner options of the job's goal loop, its coordinator's team and its saved texts.
+        """The runner options of the job's goal loop, its coordinator's team, its saved texts and the API connections
+        it searches through.
 
         A job from before passes Codex's goal mode and the built-in subagents (no authorTeam), and no texts: its
         runner reads the live workflow, as before. A job with texts gets them rewritten from its state (the
-        controller's copy) at every launch, like its role prompts.
+        controller's copy) at every launch, like its role prompts. The connections are those the job recorded when it
+        started (apiWebSearch); a job from before recorded none.
         """
 
         loop = self.state.get("goalLoop") if self.state.get("goalLoop") in runtime.GOAL_LOOPS else LEGACY_GOAL_LOOP
         team = self.state.get("authorTeam")
         options = ["--goal-loop", loop, "--author-team", "tcs" if team else "builtin"]
+        if self.state.get("apiWebSearch"):
+            # The API connections whose own search service the job searches through, as the job recorded them.
+            options.extend(["--set", "api_web_search=" + json.dumps(self.state["apiWebSearch"])])
         models = self.state.get("authorSubagentModels")
         if team and models and not conversation:
             options.extend(["--author-subagent-models", json.dumps(models, separators=(",", ":"))])
@@ -9154,6 +9215,9 @@ def restore_saved_app(app, *, owned=True):
             api_models = saved_api_models(settings.get("apiModels"))
             if api_models:
                 state["apiModels"] = api_models
+            # The API connections the job searches through (a job from before records none: it searches as before).
+            if isinstance(settings.get("apiWebSearch"), list):
+                state["apiWebSearch"] = [value for value in settings["apiWebSearch"] if providers.is_api_id(value)]
             # Roles a restart already moved to their replacement keep their warning.
             if isinstance(settings.get("replacedRoles"), list):
                 replaced_roles.update(role for role in settings["replacedRoles"] if role in ROLES)
@@ -12266,6 +12330,15 @@ class Server(ThreadingHTTPServer):
         discovery = discover_api_models(entry)
         if not discovery["ok"]:
             raise ValueError(discovery["message"] or "No models are available for this API key.")
+        # Web search through this connection stays on only when one probe search answers: when it is turned on, and
+        # again when it is on and the connection now goes elsewhere (another URL, key, request source or format).
+        search_check = None
+        if entry.get("webSearch"):
+            same = expected is not None and expected.get("webSearch") and all(
+                expected.get(key) == entry.get(key) for key in ("format", "baseUrl", "apiKey", "requestSource"))
+            if not same:
+                search_check = probe_web_search(entry, discovery["models"][0]["id"])
+                entry["webSearch"] = search_check["ok"]
         with self.jobs_lock:
             # Recheck after the network request: jobs can start while it loads.
             current = providers.api_connection(requested) if requested else None
@@ -12281,7 +12354,7 @@ class Server(ThreadingHTTPServer):
                 elif (snapshot and snapshot["format"] == entry["format"] and snapshot["baseUrl"] == entry["baseUrl"]
                       and snapshot["model"] in offered and providers.api_connection(source_id) is None):
                     candidates.append((source_id, snapshot, model_id == source_id))
-            values = {**body, **entry}
+            values = {**body, **entry, **({"webSearchCheck": search_check} if search_check else {})}
             legacy_model = None
             if not requested and candidates:
                 identity, snapshot, legacy = sorted(candidates, key=lambda item: item[0])[0]

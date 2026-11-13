@@ -951,6 +951,39 @@ assert.match($('apiModelTestResult').textContent, /Choose this key under Source/
 assert(!Object.keys(elements).includes('apiModelId'));
 """)
 
+    def test_web_search_goes_only_when_on_or_turned_off_and_its_test_search_is_shown(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+// OpenAI-compatible connections only.
+assert.equal($('apiModelWebSearchLine').hidden, false);
+$('apiModelFormatOpenai').checked = false; $('apiModelFormatAnthropic').checked = true;
+$('apiModelFormatAnthropic').onchange();
+assert.equal($('apiModelWebSearchLine').hidden, true);
+$('apiModelFormatAnthropic').checked = false; $('apiModelFormatOpenai').checked = true;
+$('apiModelFormatOpenai').onchange();
+type('apiModelBaseUrl', connection.baseUrl);
+type('apiModelKey', 'secret-api-key');
+$('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
+$('apiModelSaveButton').onclick();
+assert.equal(sent[0].body.webSearch, true);
+// The service did not answer the test search: the switch stays off and the form says why.
+sent[0].reply(200, {connection: {...connection, webSearch: false, webSearchCheck: {ok: false,
+  message: 'The probe search failed: HTTP 404.'}}, ...listing([connection])});
+await settle();
+assert.match($('apiModelTestResult').textContent, /stays off: The probe search failed: HTTP 404/);
+assert.match($('apiModelTestResult').className, /error/);
+// An edited connection that has it on shows it on; turning it off sends that.
+const searching = {...connection, webSearch: true, webSearchCheck: {ok: true, message: 'The probe search answered.'}};
+sent.length = 0;
+apiModels = [searching];
+renderApiModels();
+click(rowButton('edit'));
+assert.equal($('apiModelWebSearch').checked, true);
+assert.match($('apiModelList').textContent, /web search/);
+$('apiModelWebSearch').checked = false; $('apiModelWebSearch').onchange();
+$('apiModelSaveButton').onclick();
+assert.equal(sent[0].body.webSearch, false);
+""")
+
     def test_test_connection_has_no_model_and_marks_results_stale_after_edits(self):
         self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
 type('apiModelBaseUrl', connection.baseUrl);
