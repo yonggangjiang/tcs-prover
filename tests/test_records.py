@@ -378,6 +378,28 @@ class UntracedCompactionTests(RecordCase):
         self.assertEqual(model_calls.call_list("run-1")["calls"][1]["id"], rows[1]["id"])  # Stable.
 
 
+class RoundTests(unittest.TestCase):
+    def test_each_critic_round_has_the_proof_it_received_and_its_convention_result(self):
+        transcript = [
+            {"kind": "status", "label": "Workflow step: critic", "node": "critic", "visit": 1},
+            {"kind": "request", "stage": "critic", "label": "Critic coordinator", "candidateText": "PROOF 1"},
+            {"kind": "critic_result", "round": 1, "outcome": "reject",
+             "report": {"verdict": "reject", "bugs": "B", "fixes": "", "solution": "PROOF 1"}},
+            {"kind": "status", "label": "Workflow step: critic", "node": "critic", "visit": 2},
+            {"kind": "request", "stage": "critic", "label": "Critic coordinator", "candidateText": "PROOF 2"},
+            {"kind": "critic_result", "round": 2, "outcome": "accept",
+             "report": {"verdict": "pass", "bugs": "", "fixes": "", "solution": "PROOF 2"}},
+            {"kind": "status", "label": "Workflow step: convention", "node": "convention", "visit": 1},
+            {"kind": "request", "stage": "critic", "label": "Convention critic", "candidateText": "PROOF 2"},
+            {"kind": "convention_result", "round": 2, "verdict": "fine"},
+        ]
+        rounds = model_calls._rounds(transcript)
+        self.assertEqual([(entry["round"], entry["submitted"], entry["verdict"], entry["outcome"]) for entry in rounds],
+                         [(1, "PROOF 1", "reject", "reject"), (2, "PROOF 2", "pass", "accept")])
+        self.assertEqual(rounds[1]["convention"]["verdict"], "fine")
+        self.assertIsNone(rounds[0]["convention"])
+
+
 class WebSocketContinuationTests(RecordCase):
     def test_a_continuation_is_expanded_in_the_training_record(self):
         bundle = Bundle(self.trace)

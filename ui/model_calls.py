@@ -659,12 +659,17 @@ def _expanded_request(record, line, cache):
 
 
 def _rounds(transcript):
-    """One line per critic round, from the transcript snapshot."""
+    """One line per critic round, from the transcript snapshot: the proof the critic received in that round (the
+    candidateText of the first request of its "Workflow step: critic" visit), its verdict and changes, and the
+    convention critic's result of the round."""
 
-    submitted, conventions, rounds = {}, {}, []
+    submitted, conventions, rounds, step = {}, {}, [], None
     for entry in transcript:
-        if entry.get("kind") == "request" and entry.get("stage") == "critic" and entry.get("candidateText"):
-            submitted.setdefault(len(submitted) + 1, entry["candidateText"])
+        if entry.get("kind") == "status" and str(entry.get("label", "")).startswith("Workflow step:"):
+            step = (entry.get("node"), entry.get("visit"))
+        if (entry.get("kind") == "request" and entry.get("candidateText") and step is not None
+                and step[0] == "critic"):
+            submitted.setdefault(step[1], entry["candidateText"])
         if entry.get("kind") == "convention_result":
             conventions[entry.get("round")] = {key: entry.get(key) for key in
                                                ("verdict", "intended", "assessment", "loophole", "suggestedStatement")}
