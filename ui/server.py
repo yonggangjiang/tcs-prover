@@ -11289,8 +11289,8 @@ class Server(ThreadingHTTPServer):
                 if lacking:
                     outcome = app.link_batch_related_works(store, None)
                     app.batch_related_works_linked(store_id, outcome["entries"], outcome["diagnostic"])
-                gone = related_works.shared_names(controller_directory(workspace), store_id) - {
-                    entry["name"] for entry in store.listing()}
+                # What the store holds, read strictly: a record that cannot be read now is no removal.
+                gone = related_works.shared_names(controller_directory(workspace), store_id) - store.held()
                 if gone:
                     app.unshare_related_works(store_id, gone)
         except (OSError, ValueError) as exc:

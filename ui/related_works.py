@@ -1646,6 +1646,18 @@ class BatchStore:
     def count(self):
         return count(self.root, self.root)
 
+    def held(self):
+        """The names of the works the store holds now, for decisions (listing() is for display).
+
+        A record that cannot be read raises RelatedWorksError, so a read
+        error is never taken for works removed; a store not made yet holds none.
+        """
+
+        try:
+            return {entry["name"] for entry in _active(_read_manifest(self.root)[1])}
+        except RelatedWorksError:
+            raise RelatedWorksError("The record of the batch's shared related works cannot be read.") from None
+
     def remove(self, name):
         """Remove the work ``name`` from the store; return its entry, marked "removedAt".
 

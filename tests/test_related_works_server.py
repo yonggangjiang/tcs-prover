@@ -702,6 +702,31 @@ class SharedWorksTests(RelatedWorksCase):
         self.assertEqual(sorted(os.listdir(self.folder(running))), ["INDEX.md", "a-2.txt", "b.txt", "c.txt"])
         self.assertEqual(self.steers(running), [related_works.notice_text(["c.txt"])])
 
+    def test_a_batch_store_that_cannot_be_read_as_a_job_is_registered_takes_nothing_from_it(self):
+        self.share("", "a.txt")
+        store = server.batch_shared_store(self.runs, "")
+        real_open, real_settle = related_works._open_path, server.Server._settle_shared_works
+
+        def unreadable(path, *args, **kwargs):
+            if Path(path) == store.root:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real_open(path, *args, **kwargs)
+
+        def settle(manager, app):
+            # The store's record cannot be read for a moment, just as the new job is brought in line with it.
+            with patch.object(related_works, "_open_path", side_effect=unreadable):
+                return real_settle(manager, app)
+
+        with patch.object(server.Server, "_settle_shared_works", autospec=True, side_effect=settle):
+            app = self.manager.start_workflow({"content": "Prove S.", "workflowStages": {**STAGES, "review": True}})
+        # A read error is no removal: the job keeps the work it got when it was created, and its log says why
+        # nothing more was checked.
+        self.assertEqual(sorted(os.listdir(self.folder(app))), ["INDEX.md", "a.txt"])
+        self.assertNotIn("Related works removed", self.labels(app))
+        diagnostic = next(record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic")
+        self.assertEqual(diagnostic, "This job's related works could not be brought in line with what its batch "
+                                     "shares: The record of the batch's shared related works cannot be read.")
+
     def test_a_continuation_that_reopens_its_author_is_told_of_shared_works_its_folder_lacked(self):
         source = self.start()
         source.state.update(goalThreadId="thread-1")
