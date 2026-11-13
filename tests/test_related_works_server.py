@@ -682,6 +682,38 @@ class SharedWorksTests(RelatedWorksCase):
         self.assertEqual([(item["name"], item["sharedFrom"]) for item in retry.snapshot()["relatedWorks"]["items"]],
                          [("own.txt", ""), ("defs.md", "batch")])
 
+    def test_a_problem_that_would_pass_the_item_limit_with_its_batchs_works_is_refused_before_anything_starts(self):
+        self.share("", "a.md", "b.md")
+        token = self.upload("own.md")
+        message = ("A job can hold at most 2 related works: the 1 listed here and the 2 shared with every problem in "
+                   "this batch make 3. Remove some here, or some of the batch's on the batch page.")
+        with patch.object(related_works, "MAX_ITEMS", 2):
+            with self.assertRaises(ValueError) as refused:
+                self.start(relatedWorks=[token])
+            self.assertEqual(str(refused.exception), message)
+            with self.assertRaises(ValueError) as refused:
+                self.manager.start_direct_batch({"statements": [{"name": "a.md", "statement": "Prove A."}],
+                                                 "workflowStages": dict(STAGES), "relatedWorks": [token]})
+            self.assertEqual(str(refused.exception), message)
+            # Without the Author stage nothing would be added, so nothing is refused for it either.
+            self.manager.start_direct_batch({"statements": [{"name": "a.md", "statement": "Prove A."}],
+                                             "workflowStages": {**STAGES, "author": False}})
+        self.assertEqual(len(self.manager.jobs), 1)
+        self.assertFalse(self.expired(token))
+        self.assertEqual(self.launches[-1][2], None)
+
+    def test_a_batch_store_that_cannot_be_read_never_stops_a_new_problem(self):
+        self.share("", "a.md")
+        manifest = server.batch_shared_store(self.runs, "").root / related_works.MANIFEST_NAME
+        manifest.write_text(json.dumps({"schemaVersion": 1, "items": [{"name": "a.md", "kind": "file", "size": 5,
+                                                                       "sha256": "0" * 64}, {"broken": True}]}))
+        app = self.start()
+        self.assertEqual(app.state["phase"], "running")
+        self.assertIsNone(self.launches[-1][2])
+        diagnostics = [record["text"] for record in app.state["trace"] if record.get("kind") == "diagnostic"]
+        self.assertEqual(diagnostics[0], "The related works shared with every problem in this batch were not added to "
+                                         f"this job: {related_works.DAMAGED}")
+
     def test_cards_show_what_a_batch_shares_and_delete_batch_removes_it(self):
         named = self.manager.named_batches.create("Graph coloring")["id"]
         self.share(named, "a.md", "b.md", "c.md", "d.md")

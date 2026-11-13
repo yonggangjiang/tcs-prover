@@ -257,7 +257,8 @@ class SharedWorksDocsTests(unittest.TestCase):
                        "as do web-cutoff problems", "saved under a new name", "**from the batch**",
                        "**from the folder run**", "recorded in the run's audit log", "**Remove** never takes one away",
                        "New terminal runs do not get them", "Deleting a batch deletes what it shares",
-                       "200 works per batch", "`runs/.controller/.batches/<batch ID>/`",
+                       "200 works per batch", "a start that would pass it is refused before any job is created",
+                       "starts without them, and its activity log says why", "`runs/.controller/.batches/<batch ID>/`",
                        "`default` for the default batch"):
             with self.subTest(needed=needed):
                 self.assertIn(needed, section)

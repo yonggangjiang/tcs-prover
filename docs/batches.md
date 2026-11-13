@@ -96,7 +96,9 @@ The Overview's batch card counts them (*2 shared related works*).
   deletes what it shares.
 - The limits of related works apply: 64 MB per file, 2,000,000 characters per
   note, 200 works per batch, and at most 200 related works in each job, its own
-  and shared ones together. They are stored once in
+  and shared ones together (a start that would pass it is refused before any
+  job is created; a job that cannot take the batch's works starts without them,
+  and its activity log says why). They are stored once in
   `runs/.controller/.batches/<batch ID>/` (`default` for the default batch),
   outside every job's folder, and the stored files are read-only.
 

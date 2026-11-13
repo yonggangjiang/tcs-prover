@@ -8328,7 +8328,15 @@ class App:
         for source_store, store_id in ((store, folder_batch), (shared, self.shared_store)):
             if source_store is None or (source_store is shared and not shared.count()):
                 continue
-            outcome = source_store.link_into(workspace, manifest, run_id=self.run_dir.name, record=record)
+            try:
+                outcome = source_store.link_into(workspace, manifest, run_id=self.run_dir.name, record=record)
+            except related_works.RelatedWorksError as exc:
+                if source_store is not shared:
+                    raise
+                # What the batch shares never stops a new job: it starts without them, and its log says why.
+                diagnostics.append(f"The related works shared with every problem in this batch were not added to "
+                                   f"this job: {exc}")
+                continue
             added.append((outcome["entries"], store_id))
             diagnostics.append(outcome["diagnostic"])
         return [(entries, batch) for entries, batch in added if entries], " ".join(filter(None, diagnostics))
@@ -10556,6 +10564,8 @@ class Server(ThreadingHTTPServer):
                 raise ValueError("Related works are read by the proof author; turn on the Author stage or remove "
                                  "them.")
             self._uploads().peek(tokens)
+            if created:
+                self._check_shared_room(app.shared_store, len(tokens), stages["author"])
         effective_body = {**body, "workflowStages": stages}
         if run_id:
             defaults = {key: app.state[key] for key in (
@@ -10704,6 +10714,9 @@ class Server(ThreadingHTTPServer):
             raise ValueError("Related works are read by the proof author; turn on the Author stage or remove them.")
         if tokens:
             self._uploads().peek(tokens)
+            # Each job holds the run's works and its batch's: refused here rather than at every job's creation.
+            self._check_shared_room(shared_store_id(batch if batch in self._named_batch_ids() else ""), len(tokens),
+                                    normalized["workflowStages"]["author"])
         shared = {key: value for key, value in body.items() if key not in {"statements", "relatedWorks"}}
         # ``current`` indexes the statement being handled; None means a step
         # shared by the whole historical batch.
@@ -11116,6 +11129,19 @@ class Server(ThreadingHTTPServer):
                 results.append({"runId": app.state["runId"], "added": added, "notice": notice, "problem": ""})
 
     # --- Related works shared with every problem in a batch --------------------------------------------------------
+
+    def _check_shared_room(self, store_id, own, author):
+        """Refuse, before anything is created, a new job whose ``own`` related works and those its batch shares
+        (store ``store_id``) would pass the limit of a job."""
+
+        if not own or not author or not store_id:
+            return
+        shared = related_works.BatchStore(related_works.batch_directory(Path(self.runs) / CONTROLLER_FOLDER,
+                                                                        store_id)).count()
+        if own + shared > related_works.MAX_ITEMS:
+            raise ValueError(f"A job can hold at most {related_works.MAX_ITEMS} related works: the {own} listed here "
+                             f"and the {shared} shared with every problem in this batch make {own + shared}. Remove "
+                             f"some here, or some of the batch's on the batch page.")
 
     def _shared_batch(self, batch_id):
         """The live batch a shared-works request names ("" is the default batch); a saved or deleted one is refused."""
