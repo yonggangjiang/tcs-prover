@@ -54,7 +54,7 @@ import time
 import uuid
 
 from retrieval import runtime as retrieval_runtime
-from runner import confinement, proof_handoff, providers
+from runner import confinement, proof_handoff, providers, records
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 SEARCH_TOOLS = ("WebSearch", "WebFetch")
@@ -134,10 +134,12 @@ SETTINGS_PREFIX = "run-"
 HARNESS_FILE = "goal-harness.md"
 BATCH_LAUNCHERS = (".cmd", ".bat")
 # Claude has one public summary level: with Concise or Detailed reasoning
-# summaries a subscription model returns Anthropic's summarized thinking
-# (verified with Claude Code 2.1.289: the text arrives in the thinking block;
-# by default the CLI requests "updates", which leave it empty). API gateways
-# may return raw reasoning in the same block, so API models never show it.
+# summaries every Claude model, a subscription's or an API connection's, is
+# asked for Anthropic's summarized thinking (verified with Claude Code 2.1.289:
+# the text arrives in the thinking block; by default the CLI requests
+# "updates", which leave it empty), and the job's record keeps it. API gateways
+# may return raw reasoning in the same block, so the activity log never shows
+# an API model's (EventTranslator's summaries).
 REASONING_SUMMARY_LEVELS = ("concise", "detailed")
 SUMMARY_DISPLAY = ("--thinking-display", "summarized")
 
@@ -1068,7 +1070,9 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
 
     runtime = _runtime_module(runtime)
     api = providers.provider_kind(model) == providers.API
-    summaries = not api and summary in REASONING_SUMMARY_LEVELS
+    # Summarized thinking is asked for on every connection; only a subscription model's reaches the activity log.
+    ask_summaries = summary in REASONING_SUMMARY_LEVELS
+    summaries = ask_summaries and not api
     secret = providers.api_model_secret(model) if api else ""
     if api and not secret:
         raise _failure(runtime, "ConfigurationError")(
@@ -1117,10 +1121,12 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
         arguments = command_arguments(
             located(runtime, model, stage), model, effort, tools, allowed, settings.path, bare=bare, denied=denied,
             extra=[*(["--json-schema", json.dumps(schema, ensure_ascii=False)] if schema is not None else []),
-                   *(SUMMARY_DISPLAY if summaries else [])],
+                   *(SUMMARY_DISPLAY if ask_summaries else [])],
         )
         # The session flag precedes every free-text option.
         command = batch_safe([arguments[0], *session_flags, *arguments[1:]], runtime)
+        stream = _record_stream(model=model, stage=stage, activityLabel=activity_label or "",
+                                **({"role": "reviewer"} if stage == "review" else {}))
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1128,6 +1134,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
                 env=child,
             )
         except OSError as exc:
+            if stream is not None:
+                stream.finish()
             exc.cli_problem = "Claude"  # The CLI could not be started at all.
             raise
         if started is not None:
@@ -1174,6 +1182,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
             monitor.start()
             monitor.send_input(prompt)
             for line in monitor.lines():
+                if stream is not None:
+                    stream.line(record_scrub(line.rstrip("\n")))
                 message = json_line(line)
                 if message is None:
                     continue
@@ -1234,6 +1244,8 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
             code = process.wait()
         finally:
             monitor.close()
+            if stream is not None:
+                stream.finish()
     finally:
         settings.close()
     if conversation is not None:
@@ -1292,6 +1304,30 @@ def config_directory(environment):
     return Path(environment.get("HOME") or Path.home()) / ".claude"
 
 
+def _record_stream(**labels):
+    """The records.ClaudeStream of a Claude Code process about to start for a job with a record, or None.
+
+    Recording never stops a model call: a stream that cannot be made is noted in the record's problems."""
+
+    recorder = records.recorder()
+    if recorder is None:
+        return None
+    try:
+        return recorder.claude_stream(**labels)
+    except Exception as exc:  # noqa: BLE001
+        records.note_problem(recorder.record, f"A Claude Code process could not be recorded ({exc}).")
+        return None
+
+
+def _copy_session(config_dir, session):
+    """Copy an author's or coordinator's saved session (what is new or changed, its subagents' and tool results'
+    files included) into the job's record; Claude Code keeps the session itself."""
+
+    recorder = records.recorder()
+    if recorder is not None and _session_id(session):
+        recorder.copy_claude_session(config_dir, session)
+
+
 def session_deleter(config_dir):
     """Remove one saved conversation (its transcript and its subagent folder) from ``config_dir``/projects.
 
@@ -1304,6 +1340,9 @@ def session_deleter(config_dir):
     def delete(session_id):
         if not _session_id(session_id):
             return False
+        recorder = records.recorder()
+        if recorder is not None and not recorder.keep_claude_session(config_dir, session_id):
+            return False  # Kept: the record could not copy it (its problems say why).
         try:
             folders = set()
             for entry in list(projects.glob(f"*/{session_id}.jsonl")):
@@ -1488,13 +1527,18 @@ def stop_processes(pids, grace):
 
 
 class SessionProcess:
-    """One long-lived stream-json CLI process: a locked writer, a reader queue and a stderr tail."""
+    """One long-lived stream-json CLI process: a locked writer, a reader queue and a stderr tail.
 
-    def __init__(self, command, cwd, environment, scrub):
+    With ``stream`` (a function that gives the records.ClaudeStream of a job with a record, or None) every line the
+    CLI writes is recorded, after ``record_scrub``, until close()."""
+
+    def __init__(self, command, cwd, environment, scrub, stream=None, record_scrub=None):
         self.process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=cwd, env=environment,
         )
+        self.stream = stream() if stream is not None else None
+        self._record_scrub = record_scrub or (lambda text: text)
         self.lock = threading.Lock()
         self.messages = queue.Queue()
         self.stderr_tail = deque(maxlen=12)
@@ -1507,6 +1551,8 @@ class SessionProcess:
     def _read_output(self):
         try:
             for line in self.process.stdout:
+                if self.stream is not None:
+                    self.stream.line(self._record_scrub(line.rstrip("\n")))
                 message = json_line(line)
                 if message is not None:
                     self.messages.put(message)
@@ -1577,6 +1623,8 @@ class SessionProcess:
         for reader in self._readers:
             reader.join(timeout=1)
         _close_stream(self.process.stdin)
+        if self.stream is not None:
+            self.stream.finish()
 
 
 def _close_stream(stream):
@@ -1742,7 +1790,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     inactivity = getattr(runtime, "AUTHOR_INACTIVITY_SECONDS", 30 * 60)
     probe_limit = getattr(runtime, "AUTHOR_PROBE_SECONDS", 60)
     api = providers.provider_kind(model) == providers.API
-    summaries = not api and summary in REASONING_SUMMARY_LEVELS
+    # Summarized thinking is asked for on every connection; only a subscription model's reaches the activity log.
+    ask_summaries = summary in REASONING_SUMMARY_LEVELS
+    summaries = ask_summaries and not api
     secret = ""
     session = thread = transport = private = None
     # Orders the watcher's live input against the main loop's end of a turn.
@@ -2105,7 +2155,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         flags = (["--resume", identity, *(["--resume-session-at", resume_at] if resume_at else [])] if resume
                  else ["--session-id", identity])
         transport = SessionProcess(batch_safe([base_command[0], *flags, *base_command[1:]], runtime),
-                                   directory, environment, scrub)
+                                   directory, environment, scrub,
+                                   stream=lambda: _record_stream(role="coordinator" if coordinator else "author",
+                                                                 node=node_name, model=model, stage=stage,
+                                                                 label="Coordinator" if coordinator else "Author"),
+                                   record_scrub=scrub_event)
 
     def start_turn(instruction):
         # A retry re-sends this instruction unless Claude consumed it.
@@ -2326,7 +2380,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             located(runtime, model, "solve"), model, settings["effort"], tools, allowed, private.path, bare=bare,
             denied=denied, mcp_config=mcp_config,
             extra=["--input-format", "stream-json", "--replay-user-messages",
-                   *(SUMMARY_DISPLAY if summaries else []),
+                   *(SUMMARY_DISPLAY if ask_summaries else []),
                    "--json-schema", json.dumps(GOAL_TURN_SCHEMA),
                    "--append-system-prompt-file", str(harness)],
         )
@@ -2693,6 +2747,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             subagents.stopped(ending["reason"])
         if thread and environment is not None:
             save_transcript(config_directory(environment), thread, copies)
+            if retry is None:
+                # Pause, Stop, the time limit or the end of the work: the record copies what the session added.
+                _copy_session(config_directory(environment), thread)
         if private is not None:
             private.close()
     if pausing.is_set():
@@ -2749,7 +2806,9 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
     inactivity = getattr(runtime, "AUTHOR_INACTIVITY_SECONDS", 30 * 60)
     probe_limit = getattr(runtime, "AUTHOR_PROBE_SECONDS", 60)
     api = providers.provider_kind(model) == providers.API
-    summaries = not api and summary in REASONING_SUMMARY_LEVELS
+    # Summarized thinking is asked for on every connection; only a subscription model's reaches the activity log.
+    ask_summaries = summary in REASONING_SUMMARY_LEVELS
+    summaries = ask_summaries and not api
     final = tuple(error for error in (getattr(runtime, "FinalError", None), retrieval_runtime.RetrievalPolicyError,
                                       getattr(runtime, "ConversationAttemptFailed", None)) if error is not None)
     secret = ""
@@ -2786,8 +2845,15 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         if transport is not None:
             transport.close(runtime, grace, interrupt=True)
         flags = ["--resume", session, *(["--resume-session-at", rewind] if _session_id(rewind) else [])]
+        summary_turn = label == getattr(runtime, "CONVERSATION_LABELS", {}).get("summary", ("",))[0]
         transport = SessionProcess(batch_safe([base_command[0], *flags, *base_command[1:]], runtime),
-                                   directory, environment, scrub)
+                                   directory, environment, scrub,
+                                   stream=lambda: _record_stream(role="summary" if summary_turn else "reply",
+                                                                 node="author", model=model, stage="conversation",
+                                                                 label="Progress summary" if summary_turn
+                                                                 else "Reply to the user",
+                                                                 conversationId=conversation_id),
+                                   record_scrub=scrub_event)
         state.update(initialized=False, running=True, message=str(uuid.uuid4()), delivered=False, output=False,
                      answer="", compacted=False)
         activity.update(last=time.monotonic(), probe=None, at=None)
@@ -2851,7 +2917,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             located(runtime, model, "conversation"), model, settings["effort"], tools, allowed, private.path,
             bare=bare, denied=denied,
             extra=["--input-format", "stream-json", "--replay-user-messages",
-                   *(SUMMARY_DISPLAY if summaries else []), "--append-system-prompt-file", str(harness)],
+                   *(SUMMARY_DISPLAY if ask_summaries else []), "--append-system-prompt-file", str(harness)],
         )
         launch()
         if _session_id(rewind):
@@ -2989,5 +3055,6 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             transport.close(runtime, grace, interrupt=state["running"])
         if state["opened"] and environment is not None:
             save_transcript(config_directory(environment), session, copies)
+            _copy_session(config_directory(environment), session)
         if private is not None:
             private.close()

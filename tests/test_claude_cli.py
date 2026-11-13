@@ -810,16 +810,22 @@ class StructuredTests(FakeClaudeCase):
                 self.assertPrivateFilesRemoved()
 
     def test_reasoning_summaries_follow_the_job_setting_and_api_thinking_is_never_shown(self):
+        # Concise or Detailed asks every Claude model for summarized thinking, an API connection's too (plan v3: the
+        # record keeps it); "none" asks for none. The activity log never shows an API model's thinking text.
         thinking = {"emit": {"type": "assistant", "parent_tool_use_id": None, "uuid": "a1", "message": {"content": [
             {"type": "thinking", "thinking": "Raw gateway reasoning."}]}}}
         api = self.api_model()
-        for model, summary in (("claude-opus-5-5", "none"), (api, "concise"), (api, "detailed")):
+        for model, summary, asked in (("claude-opus-5-5", "none", False), (api, "none", False),
+                                      (api, "concise", True), (api, "detailed", True)):
             with self.subTest(model=model, summary=summary):
                 self.log.unlink(missing_ok=True)
                 self.events.clear()
                 self.script([["init", thinking, {"structured": {"statement": "S", "notes": ""}}]])
                 runtime.structured("Review.", SCHEMA, "review", model=model, summary=summary)
-                self.assertNotIn("--thinking-display", self.records("start")[0]["argv"])
+                argv = self.records("start")[0]["argv"]
+                self.assertEqual("--thinking-display" in argv, asked)
+                if asked:
+                    self.assertEqual(argv[argv.index("--thinking-display") + 1], "summarized")
                 reasoning = [event["event"]["item"] for event in self.events if event["kind"] == "codex_event"
                              and event["event"].get("item", {}).get("type") == "reasoning"]
                 self.assertEqual([item["text"] for item in reasoning], [""])
