@@ -516,9 +516,10 @@ that every prompt and tool text is the user's to adjust. What the code does:
   `team_stop(member)`. Each assignment is a one-shot run (`member_attempt()`):
   `codex exec --json` (persisted session, `exec fork` for a follow-up or retry,
   `--disable multi_agent`, `--disable goals` and `-c agents.enabled=false` (Codex
-  0.160's `codex exec` otherwise offers its own goal tools, whose goal it would
-  continue past the reply, and to GPT 6.1 Sol its collaboration tools without a
-  session limit), `--ignore-user-config`, `-a never`, the author's
+  0.160's `codex exec` otherwise offers its own goal tools, which start Codex's
+  goal mode in the member's session, a follow-up's `exec fork` inheriting that
+  goal, and to GPT 6.1 Sol its collaboration tools without a session limit),
+  `--ignore-user-config`, `-a never`, the author's
   confined profile on macOS or `-s workspace-write` with the run's network rule
   elsewhere, the agent variables removed) or `claude -p` (`run_structured` with
   `role="author"`: the author's tools without Agent, its deny rules and Bash

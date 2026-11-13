@@ -3759,9 +3759,10 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             *(["-c", f"compact_prompt={toml_string(compact_prompt)}"] if compact_prompt.strip() else []),
             *retrieval_runtime.native_search_arguments(directory), "-c", "features.view_image=false",
             # One turn, no subagents: Codex 0.160's `codex exec` otherwise offers its own goal tools (create_goal,
-            # update_goal), whose goal Codex would continue past the member's reply, and, to models of multi-agent
-            # version 2 such as GPT 6.1 Sol, its collaboration tools without any session limit, even with
-            # --disable multi_agent (captured with the real Codex against a scripted model server).
+            # update_goal), which start Codex's goal mode in the member's session (a follow-up's `exec fork`
+            # inherits that goal), and, to models of multi-agent version 2 such as GPT 6.1 Sol, its collaboration
+            # tools without any session limit, even with --disable multi_agent (both offered in requests captured
+            # with the real Codex against a scripted model server).
             "--disable", "multi_agent", "--disable", "goals", "-c", "agents.enabled=false",
             "-C", str(directory), *sandbox, "-a", "never", "exec", *(["fork"] if fork else []),
             "--json", "--skip-git-repo-check", "--ignore-user-config", "-o", str(answer), *([fork] if fork else []),
