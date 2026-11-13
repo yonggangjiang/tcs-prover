@@ -6,6 +6,7 @@ CODEX_ROLLOUT_TRACE_ROOT, a session file under CODEX_HOME/sessions) and deletes 
 goal sessions run against the scripted app-server double of tests/test_goal_runtime.py.
 """
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from tests import isolated_state  # noqa: F401 - first: keeps private state out 
 import workflow_runner as runtime
 from runner import providers, records
 
+import test_author_conversation as conversation_test
 import test_goal_runtime as goal_test
 
 THREAD = "01a1d4e2-53df-78e1-b1a3-60906592b723"
@@ -191,6 +193,101 @@ class StructuredCallTests(RecordedJob):
         self.assertIsNone(self.lines("env.jsonl")[0]["CODEX_ROLLOUT_TRACE_ROOT"])
         self.assertEqual(self.lines("deleted.jsonl"), [THREAD])
         self.assertFalse(self.record_folder.exists())
+
+
+@unittest.skipIf(os.name == "nt", "The stand-in CLI is a POSIX script")
+class MemberTests(RecordedJob):
+    def setUp(self):
+        super().setUp()
+        self.stand_in()
+        self.directory = self.root / "run"
+        self.directory.mkdir()
+
+    def test_a_team_member_s_call_is_traced_and_its_session_copied_before_the_team_deletes_it(self):
+        sessions = runtime.MemberSessions()
+        conversation = runtime.MemberConversation("codex", None, sessions)
+        with records.labelled(role="member", member="member-1-1", label="Member 1"):
+            runtime._codex_member_attempt("Work on part 1.", "gpt-6.1-sol", "high", "concise",
+                                          directory=self.directory, conversation=conversation,
+                                          record=lambda event, root: None, started=lambda process: None,
+                                          speed="standard", compact_prompt="")
+        root = Path(self.lines("env.jsonl")[0]["CODEX_ROLLOUT_TRACE_ROOT"])
+        self.assertEqual(root.parent, self.record_folder / "codex-trace")
+        [call] = records.Record(self.record_folder).calls.read()
+        labels = json.loads((self.record_folder / "codex" / call["process"] / "process.json").read_text())
+        self.assertEqual((labels["role"], labels["member"]), ("member", "member-1-1"))
+        sessions.discard()  # Team.close()
+        self.assertEqual(self.lines("deleted.jsonl"), [THREAD])
+        self.assertEqual(len(list((self.record_folder / "sources" / "codex" / THREAD).rglob("*.jsonl.gz"))), 1)
+
+
+class WebCutoffTests(RecordedJob):
+    def launch(self, policy):
+        seen = []
+
+        def popen(command, **kwargs):
+            seen.append(kwargs["env"])
+            raise OSError("not started")
+
+        workspace = self.root / "snapshot"
+        workspace.mkdir(exist_ok=True)
+        with mock.patch.object(runtime.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(runtime, "codex", return_value="codex"), \
+                mock.patch.object(runtime.retrieval_runtime, "codex_executable", return_value="codex"), \
+                mock.patch.object(runtime.retrieval_runtime, "temp_arguments", return_value=[]), \
+                mock.patch.object(runtime.retrieval_runtime, "remove_private_temp"), \
+                mock.patch.object(runtime.retrieval_runtime, "native_search_arguments", return_value=[]), \
+                self.assertRaises(OSError):
+            runtime._run_structured_process(
+                "Prompt", {"type": "object"}, "critic", "gpt-6.1-sol", "max", "standard", "concise", timeout=60,
+                activity_label=None, features=(), policy=policy, child_environment={"PATH": "/usr/bin"},
+                workspace=workspace)
+        return seen[-1]
+
+    def test_a_web_cutoff_structured_call_is_never_traced_while_a_live_one_is(self):
+        self.assertNotIn(records.TRACE_ROOT_ENV, self.launch({"_path": "retrieval-policy.json"}))
+        self.assertFalse((self.record_folder / "codex-trace").exists())
+        self.assertIn(records.TRACE_ROOT_ENV, self.launch(None))
+
+    def test_every_codex_launch_passes_its_own_web_cutoff_policy(self):
+        # Only a team member's call passes None: web-cutoff runs have no team (the server refuses Subagent models).
+        source = Path(runtime.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        calls = {}
+        for function in ast.walk(tree):
+            if isinstance(function, ast.FunctionDef):
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_record_codex":
+                        calls.setdefault(function.name, []).append(ast.unparse(node.args[1]))
+        self.assertEqual(calls, {"_run_structured_process": ["policy"], "_codex_member_attempt": ["None"],
+                                 "goal_session": ["policy"], "author_conversation": ["policy"]})
+
+
+class ReplyTurnTests(RecordedJob):
+    def setUp(self):
+        super().setUp()
+        popen = mock.patch.object(runtime.subprocess, "Popen", return_value=SimpleNamespace())
+        self.spawn = popen.start()
+        self.addCleanup(popen.stop)
+        self.copies = []
+        copy = mock.patch.object(records.Recorder, "copy_codex_thread",
+                                 lambda recorder, home, thread: self.copies.append(thread))
+        copy.start()
+        self.addCleanup(copy.stop)
+        self.directory = self.root / "run"
+        self.directory.mkdir()
+
+    def test_a_reply_turn_is_traced_and_the_thread_copied_after_it(self):
+        double = conversation_test.Codex([conversation_test.reply()])
+        result = runtime.author_conversation(
+            double, "Summarize your progress.", settings=goal_test.SETTINGS,
+            options={"goal_cwd": str(self.directory), "goal_thread_id": "thread-1"}, features=["multi_agent"],
+            conversation_id="c_0123456789", label=runtime.CONVERSATION_LABELS["summary"][0])
+        self.assertEqual(result["threadId"], "thread-1")
+        root = Path(self.spawn.call_args.kwargs["env"][records.TRACE_ROOT_ENV])
+        labels = json.loads((self.record_folder / "codex" / root.name / "process.json").read_text())
+        self.assertEqual((labels["role"], labels["conversationId"]), ("summary", "c_0123456789"))
+        self.assertEqual(self.copies, ["thread-1"])
 
 
 class MemberSessionTests(unittest.TestCase):
