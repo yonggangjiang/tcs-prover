@@ -45,7 +45,11 @@ GOAL_STATUSES = ("complete", "blocked", "paused")
 GOAL_STATUS_LABEL = "Goal status"
 # The longest team_wait, and its default (team-models-spec): 30 minutes, as Codex's coordinator hint asks.
 WAIT_MINUTES = 30
-# The longest report team_wait returns; a longer one is cut there, with a note naming its saved file.
+# The most report text one team_wait answer carries: a report alone up to this many characters, reports that come
+# back together share it (report_shares()); a longer one is cut, with a note naming its saved file. Codex 0.160 cuts
+# a tool's answer longer than its models' output budget (10,000 tokens, counted as about 4 bytes each) out of the
+# middle, which dropped whole report headers and file paths when several long reports came back at once (captured
+# with the real Codex against a scripted model server).
 REPORT_CHARS = 20_000
 # The CLIs' time limit for one call of this server's tools (Codex: tool_timeout_sec; Claude Code: the server's
 # timeout in ms): longer than the longest team_wait, so a wait always returns before the CLI gives up on it.
@@ -158,6 +162,20 @@ def _text_result(text, error=False):
     return {"content": [{"type": "text", "text": str(text)}], "isError": bool(error)}
 
 
+def report_shares(lengths, budget=REPORT_CHARS):
+    """How many characters of each report (``lengths``) one team_wait answer shows: all of them within ``budget``.
+
+    Every report gets an equal share; the room a shorter report leaves goes to the longer ones.
+    """
+
+    shares, left = [0] * len(lengths), budget
+    order = sorted(range(len(lengths)), key=lambda index: lengths[index])
+    for position, index in enumerate(order):
+        shares[index] = min(lengths[index], left // (len(order) - position))
+        left -= shares[index]
+    return shares
+
+
 class Service:
     """The runner's end of TCS Prover's MCP server: a local listener that runs the tools the bridge forwards.
 
@@ -251,11 +269,20 @@ class Service:
                 pass
 
     def codex_server(self):
-        """The mcp_servers entry of a Codex thread's settings for this server (approval "never" runs its tools)."""
+        """The mcp_servers entry of a Codex thread's settings for this server (approval "never" runs its tools).
+
+        Its tools are never deferred (omit_tools_from "deferred"). Codex 0.160 defers every MCP tool of a model
+        that supports tool search (GPT 6.1 Sol and GPT 5.5 among them): the model then sees neither the tools nor
+        their descriptions up front, only a code-mode model's hint to search ALL_TOOLS, or a direct model's
+        tool_search tool (captured with the real Codex against a scripted model server). Not deferred, a code-mode
+        model reads each tool as tools.mcp__tcs__<name> in its exec tool's description, as it reads Codex's own
+        update_goal there, and a direct model gets the namespace mcp__tcs with every tool.
+        """
 
         names = self.names()
         return {"command": sys.executable, "args": ["-I", str(BRIDGE)], "env": self.environment(),
                 "required": True, "tool_timeout_sec": TOOL_TIMEOUT_SECONDS, "enabled_tools": names,
+                "omit_tools_from": ["deferred"],
                 "tools": {name: {"approval_mode": "approve"} for name in names}}
 
     def claude_config(self):
@@ -487,7 +514,8 @@ class Team:
                 if self.done:
                     reports = list(self.done)
                     self.done.clear()
-                    return "\n\n".join(reports)
+                    shares = report_shares([len(report["text"]) for report in reports])
+                    return "\n\n".join(_report_text(report, share) for report, share in zip(reports, shares))
                 if self.closed is not None:
                     return f"The team has stopped: {self.closed}"
                 if self.attention_reason is not None:
@@ -602,15 +630,13 @@ class Team:
         with self.cond:
             member.state, member.process, member.thread = "idle", None, None
             closing = self.closed is not None
-            shown = text if len(text) <= REPORT_CHARS else (
-                text[:REPORT_CHARS] + f"\n[The report is cut here at {REPORT_CHARS:,} characters; the whole report is "
-                                      f"in {relative}.]")
             head = (f"Member {member.number} ({member.label}) "
                     + ("stopped" if stopped else "failed" if state == "failed" else "finished")
                     + f" the assignment \"{member.task}\".")
             where = f"Report file: {relative}" if path else f"The report could not be saved ({problem})."
             if not closing:
-                self.done.append(f"{head}\n{where}\nREPORT:\n{shown}")
+                # Shown by the next team_wait, cut to its share of the answer (report_shares()).
+                self.done.append({"head": head, "where": where, "text": text, "file": relative if path else None})
             self._record(member, state, (failure if state == "failed" else member.task)[:2000] or member.task,
                          **({"subagentReport": relative} if path else {}))
             self.cond.notify_all()
@@ -622,6 +648,16 @@ class Team:
             return save_report(self.directory, number, count, text), ""
         except (OSError, ValueError) as exc:
             return None, str(exc)
+
+
+def _report_text(report, share):
+    """One report of a team_wait answer: what it is, where it is saved, and its text cut at ``share`` characters."""
+
+    text = report["text"]
+    if len(text) > share:
+        where = f"the whole report is in {report['file']}" if report["file"] else "it could not be saved"
+        text = text[:share] + f"\n[The report is cut here at {share:,} characters; {where}.]"
+    return f"{report['head']}\n{report['where']}\nREPORT:\n{text}"
 
 
 def save_report(directory, number, count, text):

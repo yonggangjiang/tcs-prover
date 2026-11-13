@@ -3758,7 +3758,11 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             "-c", "memories.generate_memories=false", "-c", f'model_reasoning_summary="{summary}"',
             *(["-c", f"compact_prompt={toml_string(compact_prompt)}"] if compact_prompt.strip() else []),
             *retrieval_runtime.native_search_arguments(directory), "-c", "features.view_image=false",
-            "--disable", "multi_agent",
+            # One turn, no subagents: Codex 0.160's `codex exec` otherwise offers its own goal tools (create_goal,
+            # update_goal), whose goal Codex would continue past the member's reply, and, to models of multi-agent
+            # version 2 such as GPT 6.1 Sol, its collaboration tools without any session limit, even with
+            # --disable multi_agent (captured with the real Codex against a scripted model server).
+            "--disable", "multi_agent", "--disable", "goals", "-c", "agents.enabled=false",
             "-C", str(directory), *sandbox, "-a", "never", "exec", *(["fork"] if fork else []),
             "--json", "--skip-git-repo-check", "--ignore-user-config", "-o", str(answer), *([fork] if fork else []),
             "-",
@@ -4525,7 +4529,8 @@ def _initialize_author_rpc(runtime, rpc, *, policy, role, child_environment, api
 
 
 def _author_thread_options(runtime, rpc, *, directory, policy, role, model, settings, summary, features, classic,
-                           emit, read_only=False, environment=None, goals=True, servers=None, compact_prompt=""):
+                           emit, read_only=False, environment=None, goals=True, servers=None, compact_prompt="",
+                           builtin_agents=True):
     """The options with which an author starts or resumes its thread.
 
     ``environment`` is the environment of the author's app-server
@@ -4552,6 +4557,12 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     ``servers`` ({name: mcp_servers entry}) are MCP servers of TCS Prover
     itself (team.Service.codex_server()), kept on while the user's are off;
     a nonempty ``compact_prompt`` is Codex's compact_prompt setting.
+    ``builtin_agents`` False (a coordinator with TCS Prover's team) turns
+    Codex's agents off (agents.enabled): without the multi_agent feature,
+    Codex 0.160 still gives a model of multi-agent version 2 its
+    collaboration tools (spawn_agent, wait_agent, ...) and tells it that it
+    is the root of a team that can spawn sub-agents (captured with the real
+    Codex against a scripted model server); with agents off it gets neither.
     """
 
     limits = author_limits(features, settings)
@@ -4601,6 +4612,9 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
         thread_options["config"]["mcp_servers"] = {**thread_options["config"].get("mcp_servers", {}), **servers}
     if compact_prompt and compact_prompt.strip():
         thread_options["config"]["compact_prompt"] = compact_prompt
+    if not builtin_agents:
+        # TCS Prover's team in place of Codex's subagents: none of Codex's collaboration tools.
+        thread_options["config"]["agents"] = {"enabled": False}
     thread_options["config"]["features"].update(apps=False, plugins=False, view_image=False)
     # The confined profile where Codex supports one, selected exactly as the historical profile is; none of
     # the user's [sandbox_workspace_write] settings carries over: network follows the run's search mode.
@@ -4736,7 +4750,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     A coordinator with ``team`` (team.Team: TCS Prover's team in place of
     Codex's subagent tool, see _execute) gets its team tools from the same
-    server; a live instruction or time check sent to it ends a running
+    server, and Codex's agents are off in its thread (none of Codex's
+    collaboration tools, see _author_thread_options()); a live instruction
+    or time check sent to it ends a running
     team_wait early (Team.attention()), and an end that is not retried
     (pause, stop, time limit, the end of the work) stops the team's members.
     """
@@ -5135,7 +5151,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             runtime, rpc, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
             summary=summary, features=features, classic=classic, emit=emit, environment=child_environment,
             goals=not tcs, servers={team_module.SERVER_NAME: service.codex_server()} if service is not None else None,
-            compact_prompt=texts.get("codex_compact_prompt", ""))
+            compact_prompt=texts.get("codex_compact_prompt", ""), builtin_agents=team is None)
         if sandbox is not None and hasattr(runtime, "author_confinement_check"):
             runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
         if classic:

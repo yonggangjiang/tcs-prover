@@ -474,28 +474,51 @@ that every prompt and tool text is the user's to adjust. What the code does:
   library only, started by the runner's own interpreter with `-I`) that the author's CLI starts from its
   settings: Codex's thread settings `mcp_servers.tcs` (kept on while the user's
   servers are off, `required`, `tool_timeout_sec` 2,400, every tool
-  `approval_mode: approve`), Claude Code's `--mcp-config` file in the private
+  `approval_mode: approve`, `omit_tools_from: ["deferred"]`), Claude Code's `--mcp-config` file in the private
   settings folder (`timeout` 2,400,000 ms, the tools pre-approved in
   `--allowedTools`, `--strict-mcp-config` kept). Its environment holds the
   address of the runner's `team.Service` (127.0.0.1, a random port) and a random
   token; every request carries the token, and the service answers nothing else.
   The service runs the tools of the providers added to it: `GoalTool` and `Team`.
+  The bridge gives no server instructions: Codex shows them to the model with
+  the server's tools and Claude Code puts them in its system prompt, and every
+  text the model reads from TCS Prover is an editable text. Without
+  `omit_tools_from` Codex 0.160 defers every MCP tool of a model with tool
+  search (GPT 6.1 Sol, GPT 5.5): a code-mode model then reads only that some
+  tools are omitted and must search `ALL_TOOLS` for them, a direct model sees
+  them only through `tool_search`, and neither reads their descriptions. Not
+  deferred, a code-mode model (GPT 6.1 Sol) finds each tool in its `exec` tool's
+  description and calls it from its script as `tools.mcp__tcs__<name>`, as it
+  calls Codex's own `update_goal`, and a direct model (GPT 5.5) gets the
+  namespace `mcp__tcs` with each tool; the app-server reports every call as an
+  `mcpToolCall` item (`server` "tcs", `tool` the bare name).
 - **The team** (`--author-team tcs`, the coordinator of every new live job).
   `_execute` builds `team.team_members()` from `--author-subagent-models` (one
   `{model, effort}` per author subagent; none: the coordinator's model and
   effort), appends `team_note` to the coordinator's first prompt after the
-  related works, and removes the CLI's subagent tool (no `multi_agent`; a model
+  related works, and removes the CLI's subagent tool (no `multi_agent`, and in
+  the coordinator's Codex thread `agents.enabled = false`: without it Codex
+  0.160 still gives a model of multi-agent version 2 its collaboration tools
+  and tells it that it is the root of a team that can spawn sub-agents; a model
   with no Codex subagent tool, such as GPT 5.6 Luna, still coordinates). Tools:
   `team_members`, `team_assign(member, assignment)`, `team_wait(timeout_minutes)`
   (1 to 30, default 30; returns at once when no member works and no report
   waits, else when an assignment finishes or fails, with every report since the
-  last wait, each cut at 20,000 characters with a note naming its file; it ends
+  last wait; one answer carries at most `REPORT_CHARS` (20,000) characters of
+  report text, which reports that come back together share
+  (`team.report_shares()`: equal shares, the room a shorter one leaves going to
+  the longer ones), each cut one with a note naming its file, because Codex
+  0.160 cuts a tool's answer beyond its models' 10,000-token output budget out
+  of the middle; it ends
   early when TCS Prover sends a live instruction or a time check, or one came in
   the 10 s before it began), `team_followup(member, message)` (continues the
   member's last conversation; refused while it works or without one) and
   `team_stop(member)`. Each assignment is a one-shot run (`member_attempt()`):
   `codex exec --json` (persisted session, `exec fork` for a follow-up or retry,
-  `--disable multi_agent`, `--ignore-user-config`, `-a never`, the author's
+  `--disable multi_agent`, `--disable goals` and `-c agents.enabled=false` (Codex
+  0.160's `codex exec` otherwise offers its own goal tools, whose goal it would
+  continue past the reply, and to GPT 6.1 Sol its collaboration tools without a
+  session limit), `--ignore-user-config`, `-a never`, the author's
   confined profile on macOS or `-s workspace-write` with the run's network rule
   elsewhere, the agent variables removed) or `claude -p` (`run_structured` with
   `role="author"`: the author's tools without Agent, its deny rules and Bash
@@ -513,6 +536,19 @@ that every prompt and tool text is the user's to adjust. What the code does:
   reports. Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
   `codex_event` records (`root: false`).
+- **Checked with the real Codex 0.160** (the installed binary against a scripted
+  model server, no model): it starts the bridge from the settings of
+  `thread/start` and of `thread/resume` (a resumed thread gets the new address
+  and token; Codex keeps no MCP settings with a thread, so a reply turn, which
+  passes none, reopens it without TCS Prover's tools); `--disable goals` leaves
+  no goal tool of Codex; while a tool call is pending it accepts `turn/steer`
+  and answers `config/read` (a live instruction or time check ends a running
+  `team_wait` and reaches the model as its next user message), and
+  `turn/interrupt` ends the turn, the members stopping with it; `codex exec fork`
+  continues a member's conversation; `compact_prompt` (thread setting or `-c`)
+  is the prompt of a compaction. A code-mode model's `exec` call yields after
+  30 s while `team_wait` runs (Codex's default), and the model then waits on the
+  cell with Codex's `wait` tool (10 s per call unless it asks for longer).
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
   restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
   codex --author-team builtin` and no texts, also after a revision in place, and a

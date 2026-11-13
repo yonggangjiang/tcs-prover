@@ -17,7 +17,10 @@ ADDRESS_ENV = "TCS_MCP_ADDRESS"
 TOKEN_ENV = "TCS_MCP_TOKEN"
 VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MESSAGE_LIMIT = 16 * 1024 * 1024
-INSTRUCTIONS = "TCS Prover's tools for this run: the goal tool and, for a coordinator, its team."
+# The initialize answer gives no server instructions: Codex 0.160 shows them to the model as the description of
+# this server's tools (in the exec tool's description, beside each tool in ALL_TOOLS, as the namespace's
+# description), and Claude Code adds them to its system prompt, while every text the model reads from TCS Prover
+# is one of the workflow's editable texts.
 
 _output_lock = threading.Lock()
 
@@ -72,7 +75,7 @@ def handle(message):
         write({"jsonrpc": "2.0", "id": request_id, "result": {
             "protocolVersion": requested if requested in VERSIONS else VERSIONS[-1],
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "tcs", "version": "1.0.0"}, "instructions": INSTRUCTIONS}})
+            "serverInfo": {"name": "tcs", "version": "1.0.0"}}})
     elif method == "ping":
         write({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "tools/list":

@@ -134,6 +134,24 @@ class MCPClient:
         self.process.stdout.close()
 
 
+# What the real Codex 0.160 wrote to TCS Prover's bridge, line for line (captured from a coordinator's app-server
+# against a scripted model server; only the tools/call name and the ids of its turn are the test's): its MCP client
+# numbers requests from 0 and sends _meta with each.
+CODEX_MCP_LINES = [
+    '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":'
+    '{"experimental":{"codex/auth-change":{}},"elicitation":{"form":{},"url":{}}},"clientInfo":'
+    '{"name":"codex-mcp-client","title":"Codex","version":"0.160.0"}}}',
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+    '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"progressToken":0}}}',
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"callId":"act-members-1",'
+    '"x-codex-turn-metadata":{"session_id":"t-1","thread_id":"t-1","reasoning_effort":"high","turn_id":"turn-1",'
+    '"model":"gpt-5.5","sandbox":"seatbelt","sandbox_mode":"workspace-write","auto_review_enabled":false,'
+    '"node_repl_auto_review_required":false,"node_repl_disabled":false,"turn_started_at_unix_ms":1794570369984,'
+    '"codex_version":"0.160.0"},"threadId":"t-1","sessionId":"t-1","windowId":"t-1:0","itemId":"fc_1",'
+    '"progressToken":1},"name":"echo","arguments":{"x":1}}}',
+]
+
+
 class Echo:
     """A provider of one tool for the service tests."""
 
@@ -185,6 +203,35 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((claude["command"], claude["args"], claude["env"], claude["timeout"]),
                          (sys.executable, ["-I", str(team.BRIDGE)], self.service.environment(),
                           team.TOOL_TIMEOUT_SECONDS * 1000))
+
+    def test_codex_reads_every_tool_up_front_and_no_text_of_the_bridge_itself(self):
+        entry = self.service.codex_server()
+        # Codex 0.160 defers the MCP tools of a model with tool search (GPT 6.1 Sol, GPT 5.5): unlisted in the exec
+        # tool's description or behind tool_search, their descriptions unseen. Never deferred, they are listed.
+        self.assertEqual(entry["omit_tools_from"], ["deferred"])
+        environment = {**{key: value for key, value in os.environ.items() if key in ("PATH", "HOME", "SYSTEMROOT")},
+                       **entry["env"]}
+        bridge = POPEN([entry["command"], *entry["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                       env=environment)
+        try:
+            answers = {}
+            for line in CODEX_MCP_LINES:
+                bridge.stdin.write(line + "\n")
+                bridge.stdin.flush()
+                if '"id"' in line:
+                    answer = json.loads(bridge.stdout.readline())
+                    answers[answer["id"]] = answer
+        finally:
+            bridge.stdin.close()
+            bridge.wait(10)
+            bridge.stdout.close()
+        initialized = answers[0]["result"]
+        self.assertEqual(initialized["protocolVersion"], "2025-06-18")
+        # Codex shows a server's instructions to the model with its tools: the bridge has none of its own.
+        self.assertNotIn("instructions", initialized)
+        self.assertEqual([tool["name"] for tool in answers[1]["result"]["tools"]], ["echo", "block"])
+        self.assertEqual(answers[2]["result"], {"content": [{"type": "text", "text": 'echo {"x": 1}'}],
+                                                "isError": False})
 
     def test_a_call_without_the_token_gets_nothing(self):
         entry = self.service.codex_server()
@@ -300,6 +347,8 @@ class GoalLoopTests(unittest.TestCase):
         start = next(params for method, params in double.rpc.calls if method == "thread/start")
         self.assertFalse(start["config"]["features"]["goals"])
         self.assertEqual(start["config"]["mcp_servers"]["tcs"]["enabled_tools"], ["update_goal"])
+        # An author without TCS Prover's team keeps Codex's agents setting as before.
+        self.assertNotIn("agents", start["config"])
         # No goal request of Codex's goal mode.
         self.assertEqual([method for method, _ in double.rpc.calls if method.startswith("thread/goal/")], [])
         first, second, third = self.turns(double)
@@ -580,8 +629,12 @@ class TeamTests(TeamCase):
             self.addCleanup(session.close)
             self.assertEqual(next(session)["output"], POINTER)
             app_server = next(call.args[0] for call in spawn.call_args_list if "app-server" in call.args[0])
-        # The coordinator has TCS Prover's tools, and none of Codex's own subagent tools.
+        # The coordinator has TCS Prover's tools, and none of Codex's own subagent tools: without the multi_agent
+        # feature Codex 0.160 still offers a GPT 6.1 Sol thread its collaboration tools (spawn_agent, ...) unless its
+        # agents are off.
         self.assertEqual([tool["name"] for tool in seen["tools"]], ["update_goal", *team.TEAM_TOOLS])
+        start = next(params for method, params in double.rpc.calls if method == "thread/start")
+        self.assertEqual(start["config"]["agents"], {"enabled": False})
         self.assertEqual(seen["tools"][2]["description"], TEXTS["team_tool_assign"])
         self.assertEqual(seen["tools"][2]["inputSchema"]["properties"]["assignment"]["description"],
                          TEXTS["team_tool_assign_assignment"])
@@ -607,6 +660,11 @@ class TeamTests(TeamCase):
             argv = call["argv"]
             self.assertEqual(argv[argv.index("-C") + 1], str(self.run_dir))
             self.assertEqual(argv[argv.index("multi_agent") - 1], "--disable")
+            # One turn and no subagents: Codex's own goal tools and collaboration tools are off (`codex exec` 0.160
+            # offers both otherwise).
+            self.assertEqual(argv[argv.index("goals") - 1], "--disable")
+            self.assertEqual(argv[argv.index("agents.enabled=false") - 1], "-c")
+            self.assertLess(argv.index("agents.enabled=false"), argv.index("exec"))
             self.assertIn("--ignore-user-config", argv)
             self.assertEqual(argv[argv.index("-a") + 1], "never")
             # The author's sandbox: the confined profile on macOS, else Codex's workspace-write mode.
@@ -789,6 +847,84 @@ class TeamTests(TeamCase):
         self.assertTrue(answers["wait"].startswith("The wait ended early: TCS Prover sent you a live instruction"))
         self.assertIn("Try Lemma B first.", [params["input"][0]["text"] for method, params in double.rpc.calls
                                              if method == "turn/steer"])
+
+
+class ReportBudgetTests(unittest.TestCase):
+    """One team_wait answer stays within the output budget Codex 0.160 gives a tool's answer: 10,000 tokens, which
+    it counts as about 4 bytes each. Captured with the real Codex: an answer of two 19,500-character reports came to
+    the model cut out of its middle ("Warning: truncated output"), and more reports would lose whole headers."""
+
+    CODEX_BUDGET_BYTES = 10_000 * 4
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.directory = Path(folder.name).resolve()
+
+    def finished(self, replies, directory=None):
+        """team_wait's answer once every member has finished, each with its reply."""
+
+        members = team.team_members(None, "gpt-6.1-sol", "high", len(replies))
+        crew = team.Team(members, prompts=TEXTS, directory=directory or self.directory,
+                         attempt=lambda member, prompt, conversation, process: replies[member.number - 1],
+                         configuration=lambda error, member: None, emit=lambda kind, **fields: None,
+                         render=runtime.render_template, retry_note="")
+        self.addCleanup(crew.close, "The test ended.")
+        for number in range(1, len(replies) + 1):
+            crew.call("team_assign", {"member": number, "assignment": f"Part {number}"})
+        deadline = time.monotonic() + 20
+        while crew.running() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(crew.running(), 0)
+        return crew.call("team_wait", {"timeout_minutes": 1})
+
+    @staticmethod
+    def blocks(answer):
+        """{member number: (header lines, report text)} of one answer."""
+
+        found = {}
+        for block in answer.split("\n\nMember "):
+            block = block if block.startswith("Member ") else "Member " + block
+            head, _, text = block.partition("\nREPORT:\n")
+            found[int(head.split()[1])] = (head, text)
+        return found
+
+    def test_report_shares_split_the_budget_and_give_unused_room_to_longer_reports(self):
+        self.assertEqual(team.report_shares([13, 19_500, 30_000]), [13, 9_993, 9_994])
+        self.assertEqual(team.report_shares([30_000, 30_000]), [10_000, 10_000])
+        self.assertEqual(team.report_shares([5, 7]), [5, 7])
+        self.assertEqual(team.report_shares([25_000]), [team.REPORT_CHARS])
+        self.assertEqual(team.report_shares([]), [])
+
+    def test_reports_that_come_back_together_share_one_answer_each_with_its_header_and_file(self):
+        replies = ["Short report.", "A" * 19_500, "B" * 30_000]
+        answer = self.finished(replies)
+        self.assertLess(len(answer.encode("utf-8")), self.CODEX_BUDGET_BYTES)
+        blocks = self.blocks(answer)
+        self.assertEqual(sorted(blocks), [1, 2, 3])
+        for number, share in ((2, 9_993), (3, 9_994)):
+            head, text = blocks[number]
+            self.assertIn(f'Member {number} (GPT 6.1 Sol) finished the assignment "Part {number}".', head)
+            self.assertIn(f"Report file: team/member-{number}/1-report.md", head)
+            self.assertEqual(text, replies[number - 1][:share] + f"\n[The report is cut here at {share:,} characters; "
+                                   f"the whole report is in team/member-{number}/1-report.md.]")
+            # The saved file keeps the whole report.
+            self.assertEqual((self.directory / f"team/member-{number}/1-report.md").read_text(), replies[number - 1])
+        self.assertEqual(blocks[1][1], "Short report.")
+
+    def test_a_report_alone_keeps_its_20000_characters(self):
+        answer = self.finished(["C" * 25_000])
+        (head, text), = self.blocks(answer).values()
+        self.assertEqual(text, "C" * 20_000 + "\n[The report is cut here at 20,000 characters; the whole report is "
+                                              "in team/member-1/1-report.md.]")
+
+    def test_a_cut_report_that_could_not_be_saved_names_no_file(self):
+        (self.directory / "team").write_text("not a folder")
+        answer = self.finished(["D" * 25_000])
+        (head, text), = self.blocks(answer).values()
+        self.assertIn("The report could not be saved", head)
+        self.assertTrue(text.endswith("\n[The report is cut here at 20,000 characters; it could not be saved.]"))
+        self.assertNotIn("team/member-1/1-report.md", text)
 
 
 class ExecuteTeamTests(unittest.TestCase):
