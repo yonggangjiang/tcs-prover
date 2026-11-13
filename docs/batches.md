@@ -61,11 +61,12 @@ The Overview's batch card counts them (*2 shared related works*).
   - A new problem gets what the batch shares when it is created, before
     anything runs: **New problem in this batch**, **Run a folder…** into the
     batch, a rerun into it, and a job made from another job of the batch.
-  - A work you add reaches at once every problem of the batch that can still
-    take related works: in statement review or waiting for approval, queued or
-    prepared, running, paused, stopped or at its time limit. Running and paused
-    authors are told as about any added work: a running author at its next
-    step, a paused one with your next message or at **Resume**.
+  - A work you add reaches at once every problem of the batch that has not
+    finished: in statement review or waiting for approval (a stopped statement
+    review too), queued or prepared, running, paused, stopped or at its time
+    limit. Running and paused authors are told as about any added work: a
+    running author at its next step, a paused one with your next message or at
+    **Resume**.
   - Finished problems keep what they had and get no new works. A job made from
     one of them gets what the batch shares then; if it reopens the saved author
     conversation, the author is told about the works its folder lacked.

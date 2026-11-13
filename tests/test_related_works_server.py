@@ -479,11 +479,13 @@ class SharedWorksTests(RelatedWorksCase):
         return self.manager.add_batch_shared_works([self.upload(name, f"{name}\n".encode()) for name in names], batch)
 
     def test_works_shared_with_a_batch_reach_every_problem_that_can_still_take_them(self):
-        running, paused, queued, waiting, done, authorless, elsewhere = [self.start() for _ in range(7)]
+        running, paused, queued, waiting, done, authorless, elsewhere, stopped_review = [self.start() for _ in range(8)]
         running.state.update(goalThreadId="thread-1")
         self.paused(paused)
         queued.state.update(phase="prepared")
         waiting.state.update(phase="reviewed")
+        # A statement review that failed or was stopped runs again in this job: its author has yet to start.
+        stopped_review.state.update(phase="input", error="Review stopped.")
         done.state.update(phase="done")
         authorless.state.update(workflowStages={**STAGES, "author": False})
         elsewhere.state["runningElsewhere"] = "Another TCS Prover process runs this job."
@@ -495,7 +497,7 @@ class SharedWorksTests(RelatedWorksCase):
         stored = self.store_file("defs.md")
         self.assertEqual(stored.parent.parent, self.runs / server.CONTROLLER_FOLDER / ".batches" / "default")
         # One copy, hard-linked into every problem of the batch that can still take related works ...
-        for app in (running, paused, queued, waiting):
+        for app in (running, paused, queued, waiting, stopped_review):
             self.assertEqual(inode(self.folder(app) / "defs.md"), inode(stored))
         # ... never into a finished one, one without an Author stage, one another process runs, or another batch's.
         for app in (done, authorless, elsewhere, other):
@@ -503,12 +505,12 @@ class SharedWorksTests(RelatedWorksCase):
         notices = {row["runId"]: row["notice"] for row in result["results"]}
         self.assertEqual(notices, {running.state["runId"]: "instruction", paused.state["runId"]: "pending",
                                    queued.state["runId"]: "", waiting.state["runId"]: "",
-                                   elsewhere.state["runId"]: ""})
+                                   stopped_review.state["runId"]: "", elsewhere.state["runId"]: ""})
         # Running and paused authors are told as a folder run's additions tell them; the others' first prompt does.
         notice = related_works.notice_text(["defs.md"])
         self.assertEqual((self.steers(running), paused.state["relatedWorksPending"]), ([notice], ["defs.md"]))
-        self.assertEqual((self.steers(queued), self.steers(waiting)), ([], []))
-        self.assertEqual(result["summary"], "4 problems in this batch got it now, and 2 running or paused authors are "
+        self.assertEqual((self.steers(queued), self.steers(waiting), self.steers(stopped_review)), ([], [], []))
+        self.assertEqual(result["summary"], "5 problems in this batch got it now, and 2 running or paused authors are "
                                             "told. New problems in this batch get it too.")
         self.assertEqual(result["notice"], f"Could not add them to every problem: {elsewhere.state['runId']}: Another "
                                            f"TCS Prover process runs this job.")

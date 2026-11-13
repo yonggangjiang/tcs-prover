@@ -246,7 +246,7 @@ class SharedWorksDocsTests(unittest.TestCase):
                        "**Remove**", "*2 shared related works*", "as hard links to one stored copy",
                        "when it is created, before anything runs", "**New problem in this batch**",
                        "**Run a folder…** into the batch", "a rerun into it",
-                       "every problem of the batch that can still take related works",
+                       "every problem of the batch that has not finished", "(a stopped statement review too)",
                        "Running and paused authors are told",
                        "Finished problems keep what they had and get no new works",
                        "the author is told about the works its folder lacked",

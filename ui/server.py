@@ -11177,7 +11177,8 @@ class Server(ThreadingHTTPServer):
 
     def add_batch_shared_works(self, tokens, batch_id=""):
         """Share uploads with every problem in a batch: save them once in the batch's store, then link them into every
-        job of the batch that can still take related works (queued, not yet started, running or paused).
+        job of the batch that can still take related works (queued, not yet started, running or paused), and into a
+        statement review that failed or was stopped (it runs again in its own job).
 
         Each running or paused author is told by the usual notice rule; a job created later takes them when it is
         created. Finished jobs, jobs without an Author stage and saved ones are left as they are; a job another
@@ -11195,9 +11196,17 @@ class Server(ThreadingHTTPServer):
         # The jobs as they are now: a job created while the works were saved takes them when it is registered.
         for app in self._batch_members(batch_id):
             problem = app.related_works_problem()
-            if problem:
-                with app.lock:
-                    elsewhere = app.state.get("runningElsewhere") or ""
+            with app.lock:
+                elsewhere = app.state.get("runningElsewhere") or ""
+                try:
+                    author = saved_workflow_stages(app.state)["author"]
+                except ValueError:
+                    author = False
+                # A statement review that failed or was stopped runs again in its own job, whose author has yet to
+                # start: it takes them too (and loses a removed one), so its first prompt points to them.
+                review = (app.run_dir is not None and app.state["phase"] == "input" and author and not elsewhere
+                          and not app.state.get("readOnly"))
+            if problem and not review:
                 if elsewhere and problem == elsewhere:
                     results.append({"runId": app.state["runId"], "added": [], "notice": "", "problem": problem})
                     notes.append(f"{app.state.get('sourceFile') or app.state['runId']}: {problem.rstrip('.')}")
