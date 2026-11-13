@@ -3825,7 +3825,8 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
     """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
 
     Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
-    ``node_name``), each with its member's number and model.
+    ``node_name``), each with its member's number and model and its assignment's id (subagentId,
+    team_module.assignment_id()).
     """
 
     sessions = MemberSessions()
@@ -3834,9 +3835,14 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
         emit(kind, stage, node=node_name, **fields)
 
     def attempt(member, prompt, conversation, started):
+        # The assignment this attempt works on (its retries share it); taken now, so every event of the attempt
+        # keeps it.
+        identity = member.assignment
+
         def record(event, root=False):
-            emit("codex_event", stage, node=node_name, event=event, root=False, subagentMember=member.number,
-                 subagentModel=member.label, **({"provider": "claude"} if conversation.harness == "claude" else {}))
+            emit("codex_event", stage, node=node_name, event=event, root=False, subagentId=identity,
+                 subagentMember=member.number, subagentModel=member.label,
+                 **({"provider": "claude"} if conversation.harness == "claude" else {}))
         return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
                               compact_prompt=prompts.get("codex_compact_prompt", ""), record=record)
 

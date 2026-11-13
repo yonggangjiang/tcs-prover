@@ -226,7 +226,10 @@ class TranscriptViewer:
 
     @staticmethod
     def _exec_scope(record):
-        return str(record.get("stage") or ""), str(record.get("activityLabel") or "")
+        # A team member's assignment (subagentId, runner/team.assignment_id()) is an exec process of its own, run
+        # side by side with the other members' without a label of its own.
+        return (str(record.get("stage") or ""), str(record.get("activityLabel") or ""),
+                str(record.get("subagentId") or ""))
 
     def _partial(self, key, record, params, root):
         # Keep the origin so finish() still honors --stage and --root-only.

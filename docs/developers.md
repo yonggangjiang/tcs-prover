@@ -512,7 +512,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   of the coordinator keeps them working, and the next attempt reads their
   reports. Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
-  `codex_event` records (`root: false`).
+  `codex_event` records (`root: false`). Every record of one assignment, its
+  retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
+  `team.assignment_id()`): each run numbers its items from `item_0` again, so
+  the page and `transcript/view_transcript.py` keep an assignment's rows apart
+  by it, and a later assignment never replaces an earlier one's.
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
   restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
   codex --author-team builtin` and no texts, also after a revision in place, and a

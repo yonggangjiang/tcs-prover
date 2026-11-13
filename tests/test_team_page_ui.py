@@ -11,6 +11,7 @@ program, effort, connection}]), the subagent records' subagentMember and subagen
 fixtures are real (ui/presets.py, ui/server.py and an API connection "Lab key" with its model "Model A"). No server,
 model or CLI is started.
 """
+import json
 import re
 import shutil
 import unittest
@@ -18,11 +19,14 @@ import unittest
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 from tests import test_coordinator_ui as coordinator
 from tests import test_presets_ui as presets_ui
+from tests import test_team_goal_loop as team_loop
 from tests.test_provider_ui import APP, INDEX, page
 
 # The handlers of Author subagents, Subagent models and Goal loop (index.html's controls as app.js wires them).
 HANDLERS = ["// The subagent models show while Author subagents is 1 or more",
             "ui.retrievalMode.onchange = () => {"]
+# How the page puts a job's records into the activity log (with coordinator.ACTIVITY: describe and upsertTimeline).
+INGEST = ["// Keep only exact application prompts", "function completedRunLabel("]
 # Setup's reading of the form (what each program is needed for) and its words.
 SETUP_SLICES = [["function setupWords()", "function setupElement("],
                 ["function setupFormRoles()", "// Whether the built-in settings, which new problems open with"],
@@ -440,6 +444,25 @@ assert.equal(toolCall({id: 'c1', type: 'mcpToolCall', server: 'tcs', tool: 'team
   'team_assign · completed');
 assert.equal(toolCall({id: 'c2', type: 'mcpToolCall', name: 'mcp__tcs__team_wait', status: 'completed'}).text,
   'team_wait · completed');
+""")
+
+    def test_two_assignments_of_one_member_keep_their_own_rows(self):
+        # The records the runner makes for two assignments of member 2, one after the other: each run numbers its
+        # items from item_0 again.
+        records = team_loop.member_records([(2, "Lemma A\nProve it."), (2, "Lemma B\nProve it.")])
+        self.run_app([*coordinator.ACTIVITY, INGEST], coordinator.ACTIVITY_SETUP
+                     + f"const detailRows = new Map();\nconst records = {json.dumps(records)};\n", r"""
+ingest(records, true);
+const rows = ui.timeline.children.map((row) => [row._card.label, row._card.text]);
+assert.deepEqual(rows.filter(([label]) => label.startsWith('Subagent 2')), [
+  ['Subagent 2 reasoning', 'About Lemma A.'], ['Subagent 2', 'Done: Lemma A'],
+  ['Subagent 2 reasoning', 'About Lemma B.'], ['Subagent 2', 'Done: Lemma B']]);
+assert.deepEqual(rows.filter(([label]) => label.startsWith('Author subagent 2')).map(([label]) => label), [
+  'Author subagent 2 (GPT 6.1 Sol) started', 'Author subagent 2 (GPT 6.1 Sol) finished',
+  'Author subagent 2 (GPT 6.1 Sol) started', 'Author subagent 2 (GPT 6.1 Sol) finished']);
+// A later poll that brings the second assignment's events again replaces only its own rows.
+ingest(records.filter((record) => record.subagentId === 'member-2-2'));
+assert.equal(ui.timeline.children.filter((row) => row._card.label === 'Subagent 2').length, 2);
 """)
 
     def test_goal_status_records_say_what_the_author_reported_and_what_happens_next(self):

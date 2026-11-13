@@ -35,7 +35,7 @@ TEXTS = {name: text for name, text in runtime.load_workflow(WORKFLOW)["prompts"]
          if name in runtime.HARNESS_TEXTS}
 
 # A stand-in `codex` for a team member's `codex exec --json`: it logs its call, reports a saved session and answers
-# from its prompt. Markers in the prompt choose a failure: SLOW (works until stopped), FAIL-ONCE (a model-call
+# from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a failure: SLOW (works until stopped), FAIL-ONCE (a model-call
 # failure after some work, once per run folder), NOLOGIN (a login the CLI refuses).
 FAKE_CODEX = r'''
 import json, os, sys, time, uuid
@@ -60,7 +60,8 @@ log({"argv": argv, "prompt": prompt, "cwd": os.getcwd(), "fork": fork,
              if key.startswith(("CODEX", "TCS", "OPENAI", "SSH_", "GPG_")) or key == "TMPDIR"}})
 session = str(uuid.uuid4())
 out({"type": "thread.started", "thread_id": session})
-out({"type": "item.completed", "item": {"type": "reasoning", "text": "thinking about " + prompt[:40]}})
+out({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning",
+                                        "text": "thinking about " + prompt[:40]}})
 if "SLOW" in prompt:
     time.sleep(120)
 flag = os.path.join(os.environ["TCS_FAKE_CODEX_STATE"], "failed-once")
@@ -73,7 +74,7 @@ if "NOLOGIN" in prompt:
     sys.exit(1)
 first = next((line for line in prompt.splitlines() if line.strip()), "")
 reply = f"Report of {model}" + (f" (continuing {fork})" if fork else "") + f": {first}"
-out({"type": "item.completed", "item": {"type": "agent_message", "text": reply}})
+out({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": reply}})
 out({"type": "turn.completed", "usage": {"input_tokens": 1}})
 answer = argv[argv.index("-o") + 1]
 open(answer, "w").write(reply)
@@ -432,6 +433,38 @@ API_KEY = "sk-lab-0123456789abcdef"
 MEMBER_SETTINGS = {"speed": "standard", "summary": "concise"}
 
 
+def member_records(assignments, count=2):
+    """The records the runner makes for ``assignments`` [(member, assignment)], run one after another by a team of
+    ``count`` members of the coordinator's model (runtime.start_team()); each member run is a stand-in that reports
+    what a `codex exec --json` run does: its items numbered from item_0 again. The server's and the page's tests
+    read them as a job's transcript."""
+
+    records, lock = [], threading.Lock()
+
+    def capture(kind, stage, **fields):
+        with lock:
+            records.append({"kind": kind, "stage": stage, **fields})
+
+    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record):
+        first = prompt.splitlines()[0]
+        record({"type": "thread.started", "thread_id": f"019a{member.count:04d}-0000-7000-8000-000000000000"})
+        record({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning", "text": f"About {first}."}})
+        record({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": f"Done: {first}"}})
+        return f"Done: {first}"
+
+    with tempfile.TemporaryDirectory() as folder, mock.patch.object(runtime, "emit", side_effect=capture), \
+            mock.patch.object(runtime, "member_attempt", side_effect=attempt):
+        crew = runtime.start_team(team.team_members(None, "gpt-6.1-sol", "high", count), prompts=TEXTS,
+                                  directory=folder, settings=MEMBER_SETTINGS, stage="solve", node_name="author")
+        try:
+            for number, assignment in assignments:
+                crew.call("team_assign", {"member": number, "assignment": assignment})
+                crew.call("team_wait", {"timeout_minutes": 1})
+        finally:
+            crew.close("The test ended.")
+    return records
+
+
 @unittest.skipIf(os.name == "nt", "The stand-in CLIs are POSIX scripts")
 class TeamCase(unittest.TestCase):
     """Stand-in `codex` and `claude` programs on PATH, a run folder and the run's records."""
@@ -675,6 +708,36 @@ class TeamTests(TeamCase):
         self.assertIn("team/member-1/2-report.md", first)
         self.assertIn("team/member-1/3-report.md", second)
         self.assertIsNone(session["fork"])
+
+    def test_every_record_of_an_assignment_carries_its_id_and_two_assignments_never_share_one(self):
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}, {"model": "gpt-6-luna", "effort": "low"}])
+        crew.call("team_assign", {"member": 1, "assignment": "FAIL-ONCE Lemma A"})
+        self.collect(crew, 1)
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma B"})
+        crew.call("team_assign", {"member": 2, "assignment": "Lemma C"})
+        self.collect(crew, 2)
+        with self.events_lock:
+            events = [dict(event) for event in self.events]
+        member_events = [event for event in events if event["kind"] == "codex_event"]
+        statuses = [event for event in events if event.get("authorSubagent")]
+        # Its events (the retried attempt's too), its status records and its retry note: one id per assignment.
+        self.assertEqual(sorted({(event["subagentMember"], event["subagentId"]) for event in member_events}),
+                         [(1, "member-1-1"), (1, "member-1-2"), (2, "member-2-1")])
+        self.assertEqual(sorted((event["subagentId"], event["subagentState"]) for event in statuses),
+                         [("member-1-1", "finished"), ("member-1-1", "started"), ("member-1-2", "finished"),
+                          ("member-1-2", "started"), ("member-2-1", "finished"), ("member-2-1", "started")])
+        retry, = [event for event in events if event["kind"] == "diagnostic" and "retrying" in event["text"]]
+        self.assertEqual(retry["subagentId"], "member-1-1")
+        replies = {event["subagentId"]: event["event"]["item"]["text"] for event in member_events
+                   if event["event"].get("item", {}).get("type") == "agent_message"}
+        self.assertIn("(continuing ", replies["member-1-1"])  # The retry of the first assignment.
+        self.assertIn("Lemma B", replies["member-1-2"])
+        self.assertIn("Lemma C", replies["member-2-1"])
+        # Each run numbers its items from item_0 again: only the assignment's id keeps them apart.
+        first, second = ([event["event"]["item"]["id"] for event in member_events
+                          if event["subagentId"] == identity and event["event"].get("item", {}).get("type")
+                          == "agent_message"] for identity in ("member-1-1", "member-1-2"))
+        self.assertEqual(first, second)
 
     def test_a_model_call_failure_is_retried_and_a_settings_problem_goes_to_the_coordinator(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}, {"model": "gpt-6-unknown", "effort": "high"}])

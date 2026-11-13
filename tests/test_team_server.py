@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
+from tests import test_team_goal_loop as team_loop
 import workflow_runner as runtime
 from runner import prompt_catalog, providers
 from ui import batches, cli, presets, server
@@ -203,6 +204,32 @@ class JobTests(ServerCase):
                     server.App._workflow_options(include_review=False, prompt_overrides=overrides)
         with self.assertRaisesRegex(ValueError, "Prompt overrides must map prompt names to prompt text"):
             server.web_prompt_options({"promptOverrides": {"team_note": 7}}, server.PROOF_PROMPTS)
+
+
+class MemberRecordTests(ServerCase):
+    def test_two_assignments_of_one_member_are_both_listed_with_their_own_ids(self):
+        records = team_loop.member_records([(1, "Lemma A\nProve it."), (1, "Lemma B\nProve it.")])
+        app = self.job()
+        for record in records:
+            app.add_trace(record)
+
+        def listed(trace):
+            events = [(record["subagentId"], record["event"]["item"]["id"], record["event"]["item"]["text"])
+                      for record in trace if record.get("kind") == "codex_event" and record.get("root") is False
+                      and "item" in record["event"]]
+            statuses = [(record["subagentId"], record["subagentState"]) for record in trace
+                        if record.get("authorSubagent") is True]
+            return events, statuses
+
+        # The job's live window, and the job restored from its transcript after a restart.
+        for trace in (app.state["trace"], self.restored(app).state["trace"]):
+            events, statuses = listed(trace)
+            self.assertEqual(events, [("member-1-1", "item_0", "About Lemma A."),
+                                      ("member-1-1", "item_1", "Done: Lemma A"),
+                                      ("member-1-2", "item_0", "About Lemma B."),
+                                      ("member-1-2", "item_1", "Done: Lemma B")])
+            self.assertEqual(statuses, [("member-1-1", "started"), ("member-1-1", "finished"),
+                                        ("member-1-2", "started"), ("member-1-2", "finished")])
 
 
 class SettingsTests(ServerCase):
