@@ -28,6 +28,7 @@ import time
 import uuid
 from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, confinement, proof_handoff, providers
+from runner import team as team_module
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -96,6 +97,30 @@ _COORDINATOR_LIFECYCLE = (*_GOAL_LIFECYCLE, "reopen", "summary", "conversation",
 # How the proof author works (--author-mode): "coordinator" runs the node's coordinator binding, "author" the author
 # alone; "auto", the default, runs the coordinator when Author subagents is 1 or more.
 AUTHOR_MODES = ("auto", "coordinator", "author")
+# Who runs the goal loop of a Codex author or coordinator (--goal-loop): "tcs", the command line's default, TCS
+# Prover itself (it starts every turn and the model ends its goal with TCS Prover's update_goal tool, see
+# goal_session()); "codex", Codex's built-in goal mode, which every job from before keeps. Claude Code authors always
+# run TCS Prover's loop. Options without the setting (a caller that does not choose) run "codex", as before.
+GOAL_LOOPS = ("tcs", "codex")
+# Who are the author coordinator's subagents (--author-team): "tcs", the command line's default, TCS Prover's team
+# (runner/team.py, its tools through TCS Prover's MCP server); "builtin", the CLI's own subagent tool, which jobs
+# from before and web-cutoff runs keep. Options without the setting run "builtin", as before.
+AUTHOR_TEAMS = ("tcs", "builtin")
+# TCS Prover's own texts in the workflow's prompts that no node binds (the goal loop, update_goal, Claude Code's
+# goal note, Codex's compaction summary, the team), with the placeholders each may use; None: used as written.
+HARNESS_TEXTS = {
+    "goal_continuation": {"continuation", "objective", "elapsed", "limit"},
+    "goal_tool_update_goal": None, "goal_tool_update_goal_status": None, "goal_tool_update_goal_note": None,
+    "claude_goal_harness": {"objective"},
+    "codex_compact_prompt": None,
+    "team_note": {"members"}, "team_member": {"assignment"},
+    "team_tool_members": None, "team_tool_assign": None, "team_tool_assign_member": None,
+    "team_tool_assign_assignment": None, "team_tool_wait": None, "team_tool_wait_timeout_minutes": None,
+    "team_tool_followup": None, "team_tool_followup_member": None, "team_tool_followup_message": None,
+    "team_tool_stop": None, "team_tool_stop_member": None,
+}
+# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions).
+EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt",)
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -793,6 +818,38 @@ def prompt_file(path, default):
     """Read an optional per-job prompt, or use the built-in default."""
 
     return Path(path).read_text(encoding="utf-8") if path else default
+
+
+def prompt_set(path):
+    """Read a job's saved texts (--prompt-set-file): a JSON object {prompt name: text}."""
+
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise Error(f"Cannot read the job's saved prompts {path}: {exc}") from exc
+    if not isinstance(value, dict) or not all(isinstance(name, str) and isinstance(text, str)
+                                              for name, text in value.items()):
+        raise Error(f"The job's saved prompts {path} must map prompt names to text.")
+    return value
+
+
+def author_subagent_models(value):
+    """The coordinator team's models (--author-subagent-models): a JSON list of {"model", "effort"}, or None.
+
+    The number of entries is checked against Author subagents when the team starts (team.validated_team()).
+    """
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("Give the subagent models as a JSON list.") from exc
+    if value is None:
+        return None
+    try:
+        return team_module.validated_team(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 # The program each CLI is, as the source menus name it: in a title ("Claude Code missing or
@@ -1900,7 +1957,7 @@ def private_permission_arguments(base, model, *, codex_home=None, profile=None, 
 
 
 @contextmanager
-def _confined_call(writable, model, environment, policy, workspace):
+def _confined_call(writable, model, environment, policy, workspace, live=None):
     """The sandbox flags and environment of one `codex exec`, with a fresh private temp folder.
 
     Yields (flags, environment). On macOS the confined profile and a new
@@ -1919,7 +1976,8 @@ def _confined_call(writable, model, environment, policy, workspace):
         finally:
             retrieval_runtime.remove_private_temp(policy, environment)
         return
-    live = live_network()
+    # A team member's run passes the network rule of the author's working folder (``live``).
+    live = live_network() if live is None else live
     flags = private_permission_arguments(
         ":workspace" if writable else ":read-only", model, codex_home=(environment or {}).get("CODEX_HOME"),
         live=live)
@@ -2824,8 +2882,10 @@ class RequestMonitor:
     """
 
     def __init__(self, process, stage, model, effort, *, timeout, activity_label, cli="Codex", redact=None,
-                 deadline=None):
+                 deadline=None, heartbeat=True):
         self.process, self.stage, self.model, self.effort = process, stage, model, effort
+        # A team member's run (heartbeat False) shows its own events instead of the liveness heartbeat.
+        self.heartbeat = heartbeat
         self.timeout = float(STRUCTURED_STALL_SECONDS if timeout is None else timeout)
         self.deadline = None if deadline is None else float(deadline)
         self.activity_label, self.cli = activity_label, cli
@@ -3014,7 +3074,8 @@ class RequestMonitor:
         with self._lock:
             self._started_at = self._active_at = time.monotonic()
         self._watchdog.start()
-        self._heartbeat.start()
+        if self.heartbeat:
+            self._heartbeat.start()
 
     def observed(self, content):
         with self._lock:
@@ -3582,6 +3643,215 @@ def _run_structured_process(
                 failure.cli_problem = "Codex"  # It ended without any output: it could not start.
             raise failure
         return output
+
+class MemberConversation:
+    """The conversation of one attempt of a team member's assignment (runner/team.py), as its transport reports it.
+
+    ``fork_from`` is the saved session the attempt continues (a follow-up, or a retry after an attempt that worked):
+    Codex forks it (`codex exec fork <id>`), Claude Code resumes a fork of it (--resume <id> --fork-session).
+    ``session_id``, ``confirmed`` and ``output`` say what the attempt started and whether the model worked in it;
+    every session the attempt saved is registered with ``sessions`` (MemberSessions), which removes them when the
+    team ends.
+    """
+
+    resumable = True
+
+    def __init__(self, harness, fork_from, sessions):
+        self.harness, self.fork_from, self.sessions = harness, fork_from, sessions
+        self.session_id, self.confirmed, self.output, self.detail = None, False, False, {}
+
+    def created(self, session_id, deleter):
+        self.sessions.add(session_id, deleter)
+
+    def subagent(self, *_):
+        pass  # Members start no subagents.
+
+
+class MemberSessions:
+    """The saved sessions of a team's members, removed together when the team ends (Team.close())."""
+
+    def __init__(self):
+        self.items, self.lock = {}, threading.Lock()
+
+    def add(self, session_id, deleter):
+        with self.lock:
+            self.items[session_id] = deleter
+
+    def discard(self):
+        with self.lock:
+            items, self.items = dict(self.items), {}
+        for session_id, deleter in items.items():
+            try:
+                deleter(session_id)
+            except Exception:  # noqa: BLE001 - a session left behind costs disk space only.
+                pass
+
+
+def member_problem(error, model):
+    """Why a team member's failed attempt needs a change of settings (no retry helps), else None (it is retried).
+
+    A missing program, a login or key the model cannot use, a model the account or catalog does not have, an
+    endpoint that refuses the request, and any other configuration error.
+    """
+
+    failure = settings_failure(error, model)
+    if failure is not None:
+        return str(failure)
+    if isinstance(error, (FinalError, providers.ProviderError)):
+        return str(error) or type(error).__name__
+    if _cli_problem(error):
+        return _failure_reason(redact(str(error)), 600) or str(error)
+    if _plain_failure(redact(str(error))) == "authentication failed":
+        return "authentication failed: " + (_failure_reason(redact(str(error)), 300) or str(error))
+    return None
+
+
+def member_attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record):
+    """One attempt of a team member's assignment: a one-shot run of its model in the author's working folder.
+
+    Codex models run `codex exec --json` and Claude models `claude -p` (as the critic's calls do), each with the
+    author's sandbox: workspace writes in ``directory`` (whose controller files stay read-only), the network rule
+    of the author's search mode there, the same environment filtering and credentials, no subagents. The reply is
+    the member's final message. ``started(process)`` registers the CLI process (a stop ends it); ``record(event,
+    root)`` receives its public events; ``settings`` holds the job's speed and reasoning summary.
+    """
+
+    try:
+        known = providers.is_known(member.model)
+    except providers.StoreUnavailable as exc:
+        raise Error(str(exc)) from exc  # Read again at the next attempt.
+    if not known:
+        raise ConfigurationError(f"Unknown model {str(member.model)[:80]!r}: it is neither a built-in model nor a "
+                                 "model of a configured API connection.")
+    model = member.model
+    require_model_credentials(model)
+    effort = effective_effort(model, member.effort)
+    summary = reasoning_summary(model, settings.get("summary", DEFAULT_REASONING_SUMMARY))
+    if providers.harness(model) == providers.CLAUDE:
+        return claude_cli.run_structured(
+            prompt, None, "solve", model, effort, summary, timeout=None, activity_label=None, features=(),
+            workspace=Path(directory), environment=environment(model), runtime=sys.modules[__name__],
+            conversation=conversation, role="author", record=record, started=started)
+    return _codex_member_attempt(prompt, model, effort, summary, directory=directory, conversation=conversation,
+                                 record=record, started=started, speed=effective_speed(model, settings.get("speed")),
+                                 compact_prompt=compact_prompt)
+
+
+def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversation, record, started, speed,
+                          compact_prompt):
+    """A Codex team member's attempt (member_attempt()): `codex exec --json`, its session saved for a follow-up."""
+
+    child_environment = environment(model)
+    live = live_network(directory)
+    fork = conversation.fork_from if _codex_session_id(conversation.fork_from) else None
+    with _confined_call(True, model, child_environment, None, directory, live=live) as (sandbox, process_environment), \
+            tempfile.TemporaryDirectory() as folder:
+        answer = Path(folder) / "answer.md"
+        executable = (located_cli(lambda: api_codex_executable(child_environment), "Codex", model, "solve")
+                      if model_provider(model) == API_PROVIDER else located_cli(codex, "Codex", model, "solve"))
+        command = [
+            executable, "-m", wire_model(model), "-c", f'model_reasoning_effort="{effort}"',
+            *inherited_openai_base_url_arguments(overrides={"model_provider": model_provider(model)},
+                                                 environment=child_environment),
+            *provider_arguments(model), *speed_arguments(speed, model), *context_cache_arguments(),
+            "-c", "memories.generate_memories=false", "-c", f'model_reasoning_summary="{summary}"',
+            *(["-c", f"compact_prompt={toml_string(compact_prompt)}"] if compact_prompt.strip() else []),
+            *retrieval_runtime.native_search_arguments(directory), "-c", "features.view_image=false",
+            "--disable", "multi_agent",
+            "-C", str(directory), *sandbox, "-a", "never", "exec", *(["fork"] if fork else []),
+            "--json", "--skip-git-repo-check", "--ignore-user-config", "-o", str(answer), *([fork] if fork else []),
+            "-",
+        ]
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, encoding="utf-8", errors="replace", env=process_environment,
+                                       cwd=str(directory))
+        except OSError as exc:
+            exc.cli_problem = "Codex"
+            raise
+        started(process)
+        monitor = RequestMonitor(process, "solve", model, effort, timeout=None, activity_label=None, heartbeat=False)
+        provider_errors, began = [], False
+        try:
+            monitor.start()
+            monitor.send_input(prompt)
+            for line in monitor.lines():
+                try:
+                    raw_event = json.loads(line)
+                    if not isinstance(raw_event, dict):
+                        raise ValueError("not an event")
+                except ValueError:
+                    continue
+                kind = raw_event.get("type")
+                if kind == "thread.started" and _codex_session_id(raw_event.get("thread_id")):
+                    began = True
+                    conversation.session_id, conversation.confirmed = raw_event["thread_id"].lower(), True
+                    conversation.created(conversation.session_id, _codex_session_deleter(executable, child_environment))
+                elif (isinstance(kind, str) and kind.startswith("item.") and isinstance(raw_event.get("item"), dict)
+                      and raw_event["item"].get("type") not in (None, "error")):
+                    conversation.output = True
+                if kind == "error" and isinstance(raw_event.get("message"), str) \
+                        and not raw_event["message"].startswith("Reconnecting..."):
+                    provider_errors.append(raw_event["message"])
+                elif kind == "turn.failed":
+                    failure = raw_event.get("error")
+                    message = failure.get("message") if isinstance(failure, dict) else failure
+                    if isinstance(message, str) and message.strip():
+                        provider_errors.append(message.strip())
+                event = public_event(raw_event)
+                if event is not None:
+                    monitor.observed(str(event.get("type") or "").startswith("item."))
+                    record(event, False)
+            code = process.wait()
+        finally:
+            monitor.close()
+        output = answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
+        stopped = monitor.stopped("member")
+        if stopped is not None:
+            raise stopped
+        if code or (provider_errors and not output.strip()):
+            detail = _clip_middle(redact("\n".join((*provider_errors, *monitor.stderr_lines)).strip()), 8000)
+            if fork and not began:
+                raise ConversationUnavailable(f"Codex could not continue the member's conversation: {detail}")
+            failure = Error(f"Codex member failed: {detail}" if detail else "Codex member failed without diagnostics.")
+            if not monitor.output_seen:
+                failure.cli_problem = "Codex"
+            raise failure
+        return output.strip()
+
+
+def start_team(members, *, prompts, directory, settings, stage, node_name):
+    """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
+
+    Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
+    ``node_name``), each with its member's number and model.
+    """
+
+    sessions = MemberSessions()
+
+    def emit_member(kind, **fields):
+        emit(kind, stage, node=node_name, **fields)
+
+    def attempt(member, prompt, conversation, started):
+        def record(event, root=False):
+            emit("codex_event", stage, node=node_name, event=event, root=False, subagentMember=member.number,
+                 subagentModel=member.label, **({"provider": "claude"} if conversation.harness == "claude" else {}))
+        return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
+                              compact_prompt=prompts.get("codex_compact_prompt", ""), record=record)
+
+    def conversation(member, base):
+        try:
+            harness = providers.harness(member.model)
+        except providers.ProviderError:
+            harness = None
+        return MemberConversation(harness, (base or {}).get("session"), sessions)
+
+    return team_module.Team(members, prompts=prompts, directory=directory, attempt=attempt,
+                     configuration=lambda error, member: member_problem(error, member.model), emit=emit_member,
+                     render=render_template, retry_note=AUTHOR_RETRY_NOTE, retry_seconds=MODEL_RETRY_SECONDS,
+                     stop_process=stop_process, conversation=conversation, discard=sessions.discard,
+                     unavailable=lambda error: isinstance(error, ConversationUnavailable))
+
 
 def save_final_input(statement, solution, directory=None):
     """Atomically preserve the exact clean proof sent to the LaTeX editor."""
@@ -4171,7 +4441,7 @@ def _user_extensions_off(config):
 
 
 def _author_app_server(runtime, *, directory, policy, role, model, settings, features, classic, sandbox=None,
-                       stage="solve"):
+                       stage="solve", goals=True):
     """The command line of an author's Codex app-server: (argv, child environment, whether it runs an API model).
 
     With a ``sandbox`` (_author_sandbox()) the app-server runs with the
@@ -4188,7 +4458,8 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
     settings["subagents"] and settings["coordinator"]) are session flags,
     which a web-cutoff run's checks verify exactly. ``stage`` ("solve", or "conversation" for a reply
     of the paused author) words the message of a Codex that is not installed
-    (missing_cli()).
+    (missing_cli()). ``goals`` False (TCS Prover's goal loop) starts it
+    without Codex's goals feature.
     """
 
     limits = author_limits(features, settings)
@@ -4220,7 +4491,7 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
             retrieval_runtime.codex_executable(policy) if policy
             else located_cli(lambda: runtime.api_codex_executable(child_environment) if api_model
                              else runtime.codex(), "Codex", model, stage),
-            *(["--strict-config"] if policy else []), "app-server", "--enable", "goals",
+            *(["--strict-config"] if policy else []), "app-server", "--enable" if goals else "--disable", "goals",
             *retrieval_runtime.native_search_arguments(directory, policy=policy),
             *([] if "multi_agent" in features else ["--disable", "multi_agent"]),
             *runtime.provider_arguments(model), *runtime.speed_arguments(settings["speed"], model),
@@ -4253,7 +4524,7 @@ def _initialize_author_rpc(runtime, rpc, *, policy, role, child_environment, api
 
 
 def _author_thread_options(runtime, rpc, *, directory, policy, role, model, settings, summary, features, classic,
-                           emit, read_only=False, environment=None):
+                           emit, read_only=False, environment=None, goals=True, servers=None, compact_prompt=""):
     """The options with which an author starts or resumes its thread.
 
     ``environment`` is the environment of the author's app-server
@@ -4275,6 +4546,11 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     from Codex's effective settings, and view_image are turned off; settings
     that cannot be read fail the attempt, which is retried. The thread has
     the subagent limits of its app-server (author_limits()).
+
+    ``goals`` False (TCS Prover's goal loop) leaves Codex's goals feature off;
+    ``servers`` ({name: mcp_servers entry}) are MCP servers of TCS Prover
+    itself (team.Service.codex_server()), kept on while the user's are off;
+    a nonempty ``compact_prompt`` is Codex's compact_prompt setting.
     """
 
     limits = author_limits(features, settings)
@@ -4285,7 +4561,7 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
         "sandbox": "workspace-write", "approvalPolicy": "never",
         "config": {"model_reasoning_effort": settings["effort"], "model_reasoning_summary": summary,
             **retrieval_runtime.native_search_configuration(directory, policy=policy),
-            "features": {"goals": True, "multi_agent": False, "fast_mode": settings["speed"] == "fast",
+            "features": {"goals": bool(goals), "multi_agent": False, "fast_mode": settings["speed"] == "fast",
                          **{feature: True for feature in features},
                          **({"code_mode": False, "shell_tool": True} if classic else {})}},
     }
@@ -4319,6 +4595,11 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     effective = effective if isinstance(effective, dict) else {}
     # The user's MCP servers, plugins and apps run outside the sandbox: a live author gets none of them.
     thread_options["config"].update(_user_extensions_off(effective))
+    if servers:
+        # TCS Prover's own server (its tools for this run), on where the user's are off.
+        thread_options["config"]["mcp_servers"] = {**thread_options["config"].get("mcp_servers", {}), **servers}
+    if compact_prompt and compact_prompt.strip():
+        thread_options["config"]["compact_prompt"] = compact_prompt
     thread_options["config"]["features"].update(apps=False, plugins=False, view_image=False)
     # The confined profile where Codex supports one, selected exactly as the historical profile is; none of
     # the user's [sandbox_workspace_write] settings carries over: network follows the run's search mode.
@@ -4381,7 +4662,8 @@ def _root_message(message, thread):
 
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
-                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False):
+                 node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
+                 texts=None, team=None, service=None):
     """Run one goal-enabled thread with lifecycle instructions supplied by YAML.
 
     Yield its final answer only after goal completion; accept follow-up feedback
@@ -4434,9 +4716,36 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     "Coordinator report" status, and the continuation prompt follows. An
     unexpected failure of the time checks ends them, with a diagnostic that
     says so; it never stops the watcher.
+
+    Who runs the goal loop is the ``goal_loop`` option (GOAL_LOOPS). "codex"
+    is Codex's goal mode, as described above. "tcs" (a live run only; a
+    web-cutoff run keeps Codex's goal mode, see team.Service) starts the
+    app-server without Codex's goals feature, so TCS Prover starts every turn:
+    after a turn that did not end the goal it sends the next one at once, the
+    ``texts`` goal_continuation text with the continuation prompt (or, after a
+    reply the hand-in guard kept, the report prompt) placed first. The model
+    ends the goal with TCS Prover's update_goal tool (team.GoalTool, an MCP
+    tool of TCS Prover's server, served by ``service`` or by a service of this
+    session): "complete" with the turn's final reply hands that reply on,
+    exactly as a complete goal does in Codex's goal mode; "blocked" and
+    "paused" are recorded ("Goal status") and the continuation follows. Every
+    other duty (time limit, pause, stop, resume, live instructions, chat, time
+    checks, compaction re-anchor, hand-in guard, retries, records) stays as
+    above; no thread/goal request is sent.
+
+    A coordinator with ``team`` (team.Team: TCS Prover's team in place of
+    Codex's subagent tool, see _execute) gets its team tools from the same
+    server; a live instruction or time check sent to it ends a running
+    team_wait early (Team.attention()), and an end that is not retried
+    (pause, stop, time limit, the end of the work) stops the team's members.
     """
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     policy = retrieval_policy(directory, features)
+    texts = texts or {}
+    loop = "codex" if policy else options.get("goal_loop", "codex")
+    if loop not in GOAL_LOOPS:
+        raise ConfigurationError("Choose tcs or codex as the goal loop.")
+    tcs = loop == "tcs"
     retrieval_role = "author" if node_name == "author" else "structured"
     if policy and retrieval_role != "author":
         raise Error("Historical goal sessions are restricted to the configured author node.")
@@ -4514,6 +4823,41 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     check_refused = {"turn": None}
     # Where proof files can be read, a final reply of the coordinator must name one to be handed on.
     guarded = bool(coordinator) and proof_handoff.file_handoff_supported()
+    # TCS Prover's MCP server: its update_goal (TCS Prover's goal loop) and the coordinator's team tools.
+    goal_tool = own_service = None
+
+    def start_service():
+        nonlocal service, goal_tool, own_service
+        if not tcs and team is None:
+            return
+        missing = [name for name in (("goal_continuation", "goal_tool_update_goal", "goal_tool_update_goal_status",
+                                      "goal_tool_update_goal_note") if tcs else ()) if name not in texts]
+        if missing:
+            raise ConfigurationError(f"The workflow has no {', '.join(missing)} text, which TCS Prover's goal loop "
+                                     "needs; add it to the workflow's prompts or choose Codex's goal loop.")
+        if service is None:
+            service = own_service = team_module.Service()
+        if tcs:
+            goal_tool = team_module.GoalTool(
+                texts, lambda kind, **fields: emit(kind, threadId=thread, **fields),
+                lambda: goal.get("objective", ""), lambda: getattr(runtime, "workflow_elapsed", workflow_elapsed)(options))
+            service.add(goal_tool)
+        if team is not None:
+            service.add(team)
+
+    def continue_with(name):
+        """The next turn after one that did not end the goal: the prompt ``name`` (the continuation or the report
+        prompt), and under TCS Prover's goal loop the goal continuation text around it."""
+
+        text = render(name)
+        if not tcs:
+            return text
+        elapsed = getattr(runtime, "workflow_elapsed", workflow_elapsed)(options)
+        hours = controlled_author_hours(options.get("author_limit_file"),
+                                        options.get("thinking_hours", DEFAULT_AUTHOR_HOURS))
+        return runtime.render_template(texts["goal_continuation"], {
+            "continuation": text, "objective": goal.get("objective", ""), "elapsed": _clock_text(elapsed),
+            "limit": goal_limit_text(hours, runtime.workflow_remaining(options))})
 
     def is_root(message):
         return _root_message(message, thread)
@@ -4581,6 +4925,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise
         if kind != "steer":
             state["steered"] = True
+        if team is not None and kind in ("steer", "checkin"):
+            # A running team_wait returns now, so that the instruction is not held up behind it.
+            team.attention("a live instruction" if kind == "steer" else "a time check")
         if kind == "compaction":
             emit("request", label="Author context re-anchor after compaction", text=instruction, threadId=thread)
         elif kind == "steer":
@@ -4613,7 +4960,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     def check(kind):
         probe["at"] = time.monotonic()  # Before sending: the answer may arrive at once.
         try:
-            rpc.request("thread/goal/get", {"threadId": thread})
+            # Without Codex's goals feature (TCS Prover's goal loop) a settings read is the cheap question.
+            rpc.request(*(("config/read", {"cwd": str(directory)}) if tcs
+                          else ("thread/goal/get", {"threadId": thread})))
         except (runtime.Error, OSError) as exc:
             return f"Codex stopped responding: a check could not be sent ({exc})."
         if kind == "quiet":
@@ -4655,7 +5004,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if thread and state["turn"] and state["turn"] != interrupted_turn:
                     interrupted_turn = state["turn"]
                     try:
-                        rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
+                        if not tcs:
+                            rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         rpc.request("turn/interrupt", {"threadId": thread, "turnId": interrupted_turn})
                         emit("status", label="Author stopping", threadId=thread,
                              text=STOP_REQUESTED_TEXT.format(grace=_span_text(grace))
@@ -4675,7 +5025,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     return
                 try:
                     if thread:
-                        rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
+                        if not tcs:
+                            rpc.request("thread/goal/set", {"threadId": thread, "status": "paused"})
                         if state["turn"]:
                             rpc.request("turn/interrupt", {"threadId": thread, "turnId": state["turn"]})
                             emit("status", label="Author stopping", threadId=thread,
@@ -4721,7 +5072,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise runtime.Error("Pause requested.")
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
-        rpc.call("thread/goal/set", {**goal, "status": "paused"})
+        if not tcs:
+            rpc.call("thread/goal/set", {**goal, "status": "paused"})
+        elif goal_tool is not None:
+            goal_tool.take()  # A status set before this turn belongs to none.
         emit("request", label="Exact solve input", text=instruction, threadId=thread,
              model=model, reasoningEffort=settings["effort"], reasoningSummary=summary,
              **({"attempt": attempt} if attempt and not state["delivered_once"] else {}))
@@ -4738,7 +5092,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  text="The author's conversation has received the critic's feedback.")
         if expired.is_set() or runtime.workflow_remaining(options) <= 0:
             raise runtime.Error("Workflow time limit reached.")
-        if not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
+        if not tcs and not pausing.is_set() and not (pause_file and Path(pause_file).is_file()):
             rpc.call("thread/goal/set", {"threadId": thread, "status": "active"})
 
     def collect(item, answers):
@@ -4758,10 +5112,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             final["reason"] = "missing thread id"
             raise runtime.Error("The saved Codex thread ID is missing; cannot resume the same conversation."
                                 + UNAVAILABLE_THREAD_HINT)
+        start_service()
         sandbox = _author_sandbox(runtime, options, directory=directory, policy=policy, model=model)
         argv, child_environment, api_model = _author_app_server(
             runtime, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
-            features=features, classic=classic, sandbox=sandbox)
+            features=features, classic=classic, sandbox=sandbox, goals=not tcs)
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -4775,7 +5130,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                api_model=api_model, agent_limits=author_limits(features, settings))
         thread_options = _author_thread_options(
             runtime, rpc, directory=directory, policy=policy, role=retrieval_role, model=model, settings=settings,
-            summary=summary, features=features, classic=classic, emit=emit, environment=child_environment)
+            summary=summary, features=features, classic=classic, emit=emit, environment=child_environment,
+            goals=not tcs, servers={team_module.SERVER_NAME: service.codex_server()} if service is not None else None,
+            compact_prompt=texts.get("codex_compact_prompt", ""))
         if sandbox is not None and hasattr(runtime, "author_confinement_check"):
             runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
         if classic:
@@ -4838,7 +5195,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     raise
                 emit("diagnostic", text=f"Could not remove the failed turn ({exc}); sending its instruction again.",
                      threadId=thread)
-        saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed else {}
+        saved_goal = (rpc.call("thread/goal/get", {"threadId": thread}).get("goal") or {}) if resumed and not tcs else {}
         goal = {"threadId": thread, "objective": saved_goal.get("objective") or render("goal")}
         # A coordinator says so with each start: the run's author mode (see note_no_subagent_tool()).
         emit("status", label="Goal resumed" if resumed else "Goal started", threadId=thread,
@@ -4947,6 +5304,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     _note_raw_error(emit, turn.get("error"))
                     raise runtime.Error(f"Author turn {turn['status']}: {_provider_message(turn.get('error')) or 'no complete result'}")
                 state["idle_since"] = time.monotonic()
+                if tcs:
+                    # The status the model gave with update_goal in this turn; none leaves the goal active.
+                    status = goal_tool.take() or "active"
             elif method == "error":
                 if not params.get("willRetry", False):
                     _note_raw_error(emit, params.get("error"))
@@ -4963,7 +5323,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 # The coordinator's reply names no proof file: a report on its work, never a submission.
                 emit("status", label=COORDINATOR_REPORT_LABEL, threadId=thread,
                      text=_clipped(answers[-1], getattr(runtime, "COORDINATOR_REPORT_CHARS", COORDINATOR_REPORT_CHARS)))
-                start_turn(render("report" if "report" in prompts else "continuation"))
+                start_turn(continue_with("report" if "report" in prompts else "continuation"))
                 status, running, answers = None, True, []
             elif not running and status == "complete" and answers:
                 state["active"] = False
@@ -4979,8 +5339,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 stage = stages["resume"]
                 start_turn(render("repair"))
                 status, running, answers = None, True, []
-            elif not running and status in {"blocked", "complete"}:
-                start_turn(render("continuation"))
+            elif not running and (status in {"blocked", "complete"} or (tcs and status is not None)):
+                # TCS Prover's goal loop continues every turn that did not end the goal, at once.
+                start_turn(continue_with("continuation"))
                 status, running, answers = None, True, []
             elif (not running and state["idle_since"] is not None
                     and time.monotonic() - state["idle_since"] >= continue_after):
@@ -5046,7 +5407,17 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         rewind=None, pending_compaction=None)
     finally:
         stop.set()
-        if rpc and thread and state["active"]:
+        if service is not None:
+            for provider in (goal_tool, team):
+                if provider is not None:
+                    service.remove(provider)
+            if own_service is not None:
+                own_service.close()
+        if team is not None and not final.get("retry"):
+            # Pause, stop, the time limit or the end of the work: the members stop with the coordinator. A failed
+            # model call keeps them working for the next attempt, which reads their reports.
+            team.close(ending["reason"])
+        if rpc and thread and state["active"] and not tcs:
             def pause():
                 try:
                     rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
@@ -5102,6 +5473,9 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
     if not saved:
         raise SavedConversationGone("The author has not started its conversation yet.")
     policy = retrieval_policy(directory, features)
+    # A thread of TCS Prover's goal loop has no Codex goal: it is reopened without the goals feature, and no goal
+    # request is sent (see goal_session()).
+    tcs = not policy and options.get("goal_loop", "codex") == "tcs"
     restricted = not policy and getattr(runtime, "CONVERSATION_READ_ONLY", True)
     launch_features = () if restricted else tuple(features)
     classic = bool(classic) and not policy
@@ -5149,7 +5523,8 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             if state["running"] and now - activity["last"] >= inactivity:
                 probe["at"] = now  # Before sending: the answer may arrive at once.
                 try:
-                    rpc.request("thread/goal/get", {"threadId": thread})
+                    rpc.request(*(("config/read", {"cwd": str(directory)}) if tcs
+                                  else ("thread/goal/get", {"threadId": thread})))
                 except (runtime.Error, OSError) as exc:
                     return stall(f"Codex stopped responding: a check could not be sent ({exc}).")
                 emit("diagnostic", text=f"No author event for {_span_text(inactivity)}; checking that Codex still "
@@ -5171,7 +5546,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                                   read_only=restricted)
         argv, child_environment, api_model = _author_app_server(
             runtime, directory=directory, policy=policy, role="author", model=model, settings=settings,
-            features=launch_features, classic=classic, sandbox=sandbox, stage="conversation")
+            features=launch_features, classic=classic, sandbox=sandbox, stage="conversation", goals=not tcs)
         process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1, cwd=str(directory),
             env=child_environment)
@@ -5188,7 +5563,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         thread_options = _author_thread_options(
             runtime, rpc, directory=directory, policy=policy, role="author", model=model, settings=settings,
             summary=summary, features=launch_features, classic=classic, emit=emit, read_only=restricted,
-            environment=child_environment)
+            environment=child_environment, goals=not tcs)
         # Codex's legacy read-only sandbox (no confined profile) gets its network setting with the turn.
         turn_sandbox = ({"sandboxPolicy": legacy_read_only_policy(live_network(directory))}
                         if thread_options.get("sandbox") == "read-only" else {})
@@ -5229,7 +5604,8 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
                      threadId=thread)
         try:
             # The goal stays paused: Codex answers this one turn and never continues the proof by itself.
-            rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
+            if not tcs:
+                rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
         except (runtime.Error, OSError) as exc:
             if isinstance(exc, (SafetyStop, ToolRuntimeUnavailable)):
                 raise
@@ -5297,7 +5673,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
             "classic": isinstance(exc, ToolRuntimeUnavailable)}) from exc
     finally:
         stop.set()
-        if rpc is not None and thread:
+        if rpc is not None and thread and not tcs:
             def pause():
                 try:
                     rpc.call("thread/goal/set", {"threadId": thread, "status": "paused"})
@@ -6137,7 +6513,7 @@ def load_workflow(path):
         raise ValueError("A workflow must contain only prompts and nodes.")
     prompts, nodes = workflow["prompts"], workflow["nodes"]
     if not isinstance(prompts, dict) or not all(
-        isinstance(name, str) and isinstance(value, str) and value.strip()
+        isinstance(name, str) and isinstance(value, str) and (value.strip() or name in EMPTY_ALLOWED_PROMPTS)
         for name, value in prompts.items()
     ):
         raise ValueError("Workflow prompts must be named nonempty strings.")
@@ -6548,10 +6924,20 @@ def prepare(workflow, options):
     active_prompts = set().union(*(_node_prompt_names(node) for node in enabled))
     inactive_prompts = set().union(*(_node_prompt_names(node) for node in workflow["nodes"].values())) - active_prompts
     prompts = dict(workflow["prompts"])
-    prompts.update({name: value for name, value in options.get("prompts", {}).items()
-                    if name in prompts and name not in inactive_prompts})
-    if not all(isinstance(value, str) and value.strip() for value in prompts.values()):
+    # The job's saved texts (--prompt-set-file: every text it runs with, saved at its start), then its per-role
+    # prompt files, which hold the same role prompts.
+    for source in (options.get("prompt_set") or {}, options.get("prompts", {})):
+        prompts.update({name: value for name, value in source.items()
+                        if name in prompts and name not in inactive_prompts})
+    if not all(isinstance(value, str) and (value.strip() or name in EMPTY_ALLOWED_PROMPTS)
+               for name, value in prompts.items()):
         raise ValueError("Prompt overrides must be nonempty strings.")
+    for name, fields in HARNESS_TEXTS.items():
+        if name in prompts and fields is not None:
+            try:
+                _template_parts(prompts[name], fields)
+            except ValueError as exc:
+                raise ValueError(f"Prompt {name}: {exc}") from exc
     for node in enabled:
         if node["run"] == "command":
             continue
@@ -6579,9 +6965,7 @@ def prepare(workflow, options):
                 # the message and its answer file, the note on a refused submission its reason, the
                 # subagents note their number and the coordinator's time check the elapsed time and the time
                 # limit (the controller renders these with nothing else).
-                return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
-                        else {"message", "answer_file"} if key == "chat" else {"elapsed", "limit"} if key == "checkin"
-                        else fields | {"message"} if key == "conversation" else fields)
+                return _lifecycle_fields(key, fields)
 
             for key, reference in _lifecycle_map(node["lifecycle"]).items():
                 _template_parts(prompts[reference], lifecycle_fields(key))
@@ -6596,6 +6980,75 @@ def prepare(workflow, options):
                 for key, reference in _lifecycle_map(binding["lifecycle"]).items():
                     _template_parts(prompts[reference], lifecycle_fields(key))
     return prompts
+
+
+def _lifecycle_fields(key, fields):
+    """The placeholders of the lifecycle prompt bound to ``key`` (prepare()), from a goal node's ``fields``."""
+
+    return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
+            else {"message", "answer_file"} if key == "chat" else {"elapsed", "limit"} if key == "checkin"
+            else fields | {"message"} if key == "conversation" else fields)
+
+
+def prompt_rules(workflow):
+    """How the runner checks each prompt of ``workflow`` before a launch: {name: (fields, marker)}.
+
+    ``fields`` is the set of placeholders the text may use, or None for a text that is used as written (never
+    rendered, so a brace is plain text); ``marker`` is the statement marker the text must hold exactly once, or
+    None. It follows prepare() with every stage on and the coordinator's prompts included; a text two uses render
+    may use only the placeholders both allow. The Prompts dialog checks edits with it (runner/prompt_catalog.py).
+    """
+
+    rules = {name: [None, None] for name in workflow["prompts"]}
+
+    def allow(name, fields, marker=None):
+        rule = rules.setdefault(name, [None, None])
+        if fields is not None:
+            rule[0] = set(fields) if rule[0] is None else rule[0] & set(fields)
+        rule[1] = marker or rule[1]
+
+    for name, fields in HARNESS_TEXTS.items():
+        if name in rules and fields is not None:
+            allow(name, fields)
+    for node in workflow["nodes"].values():
+        if node["run"] == "structured":
+            if node.get("subagents") is not None:
+                for name in node.get("instructions", []):
+                    allow(name, {"count"})
+            reference = node["prompt"]
+            for name in ([reference["then"], reference["else"]] if isinstance(reference, dict) else [reference]):
+                allow(name, set(node.get("inputs", {})) | {"instructions"})
+        elif node["run"] == "goal":
+            fields = {"original_prompt", "directory", "solution", "bugs", "round", "revision_number",
+                      "instruction"} | set(node["resume"])
+            allow(node["prompt"], None, node["marker"])
+            if "recovery" in node:
+                allow(node["recovery"]["prompt"], fields)
+            for key, reference in _lifecycle_map(node["lifecycle"]).items():
+                allow(reference, _lifecycle_fields(key, fields))
+            if isinstance(node.get("coordinator"), dict):
+                allow(node["coordinator"]["prompt"], {"author_subagents"}, node["marker"])
+                for key, reference in _lifecycle_map(node["coordinator"]["lifecycle"]).items():
+                    allow(reference, _lifecycle_fields(key, fields))
+    return {name: (rule[0], rule[1]) for name, rule in rules.items()}
+
+
+def prompt_problem(name, text, rule):
+    """Why ``text`` cannot be the prompt ``name`` under ``rule`` (prompt_rules()), or None."""
+
+    fields, marker = rule
+    if not isinstance(text, str):
+        return "A prompt must be text."
+    if not text.strip() and name not in EMPTY_ALLOWED_PROMPTS:
+        return "A prompt cannot be empty."
+    if marker is not None and text.count(marker) != 1:
+        return f"It must contain {marker} exactly once."
+    if fields is not None:
+        try:
+            _template_parts(text, fields)
+        except ValueError as exc:
+            return str(exc)
+    return None
 
 
 def _instructions(node, prompts, values=None):
@@ -6684,6 +7137,16 @@ def checkin_text(template, elapsed, hours, remaining):
         left = f"about {_clock_text(remaining)} left" if remaining >= 60 else "less than 1 min left"
         limit = f"Time limit: {_clock_text(hours * 3600)}, {left}."
     return render_template(template, {"elapsed": _clock_text(elapsed), "limit": limit})
+
+
+def goal_limit_text(hours, remaining):
+    """{limit} of the goal continuation (TCS Prover's goal loop): the job's time limit ``hours`` (0: none) and the
+    seconds left of it, "10 h, about 4 h 48 min left", or "none"."""
+
+    if not hours:
+        return "none"
+    left = f"about {_clock_text(remaining)} left" if remaining >= 60 else "less than 1 min left"
+    return f"{_clock_text(hours * 3600)}, {left}"
 
 
 def prepare_memory_folder(directory, stage):
@@ -7816,6 +8279,9 @@ def _execute(workflow, state, options, prompts):
         _capture_unreviewed_proof(workflow, state, options)
         return state
     sessions, revisions, launchers = {}, {}, {}
+    # TCS Prover's MCP service of this runner (team.Service) and the author coordinator's team, by node: made when
+    # an author needs them, ended with the run's steps.
+    services, teams = [], {}
     options.setdefault("_workflow_started", _now())
     retry_clock(options)
     # The time limit stops only the author: later steps always finish (see workflow_remaining). They
@@ -7889,10 +8355,11 @@ def _execute(workflow, state, options, prompts):
                     inline = "\n\n" + INLINE_PROOF_NOTE if not proof_handoff.file_handoff_supported() else ""
                     directory = options.get("goal_cwd") or str(Path.cwd())
 
-                    def plan(coordinating, appendix):
+                    def plan(coordinating, appendix, note=""):
                         """How the author starts: its first prompt, its lifecycle prompts and any recovered critic
                         feedback, as the author coordinator (``coordinating``, the node's coordinator binding) or
-                        as the author alone, with the subagents note when ``appendix`` says so."""
+                        as the author alone, with the subagents note when ``appendix`` says so; ``note`` is the
+                        team note of a coordinator with TCS Prover's team."""
 
                         bound = ({**lifecycle, **_lifecycle_map(node["coordinator"]["lifecycle"])} if coordinating
                                  else lifecycle)
@@ -7911,6 +8378,10 @@ def _execute(workflow, state, options, prompts):
                             # The author may start subagents: the first prompt says how many, like the related
                             # works, and {original_prompt} carries it into the later prompts.
                             prompt += "\n\n" + render_template(prompts[bound["subagents"]], {"author_subagents": count})
+                        if note:
+                            # The coordinator's team, after the related works and before the inline proof note;
+                            # {original_prompt} carries it into the later prompts.
+                            prompt += "\n\n" + note
                         prompt += inline
                         session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
                                            for key, ref in bound.items() if key != "subagents"}
@@ -7931,7 +8402,43 @@ def _execute(workflow, state, options, prompts):
                     if count is not None:
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
-                    if coordinator and multi_agent_version(settings["model"]) == 0:
+                    texts = {name: prompts[name] for name in HARNESS_TEXTS if name in prompts}
+                    crew = None
+                    if coordinator and options.get("author_team", "builtin") == "tcs":
+                        if retrieval_policy(directory, features):
+                            # A web-cutoff run's audited configuration has no place for TCS Prover's server: its
+                            # coordinator keeps the CLI's own subagents (docs/workflow.md).
+                            emit("status", stage_name, node=current, label="Built-in subagents",
+                                 text="Web-cutoff runs keep the CLI's own subagent tool for the coordinator, with "
+                                      "the coordinator's model; TCS Prover's team is used in live runs only.")
+                        else:
+                            missing = [name for name in ("team_note", "team_member", *(
+                                name for name in HARNESS_TEXTS if name.startswith("team_tool_"))) if name not in texts]
+                            if missing:
+                                raise ConfigurationError(f"The workflow has no {', '.join(missing)} text, which the "
+                                                         "coordinator's team needs.")
+                            models = options.get("author_subagent_models")
+                            try:
+                                models = team_module.validated_team(models, count)
+                            except ValueError as exc:
+                                raise ConfigurationError(str(exc)) from exc
+                            members = team_module.team_members(models, settings["model"], settings["effort"], count)
+                            crew = teams.get(current)
+                            if crew is None or crew.closed is not None:
+                                crew = teams[current] = start_team(members, prompts=texts, directory=directory,
+                                                                   settings=settings, stage=stage_name,
+                                                                   node_name=current)
+                            # Its members are TCS Prover's: the coordinator gets no subagent tool of its CLI.
+                            features = [feature for feature in features if feature != "multi_agent"]
+                            note = team_module.team_note(texts["team_note"], members, render_template)
+                    if crew is not None:
+                        start = plan(True, False, note)
+                        prepare_memory_folder(directory, stage_name)
+                        if claude:
+                            # Claude Code's --bare mode may load no MCP server (claude_cli.goal_session): the author
+                            # then works alone like this.
+                            alone = plan(False, False)
+                    elif coordinator and multi_agent_version(settings["model"]) == 0:
                         # Codex gives this model no subagent tool: the author works alone, without the subagent
                         # feature and the subagents note, as with Author subagents 0.
                         coordinator = False
@@ -7952,11 +8459,19 @@ def _execute(workflow, state, options, prompts):
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
                     if alone is not None:
                         alone.pop("bound")
+                    service = None
+                    if crew is not None or (not claude and options.get("goal_loop", "codex") == "tcs"
+                                            and not retrieval_policy(directory, features)):
+                        if not services:
+                            services.append(team_module.Service())
+                        service = services[0]
                     launch = functools.partial(
                         claude_cli.goal_session if claude else goal_session, sys.modules[__name__], prompt,
                         prompts=session_prompts, settings=settings, features=features,
-                        stages=node.get("stages"), node_name=current,
+                        stages=node.get("stages"), node_name=current, texts=texts,
                         **({"coordinator": True} if coordinator else {}), **({"alone": alone} if alone else {}),
+                        **({"team": crew} if crew is not None else {}),
+                        **({"service": service} if service is not None else {}),
                     )
                     launchers[current] = (launch, instruction)
                     refused, bound = state.get("handoff_refused"), start["bound"]
@@ -8063,6 +8578,10 @@ def _execute(workflow, state, options, prompts):
     finally:
         for session in sessions.values():
             session.close()
+        for crew in teams.values():
+            crew.close("It stopped when the run's steps ended.")
+        for service in services:
+            service.close()
 
 
 def execute(path, state=None, *, options=None):
@@ -8378,6 +8897,20 @@ def main(argv=None):
                         help="coordinator: the proof author coordinates its subagents (the coordinator prompts); "
                              "author: it works alone even with subagents; auto, the default: coordinator when "
                              "--author-subagents is 1 or more")
+    parser.add_argument("--goal-loop", choices=GOAL_LOOPS, default="tcs",
+                        help="who runs the goal loop of a Codex author or coordinator: tcs, the default, TCS "
+                             "Prover (it starts every turn; the model ends its goal with TCS Prover's update_goal "
+                             "tool); codex: Codex's built-in goal mode")
+    parser.add_argument("--author-team", choices=AUTHOR_TEAMS, default="tcs",
+                        help="the author coordinator's subagents: tcs, the default, TCS Prover's team (any model "
+                             "for each member, see --author-subagent-models); builtin: the CLI's own subagent tool")
+    parser.add_argument("--author-subagent-models", type=author_subagent_models, metavar="JSON",
+                        help="the model of each of the coordinator's team members: a JSON list of exactly "
+                             "--author-subagents entries {\"model\": MODEL, \"effort\": EFFORT}; null or omitted: "
+                             "every member runs the coordinator's model")
+    parser.add_argument("--prompt-set-file",
+                        help="a JSON object {prompt name: text} that replaces the workflows' prompts of those names "
+                             "(a job's saved texts)")
     parser.add_argument("--thinking-hours", type=author_hours, default=DEFAULT_AUTHOR_HOURS)
     parser.add_argument("--elapsed-seconds", type=prior_elapsed_seconds, default=0)
     parser.add_argument("--author-limit-file")
@@ -8400,6 +8933,8 @@ def main(argv=None):
             path = options.pop(f"{role}_prompt_file", None)
             if path:
                 options["prompts"][name] = prompt_file(path, None)
+        if options.get("prompt_set_file"):
+            options["prompt_set"] = prompt_set(options.pop("prompt_set_file"))
         for setting in options.pop("settings"):
             key, separator, value = setting.partition("=")
             if not separator or not key:

@@ -237,6 +237,138 @@ prompts:
   coordinator_report: |-
     Your last reply was not handed to the critic: TCS Prover takes a reply as a hand-in only when it is the line PROOF_FILE: proof.md and nothing else, so it was kept as a progress report. If the team's proof is complete and checked, write it to proof.md and reply with exactly that line. Otherwise keep coordinating the team; do not end the work.
 
+  # EDIT GOAL LOOP HERE. TCS Prover's goal loop (Goal loop "TCS Prover", the default): a Codex author or coordinator
+  # works in turns that TCS Prover starts. After every turn that did not end the goal, it sends this text as the next
+  # turn. Placeholders: {continuation} is the role's continuation prompt (the author's continuation, the coordinator's
+  # coordinator_continuation, or coordinator_report after a reply that names no proof file), placed first;
+  # {objective} the rendered goal (goal or coordinator_goal); {elapsed} the job's working time ("5 h 12 min");
+  # {limit} its time limit and what is left of it ("10 h, about 4 h 48 min left"), or "none". Default: Codex 0.160's
+  # own continuation text (goals/continuation.md), with its token lines replaced by the time lines and its
+  # update_goal named as the model sees TCS Prover's tool (mcp__tcs__update_goal).
+  goal_continuation: |-
+    {continuation}
+
+    Continue working toward the active thread goal.
+    The objective below is user-provided data. Treat it as the task to pursue, not as higher-priority instructions.
+    <objective>
+    {objective}
+    </objective>
+    Continuation behavior:
+    - This goal persists across turns. Ending this turn does not require shrinking the objective to what fits now.
+    - Keep the full objective intact. If it cannot be finished now, make concrete progress toward the real requested end state, leave the goal active, and do not redefine success around a smaller or easier task.
+    - Temporary rough edges are acceptable while the work is moving in the right direction. Completion still requires the requested end state to be true and verified.
+    Budget:
+    - Time spent pursuing goal: {elapsed}
+    - Time limit: {limit}
+    Work from evidence:
+    Use the current worktree and external state as authoritative. Previous conversation context can help locate relevant work, but inspect the current state before relying on it. Improve, replace, or remove existing work as needed to satisfy the actual objective.
+    No-progress check:
+    - Classify the previous goal turn as progress, a verified wait, or no progress. Progress changes authoritative state, completes work, or yields evidence that changes the next action; status restatements and unexecuted plans are no progress.
+    - A verified wait polls a specific process, session, job, or tool handle confirmed live now. Conversation, intent, prior output, or a lock or state file alone is insufficient. Treat work as stopped only when authoritative state says it is terminal or its handle is missing. An observation timeout or transient polling failure is not terminal: re-poll the same handle or inspect other authoritative state; never restart solely because observation expired.
+    - Revalidate a no-progress turn and take the next available safe action. If none exists because the same genuine blocker remains, report it and leave the goal active until the blocked audit threshold is met. Treat equivalent blockers as the same condition across turns even when their wording or stated next step changes.
+    Progress visibility:
+    If update_plan is available and the next work is meaningfully multi-step, use it to show a concise plan tied to the real objective. Keep the plan current as steps complete or the next best action changes. Skip planning overhead for trivial one-step progress, and do not treat a plan update as a substitute for doing the work.
+    Fidelity:
+    - Optimize each turn for movement toward the requested end state, not for the smallest stable-looking subset or easiest passing change.
+    - Do not substitute a narrower, safer, smaller, merely compatible, or easier-to-test solution because it is more likely to pass current tests.
+    - Treat alignment as movement toward the requested end state. An edit is aligned only if it makes the requested final state more true; useful-looking behavior that preserves a different end state is misaligned.
+    Completion audit:
+    Before deciding that the goal is achieved, treat completion as unproven and verify it against the actual current state:
+    - Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.
+    - Preserve the original scope; do not redefine success around the work that already exists.
+    - For every explicit requirement, numbered item, named artifact, command, test, gate, invariant, and deliverable, identify the authoritative evidence that would prove it, then inspect the relevant current-state sources: files, command output, test results, PR state, rendered artifacts, runtime behavior, or other authoritative evidence.
+    - For each item, determine whether the evidence proves completion, contradicts completion, shows incomplete work, is too weak or indirect to verify completion, or is missing.
+    - Match the verification scope to the requirement's scope; do not use a narrow check to support a broad claim.
+    - Treat tests, manifests, verifiers, green checks, and search results as evidence only after confirming they cover the relevant requirement.
+    - Treat uncertain or indirect evidence as not achieved; gather stronger evidence or continue the work.
+    - The audit must prove completion, not merely fail to find obvious remaining work.
+    Do not rely on intent, partial progress, memory of earlier work, or a plausible final answer as proof of completion. Marking the goal complete is a claim that the full objective has been finished and can withstand requirement-by-requirement scrutiny. Only mark the goal achieved when current evidence proves every requirement has been satisfied and no required work remains. If the evidence is incomplete, weak, indirect, merely consistent with completion, or leaves any requirement missing, incomplete, or unverified, keep working instead of marking the goal complete. If the objective is achieved, call mcp__tcs__update_goal with status "complete" so usage accounting is preserved. If the achieved goal has a token budget, report the final consumed token budget to the user after mcp__tcs__update_goal succeeds.
+    Blocked audit:
+    - Do not call mcp__tcs__update_goal with status "blocked" the first time a blocker appears.
+    - Only use status "blocked" when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic goal continuations.
+    - If the user resumes a goal that was previously marked "blocked", treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, call mcp__tcs__update_goal with status "blocked" again.
+    - Use status "blocked" only when you are truly at an impasse and cannot make meaningful progress without user input or an external-state change.
+    - Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; call mcp__tcs__update_goal with status "blocked".
+    - Never use status "blocked" merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
+    Call mcp__tcs__update_goal only after the completion or blocked audit passes, or when the user explicitly requests pausing this goal. For a requested pause, use status "paused", report the returned status, and stop goal work; never pause on your own initiative. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.
+  # EDIT GOAL TOOL HERE: the description of the update_goal tool (TCS Prover's MCP server "tcs") with which a Codex
+  # author or coordinator under TCS Prover's goal loop ends its goal: status complete hands its turn's final reply on
+  # (as Codex's goal mode does); blocked and paused are recorded and the next turn follows (TCS Prover never stops by
+  # itself). No placeholders; used as written. Default: Codex 0.160's update_goal description.
+  goal_tool_update_goal: |-
+    Update the existing goal.
+    Set status to `paused` only at the user's explicit request to pause this goal, never on your own initiative. Ask if unclear; a later resume revokes that request. Report the returned status and stop goal work. Budget limits take precedence over pausing.
+    Set status to `complete` only when the objective has actually been achieved and no required work remains.
+    Set status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.
+    If the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, set status to `blocked` again.
+    Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.
+    Do not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.
+    Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.
+    You cannot use this tool to resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.
+    When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user.
+  # The description of update_goal's status argument (complete, blocked or paused). Default: Codex 0.160's.
+  goal_tool_update_goal_status: |-
+    Required. `paused` requires an explicit user request. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit.
+  # The description of update_goal's optional note argument (TCS Prover's own, shown on the job page).
+  goal_tool_update_goal_note: |-
+    Optional. A short note for the user on the goal's state, for example the blocking condition; it is shown on the job page.
+  # EDIT CLAUDE GOAL NOTE HERE: the harness note added to the system prompt of a Claude Code author or coordinator,
+  # which ends every turn with a structured goal status. {objective} is the rendered goal (goal or coordinator_goal).
+  claude_goal_harness: |-
+    TCS PROVER HARNESS NOTE (provider plumbing; the task itself arrives in the user messages)
+    You are working on one long-running, autonomous goal in a persistent conversation. Nobody answers questions during the work; keep working with your tools.
+
+    GOAL OBJECTIVE:
+    {objective}
+
+    End every turn by calling the StructuredOutput tool:
+    - goal_status "complete" only when the goal objective is fully achieved. final_answer must then be exactly the final response the task instructions ask for (for example "PROOF_FILE: proof.md", or the complete inline proof) and nothing else.
+    - Otherwise goal_status "in_progress" (more work remains) or "blocked" (no further progress is possible right now), an empty final_answer and a short progress_note. You will then be asked to continue.
+  # EDIT CODEX COMPACTION HERE: Codex's compact_prompt setting, the instructions for the summary Codex writes when it
+  # compacts the conversation of a Codex author, coordinator or team member. Empty (the default): Codex's own. No
+  # placeholders.
+  codex_compact_prompt: ''
+
+  # EDIT TEAM HERE: appended to the coordinator's first prompt (after the related works), so that {original_prompt}
+  # carries it into the later prompts. {members} is the list of members, one line each
+  # ("- member 1: GPT 6.1 Sol (Codex CLI)").
+  team_note: |-
+    YOUR TEAM
+    Your author subagents are TCS Prover team members, each running its own model:
+    {members}
+    Give a member an assignment with team_assign; each member works on one assignment at a time and starts fresh, knowing only what you write. Use team_wait to wait for reports (up to 30 minutes at a time), team_members to see who is working, team_followup to continue a member's last assignment in its own conversation, and team_stop to stop an assignment. A member's final reply is its report, also saved in the run folder.
+  # What a team member receives for an assignment (team_assign) or a follow-up (team_followup): {assignment} is the
+  # coordinator's text.
+  team_member: |-
+    {assignment}
+
+    Your final reply is your report to the coordinator.
+
+  # EDIT TEAM TOOLS HERE: the descriptions of the coordinator's team tools (TCS Prover's MCP server "tcs") and of their
+  # arguments, as the coordinator reads them. No placeholders; used as written.
+  team_tool_members: |-
+    List your team's members: each member's number, its model and the program that runs it, and its state (idle; working on an assignment, named by its first line, since a given time; or stopping). Check it before you assign work, so that no member stays idle.
+  team_tool_assign: |-
+    Start an assignment on an idle team member and return at once; the member works in the background while you go on. The member starts a fresh conversation in your working directory, which it shares with you and the other members (it may read and write files there), and knows only what you write: make the assignment concrete and self-contained (the exact statement or claim, the approach to take, the files to read and the file to write its results to). Its final reply is its report to you, also saved in the run folder; collect it with team_wait. Delegating is your job: keep every member working on a distinct, useful assignment. Refused for a busy member, an unknown member number or an empty assignment.
+  team_tool_assign_member: |-
+    The member's number, as team_members lists it (1 is the first member).
+  team_tool_assign_assignment: |-
+    The complete assignment: everything the member needs to know, since it sees nothing else of your conversation.
+  team_tool_wait: |-
+    Wait for reports from your team. Returns as soon as an assignment finishes or fails, with every assignment that finished since the last wait, each once: the member, its report (its final reply) and the path of the saved report file; or, when none finishes in time, at the timeout with the members' states. Waiting is part of your normal work as the coordinator: prefer long waits (up to 30 minutes) to repeated short ones. The wait also ends early when TCS Prover sends you a live instruction, a chat message or a time check, which follows this result.
+  team_tool_wait_timeout_minutes: |-
+    How long to wait, in minutes: 1 to 30; 30 when omitted.
+  team_tool_followup: |-
+    Send a follow-up to a team member in the same conversation as its last assignment, so it keeps everything it did and learned there, and return at once; its next final reply is a new report, collected with team_wait. Use it to continue or redirect the same line of work, and team_assign for unrelated work. Refused for a member that is working (stop it first) or whose conversation cannot be continued.
+  team_tool_followup_member: |-
+    The member's number, as team_members lists it (1 is the first member).
+  team_tool_followup_message: |-
+    The follow-up for the member.
+  team_tool_stop: |-
+    Stop a member's current assignment. Its report then says that it was stopped (the files it wrote stay), and the member is idle for a new assignment. Use it when a line of work no longer pays off.
+  team_tool_stop_member: |-
+    The member's number, as team_members lists it (1 is the first member).
+
   # EDIT CRITIC HERE: the critic's instructions. {count} is the run's Independent critics setting.
   critic: |-
     Act as a rigorous proof critic. Spawn exactly {count} fresh independent subagent(s) to aggressively find bugs in the

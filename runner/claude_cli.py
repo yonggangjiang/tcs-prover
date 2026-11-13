@@ -67,6 +67,8 @@ SANDBOX_ALL_HOSTS = ("*",)
 BARE_TOOLS = ("Bash", "Read", "Edit")
 STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 SUBAGENT_TOOLS = ("Task", "Agent")
+# How Claude Code names a tool of TCS Prover's MCP server "tcs" (runner/team.py) in --allowedTools and its init.
+TEAM_TOOL_PREFIX = "mcp__tcs__"
 # Subagent outcomes, verified against Claude Code 2.1.289: a subagent that an
 # API error (rate limit, overload, server error) cut off after some work
 # returns that work as an ordinary tool result headed by the error and this
@@ -160,6 +162,11 @@ End every turn by calling the StructuredOutput tool:
 # leftover_authors() also recognizes a conversation CLI.
 CONVERSATION_HARNESS_NOTE = """TCS PROVER HARNESS NOTE (provider plumbing; the message itself arrives in the user turn)
 The long-running goal is paused while the user talks with you. Reply in plain text; this turn needs no structured goal status."""
+
+
+def _team_service():
+    from runner import team  # The service lives in runner/team.py, which imports nothing from here.
+    return team.Service()
 
 
 def _runtime_module(runtime):
@@ -680,14 +687,19 @@ def api_configuration(model, effort, secret, folder, environment, runtime, stage
                   else "The claude command on PATH did not confirm that it uses a private CLAUDE_CONFIG_DIR")
 
 
-def command_arguments(executable_path, model, effort, tools, allowed, settings_path, *, bare, extra=(), denied=()):
-    """Common flags of every Claude role; ``denied`` are tools an earlier CLI offered unasked."""
+def command_arguments(executable_path, model, effort, tools, allowed, settings_path, *, bare, extra=(), denied=(),
+                      mcp_config=None):
+    """Common flags of every Claude role; ``denied`` are tools an earlier CLI offered unasked.
+
+    ``mcp_config`` is the file of TCS Prover's own MCP server (the coordinator's team, team.Service.claude_config());
+    without it the CLI gets none.
+    """
 
     return [
         executable_path, "-p", "--output-format", "stream-json", "--verbose",
         "--model", providers.wire_model(model), "--effort", effort,
         # Never load the user's MCP servers, customizations or browser integration.
-        "--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG,
+        "--strict-mcp-config", "--mcp-config", str(mcp_config) if mcp_config else EMPTY_MCP_CONFIG,
         "--safe-mode", "--disable-slash-commands", "--no-chrome", "--restricted",
         # Anything not pre-approved is denied; nothing ever waits for a prompt.
         "--permission-mode", "dontAsk", "--permission-prompts", "none",
@@ -1009,7 +1021,8 @@ def subagent_failure(block):
 
 
 def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, activity_label, features,
-                   workspace, environment, runtime=None, conversation=None, deadline=None, subagents=None):
+                   workspace, environment, runtime=None, conversation=None, deadline=None, subagents=None,
+                   role="structured", record=None, started=None):
     """Run one structured Claude request and return its structured output as JSON text.
 
     workflow_runner.structured() decodes, validates and retries the returned
@@ -1033,6 +1046,15 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     With the multi_agent feature (the critic) the CLI offers the subagent
     tool, with the settings of SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
     ``subagents`` (the critic's number) is how many may run at once.
+
+    A team member's assignment (runner/team.py) runs here too, with ``role``
+    "author" and no ``schema``: the author's tools in the author's working
+    folder ``workspace`` (its search mode, its private configuration folder
+    for an API model and the deny rules that keep its controller files
+    read-only, as goal_session() sets them), no liveness heartbeat, and its
+    final reply as the answer. ``record(event, root)`` then receives its
+    events instead of the run's records, and ``started(process)`` the CLI
+    process, which a stop of the member ends.
     """
 
     runtime = _runtime_module(runtime)
@@ -1044,12 +1066,14 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
             f"Add an API key for {providers.model_label(model)} in Advanced settings → API models.")
     if secret and hasattr(runtime, "register_secret"):
         runtime.register_secret(secret)
-    choice = {"live_search": search_is_live(None, runtime), "bash": sandbox_supported()}
-    home, reason = (api_configuration(model, effort, secret, Path.cwd(), environment, runtime, stage) if api
+    member = role == "author"
+    folder = Path(workspace) if member else Path.cwd()
+    choice = {"live_search": search_is_live(folder if member else None, runtime), "bash": sandbox_supported()}
+    home, reason = (api_configuration(model, effort, secret, folder, environment, runtime, stage) if api
                     else (None, ""))
     bare = api and home is None
-    tools, allowed = tool_permissions("structured", features, bare=bare, **choice)
-    dropped = sorted(set(tool_permissions("structured", features, bare=False, **choice)[0]) - set(tools))
+    tools, allowed = tool_permissions(role, features, bare=bare, **choice)
+    dropped = sorted(set(tool_permissions(role, features, bare=False, **choice)[0]) - set(tools))
     if dropped:
         runtime.emit("status", stage, label="Claude API mode tools",
                      text=f"{reason}, so Anthropic-format API models run Claude Code in --bare mode, which does "
@@ -1057,9 +1081,11 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     denied = disallowed_tools()
     temp = bash_temp(tools, workspace, runtime)
     subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
+    protected, protected_paths = protected_settings(workspace) if member else ({}, [])
     settings = PrivateSettings(lambda directory: {
         **({"permissions": {"deny": list(SUBAGENT_DENIED)}} if subagent_tool else {}),
-        **({"sandbox": sandbox_settings(hidden_paths(api), workspace=workspace, temp=temp,
+        **protected,
+        **({"sandbox": sandbox_settings(hidden_paths(api), protected_paths, workspace=workspace, temp=temp,
                                         live=choice["live_search"])}
            if "Bash" in tools else {}),
         **({"env": gateway_environment(model, secret)} if api else {}),
@@ -1081,7 +1107,7 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
     try:
         arguments = command_arguments(
             located(runtime, model, stage), model, effort, tools, allowed, settings.path, bare=bare, denied=denied,
-            extra=["--json-schema", json.dumps(schema, ensure_ascii=False),
+            extra=[*(["--json-schema", json.dumps(schema, ensure_ascii=False)] if schema is not None else []),
                    *(SUMMARY_DISPLAY if summaries else [])],
         )
         # The session flag precedes every free-text option.
@@ -1095,10 +1121,13 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
         except OSError as exc:
             exc.cli_problem = "Claude"  # The CLI could not be started at all.
             raise
+        if started is not None:
+            started(process)
         monitor = runtime.RequestMonitor(process, stage, model, effort, timeout=timeout,
                                          activity_label=activity_label, cli="Claude",
                                          redact=lambda text: redact(text, secret, runtime),
-                                         **({"deadline": deadline} if deadline is not None else {}))
+                                         **({"deadline": deadline} if deadline is not None else {}),
+                                         **({"heartbeat": False} if record is not None else {}))
         def record_scrub(text):
             return scrub_record(text, secret, runtime)
 
@@ -1126,7 +1155,9 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
 
         def publish(event, root=True):
             event = runtime.public_event(event)
-            if event is not None:
+            if event is not None and record is not None:
+                record(event, root)
+            elif event is not None:
                 runtime.emit("codex_event", stage, event=event, activityLabel=activity_label or "",
                              root=root, provider="claude")
 
@@ -1169,12 +1200,12 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
                         None, "failed" if failed else "completed", usage=usage,
                         error=failure_detail(message, (), secret, runtime, 1000, scrub=record_scrub)
                         if failed else None))
-                    if usage:
+                    if usage and record is None:
                         runtime.emit_cache_usage(stage, usage)
                     monitor.observed(False)
                 else:
                     retrying = api_retry_text(message)
-                    if retrying:
+                    if retrying and record is None:
                         runtime.emit("status", stage, label=f"{activity_label} · Claude API retry" if activity_label
                                      else "Claude API retry", text=retrying, activityLabel=activity_label or "")
                     # The heartbeat names a retry the CLI waits for, until anything else arrives.
@@ -1560,7 +1591,7 @@ def pause_request_cause(path):
 
 def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  node_name="author", stages=None, initial_instruction="", handoff_note="", coordinator=False,
-                 alone=None):
+                 alone=None, texts=None, team=None, service=None):
     """Run the persistent author through Claude with the Codex goal-session protocol.
 
     Drop-in replacement for workflow_runner.goal_session: same generator
@@ -1642,11 +1673,23 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
       subagent tool (--bare) runs ``alone`` instead: the author's own first
       prompt, lifecycle prompts and critic feedback ({"prompt", "prompts",
       "recovery"}), without any of this, and the run says so once.
+
+    The harness note is the ``texts`` claude_goal_harness text (an editable
+    prompt; GOAL_HARNESS_PROMPT where a workflow has none) with {objective}.
+    A coordinator with ``team`` (workflow_runner._execute: TCS Prover's team in
+    place of the Agent tool) gets TCS Prover's MCP server with its team tools
+    (--mcp-config with that server only, its tools pre-approved), served by
+    ``service`` or by one of this session; in --bare mode, which may load no
+    such server, it works ``alone`` as above. A live instruction or time check
+    written to it ends a running team_wait early (team.Team.attention()), and
+    an end that is not retried stops the team's members.
     """
 
     directory = os.path.abspath(os.fspath(options.get("goal_cwd") or os.getcwd()))
     if runtime.retrieval_policy(directory, features):
         raise _failure(runtime, "ConfigurationError")(HISTORICAL_MESSAGE)
+    texts = texts or {}
+    own_service = None
     stages = stages or {"initial": "solve", "resume": "repair", "failure": "failure"}
     continued = options.get("goal_retry") if isinstance(options.get("goal_retry"), dict) else {}
     rewind = continued.get("rewind") if isinstance(continued.get("rewind"), dict) else {}
@@ -1716,6 +1759,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     activity = {"last": time.monotonic(), "probe": None, "at": None}
     seen_compactions = set()
     tools = []
+    tools_expected = None  # With the team: tools and the team's MCP tools, which init also lists.
     denied = []
     pause_reason = ""
     retry = None
@@ -1802,6 +1846,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
 
     def steer(instruction, identity):
         send_user(instruction, "steer", identity)
+        if team is not None:
+            team.attention("a live instruction")  # A running team_wait returns, so Claude reads it now.
         # The controller recognizes a restored instruction by its command id.
         emit("request", label="Live author instruction sent", text=instruction, threadId=session, steerId=identity)
 
@@ -1845,6 +1891,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         try:
             # (the last check before it, its working time, its text)
             send_user(instruction, "checkin", (previous, int(elapsed), instruction))
+            if team is not None:
+                team.attention("a time check")
         except (OSError, ValueError) as exc:
             checks.last, check_failed["turn"] = previous, state["turn"]
             emit("diagnostic", text=f"Could not send the time check ({exc}); it is sent again when the next turn "
@@ -2173,8 +2221,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                  text=f"{reason}, so Anthropic-format API models run Claude Code in --bare mode, which does not "
                       f"offer {', '.join(dropped)}.")
         subagent_tool = bool(set(tools) & set(SUBAGENT_TOOLS))
-        if coordinator and alone is not None and not subagent_tool:
-            # No subagent tool (--bare): the author works alone, with its own prompts.
+        if coordinator and alone is not None and (bare if team is not None else not subagent_tool):
+            # No subagent tool (--bare), or no MCP server there for the team: the author works alone, with its own
+            # prompts.
+            if team is not None:
+                team.close("It stopped when the author began working alone.")
+                team = None
             coordinator = False
             prompt, prompts = alone["prompt"], alone["prompts"]
             initial_instruction = alone["recovery"] if initial_instruction else ""
@@ -2204,10 +2256,22 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             copies = _run_folder(providers.CLAUDE_TRANSCRIPTS, directory, runtime)
         except runtime.Error as exc:
             emit("diagnostic", text=f"No private copy of the author conversation can be kept: {exc}")
-        harness = private.write(HARNESS_FILE, GOAL_HARNESS_PROMPT.replace("[OBJECTIVE]", render("goal")))
+        harness = private.write(HARNESS_FILE, runtime.render_template(texts["claude_goal_harness"],
+                                                                       {"objective": render("goal")})
+                                if "claude_goal_harness" in texts
+                                else GOAL_HARNESS_PROMPT.replace("[OBJECTIVE]", render("goal")))
+        mcp_config = None
+        if team is not None:
+            if service is None:
+                service = own_service = _team_service()
+            service.add(team)
+            mcp_config = private.write("mcp-servers.json", json.dumps(service.claude_config()))
+            team_tools = [f"{TEAM_TOOL_PREFIX}{name}" for name in service.names()]
+            allowed = [*allowed, *team_tools]
+            tools_expected = [*tools, *team_tools]
         base_command = command_arguments(
             located(runtime, model, "solve"), model, settings["effort"], tools, allowed, private.path, bare=bare,
-            denied=denied,
+            denied=denied, mcp_config=mcp_config,
             extra=["--input-format", "stream-json", "--replay-user-messages",
                    *(SUMMARY_DISPLAY if summaries else []),
                    "--json-schema", json.dumps(GOAL_TURN_SCHEMA),
@@ -2381,7 +2445,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             if kind == "system":
                 subtype = message.get("subtype")
                 if subtype == "init" and message.get("parent_tool_use_id") is None:
-                    surprise = unexpected_tools(message, tools)
+                    surprise = unexpected_tools(message, tools_expected or tools)
                     if surprise:
                         raise surprise_failure(surprise, denied, runtime, "the author was stopped")
                     with lock:
@@ -2545,6 +2609,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         if transport is not None:
             # Input already written may have started a turn the CLI is running.
             transport.close(runtime, grace, interrupt=state["running"] or bool(pending))
+        if service is not None and team is not None:
+            service.remove(team)
+        if own_service is not None:
+            own_service.close()
+        if team is not None and retry is None:
+            # Pause, stop, the time limit or the end of the work: the members stop with the coordinator. A failed
+            # model call keeps them working for the next attempt, which reads their reports.
+            team.close(ending["reason"])
         if subagents is not None and hasattr(subagents, "stopped"):
             # Its subagents ran in the CLI: the activity log says that those still running stopped.
             subagents.stopped(ending["reason"])
