@@ -68,6 +68,13 @@ class ServerCase(unittest.TestCase):
                         if key not in {"goalLoop", "authorSubagentModels", "authorTeam"}}
             path.write_text(json.dumps(settings))
             (folder / server.PROMPT_SET_FILENAME).unlink()
+            (folder / server.PROMPT_EDITS_FILENAME).unlink(missing_ok=True)
+
+    def forget_edits(self, app):
+        """Turn a job into one saved before the texts edited for it were (its texts are saved, its edits not)."""
+
+        for folder in (server.controller_directory(app.run_dir), app.run_dir):
+            (folder / server.PROMPT_EDITS_FILENAME).unlink()
 
 
 class JobTests(ServerCase):
@@ -206,6 +213,63 @@ class JobTests(ServerCase):
             server.web_prompt_options({"promptOverrides": {"team_note": 7}}, server.PROOF_PROMPTS)
 
 
+class PromptEditTests(ServerCase):
+    """The texts edited for a job (promptEdits), saved beside every text it runs with: what a rerun carries."""
+
+    def test_a_job_saves_the_texts_edited_for_it_beside_its_texts(self):
+        defaults = server.prompt_defaults()
+        app = self.job({"promptOverrides": {"goal_continuation": "Go on: {continuation} {objective}",
+                                            "team_note": defaults["team_note"]}},
+                       author_prompt="My author. [STATEMENT]  ", critic_prompt=defaults["critic"])
+        # Each edit as the job keeps it; one that left a text as its default is no edit.
+        edits = {"goal_continuation": "Go on: {continuation} {objective}", "author": "My author. [STATEMENT]"}
+        self.assertEqual(app.state["promptEdits"], edits)
+        self.assertEqual({name: app.state["promptSet"][name] for name in edits}, edits)
+        for folder in (server.controller_directory(app.run_dir), app.run_dir):
+            self.assertEqual(json.loads((folder / server.PROMPT_EDITS_FILENAME).read_text()), edits)
+        restored = self.restored(app)
+        self.assertEqual(restored.state["promptEdits"], edits)
+        # A job without edits saves that it has none.
+        plain = self.job()
+        self.assertEqual(plain.state["promptEdits"], {})
+        self.assertEqual(self.restored(plain).state["promptEdits"], {})
+        # A job whose texts were saved before their edits were, and a job from before: none known.
+        self.forget_edits(app)
+        self.assertIsNone(self.restored(app).state["promptEdits"])
+        self.make_old(plain)
+        self.assertIsNone(self.restored(plain).state["promptEdits"])
+
+    def test_a_job_made_from_another_keeps_its_edits_and_adds_the_requests(self):
+        source = self.job({"promptOverrides": {"team_note": "Team: {members}"}}, author_prompt="Mine. [STATEMENT]")
+        edits = {"team_note": "Team: {members}", "author": "Mine. [STATEMENT]"}
+        # The source ran another default of team_wait's description than today's workflow has.
+        source.state["promptSet"] = {**source.state["promptSet"], "team_tool_wait": "Yesterday's wait."}
+        for folder in (server.controller_directory(source.run_dir), source.run_dir):
+            (folder / server.PROMPT_SET_FILENAME).write_text(json.dumps(source.state["promptSet"]))
+        # A continuation runs the source's texts and keeps its edits.
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(source.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual(continued.state["promptSet"], source.state["promptSet"])
+        self.assertEqual(continued.state["promptEdits"], edits)
+        # A revision of a job keeps its edits and adds the request's.
+        team = server.web_team_options({"promptOverrides": {"goal_continuation": "On: {continuation} {objective}"}},
+                                       source.state)
+        self.assertEqual(team["prompt_edits"], {**edits, "goal_continuation": "On: {continuation} {objective}"})
+        options = server.App._workflow_options(include_review=False, author_prompt=source.state["authorPrompt"],
+                                               **team)
+        self.assertEqual(options["promptEdits"], {**edits, "goal_continuation": "On: {continuation} {objective}"})
+        # Made from a job that saved no edits: none known, so it saves none (a rerun then compares with the defaults).
+        self.forget_edits(source)
+        continued = server.App(runs=self.runs, load_latest=False)
+        continued.start_direct_statement(STATEMENT, continuation_source=str(source.run_dir), stopped_stage="solve",
+                                         allow_external_source=True)
+        self.assertEqual(continued.state["promptSet"], source.state["promptSet"])
+        self.assertIsNone(continued.state["promptEdits"])
+        self.assertFalse((server.controller_directory(continued.run_dir) / server.PROMPT_EDITS_FILENAME).exists())
+        self.assertIs(server.web_team_options({}, {**source.state, "promptEdits": None})["prompt_edits"], False)
+
+
 class MemberRecordTests(ServerCase):
     def test_two_assignments_of_one_member_are_both_listed_with_their_own_ids(self):
         records = team_loop.member_records([(1, "Lemma A\nProve it."), (1, "Lemma B\nProve it.")])
@@ -333,13 +397,16 @@ class SetupTests(ServerCase):
 
 class BatchViewTests(ServerCase):
     def test_a_saved_job_in_a_batch_shows_its_loop_team_and_texts(self):
-        app = self.job({"authorSubagentModels": MODELS})
+        app = self.job({"authorSubagentModels": MODELS, "promptOverrides": {"team_note": "Team: {members}"}})
         catalog = batches.BatchCatalog(self.runs) if hasattr(batches, "BatchCatalog") else None
         if catalog is None:
             self.skipTest("no batch catalog class")
         state = catalog.state(batches.ORIGINAL_BATCH, app.run_dir.name)
         self.assertEqual((state["goalLoop"], state["authorSubagentModels"]), ("tcs", MODELS))
         self.assertEqual(state["promptSet"], app.state["promptSet"])
+        # The texts edited for it, which a rerun from the saved batch carries.
+        self.assertEqual(state["promptEdits"], {"team_note": "Team: {members}"})
         self.make_old(app)
         state = catalog.state(batches.ORIGINAL_BATCH, app.run_dir.name)
         self.assertEqual((state["goalLoop"], state["authorTeam"], state["promptSet"]), ("codex", None, None))
+        self.assertIsNone(state["promptEdits"])

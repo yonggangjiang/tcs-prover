@@ -603,7 +603,7 @@ async function rerunWithStatement(statement) {
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
     "authorSubagentModels", "goalLoop", "goalLoopRecorded", "thinkingHours", "skipStatementReview",
-    "statementReviewOnly", "promptSet",
+    "statementReviewOnly", "promptSet", "promptEdits",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
@@ -1515,6 +1515,28 @@ function promptBaseline(name, source = state) {
 function syncPrompts(source = state) {
   promptOverrides = {};
   promptValues = Object.fromEntries(promptNames().map((name) => [name, promptBaseline(name, source) || ""]));
+  if (typeof renderPromptSetting === "function") renderPromptSetting();
+}
+
+// A rerun's texts ("Rerun with suggested statement", see rerunWithStatement), after syncPrompts() with the job's
+// ``settings``: the texts edited for the job become this form's edits of today's defaults. Those it saved as edited
+// (settings.promptEdits) go along when today's workflow still has them and they still differ from today's default;
+// its other texts were the defaults of its day and give way to today's. A job that saved none (one from before) gives
+// every text it saved that differs from today's default (the role prompts only, for a job from before every text was
+// saved).
+function seedPromptOverrides(settings) {
+  const edits = settings.promptEdits;
+  if (edits && typeof edits === "object") {
+    for (const name of promptNames()) {
+      const text = edits[name];
+      if (typeof text === "string" && text.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = text;
+    }
+    promptValues = Object.fromEntries(promptNames().map((name) => [name, promptOverrides[name] ?? promptDefault(name)]));
+  } else {
+    for (const [name, prompt] of Object.entries(promptValues)) {
+      if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;
+    }
+  }
   if (typeof renderPromptSetting === "function") renderPromptSetting();
 }
 
@@ -4376,14 +4398,8 @@ function render(next) {
     ui.problem.value = seed ? seed.statement : state.originalContent || state.draft || state.latexInput || "";
     applyComposerSettings(source);
     syncPrompts(source);
-    if (seed) {
-      // The job's own texts go with the new problem as edits of the defaults: every text it saved that differs from
-      // today's default (the role prompts only, for a job from before every text was saved).
-      for (const [name, prompt] of Object.entries(promptValues)) {
-        if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;
-      }
-      if (typeof renderPromptSetting === "function") renderPromptSetting();
-    }
+    // The job's edited texts go with the new problem (see seedPromptOverrides).
+    if (seed && typeof seedPromptOverrides === "function") seedPromptOverrides(seed.settings);
     // Saved settings (see presetsFormOpened): a fresh form takes the default, when one is saved; a rerun
     // pre-fill and a job sent back to the form keep their own settings.
     if (typeof presetsFormOpened === "function") {

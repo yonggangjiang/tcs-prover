@@ -454,7 +454,15 @@ that every prompt and tool text is the user's to adjust. What the code does:
   state and passes `--prompt-set-file` (catalog names; the runner maps
   `convention` to `convention_critic`), reply turns and the writer included, and
   chat messages use the job's `chat` text. A job from before has no `promptSet`
-  (`goalLoopRecorded: false`) and reads the live workflow, as before.
+  (`goalLoopRecorded: false`) and reads the live workflow, as before. Beside the
+  set, `promptEdits` (`prompts/prompt-edits.json`, `job_prompt_edits()`) keeps
+  the texts edited for the job: a new job's `promptOverrides` and role prompts
+  that differ from the defaults; a job made from another one (a revision in
+  place, a continuation) keeps that one's and adds the request's, or saves none
+  when that one saved none. A rerun (app.js `seedPromptOverrides()`) carries
+  only `promptEdits` (each still in today's catalog and still differing from
+  today's default); without them, every saved text that differs from today's
+  default, as before.
 - **The goal loop** (`goal_session`, `--goal-loop`). `codex` is Codex's goal mode,
   unchanged. `tcs` starts the app-server with `--disable goals` and sends no
   `thread/goal/*` request: TCS Prover starts every turn and, after one that did

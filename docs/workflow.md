@@ -82,11 +82,14 @@ the file is fixed.
   edits apply to the job you are about to start only: they are never remembered
   in the browser, carried into the next new problem or kept in
   [saved settings](saved-settings.md). **Rerun with suggested statement** takes
-  along the job's texts that differ from today's defaults.
+  along the texts that were edited for the job (those that still differ from
+  today's defaults); its other texts were the defaults of its day and give way
+  to today's. A job that saved no record of its edits (one from before) takes
+  along every text it saved that differs from today's defaults.
 - **Each job keeps its texts.** A new job saves the whole set it runs with (the
-  defaults and your edits) in its folders and reads its own copy every time it
-  starts, resumes or continues, so later edits of the workflow files never
-  change a job that has started. **Run settings → View this job's prompts**
+  defaults and your edits) in its folders, and beside it which of them you
+  edited, and reads its own copy every time it starts, resumes or continues, so
+  later edits of the workflow files never change a job that has started. **Run settings → View this job's prompts**
   shows them, read-only, each marked when it differs from today's default. A job
   from before keeps working as it did: it saved only its role prompts (shown
   there with a note) and reads its other texts from the workflow files each time

@@ -1410,6 +1410,11 @@ LEGACY_GOAL_LOOP = "codex"
 # The texts a job runs with (its promptSet, by catalog name: prompt_catalog), saved at its start in its controller
 # folder and its run folder; every launch passes the controller's copy to the runner (--prompt-set-file).
 PROMPT_SET_FILENAME = "prompts/prompt-set.json"
+# The texts the user edited for a job (its promptEdits: the promptOverrides it was started with, by catalog name, each
+# that differs from the default it replaced), saved beside its promptSet: a rerun of the job carries these and nothing
+# else of its set, whose other texts were the defaults of its day. A job that saved none (one from before) is rerun
+# with every saved text that differs from today's default, as before.
+PROMPT_EDITS_FILENAME = "prompts/prompt-edits.json"
 
 
 def web_team_options(body, source=None):
@@ -1426,10 +1431,17 @@ def web_team_options(body, source=None):
     texts = {name: text for name, text in {**saved, **overrides}.items() if name not in PROMPT_ROLES}
     legacy = source is not None and (source.get("goalLoopRecorded") is False
                                      or source.get("goalLoop") not in runtime.GOAL_LOOPS)
+    # What was edited (_workflow_options' prompt_edits): for a job made from another one, the texts edited for that
+    # one and those the request edits now, or False when that one recorded none; a new job's are what it is given.
+    edits = None
+    if source is not None:
+        recorded = source.get("promptEdits")
+        edits = ({**recorded, **{name: text for name, text in overrides.items() if isinstance(text, str)}}
+                 if isinstance(recorded, dict) else False)
     source = source or {}
     return {"goal_loop": body.get("goalLoop", source.get("goalLoop", DEFAULT_GOAL_LOOP)),
             "author_subagent_models": body.get("authorSubagentModels", source.get("authorSubagentModels")),
-            "prompt_overrides": texts, "legacy_team": legacy}
+            "prompt_overrides": texts, "prompt_edits": edits, "legacy_team": legacy}
 
 
 def saved_team_options(state):
@@ -1455,19 +1467,34 @@ def prompt_catalog_check(body):
     return {"errors": prompt_catalog.problems(runtime, overrides)}
 
 
-def job_prompt_set(prompts, overrides):
-    """The full set of texts a new job runs with, by catalog name: the current defaults, its role ``prompts``
-    ({role: text}, already checked) and its other edited ``overrides``, which are checked here as the runner checks
-    them. A problem raises ValueError naming the text."""
+def prompt_defaults():
+    """Every text's current default, by catalog name (the texts of GET /prompt-catalog)."""
+
+    return {entry["name"]: entry["text"] for entry in prompt_catalog.entries(runtime, REVIEW_PROMPT)}
+
+
+def job_prompt_set(prompts, overrides, defaults=None):
+    """The full set of texts a new job runs with, by catalog name: the current ``defaults`` (prompt_defaults()), its
+    role ``prompts`` ({role: text}, already checked) and its other edited ``overrides``, which are checked here as the
+    runner checks them. A problem raises ValueError naming the text."""
 
     problems = prompt_catalog.problems(runtime, overrides or {})
     if problems:
         name, problem = next(iter(sorted(problems.items())))
         raise ValueError(f"The prompt {prompt_catalog.label(name)!r} cannot be used: {problem}")
-    texts = {entry["name"]: entry["text"] for entry in prompt_catalog.entries(runtime, REVIEW_PROMPT)}
+    texts = dict(defaults if defaults is not None else prompt_defaults())
     texts.update(prompts)
     texts.update(overrides or {})
     return texts
+
+
+def job_prompt_edits(edits, defaults):
+    """The texts a new job records as edited (its promptEdits, PROMPT_EDITS_FILENAME): of ``edits`` ({catalog name:
+    text}), each text of a known name that differs from its default in ``defaults`` (whitespace at its ends aside), as
+    the job keeps it (a role prompt without that whitespace)."""
+
+    return {name: text.strip() if name in PROMPT_ROLES else text for name, text in edits.items()
+            if isinstance(text, str) and isinstance(defaults.get(name), str) and text.strip() != defaults[name].strip()}
 
 
 def saved_prompt_set(run_dir):
@@ -1483,9 +1510,23 @@ def saved_prompt_set(run_dir):
     return value
 
 
+def saved_prompt_edits(run_dir):
+    """The texts edited for a saved job (PROMPT_EDITS_FILENAME in its controller folder), or None when it saved none:
+    a job from before, or one whose texts were saved before their edits were (see PROMPT_EDITS_FILENAME)."""
+
+    try:
+        value = json.loads(controlled_path(Path(run_dir), PROMPT_EDITS_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict) or not all(isinstance(name, str) and isinstance(text, str)
+                                              for name, text in value.items()):
+        return None
+    return value
+
+
 def saved_team_state(run_dir):
-    """The goal loop, Subagent models and texts a saved job recorded (its controller's job-settings.json and
-    PROMPT_SET_FILENAME); {} when they cannot be read (a job from before)."""
+    """The goal loop, Subagent models and texts a saved job recorded (its controller's job-settings.json,
+    PROMPT_SET_FILENAME and PROMPT_EDITS_FILENAME); {} when they cannot be read (a job from before)."""
 
     try:
         settings = json.loads(controlled_path(Path(run_dir), JOB_SETTINGS_FILENAME).read_text(encoding="utf-8"))
@@ -1502,6 +1543,9 @@ def saved_team_state(run_dir):
     texts = saved_prompt_set(run_dir)
     if texts is not None:
         state["promptSet"] = texts
+        edits = saved_prompt_edits(run_dir)
+        if edits is not None:
+            state["promptEdits"] = edits
     return state
 
 
@@ -2189,6 +2233,8 @@ def empty_state(trace=None, trace_version=0):
         "authorTeam": None,
         # The texts the job runs with, by Prompts-dialog name (PROMPT_SET_FILENAME), or None for a job from before.
         "promptSet": None,
+        # Those of them the user edited (PROMPT_EDITS_FILENAME), which a rerun carries; None when the job saved none.
+        "promptEdits": None,
         # False for a saved job that recorded no goal loop (every job from before): it keeps Codex's goal mode and
         # the built-in subagents, saves none (see _save_job_settings), and a job made from it keeps them too.
         "goalLoopRecorded": True,
@@ -3098,6 +3144,12 @@ class App:
             self._save_controlled(PROMPT_SET_FILENAME,
                                   json.dumps(texts, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             self._saved_prompt_set = dict(texts)
+        edits = options.get("promptEdits")
+        if isinstance(texts, dict) and isinstance(edits, dict) and edits != getattr(self, "_saved_prompt_edits", None):
+            # Those the user edited (PROMPT_EDITS_FILENAME), beside them.
+            self._save_controlled(PROMPT_EDITS_FILENAME,
+                                  json.dumps(edits, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            self._saved_prompt_edits = dict(edits)
         if options.get("authorModeRecorded") is False:
             # A job from before the coordinator records no mode, so it stays a single author (see AUTHOR_MODES).
             values.pop("authorMode", None)
@@ -3688,7 +3740,8 @@ class App:
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
         workflow_stages=None, coordinator_prompt=None, author_mode=None,
-        goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None, prompt_overrides=None, legacy_team=False,
+        goal_loop=DEFAULT_GOAL_LOOP, author_subagent_models=None, prompt_overrides=None, prompt_edits=None,
+        legacy_team=False,
     ):
         """Normalize and validate settings shared by both input modes.
 
@@ -3703,6 +3756,9 @@ class App:
         TCS Prover team; a web-cutoff coordinator keeps the CLI's built-in subagents). ``legacy_team`` (a job made
         from a job from before) keeps Codex's goal mode and the built-in subagents. ``prompt_overrides`` are the
         edited texts other than the role prompts; with them the job records promptSet, every text it runs with.
+        ``prompt_edits`` ({catalog name: text}) are the texts the user edited, which the job records as promptEdits
+        (job_prompt_edits()): None for a new job, whose role prompts given here and ``prompt_overrides`` are its
+        edits; False when they are not known (a job made from one that recorded none), so it records none either.
         """
 
         stages = normalize_workflow_stages(workflow_stages) if workflow_stages is not None else {
@@ -3835,12 +3891,18 @@ class App:
                 selected_models = [*selected_models, *(entry["model"] for entry in team_models)]
         require_model_access(selected_models)
         api_models = api_model_snapshot(selected_models)
-        prompt_set = job_prompt_set({name: prompts[name] for name in PROMPT_ROLES}, prompt_overrides)
+        defaults_texts = prompt_defaults()
+        prompt_set = job_prompt_set({name: prompts[name] for name in PROMPT_ROLES}, prompt_overrides, defaults_texts)
+        if prompt_edits is None:
+            # A new job: the role prompts it was given and its other texts are what the user edited.
+            prompt_edits = {**{name: value for name, value in supplied_prompts.items() if value is not None},
+                            **(prompt_overrides or {})}
         return {
             "goalLoop": goal_loop,
             "authorSubagentModels": team_models,
             "authorTeam": author_team,
             "promptSet": prompt_set,
+            "promptEdits": None if prompt_edits is False else job_prompt_edits(prompt_edits, defaults_texts),
             **search_options,
             **({"apiModels": api_models} if api_models else {}),
             "workflowStages": stages,
@@ -4030,7 +4092,7 @@ class App:
             unrecorded = {"authorModeRecorded": False} if retry and not self.state.get("authorModeRecorded", True) else {}
             if retry and not self.state.get("goalLoopRecorded", True):
                 # A job from before keeps Codex's goal mode, the built-in subagents and the live workflow's texts.
-                unrecorded.update(goalLoopRecorded=False, promptSet=None)
+                unrecorded.update(goalLoopRecorded=False, promptSet=None, promptEdits=None)
             self._save_job_settings({
                 **options,
                 "problemMode": "statement",
@@ -8937,9 +8999,12 @@ def restore_saved_app(app, *, owned=True):
             ).strip())
         except (OSError, UnicodeError):
             pass
-    # The texts the job runs with (None for a job from before, which runs the live workflow's).
+    # The texts the job runs with (None for a job from before, which runs the live workflow's), and those of them
+    # the user edited (None when it saved none).
     state["promptSet"] = saved_prompt_set(run_dir)
     app._saved_prompt_set = state["promptSet"]
+    state["promptEdits"] = saved_prompt_edits(run_dir) if state["promptSet"] is not None else None
+    app._saved_prompt_edits = state["promptEdits"]
     if "goalLoop" not in persisted_settings:
         state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None, goalLoopRecorded=False)
 

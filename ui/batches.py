@@ -522,7 +522,7 @@ class BatchCatalog:
             state['coordinatorProgress'] = None if log is None else {key: log[key] for key in PROGRESS_LOG_FIELDS}
         # Who ran the goal loop and the coordinator's team, and the texts the job ran with, as a restored job shows
         # them: a job from before had Codex's goal mode and no TCS Prover team, and saved no texts.
-        from .server import LEGACY_GOAL_LOOP, PROMPT_SET_FILENAME, saved_team
+        from .server import LEGACY_GOAL_LOOP, PROMPT_EDITS_FILENAME, PROMPT_SET_FILENAME, saved_team
         from runner import team as team_module
         import workflow_runner
         if settings.get('goalLoop') in workflow_runner.GOAL_LOOPS:
@@ -536,6 +536,15 @@ class BatchCatalog:
             state.update(goalLoop=LEGACY_GOAL_LOOP, authorTeam=None, authorSubagentModels=None)
         texts = self._json(directory, PROMPT_SET_FILENAME, None)
         state['promptSet'] = texts if texts and all(isinstance(value, str) for value in texts.values()) else None
+        # The texts edited for it, which a rerun carries (None: it saved none; {} is a saved "none edited").
+        edits = None
+        if state['promptSet'] is not None:
+            try:
+                edits = json.loads(self._read(directory, PROMPT_EDITS_FILENAME, None) or 'null')
+            except (ValueError, RecursionError):
+                edits = None
+        readable = isinstance(edits, dict) and all(isinstance(value, str) for value in edits.values())
+        state['promptEdits'] = edits if readable else None
         for role in ('review', *PROOF_PROMPTS):
             # Never the current default in place of a saved prompt that is too large to show.
             prompt = (self._too_large(directory, f'prompts/{role}.txt')

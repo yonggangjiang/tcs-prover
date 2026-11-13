@@ -993,7 +993,7 @@ assert.equal(composerSeed.settings.criticPrompt, 'JOB CRITIC PROMPT');
                      "ui.problem.value = seed ? seed.statement :", "setChoice(ui.criticModel, source.criticModel",
                      "ui.criticCount.value = source.criticCount", "ui.authorSubagents.value =",
                      "syncPrompts(source);",
-                     "if (prompt && prompt.trim() !== String(promptDefault(name)).trim()) promptOverrides[name] = prompt;"):
+                     'if (seed && typeof seedPromptOverrides === "function") seedPromptOverrides(seed.settings);'):
             self.assertIn(line, block)
 
     def test_the_markup_and_the_jobs_list(self):
