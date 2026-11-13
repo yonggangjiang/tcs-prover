@@ -602,7 +602,8 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "authorSubagentModels", "goalLoop", "thinkingHours", "skipStatementReview", "statementReviewOnly", "promptSet",
+    "authorSubagentModels", "goalLoop", "goalLoopRecorded", "thinkingHours", "skipStatementReview",
+    "statementReviewOnly", "promptSet",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
   settings.workflowStages = { ...workflowStagesFor(state), author: true };
@@ -2172,7 +2173,8 @@ function describe(entry) {
     "dynamicToolCall", "webSearch", "web_search",
   ]);
   if (toolTypes.has(item.type)) {
-    const action = item.tool || item.name || item.command || item.type;
+    // TCS Prover's own tools (its MCP server "tcs") by their names: Claude Code calls them mcp__tcs__<name>.
+    const action = String(item.tool || item.name || item.command || item.type).replace(/^mcp__tcs__/, "");
     const status = item.status || (name.includes("completed") ? "completed" : "started");
     return {
       key: `tool:${itemId || keyBase}`, type: "tool",
@@ -4414,7 +4416,7 @@ function render(next) {
     ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 3;
     if (typeof applyTeamModels === "function") {
-      applyGoalLoop(state.goalLoop);
+      applyGoalLoop(state.goalLoopRecorded === false ? undefined : state.goalLoop);
       applyTeamModels(state.authorSubagentModels);
     }
     ui.thinkingHours.value = state.thinkingHours ?? 0;
@@ -4622,9 +4624,11 @@ function applyComposerSettings(source) {
   ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 3;
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
-  // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's).
+  // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's). A job from
+  // before the setting (goalLoopRecorded false) ran Codex's goal mode without choosing it: a new job from it gets the
+  // default.
   if (typeof applyTeamModels === "function") {
-    applyGoalLoop(source.goalLoop);
+    applyGoalLoop(source.goalLoopRecorded === false ? undefined : source.goalLoop);
     applyTeamModels(source.authorSubagentModels);
   }
   ui.thinkingHours.value = source.thinkingHours ?? 0;
@@ -8425,12 +8429,7 @@ function setupFormRoles() {
   const catalog = state?.workflow?.settings?.model_catalog;
   if (!(composingProblem && !currentJob && state.phase === "input" && Array.isArray(catalog))) return null;
   const stages = selectedWorkflowStages();
-  const entry = (role, model, on, label = "") => {
-    const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
-    const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
-    return { role, on, model, modelLabel: row?.label || String(label || model).replace(/ — default$/, ""), program,
-      signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
-  };
+  const entry = (role, model, on, label = "") => setupModelRow(catalog, role, model, on, label);
   const rows = ["review", "author", "critic", "writer"].map((role) => {
     const select = ui[`${role}Model`], model = select?.value || "";
     return entry(role, model, Boolean(stages[role === "writer" ? "writing" : role]),
@@ -8442,6 +8441,29 @@ function setupFormRoles() {
     rows.push({ ...entry(`member${index + 1}`, choice.model, true), member: index + 1 });
   });
   return rows;
+}
+
+// One model's row for Setup: what it is, whether its stage is on, the program that runs it (an API model's follows
+// its format) and whether that program must be signed in (a built-in model).
+function setupModelRow(catalog, role, model, on, label = "") {
+  const provider = modelProvider(model), row = catalog.find((item) => item.id === model);
+  const program = provider === "api" ? { openai: "codex", anthropic: "claude" }[row?.format] || "" : provider;
+  return { role, on, model, modelLabel: row?.label || String(label || model).replace(/ — default$/, ""), program,
+    signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
+}
+
+// The author subagents of your default saved settings ("Choose for each"), as Setup rows: GET /setup lists the
+// default settings' roles, and the page adds their subagents (with the Author stage on and 1 or more of them).
+function setupDefaultMembers() {
+  const store = typeof presetStore === "function" ? presetStore() : null;
+  const preset = store?.presets?.find((item) => item.id === store.defaultId && !item.unusable);
+  const settings = preset?.settings || {};
+  const catalog = state?.workflow?.settings?.model_catalog;
+  if (!Array.isArray(catalog) || !settings.workflowStages?.author || !(Number(settings.authorSubagents) >= 1)
+    || !Array.isArray(settings.authorSubagentModels)) return [];
+  return settings.authorSubagentModels.map((item, index) => ({
+    ...setupModelRow(catalog, `member${index + 1}`, String(item?.model || ""), true, preset.labels?.[item?.model]),
+    member: index + 1 }));
 }
 
 // A role's name in Setup's sentences ("Proof author"), or an author subagent's ("Author subagent 2").
@@ -8462,7 +8484,8 @@ function setupNeeds() {
   const form = setupFormRoles();
   const active = (rows) => (rows || []).filter((row) => row.on && row.program);
   const formRows = active(form);
-  const defaultRows = data?.defaults?.source === "saved" ? active(data.defaults.roles) : [];
+  const defaultRows = data?.defaults?.source === "saved"
+    ? active([...(data.defaults.roles || []), ...setupDefaultMembers()]) : [];
   const needs = {};
   for (const program of ["codex", "claude", "latex"]) {
     const uses = (rows) => program === "latex" ? rows.filter((row) => row.role === "writer")
@@ -9703,18 +9726,21 @@ function applyPreset(preset) {
   const missing = [], roles = ["review", "author", "critic", "writer"];
   for (const role of roles) {
     const model = String(settings[`${role}Model`] || "");
-    const listed = (preset.unavailable || []).find((item) => item.role === role);
+    const listed = (preset.unavailable || []).find((item) => item.role === role && !item.member);
     const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
     if (!gone) continue;
     settings[`${role}Model`] = "gpt-6.1-sol";
     missing.push({ role, label: listed?.label || preset.labels?.[model] || model });
   }
-  // An author subagent's removed API model the same way ("author subagent 2").
-  if (Array.isArray(settings.authorSubagentModels) && Array.isArray(catalog)) {
+  // An author subagent's removed API model the same way ("author subagent 2"): the server lists it with its member
+  // number, or the menus no longer have it.
+  if (Array.isArray(settings.authorSubagentModels)) {
     settings.authorSubagentModels = settings.authorSubagentModels.map((item, index) => {
       const model = String(item?.model || "");
-      if (!model.startsWith("api:") || catalog.some((row) => row.id === model)) return item;
-      missing.push({ role: `member${index + 1}`, label: preset.labels?.[model] || model });
+      const listed = (preset.unavailable || []).find((entry) => Number(entry.member) === index + 1);
+      const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
+      if (!gone) return item;
+      missing.push({ role: `member${index + 1}`, label: listed?.label || preset.labels?.[model] || model });
       return { ...item, model: "gpt-6.1-sol" };
     });
   }

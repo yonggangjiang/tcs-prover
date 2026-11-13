@@ -25,7 +25,7 @@ HANDLERS = ["// The subagent models show while Author subagents is 1 or more",
             "ui.retrievalMode.onchange = () => {"]
 # Setup's reading of the form (what each program is needed for) and its words.
 SETUP_SLICES = [["function setupWords()", "function setupElement("],
-                ["function setupFormRoles()", "function setupNeeds()"],
+                ["function setupFormRoles()", "// Whether the built-in settings, which new problems open with"],
                 ["function setupJoin(", "// The programs that need setting up"]]
 
 FORM_SETUP = r"""
@@ -237,6 +237,11 @@ applyComposerSettings({...fresh(), authorSubagents: 2});
 assert.deepEqual([ui.authorSubagentModelsMode.value, ui.authorTeamSetting.hidden, proofJobSettings().goalLoop],
   ["same", true, "tcs"]);
 assert.equal(proofJobSettings().authorSubagentModels, null);
+// A job from before the goal loop setting ran Codex's goal mode without choosing it: a new job from it gets the default.
+applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex", goalLoopRecorded: false});
+assert.equal(proofJobSettings().goalLoop, "tcs");
+applyComposerSettings({...fresh(), authorSubagents: 2, goalLoop: "codex", goalLoopRecorded: true});
+assert.equal(proofJobSettings().goalLoop, "codex");
 // A job sent back to the form shows its own.
 currentJob = "job-1";
 composingProblem = false;
@@ -282,6 +287,14 @@ assert.equal(proofJobSettings().goalLoop, "codex");
 assert.equal(presetStore().note, "Author subagent 1 model not available (Gone model), so the author subagent 1 uses "
   + "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.");
 assert.equal(presetStore().warning, true);
+// The server's list names a member's unavailable model by its number: only that member falls back, never the author.
+applyPreset({id: "p-team", name: "Team", labels: {}, settings: {...settings, authorModel: "claude-opus-5-5",
+  authorSubagentModels: [{model: "claude-opus-5-5", effort: "max"}, {model: "claude-sonnet-5-5", effort: "high"}]},
+  unavailable: [{role: "author", member: 2, model: "claude-sonnet-5-5", label: "Claude Sonnet 5.5",
+    text: "Author subagent 2 model not available: Claude Sonnet 5.5"}]});
+assert.equal(ui.authorModel.value, "claude-opus-5-5");
+assert.deepEqual(proofJobSettings().authorSubagentModels.map((item) => item.model), ["claude-opus-5-5", "gpt-6.1-sol"]);
+assert.match(presetStore().note, /^Author subagent 2 model not available \(Claude Sonnet 5\.5\)/);
 """)
 
     def test_the_summary_of_advanced_settings_names_the_goal_loop_and_the_team(self):
@@ -420,6 +433,13 @@ assert.equal(describe(event(2, {id: 'item_3', type: 'command_execution', command
   'Subagent 2 tool');
 assert.equal(describe({...event(2, {}), event: {method: 'turn/started', params: {turn: {id: 't1'}}}}).label,
   'Subagent 2 turn running');
+// The coordinator's team tools by their names, from Codex (server "tcs", tool "team_assign") or Claude Code.
+const toolCall = (item) => describe({kind: 'codex_event', root: true, stage: 'solve', node: 'author', time: 't',
+  event: {method: 'item/completed', params: {item}}});
+assert.equal(toolCall({id: 'c1', type: 'mcpToolCall', server: 'tcs', tool: 'team_assign', status: 'completed'}).text,
+  'team_assign · completed');
+assert.equal(toolCall({id: 'c2', type: 'mcpToolCall', name: 'mcp__tcs__team_wait', status: 'completed'}).text,
+  'team_wait · completed');
 """)
 
     def test_goal_status_records_say_what_the_author_reported_and_what_happens_next(self):
@@ -455,6 +475,9 @@ const selectedWorkflowStages = () => stages;
 for (const role of ['review', 'author', 'critic', 'writer']) ui[`${role}Model`].value = 'gpt-6.1-sol';
 let team = null;
 const teamModelsSetting = (given) => (given.author ? team : null);
+let presets = {presets: [], defaultId: ''}, setup = null;
+const presetStore = () => presets;
+const setupStore = () => ({data: setup});
 """, r"""
 const rows = () => setupFormRoles().map(({role, on, program, signIn, member}) => [role, on, program, signIn, member]);
 assert.equal(setupFormRoles().length, 4);
@@ -478,6 +501,33 @@ for (const role of ['review', 'author', 'critic', 'writer']) ui[`${role}Model`].
 stages = {review: true, author: true, critic: true, writing: true};
 assert.equal(setupRoleGroups(setupFormRoles().filter(row => row.on)),
   'all four roles and Author subagents 1, 2 (Claude Opus 5.5)');
+
+// Your default saved settings' subagents count too (GET /setup lists only their roles), with the form closed.
+composingProblem = false;
+const defaultTeam = [{model: 'claude-opus-5-5', effort: 'max'}, {model: 'api:gate--m-c', effort: 'high'}];
+const saved = (settings) => {
+  presets = {presets: [{id: 'd', name: 'Team', labels: {}, settings: {workflowStages: {author: true},
+    authorSubagents: 2, authorSubagentModels: defaultTeam, ...settings}}], defaultId: 'd'};
+};
+saved({});
+assert.deepEqual(setupDefaultMembers().map(({role, program, signIn, member}) => [role, program, signIn, member]),
+  [['member1', 'claude', true, 1], ['member2', 'claude', false, 2]]);
+setup = {defaults: {source: 'saved', roles: [{role: 'author', on: true, program: 'codex', signIn: true, model: 'gpt-6.1-sol'}]},
+  jobs: {}};
+const needs = setupNeeds();
+// With the form closed, what the default settings use is what needs each program.
+assert.deepEqual([needs.claude.needed, needs.claude.signIn, needs.claude.roles.map((row) => row.role)],
+  [true, true, ['member1', 'member2']]);
+assert.deepEqual(needs.codex.roles.map((row) => row.role), ['author']);
+for (const settings of [{workflowStages: {author: false}}, {authorSubagents: 0}, {authorSubagentModels: null}]) {
+  saved(settings);
+  assert.deepEqual(setupDefaultMembers(), [], JSON.stringify(settings));
+  assert.equal(setupNeeds().claude.needed, false);
+}
+// Built-in default settings never count.
+saved({});
+setup.defaults.source = 'built-in';
+assert.equal(setupNeeds().claude.needed, false);
 """)
 
 
