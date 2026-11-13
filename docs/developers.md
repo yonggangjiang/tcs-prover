@@ -488,7 +488,10 @@ that every prompt and tool text is the user's to adjust. What the code does:
   server. Claude Code authors always ran TCS Prover's loop; their harness note
   is `claude_goal_harness` and their continuation the role's, as before.
 - **TCS Prover's MCP server.** `runner/tcs_mcp.py` is a stdio MCP server (standard
-  library only, started by the runner's own interpreter with `-I`) that Codex
+  library only, started by the runner's own interpreter with `-I`; it switches
+  its stdin and stdout to UTF-8 as it starts, as a piped Python process on
+  Windows reads and writes the ANSI code page and `-I` ignores `PYTHONUTF8`)
+  that Codex
   starts from its thread settings `mcp_servers.tcs` (kept on while the user's
   servers are off, `required`, `tool_timeout_sec` 2,400, every tool
   `approval_mode: approve`, `omit_tools_from: ["deferred"]`). Its environment
@@ -559,7 +562,10 @@ that every prompt and tool text is the user's to adjust. What the code does:
   `role="author"`: the author's tools without Agent, its deny rules and Bash
   sandbox, no `--json-schema`) in the author's working folder. The input is
   `team_member` with the assignment; the final reply is the report, saved
-  owner-only and never through a link as `team/member-<n>/<k>-report.md`. A
+  owner-only and never through a link as `team/member-<n>/<k>-report.md`
+  (`team.save_report()`: relative to open folders where the system can, else,
+  on Windows, each part checked with lstat, a junction included; always a new
+  file, after any earlier file or link of its name is removed). A
   failed model call is retried every minute without limit, continuing the
   member's conversation when the attempt worked (`AUTHOR_RETRY_NOTE`); a
   settings problem (`member_problem()`: a missing CLI, a failed login, an unknown
@@ -572,13 +578,21 @@ that every prompt and tool text is the user's to adjust. What the code does:
   the rules above. Members are children of the runner: a pause, Stop, the time limit, the end of
   the work and a restart stop them (their records say why); a failed model call
   of the coordinator keeps them working, and the next attempt reads their
-  reports. Records: **Author subagent started/finished/failed** with
+  reports: a `team_wait` that the failed attempt's CLI was running ends without
+  taking a report or an attention (`Team.release_waits()`, from goal_session's
+  cleanup on both paths). A member's retry notes carry `attempt`, counted per
+  assignment, so only the first two stay pinned (`important_record()`). Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
   `codex_event` records (`root: false`). Every record of one assignment, its
   retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
   `team.assignment_id()`): each run numbers its items from `item_0` again, so
   the page and `transcript/view_transcript.py` keep an assignment's rows apart
-  by it, and a later assignment never replaces an earlier one's.
+  by it, and a later assignment never replaces an earlier one's. `k` follows
+  the member's highest report number in the working folder
+  (`team.highest_report()`), and each assignment creates its empty report file
+  as it starts (`team.reserve_report()`), so a later runner of the job (after a
+  pause, a restart or the time limit, each with a team of its own) never takes
+  an earlier one's numbers, even when that runner ended before the report.
 - **Checked with the real Codex 0.160** (the installed binary against a scripted
   model server, no model): it starts the bridge from the settings of
   `thread/start` and of `thread/resume` (a resumed thread gets the new address
