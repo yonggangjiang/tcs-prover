@@ -781,6 +781,8 @@ class TeamTests(TeamCase):
         self.assertEqual(retry["text"], "Member 1 (Claude Opus 5.5): Claude API retry: status 401, retrying in 0.6 s "
                                         "(attempt 1 of 300)")
         self.assertEqual((retry["subagentMember"], retry["subagentModel"]), (1, "Claude Opus 5.5"))
+        # A record of the assignment like its events and the team's own retry notes: it carries the assignment's id.
+        self.assertEqual(retry["subagentId"], "member-1-1")
 
     def test_followup_continues_a_members_conversation_and_wrong_calls_are_refused(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}])
