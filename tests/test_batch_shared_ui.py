@@ -143,6 +143,31 @@ assert.deepEqual(rowsOf(ui.batchSharedList), [['NOTE', 'Plan.md', 'note â€œPlanâ
 assert.equal(ui.batchSharedCount.textContent, '1 related work');
 """)
 
+    def test_a_first_read_of_the_list_that_fails_is_not_tried_again_at_once(self):
+        self.run_app(related.PANEL, PAGE_SETUP, r"""
+currentJob = ''; currentBatch = 'batch_00000000a1'; batches = [graph];
+// The page opens while the list cannot be read (TCS Prover restarting, or the batch deleted in another tab); the
+// refusal arrives later, as a real request's does.
+answers['/batch-shared-works'] = () => new Promise((resolve, reject) => setImmediate(() =>
+  reject(new Error('Failed to fetch'))));
+renderBatchShared();
+for (let step = 0; step < 20; step += 1) await tick();
+const reads = sent.length;
+answers['/batch-shared-works'] = listing([defs]);
+// One read, which says why it failed; the next comes with a later poll, as after a read that worked.
+assert.equal(reads, 1);
+assert.equal(ui.batchSharedStatus.textContent, 'Failed to fetch');
+renderBatchShared();
+await tick(); await tick();
+assert.equal(sent.length, 1);
+// A change of the card's count (a work shared in another tab) reads it again at once.
+batches = [{...graph, sharedWorks: {count: 3, names: ['defs.md', 'Plan.md', 'x.md']}}];
+renderBatchShared();
+await tick(); await tick();
+assert.equal(sent.length, 2);
+assert.deepEqual(rowsOf(ui.batchSharedList), [['MD', 'defs.md', '2.0 KB', 'Remove']]);
+""")
+
     def test_the_section_shows_only_on_a_live_batch_page_and_says_when_nothing_is_shared(self):
         self.run_app(related.PANEL, PAGE_SETUP, r"""
 currentJob = ''; currentBatch = '__root__';

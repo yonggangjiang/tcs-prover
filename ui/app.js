@@ -7032,8 +7032,11 @@ async function loadBatchShared(force = false) {
   const card = sharedBatchCard(), batch = currentBatch;
   if (!card || batchShared.loading) return;
   // The card's count changed since the last read (a change made here or in another tab): read the list again.
+  // A read that failed waits like one that worked, so a page whose first read fails (TCS Prover restarting, say)
+  // does not ask again at once with every render.
   const count = Number(card.sharedWorks.count || 0), changed = count !== batchShared.cardCount;
-  if (!force && !changed && batchShared.listing && Date.now() - batchShared.loadedAt < 10000) return;
+  if (!force && !changed && (batchShared.listing || batchShared.error)
+    && Date.now() - batchShared.loadedAt < 10000) return;
   batchShared.cardCount = count;
   batchShared.loading = true;
   try {
