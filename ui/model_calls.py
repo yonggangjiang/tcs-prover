@@ -868,6 +868,71 @@ class _Windows:
             yield window
 
 
+def _copy_file(archive, source, name):
+    """Copy one record file into the archive as ``name`` (a .gz copy decompressed), in pieces; False when it is gone
+    (a raw trace file stored and removed since it was listed)."""
+
+    try:
+        stream = gzip.open(source, "rb") if source.name.endswith(".gz") else open(source, "rb")
+    except FileNotFoundError:
+        return False
+    with stream, archive.open(name, "w", force_zip64=True) as member:
+        shutil.copyfileobj(stream, member, 1024 * 1024)
+    return True
+
+
+def _record_files(record, archive, bundles, lines):
+    """The record's own files under record/, so the download leaves out nothing the record has: calls.jsonl and
+    problems.jsonl; sources/ (the copied session files, a web-cutoff run's author sessions and discovery folders);
+    claude/ (each Claude Code process's labels and stream); of codex/, each process's labels and each stored trace's
+    manifest, event log and every payload that is not a call's request or response (those are in requests.jsonl);
+    codex-trace/ (raw trace files not stored yet, or of a format TCS Prover does not read). A .gz copy is given back
+    decompressed, under its name without .gz; a zstd one as it is. The record's bookkeeping (items/, payloads.jsonl,
+    its locks and claims, copies still being written) is not a member: requests.jsonl and items.jsonl hold what it
+    holds. Returns how many members."""
+
+    folder, count = record.folder, 0
+
+    def add(source, relative):
+        nonlocal count
+        name = "record/" + (relative[:-3] if relative.endswith(".gz") else relative)
+        count += _copy_file(archive, source, name)
+
+    for relative in ("calls.jsonl", "problems.jsonl"):
+        if (folder / relative).is_file():
+            add(folder / relative, relative)
+    for top in ("sources", "claude", "codex-trace"):
+        for source in sorted((folder / top).rglob("*")):
+            # Claims, and a copy still being written (.<name>.<id>.tmp), are the record's bookkeeping too.
+            if source.is_file() and not source.is_symlink() and not source.name.endswith(".claim") \
+                    and not (source.name.startswith(".") and source.name.endswith(".tmp")):
+                relative = source.relative_to(folder).as_posix()
+                if top == "claude" and relative.endswith(".jsonl") and (folder / (relative + ".gz")).is_file():
+                    continue  # Compressed and checked already: the .gz holds the same lines.
+                add(source, relative)
+    calls = {(line.get("process"), line.get("bundle"), line.get(field)) for line in lines for field in ("request",
+                                                                                                        "response")}
+    for process in sorted(path for path in (folder / "codex").glob("*") if path.is_dir()):
+        if (process / "process.json").is_file():
+            add(process / "process.json", f"codex/{process.name}/process.json")
+        for stored in sorted(path for path in process.iterdir() if path.is_dir()):
+            for name in ("manifest.json.gz", "trace.jsonl.gz"):
+                if (stored / name).is_file():
+                    add(stored / name, f"codex/{process.name}/{stored.name}/{name}")
+            bundle = bundles.get((process.name, stored.name)) or records.StoredBundle(record, process.name,
+                                                                                       stored.name).load()
+            for path in sorted(bundle.entries, key=lambda path: (len(path), path)):
+                if (process.name, stored.name, path) in calls:
+                    continue
+                try:
+                    data = bundle.payload(path)
+                except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile):
+                    continue  # Not rebuilt: its raw file stays in codex-trace/, given above.
+                archive.writestr(f"record/codex/{process.name}/{stored.name}/{path}", data)
+                count += 1
+    return count
+
+
 def _rounds(transcript):
     """One line per critic round, from the transcript snapshot: the proof the critic received in that round (the
     candidateText of the first request of its "Workflow step: critic" visit), its verdict and changes, and the
@@ -971,6 +1036,7 @@ def training_record(name, stream):
         for path in sorted(snapshot.rglob("*")):
             if path.is_file() and path.name not in ("transcript.jsonl.gz", "transcript.json"):
                 archive.write(path, "transcript/" + path.relative_to(snapshot).as_posix())
+        counts["recordFiles"] = _record_files(record, archive, reader.bundles, lines)
         manifest = {**record.manifest(), "exportedAt": records._iso(int(time.time() * 1000)), "counts": counts,
                     "placeholderKinds": {
                         "hidden_reasoning": "the provider sent no raw reasoning; facts give its token count",

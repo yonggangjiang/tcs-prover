@@ -830,7 +830,14 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   self-contained example per request with a WebSocket continuation's input
   expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window
   with each call's input boundary and outputs and the critic round's outcome;
-  `rounds.jsonl`; the transcript snapshot; `manifest.json`; sent in HTTP/1.1
+  `rounds.jsonl`; the transcript snapshot; `record/`, the record's own files,
+  so nothing it has is left out: `calls.jsonl`, `problems.jsonl`, `sources/`
+  (a web-cutoff run's author sessions included), `claude/`, each Codex
+  process's `process.json`, each stored trace's `manifest.json`, `trace.jsonl`
+  and every payload that is not a request or response (tool calls and their
+  results), and raw `codex-trace/` files, `.gz` copies decompressed (locks,
+  claims and copies still being written are left out);
+  `manifest.json`; sent in HTTP/1.1
   chunks of about `CHUNK_BYTES`, 64 KiB: a download that fails part way gets
   no last chunk, so the browser reports it failed, and its archive no central
   directory, so no ZIP reader takes it for whole), `GET /records` and

@@ -46,6 +46,14 @@ def request(items, **extra):
             "stream": True, "include": ["reasoning.encrypted_content"], "prompt_cache_key": THREAD, **extra}
 
 
+def download(name="run-1"):
+    """The training download of a record, as an open ZIP archive."""
+
+    buffer = io.BytesIO()
+    model_calls.training_record(name, buffer)
+    return zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+
+
 class Bundle:
     """A trace bundle written as Codex 0.160's TraceWriter writes one."""
 
@@ -58,7 +66,7 @@ class Bundle:
              "started_at_unix_ms": self.time, "raw_event_log": "trace.jsonl", "payloads_dir": "payloads"},
             indent=2), encoding="utf-8")
         self.schema = schema
-        self.files = {}
+        self.files, self.trace = {}, b""  # Every payload file and the event log, as written.
 
     def payload(self, kind, value=None, text=None):
         self.ordinal += 1
@@ -71,10 +79,12 @@ class Bundle:
     def event(self, payload, thread=None):
         self.seq += 1
         self.time += 5
+        line = json.dumps({"schema_version": self.schema, "seq": self.seq, "wall_time_unix_ms": self.time,
+                           "rollout_id": self.thread, "thread_id": thread, "codex_turn_id": "turn-1",
+                           "payload": payload}) + "\n"
         with open(self.folder / "trace.jsonl", "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"schema_version": self.schema, "seq": self.seq, "wall_time_unix_ms": self.time,
-                                     "rollout_id": self.thread, "thread_id": thread, "codex_turn_id": "turn-1",
-                                     "payload": payload}) + "\n")
+            stream.write(line)
+        self.trace += line.encode()
 
     def thread_started(self, thread=None, path="/root"):
         meta = self.payload("session_metadata", {"thread_id": thread or self.thread, "agent_path": path})
@@ -353,6 +363,23 @@ class ModelCallViewTests(RecordCase):
         self.assertEqual([call["inputEnd"] for call in windows[0]["calls"]], [3, 6])
         self.assertEqual(len(windows[0]["items"]), 8)
 
+    def test_the_training_record_has_the_trace_s_event_log_and_every_payload_beside_the_calls(self):
+        archive = download()
+        stored = f"record/codex/{self.trace.name}/{self.bundle.folder.name}"
+        self.assertEqual(archive.read(f"{stored}/trace.jsonl"), self.bundle.trace)
+        self.assertEqual(json.loads(archive.read(f"{stored}/manifest.json"))["schema_version"], 1)
+        self.assertEqual(json.loads(archive.read(f"record/codex/{self.trace.name}/process.json"))["role"], "critic")
+        # Each payload that is not a request or response (those are in requests.jsonl), byte for byte: the session's
+        # metadata, the code cell's tool call and the search text it read, the cell's own response.
+        payloads = sorted(name.rsplit("/", 1)[1] for name in archive.namelist()
+                          if name.startswith(f"{stored}/payloads/"))
+        self.assertEqual(payloads, ["1.json", "4.json", "5.json", "6.json"])
+        for name in payloads:
+            self.assertEqual(archive.read(f"{stored}/payloads/{name}"), self.bundle.files[f"payloads/{name}"])
+        self.assertIn(b"SEARCHOUT", archive.read(f"{stored}/payloads/5.json"))
+        self.assertEqual(archive.read("record/calls.jsonl"), (self.record.folder / "calls.jsonl").read_bytes())
+        self.assertEqual(json.loads(archive.read("manifest.json"))["counts"]["recordFiles"], 8)
+
     def test_a_training_record_that_fails_part_way_is_never_a_whole_archive(self):
         buffer = io.BytesIO()
         with mock.patch.object(records.Objects, "names", side_effect=OSError("The item index could not be read.")), \
@@ -599,6 +626,25 @@ class ClaudeStreamTests(RecordCase):
         row = model_calls.call_list("run-1")["calls"][0]
         self.assertEqual(row["tokens"], {"input": 175, "cached": 25, "output": None, "reasoning": None})
 
+    def test_the_training_record_has_each_stream_and_session_copy(self):
+        stream = self.recorder().claude_stream(role="critic", label="Critic coordinator")
+        texts = [json.dumps(line) for line in stream_lines()]
+        for text in texts:
+            stream.line(text)
+        stream.finish()
+        project = self.root / "claude-config" / "projects" / "-work"
+        project.mkdir(parents=True)
+        (project / "s-1.jsonl").write_text('{"type": "user", "message": {"content": "PROMPT-MARKER"}}\n',
+                                           encoding="utf-8")
+        self.assertTrue(records.Recorder(self.record.folder).keep_claude_session(self.root / "claude-config", "s-1"))
+        # A copy still being written when the download runs is not one of the record's files yet.
+        (self.record.folder / "sources" / "claude" / "-work" / ".s-2.jsonl.gz.0123abcd.tmp").write_bytes(b"\x1f\x8b")
+        archive = download()
+        self.assertEqual(archive.read(f"record/claude/{stream.label}.jsonl").decode().splitlines(), texts)
+        self.assertEqual(json.loads(archive.read(f"record/claude/{stream.label}.json"))["role"], "critic")
+        self.assertEqual(archive.read("record/sources/claude/-work/s-1.jsonl"), (project / "s-1.jsonl").read_bytes())
+        self.assertFalse([name for name in archive.namelist() if name.endswith((".claim", ".gz", ".tmp"))])
+
     def test_the_routes_keep_at_most_read_cache_bytes_of_what_they_read(self):
         stream = self.recorder().claude_stream(role="critic")
         for line in stream_lines():
@@ -789,6 +835,27 @@ class SnapshotTests(RecordCase):
                          / f"rollout-2026-11-13T10-00-00-{THREAD}.jsonl.gz").is_file())
         self.assertEqual(records.read_source(sources / "discovery" / "discovery-1" / "events.jsonl.gz"), b"{}\n")
         self.assertFalse((sources / "discovery" / "pacing.json.gz").exists())
+
+    def test_a_web_cutoff_run_s_download_holds_its_author_sessions_and_discovery_folders(self):
+        # Its author's calls exist in the record only as the copied sessions: the download must hold them.
+        self.record.update_manifest(webCutoff=True)
+        controller = self.root / "experiment-control" / "run-1-abc"
+        home = controller / "codex-home"
+        session = home / "author" / "sessions" / "2026" / "11" / "13" / f"rollout-2026-11-13T10-00-00-{THREAD}.jsonl"
+        rollout(session, {"id": THREAD, "session_id": THREAD}, [
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "AUTHOR-WORK the lemma holds"}]}}])
+        discovery = controller / "discovery-state" / "discovery-1"
+        discovery.mkdir(parents=True)
+        (discovery / "urls.json").write_text('{"urls": ["https://example.org/paper.pdf"]}', encoding="utf-8")
+        policy = controller / "retrieval-policy.json"
+        policy.write_text(json.dumps({"isolation": {"codexHome": str(home)}}), encoding="utf-8")
+        records.copy_web_cutoff(self.record, policy)
+        archive = download()
+        self.assertEqual(archive.read(f"record/sources/web-cutoff/author-sessions/2026/11/13/{session.name}"),
+                         session.read_bytes())
+        self.assertEqual(archive.read("record/sources/web-cutoff/discovery/discovery-1/urls.json"),
+                         (discovery / "urls.json").read_bytes())
 
     def test_a_discovery_call_s_copy_of_the_login_never_reaches_the_record(self):
         # A URL discovery call keeps a copy of the ChatGPT login in its private Codex home while it runs, and a call

@@ -410,6 +410,8 @@ and the coordinator's team members), with its model, tokens, timing and status.
   records (`GET /records`), delete one (`DELETE /records/<run folder>`, refused
   while the job works), list and show a job's model calls, and give the
   training download (`GET /jobs/<run folder>/training-record`, a ZIP of every
-  request in full, every item once, each context window, each critic round and
-  the transcript, nothing replaced or left out); the page's views of them are
+  request in full, every item once, each context window, each critic round,
+  the transcript and the record's own files, such as the copied sessions,
+  Claude Code's output and Codex's event logs and tool results, nothing
+  replaced or left out); the page's views of them are
   still to come (see [Developers](developers.md#job-records)).
