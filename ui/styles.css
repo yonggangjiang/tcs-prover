@@ -4356,6 +4356,9 @@ kbd {
   text-transform: var(--label-transform);
 }
 .progress-log-meta { margin: 0; color: var(--ink-2); font-size: var(--text-xs); overflow-wrap: anywhere; }
+.progress-log-versions { color: var(--ink-2); font-size: var(--text-xs); }
+.progress-log-versions summary { cursor: pointer; width: max-content; max-width: 100%; }
+.progress-log-versions p { margin: var(--space-1) 0 0; max-width: 80ch; overflow-wrap: anywhere; }
 .progress-log > .help { max-width: 80ch; margin: 0; overflow-wrap: anywhere; }
 .progress-log-text {
   max-height: 24rem;

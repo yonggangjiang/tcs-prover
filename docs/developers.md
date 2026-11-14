@@ -462,6 +462,13 @@ the problem-solving to its subagents. What the runner and the server add:
   is read again at the next tick. Saved read-only batches show the same, read
   once per request (from the run's own folder when the saved working folder is
   not a folder of the batch catalog, such as a run moved into a batch folder).
+  The coordinator dates none of its entries, so the job keeps when each version
+  was saved: `state.coordinatorProgressVersions`, `[{version, at, chars}]`
+  oldest first, each new version as the tick read it (its modification time;
+  versions saved within one tick are one), the newest `PROGRESS_LOG_VERSIONS`
+  (500), in the controller folder's `progress-log-versions.json` (owner-only;
+  `saved_progress_log_versions()` reads it for a restarted server and a saved
+  batch). The page lists their times under the log.
 
 ## TCS Prover's goal loop and team
 

@@ -200,7 +200,8 @@ const ui = {
   conversationSummaryLink: $("conversationSummaryLink"),
   progressLog: $("progressLog"), progressLogHeading: $("progressLogHeading"), progressLogMeta: $("progressLogMeta"),
   progressLogText: $("progressLogText"), progressLogNote: $("progressLogNote"), progressLogEmpty: $("progressLogEmpty"),
-  progressLogAlone: $("progressLogAlone"),
+  progressLogAlone: $("progressLogAlone"), progressLogVersions: $("progressLogVersions"),
+  progressLogVersionsSummary: $("progressLogVersionsSummary"), progressLogVersionsText: $("progressLogVersionsText"),
   relatedWorksPanel: $("relatedWorksPanel"), relatedWorksHeading: $("relatedWorksHeading"),
   relatedWorksNote: $("relatedWorksNote"), relatedWorksList: $("relatedWorksList"),
   relatedWorksEmpty: $("relatedWorksEmpty"), relatedWorksActions: $("relatedWorksActions"),
@@ -5190,7 +5191,9 @@ function renderRelatedWorksPanel() {
 // The text is set as plain text, never markup. The box opens at the end of the log and stays there as the log grows,
 // unless the reader scrolled up in it. When the server kept only the end of a longer file, a note says so, how large
 // the whole file is and where it is. Written only on change. When the job's runner said that its model has no
-// subagent tool (authorModeEffective), the author works alone and writes no log: one line says so instead.
+// subagent tool (authorModeEffective), the author works alone and writes no log: one line says so instead. Under the
+// log, "Saved 5 times, last at 14:50:46" opens the time of each saved version (state.coordinatorProgressVersions,
+// oldest first), as the coordinator dates none of its entries by itself.
 let progressLogRun = null;
 // The text on screen ({job, version, asked, text}: its version, and the state's version it was fetched for), the job
 // whose text is being fetched, and when a failed fetch may be tried again.
@@ -5205,7 +5208,8 @@ function renderProgressLog() {
   show(ui.progressLogAlone, alone);
   show(ui.progressLogHeading, !alone);
   if (!visible || alone) {
-    for (const part of [ui.progressLogMeta, ui.progressLogText, ui.progressLogNote, ui.progressLogEmpty]) show(part, false);
+    for (const part of [ui.progressLogMeta, ui.progressLogText, ui.progressLogNote, ui.progressLogEmpty,
+      ui.progressLogVersions]) show(part, false);
     progressLogRun = null;
     return;
   }
@@ -5255,6 +5259,26 @@ function renderProgressLog() {
     ? `Showing the last ${shown.toLocaleString("en-US")} characters; the whole file${size} is ${where}.` : "";
   if (ui.progressLogNote.textContent !== note) ui.progressLogNote.textContent = note;
   show(ui.progressLogNote, Boolean(note));
+  const versions = progressLogVersionTimes(state.coordinatorProgressVersions);
+  const summary = versions.length ? `Saved ${versions.length === 1 ? "once" : `${versions.length} times`}, last at `
+    + versions[versions.length - 1] : "";
+  if (ui.progressLogVersionsSummary.textContent !== summary) ui.progressLogVersionsSummary.textContent = summary;
+  const times = versions.length ? `Each saved version, oldest first: ${versions.join(", ")}.` : "";
+  if (ui.progressLogVersionsText.textContent !== times) ui.progressLogVersionsText.textContent = times;
+  show(ui.progressLogVersions, Boolean(progress && versions.length));
+}
+
+// The local times at which the versions of the progress log were saved ({at: an ISO time}, oldest first): "14:45:35",
+// or "13 Nov 23:10:02" for a day other than today. An entry without a readable time is left out.
+function progressLogVersionTimes(versions) {
+  const today = new Date().toDateString();
+  return (Array.isArray(versions) ? versions : []).map((entry) => Date.parse(entry?.at ?? ""))
+    .filter((time) => Number.isFinite(time)).map((time) => {
+      const date = new Date(time);
+      const clock = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+      return date.toDateString() === today ? clock
+        : `${date.toLocaleDateString([], { day: "numeric", month: "short" })} ${clock}`;
+    });
 }
 
 // Fetch the text of the progress log of ``job`` (the job on screen), whose state names version ``asked``, then draw

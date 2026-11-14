@@ -1012,6 +1012,11 @@
                 <pre id="progressLogText" class="progress-log-text" role="region" aria-labelledby="progressLogHeading"
                   tabindex="0" hidden></pre>
                 <p id="progressLogNote" class="help progress-log-note" hidden></p>
+                <!-- When each version of the log was saved, oldest first (state.coordinatorProgressVersions). -->
+                <details id="progressLogVersions" class="progress-log-versions" hidden>
+                  <summary id="progressLogVersionsSummary"></summary>
+                  <p id="progressLogVersionsText"></p>
+                </details>
                 <p id="progressLogEmpty" class="help progress-log-empty" hidden>The coordinator has not written its progress log yet.</p>
                 <!-- In place of the log when the job's model has no subagent tool, so its author works alone. -->
                 <p id="progressLogAlone" class="help progress-log-alone" hidden></p>

@@ -517,9 +517,12 @@ class BatchCatalog:
         state['authorModeRecorded'] = settings.get('authorMode') in AUTHOR_MODES
         state['authorMode'] = settings['authorMode'] if state['authorModeRecorded'] else 'author'
         if state['authorMode'] == 'coordinator':
-            # What the page shows of its progress log but the text, which it fetches apart (progress_log()).
+            # What the page shows of its progress log but the text, which it fetches apart (progress_log()), and when
+            # each of its versions was saved.
+            from .server import saved_progress_log_versions
             log = self._progress_log(directory, settings)
             state['coordinatorProgress'] = None if log is None else {key: log[key] for key in PROGRESS_LOG_FIELDS}
+            state['coordinatorProgressVersions'] = saved_progress_log_versions(directory) if log is not None else []
         # Who ran the goal loop and the coordinator's team, and the texts the job ran with, as a restored job shows
         # them: a job from before had Codex's goal mode and no TCS Prover team, and saved no texts.
         from .server import LEGACY_GOAL_LOOP, PROMPT_EDITS_FILENAME, PROMPT_SET_FILENAME, saved_team

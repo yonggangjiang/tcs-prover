@@ -450,6 +450,30 @@ for (const changes of [{authorMode: 'author'}, {authorMode: undefined},
 }
 """)
 
+    def test_the_progress_log_lists_when_each_version_was_saved(self):
+        self.run_app(PROGRESS, PROGRESS_SETUP, r"""
+const versions = () => ({hidden: ui.progressLogVersions.hidden, summary: ui.progressLogVersionsSummary.textContent,
+  text: ui.progressLogVersionsText.textContent});
+// None saved yet: nothing said.
+await draw(progress('Log'));
+assert.equal(versions().hidden, true);
+// Local times of today, oldest first; another day also names its date.
+const today = new Date();
+const at = (hours, minutes, seconds, days = 0) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - days,
+  hours, minutes, seconds).toISOString();
+await draw({coordinatorProgressVersions: [{version: 'v1', at: at(14, 45, 35), chars: 494},
+  {version: 'v2', at: at(14, 47, 41), chars: 900}, {version: 'v3', at: 'not a time'}, {version: 'v4', at: at(14, 50, 46)}]});
+assert.deepEqual(versions(), {hidden: false, summary: 'Saved 3 times, last at 14:50:46',
+  text: 'Each saved version, oldest first: 14:45:35, 14:47:41, 14:50:46.'});
+await draw({coordinatorProgressVersions: [{version: 'v1', at: at(23, 10, 2, 1)}]});
+const yesterday = new Date(at(23, 10, 2, 1)).toLocaleDateString([], {day: 'numeric', month: 'short'});
+assert.deepEqual(versions(), {hidden: false, summary: `Saved once, last at ${yesterday} 23:10:02`,
+  text: `Each saved version, oldest first: ${yesterday} 23:10:02.`});
+// No log (yet, or any more): no versions either.
+await draw({coordinatorProgress: null});
+assert.equal(versions().hidden, true);
+""")
+
     def test_render_draws_the_progress_log_of_a_coordinator_job(self):
         self.run_app(conversation.RENDER, conversation.RENDER_SETUP, r"""
 const coordinator = {...author, phase: 'running', authorMode: 'coordinator', authorSubagents: 3,

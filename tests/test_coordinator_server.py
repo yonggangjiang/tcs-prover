@@ -6,6 +6,7 @@ Offline: runners are stand-in processes (Popen is patched); no CLI or model star
 
 import io
 import json
+import stat
 import os
 from pathlib import Path
 import tempfile
@@ -528,6 +529,43 @@ class ProgressLogTests(ServerCase):
         alone.collect_progress_log()
         self.assertIsNone(alone.state["coordinatorProgress"])
 
+    def test_the_job_keeps_when_each_version_of_the_log_was_saved(self):
+        # The coordinator dates none of its entries: the job keeps the time of each version it read, oldest first.
+        self.assertEqual(server.PROGRESS_LOG_VERSIONS, 500)
+        self.write(b"- Lemma 1 verified.\n")
+        os.utime(self.memory / "progress.md", (1_800_000_000, 1_800_000_000))
+        self.app.collect_progress_log()
+        first = self.app.snapshot()["coordinatorProgressVersions"]
+        self.assertEqual(first, [{"version": self.app.state["coordinatorProgress"]["version"],
+                                  "at": "2027-01-15T08:00:00+00:00", "chars": 20}])
+        # Read again unchanged (a new step's state, say): no new version.
+        self.app.state["coordinatorProgress"] = None
+        self.app.collect_progress_log()
+        self.assertEqual(self.app.state["coordinatorProgressVersions"], first)
+        self.write(b"- Lemma 1 verified.\n- Lemma 2 verified.\n")
+        os.utime(self.memory / "progress.md", (1_800_000_125, 1_800_000_125))
+        self.app.collect_progress_log()
+        versions = self.app.state["coordinatorProgressVersions"]
+        self.assertEqual([entry["at"] for entry in versions], ["2027-01-15T08:00:00+00:00", "2027-01-15T08:02:05+00:00"])
+        # Kept in the controller folder, owner-only, so the next server shows them too (and a saved job's batch).
+        saved = server.controller_directory(self.app.run_dir) / server.PROGRESS_LOG_VERSIONS_FILE
+        self.assertEqual(json.loads(saved.read_text()), versions)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
+        self.assertFalse((self.app.run_dir / server.PROGRESS_LOG_VERSIONS_FILE).exists())
+        again = server.App(runs=self.runs, load_latest=False)
+        again.run_dir, again.state = self.app.run_dir, {**self.app.state, "coordinatorProgress": None}
+        again.collect_progress_log()
+        self.assertEqual(again.state["coordinatorProgressVersions"], versions)
+        self.assertEqual(server.saved_progress_log_versions(self.app.run_dir), versions)
+        # The newest PROGRESS_LOG_VERSIONS are kept.
+        with mock.patch.object(server, "PROGRESS_LOG_VERSIONS", 3):
+            for number in range(3, 6):
+                self.write(b"- Lemma %d verified.\n" % number)
+                self.app.collect_progress_log()
+        self.assertEqual([entry["chars"] for entry in self.app.state["coordinatorProgressVersions"]], [20, 20, 20])
+        self.assertEqual(len(json.loads(saved.read_text())), 3)
+
     def test_state_polls_carry_the_logs_version_and_the_page_fetches_its_text(self):
         self.write(("- 1 h: Lemma 1 verified.\n" * 4000).encode())
         self.app.collect_progress_log()
@@ -564,6 +602,8 @@ class ProgressLogTests(ServerCase):
         self.app.state["goalWorkspace"] = str(self.app.run_dir.resolve())
         self.app._save_job_settings(self.app.state)
         self.write(b"- 1 h: Lemma 1 verified.\n")
+        self.app.collect_progress_log()  # Its one version's time, which the saved job shows too.
+        versions = self.app.state["coordinatorProgressVersions"]
         self.app.process = self.app.active_token = self.app.worker_token = None
         archive = self.runs / "archive"
         archive.mkdir()
@@ -575,6 +615,7 @@ class ProgressLogTests(ServerCase):
         state = catalog.state("archive", self.app.run_dir.name)
         self.assertEqual(state["authorMode"], "coordinator")
         self.assertEqual(state["coordinatorProgress"]["chars"], len("- 1 h: Lemma 1 verified.\n"))
+        self.assertEqual((len(versions), state["coordinatorProgressVersions"]), (1, versions))
         self.assertEqual(catalog.response("/progress-log", "archive", self.app.run_dir.name)[0]["text"],
                          "- 1 h: Lemma 1 verified.\n")
 

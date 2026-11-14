@@ -197,6 +197,14 @@ class AccuracyTests(unittest.TestCase):
                       "filtering policy\", or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting "
                       "causes it, and a retry may pass.", flat(DOCS / "retries.md"))
 
+    def test_the_progress_log_s_version_times_are_named_with_their_limit(self):
+        self.assertIn("\nPROGRESS_LOG_VERSIONS = 500\n", (ROOT / "ui" / "server.py").read_text(encoding="utf-8"))
+        self.assertIn("the newest `PROGRESS_LOG_VERSIONS` (500)", flat(DOCS / "developers.md"))
+        self.assertIn("*Saved 5 times, last at 14:50:46* opens the time of each saved version, oldest first, as TCS "
+                      "Prover read the file (about once a second; versions saved within that second count as one). "
+                      "The coordinator's entries carry no dates of their own; the newest 500 versions' times are kept.",
+                      flat(DOCS / "job-page.md"))
+
     def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
         # A coordinator that cannot use its team is listed under Needs your attention while its run goes on
         # (workflow_runner.CoordinatorWatch): the limits as the code has them, named where they apply.

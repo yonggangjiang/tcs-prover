@@ -75,6 +75,12 @@ PROGRESS_LOG_READ_BYTES = 4 * MAX_PROGRESS_LOG_CHARS + 4
 # What a job's state shows of that log: all but its text, which the page fetches apart (/progress-log,
 # App.progress_log()) when "version" changes.
 PROGRESS_LOG_FIELDS = ("updatedAt", "truncated", "chars", "bytes", "version")
+# The coordinator dates none of its entries by itself: the job keeps when each version of the log was saved, as the
+# server read it (about once a second, so versions saved within one second are one), {"version", "at", "chars"} for
+# the newest PROGRESS_LOG_VERSIONS versions, in the controller's PROGRESS_LOG_VERSIONS_FILE; the page lists their
+# times (coordinatorProgressVersions).
+PROGRESS_LOG_VERSIONS = 500
+PROGRESS_LOG_VERSIONS_FILE = "progress-log-versions.json"
 # The author coordinator's own status records that the page's window keeps (important_record()): its hourly time
 # checks and its replies that named no proof file, a few per hour at most.
 COORDINATOR_RECORD_LABELS = frozenset({getattr(runtime, "COORDINATOR_CHECKIN_LABEL", "Coordinator time check"),
@@ -1158,6 +1164,21 @@ def read_progress_log(workspace, signature=None):
     return {"text": shown, "chars": len(shown), "truncated": bool(start) or len(text) > len(shown),
             "bytes": info.st_size, "updatedAt": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
             "version": hashlib.sha256(shown.encode("utf-8")).hexdigest()[:16], "signature": list(current)}
+
+
+def saved_progress_log_versions(run_dir):
+    """When each saved version of a run's progress log was saved, as its controller folder keeps them
+    (PROGRESS_LOG_VERSIONS_FILE): [{"version", "at", "chars"}], oldest first; [] when there is none to read."""
+
+    try:
+        path = controller_directory(run_dir) / PROGRESS_LOG_VERSIONS_FILE
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else []
+    except (OSError, ValueError):
+        saved = []
+    return [{"version": entry["version"], "at": entry["at"], "chars": entry.get("chars")}
+            for entry in (saved if isinstance(saved, list) else [])
+            if isinstance(entry, dict) and isinstance(entry.get("version"), str)
+            and isinstance(entry.get("at"), str)][-PROGRESS_LOG_VERSIONS:]
 
 
 def delivered_repair(record):
@@ -2398,6 +2419,8 @@ def empty_state(trace=None, trace_version=0):
         # The author coordinator's progress log as the job page shows it (read_progress_log() without its
         # signature), or None until the file exists.
         "coordinatorProgress": None,
+        # When each version of that log was saved, oldest first: [{"version", "at", "chars"}] (PROGRESS_LOG_VERSIONS).
+        "coordinatorProgressVersions": [],
         # How a coordinator job's author works as its runner last reported it (follow_author_mode()): None, as
         # recorded, or {"mode": "author", ...} when its model has no subagent tool. Kept in the state only.
         "authorModeEffective": None,
@@ -3237,8 +3260,11 @@ class App:
         # Read the answer files once more, at once, after the job ended (see collect_chat_answers).
         self._chat_final_pass = False
         # The author coordinator's progress log as last read (read_progress_log()), whose text the page fetches apart
-        # from the state (progress_log()), and the (size, mtime_ns) it was read at (see collect_progress_log).
+        # from the state (progress_log()), and the (size, mtime_ns) it was read at (see collect_progress_log); the
+        # times of its versions (_progress_log_versions(): the run folder they belong to and the list), read from the
+        # controller folder when first needed.
         self._progress_signature = self._progress_log = None
+        self._progress_versions = None
         # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
         self._stop_in_place = False
         # Whether the activity log said that the job's record could not be made, and when a web-cutoff run's files
@@ -8117,6 +8143,27 @@ class App:
             self._progress_signature, self._progress_log = signature, log
             self.state["coordinatorProgress"] = (None if log is None else
                                                  {key: log[key] for key in PROGRESS_LOG_FIELDS})
+            self.state["coordinatorProgressVersions"] = self._progress_log_versions(log)
+
+    def _progress_log_versions(self, log):
+        """When each version of the progress log was saved, with ``log`` (read_progress_log()) added when its version
+        is new: [{"version", "at", "chars"}], oldest first, the newest PROGRESS_LOG_VERSIONS (under the job lock).
+
+        Kept in the controller folder (PROGRESS_LOG_VERSIONS_FILE, owner-only), so a restart keeps them; a file that
+        cannot be read or written leaves the times of this server's own reads.
+        """
+
+        if self._progress_versions is None or self._progress_versions[0] != str(self.run_dir):
+            self._progress_versions = (str(self.run_dir), saved_progress_log_versions(self.run_dir))
+        versions = self._progress_versions[1]
+        if log is not None and (not versions or versions[-1]["version"] != log["version"]):
+            versions.append({"version": log["version"], "at": log["updatedAt"], "chars": log["chars"]})
+            del versions[:-PROGRESS_LOG_VERSIONS]
+            try:
+                self._save_controlled(PROGRESS_LOG_VERSIONS_FILE, json.dumps(versions) + "\n", run_copy=False)
+            except (OSError, runtime.Error):
+                pass  # Kept in memory: the next version tries the file again.
+        return [dict(entry) for entry in versions]
 
     def progress_log(self):
         """The author coordinator's progress log as the job page shows it (GET /progress-log): the state's
