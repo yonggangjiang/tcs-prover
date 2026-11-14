@@ -683,6 +683,44 @@ assert.equal(items()[4].querySelector('.mcb-line2').textContent, 'claude-gw · 4
 assert.equal(items()[1].querySelector('.mcb-line2').textContent.split(' · ')[0], 'GPT 6.1 Sol');
 """.replace("RUN", json.dumps(RUN)))
 
+    def test_claude_codes_report_of_a_failed_request_is_no_answer_and_its_calls_offer_no_full_request(self):
+        self.run_pages(r"""
+// Claude Code gave up on a request: its report ("API Error: 400 …") is the call's error and its one received text.
+const base = '/jobs/' + RUN + '/model-calls';
+const blocked = 'API Error: 400 Output blocked by content filtering policy';
+const failed = {...ROWS[4], id: 'c000024', status: 'failed', error: blocked, time: '2026-11-14T02:06:30Z',
+  tokens: {input: null, cached: null, output: null, reasoning: null}, placeholderKinds: ['token_probabilities', 'network_only']};
+const rows = [...ROWS, failed];
+answers[base + '?offset=0&limit=1000'] = {body: {total: rows.length, calls: rows, recordState: {available: true, problems: []}}};
+answers[base + '/c000024'] = {body: {sent: {instructions: null, tools: null, previousCallId: 'c000020', newItems: []},
+  received: {items: [{type: 'text', item: {type: 'text', text: blocked}, output: null, nestedToolCalls: []}]},
+  usage: null, placeholders: [], rawAvailable: true, error: blocked}};
+await openModelCalls(RUN, {from: 'records', call: 'c000024'});
+await settle();
+const pane = () => $('callPane');
+assert.equal(pane().querySelector('.mc-error').textContent, 'Failed' + blocked);
+const received = pane().querySelector('.mc-received');
+assert.equal(received.querySelector('.mc-sec-head').textContent,
+  "ReceivedNothing from the model: Claude Code's report of the failed request");
+const [report] = received.querySelector('.mc-items').children;
+assert.equal(report.querySelector('.mc-item-head').textContent, "Claude Code's reportnot the model's");
+assert.equal(received.querySelector('.mc-items').children.length, 1);
+// Its stream does not carry the request: Raw JSON only, no Full request.
+const actions = () => pane().querySelector('.mc-detail-actions').children.map((node) => node.textContent);
+assert.deepEqual(actions().slice(1), ['Raw JSON']);
+// Claude Code's call that answered: its text is the answer, and again no Full request.
+await showCall('c000020');
+await settle();
+assert.deepEqual(pane().querySelector('.mc-received').querySelector('.mc-items').children.map((item) =>
+  item.className === 'mc-withheld' ? 'withheld' : item.querySelector('.mc-kind').textContent),
+  ['Thinking summary', 'withheld', 'Answer']);
+assert.deepEqual(actions().slice(1), ['Raw JSON']);
+// A Codex call keeps it.
+await showCall('c000010');
+await settle();
+assert.deepEqual(actions().slice(1), ['Full request', 'Raw JSON']);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
+
     def test_a_number_in_the_words_is_a_whole_number_and_alone_also_a_calls_number(self):
         self.run_pages(r"""
 // Forty critic calls, rounds 1 to 4 in turn: call 213-like numbers and ids hold digits of other numbers.

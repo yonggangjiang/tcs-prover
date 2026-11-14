@@ -11897,11 +11897,16 @@ function renderCallPane(row = null, detail = undefined) {
   const actions = mcNode("div", "mc-detail-actions", mcNode("span", "mcb-step", prev, nextButton));
   const raw = detail && !detail.readError && detail.rawAvailable;
   if (raw) {
-    const full = mcButton("secondary compact", "Full request", "open");
-    full.onclick = () => toggleFullRequest(row, full);
+    // Claude Code's stream does not carry the request it sent: no Full request for its calls (Raw JSON has the
+    // stream's lines of the call).
+    if (row.program !== "claude") {
+      const full = mcButton("secondary compact", "Full request", "open");
+      full.onclick = () => toggleFullRequest(row, full);
+      actions.append(full);
+    }
     const json = mcButton("secondary compact", "Raw JSON", "download");
     json.onclick = () => downloadRawCall(row, json);
-    actions.append(full, json);
+    actions.append(json);
   }
   const bar = mcNode("div", "mcb-pane-bar", mcNode("div", "mcb-entry", back,
     mcNode("div", "mc-detail-title", heading, meta)), actions);
@@ -12169,6 +12174,10 @@ function callItem(view, context) {
     case "tool_result":
       return itemCard("Tool result", "tool", item.is_error ? "an error" : "", longText(outputText(item.content)));
     case "text":
+      if (context.report) {
+        return itemCard("Claude Code's report", "warning", "not the model's",
+          longText(item.text, { className: "mc-pre mc-prose" }));
+      }
       return itemCard(sent ? "Text sent" : "Answer", "summary", "", longText(item.text, { className: "mc-pre mc-prose" }));
     case "additional_tools": {
       const names = toolNames(item.tools);
@@ -12321,12 +12330,22 @@ function nestedCall(call) {
 }
 
 // What came back, in order; the placeholder of hidden reasoning after the reasoning it stands for.
+// Claude Code's report of a request it gave up on: its one received text is the call's error ("API Error: 400 …"),
+// Claude Code's words, not the model's answer.
+function claudeReport(row, detail, view) {
+  const error = String(detail.error || row.error || "").trim();
+  return row.program === "claude" && row.status === "failed" && Boolean(error)
+    && (view.type || view.item?.type) === "text" && String(view.item?.text || "").trim() === error;
+}
+
 function receivedSection(row, detail) {
   const items = Array.isArray(detail.received?.items) ? detail.received.items : [];
   const hidden = (detail.placeholders || []).find((item) => item?.kind === "hidden_reasoning");
   const section = mcNode("section", "mc-sec mc-received");
   section.setAttribute("aria-label", "Received");
-  const note = items.length ? `${items.length} ${items.length === 1 ? "item" : "items"}, in the order they came`
+  const reported = items.length && items.every((view) => claudeReport(row, detail, view));
+  const note = reported ? "Nothing from the model: Claude Code's report of the failed request"
+    : items.length ? `${items.length} ${items.length === 1 ? "item" : "items"}, in the order they came`
     : ["failed", "cancelled", "interrupted"].includes(row.status) ? "Nothing came back" : "No item recorded";
   section.append(sectionHead("Received", note));
   const list = mcNode("ol", "mc-items");
@@ -12334,7 +12353,7 @@ function receivedSection(row, detail) {
     .reduce((last, type, index) => ["reasoning", "thinking", "redacted_thinking"].includes(type) ? index : last, -1);
   if (hidden && reasoning < 0) list.append(withheldCard(hidden, row));
   items.forEach((view, index) => {
-    list.append(callItem(view, { sent: false, row }));
+    list.append(callItem(view, { sent: false, row, report: claudeReport(row, detail, view) }));
     if (hidden && index === reasoning) list.append(withheldCard(hidden, row));
   });
   for (const placeholder of detail.placeholders || []) {

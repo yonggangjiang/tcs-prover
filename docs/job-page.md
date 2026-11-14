@@ -439,12 +439,15 @@ The chosen call shows, from the top:
 - **Sent**: the instructions and the tools in one line each (**Show** opens
   them), then only the items new since the previous call of the same
   conversation, such as the output of the tool it called last; **Full
-  request** shows the whole request exactly as recorded;
+  request** shows the whole request exactly as recorded (a Codex call's:
+  Claude Code's output does not carry the request it sent);
 - **Received**, in the order it came: the reasoning summary, the placeholder
   *Hidden reasoning · N tokens* (OpenAI and Anthropic send no raw reasoning;
   the encrypted copy that came back is kept), each code cell with the searches
   and commands it ran (**Show the text it read** opens what a search
-  returned), each tool call with its output, and the answer;
+  returned), each tool call with its output, and the answer. A request Claude
+  Code gave up on shows its report (*API Error: 400 …*) as Claude Code's, not
+  as an answer of the model;
 - usage, timing, and **Not in this record**: what this route cannot hold, such
   as token probabilities and the details only the network carries.
 
