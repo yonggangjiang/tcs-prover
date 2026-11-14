@@ -1,7 +1,8 @@
 """The record of a job's model calls: what was sent to the model and what came back, kept apart from the run.
 
 Plan v3, section 1 (the owner's decisions of 13 Nov 2026): TCS Prover records every model call through the programs'
-own copies, with nothing on the network changed:
+own copies, with no relay on the network (the trace makes Codex 0.160 add one header, x-codex-inference-call-id, to
+each model request it traces and sends over HTTP: docs/developers.md, "Job records"):
 - Codex's own full trace: every Codex process of a live run gets CODEX_ROLLOUT_TRACE_ROOT=<record>/codex-trace/<label>
   (codex_process()), and each trace is ingested into the record while the process runs and when it ends;
 - the CLI session files: copied into <record>/sources/ (and the copy verified) before TCS Prover deletes any session,

@@ -697,8 +697,14 @@ that every prompt and tool text is the user's to adjust. What the code does:
 
 Owner's decisions (13 Nov 2026, plan v3 section 1): keep every model request and
 response locally, organized for training, from the programs' own copies, with
-nothing on the network changed. `runner/records.py` writes a job's record,
-`ui/model_calls.py` reads it.
+no relay on the network. Codex's trace changes one thing there: with a trace
+root set, Codex 0.160 adds the header `x-codex-inference-call-id` (a fresh id
+for each attempt) to each model request it traces and sends over HTTP, that
+is, an API connection's requests (not its local compactions, which it does not
+trace) and any HTTP fallback (`core/src/client.rs`,
+`rollout-trace/src/inference.rs`); requests over a WebSocket (the ChatGPT
+login's) carry none, and no setting turns the header off. `runner/records.py`
+writes a job's record, `ui/model_calls.py` reads it.
 
 - **Where.** `<state>/records/<run folder name>/` (`providers.state_directory()`,
   `.tcs-prover/` by default), owner-only folders and files. The server makes it

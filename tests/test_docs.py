@@ -71,6 +71,17 @@ def flat(path):
 class AccuracyTests(unittest.TestCase):
     """What the README and the guides say where the code decides it."""
 
+    def test_the_job_records_name_the_header_codex_s_trace_adds(self):
+        # With CODEX_ROLLOUT_TRACE_ROOT set, Codex 0.160 adds x-codex-inference-call-id to each HTTP model request
+        # (rollout-trace/src/inference.rs, add_request_headers): the record's one change on the network.
+        text = flat(DOCS / "developers.md")
+        records_section = text[text.index("## Job records"):text.index("## HTTP API notes")]
+        self.assertIn("adds the header `x-codex-inference-call-id`", records_section)
+        self.assertNotIn("nothing on the network changed", text)
+        source = (ROOT / "runner" / "records.py").read_text(encoding="utf-8")
+        self.assertIn("x-codex-inference-call-id", source)
+        self.assertNotIn("nothing on the network changed", source)
+
     def test_the_readme_says_the_work_leaves_the_computer(self):
         # Only the Codex CLI and Claude Code run here; the model calls go to the provider or the API endpoint.
         text = flat(README)
