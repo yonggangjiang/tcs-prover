@@ -111,6 +111,32 @@ class ConnectionSwitchTests(SwitchCase):
         self.save(id=connection["id"], webSearch=True, apiKey=KEY + "-new")
         self.assertEqual(len(self.searches()), 2)
 
+    def test_a_result_saved_in_the_earlier_words_reads_as_the_server_says_it_now(self):
+        # A connection saved with web search on before the test search was called one, then edited without changing
+        # its URL, key or request source: no new test search; its result reads "the test search answered".
+        connection = self.save(webSearch=True)
+        store = json.loads(providers.store_path().read_text())
+        store["models"][0]["webSearchCheck"]["message"] = "The probe search answered (514 characters)."
+        providers.store_path().write_text(json.dumps(store))
+        shown = lambda: providers.api_connection(connection["id"], cached=False)["webSearchCheck"]["message"]  # noqa
+        self.assertEqual(shown(), "The test search answered (514 characters).")
+        listed = next(row for row in self.http.api_model_listing()["connections"] if row["id"] == connection["id"])
+        self.assertEqual(listed["webSearchCheck"]["message"], "The test search answered (514 characters).")
+        saved = self.save(id=connection["id"], webSearch=True, apiKey="", label="Renamed proxy")
+        self.assertEqual(len(self.searches()), 1)
+        self.assertEqual(saved["webSearchCheck"]["message"], "The test search answered (514 characters).")
+        stored = json.loads(providers.store_path().read_text())["models"][0]["webSearchCheck"]["message"]
+        self.assertEqual(stored, "The test search answered (514 characters).")
+        # A service out of reach, saved when its reason went on in capitals after the colon.
+        old = "The test search could not reach the search service: The connection was refused (ConnectionRefusedError)."
+        self.assertEqual(providers._search_check({"ok": False, "message": old})["message"],
+                         "The test search could not reach the search service: the connection was refused "
+                         "(ConnectionRefusedError).")
+        # Words of the service's own are left as they came; an abbreviation keeps its capitals.
+        for message in ('The test search failed (HTTP 404: {"error": "The probe search route is gone"}).',
+                        "The test search could not reach the search service: HTTP proxy refused the request."):
+            self.assertEqual(providers._search_check({"ok": False, "message": message})["message"], message)
+
     def test_a_service_that_does_not_answer_a_search_leaves_it_off_and_says_why(self):
         # The editor shows the message after "Web search through this connection stays off:": it ends with a full
         # stop, and the service's own words stay inside its parentheses.

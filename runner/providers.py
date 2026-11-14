@@ -669,14 +669,25 @@ def _resolve_api_model(entries, model_id):
     return None
 
 
+# The words of a test search's result saved before it was called one: "The probe search answered (514 characters).",
+# and a reason that went on in capitals after its colon ("… the search service: The connection was refused …").
+_OLD_SEARCH_WORDS = ((re.compile(r"^The probe search\b"), lambda match: "The test search"),
+                     (re.compile(r"^(The test search could not reach the search service: )([A-Z])(?=[a-z])"),
+                      lambda match: match[1] + match[2].lower()))
+
+
 def _search_check(value):
-    """The saved result of a connection's probe search ({ok, at, message}), or None."""
+    """The saved result of a connection's test search ({ok, at, message}), or None; a message saved before in the
+    earlier words reads as the server says it now (_OLD_SEARCH_WORDS)."""
 
     if not isinstance(value, dict):
         return None
     message = value.get("message")
+    message = message if isinstance(message, str) else ""
+    for pattern, words in _OLD_SEARCH_WORDS:
+        message = pattern.sub(words, message, count=1)
     return {"ok": value.get("ok") is True, "at": value.get("at") if isinstance(value.get("at"), str) else "",
-            "message": (message if isinstance(message, str) else "")[:MAX_TEST_MESSAGE_CHARS]}
+            "message": message[:MAX_TEST_MESSAGE_CHARS]}
 
 
 def _last_test(value):

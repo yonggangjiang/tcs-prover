@@ -1065,8 +1065,10 @@ connection keeps the result as
 through this connection is on:" or "stays off:", the message's first word in
 lower case (*is on: the test search answered (514 characters).*; the
 connection's key is removed from the message, as from a Test's, since an error
-page may quote the header it received). A saved connection
-that stays the same (URL, key, request source, format) is not tested again. A
+page may quote the header it received; a result saved in the earlier words,
+*The probe search answered …*, reads as *The test search answered …*). A saved
+connection that stays the same (URL, key, request source, format) is not
+tested again. A
 new live job records the connections of its models that have it on as
 `apiWebSearch` in its state and `job-settings.json`; every runner of the job
 gets `--set api_web_search=[...]` (the review worker `--api-web-search`), and
