@@ -617,6 +617,35 @@ $('callsFilterText').dispatch('input');
 assert.deepEqual(shown(), ['c000016']);
 """.replace("RUN", json.dumps(RUN)))
 
+    def test_a_number_in_the_words_is_a_whole_number_and_alone_also_a_calls_number(self):
+        self.run_pages(r"""
+// Forty critic calls, rounds 1 to 4 in turn: call 213-like numbers and ids hold digits of other numbers.
+const base = '/jobs/' + RUN + '/model-calls';
+const many = Array.from({length: 40}, (_, index) => ({...ROWS[1], id: 'c0000' + String(index + 1).padStart(2, '0'),
+  label: 'Critic coordinator · round ' + (index % 4 + 1)}));
+answers[base + '?offset=0&limit=1000'] = {body: {total: 40, calls: many, recordState: {available: true, problems: []}}};
+await openModelCalls(RUN, {from: 'records'});
+await settle();
+const shown = () => $('callsList').children.map((item) => item.firstChild.dataset.call);
+const type = (words) => { $('callsFilterText').value = words; $('callsFilterText').dispatch('input'); };
+// "round 3": the round 3 calls only, not calls 3, 13, 23, 30 to 39 or the ids that hold a 3.
+type('round 3');
+assert.deepEqual(shown(), ['c000003', 'c000007', 'c000011', 'c000015', 'c000019', 'c000023', 'c000027', 'c000031',
+  'c000035', 'c000039']);
+assert(shown().every((id) => many.find((row) => row.id === id).label.endsWith('round 3')));
+// A number alone: also the call with that number (call 13 is a round 1 call).
+type('13');
+assert.deepEqual(shown(), ['c000013']);
+type('2');
+assert.deepEqual(shown(), ['c000002', 'c000006', 'c000010', 'c000014', 'c000018', 'c000022', 'c000026', 'c000030',
+  'c000034', 'c000038']);
+// An id, and digits that are not a whole number of the words.
+type('c000017');
+assert.deepEqual(shown(), ['c000017']);
+type('round 31');
+assert.deepEqual(shown(), []);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
+
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):
         self.run_pages(r"""
 await settle();

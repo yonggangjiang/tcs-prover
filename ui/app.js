@@ -11541,20 +11541,35 @@ function withheldText(row) {
   return parts.join("; ");
 }
 
-// The words a row is found by: its role, detail, model, program, status and failure.
-function callSearchText(row, number) {
+// The words a row is found by: its role, detail, model, program, status, failure and id.
+function callSearchText(row) {
   const [title, detail] = callRole(row);
-  return [number, title, detail, row.role, row.label, row.member, callModel(row.model), row.model,
+  return [title, detail, row.role, row.label, row.member, callModel(row.model), row.model,
     row.program === "claude" ? "Claude Code" : "Codex CLI", (CALL_STATUS[row.status] || [row.status])[0], row.error,
     row.id].filter(Boolean).join(" ").toLowerCase();
 }
 
+// Whether a row's words have ``word``: a number as a whole number only (the 3 of "round 3", not the digits of
+// 213 or of the id c000213), any other word anywhere.
+function callHasWord(text, word) {
+  if (!/^\d+$/.test(word)) return text.includes(word);
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!/\d/.test(text[at - 1] || "") && !/\d/.test(text[at + word.length] || "")) return true;
+  }
+  return false;
+}
+
+// The rows the filter and the words keep; a number typed alone also finds the call with that number.
 function callsShown() {
   const store = callsStore();
   const words = store.words.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  return store.rows.map((row, index) => ({ row, number: index + 1 })).filter(({ row, number }) =>
-    (store.filter === "all" || (CALL_GROUPS[store.filter] || []).includes(row.role))
-    && words.every((word) => callSearchText(row, number).includes(word)));
+  const alone = words.length === 1 && /^\d+$/.test(words[0]) ? Number(words[0]) : 0;
+  return store.rows.map((row, index) => ({ row, number: index + 1 })).filter(({ row, number }) => {
+    if (store.filter !== "all" && !(CALL_GROUPS[store.filter] || []).includes(row.role)) return false;
+    if (!words.length || number === alone) return true;
+    const text = callSearchText(row);
+    return words.every((word) => callHasWord(text, word));
+  });
 }
 
 function renderCallsHead() {

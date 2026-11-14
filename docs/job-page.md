@@ -426,7 +426,9 @@ out, its status (a check mark when done, *Failed*, *Cancelled*,
 *Interrupted*, *Not recorded*) and a crossed-out eye when the provider kept
 its reasoning hidden. **All**, **Coordinator** (**Author** for a job without a
 coordinator), **Members** and **Critics** filter the list, and the search box
-keeps the rows whose role, model, status or failure has your words. While the
+keeps the rows whose role, model, status or failure has your words; a number
+counts as a whole number (*round 3* finds the round 3 calls, not call 213), and
+a number alone also finds the call with that number. While the
 job works, the list grows as calls are recorded (the page looks every 5
 seconds, every 30 once nothing changed for a minute).
 
