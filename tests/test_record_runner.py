@@ -235,6 +235,70 @@ class MemberTests(RecordedJob):
         self.assertEqual(len(list((self.record_folder / "sources" / "codex" / THREAD).rglob("*.jsonl.gz"))), 1)
 
 
+class MemberUsageTests(RecordedJob):
+    """A member's turn.completed reports its own calls' usage from the record, not the forked conversation's."""
+
+    # Codex 0.160's turn.completed of member 1's fourth assignment (a follow-up: `exec fork`), which counted all four
+    # assignments, and the usage of the one request the stand-in's trace holds (the record's own).
+    CONVERSATION = {"input_tokens": 539386, "cached_input_tokens": 453120, "cache_write_input_tokens": 0,
+                    "output_tokens": 8050, "reasoning_output_tokens": 808}
+    OWN = {"input_tokens": 102763, "cached_input_tokens": 92800, "cache_write_input_tokens": 0, "output_tokens": 642,
+           "reasoning_output_tokens": 0, "total_tokens": 103405}
+
+    def setUp(self):
+        super().setUp()
+        fake = self.root / "codex"
+        fake.write_text(f"#!{sys.executable}\n" + STAND_IN.replace('"token_usage": {"input_tokens": 7}',
+                                                                  f'"token_usage": {json.dumps(self.OWN)}')
+                        + f'print(json.dumps({{"type": "turn.completed", "usage": {self.CONVERSATION!r}}}))\n')
+        fake.chmod(0o700)
+        patcher = mock.patch.object(runtime, "codex", lambda: str(fake))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.directory = self.root / "run"
+        self.directory.mkdir()
+
+    def attempt(self):
+        recorded = []
+        conversation = runtime.MemberConversation("codex", None, runtime.MemberSessions())
+        with records.labelled(role="member", member="member-1-4", label="Member 1"):
+            runtime._codex_member_attempt("Audit proof.md.", "gpt-6.1-sol", "high", "concise", directory=self.directory,
+                                          conversation=conversation, record=lambda event, root: recorded.append(event),
+                                          started=lambda process: None, speed="standard", compact_prompt="")
+        return recorded
+
+    def test_the_turn_s_usage_is_its_own_calls_and_the_conversation_s_is_kept_beside_it(self):
+        events = self.attempt()
+        completed, = [event for event in events if event.get("type") == "turn.completed"]
+        self.assertEqual(completed["usage"], {key: self.OWN[key] for key in self.CONVERSATION})
+        self.assertEqual((completed["conversationUsage"], completed["modelCalls"]), (self.CONVERSATION, 1))
+        # It comes last, once the process's calls are in the record.
+        self.assertIs(events[-1], completed)
+        [call] = records.Record(self.record_folder).calls.read()
+        self.assertEqual(call["usage"], self.OWN)
+
+    def test_a_request_that_never_ended_leaves_codex_s_count(self):
+        # Its line is "interrupted", without usage: the record does not hold all of the process's own usage.
+        fake = self.root / "codex"
+        fake.write_text(fake.read_text().replace('"type": "inference_completed"', '"type": "inference_pending"'))
+        completed, = [event for event in self.attempt() if event.get("type") == "turn.completed"]
+        self.assertEqual(completed, {"type": "turn.completed", "usage": self.CONVERSATION})
+        [call] = records.Record(self.record_folder).calls.read()
+        self.assertEqual((call["status"], call.get("usage")), ("interrupted", None))
+
+    def test_without_the_record_s_usage_the_turn_stays_as_codex_wrote_it(self):
+        event = {"type": "turn.completed", "usage": dict(self.CONVERSATION)}
+        self.assertEqual(runtime.member_usage(event, None), event)
+        # A call of the process without usage (interrupted, or of a trace format not read): not the process's own.
+        self.assertEqual(runtime.member_usage(event, SimpleNamespace(usage=lambda: None)), event)
+        # The same usage as Codex's (a first assignment): no conversation usage beside it.
+        same = runtime.member_usage(event, SimpleNamespace(usage=lambda: {**self.CONVERSATION, "calls": 4}))
+        self.assertEqual(same, {**event, "modelCalls": 4})
+
+
 class WebCutoffTests(RecordedJob):
     def launch(self, policy):
         seen = []

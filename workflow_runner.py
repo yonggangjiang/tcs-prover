@@ -4300,7 +4300,8 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             raise
         started(process)
         monitor = RequestMonitor(process, "solve", model, effort, timeout=None, activity_label=None, heartbeat=False)
-        provider_errors, began = [], False
+        # Codex's turn.completed, recorded once the process's own calls are in the job's record (member_usage()).
+        provider_errors, began, completed = [], False, None
         try:
             monitor.start()
             monitor.send_input(prompt)
@@ -4330,11 +4331,16 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
                 event = public_event(raw_event)
                 if event is not None:
                     monitor.observed(str(event.get("type") or "").startswith("item."))
-                    record(event, False)
+                    if kind == "turn.completed" and completed is None:
+                        completed = event
+                    else:
+                        record(event, False)
             code = process.wait()
         finally:
             monitor.close()
             _finish_trace(trace)
+            if completed is not None:
+                record(member_usage(completed, trace), False)
         output = answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
         stopped = monitor.stopped("member")
         if stopped is not None:
@@ -4348,6 +4354,22 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
                 failure.cli_problem = "Codex"
             raise failure
         return output.strip()
+
+
+def member_usage(event, trace):
+    """A team member's turn.completed (`codex exec --json`) with the usage of its own model calls, as the job's record
+    holds them (records.TraceProcess.usage()): a follow-up or retry continues the member's conversation with `exec
+    fork`, whose turn.completed counts the whole conversation's tokens (Codex 0.160: a fourth assignment reported
+    539,386 input tokens, its own 3 calls 102,763), which the event keeps as conversationUsage. Without the record's
+    usage (no record, a call without usage) the event stays as Codex wrote it."""
+
+    own = trace.usage() if trace is not None and hasattr(trace, "usage") else None
+    usage = event.get("usage")
+    if not isinstance(own, dict) or not isinstance(usage, dict):
+        return event
+    mine = {key: own.get(key, 0) for key in usage}  # Codex's fields, from the record.
+    return {**event, "usage": mine, **({"conversationUsage": usage} if mine != usage else {}),
+            "modelCalls": own.get("calls")}
 
 
 def start_team(members, *, prompts, directory, settings, stage, node_name):

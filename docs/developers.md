@@ -658,7 +658,14 @@ that every prompt and tool text is the user's to adjust. What the code does:
   member that keeps failing under Needs your attention (see
   [Repeating failures](#repeating-failures-and-needs-your-attention)). Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
-  `codex_event` records (`root: false`). Every record of one assignment, its
+  `codex_event` records (`root: false`). A Codex member's `turn.completed` is
+  recorded once its process's calls are in the job's record, with the usage of
+  those calls (`member_usage()`, `records.TraceProcess.usage()`, and
+  `modelCalls`): a follow-up or retry runs as `exec fork`, whose
+  `turn.completed` counts the whole forked conversation (in the trial, 539,386
+  input tokens for a fourth assignment whose own 3 calls used 102,763), kept
+  as `conversationUsage`; without the record's usage (no record, or a call it
+  holds none of) the event stays as Codex wrote it. Every record of one assignment, its
   retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
   `team.assignment_id()`): each run numbers its items from `item_0` again, so
   the page and `transcript/view_transcript.py` keep an assignment's rows apart

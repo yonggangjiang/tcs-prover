@@ -938,6 +938,9 @@ class TraceIngest:
         self.unrecognized = []  # request starts of a bundle of an unknown format not given a line yet
         self.starts = 0  # how many request starts of an unknown format were read
         self.said = False  # whether the record's problems say that this bundle's format is not recognized
+        # The token usage of the calls this ingest gave a line ({field: sum}, "calls", and "missing": calls without
+        # one, such as an interrupted or unrecognized request), which TraceProcess.usage() adds up.
+        self.usage = {"calls": 0, "missing": 0}
 
     def _check_manifest(self):
         manifest = read_json(self.raw / "manifest.json")
@@ -1001,6 +1004,18 @@ class TraceIngest:
             if calls:
                 self.record.calls.append(calls)
                 self.ended.update(call["callId"] for call in calls)
+                for call in calls:
+                    self._count_usage(call)
+
+    def _count_usage(self, call):
+        usage = call.get("usage")
+        self.usage["calls"] += 1
+        if not isinstance(usage, dict):
+            self.usage["missing"] += 1
+            return
+        for key, value in usage.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                self.usage[key] = self.usage.get(key, 0) + value
 
     def _note_unrecognized(self, event):
         payload = event.get("payload") if isinstance(event, dict) else None
@@ -1279,6 +1294,22 @@ class TraceProcess:
             self.poll(final=True)
         except Exception as exc:  # noqa: BLE001
             note_problem(self.record, f"The trace of Codex process {self.label} could not be stored ({exc}).")
+
+    def usage(self):
+        """The token usage of this process's own model calls as the record holds them (summed, as Codex reports a
+        turn's: input_tokens, cached_input_tokens, output_tokens, ...), with "calls"; None when a call has none (an
+        interrupted or unrecognized request) or there is no call. A `codex exec fork` reports the whole forked
+        conversation's tokens in its turn.completed; this is the fork's own."""
+
+        with self.lock:
+            totals = {}
+            for ingest in self.ingests.values():
+                for key, value in ingest.usage.items():
+                    totals[key] = totals.get(key, 0) + value
+        if not totals.get("calls") or totals.get("missing"):
+            return None
+        totals.pop("missing", None)
+        return totals
 
 
 class ClaudeStream:
