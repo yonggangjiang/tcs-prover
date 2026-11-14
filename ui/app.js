@@ -11142,7 +11142,6 @@ function recordRow(row, largest) {
     open.onclick = (event) => {
       if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       event.preventDefault();
-      clearTimeout(recordsStore().timer);
       selectJob(row.runFolder);
     };
     job.append(" ", open);

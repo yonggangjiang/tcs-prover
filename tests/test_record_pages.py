@@ -653,6 +653,15 @@ assert.equal($('callsEmpty').textContent, 'This job has no record of its model c
 assert.equal($('callsBrowser').hidden, true);
 assert.equal($('callsTrainingButton').hidden, true);
 assert.equal($('callsMeta').textContent, 'No record');
+// A deleted job's record: back to Records, and its title in the crumbs leads nowhere.
+const gone = '2026-11-09_08-31-00_sensitivity';
+answers['/jobs/' + gone + '/model-calls?offset=0&limit=1000'] = {body: {total: 0, calls: [], recordState: {available: true, problems: []}}};
+await openModelCalls(gone, {from: 'records'});
+await settle();
+assert.equal($('callsBackText').textContent, 'Back to Records');
+assert.equal(ui.callsJobCrumb.textContent, 'Prove that s(f) >= sqrt(deg(f)).');
+assert.equal(ui.callsJobCrumb.disabled, true);
+assert.equal($('callsEmpty').textContent, 'No model call recorded yet. Calls appear here as the job makes them.');
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
 
     def test_the_training_record_downloads_and_a_failed_download_shows_as_failed(self):
