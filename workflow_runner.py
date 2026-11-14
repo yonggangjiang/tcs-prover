@@ -272,12 +272,17 @@ COORDINATOR_REPORT_LABEL = "Coordinator report"
 # stays incomplete (no update_goal "complete": the reply is not handed in). Each warning is a pinned diagnostic
 # (coordinatorWarning, its kind in COORDINATOR_WARNINGS) and stays listed until a status with
 # coordinatorWarningCleared ends it: the next team call, the next team call that reaches TCS Prover, the next
-# hand-in.
+# hand-in. A coordinator one of whose team calls has already worked has its team tools, so its "teamless" warning
+# names what it does instead: while a member works on an assignment, it checks on its members between team calls
+# (COORDINATOR_CHECKING_LABEL; seen in real runs of 14 Nov 2026: Codex's sleep tool, then a script reading a
+# member's transcript, again and again) instead of waiting with team_wait; while no member works, it does the work
+# itself instead of giving it to a member.
 COORDINATOR_TEAMLESS_CALLS = 10
 COORDINATOR_TEAMLESS_SECONDS = 20 * 60
 COORDINATOR_UNTAKEN_HANDINS = 3
 COORDINATOR_WARNINGS = {"teamless": "Coordinator works without its team", "refused": "Team tool call refused",
                         "handin": "Proof not handed in"}
+COORDINATOR_CHECKING_LABEL = "Coordinator keeps checking on its team instead of waiting"
 COORDINATOR_WARNING_CLEARED_LABEL = "Coordinator warning cleared"
 # The status records of the author's own subagents (see AuthorSubagents), by
 # state; a started record names the first line of the subagent's assignment,
@@ -2991,6 +2996,18 @@ def refused_team_call(line):
     return found.group(0) if found and _TEAM_TOOL_NAME.search(found.group(1)) else ""
 
 
+def team_call_worked(item):
+    """Whether a Codex mcpToolCall item that completed is a call TCS Prover answered without an error.
+
+    Codex 0.160 marks a call whose answer is an error result "failed" (a team_assign of a busy member, recorded by the
+    real Codex), and a call it could not run carries an error."""
+
+    if not isinstance(item, dict) or item.get("status") != "completed" or item.get("error"):
+        return False
+    result = item.get("result")
+    return not (isinstance(result, dict) and result.get("isError"))
+
+
 class CoordinatorWatch:
     """Whether the author coordinator works without TCS Prover's team: warnings that list its job under Needs your
     attention while the run goes on (see COORDINATOR_TEAMLESS_CALLS).
@@ -3003,10 +3020,13 @@ class CoordinatorWatch:
     Prover's team (without it only the hand-ins are watched). ``emit(kind, **fields)`` records each warning and the
     status that clears it. ``warned`` holds the warnings that an earlier attempt of the same runner showed and did
     not clear (its retry details carry shown()): the server lists them until a status clears them, so this watch
-    clears them as its own. Thread-safe: Codex's error output is read on a thread of its own.
+    clears them as its own. ``worked`` says that a team call of an earlier attempt worked (its retry details carry
+    team_worked). ``working()`` is the team's own count of members working on an assignment or with a report not yet
+    collected (team.Team.busy()), read when a "teamless" warning fires; a watch without it takes the members to be
+    working. Thread-safe: Codex's error output is read on a thread of its own.
     """
 
-    def __init__(self, emit, team=True, clock=time.monotonic, warned=()):
+    def __init__(self, emit, team=True, clock=time.monotonic, warned=(), worked=False, working=None):
         self.emit, self.team, self.clock = emit, team, clock
         self.lock = threading.Lock()
         self.calls, self.since = 0, clock()
@@ -3014,6 +3034,20 @@ class CoordinatorWatch:
         self.handins = 0
         self.warned = {kind for kind in (warned if isinstance(warned, (list, tuple, set)) else ())
                        if kind in COORDINATOR_WARNINGS}
+        # Whether a team tool call of this coordinator has worked (TCS Prover's team answered it without an error):
+        # then its team tools reach the model, and model calls without a team call are the coordinator checking on its
+        # members (sleeping, reading their files) instead of waiting with team_wait, which the "teamless" warning
+        # says (COORDINATOR_CHECKING_LABEL) in place of tools that may never reach the model. It counts across the
+        # job's attempts while its team works, not only in this coordinator session: a retry after a model-call
+        # failure, also one in a new conversation, starts the same program with the same settings and the same team,
+        # whose members work on through it (goal_session() keeps the team for the next attempt), so the tools that
+        # reached the model still do, and a coordinator that resumes its conversation goes on checking as it did; a
+        # watch that forgot it would blame dropped tools again after every retry. The retry details carry it
+        # (team_worked, through _goal_step()). A pause, a stop, the time limit or a restart stops the members with
+        # the coordinator: the next runner's watch starts without it, and the team call that hands out work again
+        # shows it again.
+        self.team_worked = worked is True
+        self.working = working
 
     def shown(self):
         """The warnings shown and not cleared, oldest name first: what the next attempt's watch takes over."""
@@ -3027,14 +3061,18 @@ class CoordinatorWatch:
                 return
             self.calls += 1
             due = self.calls >= COORDINATOR_TEAMLESS_CALLS and not self.running and "teamless" not in self.warned
-            calls, seconds = self.calls, self.clock() - self.since
+            calls, seconds, worked = self.calls, self.clock() - self.since, self.team_worked
         if due:
-            self._teamless(calls, seconds)
+            self._teamless(calls, seconds, worked)
 
-    def team_call(self, key, finished=False):
+    def team_call(self, key, finished=False, worked=False):
+        """A team tool call starts, or ends (``finished``): ``worked`` when TCS Prover's team answered it without an
+        error."""
+
         with self.lock:
             if finished:
                 self.running.discard(key)
+                self.team_worked = self.team_worked or worked is True
             else:
                 self.running.add(key)
             self.calls, self.since = 0, self.clock()
@@ -3052,9 +3090,9 @@ class CoordinatorWatch:
                 self.since = now  # The time without team calls runs only while the coordinator works without one.
                 return
             due = now - self.since >= COORDINATOR_TEAMLESS_SECONDS and "teamless" not in self.warned
-            calls, seconds = self.calls, now - self.since
+            calls, seconds, worked = self.calls, now - self.since, self.team_worked
         if due:
-            self._teamless(calls, seconds)
+            self._teamless(calls, seconds, worked)
 
     def refused(self, detail):
         # Without TCS Prover's team no team call could ever clear it (a refused update_goal is watched by its
@@ -3084,17 +3122,35 @@ class CoordinatorWatch:
             self.handins = 0
         self._clear("handin", "The coordinator handed its proof in.")
 
-    def _teamless(self, calls, seconds):
-        if self._warn("teamless"):
+    def _teamless(self, calls, seconds, worked=False):
+        if not self._warn("teamless"):
+            return
+        counts = (f"The coordinator has made {calls} model {'call' if calls == 1 else 'calls'} in "
+                  f"{_span_text(seconds)} without calling any team tool")
+        if not worked:
+            # (a) No team call has worked yet: its team tools may never reach the model.
             self.emit("diagnostic", label=COORDINATOR_WARNINGS["teamless"], coordinatorWarning="teamless",
                       needsAttention=True, modelCalls=calls,
-                      text=f"The coordinator has made {calls} model {'call' if calls == 1 else 'calls'} in "
-                           f"{_span_text(seconds)} without calling any team tool: its requests may reach the model "
-                           "without TCS Prover's team tools (an API connection or proxy that drops them, for "
-                           "example), so the work is not delegated. The run goes on, and the job is listed under "
-                           "Needs your attention until the coordinator calls a team tool (listed after "
-                           f"{COORDINATOR_TEAMLESS_CALLS} model calls or {_span_text(COORDINATOR_TEAMLESS_SECONDS)} "
-                           "without one).")
+                      text=f"{counts}: its requests may reach the model without TCS Prover's team tools (an API "
+                           "connection or proxy that drops them, for example), so the work is not delegated. The run "
+                           "goes on, and the job is listed under Needs your attention until the coordinator calls a "
+                           f"team tool (listed after {COORDINATOR_TEAMLESS_CALLS} model calls or "
+                           f"{_span_text(COORDINATOR_TEAMLESS_SECONDS)} without one).")
+        elif self.working is None or self.working():
+            # (b) Its team tools work (self.team_worked) and a member works on an assignment now (the team's own
+            # state, Team.busy(): a member stopping counts, its report is still to come, and so does a report that
+            # waits for team_wait): it checks on its members instead of waiting for them.
+            self.emit("diagnostic", label=COORDINATOR_CHECKING_LABEL, coordinatorWarning="teamless",
+                      needsAttention=True, modelCalls=calls, teamWorked=True,
+                      text=f"{counts}. It is checking on its members between team calls (for example by sleeping "
+                           "and reading files) instead of waiting with team_wait, each check sends its whole "
+                           "conversation to the model again, and the run goes on.")
+        else:
+            # (c) Its team tools work, and no member works on an assignment: it does the work itself.
+            self.emit("diagnostic", label=COORDINATOR_WARNINGS["teamless"], coordinatorWarning="teamless",
+                      needsAttention=True, modelCalls=calls, teamWorked=True,
+                      text=f"{counts} while no member is working: it is doing the work itself instead of giving it "
+                           "to a member. The run goes on.")
 
     def _warn(self, kind):
         with self.lock:
@@ -5601,7 +5657,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # Whether the coordinator works without TCS Prover's team, or replies with its proof file without handing it in:
     # warnings while the run goes on (CoordinatorWatch).
     team_watch = (CoordinatorWatch(lambda kind, **fields: emit(kind, threadId=thread, **fields), team=team is not None,
-                                   warned=continued.get("warned") or ())
+                                   warned=continued.get("warned") or (), worked=continued.get("team_worked") is True,
+                                   working=getattr(team, "busy", None))
                   if coordinator and (team is not None or tcs) else None)
 
     def start_service():
@@ -6075,7 +6132,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     subagents.codex_item(item)
                 if (team_watch is not None and item.get("type") in {"mcpToolCall", "mcp_tool_call"}
                         and item.get("server") == team_module.SERVER_NAME and item.get("tool") in team_module.TEAM_TOOLS):
-                    team_watch.team_call(item.get("id"), finished=method == "item/completed")
+                    team_watch.team_call(item.get("id"), finished=method == "item/completed",
+                                         worked=method == "item/completed" and team_call_worked(item))
                 searches.item(method, item)
             if method == "turn/started":
                 running, answers = True, []
@@ -6234,7 +6292,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "steer": state["steer"], "pending_compaction": pending_compaction,
                                   "refusal": final["refusal"], "classic_shell": classic or (tools and not policy),
                                   "checked": checks.last if checks is not None else None,
-                                  "warned": team_watch.shown() if team_watch is not None else []}
+                                  "warned": team_watch.shown() if team_watch is not None else [],
+                                  "team_worked": team_watch.team_worked if team_watch is not None else False}
                 if thread and _context_window_failure(failure):
                     # The same conversation would fail again: continue in a new one.
                     final["retry"].update(
@@ -9030,7 +9089,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
              "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
-             "replace": None, "refusal": None, "classic_shell": False, "checked": None, "warned": []}
+             "replace": None, "refusal": None, "classic_shell": False, "checked": None, "warned": [],
+             "team_worked": False}
     failing_since = None
     with retry_clock(options).call(stage):
         while True:
@@ -9050,6 +9110,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                     known["checked"] = retry["checked"]  # The coordinator's last time check (TimeChecks).
                 if isinstance(retry.get("warned"), list):
                     known["warned"] = retry["warned"]  # The coordinator's warnings still listed (CoordinatorWatch).
+                # A team call of the coordinator worked in an earlier attempt: its team runs on (CoordinatorWatch).
+                known["team_worked"] = known["team_worked"] or retry.get("team_worked") is True
                 # Consecutive identical refusals to reopen the thread; any other outcome resets the count.
                 known["refusal"] = retry.get("refusal")
                 known["classic_shell"] = known["classic_shell"] or bool(retry.get("classic_shell"))
@@ -9089,7 +9151,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
                              "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"],
-                             "checked": known["checked"], "warned": known["warned"]}
+                             "checked": known["checked"], "warned": known["warned"],
+                             "team_worked": known["team_worked"]}
                 if rewind.get("fresh") or known["replace"]:
                     # The conversation's first turn produced nothing (a new
                     # conversation with the same first instruction loses

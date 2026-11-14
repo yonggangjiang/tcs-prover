@@ -554,6 +554,16 @@ class Team:
     def running(self):
         return sum(1 for member in self.members.values() if member.state != "idle")
 
+    def busy(self):
+        """Members working on an assignment plus reports finished and not yet collected with team_wait.
+
+        The coordinator's "without a team call" warning reads it (workflow_runner.CoordinatorWatch): a report that
+        waits for team_wait is work of the team the coordinator should collect, not work it does alone.
+        """
+
+        with self.cond:
+            return self.running() + len(self.done)
+
     def _record(self, member, state, text, **fields):
         self.emit("status", label=MEMBER_LABELS[state], authorSubagent=True,
                   subagentId=member.assignment, subagentTask=member.task,

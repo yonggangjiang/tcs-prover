@@ -703,13 +703,37 @@ that every prompt and tool text is the user's to adjust. What the code does:
   reads; the flattened name `mcp__tcs__team_members`, a tool the namespace does
   not have, `mcp__tcsteam_status`, and a namespace no server has,
   `mcp__teamteam_wait`, all captured with the real Codex against a scripted
-  model server), and after `COORDINATOR_UNTAKEN_HANDINS` (3) such replies. A
-  status `Coordinator warning cleared` (`coordinatorWarningCleared`, pinned)
+  model server), and after `COORDINATOR_UNTAKEN_HANDINS` (3) such replies.
+  Once a team call of the coordinator has worked (`team_worked`: TCS Prover's
+  team answered it without an error, a Codex `mcpToolCall` item that completed
+  with no error, `team_call_worked()`, or a Claude `tools/call` answered
+  without an error result, which ends the call in the watch just before the
+  CLI has the answer), the `teamless` warning has `teamWorked` and names what
+  the coordinator does, by the team's own count of members working when it
+  fires (`Team.busy()`, members not idle, a stopping one included, plus reports
+  not yet collected with `team_wait`, which
+  both goal sessions hand the watch as `working`): with a member working, the
+  label `COORDINATOR_CHECKING_LABEL` ("Coordinator keeps checking on its team
+  instead of waiting"), the coordinator checking on its members between team
+  calls instead of waiting with `team_wait`, each check sending its whole
+  conversation to the model again; with none, the usual label and "while no
+  member is working: it is doing the work itself instead of giving it to a
+  member", without proxies or dropped tools. Its limits, clock and clearing
+  stay (real runs of 14 Nov 2026: GPT 6.1 Sol coordinating 1 member under
+  Codex 0.160 slept 40 s with Codex's clock tool, read its member's
+  `transcript.jsonl` with a script and edited a memory note, 29 to 42 model
+  calls in its first 15 minutes, each re-sending 40-78k tokens, and was told
+  its tools may not reach the model).
+  A status `Coordinator warning cleared` (`coordinatorWarningCleared`, pinned)
   ends each: the next team call, the next team call that reaches TCS Prover,
   the next hand-in. A model-call failure ends the goal session, and the next
   attempt's watch is a new one: the failed attempt's retry details carry the
   warnings still listed (`warned`, `CoordinatorWatch.shown()`, through
-  `_goal_step()`), which the new watch clears as its own. Without TCS Prover's
+  `_goal_step()`), which the new watch clears as its own.
+  They also carry `team_worked`, kept once true across the runner's attempts
+  and new conversations, as the team works on through them; a new runner
+  (after a pause, a stop or a restart, which stop the members) starts without
+  it. Without TCS Prover's
   team only the hand-ins are watched, a refused call included (no team call
   could clear it; a refused `update_goal` leaves replies not handed in). The
   server keeps the warnings not cleared

@@ -1826,11 +1826,14 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # and the same for input given up on after QUEUED_INPUT_SECONDS.
     pending, given_up = {}, {}
     # A coordinator with TCS Prover's team that works without it is listed under Needs your attention while it works
-    # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls.
+    # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls,
+    # each of which worked when TCS Prover's team answered it without an error, and the team's own count of members
+    # working or with a report not yet collected (Team.busy()).
     # An attempt that continues an earlier one after a model-call failure clears the warnings that one left listed.
     watch_class = getattr(runtime, "CoordinatorWatch", None)
     team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields),
-                              warned=continued.get("warned") or ())
+                              warned=continued.get("warned") or (), worked=continued.get("team_worked") is True,
+                              working=getattr(team, "busy", None))
                   if coordinator and team is not None and watch_class is not None else None)
     replies = {"last": None}  # The newest answer's message ID: its content blocks come one after another.
     held, told = {}, set()  # Live instructions that could not be sent, and those already reported.
@@ -2068,7 +2071,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             send({"subtype": "error", "error": f"There is no MCP server {str(request.get('server_name'))[:80]!r}."})
             return
 
-        def run():
+        def run(key=None):
             rpc = request.get("message")
             try:
                 answer = service.answer(rpc)
@@ -2077,7 +2080,15 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                           "error": {"code": -32603, "message": f"TCS Prover could not answer: {exc}"}}
             if answer is None:  # A notification gets the empty answer Claude Code expects.
                 answer = {"jsonrpc": "2.0", "result": {}, "id": 0}
-            send({"subtype": "success", "response": {"mcp_response": answer}})
+            try:
+                if key is not None:
+                    # A watched team call ends as TCS Prover answers it, before the CLI (and so its next model call)
+                    # has the answer; it worked when the team answered it without an error (CoordinatorWatch).
+                    result = answer.get("result") if isinstance(answer, dict) and "error" not in answer else None
+                    team_watch.team_call(key, finished=True,
+                                         worked=isinstance(result, dict) and not result.get("isError"))
+            finally:
+                send({"subtype": "success", "response": {"mcp_response": answer}})
 
         call = request.get("message") if isinstance(request.get("message"), dict) else {}
         if call.get("method") == "tools/call":
@@ -2085,14 +2096,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             watched = team_watch is not None and name in team_module.TEAM_TOOLS
 
             def run_watched():
-                key = f"claude-call-{identity}"
+                key = f"claude-call-{identity}" if watched else None
                 if watched:
                     team_watch.team_call(key)
-                try:
-                    run()
-                finally:
-                    if watched:
-                        team_watch.team_call(key, finished=True)
+                run(key)
 
             threading.Thread(target=run_watched, name="tcs-claude-call", daemon=True).start()
         else:
@@ -2758,7 +2765,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                          "output": state["output"], "anchor": state["anchor"], "rewind": rewind,
                          "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered,
                          "checked": checks.last if checks is not None else None,
-                         "warned": team_watch.shown() if team_watch is not None else []}
+                         "warned": team_watch.shown() if team_watch is not None else [],
+                         "team_worked": team_watch.team_worked if team_watch is not None else False}
                 if thread and getattr(runtime, "_context_window_failure", lambda error: False)(exc):
                     # The same conversation would fail again: continue in a new one.
                     repair = pending_repair()

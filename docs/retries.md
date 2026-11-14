@@ -117,11 +117,16 @@ that is fixed: a program Setup installs is found by the waiting job at its next
 retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
 
-A coordinator that cannot use its team is listed there too, while its run goes
-on: one that made 10 model calls, or worked 20 minutes, without a team call, one
-whose team tool call Codex refused, and one that named its proof file in 3
-replies without handing it in (see [the author's
-team](workflow.md#the-authors-team)).
+A coordinator that cannot use its team, or does not wait for it, is listed there
+too, while its run goes on: one that made 10 model calls, or worked 20 minutes,
+without a team call, one whose team tool call Codex refused, and one that named
+its proof file in 3 replies without handing it in (see [the author's
+team](workflow.md#the-authors-team)). Once a team call of that coordinator has
+worked, its team tools reach the model, and the first of these says what it
+does: while a member works, it reads **Coordinator keeps checking on its team
+instead of waiting** (it checks on its members instead of waiting with
+`team_wait`); while no member works, it says that the coordinator is doing the
+work itself instead of giving it to a member.
 
 A job whose model calls keep failing the same way is listed there too, while
 its retries go on every minute without limit: at once when the provider says

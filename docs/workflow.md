@@ -318,22 +318,31 @@ Claude Code's own subagents.
   with the service's words.
   Pause, Stop, the time limit and a restart stop the members with the
   coordinator; only their files stay.
-- **When the coordinator cannot use its team.** The job is listed under
-  **Needs your attention** while the work goes on, and the activity log keeps
-  the warning, when the coordinator makes 10 model calls, or works 20 minutes
-  (not counting a team tool that runs, such as a long `team_wait`), without
-  calling any team tool (**Coordinator works without its team**: its requests
-  may reach the model without the team tools, for example through a proxy that
-  drops them); when Codex refuses one of its team tool calls ("unsupported
-  call", **Team tool call refused**); and when a coordinator under TCS Prover's
-  goal loop ends 3 turns with a reply that names its proof file without
-  marking its goal complete (**Proof not handed in**: without `update_goal`'s
-  "complete" the reply is not handed in). Each warning ends by itself, with a
-  **Coordinator warning cleared** line: at the coordinator's next team call,
-  its next team call that reaches the team, its next hand-in, also after a
-  failed model call restarted the coordinator's session. A coordinator without
-  TCS Prover's team (one using its program's own subagents) gets only the
-  **Proof not handed in** warning.
+- **When the coordinator cannot use its team, or does not wait for it.** The
+  job is listed under **Needs your attention** while the work goes on, and the
+  activity log keeps the warning, when the coordinator makes 10 model calls, or
+  works 20 minutes (not counting a team tool that runs, such as a long
+  `team_wait`), without calling any team tool (**Coordinator works without its
+  team**: its requests may reach the model without the team tools, for example
+  through a proxy that drops them; once one of its team tool calls has worked,
+  answered by the team without an error, also before a failed model call
+  restarted its session, its tools reach the model, and the same warning says
+  what it does: while a member works on an assignment, it reads **Coordinator
+  keeps checking on its team instead of waiting**: the coordinator checks on
+  its members between team calls, for example by sleeping and reading their
+  files, instead of waiting with `team_wait`, each check sending its whole
+  conversation to the model again; while no member works, it keeps the title
+  **Coordinator works without its team** and says that the coordinator is doing
+  the work itself instead of giving it to a member); when Codex refuses one of
+  its team tool calls ("unsupported call", **Team tool call refused**); and
+  when a coordinator under TCS Prover's goal loop ends 3 turns with a reply
+  that names its proof file without marking its goal complete (**Proof not
+  handed in**: without `update_goal`'s "complete" the reply is not handed in).
+  Each warning ends by itself, with a **Coordinator warning cleared** line: at
+  the coordinator's next team call, its next team call that reaches the team,
+  its next hand-in, also after a failed model call restarted the coordinator's
+  session. A coordinator without TCS Prover's team (one using its program's own
+  subagents) gets only the **Proof not handed in** warning.
 - **The team note.** `team_note` is added to the coordinator's first prompt,
   after the related works; `{members}` lists the members, one line each (such as
   "- member 1: GPT 6.1 Sol (Codex CLI)").

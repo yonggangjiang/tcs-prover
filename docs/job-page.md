@@ -31,7 +31,10 @@ PDF without TeX), or saving a file. A job whose model calls keep failing the
 same way says so under its title, as the Overview lists it under **Needs your
 attention**: at once for an account out of credit or a usage limit, otherwise
 after 15 minutes of the same failure (see
-[Retries](retries.md#what-needs-you)); its retries go on every minute.
+[Retries](retries.md#what-needs-you)); its retries go on every minute. A
+coordinator that does not use its team as it should says so there too while
+its run goes on, for example *Coordinator keeps checking on its team instead of
+waiting* (see [the author's team](workflow.md#the-authors-team)).
 
 **Run settings**, below the activity log, lists the models and settings the job
 runs with. Its **Proof author** row ends with how the author works:
