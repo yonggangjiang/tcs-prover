@@ -330,6 +330,22 @@ class ProviderMarkupTests(unittest.TestCase):
         self.assertIn('class="api-optional-settings"', markup)
         self.assertIn('id="runSettingsWarning"', INDEX.read_text(encoding="utf-8"))
 
+    def test_the_forms_warning_line_takes_the_pages_warning_style(self):
+        # A saved connection whose web search stays off: its warning line under the saved outcome looks like the
+        # page's warnings (the API connections' own status line among them): a neutral note with an amber rule at its
+        # edge, an ink rule in the Ink theme.
+        styles = re.sub(r"/\*.*?\*/", "", (ROOT / "ui" / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+        rules = [(" ".join(head.split()), " ".join(body.split()))
+                 for head, body in re.findall(r"([^{}]+)\{([^{}]*)\}", styles)]
+        warnings = [(head, body) for head, body in rules
+                    if ".api-models-status.warning" in head and ".job-warning" in head]
+        self.assertEqual(len(warnings), 2)
+        for head, _ in warnings:
+            with self.subTest(rule=head):
+                self.assertIn(".api-test-warning", re.split(r"[\s,()]+", head))
+        self.assertIn("box-shadow: inset 2px 0 0 var(--waiting);", warnings[0][1])
+        self.assertTrue(warnings[1][0].startswith(':root[data-theme="ink"]'))
+
     def test_slice_markers_used_by_the_ui_tests_occur_once(self):
         # Every UI test cuts app.js by marker text; a second copy of a marker silently moves a slice.
         source = APP.read_text(encoding="utf-8")
@@ -965,12 +981,13 @@ type('apiModelKey', 'secret-api-key');
 $('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
 $('apiModelSaveButton').onclick();
 assert.equal(sent[0].body.webSearch, true);
-// The service did not answer the test search: the switch stays off and the form says why.
+// The service did not answer the test search: the connection is saved, its switch stays off and the form says why.
 sent[0].reply(200, {connection: {...connection, webSearch: false, webSearchCheck: {ok: false,
-  message: 'The probe search failed: HTTP 404.'}}, ...listing([connection])});
+  message: 'The test search failed (HTTP 404).'}}, ...listing([connection])});
 await settle();
-assert.match($('apiModelTestResult').textContent, /stays off: The probe search failed: HTTP 404/);
-assert.match($('apiModelTestResult').className, /error/);
+assert.equal($('apiModelTestResult').querySelector('.api-test-warning').textContent,
+  'Web search through this connection stays off: The test search failed (HTTP 404).');
+assert.equal($('apiModelTestResult').className, 'api-test-result ok');
 // An edited connection that has it on shows it on; turning it off sends that.
 const searching = {...connection, webSearch: true, webSearchCheck: {ok: true, message: 'The probe search answered.'}};
 sent.length = 0;
@@ -1031,6 +1048,55 @@ await save(testing, searching, 'turned on');
 edit(); $('apiModelFormatOpenai').checked = false; $('apiModelFormatAnthropic').checked = true;
 $('apiModelFormatAnthropic').onchange();
 await save(plain, {...connection, format: 'anthropic'}, 'Anthropic');
+""")
+
+    def test_a_failed_test_search_reads_as_saved_with_its_reason_as_a_warning_line(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+const result = $('apiModelTestResult');
+const parts = () => result.children.map((child) => [child.tagName, child.className, child.textContent]);
+const next = 'Choose this key under Source in any role, then choose a model.';
+const reason = 'The test search failed (HTTP 404: {"error": {"message": "This gateway has no search service '
+  + '(POST /v1/alpha/search is not routed).", "type": "not_found"}}).';
+const failed = {...connection, label: 'Backup gateway', webSearch: false, webSearchCheck: {ok: false, message: reason}};
+const saveOn = async (answer) => {
+  $('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
+  $('apiModelSaveButton').onclick();
+  sent[sent.length - 1].reply(200, {connection: answer, ...listing([answer])});
+  await settle();
+};
+type('apiModelBaseUrl', connection.baseUrl); type('apiModelKey', 'secret-api-key');
+await saveOn(failed);
+// The connection is saved: the saved mark and words of any save, its next step a sentence of its own; then the web
+// search sentence, ending with a full stop, as a warning line of its own (not the error's cross).
+assert.equal(result.className, 'api-test-result ok');
+assert.deepEqual(parts(), [['STRONG', '', 'Saved Backup gateway.'], ['SPAN', 'api-test-detail', next],
+  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${reason}`]]);
+// Edited and saved again with the same outcome: "Updated", the same warning.
+click(rowButton('edit'));
+await saveOn(failed);
+assert.equal(result.className, 'api-test-result ok');
+assert.deepEqual(parts(), [['STRONG', '', 'Updated Backup gateway.'], ['SPAN', 'api-test-detail', next],
+  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${reason}`]]);
+// Without the test search's words, the warning still says that web search stays off.
+click(rowButton('edit'));
+await saveOn({...failed, webSearchCheck: null});
+assert.deepEqual(parts().map((part) => part[2]), ['Updated Backup gateway.', next,
+  'Web search through this connection stays off.']);
+// The test search answered: as before, no warning; the web search sentence, then the next step.
+click(rowButton('edit'));
+await saveOn({...connection, label: 'Research gateway', webSearch: true, webSearchCheck: {ok: true,
+  message: 'The probe search answered (514 characters).'}});
+assert.equal(result.className, 'api-test-result ok');
+assert.deepEqual(parts(), [['STRONG', '', 'Updated Research gateway.'], ['SPAN', 'api-test-detail',
+  `Web search through this connection is on: The probe search answered (514 characters). ${next}`]]);
+// A save that fails is still an error, without a warning.
+click(rowButton('edit')); type('apiModelBaseUrl', 'https://lab.example/v3');
+$('apiModelSaveButton').onclick();
+sent[sent.length - 1].reply(400, {error: 'No models are available for this API key.'});
+await settle();
+assert.equal(result.className, 'api-test-result error');
+assert.deepEqual(parts(), [['STRONG', '', 'Not saved'], ['SPAN', 'api-test-detail',
+  'No models are available for this API key.']]);
 """)
 
     def test_test_connection_has_no_model_and_marks_results_stale_after_edits(self):

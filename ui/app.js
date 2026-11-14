@@ -7443,11 +7443,13 @@ function showApiStatus(text, warning = false) {
   apiUi.status.className = `api-models-status${warning && text ? " warning" : ""}`;
   apiUi.status.textContent = text;
 }
-function showApiResult(tone, text, detail = "") {
+// The form's result: the outcome, its detail, and a warning under them in the page's warning style.
+function showApiResult(tone, text, detail = "", warning = "") {
   apiShownTest = null;
   apiUi.result.className = `api-test-result${tone ? ` ${tone}` : ""}`;
   apiUi.result.replaceChildren(...(text ? [apiElement("strong", "", text)] : []),
-    ...(detail ? [apiElement("span", "api-test-detail", detail)] : []));
+    ...(detail ? [apiElement("span", "api-test-detail", detail)] : []),
+    ...(warning ? [apiElement("span", "api-test-warning", warning)] : []));
 }
 function clearApiResult() { showApiResult("", ""); }
 function apiTestText(result) {
@@ -7735,11 +7737,13 @@ async function saveApiModel() {
   } catch (error) { failure = error.message; keyRequired = Boolean(error.keyRequired); }
   setApiBusy(false); renderApiForm(); restoreApiFocus(apiUi.save);
   if (keyRequired) askApiKey();
-  // Asked for web search: what the test search found (it stays off when the service did not answer).
+  // Asked for web search: what the test search found. When the service did not answer, web search stays off and
+  // the connection is saved all the same: the saved outcome, then that sentence as a warning under it.
   const search = saved && values.webSearch ? apiWebSearchText(saved) : "";
-  showApiResult(saved ? (search && !saved.webSearch ? "error" : "ok") : "error",
-    saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
-    saved ? [search, "Choose this key under Source in any role, then choose a model."].filter(Boolean).join(" ") : failure);
+  const warning = search && !saved.webSearch ? search : "";
+  const next = "Choose this key under Source in any role, then choose a model.";
+  showApiResult(saved ? "ok" : "error", saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
+    saved ? [warning ? "" : search, next].filter(Boolean).join(" ") : failure, warning);
 }
 // Whether a save sends the test search of web search through this connection, as the controller decides
 // (ui/server.py save_api_connection): the switch is on, and the connection is new, had it off, or now goes

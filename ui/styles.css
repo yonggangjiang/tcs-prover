@@ -2162,7 +2162,8 @@ kbd {
 .retrieval-cutoff-setting { margin-top: var(--space-3); }
 #retrievalCutoffUtc { font-family: var(--font-mono); }
 /* Warnings: a neutral note with a short amber rule at its edge. */
-.retrieval-configuration-notice, .job-warning, .api-models-status.warning, .preset-note[data-tone="warning"] {
+.retrieval-configuration-notice, .job-warning, .api-models-status.warning, .preset-note[data-tone="warning"],
+.api-test-warning {
   margin-top: var(--space-3);
   padding: 9px 13px;
   border: 1px solid var(--line-strong);
@@ -3776,6 +3777,13 @@ kbd {
   margin-right: auto;
 }
 .api-model-form-actions .api-test-detail { grid-column: 2; }
+/* A saved connection's warning (its web search stays off, and why) under the outcome: the page's warning note, in the
+   page's text rather than the result's. */
+.api-model-form-actions .api-test-warning {
+  grid-column: 2;
+  margin-top: 4px;
+  font: 400 var(--text-sm)/var(--leading-normal) var(--font-sans);
+}
 
 
 /* Animation: one slow ring on the live dot while a job works. Nothing else moves on its own. */
@@ -4200,7 +4208,7 @@ kbd {
 :root[data-theme="ink"] .nav-meter i.incomplete { background: rgb(var(--accent-rgb) / 0.18); }
 :root[data-theme="ink"] :is(.critic-cycle, .checkpoint-row, .job-error) { box-shadow: inset 2px 0 0 var(--ink-3); }
 :root[data-theme="ink"] :is(.retrieval-configuration-notice, .job-warning, .api-models-status.warning,
-  .preset-note[data-tone="warning"], .preset-row-warning) { box-shadow: inset 2px 0 0 var(--ink); }
+  .preset-note[data-tone="warning"], .preset-row-warning, .api-test-warning) { box-shadow: inset 2px 0 0 var(--ink); }
 :root[data-theme="ink"] .critic-review[data-outcome="pass_edited_limit"] > p { color: var(--ink); }
 :root[data-theme="ink"] :is(.notice, .provider-chip[data-state="warning"]) { border-color: var(--line-strong); }
 :root[data-theme="ink"] .job[data-status="running"] .timeline-head h2::after {
