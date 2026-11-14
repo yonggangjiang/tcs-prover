@@ -26,6 +26,7 @@ from tests import isolated_state  # noqa: F401 - first: keeps private state out 
 import workflow_runner as runtime
 from runner import claude_cli, confinement, providers, tcs_mcp, team
 
+import codex_refusals
 import test_author_coordinator as coordinator_test
 import test_claude_cli as claude_test
 import test_goal_runtime as goal_test
@@ -38,11 +39,17 @@ POINTER = "PROOF_FILE: proof.md"
 TEXTS = {name: text for name, text in runtime.load_workflow(WORKFLOW)["prompts"].items()
          if name in runtime.HARNESS_TEXTS}
 
+# The lines the real Codex 0.160 printed when an OpenAI-format API connection refused the request (tests/
+# codex_refusals.py): its endpoint's HTTP 400 invalid_request_error (a request it rejects as invalid), which Codex
+# reports as the endpoint's body alone, its HTTP 400 model_not_found (a model it does not have), reported the same
+# way, and its HTTP 401 (a key it refuses), in Codex's words "unexpected status 401 Unauthorized: …".
+CODEX_REFUSALS = {"REJECTED": codex_refusals.EXEC_400, "NOMODEL": codex_refusals.EXEC_400_NO_MODEL,
+                  "BADKEY": codex_refusals.EXEC_401}
 # A stand-in `codex` for a team member's `codex exec --json`: it logs its call, reports a saved session and answers
 # from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a
 # failure: SLOW (works until stopped), FAIL-ONCE (a model-call failure after some work, once per run folder), NOLOGIN
-# (a login the CLI refuses).
-FAKE_CODEX = r'''
+# (a login the CLI refuses), REJECTED, NOMODEL and BADKEY (the refusals of CODEX_REFUSALS, whose lines it prints).
+FAKE_CODEX = f"REFUSALS = {CODEX_REFUSALS!r}\n" + r'''
 import json, os, sys, time, uuid
 argv = sys.argv[1:]
 prompt = sys.stdin.read()
@@ -65,6 +72,13 @@ log({"argv": argv, "prompt": prompt, "cwd": os.getcwd(), "fork": fork,
              if key.startswith(("CODEX", "TCS", "OPENAI", "SSH_", "GPG_")) or key == "TMPDIR"}})
 session = str(uuid.uuid4())
 out({"type": "thread.started", "thread_id": session})
+refusal = next((lines for marker, lines in REFUSALS.items() if marker in prompt), None)
+if refusal:
+    out({"type": "turn.started"})
+    for line in refusal:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    sys.exit(1)
 out({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning",
                                         "text": "thinking about " + prompt[:40]}})
 if "SLOW" in prompt:
@@ -608,6 +622,17 @@ API_KEY = "sk-lab-0123456789abcdef"
 MEMBER_SETTINGS = {"speed": "standard", "summary": "concise"}
 
 
+def refused_report(member, reason):
+    """The report the coordinator gets when member ``member``'s API connection refused the request (its endpoint
+    rejected it as invalid, said the model does not exist or that its key cannot use it, or refused its key) with
+    ``reason``, the service's words: the owner's wording of 14 Nov 2026, spelled out here so that any change of it
+    shows."""
+
+    return (f"Member {member}'s assignment failed: its API connection refused the request ({reason}). This may be a "
+            "temporary problem of the service or a wrong setting. Keep the work going: give this assignment to "
+            f"another member, or give it to member {member} again later.")
+
+
 def member_records(assignments, count=2):
     """The records the runner makes for ``assignments`` [(member, assignment)], run one after another by a team of
     ``count`` members of the coordinator's model (runtime.start_team()); each member run is a stand-in that reports
@@ -1017,12 +1042,71 @@ class TeamTests(TeamCase):
         crew.call("team_assign", {"member": 1, "assignment": "NOLOGIN Lemma B"})
         report, = self.collect(crew, 1)
         self.assertIn("failed the assignment", report)
-        self.assertIn("authentication failed", report)
+        # A built-in model's refused login, and below an unknown model, report as they always did: only an API
+        # connection's refusal reads as one that may pass (refused_report()).
+        self.assertTrue(report.endswith("\nREPORT:\nThe assignment failed: authentication failed: Error: 401 "
+                                        "Unauthorized: not logged in"), report)
         self.assertEqual(len(self.codex_calls()), 3)  # Never retried.
         crew.call("team_assign", {"member": 2, "assignment": "Lemma C"})
         report, = self.collect(crew, 1)
-        self.assertIn("Unknown model 'gpt-6-unknown'", report)
+        self.assertTrue(report.endswith("\nREPORT:\nThe assignment failed: Unknown model 'gpt-6-unknown': it is "
+                                        "neither a built-in model nor a model of a configured API connection."),
+                        report)
         self.assertIn("member 2: gpt-6-unknown (unknown model): idle", crew.call("team_members", {}))
+
+    def test_an_api_connection_that_refuses_the_request_fails_the_assignment_and_the_work_goes_on(self):
+        # The owner's wording (14 Nov 2026): an endpoint that rejects the request as invalid (HTTP 400) or refuses its
+        # key (HTTP 401) may refuse only for a while (a proxy whose own login refreshes) as well as for a wrong
+        # setting, so the coordinator reads that the work goes on: with another member, or with this one later.
+        # Codex reports the 400 as the endpoint's body alone: the service's words are its error's message.
+        rejected = codex_refusals.ENDPOINT_MESSAGE
+        refused = ("unexpected status 401 Unauthorized: Incorrect API key provided: sk-fake-********cdef., url: "
+                   "http://127.0.0.1:65370/v1/responses")
+        api = self.api_model()
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}, {"model": api, "effort": "medium"}])
+        for count, (line, reason) in enumerate((("REJECTED Lemma A", rejected), ("BADKEY Lemma B", refused)), 1):
+            crew.call("team_assign", {"member": 2, "assignment": line})
+            report, = self.collect(crew, 1)
+            head, _, text = report.partition("\nREPORT:\n")
+            self.assertTrue(head.startswith(f'Member 2 (lab-model) failed the assignment "{line}".'), head)
+            self.assertEqual(text, refused_report(2, reason))
+            self.assertEqual((self.run_dir / f"team/member-2/{count}-report.md").read_text(), text)
+        # The activity log's lines say what failed and end with the service's words: what a paused job is told (that
+        # a retry cannot fix it, and that a job waiting for it continues once its settings change) is not a member's.
+        self.assertEqual(tuple(event["text"] for event in self.labelled("Author subagent failed")),
+                         (f"{runtime.REQUEST_REJECTED_LABEL}: Lab gateway refuses the requests this job sends as "
+                          f"invalid ({rejected}).", f"authentication failed: {refused}"))
+        # Each ended at once, never retried.
+        self.assertEqual(len([call for call in self.codex_calls() if "lab-model" in call["argv"]]), 2)
+        self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
+                          and "retrying" in event.get("text", "")])
+        # The member is idle, and works when it gets the assignment again.
+        self.assertIn('member 2: lab-model (API connection "Lab gateway"): idle', crew.call("team_members", {}))
+        crew.call("team_assign", {"member": 2, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertTrue(report.endswith("\nREPORT:\nReport of lab-model: Lemma A"), report)
+
+    def test_an_api_connection_without_the_model_fails_the_assignment_with_the_same_report(self):
+        # An endpoint that says the model does not exist (or that this key cannot use it) is a refusal of the member's
+        # API connection too, as the owner's wording of 14 Nov 2026 says it; the author and a structured call still
+        # read "Model unavailable: … A retry cannot fix this: …" (tests/test_codex_request_rejected.py).
+        reason = "The requested model 'lab-model' does not exist."
+        crew = self.crew([{"model": self.api_model(), "effort": "medium"}])
+        crew.call("team_assign", {"member": 1, "assignment": "NOMODEL Lemma A"})
+        report, = self.collect(crew, 1)
+        head, _, text = report.partition("\nREPORT:\n")
+        self.assertTrue(head.startswith('Member 1 (lab-model) failed the assignment "NOMODEL Lemma A".'), head)
+        self.assertEqual(text, refused_report(1, reason))
+        self.assertEqual((self.run_dir / "team/member-1/1-report.md").read_text(), text)
+        failed, = self.labelled("Author subagent failed")
+        self.assertEqual(failed["text"], f"{runtime.MODEL_UNAVAILABLE_LABEL}: Lab gateway cannot be used ({reason}).")
+        # It ended at once, never retried, and the member works when it gets the assignment again.
+        self.assertEqual(len(self.codex_calls()), 1)
+        self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
+                          and "retrying" in event.get("text", "")])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertTrue(report.endswith("\nREPORT:\nReport of lab-model: Lemma A"), report)
 
     def coordinator(self, crew, turns, **options):
         service = team.Service()
@@ -1226,6 +1310,55 @@ class ReportBudgetTests(unittest.TestCase):
         self.assertIn("The report could not be saved", head)
         self.assertTrue(text.endswith("\n[The report is cut here at 20,000 characters; it could not be saved.]"))
         self.assertNotIn("team/member-1/1-report.md", text)
+
+
+class FailedReportTests(unittest.TestCase):
+    """The report of an assignment that ends at once on a failure that ``configuration`` names (team.Team): a
+    team.Refusal (the member's API connection refused the request) gets the owner's wording of 14 Nov 2026, every
+    other failure the words it always had; the member's record keeps the failure's own words either way."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.directory = Path(folder.name).resolve()
+
+    def failed(self, problem):
+        """(the report, the member's record, its saved report) of member 2's assignment, whose attempt fails with
+        ``problem`` as the failure ``configuration`` names."""
+
+        records, calls = [], []
+
+        def attempt(member, prompt, conversation, process):
+            calls.append(member.number)
+            raise runtime.Error("The member's model call failed.")
+
+        crew = team.Team(team.team_members(None, "gpt-6.1-sol", "high", 2), prompts=TEXTS, directory=self.directory,
+                         attempt=attempt, configuration=lambda error, member: problem,
+                         emit=lambda kind, **fields: records.append(fields), render=runtime.render_template,
+                         retry_note="")
+        self.addCleanup(crew.close, "The test ended.")
+        crew.call("team_assign", {"member": 2, "assignment": "Lemma A"})
+        head, _, report = crew.call("team_wait", {"timeout_minutes": 1}).partition("\nREPORT:\n")
+        self.assertTrue(head.startswith('Member 2 (GPT 6.1 Sol) failed the assignment "Lemma A".'), head)
+        self.assertEqual(calls, [2])  # Never retried.
+        record, = [record for record in records if record.get("subagentState") == "failed"]
+        self.assertEqual(record["label"], "Author subagent failed")
+        return report, record["text"], (self.directory / "team/member-2/1-report.md").read_text()
+
+    def test_a_refusal_says_the_problem_may_pass_and_asks_the_coordinator_to_keep_the_work_going(self):
+        reason = "API Error: 401 invalid x-api-key"
+        report, record, saved = self.failed(team.Refusal(f"authentication failed: {reason}", reason))
+        self.assertEqual(report, refused_report(2, reason))
+        self.assertEqual(saved, report)
+        self.assertEqual(record, f"authentication failed: {reason}")
+
+    def test_every_other_failure_reports_as_before(self):
+        problem = ("Unknown model 'gpt-6-unknown': it is neither a built-in model nor a model of a configured API "
+                   "connection.")
+        report, record, saved = self.failed(problem)
+        self.assertEqual(report, f"The assignment failed: {problem}")
+        self.assertEqual(saved, report)
+        self.assertEqual(record, problem)
 
 
 class ReportNumberingTests(unittest.TestCase):

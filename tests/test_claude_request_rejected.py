@@ -8,7 +8,9 @@ same lines with its own IDs), with CAPTURED_STDERR on its error output, and exit
 OpenAI-format API model's 400 invalid_request_error is (workflow_runner.settings_failure(), RequestRejected): a
 structured call ends after its first attempt, the author pauses with a message that says to change the connection's
 settings (a job waiting for it continues once they change), a paused author's reply fails as a settings problem, and a
-team member's assignment comes back to the coordinator as a failure with the reason.
+team member's assignment comes back to the coordinator as a failure with the endpoint's words, in a report that says
+the refusal may be temporary or a wrong setting and asks the coordinator to keep the work going (the owner's wording,
+14 Nov 2026; so does a key the endpoint refuses).
 
 Everything else stays retried every minute: the same endpoint's 400 for a conversation too long for the model and for a
 key out of credit, which Claude Code words itself (CAPTURED_TOO_LONG, CAPTURED_CREDIT), 429, overload and 5xx, and the
@@ -27,7 +29,7 @@ import unittest
 from unittest import mock
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
-from runner import claude_cli, providers
+from runner import claude_cli, providers, team
 from ui import server
 import workflow_runner as runtime
 
@@ -192,6 +194,10 @@ OPENAI_FILTERED = (
 REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid (API Error: 400 "
             f"{ENDPOINT_MESSAGE}). A retry cannot fix this: change its API connection's settings under Models & API "
             "(or the endpoint); a job waiting for it continues once its settings change.")
+# What a team member's activity-log line says of it: what failed, ending with the endpoint's words (the rest of
+# REJECTED is what a paused job is told).
+REJECTED_LINE = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid "
+                 f"(API Error: 400 {ENDPOINT_MESSAGE}).")
 
 
 def replayed(line):
@@ -235,8 +241,11 @@ class CapturedTextTests(jobs_test.Isolated):
         for prefix in ("Claude author turn failed: ", "Claude reply turn failed: "):
             self.assertEqual(str(runtime.settings_failure(runtime.Error(runner_text(CAPTURED_400[1], prefix)), model)),
                              REJECTED)
-        # A team member's failed assignment gives the coordinator the same reason.
-        self.assertEqual(runtime.member_problem(runtime.Error(text), model), REJECTED)
+        # A team member's failed assignment: the coordinator reads the endpoint's words in a report that keeps the
+        # work going (team.REFUSED_REPORT); the member's record says what failed, ending with them.
+        self.assertEqual((problem.reason, problem.summary), (f"API Error: 400 {ENDPOINT_MESSAGE}", REJECTED_LINE))
+        self.assertEqual(runtime.member_problem(runtime.Error(text), model),
+                         team.Refusal(REJECTED_LINE, f"API Error: 400 {ENDPOINT_MESSAGE}"))
 
     def test_the_same_text_from_a_built_in_claude_model_stays_retried(self):
         text = runner_text(CAPTURED_400[1])
@@ -304,14 +313,17 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), model))
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), model))
         # A key the endpoint refuses stays retried too (the job page says the key was rejected); a team member's
-        # assignment comes back as an authentication failure.
+        # assignment comes back as its API connection's refusal, with the service's words, its record as an
+        # authentication failure. A built-in Claude model's refused login comes back as before.
         for status in (401, 403):
-            text = (f"Claude review failed: Failed to authenticate. API Error: {status} invalid x-api-key\n"
-                    f"API status {status}.")
+            reason = f"Failed to authenticate. API Error: {status} invalid x-api-key"
+            text = f"Claude review failed: {reason}\nAPI status {status}."
             with self.subTest(text=text):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), model))
-                problem = runtime.member_problem(runtime.Error(text), model)
-                self.assertTrue(problem.startswith("authentication failed: "), problem)
+                self.assertEqual(runtime.member_problem(runtime.Error(text), model),
+                                 team.Refusal(f"authentication failed: {reason}", reason))
+                self.assertEqual(runtime.member_problem(runtime.Error(text), "claude-opus-5-5"),
+                                 f"authentication failed: {reason}")
 
 
 class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
@@ -443,7 +455,8 @@ class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
 
 
 class TeamMemberTests(team_test.TeamCase):
-    """A team member on an Anthropic-format connection: the coordinator gets the failed assignment with the reason."""
+    """A team member on an Anthropic-format connection that refuses the request: the coordinator gets the failed
+    assignment with the endpoint's words, in a report that keeps the work going (the owner's wording, 14 Nov 2026)."""
 
     def anthropic_model(self):
         return providers.save_api_model({"format": "anthropic", "baseUrl": "https://lab.example.com",
@@ -457,10 +470,42 @@ class TeamMemberTests(team_test.TeamCase):
         crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
         report, = self.collect(crew, 1)
         self.assertIn("failed the assignment", report)
-        self.assertIn(REJECTED.replace("Gateway", "Lab Claude"), report)
+        reason = f"API Error: 400 {ENDPOINT_MESSAGE}"
+        self.assertTrue(report.endswith("\nREPORT:\n" + team_test.refused_report(1, reason)), report)
+        self.assertNotIn("A retry cannot fix this", report)
+        # The activity log's line says what failed and ends with the endpoint's words.
+        failed, = self.labelled("Author subagent failed")
+        self.assertEqual(failed["text"], REJECTED_LINE.replace("Gateway", "Lab Claude"))
         self.assertEqual(len(self.claude_starts()), 1)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
                           and "retrying" in event.get("text", "")])
+
+    def test_a_refused_key_fails_the_assignment_with_the_same_report(self):
+        model = self.anthropic_model()
+        reason = "Failed to authenticate. API Error: 401 invalid x-api-key"
+        self.scenario.write_text(json.dumps({"turns": [
+            ["init", {"api_error": reason}, {"result": {"is_error": True, "result": reason, "api_error_status": 401}},
+             {"exit": 1}],
+            ["init", {"result": {"result": "Not reached."}}]]}))
+        crew = self.crew([{"model": model, "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertTrue(report.endswith("\nREPORT:\n" + team_test.refused_report(1, reason)), report)
+        failed, = self.labelled("Author subagent failed")
+        self.assertEqual(failed["text"], f"authentication failed: {reason}")
+        self.assertEqual(len(self.claude_starts()), 1)
+
+    def test_a_built_in_claude_members_refused_login_reports_as_before(self):
+        reason = "Failed to authenticate. API Error: 401 OAuth token has expired"
+        self.scenario.write_text(json.dumps({"turns": [
+            ["init", {"api_error": reason}, {"result": {"is_error": True, "result": reason, "api_error_status": 401}},
+             {"exit": 1}],
+            ["init", {"result": {"result": "Not reached."}}]]}))
+        crew = self.crew([{"model": "claude-opus-5-5", "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertTrue(report.endswith(f"\nREPORT:\nThe assignment failed: authentication failed: {reason}"), report)
+        self.assertEqual(len(self.claude_starts()), 1)
 
     def test_a_member_refused_for_its_tool_history_is_retried(self):
         model = self.anthropic_model()

@@ -817,6 +817,12 @@ for index, agent in enumerate(behaviour.get("subagents", [])):
     keep()
 if "hang" in behaviour:
     time.sleep(behaviour["hang"])
+if "lines" in behaviour:
+    # The lines a real Codex printed for a failed turn (tests/codex_refusals.py), exactly, and its exit code.
+    for line in behaviour["lines"]:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    sys.exit(1)
 if "fail" in behaviour:
     event({"type": "error", "message": behaviour["fail"]})
     event({"type": "turn.failed", "error": {"message": behaviour["fail"]}})

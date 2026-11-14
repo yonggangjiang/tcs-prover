@@ -23,6 +23,7 @@ Pause, Stop, the time limit and a restart stop them with the coordinator (Team.c
 
 from collections import deque
 import contextlib
+from dataclasses import dataclass
 import hmac
 import json
 import os
@@ -77,6 +78,13 @@ REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
 NAME_SURROGATE_TAG = 0x20000000
 # The start of the report of a stopped assignment; {reason} says who stopped it.
 STOPPED_REPORT = "This assignment was stopped. {reason}"
+# The report of an assignment whose member's API connection refused the request (a Refusal): {member} is the member's
+# number, {reason} the service's own words (the owner's wording, 14 Nov 2026). Such a refusal can pass (a proxy that
+# refuses requests while its own login refreshes) as well as come from a wrong setting, so the report asks the
+# coordinator to keep the work going, never to give the member up.
+REFUSED_REPORT = ("Member {member}'s assignment failed: its API connection refused the request ({reason}). This may "
+                  "be a temporary problem of the service or a wrong setting. Keep the work going: give this "
+                  "assignment to another member, or give it to member {member} again later.")
 # How long after an attention (Team.attention()) a team_wait that starts still ends at once: the coordinator may
 # have called it just before TCS Prover sent its instruction, which then waits for the call to end.
 ATTENTION_SECONDS = 10
@@ -88,6 +96,18 @@ RELEASED_WAIT = ("This wait ended because the coordinator's session restarted af
 
 class TeamError(ValueError):
     """A refused tool call: its text is the tool's answer."""
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """A failed attempt whose member's API connection refused the request, as Team's ``configuration`` names it.
+
+    ``text`` is the failure in its own words, which the member's record keeps; ``reason`` is the service's own words,
+    which the report to the coordinator quotes (REFUSED_REPORT).
+    """
+
+    text: str
+    reason: str
 
 
 def assignment_id(number, count):
@@ -438,11 +458,14 @@ class Team:
     assignment and returns the member's final reply (workflow_runner.member_attempt(); ``conversation`` is a
     MemberConversation, ``process(popen)`` registers the CLI so that a stop can end it). A failed attempt is retried
     every ``retry_seconds`` without limit, continuing the member's conversation when the attempt worked in it,
-    unless ``configuration(error)`` says only a change of settings can fix it: that failure is reported to the
-    coordinator and the member becomes idle. ``emit(kind, **fields)`` records (each record of an assignment with its
-    id, assignment_id(), which ``attempt`` finds as ``member.assignment``; a failed attempt's note carries the failure
-    in plain words and the provider's own, ``describe(error)``, and when it is retried); ``directory`` is the shared
-    working folder, where reports are saved. close() stops every member (each record says why) and ends every wait.
+    unless ``configuration(error, member)`` names a failure that ends the assignment at once (a setting the member
+    cannot work with, as text, or a Refusal): it is reported to the coordinator and the member becomes idle. The
+    report says "The assignment failed: <the text>", or for a Refusal (the member's API connection refused the
+    request) REFUSED_REPORT, which quotes the service's words and asks the coordinator to keep the work going.
+    ``emit(kind, **fields)`` records (each record of an assignment with its id, assignment_id(), which ``attempt``
+    finds as ``member.assignment``; a failed attempt's note carries the failure in plain words and the provider's
+    own, ``describe(error)``, and when it is retried); ``directory`` is the shared working folder, where reports are
+    saved. close() stops every member (each record says why) and ends every wait.
     """
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
@@ -747,6 +770,9 @@ class Team:
             reason = member.stop_reason or "It was stopped."
             text = STOPPED_REPORT.format(reason=reason) + (f"\n\n{reply}" if reply else "")
             state, failure = "failed", reason
+        elif isinstance(failure, Refusal):
+            text, state = REFUSED_REPORT.format(member=member.number, reason=failure.reason), "failed"
+            failure = failure.text  # The member's record keeps the failure's own words.
         elif failure:
             text, state = f"The assignment failed: {failure}", "failed"
         else:
