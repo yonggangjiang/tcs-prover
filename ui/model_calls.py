@@ -30,6 +30,9 @@ AUTHOR_STAGES = ("solve", "repair", "failure", "conversation")
 NETWORK_DETAILS = ["per-word arrival times", "response headers", "moderation notes"]
 # The role a node's request records name (a web-cutoff run's placeholder rows): by stage and label.
 STAGE_ROLES = {"review": "reviewer", "final": "latex editor"}
+# The label a record written before keeps for the calls of a LaTeX step, its node's name (the LaTeX steps of
+# workflows/clean_up.yaml name no label; workflow_runner.RECORD_LABELS names them now), as the list names it.
+NODE_LABELS = {"latex_editor": "LaTeX editor", "latex_repair": "LaTeX repair"}
 # The routes keep the Claude streams and trace event logs they read whole for the next request while their
 # decompressed bytes add up to at most this much (_ReadCache); a larger file is read again each time. The training
 # download keeps each Claude stream it reads until that process's last call instead.
@@ -114,6 +117,7 @@ def _role(line, labels):
     process = labels.get(line.get("process"), {})
     role = process.get("role") or {"review": "reviewer"}.get(process.get("stage")) or "model call"
     label = process.get("label") or process.get("activityLabel") or role
+    label = NODE_LABELS.get(label, label)
     member = process.get("member")
     agent = line.get("agentPath")
     if agent and agent != "/root":

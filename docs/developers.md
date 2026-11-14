@@ -812,7 +812,10 @@ writes a job's record, `ui/model_calls.py` reads it.
   `codex/<label>/process.json` (who the process was: role, node, round, label,
   member, model; the round as the activity log names it, so the critic's visit,
   the critic round the convention critic checks, and none for a LaTeX repair,
-  `workflow_runner._record_round()`) and `codex/<label>/<bundle>/`
+  `workflow_runner._record_round()`; the label the node's activity or request
+  label, else `RECORD_LABELS`' "LaTeX editor" and "LaTeX repair" for the LaTeX
+  steps, which name none, as the Model calls list also names an older record's
+  `latex_editor` and `latex_repair`, `model_calls.NODE_LABELS`) and `codex/<label>/<bundle>/`
   (`payloads.jsonl`, where each
   trace payload went, and byte copies of the bundle's `manifest.json` and
   `trace.jsonl` as `.gz`); `claude/<label>.json` and `claude/<label>.jsonl.gz`;

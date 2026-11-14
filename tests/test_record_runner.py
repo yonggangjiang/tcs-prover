@@ -412,8 +412,40 @@ class RoundLabelTests(critic_test.CriticCase):
         seen = self.recorded()
         with mock.patch.object(runtime, "_run_command", side_effect=lambda *args, **kwargs: next(compiles)):
             self.run_critic(model, workflows=(critic_test.AUTHOR_CRITIC, critic_test.CLEAN_UP))
-        self.assertEqual([entry for entry in seen if entry[0].startswith("latex_repair")],
-                         [("latex_repair", None), ("latex_repair", None)])
+        self.assertEqual([entry for entry in seen if entry[0].startswith("LaTeX repair")],
+                         [("LaTeX repair", None), ("LaTeX repair", None)])
+
+    def test_the_latex_steps_are_named_as_the_activity_log_names_them(self):
+        # Their nodes name no label (workflows/clean_up.yaml): the record names them "LaTeX editor" and "LaTeX
+        # repair", never by the node's name, and the list does so for a record written before too.
+        compiles = iter([{"status": "fail", "output": "error 1", "diagnostic": "d1"}, {"status": "pass", "output": ""}])
+
+        def model(call):
+            if call["stage"] == "final":
+                (call["workspace"] / "latex-source.tex").write_text(critic_test.LATEX)
+                return {"summary": "Edited."}
+            return critic_test.critic_answer()
+
+        captured = []
+        original = self.attempts
+
+        def attempts(critic):
+            inner = original(critic)
+
+            def attempt(*args, **settings):
+                captured.append(records.current_labels())
+                return inner(*args, **settings)
+
+            return attempt
+
+        self.attempts = attempts
+        with mock.patch.object(runtime, "_run_command", side_effect=lambda *args, **kwargs: next(compiles)):
+            self.run_critic(model, workflows=(critic_test.AUTHOR_CRITIC, critic_test.CLEAN_UP))
+        latex = [(labels["node"], labels["label"]) for labels in captured if labels.get("node", "").startswith("latex")]
+        self.assertEqual(latex, [("latex_editor", "LaTeX editor"), ("latex_repair", "LaTeX repair")])
+        for raw, shown in (("latex_editor", "LaTeX editor"), ("latex_repair", "LaTeX repair")):
+            self.assertEqual(model_calls._role({"process": "p"}, {"p": {"role": "latex editor", "label": raw}})[1],
+                             shown)
 
 
 class MemberSessionTests(unittest.TestCase):

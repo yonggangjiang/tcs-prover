@@ -3877,9 +3877,11 @@ def run_structured_attempt(
 
 
 # The record's labels of each workflow node's model calls: role (as the model-calls list names it) by node name; any
-# other node is named by itself.
+# other node is named by itself. Its label is the node's activity or request label, else RECORD_LABELS' name for the
+# node (the LaTeX steps of workflows/clean_up.yaml name none), else the node's name.
 RECORD_ROLES = {"critic": "critic", "convention": "convention critic", "latex_editor": "latex editor",
                 "latex_repair": "latex repair"}
+RECORD_LABELS = {"latex_editor": "LaTeX editor", "latex_repair": "LaTeX repair"}
 _RECORD_PROBLEM_SAID = []
 
 
@@ -9069,7 +9071,8 @@ def _execute(workflow, state, options, prompts):
             if node["run"] == "structured":
                 with records.labelled(role=RECORD_ROLES.get(current, current), node=current,
                                       round=_record_round(current, visits, state),
-                                      label=node.get("activity_label") or node.get("request_label") or current):
+                                      label=(node.get("activity_label") or node.get("request_label")
+                                             or RECORD_LABELS.get(current, current))):
                     result, raw = _model_call(node, prompts, state, node_options, visits, input_files=input_files,
                                               verify=verify)
             elif node["run"] == "command":
