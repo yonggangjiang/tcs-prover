@@ -6,6 +6,7 @@ payload with serde_json's pretty printer before the event that names it, events 
 audit's captures of the real Codex (E3, E4) round-trip the same way.
 """
 
+import errno
 import gzip
 import io
 import json
@@ -714,6 +715,32 @@ class ReasoningFillTests(RecordCase):
         lines = records.CallLog(self.path).read()
         self.assertEqual([line["callId"] for line in lines], ["call-a", "call-b", "call-c", "call-d", "msg_1", "late"])
         self.assertEqual(sum("reasoning" in line for line in lines), 3)
+
+    def test_a_record_whose_lines_cannot_be_filled_now_still_opens_and_a_later_opening_fills_them(self):
+        # Opening a record never fails because of this: a record whose lock cannot be taken (a folder where its lock
+        # file goes) or whose lines cannot be written again (a full disk) opens with its lines as they are, in the
+        # Records list beside the other records and on its own routes.
+        records.Record.create(records.record_folder("run-2"), title="Another statement")
+
+        def opened(why):
+            with mock.patch.object(records, "_FILLED", set()):  # As a new process: the record is not opened yet.
+                listed = model_calls.record_list(lambda name: True)
+            with mock.patch.object(records, "_FILLED", set()):
+                listing = model_calls.call_list("run-1")
+            self.assertEqual(sorted(row["runFolder"] for row in listed), ["run-1", "run-2"], why)
+            self.assertEqual(listing["total"], 5, why)
+            self.assertEqual(self.path.read_bytes(), self.older, why)
+
+        lock = self.record.folder / ".lock"
+        lock.unlink(missing_ok=True)
+        lock.mkdir()
+        opened("its lock cannot be taken")
+        lock.rmdir()
+        with mock.patch.object(records, "write_atomic", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            opened("a full disk")
+        with mock.patch.object(records, "_FILLED", set()):
+            records.Record(self.record.folder)
+        self.assertEqual(self.path.read_bytes(), self.filled)
 
 
 class RoundTests(unittest.TestCase):

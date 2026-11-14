@@ -9,6 +9,7 @@ goal sessions run against the scripted app-server double of tests/test_goal_runt
 import ast
 import contextlib
 import copy
+import errno
 import gzip
 import hashlib
 import io
@@ -820,6 +821,34 @@ class SettingsCopyTests(unittest.TestCase):
                 self.assertRaises(Crash):
             records.Record(self.record.folder)
         self.assertEqual((folder / "transcript.jsonl.gz").read_bytes(), original)
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+            records.Record(self.record.folder)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older))
+
+    def test_a_record_whose_snapshot_cannot_be_kept_so_now_still_opens_and_a_later_opening_does_it(self):
+        # Opening a record never fails because of this: a record whose lock cannot be taken (a folder where its lock
+        # file goes) or whose snapshot cannot be written again (a full disk) opens with its snapshot as it is, in the
+        # Records list beside the other records and on its own routes.
+        records.Record.create(records.record_folder("run-2"), title="Another statement")
+        folder = self.old_snapshot("".join(self.older).encode())
+        original = (folder / "transcript.jsonl.gz").read_bytes()
+
+        def opened(why):
+            with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):  # As a new process: not opened yet.
+                listed = model_calls.record_list(lambda name: True)
+            with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+                listing = model_calls.call_list("run-1")
+            self.assertEqual(sorted(row["runFolder"] for row in listed), ["run-1", "run-2"], why)
+            self.assertEqual(listing["total"], 0, why)
+            self.assertEqual((folder / "transcript.jsonl.gz").read_bytes(), original, why)
+
+        lock = self.record.folder / ".lock"
+        lock.unlink(missing_ok=True)
+        lock.mkdir()
+        opened("its lock cannot be taken")
+        lock.rmdir()
+        with mock.patch.object(records, "write_atomic", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            opened("a full disk")
         with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
             records.Record(self.record.folder)
         self.assertEqual(records.transcript_data(self.record), self.kept(self.older))
