@@ -698,7 +698,13 @@ that every prompt and tool text is the user's to adjust. What the code does:
   model server), and after `COORDINATOR_UNTAKEN_HANDINS` (3) such replies. A
   status `Coordinator warning cleared` (`coordinatorWarningCleared`, pinned)
   ends each: the next team call, the next team call that reaches TCS Prover,
-  the next hand-in. The server keeps the warnings not cleared
+  the next hand-in. A model-call failure ends the goal session, and the next
+  attempt's watch is a new one: the failed attempt's retry details carry the
+  warnings still listed (`warned`, `CoordinatorWatch.shown()`, through
+  `_goal_step()`), which the new watch clears as its own. Without TCS Prover's
+  team only the hand-ins are watched, a refused call included (no team call
+  could clear it; a refused `update_goal` leaves replies not handed in). The
+  server keeps the warnings not cleared
   (`App._follow_coordinator_warnings()`; a runner's end clears them) and
   lists a running job's newest one under Needs your attention (kind
   `coordinator`) after every more pressing cause. No text a model reads

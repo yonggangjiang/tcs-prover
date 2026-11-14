@@ -1827,8 +1827,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     pending, given_up = {}, {}
     # A coordinator with TCS Prover's team that works without it is listed under Needs your attention while it works
     # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls.
+    # An attempt that continues an earlier one after a model-call failure clears the warnings that one left listed.
     watch_class = getattr(runtime, "CoordinatorWatch", None)
-    team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields))
+    team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields),
+                              warned=continued.get("warned") or ())
                   if coordinator and team is not None and watch_class is not None else None)
     replies = {"last": None}  # The newest answer's message ID: its content blocks come one after another.
     held, told = {}, set()  # Live instructions that could not be sent, and those already reported.
@@ -2755,7 +2757,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                          "instruction": state["instruction"] or None, "delivered": state["delivered"],
                          "output": state["output"], "anchor": state["anchor"], "rewind": rewind,
                          "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered,
-                         "checked": checks.last if checks is not None else None}
+                         "checked": checks.last if checks is not None else None,
+                         "warned": team_watch.shown() if team_watch is not None else []}
                 if thread and getattr(runtime, "_context_window_failure", lambda error: False)(exc):
                     # The same conversation would fail again: continue in a new one.
                     repair = pending_repair()

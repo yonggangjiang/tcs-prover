@@ -3001,16 +3001,25 @@ class CoordinatorWatch:
     incomplete (untaken_handin()) and each hand-in (handed_in()); tick(active) keeps the time without team calls,
     which runs only while the goal is active and no team call runs. ``team`` says whether the coordinator has TCS
     Prover's team (without it only the hand-ins are watched). ``emit(kind, **fields)`` records each warning and the
-    status that clears it. Thread-safe: Codex's error output is read on a thread of its own.
+    status that clears it. ``warned`` holds the warnings that an earlier attempt of the same runner showed and did
+    not clear (its retry details carry shown()): the server lists them until a status clears them, so this watch
+    clears them as its own. Thread-safe: Codex's error output is read on a thread of its own.
     """
 
-    def __init__(self, emit, team=True, clock=time.monotonic):
+    def __init__(self, emit, team=True, clock=time.monotonic, warned=()):
         self.emit, self.team, self.clock = emit, team, clock
         self.lock = threading.Lock()
         self.calls, self.since = 0, clock()
         self.running = set()
         self.handins = 0
-        self.warned = set()
+        self.warned = {kind for kind in (warned if isinstance(warned, (list, tuple, set)) else ())
+                       if kind in COORDINATOR_WARNINGS}
+
+    def shown(self):
+        """The warnings shown and not cleared, oldest name first: what the next attempt's watch takes over."""
+
+        with self.lock:
+            return sorted(self.warned)
 
     def model_call(self):
         with self.lock:
@@ -3048,7 +3057,9 @@ class CoordinatorWatch:
             self._teamless(calls, seconds)
 
     def refused(self, detail):
-        if self._warn("refused"):
+        # Without TCS Prover's team no team call could ever clear it (a refused update_goal is watched by its
+        # hand-ins).
+        if self.team and self._warn("refused"):
             self.emit("diagnostic", label=COORDINATOR_WARNINGS["refused"], coordinatorWarning="refused",
                       needsAttention=True,
                       text=f"Codex refused a team tool call of the coordinator ({_clipped(detail, 300)}): the call "
@@ -5589,7 +5600,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     goal_tool = own_service = None
     # Whether the coordinator works without TCS Prover's team, or replies with its proof file without handing it in:
     # warnings while the run goes on (CoordinatorWatch).
-    team_watch = (CoordinatorWatch(lambda kind, **fields: emit(kind, threadId=thread, **fields), team=team is not None)
+    team_watch = (CoordinatorWatch(lambda kind, **fields: emit(kind, threadId=thread, **fields), team=team is not None,
+                                   warned=continued.get("warned") or ())
                   if coordinator and (team is not None or tcs) else None)
 
     def start_service():
@@ -6221,7 +6233,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "rewind": {"turn": state["turn_id"]} if reverted else None,
                                   "steer": state["steer"], "pending_compaction": pending_compaction,
                                   "refusal": final["refusal"], "classic_shell": classic or (tools and not policy),
-                                  "checked": checks.last if checks is not None else None}
+                                  "checked": checks.last if checks is not None else None,
+                                  "warned": team_watch.shown() if team_watch is not None else []}
                 if thread and _context_window_failure(failure):
                     # The same conversation would fail again: continue in a new one.
                     final["retry"].update(
@@ -9017,7 +9030,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
              "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
-             "replace": None, "refusal": None, "classic_shell": False, "checked": None}
+             "replace": None, "refusal": None, "classic_shell": False, "checked": None, "warned": []}
     failing_since = None
     with retry_clock(options).call(stage):
         while True:
@@ -9035,6 +9048,8 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                         known[key] = retry[key]
                 if type(retry.get("checked")) is int:
                     known["checked"] = retry["checked"]  # The coordinator's last time check (TimeChecks).
+                if isinstance(retry.get("warned"), list):
+                    known["warned"] = retry["warned"]  # The coordinator's warnings still listed (CoordinatorWatch).
                 # Consecutive identical refusals to reopen the thread; any other outcome resets the count.
                 known["refusal"] = retry.get("refusal")
                 known["classic_shell"] = known["classic_shell"] or bool(retry.get("classic_shell"))
@@ -9074,7 +9089,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
                              "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"],
-                             "checked": known["checked"]}
+                             "checked": known["checked"], "warned": known["warned"]}
                 if rewind.get("fresh") or known["replace"]:
                     # The conversation's first turn produced nothing (a new
                     # conversation with the same first instruction loses

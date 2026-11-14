@@ -329,7 +329,10 @@ Claude Code's own subagents.
   marking its goal complete (**Proof not handed in**: without `update_goal`'s
   "complete" the reply is not handed in). Each warning ends by itself, with a
   **Coordinator warning cleared** line: at the coordinator's next team call,
-  its next team call that reaches the team, its next hand-in.
+  its next team call that reaches the team, its next hand-in, also after a
+  failed model call restarted the coordinator's session. A coordinator without
+  TCS Prover's team (one using its program's own subagents) gets only the
+  **Proof not handed in** warning.
 - **The team note.** `team_note` is added to the coordinator's first prompt,
   after the related works; `{members}` lists the members, one line each (such as
   "- member 1: GPT 6.1 Sol (Codex CLI)").

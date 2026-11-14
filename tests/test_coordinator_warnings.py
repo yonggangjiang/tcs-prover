@@ -8,7 +8,9 @@ when Codex refuses a team tool call ("unsupported call" in its app-server's erro
 against a scripted model server printed it for the flattened name, a tool the namespace does not have and a
 namespace no server has, and sent no notification), and when a coordinator under TCS Prover's goal loop ends
 COORDINATOR_UNTAKEN_HANDINS (3) turns with a reply that names its proof file without update_goal's "complete". Each
-warning clears by itself: at the next team call, the next team call that reaches TCS Prover, the next hand-in.
+warning clears by itself: at the next team call, the next team call that reaches TCS Prover, the next hand-in, also
+in the next attempt after a model-call failure, whose new watch takes the warnings still listed from the failed
+attempt's retry details. A coordinator without TCS Prover's team is warned of its hand-ins only, a refused call too.
 
 The author's "Author cache usage" status covers the whole turn's model requests, not only its last one.
 
@@ -165,6 +167,24 @@ class WatchTests(unittest.TestCase):
             self.watch.untaken_handin()
         self.assertEqual(len(self.warnings()), 1)
 
+    def test_a_watch_clears_the_warnings_an_earlier_attempt_left_listed(self):
+        # After a model-call failure the runner continues in a new goal session, with a new watch (_goal_step()): it
+        # takes over the warnings the failed attempt left listed (its retry details, shown()), warns of none of them
+        # again, and clears each at its own end.
+        watch = runtime.CoordinatorWatch(lambda kind, **fields: self.records.append({"kind": kind, **fields}),
+                                         clock=self.clock, warned=["teamless", "handin", "not a warning"])
+        self.assertEqual(watch.shown(), ["handin", "teamless"])
+        for _ in range(10):
+            watch.model_call()
+        for _ in range(3):
+            watch.untaken_handin()
+        self.assertEqual(self.records, [])
+        watch.team_call("call-1")
+        watch.handed_in()
+        self.assertEqual(self.cleared(), ["teamless", "handin"])
+        self.assertEqual(watch.shown(), [])
+        self.assertEqual(runtime.CoordinatorWatch(lambda kind, **fields: None, warned=None).shown(), [])
+
     def test_without_a_team_only_the_hand_ins_are_watched(self):
         watch = runtime.CoordinatorWatch(lambda kind, **fields: self.records.append(fields), team=False,
                                          clock=self.clock)
@@ -172,6 +192,9 @@ class WatchTests(unittest.TestCase):
             watch.model_call()
         self.clock.now += 3600
         watch.tick()
+        # Codex's own subagents under TCS Prover's goal loop: a refused update_goal is no team tool call, and no team
+        # call could ever clear such a warning (its hand-ins are watched).
+        watch.refused("unsupported call: mcp__tcs__update_goal")
         self.assertEqual(self.records, [])
         for _ in range(3):
             watch.untaken_handin()
@@ -217,13 +240,14 @@ class SessionTests(unittest.TestCase):
         self.crew = team.Team([], prompts=team_test.TEXTS, directory=str(self.directory), attempt=None,
                               configuration=None, emit=lambda kind, **fields: None, render=None, retry_note="")
 
-    def session(self, double, crew=True, coordinator=True):
+    def session(self, double, crew=True, coordinator=True, **options):
         double.service = self.service
         session = runtime.goal_session(
             double, "Coordinate.", prompts=team_test.GOAL_PROMPTS,
             settings={"model": "gpt-6.1-sol", "effort": "high", "speed": "standard", "summary": "concise"},
             features=[], coordinator=coordinator, texts=team_test.TEXTS, service=self.service,
-            team=self.crew if crew else None, options={"goal_cwd": str(self.directory), "goal_loop": "tcs"})
+            team=self.crew if crew else None,
+            options={"goal_cwd": str(self.directory), "goal_loop": "tcs", **options})
         self.addCleanup(session.close)
         return session
 
@@ -315,6 +339,77 @@ class SessionTests(unittest.TestCase):
         self.assertLess(labels.index("Proof not handed in"), labels.index("Coordinator warning cleared"))
         self.assertLess(labels.index("Coordinator warning cleared"), labels.index("Goal complete"))
 
+    def test_the_next_attempt_after_a_model_call_failure_clears_the_warnings_the_failed_one_left_listed(self):
+        # A failed model call ends the goal session; the runner continues in a new one (_goal_step()), whose retry
+        # details name the warnings still listed. Its team call or hand-in clears them, so the job leaves Needs your
+        # attention.
+        failure = runtime.Error("stream disconnected before completion: upstream connect error")
+
+        def quiet(rpc):
+            rpc.messages.extend([usage(number) for number in range(1, 11)] + [failure])
+
+        first = team_test.LoopDouble([quiet])
+        with self.assertRaises(runtime.WorkflowPaused) as paused:
+            next(self.session(first))
+        self.assertEqual(len(self.labelled(first, "Coordinator works without its team")), 1)
+        self.assertEqual(paused.exception.retry["warned"], ["teamless"])
+
+        def team_turn(rpc):
+            rpc.messages.extend([team_item("item/started"), team_item("item/completed"), usage(11)])
+            self.done(rpc)
+
+        second = team_test.LoopDouble([team_turn])
+        self.assertEqual(next(self.session(second, goal_retry=paused.exception.retry))["output"], POINTER)
+        cleared, = self.labelled(second, "Coordinator warning cleared")
+        self.assertEqual(cleared["coordinatorWarningCleared"], "teamless")
+        self.assertEqual(self.labelled(second, "Coordinator works without its team"), [])
+
+        def pointer(rpc):
+            rpc.messages.extend([goal_test.answer(POINTER), goal_test.completed()])
+
+        def failing(rpc):
+            rpc.messages.append(failure)
+
+        third = team_test.LoopDouble([pointer, pointer, pointer, failing])
+        with self.assertRaises(runtime.WorkflowPaused) as paused:
+            next(self.session(third))
+        self.assertEqual(paused.exception.retry["warned"], ["handin"])
+        fourth = team_test.LoopDouble([self.done])
+        self.assertEqual(next(self.session(fourth, goal_retry=paused.exception.retry))["output"], POINTER)
+        labels = [event.get("label") for event in fourth.events]
+        self.assertLess(labels.index("Coordinator warning cleared"), labels.index("Goal complete"))
+        # Through the server: listed while the first attempt's warning stands, gone with the next attempt's hand-in.
+        app = server.App(runs=self.directory / "runs", load_latest=False)
+        app.state.update({"phase": "running", "stage": "solve", "activeNode": "author"})
+        for event in third.events:
+            app._follow_coordinator_warnings(event)
+        self.assertEqual(app.attention()["warning"], "handin")
+        for event in fourth.events:
+            app._follow_coordinator_warnings(event)
+        self.assertIsNone(app.attention())
+
+    def test_every_retry_of_the_runner_carries_the_warnings_still_listed(self):
+        def failing(warned):
+            raise runtime.WorkflowPaused("Network unavailable", reason="Network unavailable", thread_id="thread-1",
+                                         retry={"thread": "thread-1", "stage": "solve", "values": {}, "output": True,
+                                                "instruction": "Go on.", "delivered": True,
+                                                **({} if warned is None else {"warned": warned})})
+            yield
+
+        def done():
+            yield {"outcome": "done", "output": POINTER}
+
+        attempts, carried = iter([failing(None), failing([]), done()]), []
+
+        def launch(options, initial_instruction):
+            carried.append(options["goal_retry"]["warned"])
+            return next(attempts)
+
+        with mock.patch.object(runtime, "wait_before_retry"), mock.patch.object(runtime, "emit"):
+            result = runtime._goal_step({"author": failing(["teamless"])}, "author", launch, "", {}, next, "solve")
+        # An attempt that reports none keeps the last known; one that cleared them reports none listed.
+        self.assertEqual((result["output"], carried), (POINTER, [["teamless"], ["teamless"], []]))
+
     def test_two_such_replies_are_not_listed(self):
         def pointer(rpc):
             rpc.messages.extend([goal_test.answer(POINTER), goal_test.completed()])
@@ -393,6 +488,25 @@ class ClaudeTests(team_test.TeamCase):
             self.assertEqual(next(session)["output"], POINTER)
         self.assertIn("Done: ", self.results()["mcp__tcs__team_wait"]["content"][0]["text"])
         self.assertEqual(self.labelled("Coordinator works without its team"), [])
+
+    def test_the_next_attempt_after_a_failure_clears_the_warning_the_failed_one_left_listed(self):
+        crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")
+        # Both launches' turns: the stand-in CLI takes them in order across its runs.
+        turns = [["init", "echo", *[self.answer(number) for number in range(1, 11)], {"stderr": "fatal: crashed"},
+                  {"exit": 3}],
+                 ["init", "echo", {"mcp_call": {"name": "mcp__tcs__team_members"}},
+                  {"structured": {"goal_status": "complete", "final_answer": POINTER, "progress_note": ""}}]]
+        _, session = self.coordinator(crew, turns)
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True), \
+                self.assertRaises(runtime.WorkflowPaused) as paused:
+            next(session)
+        self.assertEqual(len(self.labelled("Coordinator works without its team")), 1)
+        self.assertEqual(paused.exception.retry["warned"], ["teamless"])
+        _, again = self.coordinator(crew, turns, goal_retry={"warned": paused.exception.retry["warned"]})
+        with mock.patch.object(runtime.proof_handoff, "file_handoff_supported", return_value=True):
+            self.assertEqual(next(again)["output"], POINTER)
+        cleared, = self.labelled("Coordinator warning cleared")
+        self.assertEqual(cleared["coordinatorWarningCleared"], "teamless")
 
     def test_nine_answers_in_eighteen_messages_are_not_listed(self):
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}], coordinator="claude-opus-5-5")

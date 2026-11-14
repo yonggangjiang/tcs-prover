@@ -257,6 +257,14 @@ class AccuracyTests(unittest.TestCase):
         for name in ("`COORDINATOR_TEAMLESS_CALLS` (10)", "`COORDINATOR_TEAMLESS_SECONDS` (20 minutes",
                      "`COORDINATOR_UNTAKEN_HANDINS` (3)", "error=unsupported call: <name>"):
             self.assertIn(name, developers)
+        # A warning of an attempt that a model-call failure ended is cleared by the next attempt (its retry details
+        # carry it); without the team only the hand-ins are watched.
+        self.assertIn("its next team call that reaches the team, its next hand-in, also after a failed model call "
+                      "restarted the coordinator's session. A coordinator without TCS Prover's team (one using its "
+                      "program's own subagents) gets only the **Proof not handed in** warning.", workflow)
+        self.assertIn("the failed attempt's retry details carry the warnings still listed (`warned`, "
+                      "`CoordinatorWatch.shown()`, through `_goal_step()`), which the new watch clears as its own.",
+                      developers)
 
     def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
         # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the
