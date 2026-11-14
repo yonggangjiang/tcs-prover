@@ -625,13 +625,22 @@ def rebuild_payload(objects, store, input_list=None):
 
     if "object" in store:
         return objects.get(store["object"])
+    return pretty(payload_value(objects, store, input_list))
+
+
+def payload_value(objects, store, input_list=None):
+    """A stored payload as parsed JSON: what json.loads() of rebuild_payload() gives, without writing the text out and
+    reading it back (ValueError when a payload kept whole is not JSON)."""
+
+    if "object" in store:
+        return json.loads(objects.get(store["object"]))
     value = json.loads(objects.get(store["skeleton"]))
     for field, refs in store.get("lists", {}).items():
         refs = input_list if refs == "input" else refs
         value[field] = [json.loads(objects.get(sha)) for sha in refs]
     for field, sha in store.get("values", {}).items():
         value[field] = json.loads(objects.get(sha))
-    return pretty(value)
+    return value
 
 
 class StoredBundle:
@@ -723,6 +732,16 @@ class StoredBundle:
             entry = self.entries[path]
         inputs = self._resolved(path, entry) if entry.get("input") is not None else None
         return rebuild_payload(self.record.objects, entry["store"], inputs)
+
+    def value(self, path):
+        """One stored payload parsed, as json.loads(payload(path)) gives it (KeyError when it is not stored)."""
+
+        entry = self.entries.get(path)
+        if entry is None:
+            self.load()
+            entry = self.entries[path]
+        inputs = self._resolved(path, entry) if entry.get("input") is not None else None
+        return payload_value(self.record.objects, entry["store"], inputs)
 
     def input(self, path):
         """The full input list (item sha256) of one stored request, or None."""

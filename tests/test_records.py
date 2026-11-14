@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 import zipfile
@@ -422,6 +423,15 @@ class LongThreadTests(RecordCase):
         self.assertEqual(requests[-1]["request"]["input"], [self.items[0], self.items[-1]])
         self.assertEqual(json.loads(archive.read("manifest.json"))["counts"]["requests"], self.LENGTH)
 
+    def test_the_download_reads_a_bundle_s_payload_list_once(self):
+        # Read again for every payload, the download's time grew with the square of the thread's requests.
+        loads = []
+        original = records.StoredBundle.load
+        with mock.patch.object(records.StoredBundle, "load",
+                               lambda bundle: loads.append(bundle.name) or original(bundle)):
+            model_calls.training_record("run-1", Sink())
+        self.assertEqual(len(loads), 1)
+
 
 class UntracedCompactionTests(RecordCase):
     def test_a_local_compaction_codex_leaves_untraced_is_a_row_with_its_summary(self):
@@ -487,6 +497,60 @@ class WebSocketContinuationTests(RecordCase):
         self.assertTrue(requests[1]["inputExpanded"])
         self.assertEqual(requests[1]["request"]["input"], [PROMPT, ANSWER, PROMPT])
 
+    def test_a_continuation_of_an_earlier_response_than_the_last_is_expanded_from_it(self):
+        # A retry after a failed continuation continues the same earlier response again.
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), [ANSWER])
+        bundle.call("call-b", request([PROMPT], previous_response_id="resp_call-a"), status="failed")
+        bundle.call("call-c", request([CELL_OUTPUT], previous_response_id="resp_call-a"), [ANSWER])
+        self.ingest(bundle)
+        buffer = io.BytesIO()
+        model_calls.training_record("run-1", buffer)
+        requests = [json.loads(line) for line in
+                    zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("requests.jsonl").splitlines()]
+        self.assertEqual([request["request"]["input"] for request in requests],
+                         [[PROMPT], [PROMPT, ANSWER, PROMPT], [PROMPT, ANSWER, CELL_OUTPUT]])
+
+
+class Sink:
+    """A download's destination that keeps nothing: it counts the bytes."""
+
+    def __init__(self):
+        self.size = 0
+
+    def write(self, data):
+        self.size += len(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+class DownloadCostTests(RecordCase):
+    """The training download runs inside the server, which hosts every job: it holds what the threads still open
+    need, never every call of the record."""
+
+    def test_the_download_keeps_no_call_it_has_written(self):
+        # 40 structured calls of a thread each, with an input of 300 KB of its own: 12 MB if they were all kept.
+        for number in range(40):
+            bundle = Bundle(self.trace, thread=f"01a1d4e2-0000-7000-8000-{number:012d}")
+            bundle.thread_started()
+            text = os.urandom(150_000).hex()
+            bundle.call(f"call-{number}", request([{"type": "message", "role": "user",
+                                                    "content": [{"type": "input_text", "text": text}]}]), [ANSWER])
+            self.ingest(bundle)
+        sink = Sink()
+        with mock.patch.object(records, "MEMBER_CACHE_BYTES", 0):  # The item store's own bounded cache aside.
+            tracemalloc.start()
+            try:
+                model_calls.training_record("run-1", sink)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        self.assertGreater(sink.size, 12_000_000)
+        self.assertLess(peak, 4_000_000)
+
 
 def stream_lines(session="s-1"):
     def assistant(identity, block, parent=None):
@@ -534,6 +598,28 @@ class ClaudeStreamTests(RecordCase):
         self.assertEqual(model_calls.call_raw("run-1", "c000001")["format"], "claude-stream")
         row = model_calls.call_list("run-1")["calls"][0]
         self.assertEqual(row["tokens"], {"input": 175, "cached": 25, "output": None, "reasoning": None})
+
+    def test_the_routes_keep_at_most_read_cache_bytes_of_what_they_read(self):
+        stream = self.recorder().claude_stream(role="critic")
+        for line in stream_lines():
+            stream.line(json.dumps(line))
+        stream.finish()
+        path = str(self.record.folder / "claude" / f"{stream.label}.jsonl.gz")
+        self.addCleanup(model_calls._STREAMS.entries.clear)
+        model_calls.call_detail("run-1", "c000001")
+        self.assertIn(path, model_calls._STREAMS.entries)  # Kept for the next request ...
+        model_calls._STREAMS.entries.clear()
+        with mock.patch.object(model_calls, "READ_CACHE_BYTES", 100):
+            model_calls.call_detail("run-1", "c000001")
+        self.assertNotIn(path, model_calls._STREAMS.entries)  # ... unless it is larger than the bound.
+        cache = model_calls._ReadCache()
+        with mock.patch.object(model_calls, "READ_CACHE_BYTES", 100):
+            cache.put("a", 1, "A", 60)
+            cache.put("b", 1, "B", 30)
+            self.assertEqual(cache.get("a", 1), "A")
+            cache.put("c", 1, "C", 30)  # 120 bytes: b, the least recently used, goes.
+            self.assertEqual([cache.get(key, 1) for key in "abc"], ["A", None, "C"])
+            self.assertIsNone(cache.get("a", 2))  # Changed since: read again.
 
     def test_a_request_without_a_result_after_it_is_interrupted(self):
         stream = self.recorder().claude_stream(role="author")

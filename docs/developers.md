@@ -836,6 +836,14 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   directory, so no ZIP reader takes it for whole), `GET /records` and
   `DELETE /records/<run>` (409 while the job's runner, review or reply turn
   runs). They read the record folder, so a deleted job's record still answers.
+  The download runs in the server, which hosts every job, so it is written in
+  one pass in time order and keeps only what is still open: each bundle's
+  `payloads.jsonl` is read once, a thread's latest request (its full input and
+  output items, which a WebSocket continuation is expanded with) until the
+  thread's last request, and a Claude Code process's stream until its last
+  call; items are read parsed, not rebuilt as text first. Between requests the
+  routes keep at most `READ_CACHE_BYTES` (64 MiB) of the Claude streams and
+  trace event logs they read (a larger file is read again each time).
   `recordState.problems` shows the newest `PROBLEMS_SHOWN` (50) distinct
   sentences of `problems.jsonl`, which keeps them all. A subagent's session file
   is recognized by its first line (its `session_meta`), of which at most

@@ -28,9 +28,11 @@ AUTHOR_STAGES = ("solve", "repair", "failure", "conversation")
 NETWORK_DETAILS = ["per-word arrival times", "response headers", "moderation notes"]
 # The role a node's request records name (a web-cutoff run's placeholder rows): by stage and label.
 STAGE_ROLES = {"review": "reviewer", "final": "latex editor"}
+# The routes keep the Claude streams and trace event logs they read whole for the next request while their
+# decompressed bytes add up to at most this much (_ReadCache); a larger file is read again each time. The training
+# download keeps each Claude stream it reads until that process's last call instead.
+READ_CACHE_BYTES = 64 * 1024 * 1024
 _CACHE_LOCK = threading.Lock()
-_STREAMS = {}  # stream path -> (size, lines)
-_EVENTS = {}  # bundle folder -> (signature, events)
 _COMPACTIONS = {}  # session copy -> (signature, [(time, summary)])
 # Codex 0.160 leaves a local compaction untraced (core/src/compact.rs: "local compaction streams are left untraced"):
 # that of every model it does not compact remotely, so of every API connection's model. Its summary is in the copied
@@ -41,6 +43,36 @@ UNTRACED_COMPACTION = ("Codex 0.160 does not trace a local compaction (that of a
 
 class NotFound(ValueError):
     """No such record or call (404)."""
+
+
+class _ReadCache:
+    """Files read whole, kept for the next request: the least recently used goes first once their decompressed bytes
+    add up to more than READ_CACHE_BYTES, and a file larger than that is never kept."""
+
+    def __init__(self):
+        self.entries, self.lock = {}, threading.Lock()  # key -> (signature, value, bytes), most recently used last
+
+    def get(self, key, signature):
+        with self.lock:
+            entry = self.entries.pop(key, None)
+            if entry is None or entry[0] != signature:
+                return None
+            self.entries[key] = entry
+            return entry[1]
+
+    def put(self, key, signature, value, size):
+        with self.lock:
+            self.entries.pop(key, None)
+            if size > READ_CACHE_BYTES:
+                return
+            self.entries[key] = (signature, value, size)
+            total = sum(entry[2] for entry in self.entries.values())
+            while total > READ_CACHE_BYTES:
+                total -= self.entries.pop(next(iter(self.entries)))[2]
+
+
+_STREAMS = _ReadCache()  # Claude stream path -> its lines
+_EVENTS = _ReadCache()  # stored bundle folder -> its trace events
 
 
 def _record(name):
@@ -267,8 +299,17 @@ def _line(record, call_id):
     raise NotFound("Unknown model call.")
 
 
-def _bundle(record, line):
-    return records.StoredBundle(record, line.get("process"), line.get("bundle")).load()
+def _bundle(record, line, bundles=None):
+    """The stored bundle of a Codex call; ``bundles``: those of a caller that reads many payloads, by process and
+    bundle, each made (its payloads.jsonl read) once."""
+
+    key = (line.get("process"), line.get("bundle"))
+    bundle = bundles.get(key) if bundles is not None else None
+    if bundle is None:
+        bundle = records.StoredBundle(record, *key).load()
+        if bundles is not None:
+            bundles[key] = bundle
+    return bundle
 
 
 def _json(data):
@@ -311,10 +352,9 @@ def _events(record, line):
         except OSError:
             continue
         signature = (str(source), info.st_size, info.st_mtime_ns)
-        with _CACHE_LOCK:
-            cached = _EVENTS.get(str(stored))
-        if cached and cached[0] == signature:
-            return cached[1]
+        cached = _EVENTS.get(str(stored), signature)
+        if cached is not None:
+            return cached
         try:
             data = source.read_bytes()
             data = gzip.decompress(data) if source.suffix == ".gz" else data
@@ -328,8 +368,7 @@ def _events(record, line):
                 continue
             if isinstance(event, dict) and isinstance(event.get("payload"), dict):
                 events.append(event)
-        with _CACHE_LOCK:
-            _EVENTS[str(stored)] = (signature, events)
+        _EVENTS.put(str(stored), signature, events, len(data))
         return events
     return []
 
@@ -432,35 +471,46 @@ def _codex_detail(record, line):
             "rawAvailable": bool(line.get("request")) and _payload(record, line, "request") is not None}
 
 
-def _stream_lines(record, line):
-    """The stream-json lines of a Claude Code call's process (plain while it runs, compressed after)."""
-
+def _stream_name(line):
     stream = line.get("stream") if isinstance(line.get("stream"), dict) else {}
-    name = str(stream.get("file") or "")
+    return str(stream.get("file") or "")
+
+
+def _stream_lines(record, line, kept=None):
+    """The stream-json lines of a Claude Code call's process (plain while it runs, compressed after); ``kept``: a
+    caller's own {stream name: (signature, lines)} for many calls (else the routes' _STREAMS)."""
+
+    name = _stream_name(line)
     for candidate in (name, name[:-3] if name.endswith(".gz") else name + ".gz"):
         try:
             path = record.path(candidate)
             info = path.stat()
         except (OSError, ValueError):
             continue
-        with _CACHE_LOCK:
-            cached = _STREAMS.get(str(path))
-        if cached and cached[0] == (info.st_size, info.st_mtime_ns):
-            return cached[1]
+        signature = (info.st_size, info.st_mtime_ns)
+        if kept is not None:
+            cached = kept.get(name, (None, None))
+            cached = cached[1] if cached[0] == (str(path), signature) else None
+        else:
+            cached = _STREAMS.get(str(path), signature)
+        if cached is not None:
+            return cached
         try:
             data = path.read_bytes()
             data = gzip.decompress(data) if path.suffix == ".gz" else data
         except (OSError, EOFError, gzip.BadGzipFile):
             continue
         lines = data.decode("utf-8", "replace").split("\n")
-        with _CACHE_LOCK:
-            _STREAMS[str(path)] = ((info.st_size, info.st_mtime_ns), lines)
+        if kept is not None:
+            kept[name] = ((str(path), signature), lines)
+        else:
+            _STREAMS.put(str(path), signature, lines, len(data))
         return lines
     return []
 
 
-def _claude_detail(record, line):
-    lines = _stream_lines(record, line)
+def _claude_detail(record, line, kept=None):
+    lines = _stream_lines(record, line, kept)
     stream = line.get("stream") if isinstance(line.get("stream"), dict) else {}
     first, last = (stream.get("lines") or [0, -1])[:2]
     messages = [_json(text) for text in lines[first:last + 1]]
@@ -541,26 +591,12 @@ def call_detail(name, call_id):
     """GET /jobs/<id>/model-calls/<callId>."""
 
     record = _record(name)
-    if call_id.startswith("u"):
-        row = next((row for row in _rows(record, summaries=True) if row["id"] == call_id), None)
+    if call_id.startswith(("u", "p")):
+        rows = _rows(record, summaries=True) if call_id.startswith("u") else _placeholder_rows(record)
+        row = next((row for row in rows if row["id"] == call_id), None)
         if row is None:
             raise NotFound("Unknown model call.")
-        summary = {"type": "compacted", "message": row["_summary"]}
-        return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
-                "received": {"items": [_view(summary)]}, "usage": None,
-                "placeholders": [{"kind": "compaction_not_traced", "facts": {"summaryChars": len(row["_summary"])},
-                                  "withheldBy": "Codex", "why": UNTRACED_COMPACTION}],
-                "rawAvailable": False}
-    if call_id.startswith("p"):
-        row = next((row for row in _placeholder_rows(record) if row["id"] == call_id), None)
-        if row is None:
-            raise NotFound("Unknown model call.")
-        return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
-                "received": {"items": []}, "usage": None,
-                "placeholders": [{"kind": "web_cutoff_one_shot", "facts": {"label": row["label"]},
-                                  "withheldBy": "TCS Prover",
-                                  "why": "Not recorded: web-cutoff one-shot calls leave no files."}],
-                "rawAvailable": False}
+        return _unrecorded_detail(row)
     line = _line(record, call_id)
     if line.get("program") == "claude":
         return _claude_detail(record, line)
@@ -569,6 +605,25 @@ def call_detail(name, call_id):
                 "received": {"items": []}, "usage": None, "placeholders": _placeholders(line, [], None),
                 "rawAvailable": False}
     return _codex_detail(record, line)
+
+
+def _unrecorded_detail(row):
+    """The detail of a row of a call the record cannot hold: an untraced compaction ("u", its summary as its one
+    received item) or a web-cutoff one-shot call ("p")."""
+
+    if row["id"].startswith("u"):
+        summary = {"type": "compacted", "message": row["_summary"]}
+        return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
+                "received": {"items": [_view(summary)]}, "usage": None,
+                "placeholders": [{"kind": "compaction_not_traced", "facts": {"summaryChars": len(row["_summary"])},
+                                  "withheldBy": "Codex", "why": UNTRACED_COMPACTION}],
+                "rawAvailable": False}
+    return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
+            "received": {"items": []}, "usage": None,
+            "placeholders": [{"kind": "web_cutoff_one_shot", "facts": {"label": row["label"]},
+                              "withheldBy": "TCS Prover",
+                              "why": "Not recorded: web-cutoff one-shot calls leave no files."}],
+            "rawAvailable": False}
 
 
 def call_raw(name, call_id):
@@ -663,25 +718,154 @@ def _archive(out):
             raise
 
 
-def _expanded_request(record, line, cache):
-    """A Codex call's exact request, its input expanded when it continues an earlier response (WebSocket)."""
+def _thread(line):
+    return line.get("process"), line.get("bundle"), line.get("threadId")
 
-    request = _json(_payload(record, line, "request"))
-    if not isinstance(request, dict):
-        return None, False
-    previous_id = request.get("previous_response_id")
-    if not previous_id:
-        cache[line["id"]] = request.get("input") or []
-        return request, False
-    base = next((other for other in _thread_calls(record, line) if other.get("responseId") == previous_id), None)
-    if base is None:
-        return request, False
-    if base["id"] not in cache:
-        _expanded_request(record, base, cache)
-    response = _json(_payload(record, base, "response")) or {}
-    full = list(cache.get(base["id"], [])) + list(response.get("output_items") or []) + list(request.get("input") or [])
-    cache[line["id"]] = full
-    return {**request, "input": full}, True
+
+def _shas(items):
+    return [records._sha(records.compact(item)) for item in items]
+
+
+def _list(value, field):
+    items = value.get(field) if isinstance(value, dict) else None
+    return items if isinstance(items, list) else []
+
+
+class _Reader:
+    """The Codex calls of one training download, read in time order.
+
+    Each stored bundle is opened once (its payloads.jsonl read once; StoredBundle keeps the inputs it resolved last),
+    and payloads are read parsed (StoredBundle.value()). Of each thread, only its latest request's full input and
+    output items are kept, until the thread's last request: a WebSocket continuation sends only what is new since an
+    earlier response, and is expanded with them. A continuation of any other request reads that one again from the
+    record. Memory therefore follows the threads still open, never the whole record.
+    """
+
+    def __init__(self, record, lines):
+        self.record, self.bundles, self.latest, self.responses, self.last = record, {}, {}, {}, {}
+        for line in lines:
+            if line.get("program") != "codex":
+                continue
+            if line.get("responseId"):
+                self.responses.setdefault((line.get("process"), line.get("bundle"), line["responseId"]), line)
+            if line.get("request"):
+                self.last[_thread(line)] = line["id"]
+
+    def value(self, line, field):
+        """A Codex call's request or response payload, parsed, or None."""
+
+        path = line.get(field)
+        if not path:
+            return None
+        try:
+            return _bundle(self.record, line, self.bundles).value(path)
+        except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile):
+            return _json(_raw_payload(self.record, line, path))
+
+    def stored(self, line, field, items):
+        """The sha256 of each of ``items``, a call's own request input or its response's output items: as the record
+        stored them, else computed."""
+
+        try:
+            bundle = _bundle(self.record, line, self.bundles)
+            entry = bundle.entries.get(line.get(field))
+            lists = (entry or {}).get("store", {}).get("lists") or {}
+            shas = (bundle.input(line[field]) if field == "request" else lists.get("output_items")) if entry else None
+        except (KeyError, ValueError, OSError, TypeError):
+            shas = None
+        return list(shas) if isinstance(shas, list) and len(shas) == len(items) else _shas(items)
+
+    def _base(self, line, request):
+        """The call whose response ``request`` continues (WebSocket), or None."""
+
+        previous = request.get("previous_response_id")
+        return self.responses.get((line.get("process"), line.get("bundle"), previous)) if previous else None
+
+    def call(self, line):
+        """(request, expanded, response, input sha256, output sha256) of a Codex call: its exact request (parsed),
+        with the input expanded when it continues an earlier response, and its exact response."""
+
+        request = self.value(line, "request") if line.get("request") else None
+        request = request if isinstance(request, dict) else None
+        response = self.value(line, "response")
+        outputs = _list(response, "output_items")
+        output_shas = self.stored(line, "response", outputs)
+        if request is None:
+            return None, False, response, [], output_shas
+        own = _list(request, "input")
+        base, expanded = self._base(line, request), False
+        if base is None:
+            inputs, shas = own, self.stored(line, "request", own)
+        else:
+            earlier = self.latest.get(_thread(line))
+            if earlier is None or earlier[0] != base["id"]:
+                earlier = self._again(base)
+            inputs, shas = earlier[1] + earlier[3] + own, earlier[2] + earlier[4] + self.stored(line, "request", own)
+            request, expanded = {**request, "input": inputs}, True
+        if self.last.get(_thread(line)) == line["id"]:
+            self.latest.pop(_thread(line), None)  # The thread's last request: nothing continues it.
+        else:
+            self.latest[_thread(line)] = (line["id"], inputs, shas, outputs, output_shas)
+        return request, expanded, response, shas, output_shas
+
+    def _again(self, line):
+        """(id, input, input sha256, outputs, output sha256) of an earlier call, read again from the record: its own
+        input after the input and outputs of the call it continues, and so on back, in a loop."""
+
+        chain, seen = [], set()
+        while line is not None and line["id"] not in seen:
+            seen.add(line["id"])
+            request = self.value(line, "request") if line.get("request") else None
+            request = request if isinstance(request, dict) else {}
+            chain.append((line, _list(request, "input"), _list(self.value(line, "response"), "output_items")))
+            line = self._base(line, request)
+        inputs, shas, outputs, output_shas = [], [], [], []
+        for number, (_, own, received) in enumerate(reversed(chain)):
+            inputs, shas = (inputs + outputs + own, shas + output_shas + _shas(own)) if number else (own, _shas(own))
+            outputs, output_shas = received, _shas(received)
+        return chain[0][0]["id"], inputs, shas, outputs, output_shas
+
+
+class _Windows:
+    """trajectories.jsonl, made as the requests go by: one window per context window of each Codex thread (a request
+    whose input does not start with its window's items so far starts a new one). Items are held as their numbers in
+    ``index`` (sha256 -> number, each item of the download once), which costs little memory."""
+
+    def __init__(self, index):
+        self.index, self.windows, self.current = index, [], {}
+
+    def add(self, line, row, input_shas, output_shas):
+        inputs = [self.index.setdefault(sha, len(self.index)) for sha in input_shas]
+        outputs = [self.index.setdefault(sha, len(self.index)) for sha in output_shas]
+        window = self.current.get(_thread(line))
+        if window is None or inputs[:len(window["items"])] != window["items"]:
+            window = self.current[_thread(line)] = {"window": len(self.windows) + 1, "threadId": line.get("threadId"),
+                                                    "role": row.get("role"), "label": row.get("label"), "items": [],
+                                                    "calls": [], "outcome": None}
+            self.windows.append(window)
+        window["items"] = inputs + outputs
+        window["calls"].append({"id": line["id"], "inputEnd": len(inputs), "outputs": outputs, "role": row.get("role"),
+                                "label": row.get("label"), "round": None})
+        window["last"] = row.get("time") or ""
+
+    def lines(self, rounds):
+        """Each window as its line, its items named by sha256 again, with the critic round that followed it."""
+
+        names = [None] * len(self.index)
+        for sha, number in self.index.items():
+            names[number] = sha
+        ends = sorted((entry.get("time") or "", entry.get("round"), entry.get("outcome")) for entry in rounds)
+        for window in self.windows:
+            last = window.pop("last", "")
+            window["items"] = [names[number] for number in window["items"]]
+            for call in window["calls"]:
+                call["outputs"] = [names[number] for number in call["outputs"]]
+            following = next((entry for entry in ends if entry[0] >= last), None)
+            if following is not None:
+                window["outcome"] = {"round": following[1], "outcome": following[2]}
+                for call in window["calls"]:
+                    call["round"] = following[1]
+            yield window
 
 
 def _rounds(transcript):
@@ -712,46 +896,54 @@ def _rounds(transcript):
 
 
 def training_record(name, stream):
-    """GET /jobs/<id>/training-record: write the ZIP to ``stream`` as it is made (see record-contract.md)."""
+    """GET /jobs/<id>/training-record: write the ZIP to ``stream`` as it is made (see record-contract.md).
+
+    One pass over the calls in time order writes requests.jsonl and gathers each item's sha256 and the context
+    windows (_Reader, _Windows); nothing of a call is kept once written, but what a later call of the same thread or
+    Claude Code process needs.
+    """
 
     record = _record(name)
     out = _Counter(stream)
-    rows = {row["id"]: row for row in _rows(record)}
+    rows = {row["id"]: row for row in _rows(record, summaries=True)}
     lines = sorted(record.calls.read(), key=lambda line: (line.get("startedMs") or 0, line["id"]))
     # The transcript snapshot's bytes that read back whole (an append cut short is left out until the next snapshot).
     snapshot_data = records.transcript_data(record)
     transcript = records.transcript_lines(snapshot_data)
     rounds = _rounds(transcript)
     counts = {"requests": 0, "items": 0, "trajectories": 0, "rounds": len(rounds)}
-    item_names = set()
+    reader, index, streams = _Reader(record, lines), {}, {}
+    windows = _Windows(index)
+    # The last call of each Claude Code process: its stream's lines are kept until then.
+    last_of_stream = {_stream_name(line): line["id"] for line in lines if line.get("program") == "claude"}
     with _archive(out) as archive:
         with archive.open("requests.jsonl", "w", force_zip64=True) as member:
-            cache = {}
             for line in lines:
                 row = rows.get(line["id"], {})
                 example = {key: row.get(key) for key in ("id", "time", "role", "label", "member", "model",
                                                          "program", "status")}
                 if line.get("program") == "claude":
-                    detail = _claude_detail(record, line)
+                    detail = _claude_detail(record, line, streams)
+                    if last_of_stream.get(_stream_name(line)) == line["id"]:
+                        streams.pop(_stream_name(line), None)  # The process's last call.
                     example.update(request=None, sent=[view["item"] for view in detail["sent"]["newItems"]],
                                    response={"content": [view["item"] for view in detail["received"]["items"]]},
                                    usage=detail["usage"], placeholders=detail["placeholders"])
                 else:
-                    request, expanded = _expanded_request(record, line, cache) if line.get("request") else (None, False)
-                    response = _json(_payload(record, line, "response"))
-                    for item in (request or {}).get("input") or []:
-                        item_names.add(records._sha(records.compact(item)))
-                    for item in (response or {}).get("output_items") or []:
-                        item_names.add(records._sha(records.compact(item)))
-                    outputs = (response or {}).get("output_items") or []
+                    request, expanded, response, input_shas, output_shas = reader.call(line)
+                    for sha in (*input_shas, *output_shas):
+                        index.setdefault(sha, len(index))
+                    if line.get("request"):
+                        windows.add(line, row, input_shas, output_shas)
                     example.update(request=request, inputExpanded=expanded, response=response,
-                                   usage=(response or {}).get("token_usage") or line.get("usage"),
-                                   placeholders=_placeholders(line, outputs, line.get("usage")))
+                                   usage=(response.get("token_usage") if isinstance(response, dict) else None)
+                                   or line.get("usage"),
+                                   placeholders=_placeholders(line, _list(response, "output_items"), line.get("usage")))
                 member.write(json.dumps(example, ensure_ascii=False).encode("utf-8") + b"\n")
                 counts["requests"] += 1
             for row in rows.values():
                 if row["id"].startswith(("p", "u")):
-                    detail = call_detail(name, row["id"])
+                    detail = _unrecorded_detail(row)
                     received = [view["item"] for view in detail["received"]["items"]]
                     member.write(json.dumps({**{key: row[key] for key in ("id", "time", "role", "label", "member",
                                                                            "model", "program", "status")},
@@ -761,12 +953,12 @@ def training_record(name, stream):
                     counts["requests"] += 1
         with archive.open("items.jsonl", "w", force_zip64=True) as member:
             for sha in record.objects.names():
-                if sha not in item_names:
+                if sha not in index:
                     continue
                 member.write(b'{"sha256":"' + sha.encode() + b'","item":' + record.objects.get(sha) + b"}\n")
                 counts["items"] += 1
         with archive.open("trajectories.jsonl", "w", force_zip64=True) as member:
-            for window in _trajectories(record, lines, rows, rounds):
+            for window in windows.lines(rounds):
                 member.write(json.dumps(window, ensure_ascii=False).encode("utf-8") + b"\n")
                 counts["trajectories"] += 1
         with archive.open("rounds.jsonl", "w", force_zip64=True) as member:
@@ -791,38 +983,3 @@ def training_record(name, stream):
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     stream.flush()
     return out.written
-
-
-def _trajectories(record, lines, rows, rounds):
-    """One line per context window of each Codex thread: its items and each call's input boundary and outputs."""
-
-    ends = sorted((entry.get("time") or "", entry.get("round"), entry.get("outcome")) for entry in rounds)
-    windows, current = [], {}
-    cache = {}
-    for line in lines:
-        if line.get("program") != "codex" or not line.get("request"):
-            continue
-        request, _ = _expanded_request(record, line, cache)
-        response = _json(_payload(record, line, "response")) or {}
-        inputs = [records._sha(records.compact(item)) for item in (request or {}).get("input") or []]
-        outputs = [records._sha(records.compact(item)) for item in response.get("output_items") or []]
-        key = (line.get("process"), line.get("bundle"), line.get("threadId"))
-        row = rows.get(line["id"], {})
-        window = current.get(key)
-        if window is None or inputs[:len(window["items"])] != window["items"]:
-            window = current[key] = {"window": len(windows) + 1, "threadId": line.get("threadId"),
-                                     "role": row.get("role"), "label": row.get("label"), "items": [], "calls": [],
-                                     "outcome": None}
-            windows.append(window)
-        window["items"] = inputs + outputs
-        window["calls"].append({"id": line["id"], "inputEnd": len(inputs), "outputs": outputs, "role": row.get("role"),
-                                "label": row.get("label"), "round": None})
-        window["last"] = row.get("time") or ""
-    for window in windows:
-        last = window.pop("last", "")
-        following = next((entry for entry in ends if entry[0] >= last), None)
-        if following is not None:
-            window["outcome"] = {"round": following[1], "outcome": following[2]}
-            for call in window["calls"]:
-                call["round"] = following[1]
-    return windows
