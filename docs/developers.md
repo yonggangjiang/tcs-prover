@@ -992,15 +992,24 @@ writes a job's record, `ui/model_calls.py` reads it.
   sidebar's total; `DELETE /records/<run>` after the in-page confirmation, whose
   409 shows in it), a record's **Model calls** (`?calls=<run folder>`, with
   `&batch=` from a job's page and `&call=<id>` once a call is chosen; it reads
-  every page of 1,000 rows, then the count every 5 s, every 30 s once it stayed
-  the same for a minute, and every page again when the count or the problems
-  change; a call's detail is read once and read again when its row changes or
-  a tool call of it still had no output), the Live activity card's **Model
+  every page of 1,000 rows and the role menus' models once (`GET /api-models`,
+  for the models' names, as it reads no job's settings), then the count every
+  5 s, every 30 s once it stayed the same for a minute, and every page again
+  when the count or the problems change; a call's detail is read once and read
+  again when its row changes or, while a tool call of it has no output, when a
+  later call of its own conversation is recorded, and drawn again only if it
+  changed), the Live activity card's **Model
   calls · N** (the count at most every 10 s) and **Training record** (the
   streamed ZIP read with `fetch()` and the token, counted as it arrives; a read
   that fails saves nothing and says so). Every request goes outside the job
   request queue. A call's outputs name their tool from the previous call,
-  which the page reads too.
+  which the page reads too. Both lists are drawn in place: a row is built once
+  and drawn again only when what it shows changed, rows a filter or the words
+  take out are kept to be put back, and the one with the focus never moves
+  (`placeChildren()`), so a list that grows or a record that grows keeps the
+  focus and the list's place; a long record's rows out of sight are not laid
+  out (`content-visibility`). Opened (by a link, its address, a reload, Back
+  or Forward), the Model calls page scrolls its list to the chosen row.
 
 ## Repeating failures and Needs your attention
 
