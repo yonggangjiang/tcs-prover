@@ -262,6 +262,22 @@ COORDINATOR_CHECKIN_SECONDS = 3600
 COORDINATOR_REPORT_CHARS = 1600
 COORDINATOR_CHECKIN_LABEL = "Coordinator time check"
 COORDINATOR_REPORT_LABEL = "Coordinator report"
+# A coordinator that cannot use TCS Prover's team fails loudly without stopping the run (CoordinatorWatch): its
+# job is listed under Needs your attention (ui/server.py App.attention()) while the work goes on, when the
+# coordinator with TCS Prover's team makes COORDINATOR_TEAMLESS_CALLS model calls, or works
+# COORDINATOR_TEAMLESS_SECONDS (not counting a team call that runs), without any team call; when Codex refuses a team
+# tool call ("unsupported call", also for a tool name the server does not list); and when a coordinator under TCS
+# Prover's goal loop ends COORDINATOR_UNTAKEN_HANDINS turns with a reply that names the proof file while its goal
+# stays incomplete (no update_goal "complete": the reply is not handed in). Each warning is a pinned diagnostic
+# (coordinatorWarning, its kind in COORDINATOR_WARNINGS) and stays listed until a status with
+# coordinatorWarningCleared ends it: the next team call, the next team call that reaches TCS Prover, the next
+# hand-in.
+COORDINATOR_TEAMLESS_CALLS = 10
+COORDINATOR_TEAMLESS_SECONDS = 20 * 60
+COORDINATOR_UNTAKEN_HANDINS = 3
+COORDINATOR_WARNINGS = {"teamless": "Coordinator works without its team", "refused": "Team tool call refused",
+                        "handin": "Proof not handed in"}
+COORDINATOR_WARNING_CLEARED_LABEL = "Coordinator warning cleared"
 # The status records of the author's own subagents (see AuthorSubagents), by
 # state; a started record names the first line of the subagent's assignment,
 # at most AUTHOR_SUBAGENT_TASK_CHARS characters of it.
@@ -2862,6 +2878,132 @@ class TimeChecks:
         self.last = max(self.last + 1, int(elapsed // self.interval))
 
 
+# Codex 0.160's words in its app-server's error output for a tool call it cannot route (core/src/tools/router.rs):
+# "ERROR codex_core::tools::router: error=unsupported call: mcp__tcs__team_members" for the flattened name, and the
+# namespace and name run together for a tool its namespace does not have ("mcp__tcsteam_status") or a namespace no
+# server has ("mcp__teamteam_wait"); the model gets "unsupported call: <name>" as the call's output, and the
+# app-server sends no notification of it (the real Codex against a scripted model server, 14 Nov 2026).
+_UNSUPPORTED_CALL = re.compile(r"\bunsupported (?:custom tool )?call: *([^\s,;]+)")
+_TEAM_TOOL_NAME = re.compile(r"mcp__tcs|team_|update_goal")
+_TERMINAL_STYLE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def refused_team_call(line):
+    """The tool call that a line of Codex's error output says it refused, when it names a team tool, else ""."""
+
+    found = _UNSUPPORTED_CALL.search(_TERMINAL_STYLE.sub("", str(line or "")))
+    return found.group(0) if found and _TEAM_TOOL_NAME.search(found.group(1)) else ""
+
+
+class CoordinatorWatch:
+    """Whether the author coordinator works without TCS Prover's team: warnings that list its job under Needs your
+    attention while the run goes on (see COORDINATOR_TEAMLESS_CALLS).
+
+    The goal session reports each model call of the coordinator (model_call()), each of its team tool calls as it
+    starts and ends (team_call()), the end of each turn (turn_ended(): a call that never ended is over), a team tool
+    call its CLI refused (refused()), a turn that ended with a reply naming the proof file while the goal stayed
+    incomplete (untaken_handin()) and each hand-in (handed_in()); tick(active) keeps the time without team calls,
+    which runs only while the goal is active and no team call runs. ``team`` says whether the coordinator has TCS
+    Prover's team (without it only the hand-ins are watched). ``emit(kind, **fields)`` records each warning and the
+    status that clears it. Thread-safe: Codex's error output is read on a thread of its own.
+    """
+
+    def __init__(self, emit, team=True, clock=time.monotonic):
+        self.emit, self.team, self.clock = emit, team, clock
+        self.lock = threading.Lock()
+        self.calls, self.since = 0, clock()
+        self.running = set()
+        self.handins = 0
+        self.warned = set()
+
+    def model_call(self):
+        with self.lock:
+            if not self.team:
+                return
+            self.calls += 1
+            due = self.calls >= COORDINATOR_TEAMLESS_CALLS and not self.running and "teamless" not in self.warned
+            calls, seconds = self.calls, self.clock() - self.since
+        if due:
+            self._teamless(calls, seconds)
+
+    def team_call(self, key, finished=False):
+        with self.lock:
+            if finished:
+                self.running.discard(key)
+            else:
+                self.running.add(key)
+            self.calls, self.since = 0, self.clock()
+        self._clear("teamless", "The coordinator called a team tool again.")
+        self._clear("refused", "A team tool call of the coordinator reached TCS Prover's team.")
+
+    def turn_ended(self):
+        with self.lock:
+            self.running.clear()
+
+    def tick(self, active=True):
+        with self.lock:
+            now = self.clock()
+            if not self.team or not active or self.running:
+                self.since = now  # The time without team calls runs only while the coordinator works without one.
+                return
+            due = now - self.since >= COORDINATOR_TEAMLESS_SECONDS and "teamless" not in self.warned
+            calls, seconds = self.calls, now - self.since
+        if due:
+            self._teamless(calls, seconds)
+
+    def refused(self, detail):
+        if self._warn("refused"):
+            self.emit("diagnostic", label=COORDINATOR_WARNINGS["refused"], coordinatorWarning="refused",
+                      needsAttention=True,
+                      text=f"Codex refused a team tool call of the coordinator ({_clipped(detail, 300)}): the call "
+                           "never reached TCS Prover's team, so its work is not delegated. The run goes on, and the "
+                           "job is listed under Needs your attention until a team tool call of the coordinator works.")
+
+    def untaken_handin(self):
+        with self.lock:
+            self.handins += 1
+            count = self.handins
+        if count >= COORDINATOR_UNTAKEN_HANDINS and self._warn("handin"):
+            self.emit("diagnostic", label=COORDINATOR_WARNINGS["handin"], coordinatorWarning="handin",
+                      needsAttention=True,
+                      text=f"The coordinator has ended {count} turns with a reply that names its proof file while "
+                           "its goal stayed incomplete (it did not call update_goal with the status complete), so "
+                           "the proof was not handed to the critic. The run goes on, and the job is listed under "
+                           "Needs your attention until the coordinator hands its proof in (listed after "
+                           f"{COORDINATOR_UNTAKEN_HANDINS} such replies).")
+
+    def handed_in(self):
+        with self.lock:
+            self.handins = 0
+        self._clear("handin", "The coordinator handed its proof in.")
+
+    def _teamless(self, calls, seconds):
+        if self._warn("teamless"):
+            self.emit("diagnostic", label=COORDINATOR_WARNINGS["teamless"], coordinatorWarning="teamless",
+                      needsAttention=True, modelCalls=calls,
+                      text=f"The coordinator has made {calls} model {'call' if calls == 1 else 'calls'} in "
+                           f"{_span_text(seconds)} without calling any team tool: its requests may reach the model "
+                           "without TCS Prover's team tools (an API connection or proxy that drops them, for "
+                           "example), so the work is not delegated. The run goes on, and the job is listed under "
+                           "Needs your attention until the coordinator calls a team tool (listed after "
+                           f"{COORDINATOR_TEAMLESS_CALLS} model calls or {_span_text(COORDINATOR_TEAMLESS_SECONDS)} "
+                           "without one).")
+
+    def _warn(self, kind):
+        with self.lock:
+            if kind in self.warned:
+                return False
+            self.warned.add(kind)
+            return True
+
+    def _clear(self, kind, text):
+        with self.lock:
+            if kind not in self.warned:
+                return
+            self.warned.discard(kind)
+        self.emit("status", label=COORDINATOR_WARNING_CLEARED_LABEL, coordinatorWarningCleared=kind, text=text)
+
+
 class StructuredConversation:
     """The CLI conversations of one structured call, kept across all of its retries.
 
@@ -4636,6 +4778,8 @@ class RPC:
         self.stderr_reader = None
         self.pending_call = None
         self.notice = None
+        # Called with each line of the app-server's error output (goal_session(): a team tool call Codex refused).
+        self.stderr_watch = None
         self.answered = set()
         if getattr(process, "stderr", None) is not None:
             def drain_errors():
@@ -4653,6 +4797,12 @@ class RPC:
                             if log is not None:
                                 log.write(value + "\n")
                                 log.flush()
+                            watch = self.stderr_watch
+                            if watch is not None:
+                                try:
+                                    watch(value)
+                                except Exception:  # noqa: BLE001 - reading the output matters more than a warning.
+                                    pass
                 except (OSError, ValueError):
                     pass
                 finally:
@@ -5263,7 +5413,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     seen_compactions = set()
     goal = {}
     pause_reason = ""
-    last_usage = {}
+    # Codex reports the thread's token totals after each model request (thread/tokenUsage/updated): the newest
+    # totals, and the last request's usage, which the turn's "Author cache usage" status shows.
+    usage = {"total": None, "last": {}}
     # The time of the newest message from Codex, and a cheap request that checks it still answers.
     activity = {"last": time.monotonic()}
     probe = {"at": None}
@@ -5285,6 +5437,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     guarded = bool(coordinator) and proof_handoff.file_handoff_supported()
     # TCS Prover's MCP server: its update_goal (TCS Prover's goal loop) and the coordinator's team tools.
     goal_tool = own_service = None
+    # Whether the coordinator works without TCS Prover's team, or replies with its proof file without handing it in:
+    # warnings while the run goes on (CoordinatorWatch).
+    team_watch = (CoordinatorWatch(lambda kind, **fields: emit(kind, threadId=thread, **fields), team=team is not None)
+                  if coordinator and (team is not None or tcs) else None)
 
     def start_service():
         nonlocal service, goal_tool, own_service
@@ -5306,6 +5462,25 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             service.add(goal_tool)
         if team is not None:
             service.add(team)
+
+    def count_request(token_usage):
+        """Keep one model request's tokens (a thread/tokenUsage/updated); whether it was a new request.
+
+        A notification whose totals did not change since the last one is no new request."""
+
+        token_usage = token_usage if isinstance(token_usage, dict) else {}
+        total, last = token_usage.get("total"), token_usage.get("last")
+        if not isinstance(last, dict) or (total is not None and total == usage["total"]):
+            return False
+        usage.update(total=total, last=last)
+        return True
+
+    def error_output(line):
+        """One line of the app-server's error output: a team tool call Codex refused warns (CoordinatorWatch)."""
+
+        refused = refused_team_call(line)
+        if refused:
+            team_watch.refused(refused)
 
     def continue_with(name):
         """The next turn after one that did not end the goal: the prompt ``name`` (the continuation or the report
@@ -5480,6 +5655,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     emit("diagnostic", text="Codex did not acknowledge the pause; keeping its saved session and the last saved work.")
                     runtime.stop_process(process)
                     return
+                if team_watch is not None:
+                    team_watch.tick(active=False)
                 continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
@@ -5499,6 +5676,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if not stop.wait(grace):
                     runtime.stop_process(process)
                 return
+            if team_watch is not None and team_watch.team:
+                try:
+                    team_watch.tick(active=state["active"] and not pausing.is_set())
+                except Exception as exc:  # noqa: BLE001 - a warning must never stop the watcher.
+                    team_watch.team = False
+                    emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if not state["active"]:
                 continue
             stall = liveness(time.monotonic())
@@ -5590,6 +5773,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
         rpc.web_cutoff = bool(policy)
         rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
+        if team_watch is not None:
+            rpc.stderr_watch = error_output
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         _initialize_author_rpc(runtime, rpc, policy=policy, role=retrieval_role, child_environment=child_environment,
@@ -5722,6 +5907,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["output"] = True  # The model worked in this turn.
                 if method == "item/completed" and item.get("type") in {"collabAgentToolCall", "collab_agent_tool_call"}:
                     subagents.codex_item(item)
+                if (team_watch is not None and item.get("type") in {"mcpToolCall", "mcp_tool_call"}
+                        and item.get("server") == team_module.SERVER_NAME and item.get("tool") in team_module.TEAM_TOOLS):
+                    team_watch.team_call(item.get("id"), finished=method == "item/completed")
             if method == "turn/started":
                 running, answers = True, []
                 state["turn"], state["idle_since"] = turn.get("id"), None
@@ -5751,12 +5939,15 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             elif method == "thread/goal/updated":
                 status = (params.get("goal") or {}).get("status")
             elif method == "thread/tokenUsage/updated":
-                last_usage = (params.get("tokenUsage") or {}).get("last") or {}
+                if count_request(params.get("tokenUsage")) and team_watch is not None:
+                    team_watch.model_call()
             elif method == "turn/completed":
                 running, state["turn"] = False, None
-                if last_usage and hasattr(runtime, "emit_cache_usage"):
-                    runtime.emit_cache_usage(stage, last_usage, label="Author cache usage")
-                    last_usage = {}
+                if team_watch is not None:
+                    team_watch.turn_ended()
+                if usage["last"] and hasattr(runtime, "emit_cache_usage"):
+                    runtime.emit_cache_usage(stage, usage["last"], label="Author cache usage")
+                    usage["last"] = {}
                 for item in turn.get("items", []):
                     collect(item, answers)
                 if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
@@ -5794,6 +5985,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             elif not running and status == "complete" and answers:
                 state["active"] = False
                 solution = answers[-1]
+                if team_watch is not None:
+                    team_watch.handed_in()
                 emit("status", label="Goal complete", threadId=thread, text=f"Thread {thread}")
                 emit("author_result", label="Author solution", text=solution, threadId=thread)
                 rejection = yield {"outcome": "done", "output": solution}
@@ -5806,6 +5999,9 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 start_turn(render("repair"))
                 status, running, answers = None, True, []
             elif not running and (status in {"blocked", "complete"} or (tcs and status is not None)):
+                if (tcs and team_watch is not None and status != "complete" and answers
+                        and names_proof_file(answers[-1])):
+                    team_watch.untaken_handin()  # A proof file named, the goal incomplete: no hand-in.
                 # TCS Prover's goal loop continues every turn that did not end the goal, at once.
                 start_turn(continue_with("continuation"))
                 status, running, answers = None, True, []

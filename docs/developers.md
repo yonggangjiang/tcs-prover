@@ -661,6 +661,34 @@ that every prompt and tool text is the user's to adjust. What the code does:
   as it starts (`team.reserve_report()`), so a later runner of the job (after a
   pause, a restart or the time limit, each with a team of its own) never takes
   an earlier one's numbers, even when that runner ended before the report.
+- **Warnings while the coordinator works** (`CoordinatorWatch`, after the
+  first real coordinator trial of 14 Nov 2026: a proxy that drops the team
+  tools would leave a coordinator that can neither delegate nor hand in, with
+  no sign). The goal session reports each model call of the coordinator (a
+  Codex `thread/tokenUsage/updated` whose totals changed; a Claude assistant
+  message ID), each team tool call as it starts and ends (Codex's `mcpToolCall`
+  items of the server `tcs`; Claude's `tools/call` control requests), the end
+  of each turn, and a coordinator reply under TCS Prover's goal loop that names
+  a proof file while `update_goal` gave no "complete". It warns, as a pinned
+  diagnostic with `coordinatorWarning` (`teamless`, `refused`, `handin`) and
+  `needsAttention`, after `COORDINATOR_TEAMLESS_CALLS` (10) model calls or
+  `COORDINATOR_TEAMLESS_SECONDS` (20 minutes, a clock that stops while a team
+  call runs, the goal waits for the critic or a pause is under way) without a
+  team call, at a team tool call Codex refused (`refused_team_call()`: Codex
+  0.160 answers the model "unsupported call: <name>" and sends the app-server
+  no notification, only the line `ERROR codex_core::tools::router:
+  error=unsupported call: <name>` of its error output, which `RPC.stderr_watch`
+  reads; the flattened name `mcp__tcs__team_members`, a tool the namespace does
+  not have, `mcp__tcsteam_status`, and a namespace no server has,
+  `mcp__teamteam_wait`, all captured with the real Codex against a scripted
+  model server), and after `COORDINATOR_UNTAKEN_HANDINS` (3) such replies. A
+  status `Coordinator warning cleared` (`coordinatorWarningCleared`, pinned)
+  ends each: the next team call, the next team call that reaches TCS Prover,
+  the next hand-in. The server keeps the warnings not cleared
+  (`App._follow_coordinator_warnings()`; a runner's end clears them) and
+  lists a running job's newest one under Needs your attention (kind
+  `coordinator`) after every more pressing cause. No text a model reads
+  changes.
 - **Codex's own subagent tools.** A Codex author or coordinator that starts no
   subagent of Codex has `agents.enabled = false` in its thread settings
   (`_author_thread_options(builtin_agents=False)`): one without the

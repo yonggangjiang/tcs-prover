@@ -317,6 +317,19 @@ Claude Code's own subagents.
   with the service's words.
   Pause, Stop, the time limit and a restart stop the members with the
   coordinator; only their files stay.
+- **When the coordinator cannot use its team.** The job is listed under
+  **Needs your attention** while the work goes on, and the activity log keeps
+  the warning, when the coordinator makes 10 model calls, or works 20 minutes
+  (not counting a team tool that runs, such as a long `team_wait`), without
+  calling any team tool (**Coordinator works without its team**: its requests
+  may reach the model without the team tools, for example through a proxy that
+  drops them); when Codex refuses one of its team tool calls ("unsupported
+  call", **Team tool call refused**); and when a coordinator under TCS Prover's
+  goal loop ends 3 turns with a reply that names its proof file without
+  marking its goal complete (**Proof not handed in**: without `update_goal`'s
+  "complete" the reply is not handed in). Each warning ends by itself, with a
+  **Coordinator warning cleared** line: at the coordinator's next team call,
+  its next team call that reaches the team, its next hand-in.
 - **The team note.** `team_note` is added to the coordinator's first prompt,
   after the related works; `{members}` lists the members, one line each (such as
   "- member 1: GPT 6.1 Sol (Codex CLI)").

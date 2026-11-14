@@ -1863,6 +1863,9 @@ def important_record(record):
             and record.get("label") in COORDINATOR_RECORD_LABELS):
         # The author coordinator's time check, or a reply of it that named no proof file.
         return True
+    if kind == "status" and isinstance(record.get("coordinatorWarningCleared"), str):
+        # The end of a coordinator's warning (a pinned diagnostic, workflow_runner.CoordinatorWatch) stays beside it.
+        return True
     if kind != "codex_event" or record.get("root") is False:
         return False
     event = record.get("event")
@@ -3213,6 +3216,7 @@ class App:
         # each one's latest failed attempt with the time its failures began; and the model calls whose last attempt
         # failed, until one works again, each with the time its failure began to repeat (_follow_failures).
         self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
+        self._coordinator_warnings = {}
         # The owner locks of this run while it may start a runner here (see ownership).
         self._claims = ownership.Claims()
         weakref.finalize(self, self._claims.release_all)
@@ -4376,6 +4380,7 @@ class App:
                 self.process = self.active_token = self.worker_token = None
                 self._end_retry_wait_locked()
                 self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
+                self._coordinator_warnings = {}
                 self.state["modelRetry"] = None
                 if self.state["phase"] == "stopping":
                     self._finish_stopped_locked(None, "The reviewer was stopped before it produced a checked statement.")
@@ -4517,6 +4522,7 @@ class App:
             # A reviewer that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
+            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             stopped = self.state["phase"] == "stopping"
             if valid:
@@ -5020,6 +5026,45 @@ class App:
             elif kind == "status" and member and record.get("subagentState") in {"finished", "failed", "stopped"}:
                 streaks.pop(key, None)
 
+    def _follow_coordinator_warnings(self, record):
+        """Keep the coordinator's warnings that its runner has not cleared, for Needs your attention (attention()).
+
+        The runner warns, without stopping the run, that the coordinator works without its team, that Codex refused
+        one of its team tool calls, or that it named its proof file without handing it in (a diagnostic with
+        coordinatorWarning, workflow_runner.CoordinatorWatch), and clears each warning with a status that has
+        coordinatorWarningCleared; a runner's end clears them all.
+        """
+
+        if not isinstance(record, dict):
+            return
+        warning, cleared = record.get("coordinatorWarning"), record.get("coordinatorWarningCleared")
+        if not isinstance(warning, str) and not isinstance(cleared, str):
+            return
+        with self.lock:
+            warnings = getattr(self, "_coordinator_warnings", None)
+            if warnings is None:
+                warnings = self._coordinator_warnings = {}
+            if isinstance(warning, str) and warning:
+                warnings.pop(warning, None)  # The newest warning last.
+                warnings[warning] = {"title": str(record.get("label") or "Coordinator needs attention"),
+                                     "text": str(record.get("text") or ""), "at": record.get("time")}
+            elif isinstance(cleared, str):
+                warnings.pop(cleared, None)
+
+    def _coordinator_attention(self, state):
+        """The newest warning of the running coordinator that is not cleared (_follow_coordinator_warnings), as a
+        Needs your attention item; its run goes on meanwhile."""
+
+        if state.get("phase") not in {"running"}:
+            return None
+        with self.lock:
+            warnings = list((getattr(self, "_coordinator_warnings", None) or {}).items())
+        if not warnings:
+            return None
+        kind, warning = warnings[-1]
+        return {"kind": "coordinator", "warning": kind, "title": warning["title"], "text": warning["text"],
+                "retrying": True}
+
     def _end_retry_wait_locked(self, now=None):
         """Leave a finished retry wait out of the current segment's active time."""
 
@@ -5259,7 +5304,10 @@ class App:
         LaTeX compiler (MacTeX); and a model call that keeps failing: at once
         when its account is out of credit, otherwise once the same failure has
         repeated for FAILING_ATTENTION_SECONDS (_failing_attention). Retries of
-        the causes that can pass by themselves go on meanwhile.
+        the causes that can pass by themselves go on meanwhile. Last, a running
+        coordinator's warning (_coordinator_attention): it works without its
+        team, Codex refused a team tool call, or its proof file was named but
+        not handed in; the run goes on.
         """
 
         state = self.state if state is None else state
@@ -5320,7 +5368,7 @@ class App:
             retry = max(pressing, key=lambda streak: streak["last"])
             cause, role = retry["failure"], TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
         if cause not in NEEDS_YOU_FAILURES:
-            return self._failing_attention(state, streaks)
+            return self._failing_attention(state, streaks) or self._coordinator_attention(state)
         model = state.get(f"{role}Model") or ""
         try:
             api = providers.provider_kind(model) == providers.API
@@ -6889,6 +6937,7 @@ class App:
             self._stop_in_place = False
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
+            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             if stopped_in_place and not (restored is not None and restored["phase"] == "paused"
                                          and read_pause_object(self.run_dir).get("pauseCause") == "stopped"):
@@ -6955,6 +7004,7 @@ class App:
                 entry = self.add_trace(record)
                 self._follow_model_retry(record)
                 self._follow_failures(record)
+                self._follow_coordinator_warnings(entry)
                 self._follow_author_question(record)
                 if convention_verdict(entry):
                     # The latest verdict decides: a new loophole verdict shows again, whatever the user did
@@ -7190,6 +7240,7 @@ class App:
             # A runner that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
             self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
+            self._coordinator_warnings = {}
             self.state["modelRetry"] = None
             if self.process is process:
                 self.process = None

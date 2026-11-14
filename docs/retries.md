@@ -112,6 +112,12 @@ that is fixed: a program Setup installs is found by the waiting job at its next
 retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
 
+A coordinator that cannot use its team is listed there too, while its run goes
+on: one that made 10 model calls, or worked 20 minutes, without a team call, one
+whose team tool call Codex refused, and one that named its proof file in 3
+replies without handing it in (see [the author's
+team](workflow.md#the-authors-team)).
+
 A job whose model calls keep failing the same way is listed there too, while
 its retries go on every minute without limit: at once when the provider says
 that the account is out of credit (**Out of credit**, for example Claude Code's

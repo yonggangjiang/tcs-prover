@@ -55,6 +55,7 @@ import uuid
 
 from retrieval import runtime as retrieval_runtime
 from runner import confinement, proof_handoff, providers, records
+from runner import team as team_module
 
 EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
 SEARCH_TOOLS = ("WebSearch", "WebFetch")
@@ -1824,6 +1825,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # message uuid -> (kind, steer id or re-anchor text) until Claude echoes it as consumed,
     # and the same for input given up on after QUEUED_INPUT_SECONDS.
     pending, given_up = {}, {}
+    # A coordinator with TCS Prover's team that works without it is listed under Needs your attention while it works
+    # on (workflow_runner.CoordinatorWatch): its model calls (one assistant message ID per request) and team calls.
+    watch_class = getattr(runtime, "CoordinatorWatch", None)
+    team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields))
+                  if coordinator and team is not None and watch_class is not None else None)
+    replies = set()
     held, told = {}, set()  # Live instructions that could not be sent, and those already reported.
     # The newest CLI message, and the control request that checks a quiet CLI still answers.
     activity = {"last": time.monotonic(), "probe": None, "at": None}
@@ -2070,8 +2077,22 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 answer = {"jsonrpc": "2.0", "result": {}, "id": 0}
             send({"subtype": "success", "response": {"mcp_response": answer}})
 
-        if isinstance(request.get("message"), dict) and request["message"].get("method") == "tools/call":
-            threading.Thread(target=run, name="tcs-claude-call", daemon=True).start()
+        call = request.get("message") if isinstance(request.get("message"), dict) else {}
+        if call.get("method") == "tools/call":
+            name = (call.get("params") or {}).get("name") if isinstance(call.get("params"), dict) else None
+            watched = team_watch is not None and name in team_module.TEAM_TOOLS
+
+            def run_watched():
+                key = f"claude-call-{identity}"
+                if watched:
+                    team_watch.team_call(key)
+                try:
+                    run()
+                finally:
+                    if watched:
+                        team_watch.team_call(key, finished=True)
+
+            threading.Thread(target=run_watched, name="tcs-claude-call", daemon=True).start()
         else:
             run()
 
@@ -2101,6 +2122,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     emit("diagnostic", text="Claude did not acknowledge the pause; keeping its saved session and the last saved work.")
                     runtime.stop_process(transport.process)
                     return
+                if team_watch is not None:
+                    team_watch.tick(active=False)
                 continue
             if runtime.workflow_remaining(options) <= 0:
                 expired.set()
@@ -2118,6 +2141,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if not stop.wait(grace):
                     runtime.stop_process(transport.process)
                 return
+            if team_watch is not None and team_watch.team:
+                try:
+                    team_watch.tick(active=state["active"] and not pausing.is_set())
+                except Exception as exc:  # noqa: BLE001 - a warning must never stop the watcher.
+                    team_watch.team = False
+                    emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if state["active"] and state["running"] and state["turn"]:
                 if checks is not None and not pausing.is_set() and state["turn"] != check_failed["turn"]:
                     with lock:
@@ -2622,6 +2651,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     state["output"] = True  # The model worked in this turn.
                     if _session_id(message.get("uuid")):
                         state["anchor"] = str(message["uuid"]).lower()
+                    reply = (message.get("message") or {}).get("id") if isinstance(message.get("message"), dict) else None
+                    if team_watch is not None and isinstance(reply, str) and reply and reply not in replies:
+                        replies.add(reply)  # Each content block of one answer comes in a message of its own.
+                        team_watch.model_call()
                 continue
             if kind == "control_response":
                 response = message.get("response") if isinstance(message.get("response"), dict) else {}
@@ -2633,6 +2666,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 continue
             if kind != "result":
                 continue
+            if team_watch is not None:
+                team_watch.turn_ended()
             with lock:
                 if state["unexpected"] and not state["delivered"] and not pausing.is_set():
                     # The turn of input given up on ended; the instruction sent after it runs next.

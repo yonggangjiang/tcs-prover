@@ -197,6 +197,26 @@ class AccuracyTests(unittest.TestCase):
                       "filtering policy\", or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting "
                       "causes it, and a retry may pass.", flat(DOCS / "retries.md"))
 
+    def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
+        # A coordinator that cannot use its team is listed under Needs your attention while its run goes on
+        # (workflow_runner.CoordinatorWatch): the limits as the code has them, named where they apply.
+        code = (ROOT / "workflow_runner.py").read_text(encoding="utf-8")
+        for line in ("COORDINATOR_TEAMLESS_CALLS = 10", "COORDINATOR_TEAMLESS_SECONDS = 20 * 60",
+                     "COORDINATOR_UNTAKEN_HANDINS = 3"):
+            self.assertIn(f"\n{line}\n", code)
+        workflow = flat(DOCS / "workflow.md")
+        self.assertIn("when the coordinator makes 10 model calls, or works 20 minutes (not counting a team tool that "
+                      "runs, such as a long `team_wait`), without calling any team tool", workflow)
+        self.assertIn("when a coordinator under TCS Prover's goal loop ends 3 turns with a reply that names its proof "
+                      "file without marking its goal complete", workflow)
+        self.assertIn("one that made 10 model calls, or worked 20 minutes, without a team call, one whose team tool "
+                      "call Codex refused, and one that named its proof file in 3 replies without handing it in",
+                      flat(DOCS / "retries.md"))
+        developers = flat(DOCS / "developers.md")
+        for name in ("`COORDINATOR_TEAMLESS_CALLS` (10)", "`COORDINATOR_TEAMLESS_SECONDS` (20 minutes",
+                     "`COORDINATOR_UNTAKEN_HANDINS` (3)", "error=unsupported call: <name>"):
+            self.assertIn(name, developers)
+
     def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
         # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the
         # multi_agent feature (workflow_runner.structured_limits()); the critic keeps Codex's subagents.
