@@ -809,7 +809,8 @@ class ProbeTests(HttpCase):
         status, result = self.call("/api-models/test", {"id": "api:broken", "format": "openai",
                                                         "baseUrl": self.endpoint.base + "/v2"})
         self.assertEqual((status, result["ok"], result["recorded"]), (200, True, False))
-        self.assertEqual(self.endpoint.requests[-1]["path"], "/v2/models")
+        # Its models, then the request shaped as runs send the team tools (an OpenAI-format connection's Test).
+        self.assertEqual([request["path"] for request in self.endpoint.requests[-2:]], ["/v2/models", "/v2/responses"])
         # Saved on the same server without a key, the repaired connection keeps it.
         status, value = self.call("/api-models", {"id": "api:broken", "format": "openai", "label": "Repaired",
                                                   "baseUrl": self.endpoint.base + "/v1"})

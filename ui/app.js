@@ -7580,6 +7580,10 @@ function apiModelRow(connection) {
   }
   item.append(glyph, copy, format, status, actions);
   if (test && !test.ok) item.append(apiElement("p", "api-test-result error", apiTestText(test)));
+  // Its last Test reached the models but not with TCS Prover's team tools: a coordinator could not use its team.
+  else if (test?.teamTools && test.teamTools.ok === false) {
+    item.append(apiElement("p", "api-test-warning", test.teamTools.message || "Team tools did not reach the model."));
+  }
   return item;
 }
 
@@ -7791,8 +7795,12 @@ async function testApiForm() {
   setApiBusy(false); renderApiForm(); renderApiModels(); restoreApiFocus(apiUi.test);
   if (edits !== apiFormEdits) return showApiResult("stale", "Connection details changed", "Test this connection again.");
   if (keyRequired) askApiKey();
+  // An OpenAI-format connection's Test also sends a request shaped as runs send TCS Prover's team tools
+  // (result.teamTools): its sentence follows, as a warning when they do not reach the model.
+  const team = result?.ok && result.teamTools ? result.teamTools : null;
   showApiResult(result?.ok ? "ok" : "error", result ? apiTestText(result) : "Connection failed",
-    result?.ok ? result.message : failure);
+    result?.ok ? [result.message, team?.ok ? team.message : ""].filter(Boolean).join(" ") : failure,
+    team && !team.ok ? team.message : "");
   apiShownTest = { ok: result?.ok };
 }
 async function saveApiModel() {

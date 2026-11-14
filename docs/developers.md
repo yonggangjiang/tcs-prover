@@ -1194,7 +1194,22 @@ connection's max output, to `<base URL>/responses` (OpenAI) or
 `<base URL without /v1>/v1/messages` (Anthropic). When the endpoint refuses it
 with an HTTP 4xx other than 401, 403 or 404, one minimal request
 (`Reply with OK.`) follows, and the result says whether the endpoint refuses
-only the shape of run requests.
+only the shape of run requests. A connection's Test (no `model`) loads its
+catalog; for an OpenAI-format one whose catalog loaded it then sends
+`probe_team_tools()`'s request (`team_tool_test_request()`): one function
+`report_result` in a namespace `mcp__tcs`, as Codex 0.160 sends TCS Prover's
+team tools (captured from the real Codex against a scripted model server): in
+the request's `tools` for a model it does not run as Responses Lite, and for a
+Lite name (`workflow_runner.codex_lite_model()`) in an `additional_tools` input
+item (role `developer`) with `reasoning.context` `"all_turns"`; both streamed,
+`store: false`, `include: ["reasoning.encrypted_content"]`,
+`parallel_tool_calls: false`. It runs with the catalog's first Lite model, else
+its first, and passes only when a `function_call` comes back with `name`
+`report_result` and `namespace` `mcp__tcs` (Codex refuses a call without it:
+"unsupported call"). The result is `teamTools` `{ok, model, form, message,
+at}`, recorded in the connection's `lastTest`; the editor adds its sentence
+after the outcome, as a warning when it failed, and the connection's row keeps
+that warning.
 
 **The Setup page.** `GET /setup` checks the programs (it reuses a check
 younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's

@@ -264,7 +264,17 @@ type a model id.
   (Anthropic, with `anthropic-version: 2023-06-01` and pagination). It has one
   30-second deadline, follows no redirect, and shows the HTTP status, the
   latency and the provider's message with the key removed. Testing unchanged
-  saved settings records the result on the connection.
+  saved settings records the result on the connection. For an OpenAI-format
+  connection whose catalog loaded, the Test then sends one request shaped as
+  runs send TCS Prover's team tools to a coordinator (a tool in the namespace
+  `mcp__tcs`; for a model the Codex CLI runs as "Responses Lite", such as
+  gpt-6.1-sol, in the same place of the request as the Codex CLI puts it), with
+  the first such model of the catalog, else its first model, and it says plainly
+  whether the model called the tool back with its namespace. When it did not
+  (the endpoint refused the request, the model called the tool without its
+  namespace, which the Codex CLI refuses, or called none), the line is a
+  warning, and the saved connection's row keeps it: a coordinator on that
+  connection could not use its team.
 - **Edit** fills the form with the saved settings; the key stays saved and is
   never shown. **Remove** deletes the connection, its key and its model choices;
   saved jobs keep their model ids and show a warning until it is back. Removing a

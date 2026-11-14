@@ -694,12 +694,18 @@ def _last_test(value):
     message = value.get("message")
     latency = value.get("latencyMs")
     status = value.get("status")
+    team = value.get("teamTools")
     return {
         "ok": value.get("ok") is True,
         "at": value.get("at") if isinstance(value.get("at"), str) else _now(),
         "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
         "message": (message if isinstance(message, str) else "")[:MAX_TEST_MESSAGE_CHARS],
         "latencyMs": latency if isinstance(latency, (int, float)) and not isinstance(latency, bool) else None,
+        # The request shaped as runs send TCS Prover's team tools (ui.server.probe_team_tools()), of an OpenAI-format
+        # connection's Test: {ok, model, form, message, at}.
+        **({"teamTools": {"ok": team.get("ok") is True, **{
+            key: str(team[key])[:MAX_TEST_MESSAGE_CHARS] for key in ("model", "form", "message", "at")
+            if isinstance(team.get(key), str)}}} if isinstance(team, dict) else {}),
     }
 
 

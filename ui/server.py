@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import weakref
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -351,6 +352,17 @@ API_TEST_STRUCTURED_PROMPT = (
 )
 API_TEST_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
                    "additionalProperties": False}
+# The Test of an OpenAI-format connection also sends one request shaped as Codex 0.160 sends TCS Prover's team tools
+# to a coordinator (probe_team_tools()): a function tool in the namespace mcp__tcs (Codex's name for the MCP server
+# "tcs"), in the request's tools, or for a model name Codex runs as Responses Lite (workflow_runner.codex_lite_model())
+# in an additional_tools input item, with Codex's other Lite settings (reasoning context "all_turns", the encrypted
+# reasoning, store false), as captured from the real Codex against a scripted model server. It passes only when the
+# model calls that tool back with its namespace: Codex refuses a call without it ("unsupported call"). It runs with
+# one model of the connection: the first Lite one of its list, else its first.
+TEAM_TOOL_TEST_NAMESPACE = f"mcp__{team_module.SERVER_NAME}"
+TEAM_TOOL_TEST_TOOL = "report_result"
+TEAM_TOOL_TEST_PROMPT = ('This is a connection test. Call the report_result tool with {"ok": true}, and do nothing '
+                         "else.")
 # Real runs ask for long answers; an endpoint that caps the output lower fails them.
 API_TEST_RUN_OUTPUT_TOKENS = 32000
 API_MODELS_MAX_RESPONSE_BYTES = 1024 * 1024
@@ -2810,6 +2822,105 @@ def _api_test_request(entry, effort=None):
     return path, headers, json.dumps(body).encode("utf-8")
 
 
+def team_tool_test_request(entry, model, effort):
+    """Path, headers and body of the Test's request shaped as runs send TCS Prover's team tools (see
+    TEAM_TOOL_TEST_NAMESPACE), and the form it takes: "additional_tools" for a Lite model, else "tools"."""
+
+    lite = runtime.codex_lite_model(model)
+    namespace = {"type": "namespace", "name": TEAM_TOOL_TEST_NAMESPACE,
+                 "description": f"Tools in the {TEAM_TOOL_TEST_NAMESPACE} namespace.",
+                 "tools": [{"type": "function", "name": TEAM_TOOL_TEST_TOOL,
+                            "description": "Report the result of the connection test.", "strict": False,
+                            "parameters": API_TEST_SCHEMA}]}
+    output = entry.get("maxOutputTokens")
+    body = {"model": model, "stream": True, "store": False, "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": effort, "summary": DEFAULT_REASONING_SUMMARY,
+                          **({"context": "all_turns"} if lite else {})},
+            "input": [*([{"type": "additional_tools", "id": f"at_{uuid.uuid4()}", "role": "developer",
+                          "tools": [namespace]}] if lite else []),
+                      {"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": TEAM_TOOL_TEST_PROMPT}]}],
+            **({} if lite else {"tools": [namespace]}),
+            "tool_choice": "auto", "parallel_tool_calls": False, **({"max_output_tokens": output} if output else {})}
+    headers = {**_api_connection_headers(entry), "Accept": "text/event-stream"}
+    return (_api_endpoint_path(entry, "responses"), headers, json.dumps(body).encode("utf-8"),
+            "additional_tools" if lite else "tools")
+
+
+def probe_team_tools(entry, models, effort=None, timeout=None):
+    """Whether an OpenAI-format connection passes on TCS Prover's team tools as runs send them: {ok, model, form,
+    message, at} for one model of ``models`` (the connection's list: its first Lite model, else its first; see
+    TEAM_TOOL_TEST_NAMESPACE), or None without a model. The key never shows in the message."""
+
+    if not models:
+        return None
+    timeout = API_TEST_TIMEOUT_SECONDS if timeout is None else timeout
+    model = next((name for name in models if runtime.codex_lite_model(name)), models[0])
+    effort = effort if effort in providers.API_EFFORTS[providers.OPENAI_FORMAT] else (
+        providers.API_EFFORTS[providers.OPENAI_FORMAT][-1])
+    path, headers, body, form = team_tool_test_request(entry, model, effort)
+    status, location, text, kind, failure = _api_test_send(entry, path, headers, body, timeout)
+    shape = ("in an additional_tools item, as Codex sends a Lite model's tools" if form == "additional_tools"
+             else "in the request's tools, as Codex sends them to this model")
+    result = {"ok": False, "model": model, "form": form,
+              "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    named = f"{TEAM_TOOL_TEST_NAMESPACE}.{TEAM_TOOL_TEST_TOOL}"
+    if status is None:
+        message = f"The request with team tools for {model} failed: {failure}"
+    elif not 200 <= status < 300:
+        try:
+            value = json.loads(text)
+        except ValueError:
+            value = None
+        detail = _api_test_error(value, text).strip() or f"HTTP {status}"
+        message = (f"The endpoint refused the request with team tools for {model} ({shape}): {detail} A coordinator "
+                   "on this connection could not reach its team.")
+    else:
+        calls, error = _api_test_tool_calls(text)
+        called = next(((name, space) for name, space in calls if name in (TEAM_TOOL_TEST_TOOL, named.replace(
+            ".", "__"))), None)
+        if error:
+            message = f"The model {model} answered the request with team tools with an error: {error}"
+        elif called and called == (TEAM_TOOL_TEST_TOOL, TEAM_TOOL_TEST_NAMESPACE):
+            result["ok"] = True
+            message = (f"Team tools reach the model: {model} called {named} with its namespace (the tools went "
+                       f"{shape}).")
+        elif called:
+            message = (f"{model} called {called[0]} without the namespace {TEAM_TOOL_TEST_NAMESPACE}: Codex refuses "
+                       "such a call (\"unsupported call\"), so a coordinator on this connection could not use its "
+                       "team.")
+        else:
+            message = (f"{model} did not call {named} (the tools went {shape}): the endpoint may not pass namespaced "
+                       "tools on, and a coordinator on this connection may not reach its team.")
+    result["message"] = _api_test_text(message, entry["apiKey"])
+    return result
+
+
+def _api_test_tool_calls(text):
+    """The function calls a streamed Responses answer made ([(name, namespace or None)]) and its error, if any."""
+
+    calls, error = [], ""
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = str(event.get("type") or "")
+        if kind in {"error", "response.failed"}:
+            failure = event.get("error") or (event.get("response") or {}).get("error") or event
+            error = _api_test_error({"error": failure} if isinstance(failure, dict) else event, str(failure))
+        elif kind == "response.output_item.done" and isinstance(event.get("item"), dict):
+            item = event["item"]
+            if item.get("type") == "function_call":
+                namespace = item.get("namespace")
+                calls.append((str(item.get("name") or ""), namespace if isinstance(namespace, str) else None))
+    return calls, error
+
+
 def _api_test_stream(text):
     """What a streamed (server-sent events) reply says: (reply text, tool called, model, error message)."""
 
@@ -2916,6 +3027,14 @@ def _api_test_failure(exc, timeout):
 def _api_test_exchange(entry, effort, timeout):
     """Send one Test request (see _api_test_request); (status or None, Location, body text, content type, failure)."""
 
+    path, headers, body = _api_test_request(entry, effort)
+    return _api_test_send(entry, path, headers, body, timeout)
+
+
+def _api_test_send(entry, path, headers, body, timeout):
+    """Send one request of a Test to the connection's server, with one overall deadline and no redirect followed:
+    (status or None, Location, body text, content type, failure)."""
+
     parts = urlsplit(entry["baseUrl"])
     deadline, status, location, kind, chunks = time.monotonic() + timeout, None, "", "", []
     connection = (
@@ -2925,7 +3044,6 @@ def _api_test_exchange(entry, effort, timeout):
         http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
     )
     try:
-        path, headers, body = _api_test_request(entry, effort)
         connection.request("POST", path or "/", body=body, headers=headers)
         # The response keeps reading through this socket after getresponse().
         channel = connection.sock
@@ -12772,6 +12890,10 @@ class Server(ThreadingHTTPServer):
             fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "apiKey") if key in body}
             entry = providers.validated_api_connection(fields, requested)
             result = discover_api_models(entry)
+            if result["ok"] and entry["format"] == providers.OPENAI_FORMAT:
+                # Then one request shaped as runs send TCS Prover's team tools (probe_team_tools()).
+                result["teamTools"] = probe_team_tools(entry, [model["id"] for model in result["models"]],
+                                                       effort=body.get("effort"))
             result["recorded"] = False
             # An entry being repaired has no saved settings to record a test on.
             if requested and providers.api_connection(requested, cached=False) is not None:
@@ -12779,7 +12901,8 @@ class Server(ThreadingHTTPServer):
                 if all(current[key] == entry[key] for key in ("format", "baseUrl", "requestSource", "apiKey")):
                     connection = providers.record_api_model_test(requested, {
                         "ok": result["ok"], "status": result["status"], "message": result["message"],
-                        "latencyMs": result["latencyMs"], "at": result["testedAt"]})
+                        "latencyMs": result["latencyMs"], "at": result["testedAt"],
+                        **({"teamTools": result["teamTools"]} if result.get("teamTools") else {})})
                     result.update(recorded=True, connection=providers.api_connection(connection["id"]), apiModel=connection)
             return result
         fields = {key: body[key] for key in ("format", "baseUrl", "requestSource", "model", "apiKey", "label",

@@ -214,6 +214,15 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("`note_failed_search_checks()` pins one **Web search may fail** diagnostic", developers)
         self.assertIn("`SearchWatch` follows those items", developers)
 
+    def test_the_connection_test_s_team_tool_request_is_described(self):
+        models = flat(DOCS / "models.md")
+        self.assertIn("For an OpenAI-format connection whose catalog loaded, the Test then sends one request shaped as "
+                      "runs send TCS Prover's team tools to a coordinator", models)
+        self.assertIn("with the first such model of the catalog, else its first model", models)
+        self.assertIn("It runs with the catalog's first Lite model, else its first, and passes only when a "
+                      "`function_call` comes back with `name` `report_result` and `namespace` `mcp__tcs`",
+                      flat(DOCS / "developers.md"))
+
     def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
         # A coordinator that cannot use its team is listed under Needs your attention while its run goes on
         # (workflow_runner.CoordinatorWatch): the limits as the code has them, named where they apply.

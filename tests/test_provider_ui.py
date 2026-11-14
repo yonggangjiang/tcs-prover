@@ -1129,6 +1129,48 @@ type('apiModelRequestSource', 'New source');
 assert.match($('apiModelTestResult').className, /stale/);
 """)
 
+    def test_the_test_says_whether_team_tools_reach_the_model(self):
+        # An OpenAI-format connection's Test also sends a request shaped as runs send TCS Prover's team tools
+        # (teamTools): its sentence follows the outcome, as a warning when they do not reach the model, and the
+        # saved connection's row keeps that warning.
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+const result = $('apiModelTestResult');
+const parts = () => result.children.map((child) => [child.className, child.textContent]);
+type('apiModelBaseUrl', connection.baseUrl); type('apiModelKey', 'secret-api-key');
+const passed = 'Team tools reach the model: gpt-6.1-sol called mcp__tcs.report_result with its namespace (the tools '
+  + 'went in an additional_tools item, as Codex sends a Lite model\'s tools).';
+$('apiModelTestButton').onclick();
+sent[0].reply(200, {ok: true, status: 200, message: 'Found 2 models.', latencyMs: 12,
+  teamTools: {ok: true, model: 'gpt-6.1-sol', form: 'additional_tools', message: passed}});
+await settle();
+assert.equal(result.className, 'api-test-result ok');
+assert.deepEqual(parts(), [['', 'Connected · 12 ms'], ['api-test-detail', `Found 2 models. ${passed}`]]);
+const failed = 'gpt-6.1-sol called mcp__tcs__report_result without the namespace mcp__tcs: Codex refuses such a '
+  + 'call ("unsupported call"), so a coordinator on this connection could not use its team.';
+$('apiModelTestButton').onclick();
+sent[1].reply(200, {ok: true, status: 200, message: 'Found 2 models.', latencyMs: 9,
+  teamTools: {ok: false, model: 'gpt-6.1-sol', form: 'additional_tools', message: failed}});
+await settle();
+assert.equal(result.className, 'api-test-result ok');
+assert.deepEqual(parts(), [['', 'Connected · 9 ms'], ['api-test-detail', 'Found 2 models.'],
+  ['api-test-warning', failed]]);
+// A connection whose models did not load says only that.
+$('apiModelTestButton').onclick();
+sent[2].reply(200, {ok: false, status: 401, message: 'Invalid API key'});
+await settle();
+assert.deepEqual(parts().map((part) => part[1]), ['401 · Invalid API key']);
+// The saved row: its last Test's team tools warning, under the row; none when they reached the model.
+const rowWith = (teamTools) => {
+  apiModels = [{...connection, lastTest: {ok: true, status: 200, message: 'Found 2 models.', teamTools}}];
+  renderApiModels();
+  return $('apiModelList').children[0].children.filter((child) => child.className === 'api-test-warning')
+    .map((child) => child.textContent);
+};
+assert.deepEqual(rowWith({ok: false, message: failed}), [failed]);
+assert.deepEqual(rowWith({ok: true, message: passed}), []);
+assert.deepEqual(rowWith(undefined), []);
+""")
+
     def test_saved_key_edit_refresh_remove_and_secret_binding(self):
         self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
 advanced.open = true; advanced.listeners.toggle({target:advanced});
