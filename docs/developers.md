@@ -963,7 +963,9 @@ writes a job's record, `ui/model_calls.py` reads it.
   `manifest.json`; sent in HTTP/1.1
   chunks of about `CHUNK_BYTES`, 64 KiB: a download that fails part way gets
   no last chunk, so the browser reports it failed, and its archive no central
-  directory, so no ZIP reader takes it for whole), `GET /records` and
+  directory, so no ZIP reader takes it for whole; the server's log says why,
+  such as a record file that cannot be read, but not for a browser that went
+  away), `GET /records` and
   `DELETE /records/<run>` (409 while the job's runner, review or reply turn
   runs). They read the record folder, so a deleted job's record still answers.
   The download runs in the server, which hosts every job, so it is written in

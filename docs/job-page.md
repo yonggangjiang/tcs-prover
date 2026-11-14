@@ -463,7 +463,7 @@ each context window, each critic round, the transcript and the record's own
 files, such as the copied sessions, Claude Code's output and Codex's event logs
 and tool results, nothing replaced or left out. The button counts what arrived;
 a download that fails part way saves nothing, and the button and the page say
-it failed.
+it failed (the server's log says why, such as a record file it cannot read).
 
 ### Records
 

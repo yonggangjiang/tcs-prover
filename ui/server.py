@@ -13110,8 +13110,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = ChunkedWriter(self.wfile) if chunked else self.wfile
                 try:
                     model_calls.training_record(parts[1], body)
-                except OSError:
-                    return None  # The browser went away or a record file could not be read: the download failed.
+                except ConnectionError:
+                    return None  # The browser went away: nothing failed here.
+                except OSError as exc:
+                    # A record file that could not be read (its permissions, a disk error): the download failed, and
+                    # the page says that the server's log says why.
+                    print(f"The training record download of {parts[1]} failed: {exc}", file=sys.stderr, flush=True)
+                    return None
                 except Exception:  # noqa: BLE001 - the download failed; the server's log says why.
                     traceback.print_exc()
                     return None
