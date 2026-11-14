@@ -20,8 +20,10 @@ from unittest import mock
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import providers, records
+from ui import model_calls
 
 import test_author_conversation as conversation_test
+import test_critic_subagents as critic_test
 import test_goal_runtime as goal_test
 
 THREAD = "01a1d4e2-53df-78e1-b1a3-60906592b723"
@@ -288,6 +290,54 @@ class ReplyTurnTests(RecordedJob):
         labels = json.loads((self.record_folder / "codex" / root.name / "process.json").read_text())
         self.assertEqual((labels["role"], labels["conversationId"]), ("summary", "c_0123456789"))
         self.assertEqual(self.copies, ["thread-1"])
+
+
+class RoundLabelTests(critic_test.CriticCase):
+    """Each workflow step's calls carry the round the activity log names (stand-in attempts, no model)."""
+
+    def recorded(self):
+        """The (row label, labels' round) the record gives each model call the stand-in attempts answer."""
+
+        seen, original = [], self.attempts
+
+        def attempts(critic):
+            inner = original(critic)
+
+            def attempt(*args, **settings):
+                labels = records.current_labels()
+                seen.append((model_calls._role({"process": "p"}, {"p": labels})[1], labels.get("round")))
+                return inner(*args, **settings)
+
+            return attempt
+
+        self.attempts = attempts
+        return seen
+
+    def test_the_convention_critic_names_the_critic_round_it_checks(self):
+        # The critic fixes the proof in round 1 and accepts it in round 2; the convention critic then checks round 2.
+        seen = self.recorded()
+        self.run_critic(critic_test.fixes, {"critic_rounds": 1})
+        [result] = self.kinds("convention_result")
+        self.assertEqual(result["label"], "Convention critic · round 2")
+        self.assertEqual(seen, [("Critic coordinator · round 1", 1), ("Critic coordinator · round 2", 2),
+                                (result["label"], 2)])
+
+    def test_a_latex_repair_names_no_round(self):
+        # Each repair comes back from the compiler, so each is a first visit: no round of its own to name.
+        compiles = iter([{"status": "fail", "output": "error 1", "diagnostic": "d1"},
+                         {"status": "fail", "output": "error 2", "diagnostic": "d2"}, {"status": "pass", "output": ""}])
+
+        def model(call):
+            if call["stage"] == "final":
+                (call["workspace"] / "latex-source.tex").write_text(critic_test.LATEX)
+                return {"summary": "Edited."}
+            return critic_test.critic_answer()
+
+        seen = self.recorded()
+        with mock.patch.object(runtime, "_run_command", side_effect=lambda *args, **kwargs: next(compiles)):
+            self.run_critic(model, workflows=(critic_test.AUTHOR_CRITIC, critic_test.CLEAN_UP))
+        self.assertEqual([entry for entry in seen if entry[0].startswith("latex_repair")],
+                         [("latex_repair", None), ("latex_repair", None)])
 
 
 class MemberSessionTests(unittest.TestCase):

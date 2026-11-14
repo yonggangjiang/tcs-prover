@@ -3576,6 +3576,17 @@ RECORD_ROLES = {"critic": "critic", "convention": "convention critic", "latex_ed
 _RECORD_PROBLEM_SAID = []
 
 
+def _record_round(node, visit, state):
+    """The round of a workflow step's model calls in the record's labels, as the activity log names it: the convention
+    critic checks the critic's latest round (its result reads "Convention critic · round <n>"); a LaTeX repair has
+    none (it is reached from the compiler, so each repair is a first visit); any other step's is its visit (the
+    critic's visit is its round)."""
+
+    if node == "convention":
+        return state.get("round") if isinstance(state.get("round"), int) else None
+    return None if node == "latex_repair" else visit
+
+
 def _record_codex(environment, policy, **labels):
     """A Codex process about to start in a live run of a job with a record: (its environment with Codex's trace
     root, its records.TraceProcess). A web-cutoff process (``policy``) and a job without a record get (environment,
@@ -8622,7 +8633,8 @@ def _execute(workflow, state, options, prompts):
             _apply_actions(node.get("before", []), {"state": state, "visit": visits}, node.get("stage", current), revision,
                            node_options)
             if node["run"] == "structured":
-                with records.labelled(role=RECORD_ROLES.get(current, current), node=current, round=visits,
+                with records.labelled(role=RECORD_ROLES.get(current, current), node=current,
+                                      round=_record_round(current, visits, state),
                                       label=node.get("activity_label") or node.get("request_label") or current):
                     result, raw = _model_call(node, prompts, state, node_options, visits, input_files=input_files,
                                               verify=verify)

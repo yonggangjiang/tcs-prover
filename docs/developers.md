@@ -718,7 +718,10 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   sha256 of its compact JSON, in gzip packs of up to `PACK_BYTES`, 64 MB, with
   `index.jsonl`; a pack member is written and synced before its index line);
   `codex/<label>/process.json` (who the process was: role, node, round, label,
-  member, model) and `codex/<label>/<bundle>/` (`payloads.jsonl`, where each
+  member, model; the round as the activity log names it, so the critic's visit,
+  the critic round the convention critic checks, and none for a LaTeX repair,
+  `workflow_runner._record_round()`) and `codex/<label>/<bundle>/`
+  (`payloads.jsonl`, where each
   trace payload went, and byte copies of the bundle's `manifest.json` and
   `trace.jsonl` as `.gz`); `claude/<label>.json` and `claude/<label>.jsonl.gz`;
   `sources/` (copied session files, gzip-compressed unless they already are);
