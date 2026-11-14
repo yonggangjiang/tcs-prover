@@ -1238,9 +1238,12 @@ which may pass; 401, 403 and 404, a refused key or model), or another refusal
 (400, 422, …) that the same request without the tools
 (`team_tool_test_request(tools=False)`: no namespace, `tool_choice` or
 `parallel_tool_calls`) gets as well; another refusal is theirs only when that
-request is answered. The editor adds its sentence after the outcome, as a
-warning when it failed or was not checked, and the connection's row keeps that
-warning.
+request is answered (one more request, with a deadline of its own,
+`API_TEST_TIMEOUT_SECONDS`: 30 seconds). A message that quotes the service puts
+its words in parentheses and ends with a full stop, within the 300 characters a
+connection keeps of it (`MAX_TEST_MESSAGE_CHARS`): longer words are clipped
+there, with "…". The editor adds its sentence after the outcome, as a warning
+when it failed or was not checked, and the connection's row keeps that warning.
 
 **The Setup page.** `GET /setup` checks the programs (it reuses a check
 younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's

@@ -280,7 +280,9 @@ type a model id.
   warning too, with what came back: no answer within the deadline, a failure
   that may pass (HTTP 408, 425, 429 or 5xx, such as a proxy's "cooling down"),
   a refused key or model (401, 403, 404), or a refusal of the same request
-  without the tool as well.
+  without the tool as well (a second request, with its own 30-second
+  deadline). The service's words in these lines are clipped to fit the 300
+  characters a connection keeps of them.
 - **Edit** fills the form with the saved settings; the key stays saved and is
   never shown. **Remove** deletes the connection, its key and its model choices;
   saved jobs keep their model ids and show a warning until it is back. Removing a

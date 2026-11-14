@@ -267,13 +267,23 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("An answer that says nothing about the team tools leaves them *not checked*, a warning too, with "
                       "what came back: no answer within the deadline, a failure that may pass (HTTP 408, 425, 429 or "
                       "5xx, such as a proxy's \"cooling down\"), a refused key or model (401, 403, 404), or a refusal "
-                      "of the same request without the tool as well.", models)
+                      "of the same request without the tool as well", models)
         self.assertIn("`ok` is null (not checked) when the answer says nothing about the team tools: no answer within "
                       "the deadline, a status of `TEAM_TOOL_TEST_UNCHECKED_STATUSES` (408, 425, 429 and every 5xx, "
                       "which may pass; 401, 403 and 404, a refused key or model), or another refusal (400, 422, …) "
                       "that the same request without the tools (`team_tool_test_request(tools=False)`: no namespace, "
                       "`tool_choice` or `parallel_tool_calls`) gets as well; another refusal is theirs only when that "
-                      "request is answered.", flat(DOCS / "developers.md"))
+                      "request is answered", flat(DOCS / "developers.md"))
+        # Their limits, named where they apply: the second request's deadline, the message a connection keeps.
+        self.assertIn("\nAPI_TEST_TIMEOUT_SECONDS = 30\n", code)
+        self.assertIn("\nMAX_TEST_MESSAGE_CHARS = 300\n", (ROOT / "runner" / "providers.py").read_text(encoding="utf-8"))
+        self.assertIn("(one more request, with a deadline of its own, `API_TEST_TIMEOUT_SECONDS`: 30 seconds). A "
+                      "message that quotes the service puts its words in parentheses and ends with a full stop, within "
+                      "the 300 characters a connection keeps of it (`MAX_TEST_MESSAGE_CHARS`): longer words are "
+                      "clipped there, with \"…\".", flat(DOCS / "developers.md"))
+        self.assertIn("or a refusal of the same request without the tool as well (a second request, with its own "
+                      "30-second deadline). The service's words in these lines are clipped to fit the 300 characters a "
+                      "connection keeps of them.", models)
 
     def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
         # A coordinator that cannot use its team is listed under Needs your attention while its run goes on
