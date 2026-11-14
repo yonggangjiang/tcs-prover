@@ -120,7 +120,13 @@ was reached, and otherwise once the same failure has repeated for 15 minutes
 them again (the numbers and request IDs in a provider's message do not make it
 another). This covers every role, a team member and a paused author's reply.
 The line goes as soon as a model call of it works again (the model's first
-output), and when its step or the job's runner ends.
+output), and when its step or the job's runner ends. A call whose answer is
+checked (a critic's, the statement reviewer's, the convention critic's, the
+LaTeX editor's) works again only once an answer is accepted when its model had
+already worked in the failed attempt: an answer refused (*the answer is not
+valid JSON*, an unmet requirement) or set aside after failed subagent calls,
+or a stream that dropped after some output, keeps counting as the same failure
+through the next attempt's answer.
 
 A web-cutoff job held because its isolated LaTeX compiler is not ready (MacTeX
 missing, being updated or damaged, or the compiler's macOS sandbox check

@@ -4462,8 +4462,11 @@ def structured(
                             f"{_clip_middle(redact(str(exc) or type(exc).__name__).strip(), 2000)}{full}"))
                     if attempts is not None and attempt >= attempts:
                         raise
+                # An attempt in which the model worked before it failed (its stream dropped after some output) says
+                # so: like a refused answer, its next attempt's output does not show that the call works again (the
+                # server keeps counting it as the same failure until an answer is accepted, App._follow_failures).
                 wait_before_retry(options, stage, attempt + 1, failure, cancel=cancel, activity=activity,
-                                  since=failing_since)
+                                  since=failing_since, record={"modelOutput": True} if conversation.output else None)
         finally:
             # The persisted CLI sessions served only this call.
             conversation.discard()

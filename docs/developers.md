@@ -1020,8 +1020,15 @@ plain words (`failure`, with the provider's line after a generic one such as
 "the CLI stopped unexpectedly") once request IDs and numbers are left out
 (`_failure_signature()`). The streak ends with the model's own output for that
 call (a `codex_event` item other than the user's message or an error, as the
-runner counts an attempt that worked), its step's result (`STEP_RESULT_KINDS`),
-the end of a member's assignment, or the runner's end. So the job stays listed
+runner counts an attempt that worked), its step's result (`STEP_RESULT_KINDS`)
+or the next step (a `Workflow step:` status of its stage), the end of a
+member's assignment, or the runner's end. A structured call whose model worked
+in the failed attempt (`failureKind` `invalid_answer` or `subagent`, or the
+retry status's `modelOutput`, which `structured()` sets when the attempt
+streamed output before it failed) is still failing at its next attempt's
+output: as its runner counts it, it works again only once an answer is
+accepted, so a critic whose answers are refused every minute is listed after
+15 minutes. So the job stays listed
 between attempts (the usage and login lines too) and the list's notifications
 fire once. Out-of-credit words are not plain words of `_FAILURE_PATTERNS`: the
 retry notes the models read stay as they were. A content filter's refusal

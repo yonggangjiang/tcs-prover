@@ -4966,8 +4966,11 @@ class App:
         waits to retry (a "Retrying model call" status with its time, or a member's retry note) starts the call's
         streak, or keeps it when the failure is the same as the last one (_failure_signature: its words without the
         numbers and IDs that change between attempts); another failure starts it again. The streak ends once the call
-        works again: the model's output (an item of its own, as the runner counts a retry that worked) or its step's
-        result, or the end of a member's assignment.
+        works again: the model's output (an item of its own, as the runner counts a retry that worked), its step's
+        result or the next step, or the end of a member's assignment. A structured call whose model had worked in a
+        failed attempt (an answer that was refused or set aside, or a stream that dropped after some output: the
+        runner's failureKind and modelOutput) works again only once an answer is accepted: its next attempt's output
+        leaves the streak, as its runner keeps counting the call as failing (structured()).
         """
 
         if not isinstance(record, dict):
@@ -4993,14 +4996,20 @@ class App:
                 signature = _failure_signature(failure, reason)
                 previous = streaks.get(key)
                 since = previous["since"] if previous and previous["signature"] == signature else now
+                # Whether the model worked in this failed attempt (see above).
+                worked = (record.get("failureKind") in {"invalid_answer", "subagent"}
+                          or record.get("modelOutput") is True)
                 streaks[key] = {"failure": failure, "reason": reason, "signature": signature, "since": since,
                                 "last": now, "text": text, "stage": str(record.get("stage") or ""),
                                 "activity": str(record.get("activityLabel") or ""),
                                 "member": record.get("subagentMember") if member else None,
-                                "memberModel": str(record.get("subagentModel") or "") if member else ""}
+                                "memberModel": str(record.get("subagentModel") or "") if member else "",
+                                "worked": worked}
             elif _model_output(record):
-                streaks.pop(key, None)
-            elif kind in STEP_RESULT_KINDS:
+                if not (streaks.get(key) or {}).get("worked"):
+                    streaks.pop(key, None)
+            elif kind in STEP_RESULT_KINDS or (kind == "status" and isinstance(label, str)
+                                               and label.startswith("Workflow step: ")):
                 stage = record.get("stage")
                 for name in [name for name, streak in streaks.items()
                              if name.startswith(key_prefix) and streak["stage"] == stage and not streak["member"]]:

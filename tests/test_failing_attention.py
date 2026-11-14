@@ -167,6 +167,67 @@ class FailingCallTests(jobs_test.Isolated):
                              "event": {"method": "item/started", "params": {"item": {"type": "reasoning"}}}})
         self.assertIsNone(author.attention())
 
+    def answered_and_refused(self, app, minutes, failure, **fields):
+        """Every minute the model answers (its message) and the runner refuses the answer the same way; ``seen`` has the
+        job's attention after each answer and after each refusal."""
+
+        seen = []
+        activity = {key: fields.pop(key) for key in ("activity", "stage") if key in fields}
+        for minute in range(minutes + 1):
+            if minute:
+                self.now += 60
+                self.follow(app, retrying_now(minute + 1, **activity))
+                self.follow(app, item_event(**activity))
+                seen.append(app.attention())
+            self.follow(app, retry(failure, attempt=minute + 2, **activity, **fields))
+            seen.append(app.attention())
+        return [item and item["kind"] for item in seen]
+
+    def test_an_answer_refused_every_minute_is_listed_after_15_minutes_until_one_is_accepted(self):
+        # A critic on a gateway that ignores the answer schema: it answers every minute, and every answer is refused
+        # the same way. None of these attempts worked, so its answers do not start the 15 minutes again.
+        app = self.running()
+        kinds = self.answered_and_refused(app, 60, "the final answer was not one complete JSON object",
+                                          failureKind="invalid_answer")
+        # Listed from the 15th minute on, also between an answer and its refusal (it never goes and comes back).
+        self.assertEqual(kinds, [None] * 29 + ["failing"] * 92)
+        self.assertTrue(app.attention()["text"].startswith(
+            "The model call of the critic coordinator has failed the same way for 60 min (the final answer was not "
+            "one complete JSON object)."), app.attention())
+        # An answer accepted: the step's result ends it.
+        self.follow(app, item_event())
+        self.assertEqual(app.attention()["kind"], "failing")
+        self.follow(app, {"kind": "critic_result", "stage": "critic", "report": {"verdict": "pass"}})
+        self.assertIsNone(app.attention())
+        # So does the next step for a call whose step has no result of its own: the LaTeX editor's.
+        for minute in range(16):
+            self.follow(app, retry("proof.md does not exist", attempt=minute + 2, activity="", stage="final",
+                                   failureKind="invalid_answer"))
+            self.now += 60
+            self.follow(app, item_event(activity="", stage="final"))
+        self.assertEqual(app.attention()["kind"], "failing")
+        self.follow(app, {"kind": "status", "stage": "final", "label": "Workflow step: latex_compile",
+                          "node": "latex_compile", "visit": 1})
+        self.assertIsNone(app.attention())
+
+    def test_an_answer_set_aside_and_a_stream_that_drops_after_some_output_keep_counting(self):
+        # An answer set aside after failed subagent calls, every minute the same way.
+        app = self.running()
+        kinds = self.answered_and_refused(app, 16, "2 subagent calls failed (model at capacity)",
+                                          failureKind="subagent", failureReason="Selected model is at capacity.")
+        self.assertEqual(kinds, [None] * 29 + ["failing"] * 4)
+        # A stream that drops after some output: the runner says the model worked in that attempt (modelOutput).
+        app = self.running()
+        kinds = self.answered_and_refused(app, 16, "connection lost", modelOutput=True)
+        self.assertEqual(kinds, [None] * 29 + ["failing"] * 4)
+        # A failure before any output stays one the model's first output ends (the provider works again).
+        self.follow(app, retry("model at capacity", attempt=30))
+        self.now += 15 * 60
+        self.follow(app, retry("model at capacity", attempt=31))
+        self.assertEqual(app.attention()["kind"], "failing")
+        self.follow(app, item_event())
+        self.assertIsNone(app.attention())
+
     def test_a_steps_result_ends_its_calls_that_kept_failing(self):
         app = self.running()
         self.fail_for(app, 15)
