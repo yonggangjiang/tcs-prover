@@ -26,6 +26,7 @@ from tests import isolated_state  # noqa: F401 - first: keeps private state out 
 import workflow_runner as runtime
 from runner import claude_cli, confinement, providers, tcs_mcp, team
 
+import codex_refusals
 import test_author_coordinator as coordinator_test
 import test_claude_cli as claude_test
 import test_goal_runtime as goal_test
@@ -38,20 +39,15 @@ POINTER = "PROOF_FILE: proof.md"
 TEXTS = {name: text for name, text in runtime.load_workflow(WORKFLOW)["prompts"].items()
          if name in runtime.HARNESS_TEXTS}
 
-# What Codex reports, as its error event and its failed turn, when an API connection refuses the request: an
-# OpenAI-format endpoint's HTTP 400 invalid_request_error (a request it rejects as invalid), and its HTTP 401 (a key it
-# refuses), each in Codex's words "unexpected status <status>: <the endpoint's body>".
-CODEX_REFUSALS = {
-    "REJECTED": ('unexpected status 400 Bad Request: {"error": {"message": "Unsupported parameter: '
-                 '\'reasoning.summary\' is not supported with this model.", "type": "invalid_request_error", '
-                 '"param": "reasoning.summary", "code": "unsupported_parameter"}}'),
-    "BADKEY": ('unexpected status 401 Unauthorized: {"error": {"message": "Incorrect API key provided.", '
-               '"type": "invalid_request_error", "code": "invalid_api_key"}}'),
-}
+# The lines the real Codex 0.160 printed when an OpenAI-format API connection refused the request (tests/
+# codex_refusals.py): its endpoint's HTTP 400 invalid_request_error (a request it rejects as invalid), which Codex
+# reports as the endpoint's body alone, and its HTTP 401 (a key it refuses), in Codex's words "unexpected status 401
+# Unauthorized: …".
+CODEX_REFUSALS = {"REJECTED": codex_refusals.EXEC_400, "BADKEY": codex_refusals.EXEC_401}
 # A stand-in `codex` for a team member's `codex exec --json`: it logs its call, reports a saved session and answers
 # from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a
 # failure: SLOW (works until stopped), FAIL-ONCE (a model-call failure after some work, once per run folder), NOLOGIN
-# (a login the CLI refuses), REJECTED and BADKEY (the refusals of CODEX_REFUSALS).
+# (a login the CLI refuses), REJECTED and BADKEY (the refusals of CODEX_REFUSALS, whose lines it prints).
 FAKE_CODEX = f"REFUSALS = {CODEX_REFUSALS!r}\n" + r'''
 import json, os, sys, time, uuid
 argv = sys.argv[1:]
@@ -75,10 +71,12 @@ log({"argv": argv, "prompt": prompt, "cwd": os.getcwd(), "fork": fork,
              if key.startswith(("CODEX", "TCS", "OPENAI", "SSH_", "GPG_")) or key == "TMPDIR"}})
 session = str(uuid.uuid4())
 out({"type": "thread.started", "thread_id": session})
-refusal = next((text for marker, text in REFUSALS.items() if marker in prompt), None)
+refusal = next((lines for marker, lines in REFUSALS.items() if marker in prompt), None)
 if refusal:
-    out({"type": "error", "message": refusal})
-    out({"type": "turn.failed", "error": {"message": refusal}})
+    out({"type": "turn.started"})
+    for line in refusal:
+        sys.stdout.write(line + "\n")
+    sys.stdout.flush()
     sys.exit(1)
 out({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning",
                                         "text": "thinking about " + prompt[:40]}})
@@ -1058,13 +1056,12 @@ class TeamTests(TeamCase):
         # The owner's wording (14 Nov 2026): an endpoint that rejects the request as invalid (HTTP 400) or refuses its
         # key (HTTP 401) may refuse only for a while (a proxy whose own login refreshes) as well as for a wrong
         # setting, so the coordinator reads that the work goes on: with another member, or with this one later.
+        # Codex reports the 400 as the endpoint's body alone: the service's words are its error's message.
+        rejected = codex_refusals.ENDPOINT_MESSAGE
+        refused = ("unexpected status 401 Unauthorized: Incorrect API key provided: sk-fake-********cdef., url: "
+                   "http://127.0.0.1:65370/v1/responses")
         api = self.api_model()
         crew = self.crew([{"model": "gpt-6.1-sol", "effort": "high"}, {"model": api, "effort": "medium"}])
-        rejected, refused = CODEX_REFUSALS["REJECTED"], CODEX_REFUSALS["BADKEY"]
-        records = (f"{runtime.REQUEST_REJECTED_LABEL}: Lab gateway refuses the requests this job sends as invalid "
-                   f"({rejected}). A retry cannot fix this: change its API connection's settings under Models & API "
-                   "(or the endpoint); a job waiting for it continues once its settings change.",
-                   f"authentication failed: {refused}")
         for count, (line, reason) in enumerate((("REJECTED Lemma A", rejected), ("BADKEY Lemma B", refused)), 1):
             crew.call("team_assign", {"member": 2, "assignment": line})
             report, = self.collect(crew, 1)
@@ -1073,7 +1070,11 @@ class TeamTests(TeamCase):
             self.assertEqual(text, refused_report(2, reason))
             self.assertEqual((self.run_dir / f"team/member-2/{count}-report.md").read_text(), text)
         # The activity log's lines keep their words.
-        self.assertEqual(tuple(event["text"] for event in self.labelled("Author subagent failed")), records)
+        self.assertEqual(tuple(event["text"] for event in self.labelled("Author subagent failed")),
+                         (f"{runtime.REQUEST_REJECTED_LABEL}: Lab gateway refuses the requests this job sends as "
+                          f"invalid ({rejected}). A retry cannot fix this: change its API connection's settings under "
+                          "Models & API (or the endpoint); a job waiting for it continues once its settings change.",
+                          f"authentication failed: {refused}"))
         # Each ended at once, never retried.
         self.assertEqual(len([call for call in self.codex_calls() if "lab-model" in call["argv"]]), 2)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"

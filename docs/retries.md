@@ -132,8 +132,9 @@ web-cutoff policy) and programming errors.
 - The proof author pauses with such an error too, and so does a model that does
   not exist or that your account cannot use (**Model unavailable**) or, for an
   API model, an endpoint that refuses the requests as invalid with HTTP 400
-  (**Request rejected by the API endpoint**; Claude Code reports it as "API
-  Error: 400" with the endpoint's message). Both list the job under **Needs your
+  (**Request rejected by the API endpoint**; Codex reports it as the endpoint's
+  error alone, of type `invalid_request_error`, and Claude Code as "API Error:
+  400" with the endpoint's message). Both list the job under **Needs your
   attention**. Such a job resumes by itself once its API connection's settings
   change; one whose built-in model is unavailable waits for **Resume**. A key
   store that cannot be read for a moment is retried like any failure.

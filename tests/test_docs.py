@@ -159,12 +159,15 @@ class AccuracyTests(unittest.TestCase):
 
     def test_claude_codes_api_error_400_is_named_where_a_refused_request_is_described(self):
         # Owner decision (13 Nov 2026): on an API connection Claude Code's "API Error: 400" pauses as Codex's 400
-        # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried.
-        self.assertIn('(**Request rejected by the API endpoint**; Claude Code reports it as "API Error: 400" with the '
-                      "endpoint's message)", flat(DOCS / "retries.md"))
+        # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried. Codex 0.160
+        # reports that 400 as the endpoint's error body alone, with no status (tests/codex_refusals.py).
+        self.assertIn("(**Request rejected by the API endpoint**; Codex reports it as the endpoint's error alone, of "
+                      'type `invalid_request_error`, and Claude Code as "API Error: 400" with the endpoint\'s message)',
+                      flat(DOCS / "retries.md"))
         trouble = flat(DOCS / "troubleshooting.md")
-        self.assertIn('- **Request rejected by the API endpoint** (HTTP 400; Claude Code says "API Error: 400" and the '
-                      "endpoint's message): the endpoint refuses run requests as invalid.", trouble)
+        self.assertIn("- **Request rejected by the API endpoint** (HTTP 400; Codex shows only the endpoint's error, of "
+                      'type `invalid_request_error`, and Claude Code says "API Error: 400" and the endpoint\'s '
+                      "message): the endpoint refuses run requests as invalid.", trouble)
         # Claude Code's own words after "API Error: 400" for a conversation whose tool calls and results do not match
         # stay retried too (workflow_runner._CLAUDE_HISTORY_MISMATCH).
         self.assertIn("A conversation too long for the model, a key out of credit, and Claude Code's own words for a "

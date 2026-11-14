@@ -563,13 +563,24 @@ _MODEL_UNAVAILABLE = re.compile(
 _PASSING_CONDITION = re.compile(r"capacity|overload|high demand|temporar|\b429\b|rate ?limit|\b5\d\d\b",
                                 re.IGNORECASE)
 # An endpoint that refuses the request itself as malformed for it: an OpenAI-format endpoint's 400
-# invalid_request_error as Codex reports it, and an Anthropic-format endpoint's (its invalid_request_error) as Claude
+# invalid_request_error that names its status, and an Anthropic-format endpoint's (its invalid_request_error) as Claude
 # Code reports it, "API Error: 400 <the endpoint's message>" (Claude Code 2.1.289, from a fake endpoint). Claude Code
 # words a conversation too long for the model ("Prompt is too long …") and a key out of credit ("Credit balance is too
 # low") otherwise, with no "API Error: 400": both stay retried, as do the three 400s it reports in its own words after
 # "API Error: 400" (_CLAUDE_HISTORY_MISMATCH).
 _REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b|"
                                r"\bAPI Error: 400\b", re.IGNORECASE)
+# Codex 0.160 reports an OpenAI-format endpoint's HTTP 400 as the endpoint's body alone, with no status (its
+# InvalidRequest error; the real Codex against a fake endpoint, through `codex exec --json` and the app-server alike):
+# {"error": {"message": "…", "type": "invalid_request_error", …}}, on one line or, as api.openai.com writes its
+# bodies, over several. A failure that quotes an error of that type is a request the endpoint refuses, as a 400 that
+# names its status is (_invalid_request_body()), unless it names another HTTP status (_OTHER_STATUS: a key refused
+# with 401 stays a failed authentication) or a conversation too large for the model in a proxy's code
+# ("context_too_large", CLIProxyAPI's); a conversation too long in the usual words and a passing condition stay
+# retried, as for every 400.
+_INVALID_REQUEST_BODY = re.compile(r'\\*"type\\*"\s*:\s*\\*"invalid_request_error\\*"')
+_OTHER_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|API status|HTTP)\s*(?!400\b)[1-5]\d\d\b",
+                           re.IGNORECASE)
 # Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
 # conversation because its tool calls and tool results do not pair up (Claude Code 2.1.289 marks all three
 # api_error "tool_history_mismatch"): a fault in Claude Code's record of the conversation, not in the connection's
@@ -579,15 +590,47 @@ _CLAUDE_HISTORY_MISMATCH = re.compile(r"\bAPI Error: 400 (?:due to tool use conc
                                       re.IGNORECASE)
 
 
+def _invalid_request_body(text):
+    """Whether a failure quotes an endpoint's invalid_request_error body, as Codex reports an HTTP 400 (see
+    _INVALID_REQUEST_BODY), naming no other HTTP status and no conversation too large for the model."""
+
+    return (bool(_INVALID_REQUEST_BODY.search(text)) and not _OTHER_STATUS.search(text)
+            and "context_too_large" not in text.lower())
+
+
+def _error_body_words(text, limit=300):
+    """The endpoint's own words in the first error body that a failure quotes whole, on one line; else "".
+
+    Codex reports an endpoint's HTTP 400 as its JSON body alone (see _INVALID_REQUEST_BODY), which api.openai.com
+    writes over several lines: the words are its error's message, as the connection's Test quotes it, else the body.
+    """
+
+    decoder = json.JSONDecoder()
+    for brace in re.finditer(r"\{", text):
+        try:
+            value, end = decoder.raw_decode(text, brace.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "error" in value:
+            error = value["error"]
+            words = error.get("message") if isinstance(error, dict) else error
+            if not isinstance(words, str) or not words.strip():
+                words = text[brace.start():end]
+            return _clipped(" ".join(words.split()), limit)
+    return ""
+
+
 def settings_failure(error, model=None):
     """A failed model call that only a change of settings can fix, as the error that says so; else None.
 
     No retry fixes a model that does not exist or that this account cannot
     use (ModelUnavailable), an API model's endpoint that refuses the request
-    as invalid (RequestRejected; a conversation that is too long is not
-    that, nor one whose tool calls and results Claude Code reports as not
-    pairing up), or private TCS Prover state that cannot be used (a
-    ProviderError).
+    as invalid (RequestRejected: HTTP 400, which Codex reports as the
+    endpoint's invalid_request_error body alone; a conversation that is too
+    long is not that, nor one whose tool calls and results Claude Code
+    reports as not pairing up), or private TCS Prover state that cannot be
+    used (a ProviderError). The endpoint's words in such a message are its
+    error's own message when the failure quotes its body.
     These end a structured call and pause an author with a message saying
     what to change; every other failure keeps being retried.
     """
@@ -610,13 +653,14 @@ def settings_failure(error, model=None):
         api = bool(model) and providers.provider_kind(model) == providers.API
     except providers.ProviderError:
         return None  # Its settings cannot be read now: retried like any failure.
-    reason = _failure_reason(text) or text
+    reason = _error_body_words(text) or _failure_reason(text) or text
     if _MODEL_UNAVAILABLE.search(text):
         fix = ("check its API connection under Models & API (Load models lists the models its key can use)" if api
                else "check that the model exists and that your login may use it")
         return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
                                 f"A retry cannot fix this: {fix}.")
-    if api and _REJECTED_REQUEST.search(text) and not _CLAUDE_HISTORY_MISMATCH.search(text):
+    if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text))
+            and not _CLAUDE_HISTORY_MISMATCH.search(text)):
         return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
                                f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
                                "under Models & API (or the endpoint); a job waiting for it continues once its "

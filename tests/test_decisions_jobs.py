@@ -28,6 +28,7 @@ from runner import claude_cli, providers
 from ui import batches, cli, review, server
 import workflow_runner as runtime
 
+import codex_refusals
 import test_live_gateway as gateway_tests
 import test_model_retry as retry_tests
 import test_provider_ui as provider_ui_tests
@@ -351,19 +352,19 @@ class TestRequestTests(Isolated):
         self.assertNotIn("tools", json.loads(server._api_test_request(openai)[2]))
 
     def test_an_invalid_request_of_an_api_model_is_a_settings_problem(self):
+        # What Codex 0.160 reported for an endpoint's HTTP 400 invalid_request_error: the endpoint's body alone.
         model = self.api_model()["id"]
-        rejected = runtime.Error("Codex review failed: unexpected status 400 Bad Request: "
-                                 '{"error": {"type": "invalid_request_error", "message": "Unsupported parameter"}}')
+        rejected = runtime.Error(codex_refusals.exec_text(codex_refusals.EXEC_400, "Codex review failed: "))
         problem = runtime.settings_failure(rejected, model)
         self.assertIsInstance(problem, runtime.RequestRejected)
         self.assertTrue(str(problem).startswith(f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests"))
         self.assertFalse(runtime.retryable_failure(problem))
         # Built-in models, a conversation that is too long, and passing conditions stay retried.
         self.assertIsNone(runtime.settings_failure(rejected, "gpt-6.1-sol"))
-        self.assertIsNone(runtime.settings_failure(runtime.Error("400 invalid_request_error: context_length_exceeded"),
-                                                   model))
-        self.assertIsNone(runtime.settings_failure(runtime.Error("400 invalid_request_error: overloaded, try later"),
-                                                   model))
+        self.assertIsNone(runtime.settings_failure(runtime.Error(codex_refusals.exec_text(
+            codex_refusals.EXEC_400_TOO_LONG, "Codex review failed: ")), model))
+        self.assertIsNone(runtime.settings_failure(runtime.Error(str(rejected).replace(
+            codex_refusals.ENDPOINT_MESSAGE, "The model is overloaded, try later.")), model))
 
 
 class StructuredSettingsFailureTests(retry_tests.RetryCase):
@@ -390,7 +391,8 @@ class StructuredSettingsFailureTests(retry_tests.RetryCase):
         return raised.exception, calls
 
     def test_an_endpoint_refusing_the_request_ends_the_call_after_one_attempt(self):
-        error, calls = self.attempts(runtime.Error("unexpected status 400: invalid_request_error: bad tool"), self.model)
+        error, calls = self.attempts(runtime.Error(codex_refusals.exec_text(codex_refusals.EXEC_400,
+                                                                            "Codex review failed: ")), self.model)
         self.assertIsInstance(error, runtime.RequestRejected)
         self.assertEqual((calls, self.waits()), ([1], 0))
 
@@ -648,7 +650,9 @@ class UnavailableModelTests(Isolated):
 
     def test_an_api_job_waiting_for_its_settings_resumes_once_they_change(self):
         model = self.api_model()["id"]
-        problem = runtime.settings_failure(runtime.Error("400 Bad Request: invalid_request_error: bad field"), model)
+        # The author's failure when its app-server reported the endpoint's 400 (tests/codex_refusals.py).
+        author = runtime._provider_message(codex_refusals.app_server_error())
+        problem = runtime.settings_failure(runtime.Error(author), model)
         app = self.paused_job(reason=str(problem), authorModel=model)
         self.assertEqual(app.state["autoResumeAt"], 0)
         self.assertEqual(app.attention()["kind"], "request")
@@ -1215,7 +1219,8 @@ class ConnectionModelTests(Isolated):
     def test_a_later_step_stopped_by_its_endpoint_resumes_once_its_connection_changes(self):
         connection = self.connection()
         model = connection["models"][0]["modelId"]
-        problem = runtime.settings_failure(runtime.Error("400 Bad Request: invalid_request_error: bad field"), model)
+        problem = runtime.settings_failure(runtime.Error(codex_refusals.exec_text(codex_refusals.EXEC_400,
+                                                                                  "Codex critic failed: ")), model)
         self.assertIsInstance(problem, runtime.RequestRejected)
         app = server.App(runs=self.runs, load_latest=False)
         app._new_run("Exact statement")
