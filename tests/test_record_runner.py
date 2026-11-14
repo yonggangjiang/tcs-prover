@@ -753,5 +753,179 @@ class SettingsCopyTests(unittest.TestCase):
         self.assertEqual(set(json.loads(kept)["event"]["result"]), {"config", "leftOut"})
 
 
+# Codex's answer to config/read in a web-cutoff run (its isolation check, a liveness probe), in small, as the real
+# Codex 0.160 app-server gave it to a real web-cutoff author's preflight (~/tcs-work/scratch/rec-fix7/probe-author):
+# TCS Prover's private configuration file in the Codex home it gives the process is the "user" layer, its command line
+# the "sessionFlags" one. Another layer could add entries beside TCS Prover's (here the system file), Codex records
+# the project it trusts in the private file itself, and reports defaults of its own with no origin (mentions_v2).
+PRIVATE_FILE = {"name": {"type": "user", "file": "/state/ctl/run-1/codex-home/author/config.toml", "profile": None},
+                "version": "sha256:4"}
+SESSION_FLAGS = {"name": {"type": "sessionFlags"}, "version": "sha256:5"}
+SYSTEM_FILE = {"name": {"type": "system", "file": "/etc/codex/config.toml"}, "version": "sha256:6"}
+SKILL = "/state/ctl/run-1/codex-home/author/skills/.system/{}/SKILL.md"
+TEMP = "/state/ctl/run-1/codex-home/tmp/author-77784-a4rily73"
+WEB_CUTOFF_ANSWER = {
+    "config": {
+        "model": None, "model_provider": None, "approval_policy": "never", "approvals_reviewer": None,
+        "sandbox_mode": None, "default_permissions": "historical", "web_search": "disabled",
+        "tools": {"web_search": None, "view_image": None}, "agents": {"max_depth": 1, "max_threads": None},
+        "project_doc_max_bytes": 0, "project_doc_fallback_filenames": None, "allow_login_shell": False,
+        "features": {"apps": False, "plugins": False, "memories": False, "hooks": False,
+                     "skip_host_skill_discovery": True, "shell_tool": True, "multi_agent": True, "code_mode_host": True,
+                     "code_mode": {"enabled": False}, "mentions_v2": True, "js_repl": True},
+        "shell_environment_policy": {"inherit": "none", "ignore_default_excludes": None, "exclude": None,
+                                     "set": {"TMPPREFIX": TEMP + "/zsh", "TMPDIR": TEMP, "PATH": "/usr/bin:/bin",
+                                             "SYSTEM_TOKEN": "SYSTEM-LAYER-SECRET"},
+                                     "include_only": None, "experimental_use_profile": None},
+        "skills": {"config": [{"path": SKILL.format("imagegen"), "enabled": False},
+                              {"path": SKILL.format("openai-docs"), "enabled": False}]},
+        "permissions": {"historical": {"filesystem": {":minimal": "read", ":workspace_roots": {".": "write"}},
+                                       "network": {"enabled": False}}},
+        "mcp_servers": {"historical_search": {"command": "/usr/bin/python3", "args": ["/checkout/BROKER-SCRIPT.py"],
+                                              "env_vars": ["BROKER-KEY-VARIABLE"], "required": True}},
+        "projects": {"/state/ctl/run-1/TRUSTED-RUN": {"trust_level": "trusted"}},
+        "windows": None, "notify": None,
+    },
+    "origins": {
+        **{path: PRIVATE_FILE for path in (
+            "approval_policy", "default_permissions", "web_search", "tools.web_search", "project_doc_max_bytes",
+            "allow_login_shell", "features.apps", "features.plugins", "features.memories", "features.hooks",
+            "features.skip_host_skill_discovery", "features.shell_tool", "features.multi_agent",
+            "features.code_mode_host", "features.code_mode.enabled", "shell_environment_policy.inherit",
+            "shell_environment_policy.set.PATH", "skills.config.0.path", "skills.config.0.enabled",
+            "skills.config.1.path", "skills.config.1.enabled", "permissions.historical.filesystem.:minimal",
+            "permissions.historical.network.enabled", "mcp_servers.historical_search.command",
+            "mcp_servers.historical_search.args.0", "mcp_servers.historical_search.env_vars.0",
+            "mcp_servers.historical_search.required", "projects./state/ctl/run-1/TRUSTED-RUN.trust_level")},
+        **{path: SESSION_FLAGS for path in ("shell_environment_policy.set.TMPDIR",
+                                            "shell_environment_policy.set.TMPPREFIX", "agents.max_depth")},
+        **{path: SYSTEM_FILE for path in ("shell_environment_policy.set.SYSTEM_TOKEN", "features.js_repl")},
+    },
+    "layers": [{"name": SESSION_FLAGS["name"], "version": "sha256:5", "config": {"agents": {"max_depth": 1}}},
+               {"name": PRIVATE_FILE["name"], "version": "sha256:4", "config": {"project_doc_max_bytes": 0}}],
+}
+# What TCS Prover set of the isolation settings: in its private configuration file, or on the command line.
+ISOLATION_KEPT = {
+    "project_doc_max_bytes": 0, "allow_login_shell": False,
+    "shell_environment_policy": {"set": {"TMPPREFIX": TEMP + "/zsh", "TMPDIR": TEMP, "PATH": "/usr/bin:/bin"},
+                                 "inherit": "none"},
+    "skills": WEB_CUTOFF_ANSWER["config"]["skills"],
+    "features": {"apps": False, "plugins": False, "memories": False, "hooks": False, "skip_host_skill_discovery": True,
+                 "shell_tool": True, "multi_agent": True, "code_mode_host": True, "code_mode": {"enabled": False}},
+}
+# Never kept: another layer's entries, Codex's own record of the project it trusts, the MCP server's definition.
+NOT_TCS_PROVER_S = ("SYSTEM-LAYER-SECRET", "SYSTEM_TOKEN", "js_repl", "mentions_v2", "TRUSTED-RUN", "BROKER-SCRIPT",
+                    "BROKER-KEY-VARIABLE", "/etc/codex")
+
+
+def leaf_paths(value, prefix=""):
+    """The paths by which Codex's answer names where each value of ``value`` came from (its origins): the keys joined
+    with dots, an array's items by their index."""
+
+    if isinstance(value, dict) and value:
+        return [path for key, item in value.items() for path in leaf_paths(item, f"{prefix}{key}.")]
+    if isinstance(value, list) and value:
+        return [path for index, item in enumerate(value) for path in leaf_paths(item, f"{prefix}{index}.")]
+    return [prefix[:-1]]
+
+
+class WebCutoffSettingsTests(unittest.TestCase):
+    """A web-cutoff run's answers to config/read keep TCS Prover's own isolation settings of the private Codex
+    configuration file it writes for each process (records.ISOLATION_SETTINGS): only what that file, or TCS Prover's
+    command line, set; never another layer's entries, Codex's own record of the project it trusts or an MCP server's
+    definition. Any other run keeps none of them (they would be the user's own)."""
+
+    def test_a_web_cutoff_run_s_answer_keeps_tcs_prover_s_isolation_settings_and_nothing_else_of_them(self):
+        kept = runtime.recorded_settings(WEB_CUTOFF_ANSWER, web_cutoff=True)
+        for key, value in ISOLATION_KEPT.items():
+            self.assertEqual(kept["config"][key], value, key)
+        self.assertNotIn("projects", kept["config"])
+        self.assertEqual(kept["config"]["mcp_servers"], ["historical_search"])
+        for private in NOT_TCS_PROVER_S:
+            self.assertNotIn(private, json.dumps(kept), private)
+        self.assertIn("and the isolation settings of its private configuration file:", kept["leftOut"])
+        # Any other run's answer keeps none of them: there they are the user's own settings.
+        live = runtime.recorded_settings(WEB_CUTOFF_ANSWER)
+        for key in ("project_doc_max_bytes", "allow_login_shell", "skills"):
+            self.assertNotIn(key, live["config"])
+        self.assertEqual(live["config"]["shell_environment_policy"], {"set": {"TMPPREFIX": TEMP + "/zsh",
+                                                                              "TMPDIR": TEMP}})
+        self.assertEqual(live["config"]["features"], {
+            name: value for name, value in ISOLATION_KEPT["features"].items() if name in records.RECORDED_FEATURES})
+        self.assertNotIn("isolation settings", live["leftOut"])
+
+    def test_every_setting_tcs_prover_writes_into_the_private_configuration_file_is_kept(self):
+        # Whatever retrieval.runtime.configuration() writes (for either adapter and role), the answer reports as the
+        # private file's: all of it is kept, but the MCP servers' definitions (names only).
+        with tempfile.TemporaryDirectory() as folder:
+            for adapter in (runtime.retrieval_runtime.MACOS_ADAPTER, runtime.retrieval_runtime.WINDOWS_ADAPTER):
+                for role in ("author", "structured"):
+                    policy = {"isolation": {"adapter": adapter, "codexHome": folder},
+                              "broker": {"command": "/usr/bin/python3", "args": ["/checkout/broker.py"]}}
+                    written = runtime.retrieval_runtime.configuration(policy, role)
+                    answer = {"config": written, "origins": {path: PRIVATE_FILE for path in leaf_paths(written)}}
+                    kept = runtime.recorded_settings(answer, web_cutoff=True)["config"]
+                    self.assertEqual(kept, {**written, "mcp_servers": sorted(written["mcp_servers"])}, (adapter, role))
+
+    def test_a_web_cutoff_app_server_s_answers_are_recorded_with_its_isolation_settings(self):
+        process = SimpleNamespace(stdout=io.StringIO(json.dumps({"id": 1, "result": WEB_CUTOFF_ANSWER}) + "\n"),
+                                  stdin=io.StringIO(), stderr=None)
+        recorded = []
+        rpc = runtime.RPC(process, recorded.append)
+        rpc.web_cutoff = True
+        self.assertEqual(rpc.call("config/read", {"cwd": "/work", "includeLayers": True}), WEB_CUTOFF_ANSWER)
+        self.assertEqual(recorded, [{"id": 1, "result": runtime.recorded_settings(WEB_CUTOFF_ANSWER, True)}])
+        self.assertEqual(recorded[0]["result"]["config"]["skills"], ISOLATION_KEPT["skills"])
+        # An app-server's RPC is no web-cutoff run's unless its goal session says so.
+        self.assertFalse(runtime.RPC(process).web_cutoff)
+
+    def test_every_app_server_s_rpc_knows_whether_it_is_a_web_cutoff_run_s(self):
+        # The author's or coordinator's app-server and a reply or summary turn's: each RPC the runner makes is told,
+        # right after it is made, from the policy of the run that started it.
+        tree = ast.parse(Path(runtime.__file__).read_text(encoding="utf-8"))
+        made = {}
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for block in ast.walk(function):
+                body = getattr(block, "body", None)
+                if not isinstance(body, list):
+                    continue
+                for index, statement in enumerate(body):
+                    if (isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+                            and ast.unparse(statement.value.func) == "runtime.RPC"):
+                        following = ast.unparse(body[index + 1]) if index + 1 < len(body) else ""
+                        made.setdefault(function.name, []).append(following)
+        self.assertEqual(made, {"goal_session": ["rpc.web_cutoff = bool(policy)"],
+                                "author_conversation": ["rpc.web_cutoff = bool(policy)"]})
+
+    def test_a_web_cutoff_record_s_snapshot_and_download_keep_them_from_a_transcript_written_before(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        change = mock.patch.dict(os.environ, {providers.STORE_ENV: str(root / "state" / "api-models.json")})
+        change.start()
+        self.addCleanup(change.stop)
+        transcript = root / "transcript.jsonl"
+        transcript.write_text(settings_line(2, WEB_CUTOFF_ANSWER), encoding="utf-8")
+        for name, web_cutoff in (("run-cutoff", True), ("run-live", False)):
+            record = records.Record.create(records.record_folder(name), title="A statement", webCutoff=web_cutoff)
+            records.snapshot(record, transcript)
+            [entry] = records.read_transcript(record)
+            self.assertEqual(entry["event"]["result"], runtime.recorded_settings(WEB_CUTOFF_ANSWER, web_cutoff), name)
+            buffer = io.BytesIO()
+            model_calls.training_record(name, buffer)
+            [line] = zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("transcript/transcript.jsonl").splitlines()
+            self.assertEqual(json.loads(line)["event"]["result"], entry["event"]["result"], name)
+            # As an earlier build's snapshot left it, the download keeps them the same way.
+            records.write_atomic(record.folder / "transcript" / "transcript.jsonl.gz",
+                                 gzip.compress(transcript.read_bytes(), mtime=0))
+            buffer = io.BytesIO()
+            model_calls.training_record(name, buffer)
+            [line] = zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("transcript/transcript.jsonl").splitlines()
+            self.assertEqual(json.loads(line)["event"]["result"], entry["event"]["result"], name)
+            self.assertEqual("project_doc_max_bytes" in entry["event"]["result"]["config"], web_cutoff, name)
+
+
 if __name__ == "__main__":
     unittest.main()

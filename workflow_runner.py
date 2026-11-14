@@ -4447,13 +4447,14 @@ def structured(
             conversation.discard()
 
 
-def recorded_settings(result):
+def recorded_settings(result, web_cutoff=False):
     """What a job's transcript records of Codex's answer to config/read (``result``): what the record keeps of it
-    (records.recorded_settings(): the settings TCS Prover sets or relies on, the MCP servers' names, and how many other
-    settings were left out), after TCS Prover's redaction (redacted()), as emit() runs it over every record. TCS Prover
-    acts on the whole answer, never on this."""
+    (records.recorded_settings(): the settings TCS Prover sets or relies on, with ``web_cutoff`` the isolation settings
+    of a web-cutoff run's private Codex configuration file too, the MCP servers' names, and how many other settings
+    were left out), after TCS Prover's redaction (redacted()), as emit() runs it over every record. TCS Prover acts on
+    the whole answer, never on this."""
 
-    return redacted(records.recorded_settings(result))
+    return redacted(records.recorded_settings(result, web_cutoff))
 
 
 class RPC:
@@ -4469,6 +4470,9 @@ class RPC:
     """
 
     skipped = 0  # Output lines that were not protocol messages (see wire()).
+    # Whether the app-server is a web-cutoff run's, whose answers to config/read keep the isolation settings of its
+    # private Codex configuration file too (recorded()); set by the goal session that starts it.
+    web_cutoff = False
 
     # The answers an unattended client gives; other requests get a JSON-RPC error.
     DECLINED = {
@@ -4592,7 +4596,7 @@ class RPC:
         if "method" in message or not isinstance(identity, (int, str)) or isinstance(identity, bool):
             return message
         if self.methods.pop(identity, None) == "config/read" and isinstance(message.get("result"), dict):
-            return {**message, "result": recorded_settings(message["result"])}
+            return {**message, "result": recorded_settings(message["result"], self.web_cutoff)}
         return message
 
     def read(self):
@@ -5442,6 +5446,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         # A web-cutoff author can read its run folder: it gets no new controller output there.
         log = None if policy else options.get("goal_stderr_log")
         rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
+        rpc.web_cutoff = bool(policy)
         rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
@@ -5892,6 +5897,7 @@ def author_conversation(runtime, instruction, *, settings, options, features=(),
         # A web-cutoff author can read its run folder: it gets no new controller output there.
         log = None if policy else options.get("goal_stderr_log")
         rpc = runtime.RPC(process, record, **({"stderr_log": log} if log else {}))
+        rpc.web_cutoff = bool(policy)
         if hasattr(rpc, "notice"):
             rpc.notice = lambda text: emit("diagnostic", text=text, threadId=thread)
         watcher = threading.Thread(target=watch, daemon=True)

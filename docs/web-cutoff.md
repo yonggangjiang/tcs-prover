@@ -128,7 +128,11 @@ critic's progress line says only that its critics have started.
   the run leaves behind, the author's session files from the run's own folder
   and the URL discovery folders, every 10 minutes while it runs and when it
   pauses, stops or ends; its one-shot calls (the critic, the convention critic,
-  the LaTeX writer) write no files, and its record says so.
+  the LaTeX writer) write no files, and its record says so. Of the settings
+  Codex reports at each start, the transcript and the record keep those TCS
+  Prover sets, with the isolation settings it writes into the run's private
+  Codex configuration (project files off, the login shell off, the commands'
+  environment, the bundled skills turned off, the features).
 
 A timestamp run you stop continues with **Continue** in its own folder under the
 same policy and keeps its time budget. Failed timestamp runs, and runs stopped

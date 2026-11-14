@@ -1197,7 +1197,7 @@ def training_record(name, stream):
             with archive.open("transcript/transcript.jsonl", "w", force_zip64=True) as member:
                 # Of Codex's answers to config/read only what the record keeps (a snapshot taken before 14 Nov 2026
                 # holds them whole).
-                member.write(records.recorded_transcript(snapshot_data))
+                member.write(records.recorded_transcript(snapshot_data, bool(record.manifest().get("webCutoff"))))
         for path in sorted(snapshot.rglob("*")):
             if path.is_file() and path.name not in ("transcript.jsonl.gz", "transcript.json"):
                 archive.write(path, "transcript/" + path.relative_to(snapshot).as_posix())

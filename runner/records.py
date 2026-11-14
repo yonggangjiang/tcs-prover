@@ -1769,7 +1769,7 @@ def close():
         _RECORDER.close()
 
 
-# --- Codex's settings in the transcript ---------------------------------------------------------------------------------
+# --- Codex's settings in the transcript --------------------------------------------------------------------------------
 
 # What a job's transcript keeps of Codex's answer to config/read (recorded_settings(): the runner keeps it so, and the
 # record's snapshot and the training download keep a transcript written before it did so too, recorded_transcript()).
@@ -1790,6 +1790,16 @@ RECORDED_ENTRIES = {"tools": ("web_search",), "agents": ("enabled", "max_concurr
 # workflow's features, ...); of the MCP servers only their names, never their definitions.
 RECORDED_FEATURES = ("goals", "multi_agent", "multi_agent_v2", "fast_mode", "code_mode", "shell_tool", "apps",
                      "plugins", "view_image", "standalone_web_search")
+# A web-cutoff run's answers also keep the isolation settings TCS Prover writes into the private Codex configuration
+# file of each of its processes (retrieval.runtime.configuration(), in the Codex home TCS Prover gives the process, so
+# the answer's origins name that file as the "user" layer, which the run's isolation check verifies): project files
+# off, the login shell off, the commands' environment policy, the bundled skills turned off, the features and Windows'
+# sandbox. Of each only what that file set: never a value another layer added (nor Codex's own record of the project
+# it trusts, "projects", which it writes into that file).
+ISOLATION_SETTINGS = ("project_doc_max_bytes", "allow_login_shell", "shell_environment_policy", "skills", "features",
+                      "windows")
+# The layer of the answer's origins that is TCS Prover's private configuration file in a web-cutoff run.
+ISOLATION_LAYER = "user"
 # A whole answer to config/read has these fields (Codex 0.160: the effective settings, where each came from, and the
 # layers when asked for them); what recorded_settings() keeps of one has "config" and "leftOut".
 SETTINGS_ANSWER_FIELDS = ("config", "origins", "layers")
@@ -1801,7 +1811,8 @@ SNAPSHOT_SETTINGS = 1
 def _settings_of_layer(config, origins, layer):
     """The settings of ``config`` (Codex's effective settings) that one layer of the configuration set, as a tree of the
     same shape. ``layer`` is the type the answer's origins name it by ("sessionFlags": the app-server's command line,
-    TCS Prover's own flags). ``origins`` names the layer each value came from by its path, the keys joined with dots
+    TCS Prover's own flags; "user": the configuration file of the process's Codex home, in a web-cutoff run TCS
+    Prover's private one). ``origins`` names the layer each value came from by its path, the keys joined with dots
     (an array's items by their index; a feature with settings of its own, set on or off, as features.<name>.enabled):
     a value is kept when it, or a value below it, came from that layer, a table with only such entries."""
 
@@ -1836,19 +1847,20 @@ def _settings_union(first, second):
     return union
 
 
-def recorded_settings(result):
+def recorded_settings(result, web_cutoff=False):
     """What a transcript records of Codex's answer to config/read (``result``): {"config", "leftOut"}. TCS Prover acts
     on the whole answer, never on this.
 
     Of the effective settings ("config") it keeps RECORDED_SETTINGS, the entries of RECORDED_ENTRIES, the features of
     RECORDED_FEATURES, the permission profile in effect (the one default_permissions names), every other setting the
-    app-server's command line set (_settings_of_layer()) and the names of the MCP servers, never their commands,
-    environments or headers; "leftOut" says in one sentence how many other settings were left out, with where each
-    setting came from (the answer's origins and layers). No reader of the transcript needs more: the job page, the
-    controller, the transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py) skip the
-    answer, and the author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc()) read the
-    answer itself. The runner runs TCS Prover's redaction over what is kept (workflow_runner.recorded_settings()), as
-    over every transcript record.
+    app-server's command line set (_settings_of_layer()), in a web-cutoff run's answer (``web_cutoff``) also the
+    ISOLATION_SETTINGS as its private configuration file set them, and the names of the MCP servers, never their
+    commands, environments or headers; "leftOut" says in one sentence how many other settings were left out, with
+    where each setting came from (the answer's origins and layers). No reader of the transcript needs more: the job
+    page, the controller, the transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py)
+    skip the answer, and the author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc())
+    read the answer itself. The runner runs TCS Prover's redaction over what is kept
+    (workflow_runner.recorded_settings()), as over every transcript record.
     """
 
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
@@ -1867,16 +1879,20 @@ def recorded_settings(result):
         kept["permissions"] = (({profile: profiles[profile]} if isinstance(profile, str) and profile in profiles
                                 else {}) if isinstance(profiles, dict) else profiles)
     kept = _settings_union(kept, _settings_of_layer(config, origins, "sessionFlags"))
+    if web_cutoff:
+        isolation = {key: config[key] for key in ISOLATION_SETTINGS if key in config}
+        kept = _settings_union(kept, _settings_of_layer(isolation, origins, ISOLATION_LAYER))
     if "mcp_servers" in config:
         servers = config["mcp_servers"]
         # Names only, also of a server the command line set, and as values, which the redaction reads: a server's
         # definition holds its command, environment and headers.
         kept["mcp_servers"] = sorted(str(name) for name in servers) if isinstance(servers, dict) else servers
     left = sum(1 for key in config if key not in kept)
+    where = (" and the isolation settings of its private configuration file" if web_cutoff else "")
     return {"config": kept, "leftOut": (
         f"TCS Prover records the Codex settings the run relies on and every setting it gave this app-server on its "
-        f"command line: {left} other setting{'' if left == 1 else 's'} of the configuration, the other entries of the "
-        f"tables kept in part, and where each setting came from were left out.")}
+        f"command line{where}: {left} other setting{'' if left == 1 else 's'} of the configuration, the other entries "
+        f"of the tables kept in part, and where each setting came from were left out.")}
 
 
 def settings_answer(event):
@@ -1892,12 +1908,12 @@ def settings_answer(event):
             and (isinstance(result.get("origins"), dict) or set(result) <= set(SETTINGS_ANSWER_FIELDS)))
 
 
-def recorded_transcript(data):
+def recorded_transcript(data, web_cutoff=False):
     """Transcript bytes as the record keeps them (its snapshot, the training download): the result of each Codex
     app-server's whole answer to config/read that a runner from before 14 Nov 2026 recorded as it came
-    (settings_answer()) is what recorded_settings() keeps of it, its line written as the server writes a transcript
-    line; every other byte is kept as it is, a line the runner already recorded so too. The run folder's own
-    transcript.jsonl is never changed."""
+    (settings_answer()) is what recorded_settings() keeps of it (with ``web_cutoff``, a web-cutoff run's record: its
+    isolation settings too), its line written as the server writes a transcript line; every other byte is kept as it
+    is, a line the runner already recorded so too. The run folder's own transcript.jsonl is never changed."""
 
     if b'"config"' not in data:
         return data
@@ -1911,7 +1927,7 @@ def recorded_transcript(data):
             continue
         if not isinstance(entry, dict) or entry.get("kind") != "codex_event" or not settings_answer(entry.get("event")):
             continue
-        entry["event"] = {**entry["event"], "result": recorded_settings(entry["event"]["result"])}
+        entry["event"] = {**entry["event"], "result": recorded_settings(entry["event"]["result"], web_cutoff)}
         try:
             lines[index] = json.dumps(entry, ensure_ascii=False).encode("utf-8")
         except UnicodeEncodeError:
@@ -1936,7 +1952,7 @@ def snapshot(record, transcript=None, job_settings=None, prompts=None):
     folder = _private_folder(record.folder / "transcript")
     with record.locked():
         if transcript is not None:
-            _snapshot_transcript(folder, Path(transcript))
+            _snapshot_transcript(folder, Path(transcript), bool(record.manifest().get("webCutoff")))
         if job_settings is not None:
             try:
                 data = Path(job_settings).read_bytes()
@@ -1956,7 +1972,7 @@ def snapshot(record, transcript=None, job_settings=None, prompts=None):
                         pass
 
 
-def _snapshot_transcript(folder, source):
+def _snapshot_transcript(folder, source, web_cutoff=False):
     try:
         data = source.read_bytes()
     except OSError:
@@ -1974,13 +1990,13 @@ def _snapshot_transcript(folder, source):
     whole = not (size is not None and size == state.get("size") and 0 < copied <= len(data)
                  and _sha(data[:copied]) == state.get("sha256") and state.get("settings") == SNAPSHOT_SETTINGS)
     if whole:
-        kept = recorded_transcript(data)
+        kept = recorded_transcript(data, web_cutoff)
         write_atomic(target, gzip.compress(kept, mtime=0))
         good = gzip.decompress(target.read_bytes()) == kept
     elif copied == len(data):
         return
     else:
-        kept = recorded_transcript(data[copied:])
+        kept = recorded_transcript(data[copied:], web_cutoff)
         member = gzip.compress(kept, mtime=0)
         with _open_private(target, "ab") as stream:
             offset = stream.seek(0, os.SEEK_END)

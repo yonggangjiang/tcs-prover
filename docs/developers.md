@@ -874,7 +874,19 @@ writes a job's record, `ui/model_calls.py` reads it.
   table only those entries, never the user's own beside them) and the MCP
   servers' names, never their definitions, with `leftOut`, one sentence
   saying how many other settings were left out; TCS Prover's redaction runs
-  over it. No reader of the transcript needs more: the job page, the
+  over it. A web-cutoff run's answers (`RPC.web_cutoff`, set from the run's
+  policy; the record's `webCutoff` for a copy) also keep the isolation
+  settings TCS Prover writes into the private configuration file of each
+  process (`records.ISOLATION_SETTINGS`, from
+  `retrieval.runtime.configuration()`: project files off, the login shell off,
+  the commands' environment policy, the bundled skills turned off, the
+  features, Windows' sandbox), of each only what that file set (the answer's
+  `user` layer, which the run's isolation check verifies is that file in the
+  Codex home TCS Prover gives the process) or the command line: never an entry
+  another layer added beside them, nor Codex's own record of the project it
+  trusts. Checked against the real Codex 0.160 app-server's answer in a
+  web-cutoff preflight of the author and of a structured call (no model call):
+  every value TCS Prover wrote is kept, about 3.5 KB of 30 to 36 KB. No reader of the transcript needs more: the job page, the
   controller, the transcript viewer and the web-cutoff audit skip the answer,
   and `retrieval.runtime.verify_rpc()` checks the answer itself. A transcript
   written before 14 Nov 2026 holds each answer whole (about 76 KB in the first
