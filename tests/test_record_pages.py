@@ -823,6 +823,43 @@ await grow({...ROWS[1], id: 'c000044', time: '2026-11-14T02:09:00Z'});
 assert.equal(reads(), before + 2);
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\nconst DETAIL_9 = {json.dumps(DETAIL_9)};\n")
 
+    def test_a_calls_own_address_shows_its_row_in_the_list(self):
+        self.run_pages(r"""
+// A list 100 px tall, 100 px from the top of the window, of rows 50 px tall; its scrollTop moves them.
+const list = $('callsList');
+list.scrollTop = 0;
+Element.prototype.getBoundingClientRect = function () {
+  if (this === list) return {top: 100, bottom: 200, height: 100};
+  const top = 100 + 50 * list.children.indexOf(this) - list.scrollTop;
+  return {top, bottom: top + 50, height: 50};
+};
+await settle();
+// Call 8's own address: the list scrolls (the page does not) to show its row in its middle.
+await openModelCalls(RUN, {from: 'records', call: 'c000016'});
+await settle();
+assert.equal(list.scrollTop, 325);
+const row = list.children[7].getBoundingClientRect();
+assert(row.top >= 100 && row.bottom <= 200);
+// Later looks leave the list where the reader scrolls it.
+list.scrollTop = 0;
+const base = '/jobs/' + RUN + '/model-calls';
+const more = [...ROWS, {...ROWS[1], id: 'c000030', time: '2026-11-14T02:07:00Z'}];
+answers[base + '?offset=0&limit=1'] = {body: {total: 9, calls: more.slice(0, 1), recordState: {available: true, problems: []}}};
+answers[base + '?offset=0&limit=1000'] = {body: {total: 9, calls: more, recordState: {available: true, problems: []}}};
+timers.filter(([fn, ms]) => ms === 5000).at(-1)[0]();
+await settle();
+assert.equal(list.scrollTop, 0);
+// Back or Forward to the page, or a reload, read it whole: the row is shown again.
+await loadCalls(true);
+await settle();
+assert.equal(list.scrollTop, 325);
+// A row already in sight leaves the list as it is.
+list.scrollTop = 0;
+await openModelCalls(RUN, {from: 'records', call: 'c000009'});
+await settle();
+assert.equal(list.scrollTop, 0);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
+
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):
         self.run_pages(r"""
 await settle();

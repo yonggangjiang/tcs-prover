@@ -11395,6 +11395,8 @@ async function loadCalls(full = false) {
     els.list.replaceChildren();
   }
   clearTimeout(store.timer);
+  // A page that opens (from a link, its own address, a reload, Back or Forward) shows the chosen call's row.
+  if (full) store.reveal = true;
   if (store.loading) return;
   store.loading = true;
   const generation = store.generation;
@@ -11475,11 +11477,26 @@ async function loadCalls(full = false) {
   } else if (!chosen) {
     renderCallPane();
   }
+  // Once the page has opened, the list stays where the reader scrolls it.
+  if (store.reveal && store.rows.length && callsRecord === run) {
+    store.reveal = false;
+    revealCallRow(store.selected || store.rows[0].id);
+  }
   if (!store.missing) {
     store.timer = setTimeout(() => {
       if (callsRecord === run) loadCalls(false);
     }, document.hidden ? Math.max(store.every, 30000) : store.every);
   }
+}
+
+// Scroll the list, not the page, so that call ``id``'s row is in sight: in the list's middle when it was not (a list
+// that is hidden, as on a phone while a call is shown, is left as it is).
+function revealCallRow(id) {
+  const list = callsEls().list, item = callsStore().items.get(id);
+  if (!item || !item.isConnected || typeof list.getBoundingClientRect !== "function") return;
+  const box = list.getBoundingClientRect(), row = item.getBoundingClientRect();
+  if (!box.height || (row.top >= box.top && row.bottom <= box.bottom)) return;
+  list.scrollTop += row.top - box.top - (box.height - row.height) / 2;
 }
 
 // Read call ``id`` again while it is shown, and draw it again only if what the record holds of it changed (what was
