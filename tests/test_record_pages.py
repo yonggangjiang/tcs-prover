@@ -538,9 +538,13 @@ assert.equal(urls.at(-1), '/?calls=' + RUN + '&call=c000011');
 $('callsList').dispatch('keydown', {key: 'ArrowUp'});
 await settle();
 assert.equal(callsStore().selected, 'c000010');
-// On a phone, "All calls" goes back to the list.
+// On a phone, "All calls" goes back to the list, and a call chosen in it takes its place.
 pane().querySelector('.mcb-back').onclick();
 assert.equal($('callsBrowser').dataset.view, 'list');
+$('callsList').children[0].firstChild.onclick();
+await settle();
+assert.equal($('callsBrowser').dataset.view, 'detail');
+assert.equal(callsStore().selected, 'c000001');
 """.replace("RUN", json.dumps(RUN)))
 
     def test_claude_calls_unrecorded_rows_filters_and_words(self):
@@ -610,8 +614,22 @@ await settle();
 await openModelCalls(RUN, {from: 'job'});
 await settle();
 assert.equal($('callsList').children.length, 8);
-// Every 5 s the page looks at the count; a new call reads the list again.
 const base = '/jobs/' + RUN + '/model-calls';
+// Every 5 s the page looks at the count only; the list is read again when the count (or what the record could not
+// do) changed. After a minute without a change it looks every 30 s.
+const lists = () => requests.filter((request) => request.path === base + '?offset=0&limit=1000').length;
+const looks = () => requests.filter((request) => request.path === base + '?offset=0&limit=1').length;
+const read = lists();
+for (let index = 0; index < 12; index++) {
+  const due = timers.filter(([fn, ms]) => ms === 5000).at(-1);
+  timers.length = 0;
+  due[0]();
+  await settle();
+}
+assert.equal(lists(), read);
+assert.equal(looks(), 12);
+assert.deepEqual(timers.filter(([fn, ms]) => ms === 30000).length, 1);
+timers.push([timers.filter(([fn, ms]) => ms === 30000)[0][0], 5000]);
 const more = [...ROWS, {...ROWS[1], id: 'c000030', time: '2026-11-14T02:07:00Z'}];
 answers[base + '?offset=0&limit=1'] = {body: {total: 9, calls: more.slice(0, 1), recordState: {available: true, problems: []}}};
 answers[base + '?offset=0&limit=1000'] = {body: {total: 9, calls: more, recordState: {available: true,
