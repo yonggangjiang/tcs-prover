@@ -12067,7 +12067,8 @@ function codeCell(view) {
   const head = mcNode("div", "mc-item-head", mcNode("span", "mc-kind", mcIcon("code"), "Code cell"),
     mcNode("span", "mc-item-note", ["JavaScript", nested.length ? `${nested.length} ${nested.length === 1 ? "call" : "calls"} inside` : ""]
       .filter(Boolean).join(" · ")));
-  const cell = mcNode("li", "mc-code", head, mcNode("pre", "", String(item.input ?? "")));
+  const cell = mcNode("li", "mc-code", head, longText(String(item.input ?? ""), { className: "mc-script", lines: 40,
+    chars: 6000 }));
   if (nested.length) cell.append(mcNode("ol", "mc-nested", ...nested.map(nestedCall)));
   if (view.output) {
     cell.append(mcNode("div", "mc-output", mcNode("span", "mc-output-label", "What the cell returned"),
@@ -12289,10 +12290,12 @@ async function toggleFullRequest(row, button) {
     let parsed = null;
     try { parsed = JSON.parse(request); } catch (_) {}
     const items = Array.isArray(parsed?.input) ? parsed.input.length : null;
-    const note = [`${request.length.toLocaleString("en-US")} characters`, items !== null ? `${items} input items` : "",
+    const note = [`${request.length.toLocaleString("en-US")} characters`,
+      items !== null ? `${items} input ${items === 1 ? "item" : "items"}` : "",
       raw.format === "codex-trace" ? "exactly as Codex's trace wrote it" : ""].filter(Boolean).join(" · ");
+    // Laid out whole in a box that scrolls; a request of more than 400,000 characters shows its start first.
     box.replaceChildren(sectionHead("Full request", note), longText(parsed ? JSON.stringify(parsed, null, 2) : request,
-      { className: "mc-pre", lines: 60, chars: 20000 }));
+      { className: "mc-pre", lines: Infinity, chars: 400000 }));
   } catch (error) {
     if (box.isConnected) box.replaceChildren(mcNode("p", "notice", `The full request could not be read: ${error.message}`));
   }

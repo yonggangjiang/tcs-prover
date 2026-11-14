@@ -5110,7 +5110,7 @@ kbd {
   overflow-wrap: anywhere; }
 .mc-pre.mc-prose { font: var(--text-sm)/1.6 var(--font-sans); }
 .mc-long { display: grid; }
-.mc-more { margin: -4px 12px 9px; }
+.mc-more { margin: 0 12px 9px; }
 .mc-output { display: grid; gap: 3px; margin: 0 12px 10px; }
 .mc-output-label { color: var(--ink-3); font-size: var(--text-xs); font-weight: 600; }
 .mc-out { margin: 0; padding: 5px 8px; border-radius: var(--radius-xs); color: var(--ink-2); background: var(--tint);
@@ -5122,7 +5122,7 @@ kbd {
 .mc-withheld strong { color: var(--ink); font-size: var(--text-sm); font-weight: 650; }
 .mc-withheld p { color: var(--ink-2); font-size: var(--text-xs); line-height: 1.55; }
 /* A code cell: its code, then the searches and commands it ran, each with what came back. */
-.mc-code > pre { margin: 6px 12px 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--ink);
+.mc-code .mc-script { margin: 6px 12px 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--ink);
   background: var(--surface-sunken); font: var(--text-xs)/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .mc-nested { display: grid; margin: 0 12px 10px; padding: 0 0 0 14px; border-left: 2px solid var(--line-strong); list-style: none; }
 .mc-nested > li { display: grid; gap: 3px; min-width: 0; padding: 6px 0; }

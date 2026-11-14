@@ -786,7 +786,7 @@ class MarkupTests(unittest.TestCase):
                       "{ display: none; }", phone)
         self.assertIn(".rec-thead { display: none; }", phone)
         # Long words wrap rather than widen the page.
-        for selector in (".mc-pre {", ".mc-out {", ".mc-item-body {", ".mc-code > pre {"):
+        for selector in (".mc-pre {", ".mc-out {", ".mc-item-body {", ".mc-code .mc-script {"):
             start = part.index("\n" + selector)
             block = part[start:part.index("}", start)]
             self.assertIn("overflow-wrap: anywhere", block, selector)
