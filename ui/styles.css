@@ -5027,6 +5027,9 @@ kbd {
 .mcb-count { display: flex; flex-wrap: wrap; align-items: center; gap: 0 4px; margin: 0 4px; color: var(--ink-3); font: var(--text-xs)/1.5 var(--font-sans); }
 .mcb-count .mc-hide .icon { color: var(--ink-3); }
 .mcb-list { display: grid; gap: 1px; min-height: 0; margin: 0 -4px; padding: 0 4px; overflow-y: auto; list-style: none; }
+/* A long record's rows out of sight are not laid out or painted (a list of 3,000 calls redraws at once); the chosen row
+   and the one with the focus are always drawn whole, their shadow and focus ring included. */
+.mcb-list > li:not(:focus-within):not(:has(> [aria-current="true"])) { content-visibility: auto; contain-intrinsic-size: auto 51px; }
 .mcb-item { position: relative; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; grid-template-rows: auto auto;
   align-items: baseline; gap: 1px 8px; width: 100%; min-height: 0; padding: 7px 9px 7px 6px; border: 1px solid transparent;
   border-radius: var(--radius-sm); color: var(--ink-2); background: transparent; font-weight: 400; text-align: left; }

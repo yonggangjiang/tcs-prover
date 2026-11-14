@@ -702,6 +702,31 @@ assert.equal(buttons[7].querySelector('.mcb-line2').textContent, 'GPT 6.1 Sol ·
 assert.equal(list.children[8].firstChild.querySelector('.mca-n').textContent, '9');
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
 
+    def test_rows_a_filter_or_the_words_take_out_are_put_back_without_being_built_again(self):
+        self.run_pages(r"""
+await settle();
+await openModelCalls(RUN, {from: 'job'});
+await settle();
+const rows = [...$('callsList').children];
+assert.equal(rows.length, 8);
+// Every row drawn from now on is counted: none is, the list's rows come back as they were.
+let built = 0;
+const draw = drawCallRow;
+drawCallRow = (...values) => { built++; return draw(...values); };
+const filter = (key) => $('callsFilter').onclick({target: $('callsFilter').querySelector('[data-calls="' + key + '"]')});
+const type = (words) => { $('callsFilterText').value = words; $('callsFilterText').dispatch('input'); };
+filter('critics');
+assert.equal($('callsList').children.length, 4);
+filter('all');
+type('claude');
+assert.equal($('callsList').children.length, 1);
+type('');
+await settle();
+assert.equal(built, 0);
+assert.equal($('callsList').children.length, 8);
+assert(rows.every((item, index) => $('callsList').children[index] === item));
+""".replace("RUN", json.dumps(RUN)))
+
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):
         self.run_pages(r"""
 await settle();
@@ -888,6 +913,10 @@ class MarkupTests(unittest.TestCase):
         self.assertIn('.mcb-browser[data-view="detail"] .mcb-nav, .mcb-browser[data-view="list"] .mcb-pane '
                       "{ display: none; }", phone)
         self.assertIn(".rec-thead { display: none; }", phone)
+        # A long record's rows out of sight are not laid out or painted, except the chosen row and the focused one
+        # (their shadow and focus ring stay whole).
+        self.assertIn('.mcb-list > li:not(:focus-within):not(:has(> [aria-current="true"])) { content-visibility: auto; '
+                      "contain-intrinsic-size: auto 51px; }", part)
         # Long words wrap rather than widen the page.
         for selector in (".mc-pre {", ".mc-out {", ".mc-item-body {", ".mc-code .mc-script {"):
             start = part.index("\n" + selector)

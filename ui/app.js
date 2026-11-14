@@ -11335,7 +11335,7 @@ function renderJobCallsEntry() {
 function callsStore() {
   return (callsStore.value ||= { run: "", rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
     selected: "", details: new Map(), raw: new Map(), filter: "all", words: "", timer: null, every: 5000, same: 0,
-    loading: false, from: "", job: null, generation: 0 });
+    loading: false, from: "", job: null, generation: 0, items: new Map() });
 }
 
 function callsEls() {
@@ -11357,7 +11357,7 @@ async function openModelCalls(run, { from = "", call = "" } = {}) {
   clearTimeout(store.timer);
   Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [], selected: call,
     details: new Map(), raw: new Map(), filter: "all", words: "", every: 5000, same: 0, from, job: null,
-    loading: false, generation: store.generation + 1 });
+    loading: false, generation: store.generation + 1, items: new Map() });
   history.pushState(null, "", callsUrl(run, call));
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView();
@@ -11388,7 +11388,7 @@ async function loadCalls(full = false) {
     // A Model calls page opened from its address (a reload, a link): it starts afresh.
     Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
       selected: new URLSearchParams(location.search).get("call") || "", details: new Map(), raw: new Map(),
-      every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1 });
+      every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1, items: new Map() });
     const els = callsEls();
     els.browser.dataset.view = store.selected ? "detail" : "list";
     els.list.replaceChildren();
@@ -11641,10 +11641,16 @@ function renderCallsList() {
     els.count.replaceChildren(`${count.join(" · ")} · `, mark, " reasoning the provider kept hidden");
   }
   // A row is drawn again only when what it shows changed, and the rows that stay are never taken out of the list:
-  // while calls are recorded, the row with the focus keeps it and the list keeps its place.
-  const drawn = new Map([...els.list.children].map((item) => [item.firstChild?.dataset?.call, item]));
+  // while calls are recorded, the row with the focus keeps it and the list keeps its place. A row that a filter or
+  // the words take out is kept, and put back as it was (a long record's list is never built again).
+  const drawn = store.items;
+  if (drawn.size > store.rows.length) {
+    const ids = new Set(store.rows.map((row) => row.id));
+    for (const id of [...drawn.keys()]) if (!ids.has(id)) drawn.delete(id);
+  }
   const items = shown.map(({ row, number }) => {
-    const item = drawn.get(row.id) || mcNode("li", "", mcNode("button", "mcb-item"));
+    let item = drawn.get(row.id);
+    if (!item) drawn.set(row.id, item = mcNode("li", "", mcNode("button", "mcb-item")));
     const key = callRowKey(row, number);
     if (item.dataset.key !== key) {
       item.dataset.key = key;
