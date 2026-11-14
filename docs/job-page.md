@@ -73,7 +73,10 @@ line, such as **Goal status · blocked**, with the author's note and what TCS
 Prover does next: it never stops for a blocked or paused goal, and when the turn
 of a complete one ends, its final reply is handed on as the author's answer; a
 turn without a final reply, and a coordinator's reply that names no proof file
-(kept as a report), get the continuation instead.
+(kept as a report), get the continuation instead. At the end of each of the
+author's turns, **Author cache usage** says how many of the turn's input tokens
+were cached, over all of the turn's model requests (*… in the turn's 23 model
+requests* for a Codex author), not only its last one.
 
 ### How jobs are counted
 

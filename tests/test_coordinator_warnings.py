@@ -10,6 +10,8 @@ namespace no server has, and sent no notification), and when a coordinator under
 COORDINATOR_UNTAKEN_HANDINS (3) turns with a reply that names its proof file without update_goal's "complete". Each
 warning clears by itself: at the next team call, the next team call that reaches TCS Prover, the next hand-in.
 
+The author's "Author cache usage" status covers the whole turn's model requests, not only its last one.
+
 Offline: the scripted RPC double of tests/test_goal_runtime.py plays Codex's app-server; no CLI is started.
 """
 
@@ -332,6 +334,22 @@ class SessionTests(unittest.TestCase):
         next(self.session(double, crew=False, coordinator=False))
         self.assertFalse([event for event in double.events if event.get("coordinatorWarning")])
         self.assertIsNone(getattr(double.rpc, "stderr_watch", None))
+
+    def test_the_author_cache_usage_covers_every_model_request_of_the_turn(self):
+        def turn(rpc):
+            rpc.messages.extend([usage(1, cached=0, inputs=20000), usage(2, cached=19000, inputs=20000),
+                                 usage(2, cached=19000, inputs=20000), usage(3, cached=19500, inputs=20000)])
+            self.done(rpc)
+
+        double = team_test.LoopDouble([turn])
+        double.emit_cache_usage = runtime.emit_cache_usage  # The runner's own, which records through emit().
+        with mock.patch.object(runtime, "emit", side_effect=double.emit):
+            next(self.session(double))
+        line, = self.labelled(double, "Author cache usage")
+        # 3 requests (one count repeated): 60,000 input tokens of which 38,500 cached, not the last request's alone.
+        self.assertEqual((line["inputTokens"], line["cachedInputTokens"], line["modelRequests"]), (60000, 38500, 3))
+        self.assertEqual(line["text"], "38,500 of 60,000 input tokens cached (64.2%) in the turn's 3 model "
+                                       "requests; 0 cache-write tokens.")
 
 
 class ClaudeTests(team_test.TeamCase):

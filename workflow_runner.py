@@ -1371,8 +1371,11 @@ def structured_workspace():
     return STRUCTURED_WORKSPACE
 
 
-def emit_cache_usage(stage, usage, label="Cache usage"):
-    """Expose cache effectiveness without changing a model request."""
+def emit_cache_usage(stage, usage, label="Cache usage", requests=None):
+    """Expose cache effectiveness without changing a model request.
+
+    ``usage`` is one request's or a turn's (``requests``: how many model requests it adds up, which the text says).
+    """
 
     if not isinstance(usage, dict):
         return
@@ -1392,14 +1395,17 @@ def emit_cache_usage(stage, usage, label="Cache usage"):
     if input_tokens <= 0:
         return
     hit_rate = min(100.0, max(0.0, cached_tokens * 100.0 / input_tokens))
+    counted = isinstance(requests, int) and not isinstance(requests, bool) and requests > 0
+    over = f" in the turn's {requests} model {'request' if requests == 1 else 'requests'}" if counted else ""
     emit(
         "status", stage, label=label,
         text=(
             f"{cached_tokens:,} of {input_tokens:,} input tokens cached "
-            f"({hit_rate:.1f}%); {cache_write_tokens:,} cache-write tokens."
+            f"({hit_rate:.1f}%){over}; {cache_write_tokens:,} cache-write tokens."
         ),
         inputTokens=input_tokens, cachedInputTokens=cached_tokens,
         cacheWriteInputTokens=cache_write_tokens, cacheHitPercent=hit_rate,
+        **({"modelRequests": requests} if counted else {}),
     )
 
 
@@ -5414,8 +5420,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     goal = {}
     pause_reason = ""
     # Codex reports the thread's token totals after each model request (thread/tokenUsage/updated): the newest
-    # totals, and the last request's usage, which the turn's "Author cache usage" status shows.
-    usage = {"total": None, "last": {}}
+    # totals, and what the requests of the current turn used, which its "Author cache usage" status shows.
+    usage = {"total": None, "turn": {}, "requests": 0}
     # The time of the newest message from Codex, and a cheap request that checks it still answers.
     activity = {"last": time.monotonic()}
     probe = {"at": None}
@@ -5464,7 +5470,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             service.add(team)
 
     def count_request(token_usage):
-        """Keep one model request's tokens (a thread/tokenUsage/updated); whether it was a new request.
+        """Add one model request's tokens (a thread/tokenUsage/updated) to its turn's; whether it was a new one.
 
         A notification whose totals did not change since the last one is no new request."""
 
@@ -5472,7 +5478,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         total, last = token_usage.get("total"), token_usage.get("last")
         if not isinstance(last, dict) or (total is not None and total == usage["total"]):
             return False
-        usage.update(total=total, last=last)
+        usage["total"] = total
+        for key, value in last.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                usage["turn"][key] = usage["turn"].get(key, 0) + value
+        usage["requests"] += 1
         return True
 
     def error_output(line):
@@ -5945,9 +5955,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 running, state["turn"] = False, None
                 if team_watch is not None:
                     team_watch.turn_ended()
-                if usage["last"] and hasattr(runtime, "emit_cache_usage"):
-                    runtime.emit_cache_usage(stage, usage["last"], label="Author cache usage")
-                    usage["last"] = {}
+                if usage["turn"] and hasattr(runtime, "emit_cache_usage"):
+                    runtime.emit_cache_usage(stage, usage["turn"], label="Author cache usage",
+                                             requests=usage["requests"])
+                usage.update(turn={}, requests=0)
                 for item in turn.get("items", []):
                     collect(item, answers)
                 if pausing.is_set() or (pause_file and Path(pause_file).is_file()):
