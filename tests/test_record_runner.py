@@ -550,7 +550,8 @@ class SettingsTranscriptTests(author_test.PipeCase):
         self.assertEqual(len(settings), 1)
         record = json.loads(settings[0])
         self.assertEqual((record["kind"], record["stage"], record["root"]), ("codex_event", "solve", True))
-        self.assertEqual(record["event"]["result"]["config"]["mcp_servers"], ["docs", "gateway-[redacted]", "node_repl"])
+        self.assertEqual(record["event"]["result"]["config"]["mcp_servers"],
+                         ["docs", "gateway-[redacted]", "node_repl"])
         self.assertLess(len(settings[0]), 3000)
         for private in (*PRIVATE, secret):
             self.assertNotIn(private, transcript.getvalue(), private)

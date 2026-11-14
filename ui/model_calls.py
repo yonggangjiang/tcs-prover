@@ -474,7 +474,8 @@ def _item_shas(record, line, field, bundles):
                 return list(shas)
     except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile, zlib.error, TypeError, AttributeError):
         pass
-    return _shas(_list(_json(_payload(record, line, field, bundles)), "input" if field == "request" else "output_items"))
+    value = _json(_payload(record, line, field, bundles))
+    return _shas(_list(value, "input" if field == "request" else "output_items"))
 
 
 def _continued(record, line, bundles):
