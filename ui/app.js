@@ -10948,7 +10948,7 @@ async function recordRequest(path, method = "GET") {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw Object.assign(new Error(data.error || `The request failed (HTTP ${response.status}).`),
-      { status: response.status });
+      { status: response.status, data });
   }
   return data;
 }
@@ -11414,10 +11414,11 @@ async function loadCalls(full = false) {
       if (listed.status === "fulfilled" && Array.isArray(listed.value)) {
         recordsStore().rows = listed.value;
         renderRecordsNav();
+        // A job without a record is not listed there: whether it is still listed is not known yet (null).
         store.job = listed.value.find((row) => row.runFolder === run)
-          || { runFolder: run, title: "", jobExists: false };
+          || { runFolder: run, title: "", jobExists: null };
       } else if (listed.status === "rejected") {
-        store.job = { runFolder: run, title: "", jobExists: false };
+        store.job = { runFolder: run, title: "", jobExists: null };
       }
     }
     let changed = full || !store.loaded;
@@ -11465,8 +11466,17 @@ async function loadCalls(full = false) {
     }
   } catch (error) {
     if (callsStore().generation !== generation) return;
-    if (error.status === 404) Object.assign(store, { missing: true, loaded: true, rows: [], total: 0, error: "" });
-    else store.error = error.message;
+    if (error.status === 404) {
+      Object.assign(store, { missing: true, loaded: true, rows: [], total: 0, error: "" });
+      // The job of a record that does not exist (one from before records were kept, or whose record was deleted):
+      // the server says whether it is still listed, and its title.
+      const data = error.data || {};
+      if (typeof data.jobExists === "boolean" && store.job && store.job.jobExists === null) {
+        store.job = { ...store.job, jobExists: data.jobExists, title: store.job.title || String(data.title || "") };
+      }
+    } else {
+      store.error = error.message;
+    }
   } finally {
     if (callsStore().generation === generation) store.loading = false;
   }
@@ -11626,6 +11636,13 @@ function callsShown() {
   });
 }
 
+// Whether the page's job is still listed: as GET /records or the record's 404 says it, else (an older server) as the
+// page was opened, from the job's page.
+function callsJobKept() {
+  const store = callsStore();
+  return typeof store.job?.jobExists === "boolean" ? store.job.jobExists : store.from === "job";
+}
+
 function renderCallsHead() {
   const store = callsStore(), els = callsEls();
   const rows = store.rows;
@@ -11645,7 +11662,7 @@ function renderCallsHead() {
   }
   // Back to the job while it is listed, else to Records (a deleted job's record).
   const job = store.job;
-  const kept = Boolean(job?.jobExists);
+  const kept = callsJobKept();
   els.backText.textContent = kept ? "Back to the job" : "Back to Records";
   els.training.hidden = store.missing || !store.loaded;
   const title = job?.title || store.run;
@@ -12507,13 +12524,13 @@ async function downloadRawCall(row, button) {
   els.back.onclick = () => {
     const store = callsStore();
     clearTimeout(store.timer);
-    if (store.job?.jobExists) selectJob(store.run);
+    if (callsJobKept()) selectJob(store.run);
     else openRecords();
   };
   els.training.onclick = () => downloadTrainingRecord(callsRecord, els.training, els.trainingText, els.notice);
   ui.callsJobCrumb.onclick = () => {
     const store = callsStore();
-    if (!store.job?.jobExists) return;
+    if (!callsJobKept()) return;
     clearTimeout(store.timer);
     selectJob(store.run);
   };

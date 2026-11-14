@@ -961,6 +961,50 @@ assert.equal(ui.callsJobCrumb.disabled, true);
 assert.equal($('callsEmpty').textContent, 'No model call recorded yet. Calls appear here as the job makes them.');
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
 
+    def test_a_job_without_a_record_leads_back_to_the_job(self):
+        self.run_pages(r"""
+await settle();
+// A job from before records were kept (or whose record was deleted) is not on the Records page: the record's 404 says
+// that the job is listed, and its title.
+const old = '2026-11-10_08-00-00_a-job-from-before-records';
+const path = '/jobs/' + old + '/model-calls?offset=0&limit=1000';
+answers[path] = {status: 404, body: {error: 'This job has no record.', jobExists: true, title: 'Prove the old bound.'}};
+const head = () => [$('callsMeta').textContent, $('callsBackText').textContent, ui.callsJobCrumb.textContent,
+  ui.callsJobCrumb.disabled];
+await openModelCalls(old, {from: 'job'});
+await settle();
+assert.deepEqual(head(), ['No record', 'Back to the job', 'Prove the old bound.', false]);
+assert.equal($('callsEmpty').hidden, false);
+$('callsBackButton').onclick();
+assert.deepEqual(jobs, [old]);
+// Opened by its address (a reload, which starts afresh): the same.
+callsRecord = old;
+location.search = 'calls=' + old;
+callsStore().run = '';
+await loadCalls(true);
+assert.equal(callsStore().from, '');
+await settle();
+assert.deepEqual(head(), ['No record', 'Back to the job', 'Prove the old bound.', false]);
+ui.callsJobCrumb.onclick();
+assert.deepEqual(jobs, [old, old]);
+// A job deleted with its record: back to Records, and the crumb leads nowhere.
+answers[path] = {status: 404, body: {error: 'This job has no record.', jobExists: false}};
+await openModelCalls(old, {from: 'records'});
+await settle();
+assert.deepEqual(head(), ['No record', 'Back to Records', old, true]);
+// An older server that does not say: back to the job when the page was opened from it, else to Records.
+answers[path] = {status: 404, body: {error: 'This job has no record.'}};
+await openModelCalls(old, {from: 'job'});
+await settle();
+assert.equal($('callsBackText').textContent, 'Back to the job');
+callsRecord = old;
+location.search = 'calls=' + old;
+callsStore().run = '';
+await loadCalls(true);
+await settle();
+assert.equal($('callsBackText').textContent, 'Back to Records');
+""")
+
     def test_the_training_record_downloads_and_a_failed_download_shows_as_failed(self):
         self.run_pages(r"""
 await settle();

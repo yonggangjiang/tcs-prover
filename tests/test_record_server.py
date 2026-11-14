@@ -157,6 +157,23 @@ class RouteTests(AppCase):
         self.assertEqual(self.call("GET", "/jobs/no-such-job/model-calls")[0], 404)
         self.assertEqual(self.call("GET", f"/jobs/{self.name}/model-calls?limit=0")[0], 400)
 
+    def test_a_listed_job_without_a_record_is_named_in_the_404(self):
+        # A job from before records were kept, or whose record was deleted: its Model calls page leads back to it.
+        old = self.new_app("Prove the old bound.\nIt has two lines.")
+        self.http.jobs[old.run_dir.name] = old
+        status, _, body = self.call("GET", f"/jobs/{old.run_dir.name}/model-calls?offset=0&limit=1000")
+        self.assertEqual((status, json.loads(body)),
+                         (404, {"error": "This job has no record.", "jobExists": True, "title": "Prove the old bound."}))
+        # A job that is not listed (deleted with its record), and a name no run folder has.
+        del self.http.jobs[old.run_dir.name]
+        status, _, body = self.call("GET", f"/jobs/{old.run_dir.name}/model-calls")
+        self.assertEqual((status, json.loads(body)), (404, {"error": "This job has no record.", "jobExists": False}))
+        status, _, body = self.call("GET", "/jobs/no-such-job/model-calls")
+        self.assertEqual((status, json.loads(body)["jobExists"]), (404, False))
+        # The other routes' 404 says only why.
+        status, _, body = self.call("GET", f"/jobs/{self.name}/model-calls/c999999")
+        self.assertEqual((status, json.loads(body)), (404, {"error": "Unknown model call."}))
+
     def test_the_training_record_is_a_zip_download(self):
         status, kind, body = self.call("GET", f"/jobs/{self.name}/training-record")
         self.assertEqual((status, kind), (200, "application/zip"))

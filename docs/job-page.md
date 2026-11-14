@@ -453,7 +453,8 @@ The chosen call shows, from the top:
 follow it as you type, filter or a call is recorded; each call has its own
 address, which opens with its row in sight in the list. On a phone the list
 and the call take turns (**All calls** goes back). A job with no record (one
-started before records were kept, or whose record you deleted) says so plainly.
+started before records were kept, or whose record you deleted) says so plainly,
+and leads back to the job while it is listed.
 
 **Training record**, on the Live activity card and the Model calls page,
 downloads the job's training record as one ZIP

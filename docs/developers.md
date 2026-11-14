@@ -933,7 +933,9 @@ writes a job's record, `ui/model_calls.py` reads it.
 - **Routes** (the session token like every route; field names in
   `~/tcs-work/fixes/record-contract.md`): `GET /jobs/<id>/model-calls?offset=&limit=`
   (time order, `limit` 1 to 1,000, 100 by default; a failed or cancelled
-  call's reason, `error`, in its row and its detail as in `calls.jsonl`), `GET
+  call's reason, `error`, in its row and its detail as in `calls.jsonl`; a job
+  without a record gets 404 with `jobExists`, whether the job is listed, and
+  then its `title`, so that its page leads back to the job), `GET
   /jobs/<id>/model-calls/<callId>` (what was sent new, what came back, usage,
   placeholders; a code cell's nested tool calls from the trace; a Codex call's
   previous request is its thread's in whichever process sent it, as a paused

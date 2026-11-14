@@ -13119,7 +13119,16 @@ class Handler(BaseHTTPRequestHandler):
                     body.end()
                 return None
         except model_calls.NotFound as exc:
-            return self.send({"error": str(exc)}, status=404)
+            body = {"error": str(exc)}
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "model-calls":
+                # A job without a record (one from before records were kept, or whose record was deleted) is still
+                # listed: its Model calls page leads back to it, by its title.
+                with self.server.jobs_lock:
+                    app = self.server.jobs.get(parts[1])
+                body["jobExists"] = app is not None
+                if app is not None:
+                    body["title"] = app._record_title()
+            return self.send(body, status=404)
         except (ValueError, OSError) as exc:
             return self.send({"error": str(exc)}, status=400)
         return self.send({"error": "Not found."}, status=404)
