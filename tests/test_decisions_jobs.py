@@ -359,12 +359,16 @@ class TestRequestTests(Isolated):
         self.assertIsInstance(problem, runtime.RequestRejected)
         self.assertTrue(str(problem).startswith(f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests"))
         self.assertFalse(runtime.retryable_failure(problem))
-        # Built-in models, a conversation that is too long, and passing conditions stay retried.
+        # Built-in models, a conversation that is too long, and passing conditions stay retried: outside the body, as
+        # Codex words a 5xx (in the body they are the endpoint's words of its 400).
         self.assertIsNone(runtime.settings_failure(rejected, "gpt-6.1-sol"))
         self.assertIsNone(runtime.settings_failure(runtime.Error(codex_refusals.exec_text(
             codex_refusals.EXEC_400_TOO_LONG, "Codex review failed: ")), model))
         self.assertIsNone(runtime.settings_failure(runtime.Error(str(rejected).replace(
-            codex_refusals.ENDPOINT_MESSAGE, "The model is overloaded, try later.")), model))
+            "Codex review failed: ", "Codex review failed: We're currently experiencing high demand, which may cause "
+                                     "temporary errors.\n")), model))
+        self.assertIsInstance(runtime.settings_failure(runtime.Error(str(rejected).replace(
+            codex_refusals.ENDPOINT_MESSAGE, "The model is overloaded, try later.")), model), runtime.RequestRejected)
 
 
 class StructuredSettingsFailureTests(retry_tests.RetryCase):

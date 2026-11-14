@@ -162,7 +162,9 @@ class AccuracyTests(unittest.TestCase):
         # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried. Codex 0.160
         # reports that 400 as the endpoint's error body alone, with no status (tests/codex_refusals.py).
         self.assertIn("(**Request rejected by the API endpoint**; Codex reports it as the endpoint's error alone, of "
-                      'type `invalid_request_error`, and Claude Code as "API Error: 400" with the endpoint\'s message)',
+                      'type `invalid_request_error`, and Claude Code as "API Error: 400" with the endpoint\'s message). '
+                      'Words such as "503", "429" or "capacity" inside that error are the endpoint\'s own (for example '
+                      '"Invalid \'input[512].content\'") and do not make it a passing failure.',
                       flat(DOCS / "retries.md"))
         trouble = flat(DOCS / "troubleshooting.md")
         self.assertIn("- **Request rejected by the API endpoint** (HTTP 400; Codex shows only the endpoint's error, of "

@@ -1074,6 +1074,18 @@ alone, typed `invalid_request_error`, as it reports every 400 (tests:
 `EXEC_400_FILTERED`, `APP_SERVER_400_FILTERED` of `tests/codex_refusals.py`),
 so it is retried like any passing failure.
 
+How a refused request is told apart (`settings_failure()`): Claude Code says
+"API Error: 400"; Codex 0.160 reports an endpoint's 400 as its body alone and
+every other status in words of its own ("unexpected status 401 Unauthorized:
+…", "exceeded retry limit, last status: 429 …", "We're currently experiencing
+high demand …" for a 500). So in a failure that is only error bodies
+(`_bare_error_body()`: whole JSON objects with an `error` member; no status
+named outside them, `_ANY_STATUS`) the words of a passing condition
+(`_PASSING_CONDITION`: a 5xx number, 429, capacity, overload, high demand,
+temporar…, rate limit) count only outside the bodies, so "Invalid
+'input[512].content'" is refused rather than retried every minute forever; the
+captured lines are in `tests/codex_refusals.py`.
+
 ## HTTP API notes
 
 The page reads `model_sources` (source menus) and `model_catalog` (model menus)

@@ -590,6 +590,14 @@ _REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid
 _INVALID_REQUEST_BODY = re.compile(r'\\*"type\\*"\s*:\s*\\*"invalid_request_error\\*"')
 _OTHER_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|API status|HTTP)\s*(?!400\b)[1-5]\d\d\b",
                            re.IGNORECASE)
+# Codex 0.160 reports every other status in words of its own around the endpoint's message ("unexpected status 401
+# Unauthorized: …, url: …", "exceeded retry limit, last status: 429 Too Many Requests", "We're currently experiencing
+# high demand, which may cause temporary errors." for a 500), never as the body alone. So in a failure that is only
+# error bodies (_bare_error_body(): whole JSON objects with an "error" member; no HTTP status named outside them,
+# _ANY_STATUS) the words of a passing condition count outside the bodies, never in them: a number such as the 512 of
+# "Invalid 'input[512].content'" is the endpoint's words of its 400, not a server error.
+_ANY_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|API status|HTTP|status code)\s*"
+                         r"[1-5]\d\d\b", re.IGNORECASE)
 # Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
 # conversation because its tool calls and tool results do not pair up (Claude Code 2.1.289 marks all three
 # api_error "tool_history_mismatch"): a fault in Claude Code's record of the conversation, not in the connection's
@@ -613,6 +621,38 @@ def _invalid_request_body(text):
             and "context_too_large" not in text.lower())
 
 
+def _error_bodies(text):
+    """The whole JSON error bodies a failure quotes, as [(start, end, body)]: objects with an "error" member, each
+    outside the others."""
+
+    decoder, found, after = json.JSONDecoder(), [], 0
+    for brace in re.finditer(r"\{", text):
+        if brace.start() < after:
+            continue  # Inside a body already found.
+        try:
+            value, end = decoder.raw_decode(text, brace.start())
+        except ValueError:
+            continue
+        if isinstance(value, dict) and "error" in value:
+            found.append((brace.start(), end, value))
+            after = end
+    return found
+
+
+def _bare_error_body(text):
+    """The text of a failure outside the error bodies it quotes (_error_bodies()) when it is only such bodies, as Codex
+    0.160 reports an endpoint's HTTP 400: one body at least, and outside them no HTTP status (_ANY_STATUS); else None.
+    """
+
+    bodies = _error_bodies(text)
+    if not bodies:
+        return None
+    ends = [0] + [end for _, end, _ in bodies]
+    starts = [start for start, _, _ in bodies] + [len(text)]
+    outside = "".join(text[end:start] for end, start in zip(ends, starts))
+    return None if _ANY_STATUS.search(outside) else outside
+
+
 def _error_body_words(text, limit=300):
     """The endpoint's own words in the first error body that a failure quotes whole, on one line; else "".
 
@@ -620,18 +660,12 @@ def _error_body_words(text, limit=300):
     writes over several lines: the words are its error's message, as the connection's Test quotes it, else the body.
     """
 
-    decoder = json.JSONDecoder()
-    for brace in re.finditer(r"\{", text):
-        try:
-            value, end = decoder.raw_decode(text, brace.start())
-        except ValueError:
-            continue
-        if isinstance(value, dict) and "error" in value:
-            error = value["error"]
-            words = error.get("message") if isinstance(error, dict) else error
-            if not isinstance(words, str) or not words.strip():
-                words = text[brace.start():end]
-            return _clipped(" ".join(words.split()), limit)
+    for start, end, value in _error_bodies(text):
+        error = value["error"]
+        words = error.get("message") if isinstance(error, dict) else error
+        if not isinstance(words, str) or not words.strip():
+            words = text[start:end]
+        return _clipped(" ".join(words.split()), limit)
     return ""
 
 
@@ -646,7 +680,9 @@ def settings_failure(error, model=None):
     reports as not pairing up, nor a content filter's refusal), or private
     TCS Prover state that cannot be used (a ProviderError). The endpoint's
     words in such a message are its error's own message when the failure
-    quotes its body.
+    quotes its body. The words of a passing condition (429, a 5xx status,
+    capacity, ...) keep a failure retried, but in a failure that is only
+    error bodies only outside them (_bare_error_body()).
     These end a structured call and pause an author with a message saying
     what to change; every other failure keeps being retried.
     """
@@ -662,7 +698,10 @@ def settings_failure(error, model=None):
     if not isinstance(error, (Error, OSError)):
         return None
     text = redact(str(error))
-    if _context_window_failure(text) or _PASSING_CONDITION.search(text):
+    # A failure that is only error bodies is an endpoint's HTTP 400 (see _ANY_STATUS): their words are the endpoint's
+    # message, so a passing condition counts only outside them.
+    outside = _bare_error_body(text)
+    if _context_window_failure(text) or _PASSING_CONDITION.search(text if outside is None else outside):
         return None
     try:
         label = providers.model_label(model) if model else "the selected model"

@@ -23,12 +23,21 @@ Captured the same way on 14 Nov 2026 (later the same day, ~/tcs-work/scratch/coo
 request, the body alone again, with ports and IDs as printed:
 - HTTP 400 for a content filter's refusal typed invalid_request_error, with no status in its body (Azure OpenAI's
   message and code), through `codex exec --json` (EXEC_400_FILTERED) and the app-server (APP_SERVER_400_FILTERED).
+- HTTP 400 invalid_request_error bodies whose messages name an item by its number, as api.openai.com words them:
+  "input[512]" (EXEC_400_INPUT_512, APP_SERVER_400_INPUT_512) and "input[429]" (EXEC_400_INPUT_429).
+With TCS Prover's RUST_LOG=error (workflow_runner.environment()), `codex exec`'s stderr held only "Reading additional
+input from stdin..." for these.
 """
 
 import json
 
 # The endpoint's own message in EXEC_400, APP_SERVER_400 and EXEC_400_INDENTED.
 ENDPOINT_MESSAGE = "Unsupported parameter: 'reasoning.summary' is not supported with this model."
+# The messages of EXEC_400_INPUT_512 (and APP_SERVER_400_INPUT_512) and EXEC_400_INPUT_429.
+INPUT_512_MESSAGE = ("Invalid 'input[512].content': string too long. Expected a string with maximum length 10485760, "
+                     "but got a string with length 10485761 instead.")
+INPUT_429_MESSAGE = ("Invalid 'input[429].content[0].text': empty string. Expected a string with minimum length 1, but "
+                     "got an empty string instead.")
 
 EXEC_400 = (
     r'''{"type":"error","message":"{\"error\": {\"message\": \"Unsupported parameter: 'reasoning.summary' is '''
@@ -133,6 +142,42 @@ APP_SERVER_400_FILTERED = (
     r'''\"type\": \"invalid_request_error\", \"param\": \"prompt\", \"code\": \"content_filter\"}}",'''
     r'''"codexErrorInfo":"other","additionalDetails":null,"misalignment":null},"startedAt":1794666968,'''
     r'''"completedAt":1794666968,"durationMs":18}},"emittedAtMs":1794666968080}''',
+)
+
+EXEC_400_INPUT_512 = (
+    r'''{"type":"error","message":"{\"error\": {\"message\": \"Invalid 'input[512].content': string too long. '''
+    r'''Expected a string with maximum length 10485760, but got a string with length 10485761 instead.\", '''
+    r'''\"type\": \"invalid_request_error\", \"param\": \"input[512].content\", \"code\": '''
+    r'''\"string_above_max_length\"}}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"error\": {\"message\": \"Invalid 'input[512].content': '''
+    r'''string too long. Expected a string with maximum length 10485760, but got a string with length 10485761 '''
+    r'''instead.\", \"type\": \"invalid_request_error\", \"param\": \"input[512].content\", \"code\": '''
+    r'''\"string_above_max_length\"}}"}}''',
+)
+APP_SERVER_400_INPUT_512 = (
+    r'''{"method":"error","params":{"error":{"message":"{\"error\": {\"message\": '''
+    r'''\"Invalid 'input[512].content': string too long. Expected a string with maximum length 10485760, but '''
+    r'''got a string with length 10485761 instead.\", \"type\": \"invalid_request_error\", \"param\": '''
+    r'''\"input[512].content\", \"code\": \"string_above_max_length\"}}","codexErrorInfo":"other",'''
+    r'''"additionalDetails":null,"misalignment":null},"willRetry":false,'''
+    r'''"threadId":"01a1da7c-b4d1-7763-bbe5-89bbe6994596","turnId":"01a1da7c-b4db-7772-b197-144ac7d526bb"},'''
+    r'''"emittedAtMs":1794666968305}''',
+    r'''{"method":"turn/completed","params":{"threadId":"01a1da7c-b4d1-7763-bbe5-89bbe6994596",'''
+    r'''"turn":{"id":"01a1da7c-b4db-7772-b197-144ac7d526bb","items":[],"itemsView":"notLoaded",'''
+    r'''"status":"failed","error":{"message":"{\"error\": {\"message\": \"Invalid 'input[512].content': string '''
+    r'''too long. Expected a string with maximum length 10485760, but got a string with length 10485761 '''
+    r'''instead.\", \"type\": \"invalid_request_error\", \"param\": \"input[512].content\", \"code\": '''
+    r'''\"string_above_max_length\"}}","codexErrorInfo":"other","additionalDetails":null,"misalignment":null},'''
+    r'''"startedAt":1794666968,"completedAt":1794666968,"durationMs":20}},"emittedAtMs":1794666968306}''',
+)
+EXEC_400_INPUT_429 = (
+    r'''{"type":"error","message":"{\"error\": {\"message\": \"Invalid 'input[429].content[0].text': empty '''
+    r'''string. Expected a string with minimum length 1, but got an empty string instead.\", \"type\": '''
+    r'''\"invalid_request_error\", \"param\": \"input[429].content[0].text\", \"code\": \"empty_string\"}}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"error\": {\"message\": '''
+    r'''\"Invalid 'input[429].content[0].text': empty string. Expected a string with minimum length 1, but got '''
+    r'''an empty string instead.\", \"type\": \"invalid_request_error\", \"param\": '''
+    r'''\"input[429].content[0].text\", \"code\": \"empty_string\"}}"}}''',
 )
 
 

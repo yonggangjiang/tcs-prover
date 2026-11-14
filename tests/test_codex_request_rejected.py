@@ -12,10 +12,14 @@ does an endpoint that says the model does not exist, which the author and a stru
 unavailable"). The endpoint's words in these messages are its error's message, also when it writes its body over
 several lines, as api.openai.com does.
 
-Everything else stays retried every minute: the same endpoint's 400 for a conversation too long for the model, a body
-that names a passing condition (429, overload, 5xx), one quoted under another HTTP status (a key refused with 401), and
-the same body from a built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test
-starts a model.
+Codex 0.160 reports every other status in words of its own, never as the body alone, so in a failure that is only
+error bodies the words of a passing condition (a 5xx number, 429, capacity, temporary, ...) keep it retried only
+outside the bodies: "input[512]" in the endpoint's message is no server error.
+
+Everything else stays retried every minute: an endpoint's 400 for a conversation too long for the model, a passing
+condition named outside the bodies, a body quoted under another HTTP status (a key refused with 401), and the same
+body from a built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test starts a
+model.
 """
 
 import functools
@@ -121,13 +125,10 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), "gpt-6.1-sol"))
                 self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
 
-    def test_a_conversation_too_long_and_a_passing_condition_stay_retried(self):
+    def test_a_conversation_too_long_stays_retried(self):
         texts = list(self.texts(captured.EXEC_400_TOO_LONG).values())
-        # The same body when the endpoint's message names a passing condition, or a conversation too large for the
-        # model in the code of a proxy such as CLIProxyAPI (whose message need not say so).
-        for message in ("The server is overloaded, try again later.", "Rate limit reached for requests.",
-                        "The upstream answered 503; try again."):
-            texts += list(self.texts(with_message(captured.EXEC_400, message)).values())
+        # A conversation too large for the model in the code of a proxy such as CLIProxyAPI (whose message need not say
+        # so).
         texts.append(captured.exec_text(tuple(line.replace("unsupported_parameter", "context_too_large") for line in
                                               with_message(captured.EXEC_400, "Request has too many tokens."))))
         for text in texts:
@@ -136,6 +137,65 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
         # The conversation too long is one: the author continues in a new conversation (goal_session()).
         self.assertTrue(runtime._context_window_failure(captured.exec_text(captured.EXEC_400_TOO_LONG)))
+
+    def test_numbers_and_words_in_the_endpoint_s_message_never_keep_a_refused_request_retried(self):
+        # The endpoint's message names an item by its number (input[512], input[429]) or says words that elsewhere
+        # name a passing condition: it is still the endpoint's 400, as Codex reports no other status as a body alone.
+        cases = [(captured.EXEC_400_INPUT_512, captured.INPUT_512_MESSAGE),
+                 (captured.EXEC_400_INPUT_429, captured.INPUT_429_MESSAGE)]
+        for message in ("The server is overloaded, try again later.", "Rate limit reached for requests.",
+                        "The upstream answered 503; try again.", "No capacity for 'service_tier': 'flex'.",
+                        "Temporary files cannot be attached to this model.", "High demand models need 'priority'."):
+            cases.append((with_message(captured.EXEC_400, message), message))
+        for lines, message in cases:
+            line = f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid ({message})."
+            for path, text in self.texts(lines).items():
+                with self.subTest(message=message, path=path):
+                    self.assertRegex(text, r"(?i)\b(?:5\d\d|429)\b|capacity|overload|rate limit|temporar|high demand")
+                    problem = runtime.settings_failure(runtime.Error(text), self.model)
+                    self.assertIsInstance(problem, runtime.RequestRejected)
+                    self.assertEqual((problem.reason, problem.summary), (message, line))
+                    self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
+                                     team.Refusal(line, message))
+        # The author's app-server reports it the same way.
+        turn = json.loads(captured.APP_SERVER_400_INPUT_512[1])["params"]["turn"]["error"]
+        for text in (author_text(captured.APP_SERVER_400_INPUT_512),
+                     f"Author turn failed: {runtime._provider_message(turn)}"):
+            with self.subTest(text=text):
+                self.assertEqual(runtime.settings_failure(runtime.Error(text), self.model).reason,
+                                 captured.INPUT_512_MESSAGE)
+
+    def test_a_failure_that_names_a_status_outside_its_bodies_is_what_that_status_says(self):
+        # Codex names every status but a 400 in its own words around the body: then the body's words count as before
+        # (_bare_error_body() finds no bare 400), so "Temporarily" in a 404's body keeps it a passing failure.
+        quoted = ('Codex member failed: unexpected status 404 Not Found: {"error": {"message": "Temporarily '
+                  'unavailable."}}, url: https://gateway.example.com/v1/responses')
+        self.assertIsNone(runtime._bare_error_body(quoted))
+        self.assertEqual(runtime._bare_error_body(captured.exec_text(captured.EXEC_400)), "Codex member failed: \n")
+
+    def test_a_body_inside_a_body_is_part_of_it(self):
+        # A gateway that nests its upstream's error in its own: all of it is the endpoint's words, so the 503 after
+        # the inner body (in the outer one) is no passing condition.
+        body = ('{"error": {"upstream": {"error": {"message": "Unsupported parameter."}}, "message": "Upstream '
+                'answered 503 for an unsupported parameter.", "type": "invalid_request_error"}}')
+        problem = runtime.settings_failure(runtime.Error(f"Codex member failed: {body}\n{body}"), self.model)
+        self.assertIsInstance(problem, runtime.RequestRejected)
+        self.assertEqual(problem.reason, "Upstream answered 503 for an unsupported parameter.")
+
+    def test_a_passing_condition_outside_the_bodies_keeps_the_failure_retried(self):
+        body = captured.exec_text(captured.EXEC_400)
+        for text in (
+                # Codex's own words for a 500 ahead of the body, and its warning about a temporary folder in stderr.
+                "Codex member failed: We're currently experiencing high demand, which may cause temporary errors.\n"
+                + body.removeprefix("Codex member failed: "),
+                body + "\nWARNING: Refusing to create helper binaries under temporary dir \"/tmp/x\"",
+                # A body quoted under a status, which then says what it is: 503 retried as before.
+                'Codex member failed: unexpected status 503 Service Unavailable: {"error": {"type": '
+                '"invalid_request_error", "message": "Upstream down."}}, url: https://gateway.example.com/v1/responses'):
+            with self.subTest(text=text):
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
+                self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
 
     def test_a_content_filter_s_refusal_as_its_body_alone_stays_retried(self):
         # Owner's decision (14 Nov 2026): a content filter's refusal is no setting of the connection and is retried
@@ -246,6 +306,16 @@ class StructuredCallTests(retry_test.RetryCase):
         self.assertEqual(result, {"statement": "S", "notes": "ok"})
         self.assertEqual((len(self.execs()), self.waits()), (2, 60))
 
+    def refused_once(self, lines, reason):
+        self.script({"lines": lines}, {"answer": VALID})
+        with self.assertRaises(runtime.RequestRejected) as raised:
+            runtime.structured("Review S.", retry_test.SCHEMA, "review", model=self.model, effort="high")
+        self.assertEqual(raised.exception.reason, reason)
+        self.assertEqual((len(self.execs()), self.waits()), (1, 0))
+
+    def test_a_400_whose_message_names_input_512_ends_the_call_after_its_first_attempt(self):
+        self.refused_once(captured.EXEC_400_INPUT_512, captured.INPUT_512_MESSAGE)
+
     def test_a_content_filter_s_refusal_is_retried(self):
         self.script({"lines": captured.EXEC_400_FILTERED}, {"answer": VALID})
         result, _ = runtime.structured("Review S.", retry_test.SCHEMA, "review", model=self.model, effort="high")
@@ -325,6 +395,14 @@ class AuthorTests(retry_test.RetryCase):
         self.assertIsNone(raised.exception.retry)
         paused, = self.statuses("Author paused")
         self.assertEqual(paused["text"], REJECTED)
+        self.assertEqual((len(self.servers), self.waits()), (1, 0))
+
+    def test_a_400_whose_message_names_input_512_pauses_the_author_without_a_retry(self):
+        self.scripts[0] = {"captured": captured.APP_SERVER_400_INPUT_512}
+        with self.assertRaises(runtime.WorkflowPaused) as raised:
+            self.run_goal(launch=self.launcher(model=save_gateway()))
+        self.assertIn(f"invalid ({captured.INPUT_512_MESSAGE}). A retry cannot fix this", raised.exception.reason)
+        self.assertIsNone(raised.exception.retry)
         self.assertEqual((len(self.servers), self.waits()), (1, 0))
 
     def test_a_content_filter_s_refusal_is_retried_in_the_same_conversation(self):
