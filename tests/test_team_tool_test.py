@@ -58,7 +58,8 @@ class Endpoint:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
                 endpoint.requests.append({"path": self.path, "body": body,
-                                          "authorization": self.headers.get("Authorization")})
+                                          "authorization": self.headers.get("Authorization"),
+                                          "headers": {name.lower(): value for name, value in self.headers.items()}})
                 status, value = endpoint.answer(body)
                 if isinstance(value, list):
                     self.send(status, "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
@@ -142,6 +143,9 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual((body["stream"], body["store"], body["include"], body["parallel_tool_calls"]),
                          (True, False, ["reasoning.encrypted_content"], False))
         self.assertEqual(endpoint.requests[0]["authorization"], f"Bearer {KEY}")
+        # With the header Codex 0.160 sends with a Lite model's requests, which CLIProxyAPI passes upstream only
+        # when the client sent it.
+        self.assertEqual(endpoint.requests[0]["headers"]["x-openai-internal-codex-responses-lite"], "true")
 
     def test_another_model_gets_the_namespace_in_the_request_s_tools(self):
         endpoint = self.endpoint(["lab-model"], lambda body: (200, call("report_result", "mcp__tcs")))
@@ -153,6 +157,8 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual([item["type"] for item in body["input"]], ["message"])
         self.assertNotIn("context", body["reasoning"])
         self.assertIn("as Codex sends them to this model", result["message"])
+        # Codex sends no Lite header for such a model.
+        self.assertNotIn("x-openai-internal-codex-responses-lite", endpoint.requests[0]["headers"])
 
     def test_a_call_without_its_namespace_or_no_call_fails_and_says_why(self):
         for answer, expected in (
@@ -264,6 +270,8 @@ class ProbeTests(unittest.TestCase):
                                   if key not in ("input", "tool_choice", "parallel_tool_calls")},
                                  {key: value for key, value in without.items() if key != "input"})
                 self.assertEqual(without["reasoning"]["context"], "all_turns")
+                self.assertEqual([request["headers"].get("x-openai-internal-codex-responses-lite")
+                                  for request in endpoint.requests], ["true", "true"])
         # A model that does not run as Responses Lite: the request without its tools has none either.
         endpoint = self.endpoint(["lab-model"], with_tools_refused(400, refusal))
         self.assertFalse(server.probe_team_tools(self.entry(endpoint), endpoint.models)["ok"])

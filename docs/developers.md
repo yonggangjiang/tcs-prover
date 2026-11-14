@@ -1215,7 +1215,11 @@ the request's `tools` for a model it does not run as Responses Lite, and for a
 Lite name (`workflow_runner.codex_lite_model()`) in an `additional_tools` input
 item (role `developer`) with `reasoning.context` `"all_turns"`; both streamed,
 `store: false`, `include: ["reasoning.encrypted_content"]`,
-`parallel_tool_calls: false`. It runs with the catalog's first Lite model, else
+`parallel_tool_calls: false`; a Lite model's request also carries the header
+Codex sends with it, `x-openai-internal-codex-responses-lite: true`
+(`TEAM_TOOL_TEST_LITE_HEADER`), which CLIProxyAPI passes upstream only when the
+client sent it and by which it treats the request otherwise. It runs with the
+catalog's first Lite model, else
 its first, and passes only when a `function_call` comes back with `name`
 `report_result` and `namespace` `mcp__tcs` (Codex refuses a call without it:
 "unsupported call"). The result is `teamTools` `{ok, model, form, message,

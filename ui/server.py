@@ -356,11 +356,14 @@ API_TEST_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, 
 # to a coordinator (probe_team_tools()): a function tool in the namespace mcp__tcs (Codex's name for the MCP server
 # "tcs"), in the request's tools, or for a model name Codex runs as Responses Lite (workflow_runner.codex_lite_model())
 # in an additional_tools input item, with Codex's other Lite settings (reasoning context "all_turns", the encrypted
-# reasoning, store false), as captured from the real Codex against a scripted model server. It passes only when the
+# reasoning, store false, the header TEAM_TOOL_TEST_LITE_HEADER), as captured from the real Codex against a scripted
+# model server. It passes only when the
 # model calls that tool back with its namespace: Codex refuses a call without it ("unsupported call"). It runs with
 # one model of the connection: the first Lite one of its list, else its first.
 TEAM_TOOL_TEST_NAMESPACE = f"mcp__{team_module.SERVER_NAME}"
 TEAM_TOOL_TEST_TOOL = "report_result"
+# The header that Codex 0.160 sends with a Lite model's requests (the real Codex's captured requests).
+TEAM_TOOL_TEST_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 # The answers to that request which say nothing about the team tools, so that they stay not checked (ok None), and
 # the end of the message's sentence: a status that may pass (500 stands for every 5xx) and a refused key or model.
 # No answer within the deadline leaves them not checked too; any other refusal (400, 422, ...) is theirs only when
@@ -2854,7 +2857,11 @@ def team_tool_test_request(entry, model, effort, tools=True):
             **({} if lite or not tools else {"tools": [namespace]}),
             **({"tool_choice": "auto", "parallel_tool_calls": False} if tools else {}),
             **({"max_output_tokens": output} if output else {})}
-    headers = {**_api_connection_headers(entry), "Accept": "text/event-stream"}
+    # Codex 0.160 marks a Lite model's requests with TEAM_TOOL_TEST_LITE_HEADER, which a proxy such as CLIProxyAPI
+    # passes upstream only when the client sent it, and by which it treats the request otherwise (it keeps
+    # parallel_tool_calls of a request without top-level tools, for one).
+    headers = {**_api_connection_headers(entry), "Accept": "text/event-stream",
+               **({TEAM_TOOL_TEST_LITE_HEADER: "true"} if lite else {})}
     return (_api_endpoint_path(entry, "responses"), headers, json.dumps(body).encode("utf-8"),
             "additional_tools" if lite else "tools")
 

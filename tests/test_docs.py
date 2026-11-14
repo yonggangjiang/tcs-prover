@@ -237,6 +237,10 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("It runs with the catalog's first Lite model, else its first, and passes only when a "
                       "`function_call` comes back with `name` `report_result` and `namespace` `mcp__tcs`",
                       flat(DOCS / "developers.md"))
+        # A Lite model's request carries the header Codex sends with it (server.TEAM_TOOL_TEST_LITE_HEADER).
+        self.assertIn("a Lite model's request also carries the header Codex sends with it, "
+                      "`x-openai-internal-codex-responses-lite: true` (`TEAM_TOOL_TEST_LITE_HEADER`), which CLIProxyAPI "
+                      "passes upstream only when the client sent it", flat(DOCS / "developers.md"))
         # An answer that says nothing about the team tools leaves them not checked (server.probe_team_tools()).
         code = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
         self.assertIn('    **dict.fromkeys((408, 425, 429, 500), "which may pass. Test again later."),\n', code)
