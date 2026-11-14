@@ -1137,6 +1137,8 @@ class ClaudeStream:
         self.order = []
         self.sent = {}  # agent -> line numbers of the user lines since its previous request
         self.stdin = []  # sha256 of what was written to the CLI's input since the main agent's previous request
+        self.retries = {}  # agent -> the attempt number of the CLI's latest retry since its previous request
+        self.model = None  # the model the CLI named as it started (system/init): that of its failed requests
         self.session = None
         self.finished = False
 
@@ -1184,39 +1186,73 @@ class ClaudeStream:
         agent = message.get("parent_tool_use_id")
         body = message.get("message") if isinstance(message.get("message"), dict) else {}
         ended = []
+        retry = claude_retry(message)
+        if kind == "system" and message.get("subtype") == "init" and agent is None \
+                and isinstance(message.get("model"), str):
+            self.model = message["model"]
         if kind == "assistant" and isinstance(body.get("id"), str):
             identity = body["id"]
+            self.retries.pop(agent, None)
             for other in list(self.open):
                 if other != identity and self.open[other]["agentPath"] == agent:
                     ended.append(other)
             call = self.open.get(identity)
             if call is None:
+                # Claude Code reports a request that failed for good as a message of its own (model "<synthetic>",
+                # usage all zero): a failed request of the model the process runs.
+                failed = claude_api_error(message)
                 call = self.open[identity] = {
                     "program": "claude", "kind": "request", "process": self.label, "callId": identity,
                     "threadId": self.session, "agentPath": agent, "startedMs": _now_ms(), "endedMs": None,
-                    "model": body.get("model"), "status": "interrupted", "usage": body.get("usage"),
-                    "requestId": message.get("request_id"),
+                    "model": self.model if failed else body.get("model"),
+                    "status": "failed" if failed else "interrupted",
+                    "usage": None if failed else body.get("usage"), "requestId": message.get("request_id"),
                     "stream": {"file": f"claude/{self.label}.jsonl.gz", "lines": [number, number],
                                "sent": self.sent.pop(agent, [])}}
+                if failed:
+                    call["error"] = " ".join(block["text"] for block in body.get("content") or ()
+                                             if isinstance(block, dict) and isinstance(block.get("text"), str)) \
+                        or str(message.get("error") or "API error")
                 if agent is None and self.stdin:
                     call["stream"]["stdin"], self.stdin = self.stdin, []  # The prompt it was sent first.
                 self.order.append(identity)
             call["stream"]["lines"][1] = number
             call["endedMs"] = _now_ms()
         elif kind == "user":
+            self.retries.pop(agent, None)
             for other in list(self.open):
                 if self.open[other]["agentPath"] == agent:
                     ended.append(other)
             self.sent.setdefault(agent, []).append(number)
         elif kind == "result":
             ended = list(self.open)
-            for identity in ended:
-                self.open[identity]["status"] = "completed"
+        elif retry is not None:
+            self._failed_attempt(*retry, message, number)
         for identity in ended:
-            self.open[identity]["status"] = "completed"
+            if self.open[identity]["status"] == "interrupted":
+                self.open[identity]["status"] = "completed"
         if ended:
             self._write([self.open.pop(identity) for identity in self.order if identity in ended])
             self.order = [identity for identity in self.order if identity not in ended]
+
+    def _failed_attempt(self, agent, attempt, error, message, number):
+        """A request of ``agent`` failed and the CLI sends it again: the failed one's own row, written at once, with
+        what it sent (which the next attempt sends too). Claude Code repeats its report of one wait for a usage limit
+        every 30 s with the same attempt number: only the first is a request."""
+
+        if attempt is not None and self.retries.get(agent) == attempt:
+            return
+        self.retries[agent] = attempt
+        now = _now_ms()
+        call = {"program": "claude", "kind": "request", "process": self.label,
+                "callId": message["uuid"] if isinstance(message.get("uuid"), str) else f"{self.label}:{number}",
+                "threadId": self.session, "agentPath": agent, "startedMs": now, "endedMs": now, "model": self.model,
+                "status": "failed", "error": error, "usage": None, "requestId": None,
+                "stream": {"file": f"claude/{self.label}.jsonl.gz", "lines": [number, number],
+                           "sent": list(self.sent.get(agent, []))}}
+        if agent is None and self.stdin:
+            call["stream"]["stdin"] = list(self.stdin)
+        self._write([call])
 
     def _write(self, calls):
         try:
@@ -1248,6 +1284,28 @@ class ClaudeStream:
             except OSError:
                 pass
         self.claim.release()
+
+
+def claude_api_error(message):
+    """Whether a Claude Code stream message is the CLI's report of a failed API request (as
+    claude_cli.api_error_message() reads it)."""
+
+    return bool(message.get("is_api_error_message") or message.get("isApiErrorMessage") or message.get("error"))
+
+
+def claude_retry(message):
+    """(agent, attempt, error) of a request that failed and that Claude Code sends again, from its report
+    (system/api_retry; a subagent's, tool_progress with subagent_retry, names the subagent's tool-use id), or None."""
+
+    if message.get("type") == "system" and message.get("subtype") == "api_retry":
+        details, agent = message, message.get("parent_tool_use_id")
+    elif message.get("type") == "tool_progress" and isinstance(message.get("subagent_retry"), dict):
+        details, agent = message["subagent_retry"], message.get("tool_use_id")
+    else:
+        return None
+    parts = (details.get("error_status"), details.get("error") or details.get("error_category"))
+    attempt = details.get("attempt") if isinstance(details.get("attempt"), int) else None
+    return agent, attempt, " ".join(str(part) for part in parts if part not in (None, "")) or "no response"
 
 
 def compress_stream(record, path):
@@ -1569,6 +1627,7 @@ def finish_leftover_stream(record, path):
     replay = ClaudeStream.__new__(ClaudeStream)
     replay.recorder, replay.record, replay.label = None, record, label
     replay.open, replay.order, replay.sent, replay.session, replay.finished = {}, [], {}, None, False
+    replay.retries, replay.model = {}, None
     labels = read_json(path.with_suffix(".json"), {})
     replay.stdin = list(labels.get("stdin") or []) if isinstance(labels, dict) else []
     calls = []

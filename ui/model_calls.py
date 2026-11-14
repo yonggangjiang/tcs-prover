@@ -136,7 +136,7 @@ def _kinds(line, tokens):
         return ["web_cutoff_one_shot"]
     if line.get("status") == "trace format not recognized":
         return ["trace_format_not_recognized"]
-    if (tokens.get("reasoning") or 0) > 0 or line.get("program") == "claude":
+    if (tokens.get("reasoning") or 0) > 0 or line.get("program") == "claude" and line.get("status") != "failed":
         kinds.append("hidden_reasoning")
     kinds.extend(["token_probabilities", "network_only"])
     if line.get("status") == "interrupted":

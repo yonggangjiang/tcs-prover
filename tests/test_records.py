@@ -686,6 +686,63 @@ class ClaudeStreamTests(RecordCase):
         self.assertTrue((folder / "20261113T000000-author-abcdef.jsonl.gz").is_file())
         self.assertFalse((folder / "20261113T000000-author-abcdef.jsonl").exists())
 
+    def test_a_request_the_provider_refused_is_a_failed_call_of_the_process_s_model(self):
+        # Claude Code reports a request that failed for good as an assistant message of its own.
+        # The job names an API connection's model by its connection; the CLI names the model it asks for.
+        stream = self.recorder().claude_stream(role="critic", model="api:gateway-claude")
+        for line in [{"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-opus-5-5"},
+                     {"type": "assistant", "parent_tool_use_id": None, "session_id": "s-1", "error": "unknown",
+                      "is_api_error_message": True, "uuid": "f2f55e24-8d4b-4ddd-b944-52133fbffd31",
+                      "message": {"id": "5facec45-8185-47be-add4-1fcef5727334", "model": "<synthetic>",
+                                  "content": [{"type": "text", "text": "API Error: 400 INJECTED-400"}],
+                                  "usage": {"input_tokens": 0, "output_tokens": 0}}},
+                     {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 400,
+                      "session_id": "s-1"}]:
+            stream.line(json.dumps(line))
+        stream.finish()
+        [call] = self.record.calls.read()
+        self.assertEqual((call["status"], call["error"], call["usage"]),
+                         ("failed", "API Error: 400 INJECTED-400", None))
+        row = model_calls.call_list("run-1")["calls"][0]
+        self.assertEqual((row["status"], row["model"], row["placeholderKinds"]),
+                         ("failed", "claude-opus-5-5", ["token_probabilities", "network_only"]))
+
+    def test_a_request_the_cli_sends_again_after_a_failure_has_its_own_failed_row(self):
+        stream = self.recorder().claude_stream(role="critic", model="api:gateway-claude")
+        stream.sent_input("Review.")
+        retry = {"type": "system", "subtype": "api_retry", "max_retries": 300, "retry_delay_ms": 623,
+                 "error_status": 529, "error": "overloaded", "session_id": "s-1"}
+        lines = [{"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-opus-5-5"},
+                 {**retry, "attempt": 1, "uuid": "u-1"},
+                 # A wait for a usage limit is reported again every 30 s with the same attempt: one request.
+                 {**retry, "attempt": 1, "uuid": "u-2"},
+                 {**retry, "attempt": 2, "uuid": "u-3"},
+                 stream_lines()[2],
+                 # A subagent's failed request, which the CLI sends again.
+                 {"type": "tool_progress", "tool_use_id": "toolu_9", "tool_name": "Agent", "parent_tool_use_id": None,
+                  "elapsed_time_seconds": 0, "uuid": "u-4", "session_id": "s-1",
+                  "subagent_retry": {"agent_id": "a1", "attempt": 1, "max_retries": 10, "retry_delay_ms": 2000,
+                                     "error_status": 503, "error_category": "server_error"}},
+                 stream_lines()[3], stream_lines()[4], stream_lines()[5]]
+        for line in lines:
+            stream.line(json.dumps(line))
+        stream.finish()
+        calls = self.record.calls.read()
+        self.assertEqual([(call["callId"], call["status"], call["agentPath"], call.get("error"), call["model"])
+                          for call in calls],
+                         [("u-1", "failed", None, "529 overloaded", "claude-opus-5-5"),
+                          ("u-3", "failed", None, "529 overloaded", "claude-opus-5-5"),
+                          ("u-4", "failed", "toolu_9", "503 server_error", "claude-opus-5-5"),
+                          ("msg_1", "completed", None, None, "claude-opus-5-5"),
+                          ("msg_2", "completed", None, None, "claude-opus-5-5")])
+        # Each failed attempt sent what the attempt after it sends again.
+        for call_id in ("c000001", "c000002", "c000004"):
+            detail = model_calls.call_detail("run-1", call_id)
+            self.assertEqual([view["item"] for view in detail["sent"]["newItems"]],
+                             [{"type": "text", "text": "Review."}], call_id)
+        rows = {row["id"]: row for row in model_calls.call_list("run-1")["calls"]}
+        self.assertEqual((rows["c000003"]["role"], rows["c000003"]["member"]), ("independent critic", "toolu_9"))
+
     def test_the_prompt_written_to_the_cli_s_input_is_the_first_request_s_input(self):
         # A structured call or team member gets its prompt on standard input, which the stream never repeats.
         prompt = "Review the proof in input.txt. CRITIC-PROMPT-MARKER"

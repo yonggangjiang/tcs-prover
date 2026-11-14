@@ -791,7 +791,14 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   it in `claude/<label>.json`, its call line's `stdin`), and is written once a
   later line of that agent or
   the turn's result shows it ended (`interrupted` when the CLI ended without a
-  result after it). The stream gives no per-request output tokens (Claude
+  result after it). A request that failed is `failed`: Claude Code's own
+  report of one it gave up on (an assistant message with
+  `is_api_error_message`, model `<synthetic>`, usage all zero) is a call of the
+  process's model with its error text and no usage, and each attempt the CLI
+  sends again (`system/api_retry`; a subagent's `tool_progress` with
+  `subagent_retry`) gets a row of its own with what it sent; a report repeated
+  with the same attempt number (a usage-limit wait, every 30 s) counts once.
+  The stream gives no per-request output tokens (Claude
   Code's lines carry the message's starting usage). With **Concise** or
   **Detailed** summaries every Claude model, an API connection's too, is asked
   for summarized thinking (`--thinking-display summarized`); only a
