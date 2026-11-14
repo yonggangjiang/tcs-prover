@@ -236,6 +236,31 @@ class StallTests(StandInCase):
         heartbeats = [event for event in self.events if event.get("heartbeat")]
         self.assertGreaterEqual(len(heartbeats), 2)
 
+    def test_the_heartbeat_names_the_call_once_and_drops_the_zero_content_note_once_content_came(self):
+        # Before content: "LaTeX editor local request is alive" (its stage's role; not "Final model request local
+        # request is alive") with the note on zero content; after content, no such note.
+        self.script({"hang": 0.7, "answer": VALID}, {"stream": 8, "every": 0.15, "answer": VALID})
+        with mock.patch.object(runtime, "STRUCTURED_HEARTBEAT_SECONDS", 0.2):
+            for _ in range(2):  # A call that is silent until its answer, then one that streams its reasoning.
+                runtime.structured("Write S.", SCHEMA, "final", model="gpt-6.1-sol", options={"thinking_hours": 0})
+        beats = [event for event in self.events if event.get("heartbeat")]
+        self.assertTrue(beats)
+        self.assertEqual({event["label"] for event in beats}, {"LaTeX editor local request is alive"})
+        before = [event["text"] for event in beats if event["contentEventCount"] == 0]
+        after = [event["text"] for event in beats if event["contentEventCount"] > 0]
+        self.assertTrue(before and after, [event["contentEventCount"] for event in beats])
+        self.assertTrue(all(text.endswith("If content is still zero, the selected provider may be computing or "
+                                          "queued server-side; its API does not expose which.") for text in before))
+        self.assertTrue(all(text.endswith("s ago.") and "content is still zero" not in text for text in after))
+        # A call with an activity label is named by it; one of another stage by that stage's role.
+        (self.state / "next").unlink()
+        self.script({"hang": 0.5, "answer": VALID})
+        self.events.clear()
+        with mock.patch.object(runtime, "STRUCTURED_HEARTBEAT_SECONDS", 0.2):
+            runtime.structured("Review S.", SCHEMA, "review", model="gpt-6.1-sol", options={"thinking_hours": 0})
+        self.assertEqual({event["label"] for event in self.events if event.get("heartbeat")},
+                         {"Statement reviewer local request is alive"})
+
     def test_a_timeout_stops_the_processes_the_cli_started(self):
         self.script({"stream": 1, "child": 120, "hang": 120})
         started = time.monotonic()

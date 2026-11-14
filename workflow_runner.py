@@ -3379,7 +3379,9 @@ class RequestMonitor:
                 content_count = self._progress["contentEventCount"]
                 retrying = self._progress.get("retrying")
             elapsed = now - self._started_at
-            label = self.activity_label or f"{self.stage.title()} model request"
+            # Who makes the call: its activity label, else its stage's role ("LaTeX editor local request is alive").
+            role = _STAGE_ROLES.get(self.stage) or f"{self.stage} model"
+            label = self.activity_label or f"{role[:1].upper()}{role[1:]}"
             alive = self.process.poll() is None
             emit(
                 "status", self.stage,
@@ -3391,10 +3393,11 @@ class RequestMonitor:
                     f"{count} public lifecycle event"
                     f"{'s' if count != 1 else ''} and {content_count} "
                     f"content event{'s' if content_count != 1 else ''}; "
-                    f"last public event {quiet:.0f}s ago. "
-                    + (f"The CLI is retrying the provider request itself: {retrying}." if retrying else
-                       "If content is still zero, the selected provider may be computing "
-                       "or queued server-side; its API does not expose which.")
+                    f"last public event {quiet:.0f}s ago."
+                    + (f" The CLI is retrying the provider request itself: {retrying}." if retrying else
+                       # Only before the first content: the provider may be computing or queued.
+                       " If content is still zero, the selected provider may be computing "
+                       "or queued server-side; its API does not expose which." if not content_count else "")
                 ),
                 heartbeat=True, elapsedSeconds=round(elapsed, 1),
                 quietSeconds=round(quiet, 1), publicEventCount=count,
