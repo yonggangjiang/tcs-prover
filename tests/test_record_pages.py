@@ -352,7 +352,13 @@ await openRecords();
 await settle();
 assert.equal(viewingRecords, true);
 assert.equal(urls.at(-1), '/?records=1');
-assert.equal($('recordsMeta').textContent, '3 records827.3 MB in all1 of deleted job');
+assert.equal($('recordsMeta').textContent, '3 records827.3 MB in all1 of a deleted job');
+// More than one: "2 of deleted jobs".
+recordsStore().rows = [...recordsStore().rows, {...recordsStore().rows[2], runFolder: '2026-11-08_10-00-00_another'}];
+renderRecords();
+assert.equal($('recordsMeta').textContent, '4 records1.41 GB in all2 of deleted jobs');
+recordsStore().rows = recordsStore().rows.slice(0, 3);
+renderRecords();
 const counts = () => $('recordsFilter').querySelectorAll('[data-records]').map((button) =>
   [button.dataset.records, button.querySelector('.seg-count').textContent, button.getAttribute('aria-pressed')]);
 assert.deepEqual(counts(), [['all', '3', 'true'], ['kept', '2', 'false'], ['deleted', '1', 'false']]);

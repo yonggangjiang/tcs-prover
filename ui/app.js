@@ -11087,7 +11087,8 @@ function renderRecords() {
   const deleted = rows.filter((row) => !row.jobExists).length;
   const meta = store.rows === null ? [store.error ? "Records could not be read" : "Reading records…"]
     : [`${rows.length} ${rows.length === 1 ? "record" : "records"}`, `${recordSize(total)} in all`,
-      ...(deleted ? [`${deleted} of deleted ${deleted === 1 ? "job" : "jobs"}`] : [])];
+      // "1 of a deleted job", "3 of deleted jobs".
+      ...(deleted ? [`${deleted} of ${deleted === 1 ? "a deleted job" : "deleted jobs"}`] : [])];
   const metaKey = meta.join("|");
   if (els.meta.dataset.key !== metaKey) {
     els.meta.dataset.key = metaKey;
