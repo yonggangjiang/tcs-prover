@@ -984,6 +984,55 @@ $('apiModelSaveButton').onclick();
 assert.equal(sent[0].body.webSearch, false);
 """)
 
+    def test_a_save_that_sends_the_test_search_says_so_while_it_runs(self):
+        self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
+const testing = 'Loading models, testing web search and saving…', plain = 'Loading models and saving…';
+// What the page says while a save runs: the Save button and the result line.
+const busy = () => [$('apiModelSaveButton').textContent, $('apiModelTestResult').textContent,
+  $('apiModelTestResult').className, $('apiModelSaveButton').disabled];
+const searching = {...connection, webSearch: true, webSearchCheck: {ok: true,
+  message: 'The probe search answered (514 characters).'}};
+let reply = 0;
+const save = async (expected, answer, why) => {
+  $('apiModelSaveButton').onclick();
+  assert.deepEqual(busy(), [expected, expected, 'api-test-result pending', true], why);
+  sent[reply++].reply(200, {connection: answer, ...listing([answer])});
+  await settle();
+  assert.notEqual($('apiModelSaveButton').textContent, expected, why);
+};
+// A new connection: switched off, saving only loads the models and saves; switched on, it sends the test search.
+type('apiModelBaseUrl', connection.baseUrl); type('apiModelKey', 'secret-api-key');
+await save(plain, connection, 'new, off');
+type('apiModelBaseUrl', connection.baseUrl); type('apiModelKey', 'secret-api-key');
+$('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
+await save(testing, searching, 'new, on');
+// A saved connection that has it on and still goes to the same place (format, base URL, key, request source)
+// is not tested again: renamed, given token limits, or with a slash after its base URL.
+const edit = () => { click(rowButton('edit')); assert.equal($('apiModelWebSearch').checked, true); };
+edit(); type('apiModelName', 'Renamed');
+await save(plain, searching, 'renamed');
+edit(); type('apiModelContextWindow', '200000');
+await save(plain, searching, 'token limits');
+edit(); type('apiModelBaseUrl', connection.baseUrl + '/');
+await save(plain, searching, 'trailing slash');
+// It is tested again when the connection goes elsewhere: another base URL, a new key or another request source.
+edit(); type('apiModelBaseUrl', 'https://lab.example/v2');
+await save(testing, searching, 'base URL');
+edit(); $('apiModelReplaceKey').onclick(); type('apiModelKey', 'new-api-key');
+await save(testing, searching, 'new key');
+edit(); type('apiModelRequestSource', 'Proof lab');
+await save(testing, searching, 'request source');
+// Turned off, or an Anthropic connection (which never has it): no test search.
+edit(); $('apiModelWebSearch').checked = false; $('apiModelWebSearch').onchange();
+await save(plain, connection, 'turned off');
+// A saved connection that has it off, turned on: tested.
+click(rowButton('edit')); $('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
+await save(testing, searching, 'turned on');
+edit(); $('apiModelFormatOpenai').checked = false; $('apiModelFormatAnthropic').checked = true;
+$('apiModelFormatAnthropic').onchange();
+await save(plain, {...connection, format: 'anthropic'}, 'Anthropic');
+""")
+
     def test_test_connection_has_no_model_and_marks_results_stale_after_edits(self):
         self.run_app(self.MANAGER, self.MANAGER_SETUP, r"""
 type('apiModelBaseUrl', connection.baseUrl);

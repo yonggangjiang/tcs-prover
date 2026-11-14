@@ -7722,8 +7722,10 @@ async function saveApiModel() {
   const values = apiFormValues();
   if (!values) return;
   const editing = Boolean(apiModelEditing), edits = apiSaveEdits;
-  setApiBusy(true, apiUi.save, "Loading models and saving…");
-  showApiResult("pending", "Loading models and saving…");
+  const busy = apiSaveTestsSearch(values) ? "Loading models, testing web search and saving…"
+    : "Loading models and saving…";
+  setApiBusy(true, apiUi.save, busy);
+  showApiResult("pending", busy);
   let saved, failure = "", keyRequired = false;
   try {
     const data = await apiModelRequest("/api-models", values);
@@ -7738,6 +7740,15 @@ async function saveApiModel() {
   showApiResult(saved ? (search && !saved.webSearch ? "error" : "ok") : "error",
     saved ? `${editing ? "Updated" : "Saved"} ${saved.label}.` : "Not saved",
     saved ? [search, "Choose this key under Source in any role, then choose a model."].filter(Boolean).join(" ") : failure);
+}
+// Whether a save sends the test search of web search through this connection, as the controller decides
+// (ui/server.py save_api_connection): the switch is on, and the connection is new, had it off, or now goes
+// elsewhere (another base URL, key or request source; only OpenAI-compatible connections have the switch).
+function apiSaveTestsSearch(values) {
+  const editing = apiModelEditing;
+  const same = editing?.webSearch && !values.apiKey && values.baseUrl.replace(/\/+$/, "") === editing.baseUrl
+    && values.requestSource === (editing.requestSource || "");
+  return values.webSearch === true && !same;
 }
 // What a saved connection's web search switch says after the save: on, or off and why (its test search's result).
 function apiWebSearchText(connection) {
