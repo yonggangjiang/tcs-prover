@@ -778,6 +778,51 @@ assert.equal(pane().getAttribute('aria-label'), 'Call 4');
 assert.deepEqual(steps(), [['Previous call, 3', false], ['Next call, 5', false]]);
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
 
+    def test_a_call_waiting_for_its_tools_output_is_read_again_only_for_a_later_call_of_its_conversation(self):
+        self.run_pages(r"""
+await settle();
+await openModelCalls(RUN, {from: 'records', call: 'c000009'});
+await settle();
+const base = '/jobs/' + RUN + '/model-calls';
+const pane = () => $('callPane');
+// Call 2's spawn_agent has no output yet. The reader opens its full request.
+assert.equal(pane().querySelector('.mc-received').querySelector('.mc-item-note').textContent, 'no output recorded');
+await pane().querySelector('.mc-detail-actions').children[1].onclick();
+await settle();
+const drawn = pane().firstChild;
+assert.equal(pane().querySelector('.mc-full').hidden, false);
+const reads = () => requests.filter((request) => request.path === base + '/c000009').length;
+const before = reads();
+const grow = async (row) => {
+  rows.push(row);
+  answers[base + '?offset=0&limit=1'] = {body: {total: rows.length, calls: rows.slice(0, 1), recordState: {available: true, problems: []}}};
+  answers[base + '?offset=0&limit=1000'] = {body: {total: rows.length, calls: [...rows], recordState: {available: true, problems: []}}};
+  timers.filter(([fn, ms]) => ms === 5000).at(-1)[0]();
+  await settle();
+};
+const rows = [...ROWS];
+// Two calls of a team member, in their own conversation: call 2 is neither read again nor drawn again.
+await grow({...ROWS[4], id: 'c000040', threadId: 'member-thread', time: '2026-11-14T02:07:00Z'});
+await grow({...ROWS[4], id: 'c000041', threadId: 'member-thread', time: '2026-11-14T02:07:30Z'});
+assert.equal(reads(), before);
+assert.equal(pane().firstChild, drawn);
+assert.equal(pane().querySelector('.mc-full').hidden, false);
+// A later call of its own conversation: read again, and drawn again only when it changed.
+await grow({...ROWS[1], id: 'c000042', time: '2026-11-14T02:08:00Z'});
+assert.equal(reads(), before + 1);
+assert.equal(pane().firstChild, drawn);
+assert.equal(pane().querySelector('.mc-full').hidden, false);
+answers[base + '/c000009'] = {body: {...DETAIL_9, received: {items: [{...DETAIL_9.received.items[0],
+  output: {type: 'function_call_output', call_id: 'call_31db', output: '{"agent_id":"a1"}'}}]}}};
+await grow({...ROWS[1], id: 'c000043', time: '2026-11-14T02:08:30Z'});
+assert.equal(reads(), before + 2);
+assert.notEqual(pane().firstChild, drawn);
+assert.equal(pane().querySelector('.mc-received').querySelector('.mc-output').textContent, 'Output{"agent_id":"a1"}');
+// Its output is there: later calls leave it.
+await grow({...ROWS[1], id: 'c000044', time: '2026-11-14T02:09:00Z'});
+assert.equal(reads(), before + 2);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\nconst DETAIL_9 = {json.dumps(DETAIL_9)};\n")
+
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):
         self.run_pages(r"""
 await settle();

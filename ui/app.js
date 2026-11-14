@@ -11335,7 +11335,7 @@ function renderJobCallsEntry() {
 function callsStore() {
   return (callsStore.value ||= { run: "", rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
     selected: "", details: new Map(), raw: new Map(), filter: "all", words: "", timer: null, every: 5000, same: 0,
-    loading: false, from: "", job: null, generation: 0, items: new Map() });
+    loading: false, from: "", job: null, generation: 0, items: new Map(), stale: new Set() });
 }
 
 function callsEls() {
@@ -11357,7 +11357,7 @@ async function openModelCalls(run, { from = "", call = "" } = {}) {
   clearTimeout(store.timer);
   Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [], selected: call,
     details: new Map(), raw: new Map(), filter: "all", words: "", every: 5000, same: 0, from, job: null,
-    loading: false, generation: store.generation + 1, items: new Map() });
+    loading: false, generation: store.generation + 1, items: new Map(), stale: new Set() });
   history.pushState(null, "", callsUrl(run, call));
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView();
@@ -11388,7 +11388,8 @@ async function loadCalls(full = false) {
     // A Model calls page opened from its address (a reload, a link): it starts afresh.
     Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
       selected: new URLSearchParams(location.search).get("call") || "", details: new Map(), raw: new Map(),
-      every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1, items: new Map() });
+      every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1, items: new Map(),
+      stale: new Set() });
     const els = callsEls();
     els.browser.dataset.view = store.selected ? "detail" : "list";
     els.list.replaceChildren();
@@ -11429,16 +11430,24 @@ async function loadCalls(full = false) {
         if (!(page.calls || []).length || rows.length >= total) break;
       }
       const before = new Map(store.rows.map((row) => [row.id, JSON.stringify(row)]));
+      const showing = store.selected || store.rows[0]?.id || "";
+      const added = rows.filter((row) => !before.has(row.id));
       Object.assign(store, { rows, total, problems, loaded: true, missing: false, error: "" });
-      // A call whose row changed is read again, and so is one whose tool calls had no output yet (an output comes
-      // with the next request of its conversation, which may just have been recorded).
+      // A call whose row changed is read again. One whose tool calls had no output yet is read again once a later call
+      // of its own conversation is recorded (that call's request carries the outputs); the one shown is drawn again
+      // only if it changed (refreshCall). Calls of other conversations, a team member's or a critic's, leave it.
       for (const row of rows) {
         const detail = store.details.get(row.id);
         if (!detail) continue;
+        if (before.get(row.id) !== JSON.stringify(row)) {
+          store.details.delete(row.id);
+          continue;
+        }
         const waiting = (detail.received?.items || []).some((view) => ["custom_tool_call", "function_call", "tool_use"]
           .includes(view.type) && !view.output);
-        if (before.get(row.id) !== JSON.stringify(row) || (waiting && rows.length !== before.size)) {
-          store.details.delete(row.id);
+        if (waiting && added.some((other) => !row.threadId || !other.threadId || other.threadId === row.threadId)) {
+          if (row.id === showing) store.stale.add(row.id);
+          else store.details.delete(row.id);
         }
       }
       store.same = 0;
@@ -11459,7 +11468,9 @@ async function loadCalls(full = false) {
   // The chosen call, else the first (shown beside the list; the phone shows the list first, and the address names
   // only a call you chose). It is drawn again only when it changed: what was opened in it stays open meanwhile.
   const chosen = store.selected || store.rows[0]?.id || "";
-  if (chosen && (chosen !== store.selected || !store.details.has(chosen))) {
+  if (chosen && chosen === store.selected && store.details.has(chosen) && store.stale.has(chosen)) {
+    await refreshCall(chosen);
+  } else if (chosen && (chosen !== store.selected || !store.details.has(chosen))) {
     await showCall(chosen, { keepView: true, address: Boolean(store.selected) });
   } else if (!chosen) {
     renderCallPane();
@@ -11468,6 +11479,23 @@ async function loadCalls(full = false) {
     store.timer = setTimeout(() => {
       if (callsRecord === run) loadCalls(false);
     }, document.hidden ? Math.max(store.every, 30000) : store.every);
+  }
+}
+
+// Read call ``id`` again while it is shown, and draw it again only if what the record holds of it changed (what was
+// opened in it stays open otherwise). A read that fails leaves it as it is, to be read at the next look.
+async function refreshCall(id) {
+  const store = callsStore(), run = callsRecord;
+  try {
+    const detail = await recordRequest(recordPath(run, "model-calls", id));
+    if (callsRecord !== run || callsStore() !== store) return;
+    store.stale.delete(id);
+    if (JSON.stringify(detail) === JSON.stringify(store.details.get(id))) return;
+    store.details.set(id, detail);
+    const row = store.rows.find((item) => item.id === id);
+    if (row && store.selected === id) renderCallPane(row, detail);
+  } catch (_) {
+    // The next look reads it again.
   }
 }
 
@@ -11742,10 +11770,11 @@ async function showCall(id, { keepView = false, address = true } = {}) {
     renderCallPane();
     return;
   }
-  if (!store.details.has(id)) {
+  if (!store.details.has(id) || store.stale.has(id)) {
     renderCallPane(row, null);
     try {
       const detail = await recordRequest(recordPath(run, "model-calls", id));
+      store.stale.delete(id);
       store.details.set(id, detail);
       if (store.details.size > 60) store.details.delete(store.details.keys().next().value);
       // The outputs it sends name their tools from the call before it: read that call too (once), then draw again.
