@@ -875,40 +875,39 @@ writes a job's record, `ui/model_calls.py` reads it.
   server's command and environment (which can hold keys), the plugins and where
   each setting came from. TCS Prover acts on all of it, but `transcript.jsonl`
   (and so the record's snapshot and the training download) records only what it
-  sets or relies on (`records.recorded_settings()`, with TCS Prover's
-  redaction `workflow_runner.recorded_settings()`, about 3 KB): the
-  model, provider, reasoning, service tier, sandbox and approval, the permission
-  profile in effect, web search, the context window and compaction limit, the
-  features it sets, the subagent limits, every other setting the app-server's
-  command line set (origin `sessionFlags`: an API connection's provider entry,
-  the variables its commands never inherit, the commands' temp folder; of a
-  table only those entries, never the user's own beside them) and the MCP
-  servers' names, never their definitions, with `leftOut`, one sentence
-  saying how many other settings were left out; TCS Prover's redaction runs
-  over it. A web-cutoff run's answers (`RPC.web_cutoff`, set from the run's
-  policy; the record's `webCutoff` for a copy) also keep the isolation
-  settings TCS Prover writes into the private configuration file of each
-  process (`records.ISOLATION_SETTINGS`, from
+  sets or relies on (`records.recorded_settings()`, with TCS Prover's redaction
+  `workflow_runner.recorded_settings()`, about 3 KB): the model, provider,
+  reasoning, service tier, sandbox and approval, the permission profile in
+  effect, web search, the context window and compaction limit, the features it
+  sets, the subagent limits, every other setting the app-server's command line
+  set (origin `sessionFlags`: an API connection's provider entry, the variables
+  its commands never inherit, the commands' temp folder; of a table only those
+  entries, never the user's own beside them) and the MCP servers' names, never
+  their definitions, with `leftOut`, one sentence saying how many other settings
+  were left out; TCS Prover's redaction runs over it. A web-cutoff run's answers
+  (`RPC.web_cutoff`, set from the run's policy; the record's `webCutoff` for a
+  copy) also keep the isolation settings TCS Prover writes into the private
+  configuration file of each process (`records.ISOLATION_SETTINGS`, from
   `retrieval.runtime.configuration()`: project files off, the login shell off,
-  the commands' environment policy, the bundled skills turned off, the
-  features, Windows' sandbox), of each only what that file set (the answer's
-  `user` layer: the process's HOME and CODEX_HOME are both the private home
-  TCS Prover makes for it, so no file of the user's can be that layer, and the
-  run's isolation check verifies it is that home's `config.toml`) or the
-  command line: never an entry
-  another layer added beside them, nor Codex's own record of the project it
-  trusts. Checked against the real Codex 0.160 app-server's answer in a
+  the commands' environment policy, the bundled skills turned off, the features,
+  Windows' sandbox), of each only what that file set (the answer's `user` layer:
+  the process's HOME and CODEX_HOME are both the private home TCS Prover makes
+  for it, so no file of the user's can be that layer, and the run's isolation
+  check verifies it is that home's `config.toml`) or the command line: never an
+  entry another layer added beside them, nor Codex's own record of the project
+  it trusts. Checked against the real Codex 0.160 app-server's answer in a
   web-cutoff preflight of the author and of a structured call (no model call):
-  every value TCS Prover wrote is kept, about 3.5 KB of 30 to 36 KB. No reader of the transcript needs more: the job page, the
-  controller, the transcript viewer and the web-cutoff audit skip the answer,
-  and `retrieval.runtime.verify_rpc()` checks the answer itself. A transcript
+  every value TCS Prover wrote is kept, about 3.5 KB of 30 to 36 KB. No reader
+  of the transcript needs more: the job page, the controller, the transcript
+  viewer and the web-cutoff audit skip the answer, and
+  `retrieval.runtime.verify_rpc()` checks the answer itself. A transcript
   written before 14 Nov 2026 holds each answer whole (about 76 KB in the first
-  real job): the record's snapshot of it and the training download keep the
-  same part of each (`records.recorded_transcript()`: a `codex_event` whose
-  `event` answers with a `config` table and its `origins`, rewritten as the
-  server writes a line, every other byte as it is), so neither carries the
-  user's whole configuration, an MCP server's environment or headers; the run
-  folder's own `transcript.jsonl` is left as it is.
+  real job): the record's snapshot of it and the training download keep the same
+  part of each (`records.recorded_transcript()`: a `codex_event` whose `event`
+  answers with a `config` table and its `origins`, rewritten as the server
+  writes a line, every other byte as it is), so neither carries the user's whole
+  configuration, an MCP server's environment or headers; the run folder's own
+  `transcript.jsonl` is left as it is.
 - **Web-cutoff runs.** Their isolation is unchanged: nothing is traced or
   streamed. `records.copy_web_cutoff()` copies the author's session files from
   the run's bundle (`<codexHome>/author/sessions`) and the discovery folders
