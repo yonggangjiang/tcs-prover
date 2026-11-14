@@ -624,7 +624,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   reports: a `team_wait` that the failed attempt's CLI was running ends without
   taking a report or an attention (`Team.release_waits()`, from goal_session's
   cleanup on both paths). A member's retry notes carry `attempt`, counted per
-  assignment, so only the first two stay pinned (`important_record()`). Records: **Author subagent started/finished/failed** with
+  assignment, so only the first two stay pinned (`important_record()`), and
+  the failure in plain words and the provider's line (`failure`,
+  `failureReason`: `describe_failure()`) with `retryAt`, so the server can list a
+  member that keeps failing under Needs your attention (see
+  [Repeating failures](#repeating-failures-and-needs-your-attention)). Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
   `codex_event` records (`root: false`). Every record of one assignment, its
   retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
@@ -977,6 +981,49 @@ writes a job's record, `ui/model_calls.py` reads it.
   service's `encrypted_output`), Claude Code's request (system prompt, tools,
   parameters) and its web search's inner request, and the input of a web-cutoff
   one-shot call.
+- **The pages** (`ui/app.js`, the part from `// --- Records and model calls` to
+  its end marker; `ui/styles.css`, the part named after option B; the owner's
+  layout pick of 13-14 Nov 2026): **Records** (`?records=1`, under Configure;
+  `GET /records`, every 15 s on the page and every minute elsewhere for the
+  sidebar's total; `DELETE /records/<run>` after the in-page confirmation, whose
+  409 shows in it), a record's **Model calls** (`?calls=<run folder>`, with
+  `&batch=` from a job's page and `&call=<id>` once a call is chosen; it reads
+  every page of 1,000 rows, then the count every 5 s, every 30 s once it stayed
+  the same for a minute, and every page again when the count or the problems
+  change; a call's detail is read once and read again when its row changes or
+  a tool call of it still had no output), the Live activity card's **Model
+  calls · N** (the count at most every 10 s) and **Training record** (the
+  streamed ZIP read with `fetch()` and the token, counted as it arrives; a read
+  that fails saves nothing and says so). Every request goes outside the job
+  request queue. A call's outputs name their tool from the previous call,
+  which the page reads too.
+
+## Repeating failures and Needs your attention
+
+A model call that keeps failing is retried every minute without limit (see
+[Retries](retries.md)), and the server lists its job under Needs your attention
+meanwhile (owner's
+decision, 14 Nov 2026; `App.attention()`): at once when its words say the
+account is out of credit (`workflow_runner.out_of_credit()`: Claude Code's
+"Credit balance is too low", "insufficient credits" or "balance", "payment
+required") or a usage limit, otherwise once the same failure has repeated for
+`FAILING_ATTENTION_SECONDS` (15 minutes; kind `failing`, *Model calls keep
+failing*). `App._follow_failures()` keeps each call's failure while it keeps
+failing: a retry status with `retryAt` (keyed as the waits are: its
+`activityLabel`, `node` or `stage`), a member's retry note (`member:<id>`) or
+a paused author's reply's (`conversation:<id>:`); the same failure is the same
+plain words (`failure`, with the provider's line after a generic one such as
+"the CLI stopped unexpectedly") once request IDs and numbers are left out
+(`_failure_signature()`). The streak ends with the model's own output for that
+call (a `codex_event` item other than the user's message or an error, as the
+runner counts an attempt that worked), its step's result (`STEP_RESULT_KINDS`),
+the end of a member's assignment, or the runner's end. So the job stays listed
+between attempts (the usage and login lines too) and the list's notifications
+fire once. Out-of-credit words are not plain words of `_FAILURE_PATTERNS`: the
+retry notes the models read stay as they were. A content filter's refusal
+(`_CONTENT_FILTER`: "content filtering policy", `content_filter`, Azure's
+"content management policy") is never a request the endpoint refuses
+(`settings_failure()`), so it is retried like any passing failure.
 
 ## HTTP API notes
 
