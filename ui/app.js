@@ -11650,8 +11650,11 @@ function callRow(row, number) {
   button.append(mcNode("span", "mca-n", number), mcNode("span", "mcb-role", title, detail ? mcNode("small", "", ` · ${detail}`) : ""),
     mcNode("span", "mca-time", callClock(row.time) || "–"), mcNode("span", "mcb-line2", callModel(row.model), numbers),
     end);
-  button.setAttribute("aria-label", [`Call ${number}`, title, detail, callModel(row.model), callClock(row.time),
-    (CALL_STATUS[row.status] || [row.status])[0], withheldText(row)].filter(Boolean).join(", "));
+  // The program that made the call (a row shows its model) is in its label and tooltip.
+  const program = row.program === "claude" ? "Claude Code" : "Codex CLI";
+  button.title = `${program} · ${row.id}`;
+  button.setAttribute("aria-label", [`Call ${number}`, title, detail, callModel(row.model), program,
+    callClock(row.time), (CALL_STATUS[row.status] || [row.status])[0], withheldText(row)].filter(Boolean).join(", "));
   button.onclick = () => showCall(row.id, { focusPane: false });
   const item = mcNode("li");
   item.append(button);

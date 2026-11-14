@@ -448,6 +448,9 @@ assert.deepEqual(titles, ['Author', 'Critic coordinator · round 1', 'Critic coo
   'Convention critic', 'LaTeX editor']);
 assert.equal(items()[2].querySelector('.mcb-line2').textContent, 'GPT 6.1 Sol · 1.8s · 13.8k → 36');
 assert.equal(items()[4].querySelector('.mcb-line2').textContent, 'Claude Opus 5.5 · 41.2k → –');
+// The program that made a call: in the row's tooltip and label.
+assert.equal(items()[4].title, 'Claude Code · c000020');
+assert.match(items()[2].getAttribute('aria-label'), /^Call 3, Critic coordinator, round 1, GPT 6\.1 Sol, Codex CLI, /);
 assert.equal(items()[2].querySelector('.mcb-hide').title, '13 reasoning tokens hidden; token probabilities and network details not recorded');
 assert.equal(items()[4].querySelector('.mcb-hide').title, "Claude's thinking: only its summary; token probabilities and network details not recorded");
 assert.equal(items()[1].querySelector('.mcb-hide'), null);
