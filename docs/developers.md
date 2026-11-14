@@ -1069,7 +1069,10 @@ fire once. Out-of-credit words are not plain words of `_FAILURE_PATTERNS`: the
 retry notes the models read stay as they were. A content filter's refusal
 (`_CONTENT_FILTER`: "content filtering policy", `content_filter`, Azure's
 "content management policy") is never a request the endpoint refuses
-(`settings_failure()`), so it is retried like any passing failure.
+(`settings_failure()`), also when Codex reports it as the endpoint's body
+alone, typed `invalid_request_error`, as it reports every 400 (tests:
+`EXEC_400_FILTERED`, `APP_SERVER_400_FILTERED` of `tests/codex_refusals.py`),
+so it is retried like any passing failure.
 
 ## HTTP API notes
 

@@ -18,6 +18,11 @@ notification and the turn/completed that followed turn/start.
 - HTTP 401 for a key the endpoint refuses (EXEC_401).
 For the 404 and the 401 Codex used its own words, "unexpected status <status>: <the error's message>, url: <the
 URL>", after five retries of its own ("Reconnecting... <n>/5 (...)", which the runner skips).
+
+Captured the same way on 14 Nov 2026 (later the same day, ~/tcs-work/scratch/coord-ready/capture), each after one
+request, the body alone again, with ports and IDs as printed:
+- HTTP 400 for a content filter's refusal typed invalid_request_error, with no status in its body (Azure OpenAI's
+  message and code), through `codex exec --json` (EXEC_400_FILTERED) and the app-server (APP_SERVER_400_FILTERED).
 """
 
 import json
@@ -104,6 +109,30 @@ EXEC_401 = (
     r'''sk-fake-********cdef., url: http://127.0.0.1:65370/v1/responses"}''',
     r'''{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Incorrect API key '''
     r'''provided: sk-fake-********cdef., url: http://127.0.0.1:65370/v1/responses"}}''',
+)
+
+EXEC_400_FILTERED = (
+    r'''{"type":"error","message":"{\"error\": {\"message\": \"The response was filtered due to the prompt '''
+    r'''triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", \"type\": '''
+    r'''\"invalid_request_error\", \"param\": \"prompt\", \"code\": \"content_filter\"}}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"error\": {\"message\": \"The response was filtered due to '''
+    r'''the prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", '''
+    r'''\"type\": \"invalid_request_error\", \"param\": \"prompt\", \"code\": \"content_filter\"}}"}}''',
+)
+APP_SERVER_400_FILTERED = (
+    r'''{"method":"error","params":{"error":{"message":"{\"error\": {\"message\": \"The response was filtered '''
+    r'''due to the prompt triggering Azure OpenAI's content management policy. Please modify your prompt and '''
+    r'''retry.\", \"type\": \"invalid_request_error\", \"param\": \"prompt\", \"code\": \"content_filter\"}}",'''
+    r'''"codexErrorInfo":"other","additionalDetails":null,"misalignment":null},"willRetry":false,'''
+    r'''"threadId":"01a1da7c-b3df-7740-8d71-e67a165e4446","turnId":"01a1da7c-b3fc-7023-946d-49b487c07245"},'''
+    r'''"emittedAtMs":1794666968079}''',
+    r'''{"method":"turn/completed","params":{"threadId":"01a1da7c-b3df-7740-8d71-e67a165e4446",'''
+    r'''"turn":{"id":"01a1da7c-b3fc-7023-946d-49b487c07245","items":[],"itemsView":"notLoaded",'''
+    r'''"status":"failed","error":{"message":"{\"error\": {\"message\": \"The response was filtered due to the '''
+    r'''prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", '''
+    r'''\"type\": \"invalid_request_error\", \"param\": \"prompt\", \"code\": \"content_filter\"}}",'''
+    r'''"codexErrorInfo":"other","additionalDetails":null,"misalignment":null},"startedAt":1794666968,'''
+    r'''"completedAt":1794666968,"durationMs":18}},"emittedAtMs":1794666968080}''',
 )
 
 

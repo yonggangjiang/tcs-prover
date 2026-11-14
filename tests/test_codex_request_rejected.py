@@ -137,6 +137,29 @@ class CapturedTextTests(jobs_test.Isolated):
         # The conversation too long is one: the author continues in a new conversation (goal_session()).
         self.assertTrue(runtime._context_window_failure(captured.exec_text(captured.EXEC_400_TOO_LONG)))
 
+    def test_a_content_filter_s_refusal_as_its_body_alone_stays_retried(self):
+        # Owner's decision (14 Nov 2026): a content filter's refusal is no setting of the connection and is retried
+        # every minute. Codex 0.160 reports it as the endpoint's body alone, typed invalid_request_error and naming no
+        # status (EXEC_400_FILTERED, APP_SERVER_400_FILTERED), as it reports every 400: the exclusion of the filter's
+        # refusals covers the rule for such bodies too.
+        turn = json.loads(captured.APP_SERVER_400_FILTERED[1])["params"]["turn"]["error"]
+        texts = {**self.texts(captured.EXEC_400_FILTERED), "author": author_text(captured.APP_SERVER_400_FILTERED),
+                 "author turn": f"Author turn failed: {runtime._provider_message(turn)}",
+                 "reply turn": f"Author reply turn failed: {runtime._provider_message(turn)}"}
+        for path, text in texts.items():
+            with self.subTest(path=path):
+                self.assertNotIn("400", text)
+                self.assertIn('"type": "invalid_request_error"', text)
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
+                self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+        # Without the filter's words the same body is a request the endpoint refuses.
+        unfiltered = texts["member"].replace("content management policy", "usage policy").replace(
+            "content_filter", "policy_violation")
+        self.assertEqual(runtime.member_problem(runtime.Error(unfiltered), self.model).reason,
+                         "The response was filtered due to the prompt triggering Azure OpenAI's usage policy. Please "
+                         "modify your prompt and retry.")
+
     def test_a_body_quoted_under_another_status_is_what_that_status_says(self):
         # Codex quotes a body after its own words for another status when the body has no message of its own
         # (its display_body()): a key refused with 401 stays a failed authentication, retried for the author (the job
@@ -223,6 +246,12 @@ class StructuredCallTests(retry_test.RetryCase):
         self.assertEqual(result, {"statement": "S", "notes": "ok"})
         self.assertEqual((len(self.execs()), self.waits()), (2, 60))
 
+    def test_a_content_filter_s_refusal_is_retried(self):
+        self.script({"lines": captured.EXEC_400_FILTERED}, {"answer": VALID})
+        result, _ = runtime.structured("Review S.", retry_test.SCHEMA, "review", model=self.model, effort="high")
+        self.assertEqual(result, {"statement": "S", "notes": "ok"})
+        self.assertEqual((len(self.execs()), self.waits()), (2, 60))
+
     def test_a_conversation_too_long_for_the_model_is_retried(self):
         self.script({"lines": captured.EXEC_400_TOO_LONG}, {"answer": VALID})
         result, _ = runtime.structured("Review S.", retry_test.SCHEMA, "review", model=self.model, effort="high")
@@ -297,6 +326,13 @@ class AuthorTests(retry_test.RetryCase):
         paused, = self.statuses("Author paused")
         self.assertEqual(paused["text"], REJECTED)
         self.assertEqual((len(self.servers), self.waits()), (1, 0))
+
+    def test_a_content_filter_s_refusal_is_retried_in_the_same_conversation(self):
+        self.scripts[0] = {"captured": captured.APP_SERVER_400_FILTERED}
+        self.assertEqual(self.run_goal(launch=self.launcher(model=save_gateway())),
+                         {"outcome": "done", "output": "Full proof"})
+        self.assertEqual((len(self.servers), self.waits()), (2, 60))
+        self.assertFalse(self.statuses("Author paused") or self.statuses("Conversation replaced"))
 
     def test_a_built_in_models_author_is_retried(self):
         self.codex_home = None
