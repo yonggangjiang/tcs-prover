@@ -856,6 +856,14 @@ def _thread(line):
     return line.get("process"), line.get("bundle"), line.get("threadId")
 
 
+def _window_thread(line):
+    """The thread whose context windows a Codex request is in (_Windows): its thread in whichever process sent it (a
+    thread a paused author leaves goes on in a summary or reply turn's process, then in the resumed author's), as for
+    the call detail's previous request; a request without a thread, its bundle's."""
+
+    return line.get("threadId") or (line.get("process"), line.get("bundle"))
+
+
 def _shas(items):
     return [records._sha(records.compact(item)) for item in items]
 
@@ -961,11 +969,11 @@ class _Reader:
 
 
 class _Windows:
-    """trajectories.jsonl, made as the requests go by: one window per context window of each Codex thread (a request
-    whose input does not start with its window's items so far, each compared as the same item whatever Codex itself
-    set on it, _item_key(), starts a new one). Items are held as their numbers in ``index`` (sha256 -> number, each
-    item of the download once), and so are their same-item keys (each item's computed once), which costs little
-    memory."""
+    """trajectories.jsonl, made as the requests go by: one window per context window of each Codex thread, whichever
+    process sent its requests (_window_thread()); a request whose input does not start with its window's items so far,
+    each compared as the same item whatever Codex itself set on it (_item_key()), starts a new one. Items are held as
+    their numbers in ``index`` (sha256 -> number, each item of the download once), and so are their same-item keys
+    (each item's computed once), which costs little memory."""
 
     def __init__(self, index):
         self.index, self.windows, self.current = index, [], {}  # current: thread -> (window, its items' key numbers)
@@ -985,14 +993,14 @@ class _Windows:
         """One request: the sha256 of its input and output items and those items."""
 
         inputs, outputs = self._numbers(input_shas, inputs), self._numbers(output_shas, outputs)
-        window, same = self.current.get(_thread(line), (None, None))
+        window, same = self.current.get(_window_thread(line), (None, None))
         sent = [self.same[number] for number in inputs]
         if window is None or sent[:len(same)] != same:
             window = {"window": len(self.windows) + 1, "threadId": line.get("threadId"), "role": row.get("role"),
                       "label": row.get("label"), "items": [], "calls": [], "outcome": None}
             self.windows.append(window)
         window["items"] = inputs + outputs
-        self.current[_thread(line)] = (window, sent + [self.same[number] for number in outputs])
+        self.current[_window_thread(line)] = (window, sent + [self.same[number] for number in outputs])
         window["calls"].append({"id": line["id"], "inputEnd": len(inputs), "outputs": outputs, "role": row.get("role"),
                                 "label": row.get("label"), "round": None})
         window["last"] = row.get("time") or ""

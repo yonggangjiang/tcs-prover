@@ -677,6 +677,38 @@ class ThreadAcrossProcessesTests(RecordCase):
         self.assertEqual((sent["previousCallId"], [view["item"] for view in sent["newItems"]]),
                          ("c000002", [self.SUMMARY_TOOLS, self.ASK]))
 
+    def test_a_thread_resumed_in_a_new_process_goes_on_in_its_context_window(self):
+        # The author is paused while a request streams (cancelled with no answer, as in the first real job), then
+        # resumed in a new app-server with no summary turn between (Pause, then Continue; or a retry): its first
+        # request starts with the window's items, sent again, so the download's window goes on.
+        author = self.process("20261113T000000-author-aaaaaa", role="author", label="Author")
+        first = Bundle(author)
+        first.thread_started()
+        first.call("call-a", request([TOOLS, SYSTEM, PROMPT]), [self.SUMMARY])
+        reference = first.payload("inference_request", request([TOOLS, SYSTEM, PROMPT, self.SUMMARY, self.GO_ON]))
+        first.event({"type": "inference_started", "inference_call_id": "call-b", "thread_id": THREAD,
+                     "codex_turn_id": "turn-1", "model": "gpt-6.1-sol", "provider_name": "OpenAI",
+                     "request_payload": reference}, THREAD)
+        first.event({"type": "inference_cancelled", "inference_call_id": "call-b", "upstream_request_id": None,
+                     "reason": "response stream dropped before provider terminal event",
+                     "partial_response_payload": None}, THREAD)
+        records.TraceIngest(self.record, author.name, first.folder).step(final=True)
+        resumed = self.process("20261113T000100-author-bbbbbb", role="author", label="Author")
+        second = Bundle(resumed)
+        second.time = first.time + 60_000
+        second.thread_started()
+        aborted = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<turn_aborted>"}]}
+        second.call("call-c", request([TOOLS, SYSTEM, PROMPT, self.RESENT, self.GO_ON, aborted, self.GO_ON]),
+                    [ANSWER])
+        records.TraceIngest(self.record, resumed.name, second.folder).step(final=True)
+        windows = [json.loads(line) for line in download().read("trajectories.jsonl").splitlines()]
+        self.assertEqual([(window["threadId"], [(call["id"], call["inputEnd"]) for call in window["calls"]])
+                          for window in windows], [(THREAD, [("c000001", 3), ("c000002", 5), ("c000003", 7)])])
+        self.assertEqual(len(windows[0]["items"]), 8)
+        sent = model_calls.call_detail("run-1", "c000003")["sent"]
+        self.assertEqual((sent["previousCallId"], [view["item"] for view in sent["newItems"]]),
+                         ("c000002", [aborted, self.GO_ON]))
+
 
 class ResentItemTests(RecordCase):
     """Codex sends each earlier item of a thread again, with what it sets itself changed (CODEX_OWN_FIELDS): an id of

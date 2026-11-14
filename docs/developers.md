@@ -897,7 +897,8 @@ writes a job's record, `ui/model_calls.py` reads it.
   /jobs/<id>/model-calls/<callId>/raw` (the exact request and response), `GET
   /jobs/<id>/training-record` (a streamed ZIP: `requests.jsonl`, one
   self-contained example per request with a WebSocket continuation's input
-  expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window,
+  expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window
+  of a thread, whichever process sent its requests (as for the call detail),
   which a request goes on in when its input starts with the window's items,
   each the same item as for the call detail,
   with each call's input boundary and outputs and the critic round's outcome;
