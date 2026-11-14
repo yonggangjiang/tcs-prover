@@ -84,6 +84,7 @@ class Element {
   get value() { return this.ownValue; }
   set value(value) { this.ownValue = String(value); }
   get firstChild() { return this.children[0] ?? null; }
+  get firstElementChild() { return this.children.find((child) => child instanceof Element) ?? null; }
   get lastChild() { return this.children.at(-1) ?? null; }
   get isConnected() { let node = this; while (node.parentElement) node = node.parentElement; return node === document.body; }
   get nextElementSibling() {
@@ -111,6 +112,24 @@ class Element {
     const siblings = this.parentElement.children;
     siblings.splice(siblings.indexOf(this) + 1, 0, node);
     node.parentElement = this.parentElement;
+    moves.push(node);
+  }
+  before(node) {
+    node.remove();
+    const siblings = this.parentElement.children;
+    siblings.splice(siblings.indexOf(this), 0, node);
+    node.parentElement = this.parentElement;
+    moves.push(node);
+  }
+  prepend(node) {
+    node.remove();
+    this.children.unshift(node);
+    node.parentElement = this;
+    moves.push(node);
+  }
+  contains(node) {
+    for (let other = node; other; other = other.parentElement) if (other === this) return true;
+    return false;
   }
   descendants() { return this.children.flatMap((child) => child instanceof Element ? [child, ...child.descendants()] : []); }
   querySelectorAll(selector) { return this.descendants().filter((node) => matches(node, selector)); }
@@ -140,6 +159,8 @@ const document = {
 };
 const elements = {};
 const $ = (id) => elements[id] ||= (() => { const node = new Element(id === 'recordsSort' ? 'select' : 'div', id); document.body.append(node); return node; })();
+// Every element put in place by after(), before() or prepend() (a row taken out and put back counts).
+const moves = [];
 const urls = [], requests = [], timers = [], saved = [];
 const location = {pathname: '/', search: ''};
 const history = {pushState(a, b, url) { urls.push(url); location.search = url.slice(1); },
@@ -644,6 +665,41 @@ type('c000017');
 assert.deepEqual(shown(), ['c000017']);
 type('round 31');
 assert.deepEqual(shown(), []);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
+
+    def test_a_recorded_call_keeps_the_rows_the_focus_and_the_place_of_the_list(self):
+        self.run_pages(r"""
+await settle();
+await openModelCalls(RUN, {from: 'job'});
+await settle();
+const base = '/jobs/' + RUN + '/model-calls';
+const list = $('callsList');
+// The reader scrolled the list and chose call 3 with a click: its row keeps the focus.
+list.children[2].firstChild.onclick();
+await settle();
+list.children[2].firstChild.focus();
+list.scrollTop = 120;
+const rows = [...list.children], buttons = rows.map((item) => item.firstChild), focused = document.activeElement;
+moves.length = 0;
+// The next call is recorded, and call 8 (the LaTeX editor) has ended meanwhile.
+const more = [...ROWS.slice(0, 7), {...ROWS[7], durationMs: 9100}, {...ROWS[1], id: 'c000030', time: '2026-11-14T02:07:00Z'}];
+answers[base + '?offset=0&limit=1'] = {body: {total: 9, calls: more.slice(0, 1), recordState: {available: true, problems: []}}};
+answers[base + '?offset=0&limit=1000'] = {body: {total: 9, calls: more, recordState: {available: true, problems: []}}};
+timers.filter(([fn, ms]) => ms === 5000).at(-1)[0]();
+await settle();
+// Every row stays in place: the same elements, none taken out and put back; the new one is added after them.
+assert.equal(list.children.length, 9);
+assert(rows.every((item, index) => list.children[index] === item));
+assert(buttons.every((button, index) => list.children[index].firstChild === button));
+assert.deepEqual(moves.map((item) => item.firstChild.dataset.call), ['c000030']);
+// The row with the focus keeps it, and the list its place.
+assert.equal(document.activeElement, focused);
+assert.equal(focused.isConnected, true);
+assert.equal(focused.getAttribute('aria-current'), 'true');
+assert.equal(list.scrollTop, 120);
+// A row that changed is drawn again in its own button.
+assert.equal(buttons[7].querySelector('.mcb-line2').textContent, 'GPT 6.1 Sol · 9.1s · 13.6k → 122');
+assert.equal(list.children[8].firstChild.querySelector('.mca-n').textContent, '9');
 """.replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
 
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):

@@ -11391,6 +11391,7 @@ async function loadCalls(full = false) {
       every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1 });
     const els = callsEls();
     els.browser.dataset.view = store.selected ? "detail" : "list";
+    els.list.replaceChildren();
   }
   clearTimeout(store.timer);
   if (store.loading) return;
@@ -11639,16 +11640,59 @@ function renderCallsList() {
     const mark = mcNode("span", "mc-hide", mcIcon("hidden"));
     els.count.replaceChildren(`${count.join(" · ")} · `, mark, " reasoning the provider kept hidden");
   }
-  const signature = JSON.stringify(shown.map(({ row, number }) => [row.id, number, row.status, row.label, row.model,
-    row.durationMs, row.tokens, row.placeholderKinds, row.time]));
-  if (els.list.dataset.signature === signature) return;
-  els.list.dataset.signature = signature;
-  els.list.replaceChildren(...shown.map(({ row, number }) => callRow(row, number)));
+  // A row is drawn again only when what it shows changed, and the rows that stay are never taken out of the list:
+  // while calls are recorded, the row with the focus keeps it and the list keeps its place.
+  const drawn = new Map([...els.list.children].map((item) => [item.firstChild?.dataset?.call, item]));
+  const items = shown.map(({ row, number }) => {
+    const item = drawn.get(row.id) || mcNode("li", "", mcNode("button", "mcb-item"));
+    const key = callRowKey(row, number);
+    if (item.dataset.key !== key) {
+      item.dataset.key = key;
+      drawCallRow(item.firstChild, row, number);
+    }
+    const current = String(row.id === store.selected);
+    if (item.firstChild.getAttribute("aria-current") !== current) item.firstChild.setAttribute("aria-current", current);
+    return item;
+  });
+  placeChildren(els.list, items);
 }
 
-function callRow(row, number) {
+// What a call's row shows: it is drawn again when this changes.
+function callRowKey(row, number) {
+  return JSON.stringify([number, row.status, row.role, row.label, row.member, row.model, row.program, row.durationMs,
+    row.tokens, row.placeholderKinds, row.time]);
+}
+
+// Make ``items`` (elements, in order) the children of ``list``, moving only what must move: an element whose place is
+// unchanged is never taken out, and the one that holds the focus never moves (the others are placed around it), so
+// that it keeps the focus and the list its scroll position.
+function placeChildren(list, items) {
+  const wanted = new Set(items);
+  for (const child of [...list.children]) if (!wanted.has(child)) child.remove();
+  const active = document.activeElement;
+  const anchor = active ? items.findIndex((item) => item.contains(active)) : -1;
+  if (anchor < 0) {
+    let previous = null;
+    for (const item of items) {
+      if (item !== (previous ? previous.nextElementSibling : list.firstElementChild)) {
+        if (previous) previous.after(item);
+        else list.prepend(item);
+      }
+      previous = item;
+    }
+    return;
+  }
+  for (let index = anchor - 1; index >= 0; index--) {
+    if (items[index].nextElementSibling !== items[index + 1]) items[index + 1].before(items[index]);
+  }
+  for (let index = anchor + 1; index < items.length; index++) {
+    if (items[index - 1].nextElementSibling !== items[index]) items[index - 1].after(items[index]);
+  }
+}
+
+// One call's row in the list: the button keeps its place (and the focus) when it is drawn again.
+function drawCallRow(button, row, number) {
   const [title, detail] = callRole(row);
-  const button = mcNode("button", "mcb-item");
   button.type = "button";
   button.dataset.call = row.id;
   button.setAttribute("aria-current", String(row.id === callsStore().selected));
@@ -11663,7 +11707,8 @@ function callRow(row, number) {
     end.append(mark);
   }
   end.append(callStatus(row, true));
-  button.append(mcNode("span", "mca-n", number), mcNode("span", "mcb-role", title, detail ? mcNode("small", "", ` · ${detail}`) : ""),
+  button.replaceChildren(mcNode("span", "mca-n", number),
+    mcNode("span", "mcb-role", title, detail ? mcNode("small", "", ` · ${detail}`) : ""),
     mcNode("span", "mca-time", callClock(row.time) || "–"), mcNode("span", "mcb-line2", callModel(row.model), numbers),
     end);
   // The program that made the call (a row shows its model) is in its label and tooltip.
@@ -11672,9 +11717,6 @@ function callRow(row, number) {
   button.setAttribute("aria-label", [`Call ${number}`, title, detail, callModel(row.model), program,
     callClock(row.time), (CALL_STATUS[row.status] || [row.status])[0], withheldText(row)].filter(Boolean).join(", "));
   button.onclick = () => showCall(row.id, { focusPane: false });
-  const item = mcNode("li");
-  item.append(button);
-  return item;
 }
 
 // Show call ``id``: its row marked, its address, its detail (read once and kept), on a phone in place of the list.
