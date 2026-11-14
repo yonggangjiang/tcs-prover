@@ -656,6 +656,36 @@ class SnapshotTests(RecordCase):
         self.assertEqual((folder / "job-settings.json").read_text(), '{"criticRounds": 2}')
         self.assertEqual((folder / "prompts" / "author.txt").read_text(), "Prove it.")
 
+    def test_a_snapshot_append_cut_short_still_reads_and_the_next_snapshot_repairs_it(self):
+        self.record.update_manifest(webCutoff=True)
+        transcript = self.root / "transcript.jsonl"
+        lines = [json.dumps({"kind": "request", "stage": "critic", "label": f"Critic {number}",
+                             "text": f"check {number} " + os.urandom(64).hex()}) for number in range(30)]
+        transcript.write_text("\n".join(lines[:10]) + "\n", encoding="utf-8")
+        records.snapshot(self.record, transcript)
+        # The server is killed, or the disk fills, while the next snapshot appends its member: part of it stays.
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines[10:20]) + "\n")
+        member = gzip.compress(("\n".join(lines[10:20]) + "\n").encode(), mtime=0)
+        target = self.record.folder / "transcript" / "transcript.jsonl.gz"
+        with target.open("ab") as stream:
+            stream.write(member[:len(member) // 2])
+        # What the last snapshot verified still reads: the list of a web-cutoff record and the download.
+        self.assertEqual(len(records.read_transcript(self.record)), 10)
+        self.assertEqual(model_calls.call_list("run-1")["total"], 10)
+        buffer = io.BytesIO()
+        model_calls.training_record("run-1", buffer)
+        kept = zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("transcript/transcript.jsonl")
+        self.assertEqual(kept.decode().splitlines(), lines[:10])
+        # The next snapshot copies the transcript whole instead of appending after the broken bytes.
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines[20:]) + "\n")
+        records.snapshot(self.record, transcript)
+        self.assertEqual([entry["label"] for entry in records.read_transcript(self.record)],
+                         [f"Critic {number}" for number in range(30)])
+        records.snapshot(self.record, transcript)  # Nothing new: nothing changes.
+        self.assertEqual(len(records.read_transcript(self.record)), 30)
+
     def test_a_web_cutoff_run_s_sessions_and_discovery_folders_are_copied(self):
         controller = self.root / "experiment-control" / "run-1-abc"
         home = controller / "codex-home"

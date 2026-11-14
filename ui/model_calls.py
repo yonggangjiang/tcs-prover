@@ -718,7 +718,9 @@ def training_record(name, stream):
     out = _Counter(stream)
     rows = {row["id"]: row for row in _rows(record)}
     lines = sorted(record.calls.read(), key=lambda line: (line.get("startedMs") or 0, line["id"]))
-    transcript = records.read_transcript(record)
+    # The transcript snapshot's bytes that read back whole (an append cut short is left out until the next snapshot).
+    snapshot_data = records.transcript_data(record)
+    transcript = records.transcript_lines(snapshot_data)
     rounds = _rounds(transcript)
     counts = {"requests": 0, "items": 0, "trajectories": 0, "rounds": len(rounds)}
     item_names = set()
@@ -773,11 +775,7 @@ def training_record(name, stream):
         snapshot = record.folder / "transcript"
         if (snapshot / "transcript.jsonl.gz").is_file():
             with archive.open("transcript/transcript.jsonl", "w", force_zip64=True) as member:
-                try:
-                    with gzip.open(snapshot / "transcript.jsonl.gz", "rb") as source:
-                        shutil.copyfileobj(source, member, 1024 * 1024)
-                except (OSError, EOFError):
-                    pass  # What could be read; the record's problems are not this download's.
+                member.write(snapshot_data)
         for path in sorted(snapshot.rglob("*")):
             if path.is_file() and path.name not in ("transcript.jsonl.gz", "transcript.json"):
                 archive.write(path, "transcript/" + path.relative_to(snapshot).as_posix())

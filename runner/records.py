@@ -44,6 +44,7 @@ import stat
 import threading
 import time
 import uuid
+import zlib
 
 from runner import providers
 
@@ -79,6 +80,8 @@ MEMBER_CACHE_BYTES = 64 * 1024 * 1024
 # next request of each thread is rebuilt in one step (StoredBundle); an input no longer kept is rebuilt along its
 # chain again. Memory only: nothing is left out.
 RESOLVED_INPUTS_KEPT = 16
+# A gzip file's members are decompressed in pieces of this many bytes (complete_members()).
+READ_PIECE_BYTES = 1024 * 1024
 # The longest first line of a Codex session file read to learn its thread (its session_meta: about 25 KB).
 SESSION_META_BYTES = 4 * 1024 * 1024
 # Payload kinds whose JSON is stored as a skeleton plus items (each item once): a request's input, instructions and
@@ -1583,8 +1586,10 @@ def snapshot(record, transcript=None, job_settings=None, prompts=None):
     """Copy the job's transcript, settings and prompt set into transcript/, so the record holds them without the run.
 
     The transcript (append-only) is added to transcript/transcript.jsonl.gz as one more gzip member holding the
-    complete lines written since the last snapshot, after a check that the copied part is unchanged (else it is copied
-    whole again); each new member is read back. job-settings.json and the prompts/ folder are copied whole.
+    complete lines written since the last snapshot, after a check that the copied part is unchanged and that the file
+    is exactly as the last verified snapshot left it (else it is copied whole again: an append that a crash or a full
+    disk cut short leaves bytes that would break every later member); each new member is read back.
+    job-settings.json and the prompts/ folder are copied whole.
     """
 
     folder = _private_folder(record.folder / "transcript")
@@ -1619,7 +1624,13 @@ def _snapshot_transcript(folder, source):
     state = read_json(folder / "transcript.json", {}) or {}
     copied = state.get("bytes") if isinstance(state.get("bytes"), int) else 0
     target = folder / "transcript.jsonl.gz"
-    whole = not (target.is_file() and 0 < copied <= len(data) and _sha(data[:copied]) == state.get("sha256"))
+    try:
+        size = target.stat().st_size
+    except OSError:
+        size = None
+    # Appended to only when the file has the size the last verified snapshot left (transcript.json "size").
+    whole = not (size is not None and size == state.get("size") and 0 < copied <= len(data)
+                 and _sha(data[:copied]) == state.get("sha256"))
     if whole:
         write_atomic(target, gzip.compress(data, mtime=0))
         good = gzip.decompress(target.read_bytes()) == data
@@ -1635,18 +1646,53 @@ def _snapshot_transcript(folder, source):
             stream.seek(offset)
             good = gzip.decompress(stream.read()) == data[copied:]
     if good:
-        write_atomic(folder / "transcript.json", json.dumps({"bytes": len(data), "sha256": _sha(data)}).encode())
+        write_atomic(folder / "transcript.json", json.dumps({"bytes": len(data), "sha256": _sha(data),
+                                                             "size": target.stat().st_size}).encode())
     else:
         write_atomic(folder / "transcript.json", b"{}")  # The next snapshot copies it whole.
+
+
+def complete_members(data):
+    """The decompressed bytes of a gzip file's members up to the first one that does not read back whole: an append
+    cut short leaves a broken member at the end (the next snapshot copies the file whole again), and what came
+    before it is still read. Each member is fed in pieces of READ_PIECE_BYTES, so many members read in linear time."""
+
+    parts, position, view = [], 0, memoryview(data)
+    while position < len(data):
+        engine, member = zlib.decompressobj(16 + zlib.MAX_WBITS), []
+        try:
+            while not engine.eof and position < len(data):
+                piece = view[position:position + READ_PIECE_BYTES]
+                position += len(piece)
+                member.append(engine.decompress(piece))
+        except zlib.error:
+            break
+        if not engine.eof:
+            break
+        position -= len(engine.unused_data)
+        parts.extend(member)
+    return b"".join(parts)
+
+
+def transcript_data(record):
+    """The bytes of the record's transcript snapshot that read back whole (complete_members()), or b""."""
+
+    try:
+        data = (record.folder / "transcript" / "transcript.jsonl.gz").read_bytes()
+    except OSError:
+        return b""
+    return complete_members(data)
 
 
 def read_transcript(record):
     """The transcript snapshot's lines, parsed (an empty list when there is none)."""
 
-    try:
-        data = gzip.decompress((record.folder / "transcript" / "transcript.jsonl.gz").read_bytes())
-    except (OSError, EOFError, gzip.BadGzipFile):
-        return []
+    return transcript_lines(transcript_data(record))
+
+
+def transcript_lines(data):
+    """The records of transcript bytes, parsed (a line that is not a JSON object is skipped)."""
+
     records = []
     for line in data.splitlines():
         try:

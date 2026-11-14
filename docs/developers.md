@@ -797,7 +797,10 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   end of the job) and before the job is deleted, the record gets the
   transcript's new complete lines (one more gzip member of
   `transcript/transcript.jsonl.gz`, after a check that the copied part is
-  unchanged, else a whole copy), `job-settings.json` and the controller's
+  unchanged and that the file has the size the last verified snapshot left in
+  `transcript.json`, else a whole copy: an append that a crash or a full disk
+  cut short is copied over, and until then readers take the members before it,
+  `records.complete_members()`), `job-settings.json` and the controller's
   `prompts/`.
 - **Web-cutoff runs.** Their isolation is unchanged: nothing is traced or
   streamed. `records.copy_web_cutoff()` copies the author's session files from
