@@ -724,7 +724,8 @@ writes a job's record, `ui/model_calls.py` reads it.
   written before 14 Nov 2026 has folders of the default mode below its own; they
   are made 0700 when it is next opened (a route, the Records list, a runner or a
   snapshot of its job; `records._private_tree()`, once per process, never
-  through a link), and its Codex call lines get `reasoning` then too (below).
+  through a link), and its Codex call lines get `reasoning` and its transcript
+  snapshot keeps only the Codex settings a snapshot keeps now then too (below).
   The server makes it
   when a runner, review worker or reply turn of the job first starts and names it
   in `TCS_PROVER_RECORD` (`records.RECORD_ENV`) for that process; `environment()`
@@ -861,7 +862,11 @@ writes a job's record, `ui/model_calls.py` reads it.
   what the runner keeps now (`records.recorded_transcript()`, below): a
   transcript written before 14 Nov 2026 holds them whole, and a snapshot taken
   before then (its `transcript.json` lacks `settings`,
-  `records.SNAPSHOT_SETTINGS`) is copied whole again.
+  `records.SNAPSHOT_SETTINGS`) is copied whole again. Such a snapshot is also
+  kept so when its record is next opened (`records._keep_snapshot_settings()`,
+  under the record's lock, the file replaced only once written and synced), so
+  the record of a job that never runs again does not keep the whole answers
+  either; its next snapshot then copies the transcript whole.
 - **Codex's settings in the transcript.** Codex's answer to `config/read` (at
   each start of an author, coordinator, reply or summary turn's app-server, at
   each liveness probe of TCS Prover's goal loop, and in a web-cutoff run's

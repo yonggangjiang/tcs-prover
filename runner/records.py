@@ -537,8 +537,9 @@ class CallLog:
 class Record:
     """One job's record folder (see the module's description). Opening one (by a route, the Records list, a runner,
     review worker or reply turn of its job, or the server's snapshot) makes every folder of an older record
-    owner-only (_private_tree()) and gives its Codex call lines written before 14 Nov 2026 their "reasoning"
-    (_fill_reasoning()), once per process."""
+    owner-only (_private_tree()), gives its Codex call lines written before 14 Nov 2026 their "reasoning"
+    (_fill_reasoning()) and keeps of Codex's settings in a transcript snapshot taken before then only what a snapshot
+    keeps now (_keep_snapshot_settings()), once per process."""
 
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -547,6 +548,7 @@ class Record:
         self._lock = FileLock(self.folder / ".lock")
         _private_tree(self.folder)
         _fill_reasoning(self)
+        _keep_snapshot_settings(self)
 
     @classmethod
     def create(cls, folder, **manifest):
@@ -2104,6 +2106,51 @@ def _snapshot_transcript(folder, source, web_cutoff=False):
                                                              "settings": SNAPSHOT_SETTINGS}).encode())
     else:
         write_atomic(folder / "transcript.json", b"{}")  # The next snapshot copies it whole.
+
+
+_KEPT_SNAPSHOTS = set()  # The record folders whose snapshot this process checked (_keep_snapshot_settings())
+_KEPT_SNAPSHOTS_LOCK = threading.Lock()
+
+
+def _keep_snapshot_settings(record):
+    """Keep of Codex's answers to config/read in a transcript snapshot taken before 14 Nov 2026 (its transcript.json
+    lacks "settings") only what recorded_transcript() keeps, once per process, when the record is opened: the record of
+    a job that never runs or is deleted again would carry the user's whole Codex configuration otherwise, which the
+    next snapshot would only then replace.
+
+    Under the record's lock (a snapshot appends under it), the snapshot's members that read back whole are written as
+    one, and replace the file only once complete and synced (write_atomic()), so a crash leaves it as it was and a
+    later opening does it again; transcript.json then says so, without a copied part, so the next snapshot copies the
+    transcript whole. A snapshot with nothing to leave out keeps its bytes and its transcript.json, with "settings"
+    added. Opening a record never fails because of this."""
+
+    key = str(record.folder)
+    with _KEPT_SNAPSHOTS_LOCK:
+        if key in _KEPT_SNAPSHOTS:
+            return
+    folder = record.folder / "transcript"
+    target, state_path = folder / "transcript.jsonl.gz", folder / "transcript.json"
+    try:
+        state = read_json(state_path, {})
+        if (not target.is_symlink() and target.is_file()
+                and not (isinstance(state, dict) and state.get("settings") == SNAPSHOT_SETTINGS)):
+            with record.locked():
+                state = read_json(state_path, {})
+                state = state if isinstance(state, dict) else {}
+                if state.get("settings") != SNAPSHOT_SETTINGS:
+                    raw = target.read_bytes()
+                    data = complete_members(raw)
+                    kept = recorded_transcript(data, bool(record.manifest().get("webCutoff")))
+                    if kept == data and state.get("size") == len(raw):
+                        state = {**state, "settings": SNAPSHOT_SETTINGS}  # Nothing to leave out: as it is.
+                    else:
+                        write_atomic(target, gzip.compress(kept, mtime=0))
+                        state = {"settings": SNAPSHOT_SETTINGS} if gzip.decompress(target.read_bytes()) == kept else {}
+                    write_atomic(state_path, json.dumps(state).encode())
+    except Exception:  # noqa: BLE001 - the record opens as it is; a later process tries again.
+        pass
+    with _KEPT_SNAPSHOTS_LOCK:
+        _KEPT_SNAPSHOTS.add(key)
 
 
 def complete_members(data):

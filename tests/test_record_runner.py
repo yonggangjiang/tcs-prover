@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
+import zlib
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
@@ -627,6 +628,22 @@ def transcript_line(entry):
     return json.dumps(entry, ensure_ascii=False) + "\n"
 
 
+class Crash(BaseException):
+    """The process dies here (a kill, a power cut): nothing after this point runs, no handler catches it."""
+
+
+def gzip_members(data):
+    """How many gzip members ``data`` holds."""
+
+    count, position = 0, 0
+    while position < len(data):
+        engine = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        engine.decompress(data[position:])
+        position = len(data) - len(engine.unused_data)
+        count += 1
+    return count
+
+
 def settings_line(identity, answer, stage="solve", **extra):
     """A transcript line of an app-server's answer to config/read, as a runner from before 14 Nov 2026 recorded it
     (``answer`` whole) or as the runner records it now (what recorded_settings() kept)."""
@@ -720,6 +737,103 @@ class SettingsCopyTests(unittest.TestCase):
         self.assert_private_left_out((folder / "transcript.jsonl.gz").read_bytes())
         self.assert_private_left_out(gzip.decompress((folder / "transcript.jsonl.gz").read_bytes()))
         self.assertEqual(json.loads((folder / "transcript.json").read_text())["settings"], records.SNAPSHOT_SETTINGS)
+
+    def old_snapshot(self, data):
+        """The record's snapshot of ``data`` as an earlier build took it: as it came, its state without "settings"."""
+
+        folder = self.record.folder / "transcript"
+        records.write_atomic(folder / "transcript.jsonl.gz", gzip.compress(data, mtime=0))
+        records.write_atomic(folder / "transcript.json", json.dumps({
+            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "size": (folder / "transcript.jsonl.gz").stat().st_size}).encode())
+        return folder
+
+    def test_a_snapshot_taken_before_keeps_only_those_settings_once_the_record_is_next_opened(self):
+        # The job never runs again, so no snapshot replaces it: opening the record does it (the Records list here).
+        data = "".join(self.older).encode()
+        self.transcript.write_bytes(data)
+        folder = self.old_snapshot(data)
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):  # As a new process: the record is not opened yet.
+            model_calls.record_list(lambda name: False)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older))
+        self.assert_private_left_out((folder / "transcript.jsonl.gz").read_bytes())
+        self.assert_private_left_out(gzip.decompress((folder / "transcript.jsonl.gz").read_bytes()))
+        self.assertEqual(json.loads((folder / "transcript.json").read_text()), {"settings": records.SNAPSHOT_SETTINGS})
+        self.assertEqual(oct((folder / "transcript.jsonl.gz").stat().st_mode & 0o777), "0o600")
+        # The next snapshot copies the transcript whole, with the lines written since.
+        later = [settings_line(7, CONFIG_ANSWER), transcript_line({"kind": "status", "stage": "solve", "time": "u"})]
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write("".join(later))
+        records.snapshot(self.record, self.transcript)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older + later))
+        # A later opening finds nothing to do.
+        inode = (folder / "transcript.jsonl.gz").stat().st_ino
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+            records.Record(self.record.folder)
+        self.assertEqual((folder / "transcript.jsonl.gz").stat().st_ino, inode)
+        self.assertEqual(self.transcript.read_text(encoding="utf-8"), "".join(self.older + later))
+
+    def test_a_crash_while_the_snapshot_is_written_again_leaves_it_as_it_was(self):
+        folder = self.old_snapshot("".join(self.older).encode())
+        original = (folder / "transcript.jsonl.gz").read_bytes()
+
+        def crash(stream):
+            raise Crash()
+
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()), mock.patch.object(records, "_fsync", crash), \
+                self.assertRaises(Crash):
+            records.Record(self.record.folder)
+        self.assertEqual((folder / "transcript.jsonl.gz").read_bytes(), original)
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+            records.Record(self.record.folder)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older))
+
+    def test_a_snapshot_with_nothing_to_leave_out_keeps_its_bytes_and_is_appended_to(self):
+        plain = [line for line in self.older if '"origins"' not in line]
+        self.transcript.write_text("".join(plain), encoding="utf-8")
+        folder = self.old_snapshot("".join(plain).encode())
+        state = json.loads((folder / "transcript.json").read_text())
+        inode = (folder / "transcript.jsonl.gz").stat().st_ino
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+            records.Record(self.record.folder)
+        self.assertEqual((folder / "transcript.jsonl.gz").stat().st_ino, inode)
+        self.assertEqual(json.loads((folder / "transcript.json").read_text()),
+                         {**state, "settings": records.SNAPSHOT_SETTINGS})
+        later = [settings_line(7, CONFIG_ANSWER)]
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write("".join(later))
+        records.snapshot(self.record, self.transcript)
+        self.assertEqual(gzip_members((folder / "transcript.jsonl.gz").read_bytes()), 2)  # Appended to.
+        self.assertEqual(records.transcript_data(self.record), self.kept(plain + later))
+
+    def test_the_snapshot_is_written_again_under_the_record_s_lock(self):
+        # The server snapshots the job (under the lock) while another request opens its record: the opening waits,
+        # reads the snapshot only once it has the lock, and leaves what the snapshot added.
+        data = "".join(self.older).encode()
+        self.transcript.write_bytes(data)
+        self.old_snapshot(data)
+        reading, appended = threading.Event(), threading.Event()
+        real = records.recorded_transcript
+
+        def keep(data, web_cutoff=False):
+            reading.set()
+            appended.wait(5)
+            return real(data, web_cutoff)
+
+        later = [transcript_line({"kind": "status", "stage": "solve", "time": "u"})]
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()), \
+                mock.patch.object(records, "recorded_transcript", keep):
+            with self.record.locked():
+                opening = threading.Thread(target=records.Record, args=(self.record.folder,))
+                opening.start()
+                self.assertFalse(reading.wait(0.5))
+                with self.transcript.open("a", encoding="utf-8") as stream:
+                    stream.write("".join(later))
+                appended.set()
+                records.snapshot(self.record, self.transcript)
+            opening.join(10)
+        self.assertFalse(opening.is_alive())
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older + later))
 
     def test_the_download_of_a_snapshot_taken_before_keeps_only_those_settings(self):
         data = "".join(self.older).encode()
