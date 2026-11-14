@@ -691,6 +691,28 @@ class ReasoningFillTests(RecordCase):
         self.assertEqual(self.path.read_bytes().split(b"\n")[0], older.split(b"\n")[0])
         self.assertEqual(self.path.read_bytes().split(b"\n")[1:], self.filled.split(b"\n")[1:])
 
+    def test_a_line_whose_response_is_only_in_the_raw_trace_gets_it_from_there(self):
+        # The record does not hold this call's response (its trace is not stored yet), the raw trace does, where the
+        # detail reads it too (model_calls._raw_payload()): a reasoning item with its encrypted copy and no reasoning
+        # tokens, so only the response says that reasoning came back.
+        label, thread = "20261113T000001-author-fedcba", "01a1d4e2-6f0e-7a41-9c3d-0d5e8b7a6c21"
+        bundle = Bundle(self.record.folder / "codex-trace" / label, thread=thread)
+        bundle.thread_started()
+        no_tokens = {**USAGE, "reasoning_output_tokens": 0}
+        bundle.call("call-e", request([PROMPT]), [REASONING, ANSWER], usage=no_tokens)
+        line = json.dumps({"id": "c000006", "program": "codex", "kind": "request", "process": label,
+                           "bundle": bundle.folder.name, "callId": "call-e", "threadId": thread, "agentPath": "/root",
+                           "startedMs": 1794573000000, "endedMs": 1794573000005, "model": "gpt-6.1-sol",
+                           "status": "completed", "request": "payloads/2.json", "response": "payloads/3.json",
+                           "usage": no_tokens}, separators=(",", ":")).encode()
+        self.path.write_bytes(self.older + b"\n" + line + b"\n")
+        self.assertEqual(self.kinds(), [["hidden_reasoning", *self.SHOWN], self.SHOWN, self.SHOWN,
+                                        [*self.SHOWN, "interrupted"], ["hidden_reasoning", *self.SHOWN]])
+        self.assertEqual(self.path.read_bytes(),
+                         self.filled + b"\n" + line[:-1] + b',"reasoning":{"items":1,"rawText":false}}\n')
+        for path, data in bundle.files.items():  # The raw trace is left as it is.
+            self.assertEqual((bundle.folder / path).read_bytes(), data, path)
+
     def test_the_lines_are_filled_under_the_record_s_lock(self):
         # A writer of the job (a runner storing a trace) holds the lock and appends while the record is opened: the
         # opening waits, reads no response before it has the lock, and keeps the appended line.
