@@ -647,7 +647,8 @@ def member_records(assignments, count=2):
 
     # runtime.member_attempt()'s own arguments: a stand-in that refused one would fail every attempt, which the team
     # retries every minute, so the next assignment of the member would be refused as busy.
-    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record, retried=None):
+    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record, retried=None,
+                noted=None):
         first = prompt.splitlines()[0]
         record({"type": "thread.started", "thread_id": f"019a{member.count:04d}-0000-7000-8000-000000000000"})
         record({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning", "text": f"About {first}."}})
@@ -678,7 +679,8 @@ def member_retry_records(failures, cli_retries):
         with lock:
             records.append({"kind": kind, "stage": stage, **fields})
 
-    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record, retried=None):
+    def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record, retried=None,
+                noted=None):
         prompts.append(prompt)
         for number in range(cli_retries):
             retried(f"Claude API retry: status 529, retrying in 35 s (attempt {number + 1} of 300)")
@@ -808,7 +810,7 @@ class TeamCase(unittest.TestCase):
         release = threading.Event()
 
         def attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
-                    retried=None):
+                    retried=None, noted=None):
             release.wait(30)
             return "Done: " + prompt.splitlines()[0]
 

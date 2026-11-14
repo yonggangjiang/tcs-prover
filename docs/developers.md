@@ -1172,7 +1172,19 @@ gets `--set api_web_search=[...]` (the review worker `--api-web-search`), and
 `model_providers.tcs_api.supports_standalone_web_search=true`,
 `features.standalone_web_search=true` and
 `suppress_unstable_features_warning=true` (the job's web search is `live`). A
-job from before records none and searches as before.
+job from before records none and searches as before. As its runner starts
+(not a reply turn's), `note_failed_search_checks()` pins one **Web search may
+fail** diagnostic (`searchCheckFailed`, `connection`) for each connection of
+`API_WEB_SEARCH` whose `webSearchCheck.ok` is false. A search that fails at run
+time leaves only an item that started: Codex 0.160 sends a search's
+`item/started` (`item.started` under `codex exec --json`) of type `webSearch`
+(`web_search`), and its `item/completed` only once the search service
+answered; for a 404, a 429, a 500 after its retries, a dropped connection or a
+body it could not read it sends none, and the model's `web__run` throws (the
+real Codex against a scripted search service). `SearchWatch` follows those
+items; after a turn that completed, the author's goal loop, a structured call
+and a team member (`member_attempt(noted=...)`) each pin a **Web search
+failed** diagnostic (`failedSearches`) naming the connection's search service.
 
 A test of one model (`POST /api-models/test` with its `api:<id>` selection id
 and wire `model`, or with unsaved settings) sends a request shaped like the ones

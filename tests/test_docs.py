@@ -205,6 +205,15 @@ class AccuracyTests(unittest.TestCase):
                       "The coordinator's entries carry no dates of their own; the newest 500 versions' times are kept.",
                       flat(DOCS / "job-page.md"))
 
+    def test_search_that_may_fail_or_failed_is_said_where_the_switch_is_described(self):
+        models = flat(DOCS / "models.md")
+        self.assertIn("A job that searches through a connection whose saved test search did not pass says so as each "
+                      "of its runners starts (**Web search may fail**", models)
+        self.assertIn("a search that fails during the run says so after its turn (**Web search failed**", models)
+        developers = flat(DOCS / "developers.md")
+        self.assertIn("`note_failed_search_checks()` pins one **Web search may fail** diagnostic", developers)
+        self.assertIn("`SearchWatch` follows those items", developers)
+
     def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
         # A coordinator that cannot use its team is listed under Needs your attention while its run goes on
         # (workflow_runner.CoordinatorWatch): the limits as the code has them, named where they apply.

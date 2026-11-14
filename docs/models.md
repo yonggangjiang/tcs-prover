@@ -293,7 +293,13 @@ type a model id.
   connection** is on: its own web search otherwise comes only with its built-in
   OpenAI provider, that is, the **Codex CLI** source. A live run whose author or
   author subagent has such a model says so in the activity log as the author
-  starts (**No web search**), and goes on without web search.
+  starts (**No web search**), and goes on without web search. A job that
+  searches through a connection whose saved test search did not pass says so as
+  each of its runners starts (**Web search may fail**, with when it was tested
+  and what the test found), and a search that fails during the run says so after
+  its turn (**Web search failed**: Codex started the search, and the search
+  service answered with an error, nothing, or something Codex could not read);
+  the run goes on either way.
 - **Anthropic format** runs through Claude Code with a private configuration
   folder per run folder under `.tcs-prover/claude-homes/` (`CLAUDE_CONFIG_DIR`),
   so your Claude login, its keychain entry and `~/.claude.json` are never read;

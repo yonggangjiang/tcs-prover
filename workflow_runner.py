@@ -32,6 +32,7 @@ from runner import prompt_catalog
 from runner import team as team_module
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -2452,6 +2453,86 @@ def note_no_subagent_tool(stage, model, count, coordinator=False, bare=False):
 
 
 NO_WEB_SEARCH_LABEL = "No web search"
+# A job that searches through an API connection whose saved test search failed says so as its runner starts
+# (note_failed_search_checks()), and a search of a Codex run that failed says so after its turn (SearchWatch).
+SEARCH_CHECK_FAILED_LABEL = "Web search may fail"
+SEARCH_FAILED_LABEL = "Web search failed"
+
+
+def note_failed_search_checks():
+    """Warn once, as the job's runner starts, for each API connection it searches through (API_WEB_SEARCH) whose
+    saved test search did not pass (providers.api_model()'s webSearchCheck): its searches may fail, which the run
+    survives (each failed search says so, SearchWatch). A pinned diagnostic."""
+
+    for connection in sorted(API_WEB_SEARCH):
+        try:
+            entry = providers.api_connection(connection)
+        except providers.ProviderError:
+            continue  # The store cannot be read now: nothing to say.
+        check = entry.get("webSearchCheck") if isinstance(entry, dict) else None
+        if not isinstance(check, dict) or check.get("ok") is not False:
+            continue
+        when = _record_moment(check.get("at"))
+        message = _clipped(" ".join(str(check.get("message") or "").split()), 300)
+        emit("diagnostic", "workflow", label=SEARCH_CHECK_FAILED_LABEL, searchCheckFailed=True,
+             connection=entry.get("label") or connection,
+             text=f"Web search through {entry.get('label') or connection} may fail: its test search did not pass"
+                  + (f" ({when})" if when else "") + (f": {message}" if message else ".")
+                  + ("" if not message or message.endswith(".") else ".")
+                  + " The run goes on; each web search that fails says so in the activity log.")
+
+
+def _record_moment(value):
+    """An ISO time as "2026-11-14 13:45 UTC", or "" for none."""
+
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+class SearchWatch:
+    """The web searches of one Codex run that started and never came back (Codex 0.160 sends a search's
+    item/started, item.started under `codex exec --json`, and its item/completed only once the search service
+    answered: a search whose service answered an error, nothing or something it could not read has none; the real
+    Codex against a scripted search service). ``item(method, item)`` follows every item event; ``failed()`` at the
+    end of a turn that completed gives how many of its searches never came back, and forgets them."""
+
+    TYPES = ("webSearch", "web_search")
+
+    def __init__(self):
+        self.pending = set()
+
+    def item(self, method, item):
+        if not isinstance(item, dict) or item.get("type") not in self.TYPES:
+            return
+        identity = item.get("id") if isinstance(item.get("id"), str) else repr(item.get("id"))
+        if method in ("item/started", "item.started"):
+            self.pending.add(identity)
+        elif method in ("item/completed", "item.completed"):
+            self.pending.discard(identity)
+
+    def failed(self):
+        count, self.pending = len(self.pending), set()
+        return count
+
+
+def failed_search_text(count, model):
+    """The activity line for ``count`` searches of one turn of ``model``'s run that never came back."""
+
+    try:
+        entry = providers.api_model(model) if model_provider(model) == API_PROVIDER else None
+    except (Error, providers.ProviderError):
+        entry = None
+    service = (f"the search service of {entry['label']}" if entry and entry.get("sourceId", entry["id"])
+               in API_WEB_SEARCH else "its search service")
+    searches = "1 web search" if count == 1 else f"{count} web searches"
+    return (f"{searches} of this turn failed: Codex started {'it' if count == 1 else 'them'}, and {service} "
+            "answered with an error, nothing, or something Codex could not read. The run goes on; the model got the "
+            "error and may search again.")
 
 
 def note_no_web_search(stage, node, model, members=(), *, coordinator=False, directory=None):
@@ -4037,6 +4118,7 @@ def _run_structured_process(
         started = False
         # The saved session of a call with subagents, which alone shows those of multi-agent version 2.
         rollout, rollout_found = None, True
+        searches = SearchWatch()  # Its web searches of the turn that have not come back.
         try:
             monitor.start()
             monitor.send_input(prompt)
@@ -4111,8 +4193,15 @@ def _run_structured_process(
                             "codex_event", stage, event=event,
                             activityLabel=activity_label or "",
                         )
+                    searches.item(kind, raw_event.get("item"))
                     if kind == "turn.completed":
                         emit_cache_usage(stage, raw_event.get("usage"))
+                        failed_searches = searches.failed()
+                        if failed_searches:
+                            name = activity_label or _STAGE_ROLES.get(stage) or "model"
+                            emit("diagnostic", stage, label=SEARCH_FAILED_LABEL, activityLabel=activity_label or "",
+                                 failedSearches=failed_searches,
+                                 text=f"{name[:1].upper()}{name[1:]}: {failed_search_text(failed_searches, model)}")
                 except ValueError:  # Includes json.JSONDecodeError.
                     emit(
                         "diagnostic", stage,
@@ -4232,7 +4321,7 @@ def member_problem(error, model):
 
 
 def member_attempt(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
-                   retried=None):
+                   retried=None, noted=None):
     """One attempt of a team member's assignment: a one-shot run of its model in the author's working folder.
 
     Codex models run `codex exec --json` and Claude models `claude -p` (as the critic's calls do), each with the
@@ -4240,7 +4329,8 @@ def member_attempt(member, prompt, conversation, started, *, directory, settings
     of the author's search mode there, the same environment filtering and credentials, no subagents. The reply is
     the member's final message. ``started(process)`` registers the CLI process (a stop ends it); ``record(event,
     root)`` receives its public events; ``retried(text)`` the retries Claude Code makes of a failed API request
-    within the run (claude_cli.run_structured()); ``settings`` holds the job's speed and reasoning summary.
+    within the run (claude_cli.run_structured()); ``noted(text)`` a line the activity log shows of the member (its
+    web searches that failed); ``settings`` holds the job's speed and reasoning summary.
     """
 
     try:
@@ -4261,11 +4351,11 @@ def member_attempt(member, prompt, conversation, started, *, directory, settings
             conversation=conversation, role="author", record=record, started=started, retried=retried)
     return _codex_member_attempt(prompt, model, effort, summary, directory=directory, conversation=conversation,
                                  record=record, started=started, speed=effective_speed(model, settings.get("speed")),
-                                 compact_prompt=compact_prompt)
+                                 compact_prompt=compact_prompt, noted=noted)
 
 
 def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversation, record, started, speed,
-                          compact_prompt):
+                          compact_prompt, noted=None):
     """A Codex team member's attempt (member_attempt()): `codex exec --json`, its session saved for a follow-up."""
 
     child_environment = environment(model)
@@ -4307,6 +4397,7 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
         monitor = RequestMonitor(process, "solve", model, effort, timeout=None, activity_label=None, heartbeat=False)
         # Codex's turn.completed, recorded once the process's own calls are in the job's record (member_usage()).
         provider_errors, began, completed = [], False, None
+        searches = SearchWatch()  # Its web searches that have not come back.
         try:
             monitor.start()
             monitor.send_input(prompt)
@@ -4333,6 +4424,11 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
                     message = failure.get("message") if isinstance(failure, dict) else failure
                     if isinstance(message, str) and message.strip():
                         provider_errors.append(message.strip())
+                searches.item(kind, raw_event.get("item"))
+                if kind == "turn.completed" and noted is not None:
+                    failed_searches = searches.failed()
+                    if failed_searches:
+                        noted(failed_search_text(failed_searches, model), failedSearches=failed_searches)
                 event = public_event(raw_event)
                 if event is not None:
                     monitor.observed(str(event.get("type") or "").startswith("item."))
@@ -4410,11 +4506,17 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
             emit("diagnostic", stage, node=node_name, text=f"Member {member.number} ({member.label}): {text}",
                  subagentId=identity, subagentMember=member.number, subagentModel=member.label,
                  attempt=retries[identity])
+
+        def noted(text, **fields):
+            # A line of the member's own (its web searches that failed), with its assignment's id.
+            emit("diagnostic", stage, node=node_name, label=SEARCH_FAILED_LABEL,
+                 text=f"Member {member.number} ({member.label}): {text}", subagentId=identity,
+                 subagentMember=member.number, subagentModel=member.label, **fields)
         with records.labelled(role="member", member=identity, label=f"Member {member.number}", node=node_name,
                               memberModel=member.label):
             return member_attempt(member, prompt, conversation, started, directory=directory, settings=settings,
                                   compact_prompt=prompts.get("codex_compact_prompt", ""), record=record,
-                                  retried=retried)
+                                  retried=retried, noted=noted)
 
     def conversation(member, base):
         try:
@@ -5449,6 +5551,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # Codex reports the thread's token totals after each model request (thread/tokenUsage/updated): the newest
     # totals, and what the requests of the current turn used, which its "Author cache usage" status shows.
     usage = {"total": None, "turn": {}, "requests": 0}
+    # The root's web searches of the current turn that have not come back (SearchWatch).
+    searches = SearchWatch()
     # The time of the newest message from Codex, and a cheap request that checks it still answers.
     activity = {"last": time.monotonic()}
     probe = {"at": None}
@@ -5947,6 +6051,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 if (team_watch is not None and item.get("type") in {"mcpToolCall", "mcp_tool_call"}
                         and item.get("server") == team_module.SERVER_NAME and item.get("tool") in team_module.TEAM_TOOLS):
                     team_watch.team_call(item.get("id"), finished=method == "item/completed")
+                searches.item(method, item)
             if method == "turn/started":
                 running, answers = True, []
                 state["turn"], state["idle_since"] = turn.get("id"), None
@@ -5982,6 +6087,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 running, state["turn"] = False, None
                 if team_watch is not None:
                     team_watch.turn_ended()
+                failed_searches = searches.failed()
+                if failed_searches and turn.get("status") == "completed":
+                    emit("diagnostic", label=SEARCH_FAILED_LABEL, threadId=thread, failedSearches=failed_searches,
+                         text=f"{'The author coordinator' if coordinator else 'The proof author'}: "
+                              f"{failed_search_text(failed_searches, model)}")
                 if usage["turn"] and hasattr(runtime, "emit_cache_usage"):
                     runtime.emit_cache_usage(stage, usage["turn"], label="Author cache usage",
                                              requests=usage["requests"])
@@ -9732,6 +9842,8 @@ def _main(argv=None):
                                                               "writer_effort")])
         open_record()
         set_web_search(options.get("api_web_search"))
+        if not converse:
+            note_failed_search_checks()
         if converse:
             if len(args.workflows) != 1:
                 raise Error("--converse takes exactly one workflow.")
