@@ -653,6 +653,26 @@ def settings_line(identity, answer, stage="solve", **extra):
                             "time": "2026-11-14T03:05:17.064817+00:00"})
 
 
+def snapshot_taken_before(record, data):
+    """Give ``record`` a transcript snapshot of ``data`` as an earlier build took it: as it came, its state
+    (transcript.json) without "settings". Returns the snapshot's folder."""
+
+    folder = record.folder / "transcript"
+    member = gzip.compress(data, mtime=0)
+    records.write_atomic(folder / "transcript.jsonl.gz", member)
+    records.write_atomic(folder / "transcript.json", json.dumps({
+        "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "size": len(member)}).encode())
+    return folder
+
+
+def downloaded_transcript(name):
+    """The transcript member of the training download of the record ``name``."""
+
+    buffer = io.BytesIO()
+    model_calls.training_record(name, buffer)
+    return zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("transcript/transcript.jsonl")
+
+
 class SettingsCopyTests(unittest.TestCase):
     """A transcript written before 14 Nov 2026 holds Codex's whole answers to config/read (the user's whole Codex
     configuration, MCP servers' environments and headers included): the record's snapshot of it and the training
@@ -741,12 +761,7 @@ class SettingsCopyTests(unittest.TestCase):
     def old_snapshot(self, data):
         """The record's snapshot of ``data`` as an earlier build took it: as it came, its state without "settings"."""
 
-        folder = self.record.folder / "transcript"
-        records.write_atomic(folder / "transcript.jsonl.gz", gzip.compress(data, mtime=0))
-        records.write_atomic(folder / "transcript.json", json.dumps({
-            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-            "size": (folder / "transcript.jsonl.gz").stat().st_size}).encode())
-        return folder
+        return snapshot_taken_before(self.record, data)
 
     def test_a_snapshot_taken_before_keeps_only_those_settings_once_the_record_is_next_opened(self):
         # The job never runs again, so no snapshot replaces it: opening the record does it (the Records list here).
@@ -1013,13 +1028,19 @@ class WebCutoffSettingsTests(unittest.TestCase):
         self.assertEqual(made, {"goal_session": ["rpc.web_cutoff = bool(policy)"],
                                 "author_conversation": ["rpc.web_cutoff = bool(policy)"]})
 
-    def test_a_web_cutoff_record_s_snapshot_and_download_keep_them_from_a_transcript_written_before(self):
+    def own_state(self):
+        """A folder of this test's own, the private state (and so the records) below it."""
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name).resolve()
         change = mock.patch.dict(os.environ, {providers.STORE_ENV: str(root / "state" / "api-models.json")})
         change.start()
         self.addCleanup(change.stop)
+        return root
+
+    def test_a_web_cutoff_record_s_snapshot_and_download_keep_them_from_a_transcript_written_before(self):
+        root = self.own_state()
         transcript = root / "transcript.jsonl"
         transcript.write_text(settings_line(2, WEB_CUTOFF_ANSWER), encoding="utf-8")
         for name, web_cutoff in (("run-cutoff", True), ("run-live", False)):
@@ -1039,6 +1060,57 @@ class WebCutoffSettingsTests(unittest.TestCase):
             [line] = zipfile.ZipFile(io.BytesIO(buffer.getvalue())).read("transcript/transcript.jsonl").splitlines()
             self.assertEqual(json.loads(line)["event"]["result"], entry["event"]["result"], name)
             self.assertEqual("project_doc_max_bytes" in entry["event"]["result"]["config"], web_cutoff, name)
+
+    def test_a_web_cutoff_record_s_snapshot_taken_before_keeps_them_once_the_record_is_next_opened(self):
+        # The job never runs again, so no snapshot replaces it: opening its record (the Records list here, as a new
+        # process) keeps of the whole answer what a snapshot keeps now, the isolation settings too, and the download
+        # then keeps what the record holds (a kept answer is not kept in part again).
+        self.own_state()
+        data = settings_line(2, WEB_CUTOFF_ANSWER).encode()
+        runs = (("run-cutoff", True), ("run-live", False))
+        for name, web_cutoff in runs:
+            record = records.Record.create(records.record_folder(name), title="A statement", webCutoff=web_cutoff)
+            snapshot_taken_before(record, data)
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):
+            model_calls.record_list(lambda name: False)
+        for name, web_cutoff in runs:
+            record = records.Record(records.record_folder(name))
+            self.assertEqual(json.loads((record.folder / "transcript" / "transcript.json").read_text()),
+                             {"settings": records.SNAPSHOT_SETTINGS}, name)
+            [entry] = records.read_transcript(record)
+            self.assertEqual(entry["event"]["result"], runtime.recorded_settings(WEB_CUTOFF_ANSWER, web_cutoff), name)
+            self.assertEqual("project_doc_max_bytes" in entry["event"]["result"]["config"], web_cutoff, name)
+            [line] = downloaded_transcript(name).splitlines()
+            self.assertEqual(json.loads(line)["event"]["result"], entry["event"]["result"], name)
+
+    def test_a_web_cutoff_record_s_snapshot_keeps_them_of_a_whole_answer_appended_later(self):
+        # A runner of an earlier build, still running when the server was updated, records each answer whole: what a
+        # later snapshot appends keeps of it what a snapshot keeps now, the isolation settings too. The member is read
+        # back against what it keeps, so the state names the transcript as copied and the next snapshot appends again.
+        root = self.own_state()
+        start = transcript_line({"kind": "status", "stage": "solve", "label": "Workflow step: author", "time": "t"})
+        for name, web_cutoff in (("run-cutoff", True), ("run-live", False)):
+            record = records.Record.create(records.record_folder(name), title="A statement", webCutoff=web_cutoff)
+            transcript = root / f"{name}.jsonl"
+            transcript.write_text(start, encoding="utf-8")
+            records.snapshot(record, transcript)
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(settings_line(2, WEB_CUTOFF_ANSWER))
+            records.snapshot(record, transcript)
+            folder = record.folder / "transcript"
+            self.assertEqual(gzip_members((folder / "transcript.jsonl.gz").read_bytes()), 2, name)  # Appended to.
+            [_, entry] = records.read_transcript(record)
+            self.assertEqual(entry["event"]["result"], runtime.recorded_settings(WEB_CUTOFF_ANSWER, web_cutoff), name)
+            self.assertEqual("project_doc_max_bytes" in entry["event"]["result"]["config"], web_cutoff, name)
+            data = transcript.read_bytes()
+            self.assertEqual(json.loads((folder / "transcript.json").read_text()), {
+                "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                "size": (folder / "transcript.jsonl.gz").stat().st_size, "settings": records.SNAPSHOT_SETTINGS}, name)
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(transcript_line({"kind": "status", "stage": "solve", "time": "u"}))
+            records.snapshot(record, transcript)
+            self.assertEqual(gzip_members((folder / "transcript.jsonl.gz").read_bytes()), 3, name)
+            self.assertEqual(records.read_transcript(record)[1], entry, name)
 
 
 if __name__ == "__main__":
