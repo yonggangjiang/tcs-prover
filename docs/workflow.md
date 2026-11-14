@@ -435,9 +435,10 @@ Checked with Codex 0.160 against a local stand-in for the model API:
 
 | Codex setting | What it enforces |
 | --- | --- |
-| `features.multi_agent_v2.max_concurrent_threads_per_session` = N + 1 | Version-2 models (GPT 6.x, GPT 5.6 Sol and Terra): at most N subagents at once, counting subagents of subagents ("agent thread limit reached"). A call without subagents gets N = 0, since Codex lists its collaboration tools to these models anyway. |
+| `features.multi_agent_v2.max_concurrent_threads_per_session` = N + 1 | Version-2 models (GPT 6.x, GPT 5.6 Sol and Terra): at most N subagents at once, counting subagents of subagents ("agent thread limit reached"). A call without subagents gets N = 0: with `multi_agent` off Codex still lists its collaboration tools to these models, unless `agents.enabled` is false (below). |
 | `agents.max_concurrent_threads_per_session` = N, `agents.max_depth` = 1 | Version-1 models (API models and others): at most N subagents at once, and subagents get no subagent tool. |
 | `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking; the author coordinator's hint also says that delegating is its task, that waiting for its subagents is part of its work, and that each starts fresh. |
+| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement reviewer, the convention critic, the LaTeX writer and its repair (a `-c` flag), and the thread of an author that works alone or with TCS Prover's team. Its model is offered none of Codex's collaboration tools. |
 
 On version-2 models the author coordinator also gets
 `features.multi_agent_v2.default_wait_timeout_ms` = 1800000, so its waits for

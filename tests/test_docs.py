@@ -157,6 +157,33 @@ class AccuracyTests(unittest.TestCase):
         self.assertNotIn("install MacTeX, then choose **Re-run preflight**", checks)
         self.assertNotIn("held until you install what is missing and choose", flat(DOCS / "models.md"))
 
+    def test_claude_codes_api_error_400_is_named_where_a_refused_request_is_described(self):
+        # Owner decision (13 Nov 2026): on an API connection Claude Code's "API Error: 400" pauses as Codex's 400
+        # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried.
+        self.assertIn('(**Request rejected by the API endpoint**; Claude Code reports it as "API Error: 400" with the '
+                      "endpoint's message)", flat(DOCS / "retries.md"))
+        trouble = flat(DOCS / "troubleshooting.md")
+        self.assertIn('- **Request rejected by the API endpoint** (HTTP 400; Claude Code says "API Error: 400" and the '
+                      "endpoint's message): the endpoint refuses run requests as invalid.", trouble)
+        # Claude Code's own words after "API Error: 400" for a conversation whose tool calls and results do not match
+        # stay retried too (workflow_runner._CLAUDE_HISTORY_MISMATCH).
+        self.assertIn("A conversation too long for the model, a key out of credit, and Claude Code's own words for a "
+                      "conversation whose tool calls and results do not match (\"API Error: 400 due to tool use "
+                      "concurrency issues\", \"… orphaned tool_result …\", \"… duplicate tool_use ID …\") are retried "
+                      "every minute instead.", trouble)
+
+    def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
+        # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the
+        # multi_agent feature (workflow_runner.structured_limits()); the critic keeps Codex's subagents.
+        developers = flat(DOCS / "developers.md")
+        self.assertIn("A structured call of Codex without subagents (the statement reviewer, the convention critic, "
+                      "and the LaTeX editor and repair) also has Codex's agents off (`-c agents.enabled=false`, "
+                      "`structured_limits()`).", developers)
+        self.assertIn("The critic keeps them for its independent critics.", developers)
+        self.assertIn("| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement "
+                      "reviewer, the convention critic, the LaTeX writer and its repair (a `-c` flag)",
+                      flat(DOCS / "workflow.md"))
+
     def test_python_commands_name_the_checkouts_venv(self):
         # A stock Mac's python3 is 3.9 (no tomllib) and it has no `python`; only web_ui.py switches to the .venv
         # by itself (and the transcript viewer needs nothing newer).
@@ -280,6 +307,7 @@ class SharedWorksDocsTests(unittest.TestCase):
                        "New problems no longer get it", "problems whose author has not started",
                        "**Related works removed**", "stopped and finished problems keep their copy",
                        "as do web-cutoff problems", "saved under a new name", "**from the batch**",
+                       "A work removed here that the problem kept is marked **from the batch, no longer shared**",
                        "**from the folder run**", "recorded in the run's audit log", "**Remove** never takes one away",
                        "New terminal runs do not get them", "Deleting a batch deletes what it shares",
                        "200 works per batch", "a start that would pass it is refused before any job is created",
@@ -290,11 +318,16 @@ class SharedWorksDocsTests(unittest.TestCase):
         self.assertIn("**Shared with a folder run**", text)
         self.assertIn("removes one that has no problems left, with the related works it shares", text)
         self.assertNotIn("Batch related works", text)
+        # The Overview lists the default batch before its first problem, so works can be shared with it first.
+        self.assertIn("and terminal runs. It is always listed, also before its first problem, so you can open it and "
+                      "share related works with it first.", text)
 
     def test_the_other_guides_point_to_it_and_quote_the_page(self):
         job = flat(DOCS / "job-page.md")
         for needed in ("[shares related works](batches.md#shared-related-works)", "**Open the batch page**",
                        "**from the batch**", "**from the folder run**", "**Related works removed**",
+                       "A work removed from the batch's shared works that this job kept is marked **from the batch, no "
+                       "longer shared**",
                        "every other job keeps its copy", "200 works per job (shared ones included)"):
             with self.subTest(needed=needed):
                 self.assertIn(needed, job)
@@ -307,7 +340,8 @@ class SharedWorksDocsTests(unittest.TestCase):
         for needed in ('class="batch-related-heading">Shared with every problem in this batch</h2>',
                        'class="batch-related-heading">Shared with a folder run</h2>'):
             self.assertIn(needed, page)
-        for needed in ('"from the batch"', '"from the folder run"', '"Open the batch page"',
+        for needed in ('"from the batch"', '"from the batch, no longer shared"', '"from the folder run"',
+                       '"Open the batch page"',
                        "shared related work${shared === 1"):
             self.assertIn(needed, app)
         self.assertIn('"label": "Related works removed"', server)

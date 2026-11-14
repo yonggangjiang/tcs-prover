@@ -372,6 +372,31 @@ class HistoricalPolicyTests(unittest.TestCase):
             read["layers"][0]["config"].pop("model_reasoning_effort")
             retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=retrieval.agent_limits(0))
 
+    def test_a_structured_call_without_subagents_is_checked_with_codex_s_agents_off(self):
+        # Its checked app-server is started with what the call gets (runtime.structured_limits()): a session of one
+        # thread and `-c agents.enabled=false`, which Codex 0.160 reports with its other agent settings unset.
+        limits = runtime.structured_limits((), None)
+        self.assertEqual(retrieval.agent_limit_arguments(limits),
+                         ["-c", "features.multi_agent_v2.max_concurrent_threads_per_session=1",
+                          "-c", "agents.enabled=false"])
+        with patch.object(retrieval, "_sandbox_canaries"), patch.object(retrieval, "_macos_network_canaries"):
+            policy, messages, rpc, environment = self.configured_rpc("structured")
+            read = messages["config/read"]
+            read["config"]["features"]["multi_agent_v2"] = {"enabled": False, "max_concurrent_threads_per_session": 1}
+            read["config"]["agents"] = {"enabled": False, "max_depth": None, "default_subagent_model": None,
+                                        "max_concurrent_threads_per_session": None}
+            read["layers"].insert(0, {"name": {"type": "sessionFlags"}, "config": json.loads(json.dumps(limits))})
+            retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=limits)
+            # Checked as a call that keeps Codex's agents, the same process is refused ...
+            with self.assertRaisesRegex(retrieval.RetrievalPolicyError, "inherited"):
+                retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=retrieval.agent_limits(0))
+            # ... and so is one whose agents are not off.
+            for enabled in (True, None):
+                read["config"]["agents"]["enabled"] = enabled
+                with self.subTest(enabled=enabled), \
+                        self.assertRaisesRegex(retrieval.RetrievalPolicyError, "inherited agents"):
+                    retrieval.verify_rpc(rpc, policy, "structured", environment, agent_limits=limits)
+
     def test_a_process_checked_without_subagent_limits_must_have_the_feature_off(self):
         # The launch preflight (ui/retrieval.py) and the First Proof launcher check their processes without limits:
         # the generated `features.multi_agent_v2 = false` must then be exactly what Codex reports.
@@ -719,9 +744,11 @@ class HistoricalPolicyTests(unittest.TestCase):
             self.assertIn(flag, command)
         self.assertLess(command.index(flags(made[-1])[0]), command.index("exec"))
         self.assertFalse(made[-1].exists())  # Removed when the call ended.
-        # The writer has no subagents: its check and its process both have the session limit of one thread.
-        self.assertEqual(limits[-1], retrieval.agent_limits(0))
+        # The writer has no subagents: its check and its process both have the session limit of one thread, and
+        # Codex's agents off.
+        self.assertEqual(limits[-1], {**retrieval.agent_limits(0), "agents": {"enabled": False}})
         self.assertIn("features.multi_agent_v2.max_concurrent_threads_per_session=1", command)
+        self.assertIn("agents.enabled=false", command)
         # Nor Codex's goal tools, as every structured call: a flag of the process, which the check never reads.
         self.assertIn(["--disable", "goals"], [command[index:index + 2] for index in range(command.index("exec"))])
 

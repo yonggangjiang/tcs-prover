@@ -343,8 +343,9 @@ do, so the proof must still be complete and self-contained.
   with your next message or **Resume** while it is paused.
 - The list marks the works its batch shares with every problem **from the
   batch**, and those of its folder run **from the folder run**; the note above
-  the list says where they are managed (the batch page). The others are the
-  job's own.
+  the list says where they are managed (the batch page). A work removed from
+  the batch's shared works that this job kept is marked **from the batch, no
+  longer shared**. The others are the job's own.
 - Works are only ever added to a job: its page cannot remove or download them,
   and a saved file is never overwritten. The one exception: a work removed from
   the batch's shared works also leaves the jobs whose author has not started

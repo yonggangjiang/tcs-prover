@@ -78,9 +78,14 @@ resets. To use fewer at once, set a [running-jobs limit](batches.md#running-jobs
 **An API connection fails.**
 - **401 · Missing API key**: the format, base URL and key do not match what the
   service expects.
-- **Request rejected by the API endpoint** (HTTP 400): the endpoint refuses run
-  requests as invalid. Edit the connection; an error-paused job resumes by
-  itself once its connection's settings change.
+- **Request rejected by the API endpoint** (HTTP 400; Claude Code says "API
+  Error: 400" and the endpoint's message): the endpoint refuses run requests as
+  invalid. Edit the connection; an error-paused job resumes by itself once its
+  connection's settings change. A conversation too long for the model, a key
+  out of credit, and Claude Code's own words for a conversation whose tool calls
+  and results do not match ("API Error: 400 due to tool use concurrency issues",
+  "… orphaned tool_result …", "… duplicate tool_use ID …") are retried every
+  minute instead.
 - OpenAI-format models need the native Codex binary on `PATH`: a `codex`
   launcher that replaces `CODEX_HOME` cannot run them.
 - Anthropic-format models run in bare mode (the activity log says why) when your

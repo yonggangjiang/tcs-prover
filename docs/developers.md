@@ -147,6 +147,18 @@ the entry point.
   with the real Codex against a scripted model server). A web-cutoff call gets
   the same flag; its isolation check (the preflight's `config/read`) is
   unchanged, and the historical discovery call had the feature off already.
+- A structured call of Codex without subagents (the statement reviewer, the
+  convention critic, and the LaTeX editor and repair) also has Codex's agents
+  off (`-c agents.enabled=false`, `structured_limits()`). Without it Codex 0.160
+  offered GPT 6.1 Sol its collaboration tools (`spawn_agent`, `wait_agent`, ...)
+  and its multi-agent instructions there too, where only the session limit of
+  one thread refused a spawn; with it the model gets neither (checked with the
+  real Codex against a scripted model server). The critic keeps them for its
+  independent critics. A web-cutoff call's preflight starts its checked
+  app-server with the same flag and compares the `agents` that `config/read`
+  reports exactly (`enabled = false`, the rest unset): the real preflight of
+  the structured role and of a critic snapshot passes, and `--strict-config`
+  accepts the flag.
 - A structured node with `proof_handoff` gets the proof snapshot as read-only
   files (the convention critic uses this without `edit`). With `edit` and
   `proof_handoff` its result also has `proofChanged` and `proofDiff` (or, for a

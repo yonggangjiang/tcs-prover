@@ -3825,8 +3825,10 @@ class App:
         if state["retrieval"]["mode"] == "historical":
             state["retrievalMode"] = "historical"
             state["retrievalCutoffUtc"] = state["retrieval"]["cutoffExclusiveUtc"]
-        # Read from the manifests without the job lock (listing never raises).
-        items = related_works.listing(workspace, controller_directory(workspace)) if workspace else []
+        # Read from the manifests without the job lock (listing never raises). A work from the batch that the batch
+        # no longer shares (removed there after this job kept its copy) is marked so.
+        shares = related_works.store_shares(self.runs / CONTROLLER_FOLDER)
+        items = related_works.listing(workspace, controller_directory(workspace), shares) if workspace else []
         batch = None
         if folder_batch:
             try:
@@ -10690,7 +10692,7 @@ class Server(ThreadingHTTPServer):
         return "That job is not in this batch." if app is not None and self.batch_of(app) != batch else ""
 
     def batch_cards(self):
-        """The /batches answer: the default batch (while it has jobs), the batches made with New batch (newest
+        """The /batches answer: the default batch (always, empty too), the batches made with New batch (newest
         first, empty ones too), then the saved folders of runs, read-only. ``canCreateBatches`` offers New batch
         (an older server or the live gateway sends none); ``batchesProblem`` says why the list cannot be read."""
 
@@ -10719,11 +10721,10 @@ class Server(ThreadingHTTPServer):
                     # The related works it shares with every problem: the card and the New problem page show them.
                     "sharedWorks": self.batch_shared_summary(batch_id), **extra}
 
-        cards = []
-        # The default batch is listed while it has problems, or works it shares with new ones.
-        if groups.get(DEFAULT_BATCH) or self.batch_shared_summary(DEFAULT_BATCH)["count"]:
-            cards.append(card(DEFAULT_BATCH, named_batches.DEFAULT_NAME, groups.get(DEFAULT_BATCH, []), current=True,
-                              default=True, runningLimit=getattr(self, "installation", {}).get("maxRunningJobs", 0)))
+        # The default batch is always listed, also with no problem and nothing shared: its page can share related
+        # works with every problem before the first one.
+        cards = [card(DEFAULT_BATCH, named_batches.DEFAULT_NAME, groups.get(DEFAULT_BATCH, []), current=True,
+                      default=True, runningLimit=getattr(self, "installation", {}).get("maxRunningJobs", 0))]
         for entry in reversed(entries):  # Newest first: the file lists them in the order they were made.
             cards.append(card(entry["id"], entry["name"], groups.get(entry["id"], []), current=False, named=True,
                               createdAt=entry["createdAt"]))

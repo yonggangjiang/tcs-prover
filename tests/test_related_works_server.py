@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import unittest
@@ -669,6 +670,49 @@ class SharedWorksTests(RelatedWorksCase):
             with self.assertRaises(ValueError):
                 self.manager.remove_batch_shared_work(name, "")
 
+    def test_a_job_that_kept_a_work_removed_from_its_batch_lists_it_as_no_longer_shared(self):
+        self.share("", "a.txt", "b.txt")
+        # The job's own b.txt keeps its name, so the batch's b.txt is b-2.txt in its folder.
+        running = self.start(relatedWorks=[self.upload("b.txt", b"own")])
+        running.state.update(goalThreadId="thread-1")
+        queued = self.start()
+        queued.state.update(phase="prepared")
+        named = self.manager.named_batches.create("Graph coloring")["id"]
+        other = self.manager.start_workflow({"content": "Prove T.", "workflowStages": dict(STAGES)}, batch=named)
+        self.share(named, "a.txt")
+
+        def marks(app):
+            return [(item["name"], item["sharedFrom"], item.get("noLongerShared", False))
+                    for item in app.snapshot()["relatedWorks"]["items"]]
+
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", False), ("b-2.txt", "batch", False)])
+        self.manager.remove_batch_shared_work("a.txt", "")
+        # The started job kept a.txt, which its batch no longer shares; the job that had not started lost it. Works
+        # still shared (by their name in the batch), the job's own and another batch's work of the same name are not
+        # marked.
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", True), ("b-2.txt", "batch", False)])
+        self.assertEqual(marks(queued), [("b.txt", "batch", False)])
+        self.assertEqual(marks(other), [("a.txt", "batch", False)])
+        # A work shared later under the same name is another work, shared; the kept one stays no longer shared.
+        self.assertEqual(self.share("", "a.txt")["added"], ["a-2.txt"])
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", True), ("b-2.txt", "batch", False),
+                                          ("a-2.txt", "batch", False)])
+        # Removing b.txt from the batch marks the job's b-2.txt, never its own b.txt.
+        self.manager.remove_batch_shared_work("b.txt", "")
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", True), ("b-2.txt", "batch", True),
+                                          ("a-2.txt", "batch", False)])
+        # A batch whose record cannot be read marks none: the list cannot tell what it shares.
+        manifest = server.batch_shared_store(self.runs, "").root / related_works.MANIFEST_NAME
+        saved = manifest.read_bytes()
+        manifest.write_text("{")
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", False), ("b-2.txt", "batch", False),
+                                          ("a-2.txt", "batch", False)])
+        # A batch whose store is gone shares none of them.
+        manifest.write_bytes(saved)
+        shutil.rmtree(server.batch_shared_store(self.runs, "").root)
+        self.assertEqual(marks(running), [("b.txt", "", False), ("a.txt", "batch", True), ("b-2.txt", "batch", True),
+                                          ("a-2.txt", "batch", True)])
+
     def test_a_job_made_while_its_batch_changes_is_brought_in_line_when_registered(self):
         self.share("", "a.txt")
         store = server.batch_shared_store(self.runs, "")
@@ -798,8 +842,9 @@ class SharedWorksTests(RelatedWorksCase):
         self.share(named, "a.md", "b.md", "c.md", "d.md")
         cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
         self.assertEqual(cards[named]["sharedWorks"], {"count": 4, "names": ["a.md", "b.md", "c.md"]})
-        # The default batch is listed once it shares works, even with no problem yet.
-        self.assertNotIn(server.DEFAULT_BATCH, cards)
+        # The default batch is always listed, also with no problem yet; its card counts what it shares.
+        self.assertEqual((cards[server.DEFAULT_BATCH]["jobCount"], cards[server.DEFAULT_BATCH]["sharedWorks"]),
+                         (0, {"count": 0, "names": []}))
         self.share("", "root.md")
         cards = {card["id"]: card for card in self.manager.batch_cards()["batches"]}
         self.assertEqual((cards[server.DEFAULT_BATCH]["jobCount"], cards[server.DEFAULT_BATCH]["sharedWorks"]),

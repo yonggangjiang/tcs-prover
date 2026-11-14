@@ -555,9 +555,21 @@ _MODEL_UNAVAILABLE = re.compile(
 # Words of a passing condition, which keep a failure retried whatever else it says.
 _PASSING_CONDITION = re.compile(r"capacity|overload|high demand|temporar|\b429\b|rate ?limit|\b5\d\d\b",
                                 re.IGNORECASE)
-# An endpoint that refuses the request itself as malformed for it.
-_REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b",
-                               re.IGNORECASE)
+# An endpoint that refuses the request itself as malformed for it: an OpenAI-format endpoint's 400
+# invalid_request_error as Codex reports it, and an Anthropic-format endpoint's (its invalid_request_error) as Claude
+# Code reports it, "API Error: 400 <the endpoint's message>" (Claude Code 2.1.289, from a fake endpoint). Claude Code
+# words a conversation too long for the model ("Prompt is too long …") and a key out of credit ("Credit balance is too
+# low") otherwise, with no "API Error: 400": both stay retried, as do the three 400s it reports in its own words after
+# "API Error: 400" (_CLAUDE_HISTORY_MISMATCH).
+_REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b|"
+                               r"\bAPI Error: 400\b", re.IGNORECASE)
+# Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
+# conversation because its tool calls and tool results do not pair up (Claude Code 2.1.289 marks all three
+# api_error "tool_history_mismatch"): a fault in Claude Code's record of the conversation, not in the connection's
+# settings, so they stay retried.
+_CLAUDE_HISTORY_MISMATCH = re.compile(r"\bAPI Error: 400 (?:due to tool use concurrency issues|orphaned tool_result "
+                                      r"in conversation history|duplicate tool_use ID in conversation history)\b",
+                                      re.IGNORECASE)
 
 
 def settings_failure(error, model=None):
@@ -566,7 +578,9 @@ def settings_failure(error, model=None):
     No retry fixes a model that does not exist or that this account cannot
     use (ModelUnavailable), an API model's endpoint that refuses the request
     as invalid (RequestRejected; a conversation that is too long is not
-    that), or private TCS Prover state that cannot be used (a ProviderError).
+    that, nor one whose tool calls and results Claude Code reports as not
+    pairing up), or private TCS Prover state that cannot be used (a
+    ProviderError).
     These end a structured call and pause an author with a message saying
     what to change; every other failure keeps being retried.
     """
@@ -595,7 +609,7 @@ def settings_failure(error, model=None):
                else "check that the model exists and that your login may use it")
         return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
                                 f"A retry cannot fix this: {fix}.")
-    if api and _REJECTED_REQUEST.search(text):
+    if api and _REJECTED_REQUEST.search(text) and not _CLAUDE_HISTORY_MISMATCH.search(text):
         return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
                                f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
                                "under Models & API (or the endpoint); a job waiting for it continues once its "
@@ -2359,6 +2373,21 @@ def subagent_limits(features, subagents, coordinator=None, long_waits=True):
     return retrieval_runtime.agent_limits(subagents, SUBAGENT_HINT.format(count=subagents, s=s))
 
 
+def structured_limits(features, subagents=None):
+    """The agent settings of one structured `codex exec` call: subagent_limits(), and for a call without the
+    multi_agent feature also Codex's agents off (agents.enabled = false).
+
+    The statement reviewer, the convention critic, the LaTeX editor and its repair start no subagent. Without that
+    setting Codex 0.160 still offers a model of multi-agent version 2 (GPT 6.x) its collaboration tools there, and
+    only the session limit of one thread refuses a spawn. The critic, which starts its independent critics as Codex
+    subagents, keeps them. A web-cutoff call's preflight checks these same settings (retrieval_environment()).
+    """
+    limits = subagent_limits(features, subagents)
+    if "multi_agent" in features:
+        return limits
+    return retrieval_runtime._merged(limits, {"agents": {"enabled": False}})
+
+
 def author_limits(features, settings):
     """subagent_limits() of the author's Codex app-server: a coordinator (``settings["coordinator"]``) gets its own
     hint and, unless the run is a web-cutoff run (``settings["web_cutoff"]``, see COORDINATOR_WAIT_MS), its
@@ -2379,7 +2408,7 @@ def structured_tool_arguments(stage, features=(), policy=None, subagents=None):
         # against a scripted model server).
         "--disable", "goals",
         *[argument for feature in ("shell_tool", "multi_agent") if feature not in features for argument in ("--disable", feature)],
-        *retrieval_runtime.agent_limit_arguments(subagent_limits(features, subagents)),
+        *retrieval_runtime.agent_limit_arguments(structured_limits(features, subagents)),
     ]
 
 
@@ -3473,7 +3502,7 @@ def run_structured_attempt(
     """
 
     policy = retrieval_policy(features=features)
-    limits = subagent_limits(features, subagents)
+    limits = structured_limits(features, subagents)
     claude = providers.harness(chosen_model(model)) == providers.CLAUDE
     if claude and policy:
         raise ConfigurationError(HISTORICAL_CODEX_ONLY)

@@ -350,15 +350,29 @@ class CodexLimitTests(unittest.TestCase):
                         argv = runtime.structured_tool_arguments(stage, features, policy, subagents)
                         self.assertIn(["--disable", "goals"], [argv[index:index + 2] for index in range(len(argv))])
 
-    def test_every_call_without_subagents_gets_a_session_of_one_thread(self):
+    def test_every_call_without_subagents_gets_a_session_of_one_thread_and_codex_s_agents_off(self):
+        # The statement reviewer, the convention critic, the LaTeX editor and its repair, live or web cutoff: Codex
+        # 0.160 otherwise offers GPT 6.x its collaboration tools, which only the session limit would refuse.
         for stage in ("review", "final", "critic"):
-            with self.subTest(stage=stage):
-                argv = runtime.structured_tool_arguments(stage, (), None)
-                self.assertIn(["--disable", "multi_agent"], [argv[index:index + 2] for index in range(len(argv))])
-                self.assertEqual([pair[1] for pair in self.pairs(argv) if "agent" in pair[1]],
-                                 ["features.multi_agent_v2.max_concurrent_threads_per_session=1"])
+            for features in ((), ("shell_tool",)):
+                for policy in (None, {"mode": "historical"}):
+                    with self.subTest(stage=stage, features=features, policy=bool(policy)):
+                        argv = runtime.structured_tool_arguments(stage, features, policy)
+                        self.assertIn(["--disable", "multi_agent"],
+                                      [argv[index:index + 2] for index in range(len(argv))])
+                        self.assertEqual([pair[1] for pair in self.pairs(argv) if "agent" in pair[1]],
+                                         ["features.multi_agent_v2.max_concurrent_threads_per_session=1",
+                                          "agents.enabled=false"])
+        # A web-cutoff call's preflight checks the same settings.
+        self.assertEqual(runtime.structured_limits(("shell_tool",)),
+                         {"features": {"multi_agent_v2": {"max_concurrent_threads_per_session": 1}},
+                          "agents": {"enabled": False}})
+        # The critic starts its independent critics as Codex subagents: its own limits, and Codex's agents on.
+        self.assertEqual(runtime.structured_limits(("multi_agent", "shell_tool"), 3),
+                         runtime.subagent_limits(("multi_agent", "shell_tool"), 3))
         # A workflow node that asks for multi_agent without a number keeps Codex's own limits.
         self.assertEqual(runtime.subagent_limits(["multi_agent"], None), {})
+        self.assertEqual(runtime.structured_limits(["multi_agent"], None), {})
 
     def test_the_reviewer_and_the_writer_have_no_subagent_tool(self):
         calls = []
