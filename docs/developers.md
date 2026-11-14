@@ -724,7 +724,8 @@ writes a job's record, `ui/model_calls.py` reads it.
   written before 14 Nov 2026 has folders of the default mode below its own; they
   are made 0700 when it is next opened (a route, the Records list, a runner or a
   snapshot of its job; `records._private_tree()`, once per process, never
-  through a link). The server makes it
+  through a link), and its Codex call lines get `reasoning` then too (below).
+  The server makes it
   when a runner, review worker or reply turn of the job first starts and names it
   in `TCS_PROVER_RECORD` (`records.RECORD_ENV`) for that process; `environment()`
   removes the variable from every child, so no CLI or model command learns it. A
@@ -781,8 +782,13 @@ writes a job's record, `ui/model_calls.py` reads it.
   failed or cancelled request's partial one too) holds of reasoning
   (`reasoning`: how many reasoning items came back, whether one carried raw
   reasoning text), from which the list gives `hidden_reasoning` as the call
-  detail does from the items (for a line written before it existed the list
-  reads the response). A bundle whose manifest or events are not of
+  detail does from the items. A line written before it existed (before 14 Nov
+  2026) gets it when its record is next opened (`records._fill_reasoning()`,
+  once per process, under the record's lock: `calls.jsonl` is written again
+  whole beside itself and swapped in only once complete and synced, so a crash
+  leaves it as it was; each line keeps its bytes, the field added at its end; a
+  reader that read the file before reads it again from its start), so the list
+  reads no response. A bundle whose manifest or events are not of
   schema version 1 (a later Codex: the installed one updates itself) stays as
   it is, its requests marked `trace format not recognized` as their starts are
   read, and the record's problems say so as soon as a running process's bundle

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import tracemalloc
 import unittest
 from unittest import mock
@@ -568,12 +569,151 @@ class CodexPlaceholderKindsTests(RecordCase):
             return [(row["status"], row["placeholderKinds"]) for row in rows]
 
         self.assertEqual(kinds(), list(zip(["completed", "completed", "cancelled", "completed"], expected)))
-        # A call line written by an earlier build does not say what came back of reasoning: its response does.
+        # A call line written by an earlier build does not say what came back of reasoning: its response does, and the
+        # line gets it when the record is next opened (here as by a new process), so the list reads no response.
         path = self.record.folder / "calls.jsonl"
-        older = [{key: value for key, value in json.loads(text).items() if key != "reasoning"}
-                 for text in path.read_text().splitlines()]
+        lines = [json.loads(text) for text in path.read_text().splitlines()]
+        older = [{key: value for key, value in line.items() if key != "reasoning"} for line in lines]
         path.write_text("".join(json.dumps(line) + "\n" for line in older))
+        with mock.patch.object(records, "_FILLED", set()), \
+                mock.patch.object(model_calls, "_payload", side_effect=AssertionError("the list read a response")):
+            rows = model_calls.call_list("run-1")["calls"]
+        self.assertEqual([row["placeholderKinds"] for row in rows], expected)
+        self.assertEqual([json.loads(text) for text in path.read_text().splitlines()], lines)
         self.assertEqual(kinds(), list(zip(["completed", "completed", "cancelled", "completed"], expected)))
+
+
+class Crash(BaseException):
+    """The process dies here (a kill, a power cut): nothing after this point runs, no handler catches it."""
+
+
+class ReasoningFillTests(RecordCase):
+    """A Codex call line written before 14 Nov 2026 (commit 31baabd) lacks "reasoning": it gets it once, when the
+    record is next opened (records._fill_reasoning()), atomically and under the record's lock, each line keeping its
+    bytes; the list then reads no response per row."""
+
+    SHOWN = ["token_probabilities", "network_only"]
+
+    def setUp(self):
+        super().setUp()
+        raw = {"type": "reasoning", "id": "rs_9", "summary": [],
+               "content": [{"type": "reasoning_text", "text": "RAW-REASONING the thoughts"}]}
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        no_tokens = {**USAGE, "reasoning_output_tokens": 0}
+        bundle.call("call-a", request([PROMPT]), [REASONING, ANSWER])
+        bundle.call("call-b", request([PROMPT, REASONING, ANSWER, PROMPT]), [raw, ANSWER], usage=no_tokens)
+        bundle.call("call-c", request([PROMPT]), [ANSWER], usage=no_tokens)
+        bundle.call("call-d", request([PROMPT]), status="interrupted")
+        self.ingest(bundle)
+        self.path = self.record.folder / "calls.jsonl"
+        built = self.path.read_bytes().split(b"\n")[:-1]  # As this build writes them, "reasoning" last.
+        self.assertEqual([b'"reasoning"' in line for line in built], [True, True, True, False])
+        # As an earlier build wrote them: without "reasoning"; with a Claude Code line, a line a crash cut short in
+        # the middle (the next append started a new line after it) and one at the end.
+        older = [json.dumps({key: value for key, value in json.loads(line).items() if key != "reasoning"},
+                            ensure_ascii=False, separators=(",", ":")).encode() for line in built]
+        claude = (b'{"id":"c000005","program":"claude","process":"x","callId":"msg_1","status":"completed",'
+                  b'"thinking":false}')
+        middle, end = b'{"id":"c000099","program":"codex","respo', b'{"id":"c000100","prog'
+        self.older = b"\n".join(older[:2] + [middle] + older[2:] + [claude, end])
+        self.filled = b"\n".join(built[:2] + [middle] + built[2:] + [claude, end])
+        self.path.write_bytes(self.older)
+        change = mock.patch.object(records, "_FILLED", set())  # As a new process: the record is not opened yet.
+        change.start()
+        self.addCleanup(change.stop)
+
+    def kinds(self):
+        """The list's placeholder kinds of the Codex rows, each checked against its detail's."""
+
+        with mock.patch.object(model_calls, "_payload", side_effect=AssertionError("the list read a response")):
+            rows = model_calls.call_list("run-1")["calls"]
+        found = []
+        for row in rows:
+            if row["program"] != "codex":
+                continue
+            detail = model_calls.call_detail("run-1", row["id"])
+            self.assertEqual(row["placeholderKinds"],
+                             list(dict.fromkeys(item["kind"] for item in detail["placeholders"])), row["id"])
+            found.append(row["placeholderKinds"])
+        return found
+
+    def test_older_lines_get_it_once_when_the_record_is_next_opened_and_keep_their_bytes(self):
+        self.assertEqual(self.kinds(), [["hidden_reasoning", *self.SHOWN], self.SHOWN, self.SHOWN,
+                                        [*self.SHOWN, "interrupted"]])
+        self.assertEqual(self.path.read_bytes(), self.filled)
+        # Opened again by this process: nothing is read again; by a later one: nothing is left to fill.
+        inode = self.path.stat().st_ino
+        with mock.patch.object(records, "_lacking_reasoning", wraps=records._lacking_reasoning) as looked:
+            model_calls.call_list("run-1")
+            records.Record(self.record.folder)
+        self.assertEqual(looked.call_count, 0)
+        with mock.patch.object(records, "_FILLED", set()):
+            records.Record(self.record.folder)
+        self.assertEqual((self.path.stat().st_ino, self.path.read_bytes()), (inode, self.filled))
+        self.assertEqual(oct(self.path.stat().st_mode & 0o777), "0o600")
+
+    def test_a_crash_while_it_writes_leaves_the_lines_as_they_were_and_the_next_opening_fills_them(self):
+        def crash(stream):
+            raise Crash()
+
+        with mock.patch.object(records, "_fsync", crash), self.assertRaises(Crash):
+            records.Record(self.record.folder)
+        self.assertEqual(self.path.read_bytes(), self.older)
+        # A copy a crash left half written is the record's bookkeeping: never read, never downloaded.
+        (self.record.folder / ".calls.jsonl.0badc0de.tmp").write_bytes(self.filled[:40])
+        with mock.patch.object(records, "_FILLED", set()):
+            records.Record(self.record.folder)
+        self.assertEqual(self.path.read_bytes(), self.filled)
+        self.assertNotIn("record/.calls.jsonl.0badc0de.tmp", download().namelist())
+
+    def test_a_reader_that_read_the_lines_before_reads_them_again_from_the_start(self):
+        # A runner's record (its Recorder) keeps reading and appending to calls.jsonl while the server opens it.
+        reader = records.CallLog(self.path)
+        before = [line["id"] for line in reader.read()]
+        records.Record(self.record.folder)
+        after = reader.read()
+        self.assertEqual([line["id"] for line in after], before)
+        self.assertEqual([line.get("reasoning") for line in after],
+                         [{"items": 1, "rawText": False}, {"items": 1, "rawText": True}, {"items": 0, "rawText": False},
+                          None, None])
+        with self.record.locked():
+            self.assertEqual(reader.append([{"program": "codex", "kind": "request", "process": "p", "callId": "e",
+                                             "status": "interrupted"}]), ["c000006"])
+
+    def test_a_line_whose_response_cannot_be_read_is_left_as_it_is(self):
+        older = self.older.replace(b'"response":"payloads/', b'"response":"payloads/9', 1)  # The first call's.
+        self.path.write_bytes(older)
+        # Like its detail, the list takes it for a call whose response has no reasoning item: its tokens say there
+        # was reasoning.
+        self.assertEqual(self.kinds()[0], ["hidden_reasoning", *self.SHOWN])
+        self.assertEqual(self.path.read_bytes().split(b"\n")[0], older.split(b"\n")[0])
+        self.assertEqual(self.path.read_bytes().split(b"\n")[1:], self.filled.split(b"\n")[1:])
+
+    def test_the_lines_are_filled_under_the_record_s_lock(self):
+        # A writer of the job (a runner storing a trace) holds the lock and appends while the record is opened: the
+        # opening waits, reads no response before it has the lock, and keeps the appended line.
+        reading, appended = threading.Event(), threading.Event()
+        real = records._response_reasoning
+
+        def read_response(record, line, bundles):
+            reading.set()
+            appended.wait(5)
+            return real(record, line, bundles)
+
+        with mock.patch.object(records, "_response_reasoning", read_response):
+            with self.record.locked():
+                opening = threading.Thread(target=records.Record, args=(self.record.folder,))
+                opening.start()
+                self.assertFalse(reading.wait(0.5))
+                self.record.calls.append([{"program": "codex", "kind": "request", "process": "p", "callId": "late",
+                                           "status": "interrupted"}])
+                appended.set()
+            opening.join(10)
+        self.assertFalse(opening.is_alive())
+        lines = records.CallLog(self.path).read()
+        self.assertEqual([line["callId"] for line in lines], ["call-a", "call-b", "call-c", "call-d", "msg_1", "late"])
+        self.assertEqual(sum("reasoning" in line for line in lines), 3)
 
 
 class RoundTests(unittest.TestCase):

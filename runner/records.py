@@ -471,13 +471,15 @@ class CallLog:
     """calls.jsonl: one line per model request, appended under the record's lock and synced.
 
     Every line has an "id" ("c" and six digits, in writing order). A line cut short by a crash is skipped by readers;
-    the next write starts a new line after it.
+    the next write starts a new line after it. The file is only ever replaced whole once (_fill_reasoning(), under the
+    record's lock): a reader that finds another file there than the one it read reads it from the start.
     """
 
     def __init__(self, path):
         self.path = Path(path)
         self._lines = []
         self._size = 0
+        self._file = None  # (device, inode) of the file read so far
         self._lock = threading.RLock()
 
     def read(self):
@@ -486,6 +488,10 @@ class CallLog:
         with self._lock:
             try:
                 with open(self.path, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if self._file is not None and self._file != (info.st_dev, info.st_ino):
+                        self._lines, self._size = [], 0  # Replaced whole: read again from its start.
+                    self._file = (info.st_dev, info.st_ino)
                     stream.seek(self._size)
                     data = stream.read()
             except OSError:
@@ -531,7 +537,8 @@ class CallLog:
 class Record:
     """One job's record folder (see the module's description). Opening one (by a route, the Records list, a runner,
     review worker or reply turn of its job, or the server's snapshot) makes every folder of an older record
-    owner-only (_private_tree())."""
+    owner-only (_private_tree()) and gives its Codex call lines written before 14 Nov 2026 their "reasoning"
+    (_fill_reasoning()), once per process."""
 
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -539,6 +546,7 @@ class Record:
         self.calls = CallLog(self.folder / "calls.jsonl")
         self._lock = FileLock(self.folder / ".lock")
         _private_tree(self.folder)
+        _fill_reasoning(self)
 
     @classmethod
     def create(cls, folder, **manifest):
@@ -814,6 +822,91 @@ def reasoning_facts(items):
     reasoning = [item for item in items if isinstance(item, dict) and item.get("type") in REASONING_ITEMS]
     return {"items": len(reasoning),
             "rawText": any(bool(item.get("content")) for item in reasoning if item.get("type") == "reasoning")}
+
+
+_FILLED = set()  # The record folders whose Codex call lines this process gave "reasoning" (_fill_reasoning())
+_FILLED_LOCK = threading.Lock()
+
+
+def _response_reasoning(record, line, bundles):
+    """reasoning_facts() of a Codex call's stored response (a failed or cancelled call's partial one), or of its raw
+    payload while its trace is not stored yet; None when it cannot be read. ``bundles``: StoredBundle by (process,
+    bundle), each loaded once."""
+
+    key = (line.get("process"), line.get("bundle"))
+    if not all(isinstance(part, str) for part in key):
+        return None
+    try:
+        record.path(f"codex/{key[0]}/{key[1]}")  # Plain names only (ValueError).
+        bundle = bundles.get(key)
+        if bundle is None:
+            bundle = bundles[key] = StoredBundle(record, *key).load()
+        try:
+            data = bundle.payload(line["response"])
+        except Exception:  # noqa: BLE001 - not stored (yet), or a pack that does not read: the raw file, if any.
+            data = record.path(f"codex-trace/{key[0]}/{key[1]}/{line['response']}").read_bytes()
+        value = json.loads(data)
+    except Exception:  # noqa: BLE001 - a response that cannot be read says nothing of reasoning.
+        return None
+    if not isinstance(value, dict):
+        return None
+    items = value.get("output_items")
+    return reasoning_facts(items if isinstance(items, list) else [])
+
+
+def _lacking_reasoning(line):
+    """Whether one parsed call line is a Codex call's with a response but no "reasoning" (written before 14 Nov 2026,
+    commit 31baabd, when the field was added)."""
+
+    return (isinstance(line, dict) and line.get("program") == "codex" and "reasoning" not in line
+            and isinstance(line.get("response"), str) and bool(line["response"]))
+
+
+def _fill_reasoning(record):
+    """Give each Codex call line written before the "reasoning" field existed that field (what its response holds of
+    reasoning, _response_reasoning()), once per process, when the record is opened: the list then reads no response
+    per row (ui/model_calls.py), and its placeholder kinds are the detail's.
+
+    calls.jsonl is written again whole beside itself and replaces itself only once complete and synced (write_atomic(),
+    under the record's lock, against every writer of the job's processes), so a crash leaves it as it was, and a later
+    process tries again. Each line keeps its bytes, a filled one with ',"reasoning":{...}' added at its end as a line of
+    this build has it, a line cut short by a crash too; a line whose response cannot be read is left as it is (the list
+    takes it for one without reasoning items, as the detail does). A reader that read the file before it was replaced
+    reads it again from its start (CallLog). Opening a record never fails because of this."""
+
+    key = str(record.folder)
+    with _FILLED_LOCK:
+        if key in _FILLED:
+            return
+    path = record.folder / "calls.jsonl"
+    try:
+        if not path.is_symlink() and path.is_file() and any(
+                _lacking_reasoning(line) for line in transcript_lines(path.read_bytes())):
+            bundles = {}
+            with record.locked():
+                data = path.read_bytes()  # As it is now that no writer of the job can append.
+                lines = data.split(b"\n")
+                for index, raw in enumerate(lines):
+                    try:
+                        value = json.loads(raw)
+                    except (ValueError, UnicodeError, RecursionError):
+                        continue  # Cut short by a crash, or empty: kept as it is.
+                    if not _lacking_reasoning(value):
+                        continue
+                    facts = _response_reasoning(record, value, bundles)
+                    text = raw.rstrip()
+                    if facts is None or not text.endswith(b"}"):
+                        continue
+                    filled = text[:-1] + b',"reasoning":' + compact(facts) + b"}"
+                    if json.loads(filled) == {**value, "reasoning": facts}:
+                        lines[index] = filled + raw[len(text):]
+                changed = b"\n".join(lines)
+                if changed != data:
+                    write_atomic(path, changed)
+    except Exception:  # noqa: BLE001 - the record opens as it is; a later process tries again.
+        pass
+    with _FILLED_LOCK:
+        _FILLED.add(key)
 
 
 class TraceIngest:

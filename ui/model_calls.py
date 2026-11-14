@@ -137,11 +137,12 @@ def _tokens(line):
             "output": usage.get("output_tokens"), "reasoning": usage.get("reasoning_output_tokens")}
 
 
-def _kinds(line, thinking=None, reasoning=None):
+def _kinds(line, thinking=None):
     """The kinds of a call's placeholders as its detail has them (_placeholders()), from its call line, which says what
     came back of reasoning: a Claude Code call's "thinking" (whether a thinking block came back), a Codex call's
-    "reasoning" (records.reasoning_facts() of its output items). A line written by an earlier build has neither:
-    call_list() reads the call's stream or response for it and gives ``thinking`` or ``reasoning``."""
+    "reasoning" (records.reasoning_facts() of its output items; a line written before 14 Nov 2026 gets it when the
+    record is next opened, records._fill_reasoning(), so no response is read here). A Claude Code line written by an
+    earlier build has no "thinking": call_list() reads the call's stream for it and gives ``thinking``."""
 
     if line.get("status") == "not recorded":
         return ["web_cutoff_one_shot"]
@@ -150,7 +151,7 @@ def _kinds(line, thinking=None, reasoning=None):
     if line.get("program") == "claude":
         facts = {"items": int(bool(line.get("thinking") if thinking is None else thinking)), "rawText": False}
     else:
-        facts = line.get("reasoning") if reasoning is None else reasoning
+        facts = line.get("reasoning")
     usage = line.get("usage") if isinstance(line.get("usage"), dict) else None
     return list(dict.fromkeys(placeholder["kind"] for placeholder in _placeholders(line, [], usage, facts)))
 
@@ -177,9 +178,8 @@ def _row(line, labels):
            "durationMs": duration, "tokens": tokens, "status": line.get("status") or "completed",
            "error": _error(line), "placeholderKinds": _kinds(line), "kind": line.get("kind") or "request",
            "threadId": line.get("threadId")}
-    if (line.get("program") == "claude" and "thinking" not in line
-            or line.get("program") == "codex" and line.get("response") and "reasoning" not in line):
-        row["_line"] = line  # Written by an earlier build: its kinds come from its stream or response (call_list()).
+    if line.get("program") == "claude" and "thinking" not in line:
+        row["_line"] = line  # Written by an earlier build: its kinds come from its stream (call_list()).
     return row
 
 
@@ -290,7 +290,8 @@ def _problems(record):
 
 def _rows(record, summaries=False, lines=False):
     """Every row of the list, in time order (``summaries``: the untraced compactions keep their "_summary";
-    ``lines``: a call whose line does not say what came back of reasoning keeps its "_line", _row())."""
+    ``lines``: a Claude Code call whose line does not say whether a thinking block came back keeps its "_line",
+    _row())."""
 
     labels = _labels(record)
     rows = ([_row(line, labels) for line in record.calls.read()] + _placeholder_rows(record)
@@ -318,16 +319,10 @@ def call_list(name, offset=0, limit=DEFAULT_LIMIT):
     page = rows[offset:offset + limit]
     for row in page:
         line = row.pop("_line", None)
-        if line is None:
-            continue
-        if line.get("program") == "claude":
+        if line is not None:
             # Whether a thinking block came back is in the call's stream.
             thinking = any(block.get("type") in records.THINKING_BLOCKS for block in _claude_blocks(record, line))
             row["placeholderKinds"] = _kinds(line, thinking=thinking)
-        else:
-            # What came back of reasoning is in the call's response (a failed or cancelled call's partial one).
-            response = _json(_payload(record, line, "response"))
-            row["placeholderKinds"] = _kinds(line, reasoning=records.reasoning_facts(_list(response, "output_items")))
     return {"total": len(rows), "calls": page, "recordState": {"available": True, "problems": _problems(record)}}
 
 
