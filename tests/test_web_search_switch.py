@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
@@ -110,16 +111,41 @@ class ConnectionSwitchTests(SwitchCase):
         self.assertEqual(len(self.searches()), 2)
 
     def test_a_service_that_does_not_answer_a_search_leaves_it_off_and_says_why(self):
-        for answer, words in (((404, {"error": "no such route"}), "HTTP 404"),
-                              ((200, {"results": []}), "not a search result"),
-                              ((200, b"<html>login</html>"), "not a search result")):
+        # The editor shows the message after "Web search through this connection stays off:": it ends with a full
+        # stop, and the service's own words stay inside its parentheses.
+        not_a_result = 'The test search failed (its answer is not a JSON object with an "output" text'
+        for answer, message in (((404, {"error": "no such route"}),
+                                 'The test search failed (HTTP 404: {"error": "no such route"}).'),
+                                ((404, b""), "The test search failed (HTTP 404)."),
+                                ((200, {"results": []}), not_a_result + ': {"results": []}).'),
+                                ((200, b"<html>login</html>"), not_a_result + ": <html>login</html>)."),
+                                ((200, b""), not_a_result + ").")):
             with self.subTest(answer=answer):
                 self.endpoint.search = answer
                 connection = self.save(webSearch=True)
                 self.assertFalse(connection["webSearch"])
                 self.assertFalse(connection["webSearchCheck"]["ok"])
-                self.assertIn(words, connection["webSearchCheck"]["message"])
+                self.assertEqual(connection["webSearchCheck"]["message"], message)
                 self.assertFalse(providers.api_connection(connection["id"], cached=False)["webSearch"])
+
+    def test_a_long_failure_is_quoted_in_part_and_its_message_still_ends_with_a_full_stop(self):
+        self.endpoint.search = (502, {"error": "x" * 1000})
+        connection = self.save(webSearch=True)
+        message = connection["webSearchCheck"]["message"]
+        self.assertTrue(message.startswith('The test search failed (HTTP 502: {"error": "xxx'), message)
+        self.assertTrue(message.endswith("xxx)."), message)
+        # The connection keeps it whole: the stored message is not cut before its closing parenthesis.
+        self.assertEqual(providers.api_connection(connection["id"], cached=False)["webSearchCheck"]["message"], message)
+
+    def test_a_search_service_out_of_reach_leaves_it_off_and_says_so(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        entry = {"format": "openai", "baseUrl": f"http://127.0.0.1:{port}/v1", "apiKey": KEY, "requestSource": ""}
+        check = server.probe_web_search(entry, "gpt-6.1-sol", timeout=5)
+        self.assertFalse(check["ok"])
+        self.assertEqual(check["message"], "The test search could not reach the search service: The connection was "
+                                           "refused (ConnectionRefusedError).")
 
     def test_a_failure_that_quotes_the_key_never_shows_it(self):
         # Some proxies' error pages quote the Authorization header they received.
@@ -138,7 +164,8 @@ class ConnectionSwitchTests(SwitchCase):
         with mock.patch.object(server, "WEB_SEARCH_PROBE_MAX_BYTES", 16):
             connection = self.save(webSearch=True)
         self.assertFalse(connection["webSearch"])
-        self.assertIn("longer than", connection["webSearchCheck"]["message"])
+        self.assertRegex(connection["webSearchCheck"]["message"],
+                         r"^The test search's answer is longer than \d+ MiB; it was not read\.$")
 
     def test_an_anthropic_connection_never_has_it(self):
         entry = providers._validated_connection({"format": "anthropic", "baseUrl": "https://gateway.example.com",

@@ -2905,10 +2905,12 @@ def probe_web_search(entry, model, timeout=None):
     finally:
         connection.close()
     now = datetime.now(timezone.utc).isoformat()
+    # A failure's message ends with a full stop: the editor shows it after "Web search through this connection stays
+    # off:", and the service's own words go in parentheses, so that they never run into the editor's next sentence.
     if failure:
-        return {"ok": False, "at": now, "message": f"The probe search could not reach the search service: {failure}"}
+        return {"ok": False, "at": now, "message": f"The test search could not reach the search service: {failure}"}
     if len(data) > WEB_SEARCH_PROBE_MAX_BYTES:
-        return {"ok": False, "at": now, "message": "The probe search's answer is longer than "
+        return {"ok": False, "at": now, "message": "The test search's answer is longer than "
                                                    f"{WEB_SEARCH_PROBE_MAX_BYTES // (1024 * 1024)} MiB; it was not read."}
     text = data.decode("utf-8", "replace")
     try:
@@ -2921,8 +2923,9 @@ def probe_web_search(entry, model, timeout=None):
     # the API Test (_api_test_text), since the message is kept with the connection and shown with it.
     excerpt = _api_test_text(text, entry["apiKey"])[:200]
     why = (f"HTTP {status}" if status is None or not 200 <= status < 300
-           else "its answer is not a search result (a JSON object with an \"output\" text)")
-    return {"ok": False, "at": now, "message": f"The probe search failed: {why}" + (f": {excerpt}" if excerpt else ".")}
+           else "its answer is not a JSON object with an \"output\" text")
+    quoted = f": {excerpt}" if excerpt else ""
+    return {"ok": False, "at": now, "message": f"The test search failed ({why}{quoted})."}
 
 
 def _api_test_outcome(status, location, text, kind, streamed):
