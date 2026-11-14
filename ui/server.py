@@ -2872,9 +2872,13 @@ def probe_team_tools(entry, models, effort=None, timeout=None):
             value = json.loads(text)
         except ValueError:
             value = None
-        detail = _api_test_error(value, text).strip() or f"HTTP {status}"
-        message = (f"The endpoint refused the request with team tools for {model} ({shape}): {detail} A coordinator "
-                   "on this connection could not reach its team.")
+        # The service's words go in parentheses and the message ends with a full stop, so that they never run into
+        # its next sentence, within the MAX_TEST_MESSAGE_CHARS a connection keeps.
+        sent = "an additional_tools item" if form == "additional_tools" else "the request's tools"
+        message = _api_test_quoted(
+            f"The endpoint refused the request with team tools for {model}, sent in {sent} ",
+            _api_test_status_words(status, value, text, entry["apiKey"]),
+            ". A coordinator on this connection could not reach its team.")
     else:
         calls, error = _api_test_tool_calls(text)
         called = next(((name, space) for name, space in calls if name in (TEAM_TOOL_TEST_TOOL, named.replace(
@@ -2971,6 +2975,24 @@ def _api_test_text(text, key):
     text = runtime.redact(text)
     limit = providers.MAX_TEST_MESSAGE_CHARS
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _api_test_status_words(status, value, text, key):
+    """What an answer with an HTTP error status says, on one line and without the key: "HTTP <status>: <the
+    service's own words>" (its error's message, else its body; see _api_test_error), or "HTTP <status>"."""
+
+    words = _api_test_text(_api_test_error(value, text), key).strip()
+    return f"HTTP {status}: {words}" if words else f"HTTP {status}"
+
+
+def _api_test_quoted(head, words, tail):
+    """``head``, the service's ``words`` in parentheses, then ``tail``: the words clipped so that the whole message
+    fits the MAX_TEST_MESSAGE_CHARS a connection keeps of it."""
+
+    room = providers.MAX_TEST_MESSAGE_CHARS - len(head) - len(tail) - 2
+    if len(words) > room:
+        words = words[:max(room - 1, 0)].rstrip() + "…"
+    return f"{head}({words}){tail}"
 
 
 def _api_test_reply(value):

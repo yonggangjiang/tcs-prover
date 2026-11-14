@@ -28,8 +28,8 @@ KEY = "sk-team-tool-test-0123456789"
 
 
 class Endpoint:
-    """A Responses endpoint on 127.0.0.1: ``models`` for GET .../models; ``answer(body)`` -> (status, events or body)
-    for POST .../responses."""
+    """A Responses endpoint on 127.0.0.1: ``models`` for GET .../models; ``answer(body)`` -> (status, events, a JSON
+    body or raw bytes) for POST .../responses."""
 
     def __init__(self, models, answer):
         self.models, self.answer, self.requests = models, answer, []
@@ -60,6 +60,8 @@ class Endpoint:
                 if isinstance(value, list):
                     self.send(status, "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
                                               for event in value).encode(), "text/event-stream")
+                elif isinstance(value, bytes):
+                    self.send(status, value, "text/plain")
                 else:
                     self.send(status, json.dumps(value).encode())
 
@@ -158,11 +160,31 @@ class ProbeTests(unittest.TestCase):
             "message": f"Unknown input item type 'additional_tools' (key {KEY}).", "type": "invalid_request_error"}}))
         result = server.probe_team_tools(self.entry(endpoint), endpoint.models)
         self.assertFalse(result["ok"])
-        self.assertTrue(result["message"].startswith("The endpoint refused the request with team tools for gpt-6.1-sol "
-                                                     "(in an additional_tools item, as Codex sends a Lite model's "
-                                                     "tools): Unknown input item type 'additional_tools' (key"))
+        self.assertEqual(result["message"], "The endpoint refused the request with team tools for gpt-6.1-sol, sent in "
+                                            "an additional_tools item (HTTP 400: Unknown input item type "
+                                            "'additional_tools' (key [redacted]).). A coordinator on this connection "
+                                            "could not reach its team.")
         self.assertNotIn(KEY, result["message"])
         self.assertIsNone(server.probe_team_tools(self.entry(endpoint), []))
+
+    def test_a_refusal_s_message_ends_with_a_full_stop_within_what_a_connection_keeps(self):
+        # The service's words in parentheses: words without a full stop of their own never run into the next
+        # sentence, and long ones are clipped so that the message keeps its end (a connection keeps 300 characters).
+        for words, expected in (
+                ("Unsupported parameter: 'tools'", "The endpoint refused the request with team tools for lab-model, "
+                 "sent in the request's tools (HTTP 400: Unsupported parameter: 'tools'). A coordinator on this "
+                 "connection could not reach its team."),
+                ("", "The endpoint refused the request with team tools for lab-model, sent in the request's tools "
+                 "(HTTP 400). A coordinator on this connection could not reach its team.")):
+            endpoint = self.endpoint(["lab-model"], lambda body, words=words: (
+                400, {"error": {"message": words, "type": "invalid_request_error"}} if words else b""))
+            with self.subTest(words=words):
+                self.assertEqual(server.probe_team_tools(self.entry(endpoint), endpoint.models)["message"], expected)
+        endpoint = self.endpoint(["lab-model"], lambda body: (400, {"error": {"message": "Unsupported tool. " * 40}}))
+        message = server.probe_team_tools(self.entry(endpoint), endpoint.models)["message"]
+        self.assertEqual(len(message), providers.MAX_TEST_MESSAGE_CHARS)
+        self.assertIn("(HTTP 400: Unsupported tool. Unsupported tool.", message)
+        self.assertTrue(message.endswith("…). A coordinator on this connection could not reach its team."))
 
 
 class RouteTests(unittest.TestCase):
