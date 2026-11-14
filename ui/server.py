@@ -5313,9 +5313,9 @@ class App:
             return {"kind": "cli", "title": f"{runtime.CLI_NAMES[cli]} not installed or not working",
                     "retrying": True, "text": str(waiting.get("text") or failure)}
         # A login or a usage limit needs you at once whichever call has it: a team member's is listed also while
-        # another call waits to retry for another reason, or failed after it (the newest such call).
-        pressing = [streak for streak in streaks if streak.get("failure") in NEEDS_YOU_FAILURES
-                    and phase in {"reviewing", "running"}]
+        # another call waits to retry for another reason, or failed after it (the newest such call), and a paused
+        # author's reply's whatever paused the job.
+        pressing = [streak for streak in streaks if streak.get("failure") in NEEDS_YOU_FAILURES]
         if cause not in NEEDS_YOU_FAILURES and pressing:
             retry = max(pressing, key=lambda streak: streak["last"])
             cause, role = retry["failure"], TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
@@ -5330,18 +5330,22 @@ class App:
         if retry and retry.get("memberModel"):
             name = retry["memberModel"]  # A team member's own model.
         retrying = bool(retry) or bool(state.get("autoResumeAt"))
+        # A paused job's reply retries, not the job.
+        reply = bool(retry and retry.get("reply"))
+        goes_on = "the author's reply continues by itself" if reply else "the job continues by itself"
         if cause == "usage limit reached":
             return {"kind": "usage", "title": "Usage limit reached", "retrying": retrying,
-                    "text": f"{name} reports a usage limit. The job retries every {retry_interval_text()} and "
-                            "continues by itself when the limit resets."}
+                    "text": f"{name} reports a usage limit. "
+                            + (f"The author's reply is retried every {retry_interval_text()}" if reply
+                               else f"The job retries every {retry_interval_text()}")
+                            + " and continues by itself when the limit resets."}
         if api:
             return {"kind": "key", "title": "API key rejected", "retrying": retrying,
-                    "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; "
-                            "the job continues by itself."}
+                    "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; {goes_on}."}
         # The page adds a link to Setup, where the program signs in again (or the terminal command does).
         command = "codex login" if name == "Codex" else "claude auth login"
         return {"kind": "login", "title": f"{name} login needed", "retrying": retrying,
-                "text": f"Sign in again on the Setup page, or run {command} in a terminal; the job continues by itself."}
+                "text": f"Sign in again on the Setup page, or run {command} in a terminal; {goes_on}."}
 
     def _failing_streaks(self, phase):
         """The model calls of the job's runner that keep failing (_follow_failures) while it runs, or of a paused

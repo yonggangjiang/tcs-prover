@@ -96,9 +96,11 @@ incompatible" while the retries continue, until it works again.
 ## What needs you
 
 Some causes need you although the job keeps retrying: an expired login, a usage
-limit, an API key the endpoint refuses, or a program that is not installed (or
-does not start), after the same failure three times in a row (also while a
-paused author's reply waits for it). The Overview then lists the job under
+limit or an API key the endpoint refuses, of any of the job's calls (a team
+member's, or a paused author's reply's: then the reply retries, and comes by
+itself once it is fixed), or a program that is not installed (or does not
+start), after the same failure three times in a row (also while a paused
+author's reply waits for it). The Overview then lists the job under
 **Needs your attention** with what to do, for example *Codex login needed: Sign
 in again on the Setup page, or run codex login in a terminal*, *Claude login
 needed: Sign in again on the Setup page, or run claude auth login in a

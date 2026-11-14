@@ -356,6 +356,43 @@ class FailingCallTests(jobs_test.Isolated):
         app.state["phase"] = "running"
         self.assertIsNone(app.attention())
 
+    def test_a_paused_authors_reply_at_a_usage_limit_or_logged_out_is_listed_at_once(self):
+        # A job paused by you or at its time limit; you ask the author something, and its account is at its limit.
+        app = self.running()
+        app.state.update(phase="paused", stage="solve", activeNode="author", error="")
+        prefix = "conversation:c_0123456789:"
+
+        def reply_failed(failure, attempt):
+            app._follow_failures(retry(failure, attempt=attempt, activity="", stage="conversation", node="author",
+                                       conversationId="c_0123456789"), key_prefix=prefix)
+
+        reply_failed("usage limit reached", 2)
+        attention = app.attention()
+        self.assertEqual((attention["kind"], attention["title"], attention["retrying"]),
+                         ("usage", "Usage limit reached", True))
+        self.assertEqual(attention["text"], "Codex reports a usage limit. The author's reply is retried every 1 minute "
+                                            "and continues by itself when the limit resets.")
+        # Still a usage limit 15 minutes later, not a call that keeps failing.
+        for minute in range(16):
+            self.now += 60
+            reply_failed("usage limit reached", minute + 3)
+        self.assertEqual(app.attention()["kind"], "usage")
+        # The reply came: listed no more.
+        app._follow_failures({"kind": "conversation_reply", "stage": "conversation", "label": "Author reply",
+                              "text": "Done."}, key_prefix=prefix)
+        self.assertIsNone(app.attention())
+        # Its login expired: the login line, at once.
+        reply_failed("authentication failed", 2)
+        attention = app.attention()
+        self.assertEqual((attention["kind"], attention["title"]), ("login", "Codex login needed"))
+        self.assertEqual(attention["text"], "Sign in again on the Setup page, or run codex login in a terminal; the "
+                                            "author's reply continues by itself.")
+        # A running job's own usage limit keeps its words.
+        app.state["phase"] = "running"
+        self.follow(app, retry("usage limit reached"))
+        self.assertTrue(app.attention()["text"].endswith("The job retries every 1 minute and continues by itself "
+                                                         "when the limit resets."), app.attention())
+
     def test_the_overview_lists_the_job(self):
         app = self.paused_job(sourceFile="P07.md")
         app.state.update(phase="running", stage="critic", activeNode="critic")
