@@ -152,7 +152,10 @@ the bug report to the author's normal repair loop.
 
 ## Reading a transcript
 
-`transcript.jsonl` is the complete machine-readable event log. The transcript
+`transcript.jsonl` is the complete machine-readable event log (of Codex's
+effective settings, which it reports at each start, it keeps only those TCS
+Prover sets or relies on: see
+[Job records](developers.md#job-records)). The transcript
 viewer shows workflow stages, public reasoning summaries, model messages,
 subagent and tool activity, critic checks and results, without protocol noise:
 

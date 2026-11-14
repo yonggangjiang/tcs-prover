@@ -4447,6 +4447,65 @@ def structured(
             conversation.discard()
 
 
+# What a job's transcript keeps of Codex's answer to config/read (recorded_settings()). The answer holds the user's
+# whole Codex configuration: in the first real job about 75 KB at each start of an app-server, with every project
+# folder the user trusts, each MCP server's command and environment (which can hold keys), the plugins, and where each
+# setting came from. The transcript keeps the effective settings TCS Prover sets or relies on: these ...
+RECORDED_SETTINGS = ("model", "model_provider", "model_reasoning_effort", "model_reasoning_summary", "service_tier",
+                     "approval_policy", "sandbox_mode", "sandbox_workspace_write", "default_permissions",
+                     "web_search", "model_auto_compact_token_limit_scope")
+# ... of these tables only the entries TCS Prover sets (the web search tool, the subagent limits) ...
+RECORDED_ENTRIES = {"tools": ("web_search",), "agents": ("enabled", "max_concurrent_threads_per_session", "max_depth")}
+# ... and of the features those it sets on an app-server's command line or in a thread's settings, and any other the
+# command line set (a workflow's features: the answer's origins name "sessionFlags").
+RECORDED_FEATURES = ("goals", "multi_agent", "multi_agent_v2", "fast_mode", "code_mode", "shell_tool", "apps",
+                     "plugins", "view_image", "standalone_web_search")
+
+
+def recorded_settings(result):
+    """What a job's transcript records of Codex's answer to config/read (``result``); TCS Prover acts on the whole
+    answer, never on this.
+
+    Of the effective settings ("config") it keeps RECORDED_SETTINGS, the entries of RECORDED_ENTRIES, the features of
+    RECORDED_FEATURES and those the app-server's command line set, the permission profile in effect (the one
+    default_permissions names) and the names of the MCP servers, never their commands, environments or headers;
+    "leftOut" says in one sentence how many other settings were left out, with where each setting came from (the
+    answer's origins and layers). No reader of the transcript needs more: the job page, the controller, the
+    transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py) skip the answer, and the
+    author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc()) read the answer itself.
+    TCS Prover's redaction (redacted()) runs over what is kept, as emit() runs it over every record.
+    """
+
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    origins = result.get("origins") if isinstance(result.get("origins"), dict) else {}
+    kept = {key: config[key] for key in RECORDED_SETTINGS if key in config}
+    for key, names in RECORDED_ENTRIES.items():
+        if key in config:
+            table = config[key]
+            kept[key] = {name: table[name] for name in names if name in table} if isinstance(table, dict) else table
+    if "features" in config:
+        features = config["features"]
+        flagged = {path.split(".")[1] for path, origin in origins.items()
+                   if isinstance(path, str) and path.startswith("features.") and isinstance(origin, dict)
+                   and isinstance(origin.get("name"), dict) and origin["name"].get("type") == "sessionFlags"}
+        kept["features"] = ({name: value for name, value in features.items()
+                             if name in RECORDED_FEATURES or name in flagged}
+                            if isinstance(features, dict) else features)
+    if "permissions" in config:
+        profiles, profile = config["permissions"], config.get("default_permissions")
+        kept["permissions"] = (({profile: profiles[profile]} if isinstance(profile, str) and profile in profiles
+                                else {}) if isinstance(profiles, dict) else profiles)
+    if "mcp_servers" in config:
+        servers = config["mcp_servers"]
+        # Names only, and as values, which the redaction reads: a server's definition holds its command, environment
+        # and headers.
+        kept["mcp_servers"] = sorted(str(name) for name in servers) if isinstance(servers, dict) else servers
+    left = sum(1 for key in config if key not in kept)
+    return redacted({"config": kept, "leftOut": (
+        f"TCS Prover records only the Codex settings it sets or relies on: {left} other setting"
+        f"{'' if left == 1 else 's'} of the configuration, and where each setting came from, were left out.")})
+
+
 class RPC:
     """Send the few JSON-RPC messages needed by Goal mode.
 
@@ -4473,6 +4532,9 @@ class RPC:
     def __init__(self, process, record=None, stderr_log=None):
         self.process, self.record = process, record
         self.number, self.waiting = 0, deque()
+        # The method of each request sent and not answered yet: what ``record`` gets of an answer depends on it
+        # (recorded()).
+        self.methods = {}
         self.write_lock = threading.Lock()
         self.stderr_tail = deque(maxlen=12)
         self.stderr_reader = None
@@ -4560,7 +4622,7 @@ class RPC:
                          "protocol message" + (" (later ones are skipped silently)" if self.skipped == 3 else "")
                          + f": {_clipped(redact(line.strip()), 300)}")
         if self.record:
-            self.record(message)
+            self.record(self.recorded(message))
         # This is a runtime warning, not model-authored text. Continuing after
         # it can strand goal completion and repeatedly spend requests while
         # every functions.exec call fails, including historical retrieval.
@@ -4569,6 +4631,18 @@ class RPC:
             raise ToolRuntimeUnavailable("Required model tool runtime is unavailable: " + message["params"]["message"])
         if "id" in message and "method" in message:
             self.answer(message)
+        return message
+
+    def recorded(self, message):
+        """``message`` as the job's transcript records it: an answer to config/read (the user's whole Codex
+        configuration) with only the settings that matter to the run (recorded_settings()), any other message as it
+        came. The message itself is unchanged: its reader acts on all of it."""
+
+        identity = message.get("id")
+        if "method" in message or not isinstance(identity, (int, str)) or isinstance(identity, bool):
+            return message
+        if self.methods.pop(identity, None) == "config/read" and isinstance(message.get("result"), dict):
+            return {**message, "result": recorded_settings(message["result"])}
         return message
 
     def read(self):
@@ -4585,6 +4659,7 @@ class RPC:
         with self.write_lock:
             self.number += 1
             request = self.number
+            self.methods[request] = method
             if before_send is not None:
                 before_send(request)
             self.process.stdin.write(json.dumps({

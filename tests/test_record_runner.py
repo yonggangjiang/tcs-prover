@@ -7,6 +7,9 @@ goal sessions run against the scripted app-server double of tests/test_goal_runt
 """
 
 import ast
+import contextlib
+import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -24,7 +27,11 @@ from ui import model_calls
 
 import test_author_conversation as conversation_test
 import test_critic_subagents as critic_test
+import test_decisions_author as author_test
 import test_goal_runtime as goal_test
+
+# The runner's own emit(), which writes each record of the transcript (tests replace it in their setUp).
+REAL_EMIT = runtime.emit
 
 THREAD = "01a1d4e2-53df-78e1-b1a3-60906592b723"
 SCHEMA = {"type": "object", "properties": {"verdict": {"type": "string"}}, "required": ["verdict"],
@@ -406,6 +413,154 @@ class GoalSessionTests(RecordedJob):
             next(session)
         self.assertTrue(paused.exception.retry)
         self.assertEqual(self.copies, [])
+
+
+# Codex's answer to config/read, as the first real job got it at each start of an app-server, in small: the settings
+# TCS Prover sets or relies on, and the user's own (projects, MCP servers with their environment and headers, plugins,
+# apps, providers, shell variables, ...), with where each setting came from.
+CONFIG_ANSWER = {
+    "config": {
+        "model": "gpt-6-astra", "model_provider": None, "model_reasoning_effort": "ultra",
+        "model_reasoning_summary": None, "service_tier": "priority", "approval_policy": "never",
+        "sandbox_mode": "workspace-write", "sandbox_workspace_write": {"writable_roots": [], "network_access": True},
+        "default_permissions": "tcs_prover_private",
+        "permissions": {"tcs_prover_private": {"filesystem": {":workspace_roots": {".": "write"}}, "network": None},
+                        "users-own": {"filesystem": {"/Users/someone/clients": "write"}}},
+        "web_search": "disabled", "tools": {"web_search": None, "view_image": True},
+        "model_auto_compact_token_limit_scope": "body_after_prefix",
+        "agents": {"max_depth": 1, "max_concurrent_threads_per_session": 3,
+                   "researcher": {"config_file": "/Users/someone/agents/researcher.toml"}},
+        "features": {"goals": False, "multi_agent": False, "multi_agent_v2": {"max_concurrent_threads_per_session": 1},
+                     "fast_mode": False, "js_repl": True, "remote_plugin": True, "memories": False},
+        "mcp_servers": {"node_repl": {"command": "node_repl", "env": {"BROWSER_TOKEN": "MCP-ENV-SECRET"}},
+                        "docs": {"url": "https://docs.example",
+                                 "http_headers": {"Authorization": "Bearer MCP-HEADER-SECRET"}}},
+        "projects": {"/Users/someone/private-client": {"trust_level": "trusted"}},
+        "plugins": {"slack@openai-curated": {"enabled": True}},
+        "apps": {"calendar": {"enabled": True}},
+        "model_providers": {"gateway": {"base_url": "https://gateway.example",
+                                        "http_headers": {"X-Key": "PROVIDER-HEADER-SECRET"}}},
+        "shell_environment_policy": {"set": {"DEPLOY_TOKEN": "SHELL-ENV-SECRET"}},
+        "notify": ["/Users/someone/bin/notify"], "tui": {"theme": "dark"},
+    },
+    "origins": {
+        "features.goals": {"name": {"type": "sessionFlags"}, "version": "sha256:1"},
+        # A workflow's feature: TCS Prover's command line sets it.
+        "features.js_repl": {"name": {"type": "sessionFlags"}, "version": "sha256:1"},
+        "features.remote_plugin": {"name": {"type": "user", "file": "/Users/someone/.codex/config.toml"},
+                                   "version": "sha256:2"},
+        "projects./Users/someone/private-client.trust_level": {
+            "name": {"type": "user", "file": "/Users/someone/.codex/config.toml"}, "version": "sha256:2"},
+    },
+    "layers": [{"name": {"type": "user", "file": "/Users/someone/.codex/config.toml"},
+                "config": {"projects": {"/Users/someone/private-client": {"trust_level": "trusted"}}}}],
+}
+KEPT_SETTINGS = {
+    "model": "gpt-6-astra", "model_provider": None, "model_reasoning_effort": "ultra", "model_reasoning_summary": None,
+    "service_tier": "priority", "approval_policy": "never", "sandbox_mode": "workspace-write",
+    "sandbox_workspace_write": {"writable_roots": [], "network_access": True},
+    "default_permissions": "tcs_prover_private",
+    "permissions": {"tcs_prover_private": {"filesystem": {":workspace_roots": {".": "write"}}, "network": None}},
+    "web_search": "disabled", "tools": {"web_search": None},
+    "model_auto_compact_token_limit_scope": "body_after_prefix",
+    "agents": {"max_depth": 1, "max_concurrent_threads_per_session": 3},
+    "features": {"goals": False, "multi_agent": False, "multi_agent_v2": {"max_concurrent_threads_per_session": 1},
+                 "fast_mode": False, "js_repl": True},
+    "mcp_servers": ["docs", "node_repl"],
+}
+LEFT_OUT = ("TCS Prover records only the Codex settings it sets or relies on: 7 other settings of the configuration, "
+            "and where each setting came from, were left out.")
+# What the user's configuration holds that the run does not need: none of it reaches the transcript.
+PRIVATE = ("MCP-ENV-SECRET", "MCP-HEADER-SECRET", "PROVIDER-HEADER-SECRET", "SHELL-ENV-SECRET", "private-client",
+           "slack@openai-curated", "researcher.toml", "users-own", "remote_plugin", "notify")
+
+
+class SettingsRecordTests(unittest.TestCase):
+    """Codex's answer to config/read holds the user's whole Codex configuration: the transcript keeps only the
+    settings TCS Prover sets or relies on (workflow_runner.recorded_settings()), while TCS Prover acts on all of it."""
+
+    def rpc(self, *messages):
+        process = SimpleNamespace(stdout=io.StringIO("".join(json.dumps(message) + "\n" for message in messages)),
+                                  stdin=io.StringIO(), stderr=None)
+        recorded = []
+        return runtime.RPC(process, recorded.append), recorded
+
+    def test_the_answer_to_config_read_is_recorded_with_only_the_settings_that_matter_to_the_run(self):
+        rpc, recorded = self.rpc({"id": 1, "result": CONFIG_ANSWER})
+        self.assertEqual(rpc.call("config/read", {"cwd": "/work"}), CONFIG_ANSWER)  # The answer itself, whole.
+        [message] = recorded
+        self.assertEqual(message, {"id": 1, "result": {"config": KEPT_SETTINGS, "leftOut": LEFT_OUT}})
+        for private in PRIVATE:
+            self.assertNotIn(private, json.dumps(message), private)
+
+    def test_a_check_s_answer_is_recorded_the_same_way_and_any_other_message_as_it_came(self):
+        # A silent author under TCS Prover's goal loop is checked with config/read, answered later (rpc.request()).
+        started = {"method": "turn/started", "params": {"threadId": "t", "turn": {"id": "turn-1"}}}
+        rpc, recorded = self.rpc(started, {"id": 1, "result": CONFIG_ANSWER}, {"id": 2, "result": {"thread": {}}},
+                                 {"id": 3, "error": {"code": -32603, "message": "busy"}})
+        for method in ("config/read", "thread/start", "config/read"):
+            rpc.request(method, {})
+        self.assertEqual([rpc.read() for _ in range(4)][1], {"id": 1, "result": CONFIG_ANSWER})
+        self.assertEqual(recorded, [started, {"id": 1, "result": {"config": KEPT_SETTINGS, "leftOut": LEFT_OUT}},
+                                    {"id": 2, "result": {"thread": {}}},
+                                    {"id": 3, "error": {"code": -32603, "message": "busy"}}])
+        self.assertEqual(rpc.methods, {})
+
+    def test_tcs_prover_s_redaction_runs_over_what_is_kept(self):
+        secret = "registered-key-0d6f1a9c2b7e"
+        runtime.register_secret(secret)
+        self.addCleanup(runtime._REGISTERED_SECRETS.discard, secret)
+        answer = copy.deepcopy(CONFIG_ANSWER)
+        answer["config"]["mcp_servers"][f"gateway-{secret}"] = {"command": "gateway"}
+        answer["config"]["model_provider"] = f"provider-{secret}"
+        kept = runtime.recorded_settings(answer)
+        self.assertEqual((kept["config"]["model_provider"], kept["config"]["mcp_servers"]),
+                         ("provider-[redacted]", ["docs", "gateway-[redacted]", "node_repl"]))
+        self.assertNotIn(secret, json.dumps(kept))
+
+
+class SettingsTranscriptTests(author_test.PipeCase):
+    """The author's app-server, its real RPC class and the runner's own emit(): what reaches the transcript."""
+
+    def test_the_transcript_keeps_only_what_matters_while_codex_still_gets_every_user_extension_turned_off(self):
+        secret = "registered-key-5b1e0c7d9a3f"
+        runtime.register_secret(secret)
+        self.addCleanup(runtime._REGISTERED_SECRETS.discard, secret)
+        answer = copy.deepcopy(CONFIG_ANSWER)
+        answer["config"]["mcp_servers"][f"gateway-{secret}"] = {"command": "gateway", "env": {"KEY": secret}}
+
+        def handler(server_double, message):
+            if message["method"] == "config/read":
+                server_double.reply(message, answer)
+            elif message["method"] == "turn/start":
+                server_double.reply(message, {"turn": {"id": "turn-1"}})
+                server_double.write({"method": "turn/started", "params": {"threadId": "thread-1",
+                                                                          "turn": {"id": "turn-1"}}})
+                for item in author_test.completion("thread-1", "turn-1"):
+                    server_double.write(item)
+            else:
+                author_test.answer_setup(server_double, message)
+
+        self.handlers.append(handler)
+        transcript = io.StringIO()
+        with mock.patch.object(runtime, "emit", REAL_EMIT), contextlib.redirect_stdout(transcript):
+            self.assertEqual(next(self.session())["outcome"], "done")
+        lines = transcript.getvalue().splitlines()
+        settings = [line for line in lines if '"leftOut"' in line]
+        self.assertEqual(len(settings), 1)
+        record = json.loads(settings[0])
+        self.assertEqual((record["kind"], record["stage"], record["root"]), ("codex_event", "solve", True))
+        self.assertEqual(record["event"]["result"]["config"]["mcp_servers"], ["docs", "gateway-[redacted]", "node_repl"])
+        self.assertLess(len(settings[0]), 3000)
+        for private in (*PRIVATE, secret):
+            self.assertNotIn(private, transcript.getvalue(), private)
+        # TCS Prover acted on the whole answer: each of the user's MCP servers, plugins and apps is off by name.
+        start = next(message["params"]["config"] for message in self.servers[0].received
+                     if message["method"] == "thread/start")
+        self.assertEqual((start["mcp_servers"], start["plugins"], start["apps"]),
+                         ({"node_repl": {"enabled": False}, "docs": {"enabled": False},
+                           f"gateway-{secret}": {"enabled": False}}, {"slack@openai-curated": {"enabled": False}},
+                          {"_default": {"enabled": False}, "calendar": {"enabled": False}}))
 
 
 if __name__ == "__main__":
