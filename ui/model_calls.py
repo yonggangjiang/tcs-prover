@@ -5,6 +5,7 @@ Everything here only reads, except delete_record(). Placeholders say what a call
 are computed here, for the view and the download alike, never stored.
 """
 
+import collections
 import contextlib
 import gzip
 import hashlib
@@ -320,14 +321,14 @@ def _json(data):
         return None
 
 
-def _payload(record, line, field):
-    """The exact bytes of a call's request or response payload, or None."""
+def _payload(record, line, field, bundles=None):
+    """The exact bytes of a call's request or response payload, or None (``bundles``: see _bundle())."""
 
     path = line.get(field)
     if not path or line.get("program") != "codex":
         return None
     try:
-        return _bundle(record, line).payload(path)
+        return _bundle(record, line, bundles).payload(path)
     except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile):
         return _raw_payload(record, line, path)
 
@@ -415,19 +416,76 @@ def _stored_json(bundle, reference):
 
 
 def _thread_calls(record, line):
-    """The Codex calls of ``line``'s thread in its bundle, in time order."""
+    """The Codex requests of ``line``'s thread, in time order, whichever process sent them: a thread a paused author
+    leaves goes on in a summary or reply turn's process, then in the resumed author's (a line without a thread: its
+    bundle's own)."""
 
+    thread = line.get("threadId")
     same = [other for other in record.calls.read()
-            if other.get("program") == "codex" and other.get("process") == line.get("process")
-            and other.get("bundle") == line.get("bundle") and other.get("threadId") == line.get("threadId")
-            and other.get("request")]
+            if other.get("program") == "codex" and other.get("request") and other.get("threadId") == thread
+            and (thread or (other.get("process"), other.get("bundle")) == (line.get("process"), line.get("bundle")))]
     return sorted(same, key=lambda other: (other.get("startedMs") or 0, other["id"]))
 
 
+def _item_shas(record, line, field, bundles):
+    """The sha256 of each input item of a Codex call's request (``field`` "request") or of each output item of its
+    response ("response"): as the record stored them, else of the payload as read (a raw one while its process
+    runs)."""
+
+    path = line.get(field)
+    if not path:
+        return []
+    try:
+        bundle = _bundle(record, line, bundles)
+        entry = bundle.entries.get(path)
+        if entry is not None:
+            shas = (bundle.input(path) if field == "request"
+                    else ((entry.get("store") or {}).get("lists") or {}).get("output_items"))
+            if isinstance(shas, list):
+                return list(shas)
+    except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile, zlib.error, TypeError, AttributeError):
+        pass
+    return _shas(_list(_json(_payload(record, line, field, bundles)), "input" if field == "request" else "output_items"))
+
+
+def _continued(record, line, bundles):
+    """The response a Codex call's request continues (its previous_response_id: a WebSocket continuation), or None;
+    read from the request's stored skeleton (the request without its items) where it has one."""
+
+    path = line.get("request")
+    if not path:
+        return None
+    try:
+        store = (_bundle(record, line, bundles).entries.get(path) or {}).get("store") or {}
+        if "skeleton" in store:
+            head = json.loads(record.objects.get(store["skeleton"]))
+            return head.get("previous_response_id") if isinstance(head, dict) else None
+    except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile, zlib.error, TypeError, AttributeError):
+        pass
+    request = _json(_payload(record, line, "request", bundles))
+    return request.get("previous_response_id") if isinstance(request, dict) else None
+
+
+def _context(record, line, thread, bundles):
+    """The sha256 of every item a Codex request had: its whole input and its output items. A WebSocket continuation
+    sent only what was new since the response it continues, so that request's input and output are added, and so on
+    back along the chain, in a loop (a chain is as long as its process's requests of the thread)."""
+
+    responses = {other["responseId"]: other for other in thread if other.get("responseId")}
+    shas, seen = [], set()
+    while line is not None and line["id"] not in seen:
+        seen.add(line["id"])
+        shas += _item_shas(record, line, "request", bundles) + _item_shas(record, line, "response", bundles)
+        continued = _continued(record, line, bundles)
+        line = responses.get(continued) if continued else None
+    return shas
+
+
 def _codex_detail(record, line):
-    bundle = _bundle(record, line)
-    request = _json(_payload(record, line, "request")) or {}
-    response = _json(_payload(record, line, "response")) or {}
+    bundles = {}
+    bundle = _bundle(record, line, bundles)
+    request = _json(_payload(record, line, "request", bundles)) or {}
+    response = _json(_payload(record, line, "response", bundles)) or {}
     inputs = request.get("input") if isinstance(request.get("input"), list) else []
     outputs = response.get("output_items") if isinstance(response.get("output_items"), list) else []
     thread = _thread_calls(record, line)
@@ -439,17 +497,17 @@ def _codex_detail(record, line):
         previous = next((other for other in thread if other.get("responseId") == request["previous_response_id"]),
                         previous)
     elif previous is not None:
-        before = _json(_payload(record, previous, "request")) or {}
-        after = _json(_payload(record, previous, "response")) or {}
-        known = [records.compact(item) for item in (before.get("input") or []) + (after.get("output_items") or [])]
-        mine = [records.compact(item) for item in inputs]
-        keep = 0
-        for own, theirs in zip(mine, known):
-            if own != theirs:
-                break
-            keep += 1
-        new_items = inputs[keep:]
-    later = (_json(_payload(record, following, "request")) or {}).get("input") if following else None
+        # What the previous request had (its whole input and its output) is not new, each item as often as it had
+        # it: the rest of this input is, in order. A request of another process starts with its own tools item, and
+        # Codex resends an earlier output with metadata of its own, so neither is a prefix of this input.
+        known = collections.Counter(_context(record, previous, thread, bundles))
+        new_items = []
+        for item, sha in zip(inputs, _shas(inputs)):
+            if known[sha] > 0:
+                known[sha] -= 1
+            else:
+                new_items.append(item)
+    later = (_json(_payload(record, following, "request", bundles)) or {}).get("input") if following else None
     outputs_by_call = {item.get("call_id"): item for item in later or ()
                        if isinstance(item, dict) and str(item.get("type", "")).endswith("_output")}
     received = []
@@ -469,7 +527,7 @@ def _codex_detail(record, line):
                      "previousCallId": previous["id"] if previous else None},
             "received": {"items": received}, "usage": usage,
             "placeholders": _placeholders(line, outputs, usage),
-            "rawAvailable": bool(line.get("request")) and _payload(record, line, "request") is not None}
+            "rawAvailable": bool(line.get("request")) and _payload(record, line, "request", bundles) is not None}
 
 
 def _stream_name(line):

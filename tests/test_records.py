@@ -560,6 +560,95 @@ class WebSocketContinuationTests(RecordCase):
                          [[PROMPT], [PROMPT, ANSWER, PROMPT], [PROMPT, ANSWER, CELL_OUTPUT]])
 
 
+class ThreadAcrossProcessesTests(RecordCase):
+    """A thread a paused author leaves goes on in a summary or reply turn's Codex process, then in the resumed
+    author's: a call's previous request, and the next one with its tool calls' outputs, are its thread's in whichever
+    process sent them."""
+
+    # A read-only turn's tools; the resent output of another process (Codex adds metadata of its own); the turns.
+    SUMMARY_TOOLS = {"type": "additional_tools", "id": "at_2", "role": "developer",
+                     "tools": [{"type": "namespace", "name": "functions", "tools": []}]}
+    CELL_2 = {"type": "custom_tool_call", "id": "ctc_2", "status": "completed", "call_id": "call-2", "name": "exec",
+              "input": "text(1);\n"}
+    CELL_2_OUTPUT = {"type": "custom_tool_call_output", "id": "ctco_2", "call_id": "call-2",
+                     "output": [{"type": "input_text", "text": "1"}]}
+    ASK = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Write a progress summary."}]}
+    SUMMARY = {"type": "message", "id": "msg_3", "role": "assistant",
+               "content": [{"type": "output_text", "text": "Progress so far."}]}
+    RESENT = {**SUMMARY, "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["text"]}}
+    GO_ON = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Keep working."}]}
+
+    def process(self, name, **labels):
+        folder = self.record.folder / "codex-trace" / name
+        folder.mkdir(parents=True)
+        records.write_atomic(self.record.folder / "codex" / name / "process.json", json.dumps(labels).encode())
+        return folder
+
+    def test_a_call_is_compared_with_the_previous_request_of_its_thread_in_another_process(self):
+        author = self.process("20261113T000000-author-aaaaaa", role="author", label="Author")
+        first = Bundle(author)
+        first.thread_started()
+        first.call("call-a", request([TOOLS, SYSTEM, PROMPT]), [REASONING, CELL])
+        # A WebSocket continuation sends only what is new since call-a's response.
+        first.call("call-b", request([CELL_OUTPUT], previous_response_id="resp_call-a"), [ANSWER, self.CELL_2])
+        records.TraceIngest(self.record, author.name, first.folder).step(final=True)
+        summary = self.process("20261113T000100-summary-bbbbbb", role="summary", label="Progress summary")
+        second = Bundle(summary)
+        second.time = first.time + 60_000
+        second.thread_started()
+        # A new process sends the thread whole, with tools of its own, then its turn: the prompt is asked again.
+        history = [SYSTEM, PROMPT, REASONING, CELL, CELL_OUTPUT, ANSWER, self.CELL_2, self.CELL_2_OUTPUT]
+        second.call("call-c", request([self.SUMMARY_TOOLS, *history, self.ASK, PROMPT]), [self.SUMMARY])
+        records.TraceIngest(self.record, summary.name, second.folder).step(final=True)
+        resumed = self.process("20261113T000200-author-cccccc", role="author", label="Author")
+        third = Bundle(resumed)
+        third.time = second.time + 60_000
+        third.thread_started()
+        third.call("call-d", request([TOOLS, *history, self.ASK, PROMPT, self.RESENT, self.GO_ON]), [ANSWER])
+        records.TraceIngest(self.record, resumed.name, third.folder).step(final=True)
+        rows = model_calls.call_list("run-1")["calls"]
+        self.assertEqual([(row["id"], row["role"]) for row in rows],
+                         [("c000001", "author"), ("c000002", "author"), ("c000003", "summary"), ("c000004", "author")])
+        news = {}
+        for row in rows:
+            sent = model_calls.call_detail("run-1", row["id"])["sent"]
+            news[row["id"]] = (sent["previousCallId"], [view["item"] for view in sent["newItems"]])
+        self.assertEqual(news, {
+            "c000001": (None, [TOOLS, SYSTEM, PROMPT]),
+            "c000002": ("c000001", [CELL_OUTPUT]),
+            # Each item the previous request had, in its whole input or its output, is not new, once for each time it
+            # had it.
+            "c000003": ("c000002", [self.SUMMARY_TOOLS, self.CELL_2_OUTPUT, self.ASK, PROMPT]),
+            "c000004": ("c000003", [TOOLS, self.RESENT, self.GO_ON])})
+        # The author's last call before the pause: its tool call's output is in the summary turn's request.
+        received = model_calls.call_detail("run-1", "c000002")["received"]["items"]
+        self.assertEqual([(view["item"], view["output"]) for view in received],
+                         [(ANSWER, None), (self.CELL_2, self.CELL_2_OUTPUT)])
+
+    def test_a_continuation_kept_whole_is_followed_back_too(self):
+        # A payload whose rebuild would differ (serde_json's 1e-7) is kept as its exact bytes, without a skeleton.
+        author = self.process("20261113T000000-author-aaaaaa", role="author", label="Author")
+        first = Bundle(author)
+        first.thread_started()
+        first.call("call-a", request([TOOLS, SYSTEM, PROMPT]), [REASONING, CELL])
+        text = json.dumps(request([CELL_OUTPUT], previous_response_id="resp_call-a"), indent=2).replace(
+            '"stream": true', '"temperature": 1e-7')
+        first.call("call-b", None, [ANSWER], text=text)
+        records.TraceIngest(self.record, author.name, first.folder).step(final=True)
+        self.assertFalse(records.StoredBundle(self.record, author.name, first.folder.name).load()
+                         .entries["payloads/4.json"].get("exact", True))
+        summary = self.process("20261113T000100-summary-bbbbbb", role="summary", label="Progress summary")
+        second = Bundle(summary)
+        second.time = first.time + 60_000
+        second.thread_started()
+        second.call("call-c", request([self.SUMMARY_TOOLS, SYSTEM, PROMPT, REASONING, CELL, CELL_OUTPUT, ANSWER,
+                                       self.ASK]), [self.SUMMARY])
+        records.TraceIngest(self.record, summary.name, second.folder).step(final=True)
+        sent = model_calls.call_detail("run-1", "c000003")["sent"]
+        self.assertEqual((sent["previousCallId"], [view["item"] for view in sent["newItems"]]),
+                         ("c000002", [self.SUMMARY_TOOLS, self.ASK]))
+
+
 class Sink:
     """A download's destination that keeps nothing: it counts the bytes."""
 

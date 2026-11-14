@@ -883,7 +883,12 @@ writes a job's record, `ui/model_calls.py` reads it.
   `~/tcs-work/fixes/record-contract.md`): `GET /jobs/<id>/model-calls?offset=&limit=`
   (time order, `limit` 1 to 1,000, 100 by default), `GET
   /jobs/<id>/model-calls/<callId>` (what was sent new, what came back, usage,
-  placeholders; a code cell's nested tool calls from the trace), `GET
+  placeholders; a code cell's nested tool calls from the trace; a Codex call's
+  previous request is its thread's in whichever process sent it, as a paused
+  author's thread goes on in a summary or reply turn's process and then in the
+  resumed author's, and what is new is what this input has beyond that
+  request's whole input and output, a WebSocket continuation's chain followed
+  back), `GET
   /jobs/<id>/model-calls/<callId>/raw` (the exact request and response), `GET
   /jobs/<id>/training-record` (a streamed ZIP: `requests.jsonl`, one
   self-contained example per request with a WebSocket continuation's input
