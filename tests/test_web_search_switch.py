@@ -44,9 +44,9 @@ class Endpoint:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-                endpoint.requests.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()},
-                                          "body": body})
-                return self.reply(*endpoint.search)
+                headers = {k.lower(): v for k, v in self.headers.items()}
+                endpoint.requests.append({"path": self.path, "headers": headers, "body": body})
+                return self.reply(*(endpoint.search(headers) if callable(endpoint.search) else endpoint.search))
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
@@ -120,6 +120,19 @@ class ConnectionSwitchTests(SwitchCase):
                 self.assertFalse(connection["webSearchCheck"]["ok"])
                 self.assertIn(words, connection["webSearchCheck"]["message"])
                 self.assertFalse(providers.api_connection(connection["id"], cached=False)["webSearch"])
+
+    def test_a_failure_that_quotes_the_key_never_shows_it(self):
+        # Some proxies' error pages quote the Authorization header they received.
+        self.endpoint.search = lambda headers: (
+            401, {"error": {"message": f"Invalid token: {headers['authorization']} ({json.dumps(KEY)})"}})
+        connection = self.save(webSearch=True)
+        self.assertFalse(connection["webSearch"])
+        self.assertIn("HTTP 401", connection["webSearchCheck"]["message"])
+        self.assertIn("Invalid token: Bearer [redacted]", connection["webSearchCheck"]["message"])
+        self.assertNotIn(KEY, json.dumps(connection))
+        self.assertNotIn(KEY, json.dumps(self.http.api_model_listing()))
+        stored = json.loads(providers.store_path().read_text())["models"][0]
+        self.assertNotIn(KEY, stored["webSearchCheck"]["message"])
 
     def test_an_answer_too_long_to_read_leaves_it_off_and_says_so(self):
         with mock.patch.object(server, "WEB_SEARCH_PROBE_MAX_BYTES", 16):

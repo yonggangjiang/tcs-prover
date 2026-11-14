@@ -856,7 +856,9 @@ URL>/alpha/search` with the connection's key and request source. Saving it on
 a JSON object whose `output` is text (at most `WEB_SEARCH_PROBE_MAX_BYTES`, 4
 MiB, of the answer is read; a longer one is refused, saying so), and the
 connection keeps the result as
-`webSearchCheck` `{ok, at, message}`, which the editor shows. A saved connection
+`webSearchCheck` `{ok, at, message}`, which the editor shows (the connection's
+key is removed from the message, as from a Test's, since an error page may
+quote the header it received). A saved connection
 that stays the same (URL, key, request source, format) is not probed again. A
 new live job records the connections of its models that have it on as
 `apiWebSearch` in its state and `job-settings.json`; every runner of the job

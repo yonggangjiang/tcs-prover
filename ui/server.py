@@ -2917,7 +2917,9 @@ def probe_web_search(entry, model, timeout=None):
         value = None
     if status is not None and 200 <= status < 300 and isinstance(value, dict) and isinstance(value.get("output"), str):
         return {"ok": True, "at": now, "message": f"The probe search answered ({len(value['output']):,} characters)."}
-    excerpt = runtime.redact(" ".join(text.split()))[:200]
+    # An error page may quote the Authorization header it received: the connection's key goes before the clip, as in
+    # the API Test (_api_test_text), since the message is kept with the connection and shown with it.
+    excerpt = _api_test_text(text, entry["apiKey"])[:200]
     why = (f"HTTP {status}" if status is None or not 200 <= status < 300
            else "its answer is not a search result (a JSON object with an \"output\" text)")
     return {"ok": False, "at": now, "message": f"The probe search failed: {why}" + (f": {excerpt}" if excerpt else ".")}
