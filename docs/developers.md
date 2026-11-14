@@ -991,17 +991,19 @@ are ignored.
 `webSearch` (off for every connection saved before it existed) turns on Codex
 0.160's own web search (web.run), which posts each search to `<base
 URL>/alpha/search` with the connection's key and request source. Saving it on
-(`POST /api-models` with `webSearch: true`) first sends one probe search
+(`POST /api-models` with `webSearch: true`) first sends one test search
 (`probe_web_search()`: `{id, model, commands: {search_query: [{q}]}, settings:
 {allowed_callers: ["direct"], external_web_access: true}, max_output_tokens:
 2500}`, the shape Codex sends); it stays on only if the answer is HTTP 2xx with
 a JSON object whose `output` is text (at most `WEB_SEARCH_PROBE_MAX_BYTES`, 4
 MiB, of the answer is read; a longer one is refused, saying so), and the
 connection keeps the result as
-`webSearchCheck` `{ok, at, message}`, which the editor shows (the connection's
-key is removed from the message, as from a Test's, since an error page may
-quote the header it received). A saved connection
-that stays the same (URL, key, request source, format) is not probed again. A
+`webSearchCheck` `{ok, at, message}`, which the editor shows after "Web search
+through this connection is on:" or "stays off:", the message's first word in
+lower case (*is on: the test search answered (514 characters).*; the
+connection's key is removed from the message, as from a Test's, since an error
+page may quote the header it received). A saved connection
+that stays the same (URL, key, request source, format) is not tested again. A
 new live job records the connections of its models that have it on as
 `apiWebSearch` in its state and `job-settings.json`; every runner of the job
 gets `--set api_web_search=[...]` (the review worker `--api-web-search`), and

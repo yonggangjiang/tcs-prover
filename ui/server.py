@@ -2907,8 +2907,10 @@ def probe_web_search(entry, model, timeout=None):
     now = datetime.now(timezone.utc).isoformat()
     # A failure's message ends with a full stop: the editor shows it after "Web search through this connection stays
     # off:", and the service's own words go in parentheses, so that they never run into the editor's next sentence.
+    # What follows a colon goes on in lower case ("… the search service: the connection was refused …").
     if failure:
-        return {"ok": False, "at": now, "message": f"The test search could not reach the search service: {failure}"}
+        return {"ok": False, "at": now, "message": "The test search could not reach the search service: "
+                                                   f"{failure[:1].lower()}{failure[1:]}"}
     if len(data) > WEB_SEARCH_PROBE_MAX_BYTES:
         return {"ok": False, "at": now, "message": "The test search's answer is longer than "
                                                    f"{WEB_SEARCH_PROBE_MAX_BYTES // (1024 * 1024)} MiB; it was not read."}
@@ -2918,7 +2920,7 @@ def probe_web_search(entry, model, timeout=None):
     except ValueError:
         value = None
     if status is not None and 200 <= status < 300 and isinstance(value, dict) and isinstance(value.get("output"), str):
-        return {"ok": True, "at": now, "message": f"The probe search answered ({len(value['output']):,} characters)."}
+        return {"ok": True, "at": now, "message": f"The test search answered ({len(value['output']):,} characters)."}
     # An error page may quote the Authorization header it received: the connection's key goes before the clip, as in
     # the API Test (_api_test_text), since the message is kept with the connection and shown with it.
     excerpt = _api_test_text(text, entry["apiKey"])[:200]

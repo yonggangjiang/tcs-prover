@@ -7754,11 +7754,16 @@ function apiSaveTestsSearch(values) {
     && values.requestSource === (editing.requestSource || "");
   return values.webSearch === true && !same;
 }
-// What a saved connection's web search switch says after the save: on, or off and why (its test search's result).
+// What a saved connection's web search switch says after the save: on, or off and why (its test search's result),
+// whose sentence goes on after the colon in lower case: "is on: the test search answered (514 characters)."
 function apiWebSearchText(connection) {
   const check = connection.webSearchCheck;
-  if (connection.webSearch) return `Web search through this connection is on${check?.message ? `: ${check.message}` : "."}`;
-  return `Web search through this connection stays off${check?.message ? `: ${check.message}` : "."}`;
+  const why = check?.message ? `: ${afterColon(check.message)}` : ".";
+  return `Web search through this connection ${connection.webSearch ? "is on" : "stays off"}${why}`;
+}
+// A sentence that follows a colon starts in lower case; a word in capitals (an abbreviation such as HTTP) keeps them.
+function afterColon(text) {
+  return /^[A-Z][a-z]/.test(text) ? `${text[0].toLowerCase()}${text.slice(1)}` : text;
 }
 async function refreshApiConnection(connection, button) {
   if (apiModelBusy) return;

@@ -98,7 +98,8 @@ class ConnectionSwitchTests(SwitchCase):
         connection = self.save(webSearch=True)
         self.assertTrue(connection["webSearch"])
         self.assertTrue(connection["webSearchCheck"]["ok"])
-        self.assertIn("answered", connection["webSearchCheck"]["message"])
+        # A test search, as the editor says it ("is on: the test search answered (33 characters)."), never a "probe".
+        self.assertEqual(connection["webSearchCheck"]["message"], "The test search answered (33 characters).")
         [search] = self.searches()
         self.assertEqual(search["path"], "/v1/alpha/search")
         self.assertEqual(search["headers"]["authorization"], f"Bearer {KEY}")
@@ -144,7 +145,8 @@ class ConnectionSwitchTests(SwitchCase):
         entry = {"format": "openai", "baseUrl": f"http://127.0.0.1:{port}/v1", "apiKey": KEY, "requestSource": ""}
         check = server.probe_web_search(entry, "gpt-6.1-sol", timeout=5)
         self.assertFalse(check["ok"])
-        self.assertEqual(check["message"], "The test search could not reach the search service: The connection was "
+        # What follows its colon goes on in lower case.
+        self.assertEqual(check["message"], "The test search could not reach the search service: the connection was "
                                            "refused (ConnectionRefusedError).")
 
     def test_a_failure_that_quotes_the_key_never_shows_it(self):

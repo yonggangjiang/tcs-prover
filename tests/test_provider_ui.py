@@ -986,10 +986,10 @@ sent[0].reply(200, {connection: {...connection, webSearch: false, webSearchCheck
   message: 'The test search failed (HTTP 404).'}}, ...listing([connection])});
 await settle();
 assert.equal($('apiModelTestResult').querySelector('.api-test-warning').textContent,
-  'Web search through this connection stays off: The test search failed (HTTP 404).');
+  'Web search through this connection stays off: the test search failed (HTTP 404).');
 assert.equal($('apiModelTestResult').className, 'api-test-result ok');
 // An edited connection that has it on shows it on; turning it off sends that.
-const searching = {...connection, webSearch: true, webSearchCheck: {ok: true, message: 'The probe search answered.'}};
+const searching = {...connection, webSearch: true, webSearchCheck: {ok: true, message: 'The test search answered.'}};
 sent.length = 0;
 apiModels = [searching];
 renderApiModels();
@@ -1008,7 +1008,7 @@ const testing = 'Loading models, testing web search and saving…', plain = 'Loa
 const busy = () => [$('apiModelSaveButton').textContent, $('apiModelTestResult').textContent,
   $('apiModelTestResult').className, $('apiModelSaveButton').disabled];
 const searching = {...connection, webSearch: true, webSearchCheck: {ok: true,
-  message: 'The probe search answered (514 characters).'}};
+  message: 'The test search answered (514 characters).'}};
 let reply = 0;
 const save = async (expected, answer, why) => {
   $('apiModelSaveButton').onclick();
@@ -1057,6 +1057,8 @@ const parts = () => result.children.map((child) => [child.tagName, child.classNa
 const next = 'Choose this key under Source in any role, then choose a model.';
 const reason = 'The test search failed (HTTP 404: {"error": {"message": "This gateway has no search service '
   + '(POST /v1/alpha/search is not routed).", "type": "not_found"}}).';
+// The editor goes on after its colon in lower case: "stays off: the test search failed (…)".
+const shown = `the${reason.slice(3)}`;
 const failed = {...connection, label: 'Backup gateway', webSearch: false, webSearchCheck: {ok: false, message: reason}};
 const saveOn = async (answer) => {
   $('apiModelWebSearch').checked = true; $('apiModelWebSearch').onchange();
@@ -1070,13 +1072,13 @@ await saveOn(failed);
 // search sentence, ending with a full stop, as a warning line of its own (not the error's cross).
 assert.equal(result.className, 'api-test-result ok');
 assert.deepEqual(parts(), [['STRONG', '', 'Saved Backup gateway.'], ['SPAN', 'api-test-detail', next],
-  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${reason}`]]);
+  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${shown}`]]);
 // Edited and saved again with the same outcome: "Updated", the same warning.
 click(rowButton('edit'));
 await saveOn(failed);
 assert.equal(result.className, 'api-test-result ok');
 assert.deepEqual(parts(), [['STRONG', '', 'Updated Backup gateway.'], ['SPAN', 'api-test-detail', next],
-  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${reason}`]]);
+  ['SPAN', 'api-test-warning', `Web search through this connection stays off: ${shown}`]]);
 // Without the test search's words, the warning still says that web search stays off.
 click(rowButton('edit'));
 await saveOn({...failed, webSearchCheck: null});
@@ -1085,10 +1087,15 @@ assert.deepEqual(parts().map((part) => part[2]), ['Updated Backup gateway.', nex
 // The test search answered: as before, no warning; the web search sentence, then the next step.
 click(rowButton('edit'));
 await saveOn({...connection, label: 'Research gateway', webSearch: true, webSearchCheck: {ok: true,
-  message: 'The probe search answered (514 characters).'}});
+  message: 'The test search answered (514 characters).'}});
 assert.equal(result.className, 'api-test-result ok');
 assert.deepEqual(parts(), [['STRONG', '', 'Updated Research gateway.'], ['SPAN', 'api-test-detail',
-  `Web search through this connection is on: The probe search answered (514 characters). ${next}`]]);
+  `Web search through this connection is on: the test search answered (514 characters). ${next}`]]);
+// A reason that starts with an abbreviation keeps its capitals after the colon.
+click(rowButton('edit'));
+await saveOn({...failed, webSearchCheck: {ok: false, message: 'HTTP 404 from the search service.'}});
+assert.deepEqual(parts().map((part) => part[2]), ['Updated Backup gateway.', next,
+  'Web search through this connection stays off: HTTP 404 from the search service.']);
 // A save that fails is still an error, without a warning.
 click(rowButton('edit')); type('apiModelBaseUrl', 'https://lab.example/v3');
 $('apiModelSaveButton').onclick();
