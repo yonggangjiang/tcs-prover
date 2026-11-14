@@ -92,6 +92,11 @@ REQUEST_ENDS = {
 }
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
+# The files in which Codex keeps a login (auth.json: the ChatGPT login or an API key; .credentials.json: MCP sign-ins
+# when no keychain is available). A web-cutoff URL discovery call keeps a copy of the login in its private Codex home
+# while it runs, and a call stopped by a signal leaves it there (retrieval/historical_codex_discovery.py): the record
+# never copies one (copy_web_cutoff()).
+LOGIN_FILES = ("auth.json", ".credentials.json")
 # A Codex session file: rollout-<YYYY-MM-DDThh-mm-ss>-<thread id>[_<segment id>].jsonl, compressed .jsonl.zst.
 _ROLLOUT = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl(?:\.zst)?\Z")
 
@@ -1625,7 +1630,7 @@ def read_transcript(record):
 def copy_web_cutoff(record, policy_path):
     """Copy what a web-cutoff run leaves behind into sources/web-cutoff/: the author's session files from the run's
     bundle (<codexHome>/author/sessions) and the URL discovery folders (discovery-state/discovery-*), new or changed
-    files only. Its isolation is untouched: nothing of this reaches its processes."""
+    files only, never a login (LOGIN_FILES). Its isolation is untouched: nothing of this reaches its processes."""
 
     policy = read_json(policy_path, {})
     if not isinstance(policy, dict):
@@ -1645,6 +1650,8 @@ def copy_web_cutoff(record, policy_path):
             relative = source.relative_to(root).as_posix()
             if prefix.endswith("discovery") and not relative.startswith("discovery-"):
                 continue
+            if source.name.lower() in LOGIN_FILES:
+                continue  # A discovery call's copy of the login.
             try:
                 target = record.path(f"{prefix}/{stored_name(relative)}")
                 if copied_size(target) == source.stat().st_size % 2 ** 32:

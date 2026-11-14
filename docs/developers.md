@@ -800,9 +800,12 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   the run's bundle (`<codexHome>/author/sessions`) and the discovery folders
   (`discovery-state/discovery-*`) into `sources/web-cutoff/`, at each snapshot
   and every `RECORD_COPY_SECONDS` (600 s) while the job runs, well before
-  discovery prunes a folder (a day old at least). Their one-shot calls appear
-  in the model-calls list as rows of status `not recorded` (one per attempt's
-  request record).
+  discovery prunes a folder (a day old at least). A login is never copied: a
+  discovery call keeps a copy of the ChatGPT login in its private Codex home
+  while it runs (and a call stopped by a signal leaves it there), so files
+  named `auth.json` or `.credentials.json` (`records.LOGIN_FILES`) are left
+  out. Their one-shot calls appear in the model-calls list as rows of status
+  `not recorded` (one per attempt's request record).
 - **Placeholders** (computed by `ui/model_calls.py`, never stored): `kind`,
   `facts`, `withheldBy`, `why`: `hidden_reasoning` (reasoning tokens; whether
   the encrypted copy or signature is kept), `token_probabilities` (refused by

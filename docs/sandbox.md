@@ -58,7 +58,9 @@ call (web-cutoff runs) are deleted when the call ends.
 calls (see [The job page](job-page.md#the-record-of-every-model-call)). It is
 not among the entries above (keeping models away from it was left for later):
 on macOS no run's model reads it all the same, as they read nothing of the
-checkout; on Linux and Windows a live run's model could (see below).
+checkout; on Linux and Windows a live run's model could (see below). A record
+never holds a login: the copy a web-cutoff URL discovery call keeps while it
+runs is left out of the discovery folders it copies.
 
 ## Claude Code
 

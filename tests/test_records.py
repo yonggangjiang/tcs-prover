@@ -615,6 +615,29 @@ class SnapshotTests(RecordCase):
         self.assertEqual(records.read_source(sources / "discovery" / "discovery-1" / "events.jsonl.gz"), b"{}\n")
         self.assertFalse((sources / "discovery" / "pacing.json.gz").exists())
 
+    def test_a_discovery_call_s_copy_of_the_login_never_reaches_the_record(self):
+        # A URL discovery call keeps a copy of the ChatGPT login in its private Codex home while it runs, and a call
+        # stopped by a signal leaves it there; the folder is copied every RECORD_COPY_SECONDS meanwhile.
+        controller = self.root / "experiment-control" / "run-1-abc"
+        home = controller / "discovery-state" / "discovery-k2x9" / "home"
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text('{"tokens": {"refresh_token": "FAKE-REFRESH-TOKEN"}}', encoding="utf-8")
+        (home / ".credentials.json").write_text('{"token": "FAKE-MCP-TOKEN"}', encoding="utf-8")
+        (home / "config.toml").write_text("", encoding="utf-8")
+        (home.parent / "events.jsonl").write_text('{"type": "thread.started"}\n', encoding="utf-8")
+        policy = controller / "retrieval-policy.json"
+        policy.write_text(json.dumps({"isolation": {}}), encoding="utf-8")
+        records.copy_web_cutoff(self.record, policy)
+        copied = self.record.folder / "sources" / "web-cutoff" / "discovery" / "discovery-k2x9"
+        self.assertTrue((copied / "events.jsonl.gz").is_file())
+        self.assertTrue((copied / "home" / "config.toml.gz").is_file())
+        self.assertEqual(sorted(path.name for path in (copied / "home").iterdir()), ["config.toml.gz"])
+        for path in self.record.folder.rglob("*"):
+            if path.is_file():
+                data = records.read_source(path) or b""
+                self.assertNotIn(b"FAKE-REFRESH-TOKEN", data, path)
+                self.assertNotIn(b"FAKE-MCP-TOKEN", data, path)
+
 
 class StoreTests(RecordCase):
     def test_only_plain_folder_names_name_a_record(self):
