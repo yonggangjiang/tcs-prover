@@ -175,7 +175,8 @@ ENDPOINT_MESSAGE = "max_tokens: 64000 > 32000, which is the maximum allowed numb
 FILTER_MESSAGE = "Output blocked by content filtering policy"
 CONTENT_FILTER = tuple(line.replace(ENDPOINT_MESSAGE, FILTER_MESSAGE) for line in CAPTURED_400)
 # The same refusal from an OpenAI-format endpoint as Codex reports a 400 (Azure OpenAI's content filter: its message and
-# the code "content_filter"), with and without an invalid_request_error type.
+# the code "content_filter"), with and without an invalid_request_error type, and one with Azure's message alone (its
+# ResponsibleAIPolicyViolation code, as a gateway may relay it): "content management policy" says it by itself.
 OPENAI_FILTERED = (
     'Codex review failed: unexpected status 400 Bad Request: {"error": {"message": "The response was filtered due to the '
     "prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", \"type\": "
@@ -183,6 +184,9 @@ OPENAI_FILTERED = (
     'Codex review failed: unexpected status 400 Bad Request: {"error": {"message": "The response was filtered due to the '
     "prompt triggering Azure OpenAI's content management policy.\", \"type\": null, \"param\": \"prompt\", \"code\": "
     '"content_filter", "status": 400}}',
+    'Codex review failed: unexpected status 400 Bad Request: {"error": {"message": "The response was filtered due to the '
+    "prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", \"type\": "
+    '"invalid_request_error", "param": "prompt", "code": "ResponsibleAIPolicyViolation", "status": 400}}',
 )
 # What the job says for the Anthropic-format connection "Gateway" (the label of claude_test's API model).
 REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid (API Error: 400 "
@@ -268,12 +272,15 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), model))
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), model))
                 self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
-        # The same refusal from an OpenAI-format endpoint, whatever type its 400 names.
+        # The same refusal from an OpenAI-format endpoint, whatever type and code its 400 names.
         openai = self.api_model()["id"]
         for text in OPENAI_FILTERED:
             with self.subTest(text=text):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), openai))
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), openai))
+        # Azure's message alone is such a refusal although it is an invalid_request_error 400 without the code.
+        self.assertNotRegex(OPENAI_FILTERED[2], r"(?i)content[ _-]?filter")
+        self.assertRegex(OPENAI_FILTERED[2], r"invalid_request_error[\s\S]*\b400\b")
         # Every other rule stays: the endpoint's other 400s are requests it refuses, in either format.
         self.assertIsInstance(runtime.settings_failure(runtime.Error(runner_text(CAPTURED_400[1])), model),
                               runtime.RequestRejected)
