@@ -1547,6 +1547,20 @@ def _plain_failure(text):
     return next((plain for pattern, plain in _FAILURE_PATTERNS if re.search(pattern, lowered)), "")
 
 
+# Provider words for an account whose credit is used up: Claude Code's "Credit balance is too low" (Anthropic's 400 for
+# a key without credit), a gateway's "insufficient credits" or "insufficient balance", HTTP 402 Payment Required. Such a
+# failure is retried every minute like any other (no plain words of _FAILURE_PATTERNS: the retry notes the models read
+# stay as they were); the job is listed under Needs your attention at once (ui/server.py App.attention()).
+_OUT_OF_CREDIT = re.compile(r"credit balance is too low|insufficient[ _](?:credits?|balance|funds)|out of credits?|"
+                            r"requires more credits|payment[ _]required", re.IGNORECASE)
+
+
+def out_of_credit(text):
+    """Whether a failure's words say that the account behind the model has no credit left."""
+
+    return bool(_OUT_OF_CREDIT.search(str(text or "")))
+
+
 def _subagent_summary(failures):
     """("2 subagent calls", "model at capacity; connection lost") for {subagent: provider message}."""
 
@@ -4121,7 +4135,8 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
                      configuration=lambda error, member: member_problem(error, member.model), emit=emit_member,
                      render=render_template, retry_note=AUTHOR_RETRY_NOTE, retry_seconds=MODEL_RETRY_SECONDS,
                      stop_process=stop_process, conversation=conversation, discard=sessions.discard,
-                     unavailable=lambda error: isinstance(error, ConversationUnavailable))
+                     unavailable=lambda error: isinstance(error, ConversationUnavailable),
+                     describe=describe_failure)
 
 
 def save_final_input(statement, solution, directory=None):

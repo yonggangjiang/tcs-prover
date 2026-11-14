@@ -110,6 +110,18 @@ that is fixed: a program Setup installs is found by the waiting job at its next
 retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
 
+A job whose model calls keep failing the same way is listed there too, while
+its retries go on every minute without limit: at once when the provider says
+that the account is out of credit (**Out of credit**, for example Claude Code's
+"Credit balance is too low", with the model's connection), or that a usage limit
+was reached, and otherwise once the same failure has repeated for 15 minutes
+(**Model calls keep failing**: which call, for how long, and the failure). The
+15 minutes count from the first failure of that kind; another failure starts
+them again (the numbers and request IDs in a provider's message do not make it
+another). This covers every role, a team member and a paused author's reply.
+The line goes as soon as a model call of it works again (the model's first
+output), and when its step or the job's runner ends.
+
 A web-cutoff job held because its isolated LaTeX compiler is not ready (MacTeX
 missing, being updated or damaged, or the compiler's macOS sandbox check
 failing) is listed as *LaTeX compiler not ready*, with what fixes its cause. The

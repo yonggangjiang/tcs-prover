@@ -171,6 +171,17 @@ class AccuracyTests(unittest.TestCase):
                       "conversation whose tool calls and results do not match (\"API Error: 400 due to tool use "
                       "concurrency issues\", \"… orphaned tool_result …\", \"… duplicate tool_use ID …\") are retried "
                       "every minute instead.", trouble)
+        # A job whose model calls keep failing the same way is listed under Needs your attention while it retries:
+        # at once out of credit or at a usage limit, otherwise after server.FAILING_ATTENTION_SECONDS (owner's
+        # decision, 14 Nov 2026), named where it applies.
+        self.assertIn("\nFAILING_ATTENTION_SECONDS = 15 * 60\n", (ROOT / "ui" / "server.py").read_text(encoding="utf-8"))
+        retries = flat(DOCS / "retries.md")
+        self.assertIn("A job whose model calls keep failing the same way is listed there too, while its retries go on "
+                      "every minute without limit: at once when the provider says that the account is out of credit "
+                      "(**Out of credit**, for example Claude Code's \"Credit balance is too low\", with the model's "
+                      "connection), or that a usage limit was reached, and otherwise once the same failure has "
+                      "repeated for 15 minutes", retries)
+        self.assertIn("after 15 minutes of the same failure", flat(DOCS / "job-page.md"))
         # So is a content filter's refusal, in either format (owner's decision, 14 Nov 2026;
         # workflow_runner._CONTENT_FILTER).
         self.assertIn("So is a content filter's refusal (\"API Error: 400 Output blocked by content filtering policy\", "

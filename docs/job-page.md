@@ -27,7 +27,11 @@ growing.* One mark shows where the run is:
 While the job works, the status card says when the last event arrived (*Last
 activity 2m 05s ago*) and, while something waits to retry, what waits and since
 when: a failed model call, a command that could not run (such as compiling the
-PDF without TeX), or saving a file.
+PDF without TeX), or saving a file. A job whose model calls keep failing the
+same way says so under its title, as the Overview lists it under **Needs your
+attention**: at once for an account out of credit or a usage limit, otherwise
+after 15 minutes of the same failure (see
+[Retries](retries.md#what-needs-you)); its retries go on every minute.
 
 **Run settings**, below the activity log, lists the models and settings the job
 runs with. Its **Proof author** row ends with how the author works:

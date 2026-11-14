@@ -440,12 +440,14 @@ class Team:
     every ``retry_seconds`` without limit, continuing the member's conversation when the attempt worked in it,
     unless ``configuration(error)`` says only a change of settings can fix it: that failure is reported to the
     coordinator and the member becomes idle. ``emit(kind, **fields)`` records (each record of an assignment with its
-    id, assignment_id(), which ``attempt`` finds as ``member.assignment``); ``directory`` is the shared working
-    folder, where reports are saved. close() stops every member (each record says why) and ends every wait.
+    id, assignment_id(), which ``attempt`` finds as ``member.assignment``; a failed attempt's note carries the failure
+    in plain words and the provider's own, ``describe(error)``, and when it is retried); ``directory`` is the shared
+    working folder, where reports are saved. close() stops every member (each record says why) and ends every wait.
     """
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
-                 retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None):
+                 retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None,
+                 describe=None):
         self.members = {entry["member"]: _Member(entry) for entry in members}
         self.prompts, self.directory = prompts, Path(directory)
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
@@ -455,6 +457,10 @@ class Team:
         self.discard = discard or (lambda: None)
         # Whether a failure says that the conversation the attempt continued is gone.
         self.unavailable = unavailable or (lambda error: False)
+        # A failed attempt in plain words and the provider's own line (workflow_runner.describe_failure()): the server
+        # lists a member whose model calls keep failing the same way under Needs your attention (ui/server.py
+        # App._follow_failures()).
+        self.describe = describe or (lambda error: ((str(error).strip().splitlines() or [type(error).__name__])[0], ""))
         self.cond = threading.Condition()
         self.done = deque()
         self.attention_reason = None  # (reason, time.monotonic()) of the latest attention
@@ -708,7 +714,8 @@ class Team:
                                                  + (", continuing its conversation." if worked else
                                                     ", running the assignment again."),
                               subagentMember=member.number, subagentModel=member.label,
-                              subagentId=assignment_id(member.number, count), attempt=attempts)
+                              subagentId=assignment_id(member.number, count), attempt=attempts,
+                              **self._failure_fields(exc))
                     if worked:
                         base = {"session": conversation.session_id, "harness": getattr(conversation, "harness", None)}
                         instruction = self.retry_note
@@ -722,6 +729,17 @@ class Team:
                                                "harness": getattr(conversation, "harness", None)}
             break
         self._finish(member, count, reply, failure)
+
+    def _failure_fields(self, error):
+        """A failed attempt's note fields for the server: its failure in plain words, the provider's line and when it
+        is retried. A description that fails leaves them out (the note stays)."""
+
+        try:
+            plain, reason = self.describe(error)
+        except Exception:  # noqa: BLE001 - the note matters more than its fields.
+            return {}
+        return {"failure": str(plain or "")[:300], "failureReason": str(reason or "")[:300],
+                "retryAt": time.time() + self.retry_seconds}
 
     def _finish(self, member, count, reply, failure):
         stopped = member.cancel.is_set()
