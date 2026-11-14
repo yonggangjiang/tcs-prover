@@ -153,11 +153,12 @@ web-cutoff policy) and programming errors.
   not exist or that your account cannot use (**Model unavailable**) or, for an
   API model, an endpoint that refuses the requests as invalid with HTTP 400
   (**Request rejected by the API endpoint**; Codex reports it as the endpoint's
-  error alone, of type `invalid_request_error`, and Claude Code as "API Error:
-  400" with the endpoint's message). Words such as "503", "429" or "capacity"
-  inside that error are the endpoint's own (for example "Invalid
-  'input[512].content'") and do not make it a passing failure. Both list the job
-  under **Needs your attention**. Such a job resumes by itself once its API connection's settings
+  error alone, whichever server wrote it, and Claude Code as "API Error: 400"
+  with the endpoint's message). Words such as "503", "429" or "capacity" inside
+  that error are the endpoint's own (for example "Invalid 'input[512].content'")
+  and do not make it a passing failure; a 400 whose error is plain text ("Bad
+  Request") cannot be told from Codex's own words and is retried. Both list the
+  job under **Needs your attention**. Such a job resumes by itself once its API connection's settings
   change; one whose built-in model is unavailable waits for **Resume**. A key
   store that cannot be read for a moment is retried like any failure, and so
   is a content filter's refusal (Claude Code's "API Error: 400 Output blocked

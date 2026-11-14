@@ -12,14 +12,16 @@ does an endpoint that says the model does not exist, which the author and a stru
 unavailable"). The endpoint's words in these messages are its error's message, also when it writes its body over
 several lines, as api.openai.com does.
 
-Codex 0.160 reports every other status in words of its own, never as the body alone, so in a failure that is only
-error bodies the words of a passing condition (a 5xx number, 429, capacity, temporary, ...) keep it retried only
-outside the bodies: "input[512]" in the endpoint's message is no server error.
+Codex 0.160 reports every other status in words of its own, never as the body alone, so a failure that is only error
+bodies is an endpoint's 400 whatever the body: other servers' bodies (vLLM's {"object": "error", ...}, an "error"
+that is a string, FastAPI's {"detail": ...}) are such requests too, and the words of a passing condition (a 5xx
+number, 429, capacity, temporary, ...) keep it retried only outside the bodies: "input[512]" in the endpoint's message
+is no server error.
 
-Everything else stays retried every minute: an endpoint's 400 for a conversation too long for the model, a passing
-condition named outside the bodies, a body quoted under another HTTP status (a key refused with 401), and the same
-body from a built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test starts a
-model.
+Everything else stays retried every minute: an endpoint's 400 for a conversation too long for the model (in any of
+those bodies), a passing condition named outside the bodies, a body quoted under another HTTP status (a key refused
+with 401), a 400 whose body is plain text (which cannot be told from Codex's own words), and the same body from a
+built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test starts a model.
 """
 
 import functools
@@ -126,7 +128,7 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
 
     def test_a_conversation_too_long_stays_retried(self):
-        texts = list(self.texts(captured.EXEC_400_TOO_LONG).values())
+        texts = [*self.texts(captured.EXEC_400_TOO_LONG).values(), *self.texts(captured.EXEC_400_VLLM_TOO_LONG).values()]
         # A conversation too large for the model in the code of a proxy such as CLIProxyAPI (whose message need not say
         # so).
         texts.append(captured.exec_text(tuple(line.replace("unsupported_parameter", "context_too_large") for line in
@@ -135,8 +137,10 @@ class CapturedTextTests(jobs_test.Isolated):
             with self.subTest(text=text):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
-        # The conversation too long is one: the author continues in a new conversation (goal_session()).
-        self.assertTrue(runtime._context_window_failure(captured.exec_text(captured.EXEC_400_TOO_LONG)))
+        # The conversation too long is one, also in vLLM's body: the author continues in a new conversation
+        # (goal_session()).
+        for lines in (captured.EXEC_400_TOO_LONG, captured.EXEC_400_VLLM_TOO_LONG):
+            self.assertTrue(runtime._context_window_failure(captured.exec_text(lines)))
 
     def test_numbers_and_words_in_the_endpoint_s_message_never_keep_a_refused_request_retried(self):
         # The endpoint's message names an item by its number (input[512], input[429]) or says words that elsewhere
@@ -196,6 +200,40 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
                 self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
                 self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+
+    def test_other_servers_400_bodies_are_requests_the_endpoint_refuses(self):
+        # vLLM's BadRequestError (with no invalid_request_error anywhere), with and without the "error" wrapper; an
+        # "error" that is a string (Ollama's); FastAPI's {"detail": ...}. The reason is the body's own words.
+        cases = ((captured.EXEC_400_VLLM, captured.VLLM_MESSAGE), (captured.EXEC_400_VLLM_WRAPPED, captured.VLLM_MESSAGE),
+                 (captured.EXEC_400_ERROR_TEXT, "lab-model does not support tools"),
+                 (captured.EXEC_400_DETAIL, "Bad Request"))
+        for lines, reason in cases:
+            line = f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid ({reason})."
+            for path, text in self.texts(lines).items():
+                with self.subTest(reason=reason, path=path):
+                    self.assertNotIn("invalid_request", text)
+                    problem = runtime.settings_failure(runtime.Error(text), self.model)
+                    self.assertIsInstance(problem, runtime.RequestRejected)
+                    self.assertEqual(str(problem), f"{line} A retry cannot fix this: change its API connection's "
+                                                   "settings under Models & API (or the endpoint); a job waiting for "
+                                                   "it continues once its settings change.")
+                    self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
+                                     team.Refusal(line, reason))
+                    # A built-in model's same failure stays retried.
+                    self.assertIsNone(runtime.settings_failure(runtime.Error(text), "gpt-6.1-sol"))
+        turn = json.loads(captured.APP_SERVER_400_VLLM[1])["params"]["turn"]["error"]
+        for text in (author_text(captured.APP_SERVER_400_VLLM), f"Author turn failed: {runtime._provider_message(turn)}",
+                     f"Author reply turn failed: {runtime._provider_message(turn)}"):
+            with self.subTest(text=text):
+                self.assertEqual(runtime.settings_failure(runtime.Error(text), self.model).reason, captured.VLLM_MESSAGE)
+
+    def test_a_400_whose_body_is_plain_text_stays_retried(self):
+        # Codex 0.160 reports it as those words alone (EXEC_400_PLAIN), which nothing tells from its own words.
+        for path, text in self.texts(captured.EXEC_400_PLAIN).items():
+            with self.subTest(path=path):
+                self.assertEqual(text.split(": ", 1)[1], "Bad Request\nBad Request")
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
 
     def test_a_content_filter_s_refusal_as_its_body_alone_stays_retried(self):
         # Owner's decision (14 Nov 2026): a content filter's refusal is no setting of the connection and is retried
@@ -313,6 +351,9 @@ class StructuredCallTests(retry_test.RetryCase):
         self.assertEqual(raised.exception.reason, reason)
         self.assertEqual((len(self.execs()), self.waits()), (1, 0))
 
+    def test_another_server_s_400_ends_the_call_after_its_first_attempt(self):
+        self.refused_once(captured.EXEC_400_VLLM, captured.VLLM_MESSAGE)
+
     def test_a_400_whose_message_names_input_512_ends_the_call_after_its_first_attempt(self):
         self.refused_once(captured.EXEC_400_INPUT_512, captured.INPUT_512_MESSAGE)
 
@@ -397,13 +438,18 @@ class AuthorTests(retry_test.RetryCase):
         self.assertEqual(paused["text"], REJECTED)
         self.assertEqual((len(self.servers), self.waits()), (1, 0))
 
-    def test_a_400_whose_message_names_input_512_pauses_the_author_without_a_retry(self):
-        self.scripts[0] = {"captured": captured.APP_SERVER_400_INPUT_512}
-        with self.assertRaises(runtime.WorkflowPaused) as raised:
-            self.run_goal(launch=self.launcher(model=save_gateway()))
-        self.assertIn(f"invalid ({captured.INPUT_512_MESSAGE}). A retry cannot fix this", raised.exception.reason)
-        self.assertIsNone(raised.exception.retry)
-        self.assertEqual((len(self.servers), self.waits()), (1, 0))
+    def test_another_server_s_400_and_a_number_in_its_message_pause_the_author_without_a_retry(self):
+        for lines, reason in ((captured.APP_SERVER_400_VLLM, captured.VLLM_MESSAGE),
+                              (captured.APP_SERVER_400_INPUT_512, captured.INPUT_512_MESSAGE)):
+            with self.subTest(reason=reason):
+                self.servers.clear()
+                self.scripts[:] = [{"captured": lines}, {"answer": "Full proof"}]
+                with self.assertRaises(runtime.WorkflowPaused) as raised:
+                    self.run_goal(launch=self.launcher(model=save_gateway()))
+                self.assertIn(f"invalid ({reason}). A retry cannot fix this", raised.exception.reason)
+                self.assertIsNone(raised.exception.retry)
+                self.assertEqual(len(self.servers), 1)
+        self.assertEqual(self.waits(), 0)
 
     def test_a_content_filter_s_refusal_is_retried_in_the_same_conversation(self):
         self.scripts[0] = {"captured": captured.APP_SERVER_400_FILTERED}

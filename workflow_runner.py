@@ -592,10 +592,14 @@ _OTHER_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|AP
                            re.IGNORECASE)
 # Codex 0.160 reports every other status in words of its own around the endpoint's message ("unexpected status 401
 # Unauthorized: …, url: …", "exceeded retry limit, last status: 429 Too Many Requests", "We're currently experiencing
-# high demand, which may cause temporary errors." for a 500), never as the body alone. So in a failure that is only
-# error bodies (_bare_error_body(): whole JSON objects with an "error" member; no HTTP status named outside them,
-# _ANY_STATUS) the words of a passing condition count outside the bodies, never in them: a number such as the 512 of
-# "Invalid 'input[512].content'" is the endpoint's words of its 400, not a server error.
+# high demand, which may cause temporary errors." for a 500), never as the body alone. So a failure that is only error
+# bodies (_bare_error_body(): whole JSON objects with an "error" member, of any type, as OpenAI, Ollama and most
+# gateways write them, vLLM's and SGLang's {"object": "error", …}, or FastAPI's {"detail": …}; no HTTP status named
+# outside them, _ANY_STATUS) is an endpoint's HTTP 400 whatever its body says: a request it refuses on an API
+# connection, but for a conversation too long for the model (the usual words or "context_too_large"), a content
+# filter's refusal, and a passing condition named outside the bodies, never in them (a number such as the 512 of
+# "Invalid 'input[512].content'" is the endpoint's words, not a server error). A body that is plain text ("Bad
+# Request") cannot be told from Codex's own words, so it stays retried.
 _ANY_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|API status|HTTP|status code)\s*"
                          r"[1-5]\d\d\b", re.IGNORECASE)
 # Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
@@ -622,8 +626,8 @@ def _invalid_request_body(text):
 
 
 def _error_bodies(text):
-    """The whole JSON error bodies a failure quotes, as [(start, end, body)]: objects with an "error" member, each
-    outside the others."""
+    """The whole JSON error bodies a failure quotes, as [(start, end, body)]: objects with an "error" member, objects
+    whose "object" is "error" (vLLM's, SGLang's) and FastAPI's {"detail": …}, each outside the others."""
 
     decoder, found, after = json.JSONDecoder(), [], 0
     for brace in re.finditer(r"\{", text):
@@ -633,7 +637,8 @@ def _error_bodies(text):
             value, end = decoder.raw_decode(text, brace.start())
         except ValueError:
             continue
-        if isinstance(value, dict) and "error" in value:
+        if isinstance(value, dict) and ("error" in value or value.get("object") == "error"
+                                        or set(value) == {"detail"}):
             found.append((brace.start(), end, value))
             after = end
     return found
@@ -656,12 +661,13 @@ def _bare_error_body(text):
 def _error_body_words(text, limit=300):
     """The endpoint's own words in the first error body that a failure quotes whole, on one line; else "".
 
-    Codex reports an endpoint's HTTP 400 as its JSON body alone (see _INVALID_REQUEST_BODY), which api.openai.com
-    writes over several lines: the words are its error's message, as the connection's Test quotes it, else the body.
+    Codex reports an endpoint's HTTP 400 as its JSON body alone (see _INVALID_REQUEST_BODY and _ANY_STATUS), which
+    api.openai.com writes over several lines: the words are its error's message (vLLM's at the top of its body, an
+    "error" or "detail" that is text itself), as the connection's Test quotes it, else the body.
     """
 
     for start, end, value in _error_bodies(text):
-        error = value["error"]
+        error = value["error"] if "error" in value else value.get("detail", value)
         words = error.get("message") if isinstance(error, dict) else error
         if not isinstance(words, str) or not words.strip():
             words = text[start:end]
@@ -675,8 +681,8 @@ def settings_failure(error, model=None):
     No retry fixes a model that does not exist or that this account cannot
     use (ModelUnavailable), an API model's endpoint that refuses the request
     as invalid (RequestRejected: HTTP 400, which Codex reports as the
-    endpoint's invalid_request_error body alone; a conversation that is too
-    long is not that, nor one whose tool calls and results Claude Code
+    endpoint's error body alone, of whatever type; a conversation that is
+    too long is not that, nor one whose tool calls and results Claude Code
     reports as not pairing up, nor a content filter's refusal), or private
     TCS Prover state that cannot be used (a ProviderError). The endpoint's
     words in such a message are its error's own message when the failure
@@ -714,7 +720,8 @@ def settings_failure(error, model=None):
                else "check that the model exists and that your login may use it")
         summary = f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason})."
         return ModelUnavailable(f"{summary} A retry cannot fix this: {fix}.", reason, summary)
-    if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text))
+    bare_400 = outside is not None and "context_too_large" not in text.lower()
+    if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text) or bare_400)
             and not _CLAUDE_HISTORY_MISMATCH.search(text) and not _CONTENT_FILTER.search(text)):
         summary = f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as invalid ({reason})."
         return RequestRejected(f"{summary} A retry cannot fix this: change its API connection's settings under "

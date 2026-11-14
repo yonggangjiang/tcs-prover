@@ -1078,13 +1078,19 @@ How a refused request is told apart (`settings_failure()`): Claude Code says
 "API Error: 400"; Codex 0.160 reports an endpoint's 400 as its body alone and
 every other status in words of its own ("unexpected status 401 Unauthorized:
 …", "exceeded retry limit, last status: 429 …", "We're currently experiencing
-high demand …" for a 500). So in a failure that is only error bodies
-(`_bare_error_body()`: whole JSON objects with an `error` member; no status
-named outside them, `_ANY_STATUS`) the words of a passing condition
+high demand …" for a 500), so a failure that is only error bodies
+(`_bare_error_body()`: whole JSON objects with an `error` member of any type,
+vLLM's and SGLang's `{"object": "error", …}`, FastAPI's `{"detail": …}`; no
+status named outside them, `_ANY_STATUS`) is a request the endpoint refuses on
+an API connection, except a conversation too long for the model (also vLLM's
+"maximum context length", CLIProxyAPI's `context_too_large`) and a content
+filter's refusal. In such a failure the words of a passing condition
 (`_PASSING_CONDITION`: a 5xx number, 429, capacity, overload, high demand,
 temporar…, rate limit) count only outside the bodies, so "Invalid
 'input[512].content'" is refused rather than retried every minute forever; the
-captured lines are in `tests/codex_refusals.py`.
+captured lines are in `tests/codex_refusals.py`. A 400 whose body is plain text
+("Bad Request", `EXEC_400_PLAIN`) cannot be told from Codex's own words and
+stays retried.
 
 ## HTTP API notes
 

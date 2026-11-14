@@ -25,6 +25,11 @@ request, the body alone again, with ports and IDs as printed:
   message and code), through `codex exec --json` (EXEC_400_FILTERED) and the app-server (APP_SERVER_400_FILTERED).
 - HTTP 400 invalid_request_error bodies whose messages name an item by its number, as api.openai.com words them:
   "input[512]" (EXEC_400_INPUT_512, APP_SERVER_400_INPUT_512) and "input[429]" (EXEC_400_INPUT_429).
+- Other servers' HTTP 400 bodies: vLLM's {"object": "error", ..., "type": "BadRequestError", "code": 400}
+  (EXEC_400_VLLM, APP_SERVER_400_VLLM), the same in an "error" wrapper as newer vLLM writes it
+  (EXEC_400_VLLM_WRAPPED), vLLM's conversation too long for the model (EXEC_400_VLLM_TOO_LONG), an "error" that is a
+  string, as Ollama writes it (EXEC_400_ERROR_TEXT), FastAPI's {"detail": ...} (EXEC_400_DETAIL), and a text/plain
+  "Bad Request" (EXEC_400_PLAIN, which Codex reports as those words alone).
 With TCS Prover's RUST_LOG=error (workflow_runner.environment()), `codex exec`'s stderr held only "Reading additional
 input from stdin..." for these.
 """
@@ -33,11 +38,12 @@ import json
 
 # The endpoint's own message in EXEC_400, APP_SERVER_400 and EXEC_400_INDENTED.
 ENDPOINT_MESSAGE = "Unsupported parameter: 'reasoning.summary' is not supported with this model."
-# The messages of EXEC_400_INPUT_512 (and APP_SERVER_400_INPUT_512) and EXEC_400_INPUT_429.
+# The messages of EXEC_400_INPUT_512 (and APP_SERVER_400_INPUT_512), EXEC_400_INPUT_429 and the vLLM bodies.
 INPUT_512_MESSAGE = ("Invalid 'input[512].content': string too long. Expected a string with maximum length 10485760, "
                      "but got a string with length 10485761 instead.")
 INPUT_429_MESSAGE = ("Invalid 'input[429].content[0].text': empty string. Expected a string with minimum length 1, but "
                      "got an empty string instead.")
+VLLM_MESSAGE = "'reasoning.summary' is not supported."
 
 EXEC_400 = (
     r'''{"type":"error","message":"{\"error\": {\"message\": \"Unsupported parameter: 'reasoning.summary' is '''
@@ -178,6 +184,53 @@ EXEC_400_INPUT_429 = (
     r'''\"Invalid 'input[429].content[0].text': empty string. Expected a string with minimum length 1, but got '''
     r'''an empty string instead.\", \"type\": \"invalid_request_error\", \"param\": '''
     r'''\"input[429].content[0].text\", \"code\": \"empty_string\"}}"}}''',
+)
+EXEC_400_VLLM = (
+    r'''{"type":"error","message":"{\"object\": \"error\", \"message\": \"'reasoning.summary' is not '''
+    r'''supported.\", \"type\": \"BadRequestError\", \"param\": null, \"code\": 400}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"object\": \"error\", \"message\": \"'reasoning.summary' is '''
+    r'''not supported.\", \"type\": \"BadRequestError\", \"param\": null, \"code\": 400}"}}''',
+)
+APP_SERVER_400_VLLM = (
+    r'''{"method":"error","params":{"error":{"message":"{\"object\": \"error\", \"message\": '''
+    r'''\"'reasoning.summary' is not supported.\", \"type\": \"BadRequestError\", \"param\": null, \"code\": '''
+    r'''400}","codexErrorInfo":"other","additionalDetails":null,"misalignment":null},"willRetry":false,'''
+    r'''"threadId":"01a1da7c-b632-7171-8d84-793fc0d596da","turnId":"01a1da7c-b63d-7583-8f24-6e41c21c90d6"},'''
+    r'''"emittedAtMs":1794666968659}''',
+    r'''{"method":"turn/completed","params":{"threadId":"01a1da7c-b632-7171-8d84-793fc0d596da",'''
+    r'''"turn":{"id":"01a1da7c-b63d-7583-8f24-6e41c21c90d6","items":[],"itemsView":"notLoaded",'''
+    r'''"status":"failed","error":{"message":"{\"object\": \"error\", \"message\": \"'reasoning.summary' is not '''
+    r'''supported.\", \"type\": \"BadRequestError\", \"param\": null, \"code\": 400}","codexErrorInfo":"other",'''
+    r'''"additionalDetails":null,"misalignment":null},"startedAt":1794666968,"completedAt":1794666968,'''
+    r'''"durationMs":21}},"emittedAtMs":1794666968660}''',
+)
+EXEC_400_VLLM_WRAPPED = (
+    r'''{"type":"error","message":"{\"error\": {\"message\": \"'reasoning.summary' is not supported.\", '''
+    r'''\"type\": \"BadRequestError\", \"param\": null, \"code\": 400}}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"error\": {\"message\": \"'reasoning.summary' is not '''
+    r'''supported.\", \"type\": \"BadRequestError\", \"param\": null, \"code\": 400}}"}}''',
+)
+EXEC_400_VLLM_TOO_LONG = (
+    r'''{"type":"error","message":"{\"object\": \"error\", \"message\": \"This model's maximum context length '''
+    r'''is 32768 tokens. However, you requested 33792 tokens (32768 in the messages, 1024 in the completion). '''
+    r'''Please reduce the length of the messages or completion.\", \"type\": \"BadRequestError\", \"param\": '''
+    r'''null, \"code\": 400}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"object\": \"error\", \"message\": \"This model's maximum '''
+    r'''context length is 32768 tokens. However, you requested 33792 tokens (32768 in the messages, 1024 in the '''
+    r'''completion). Please reduce the length of the messages or completion.\", \"type\": \"BadRequestError\", '''
+    r'''\"param\": null, \"code\": 400}"}}''',
+)
+EXEC_400_ERROR_TEXT = (
+    r'''{"type":"error","message":"{\"error\": \"lab-model does not support tools\"}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"error\": \"lab-model does not support tools\"}"}}''',
+)
+EXEC_400_DETAIL = (
+    r'''{"type":"error","message":"{\"detail\": \"Bad Request\"}"}''',
+    r'''{"type":"turn.failed","error":{"message":"{\"detail\": \"Bad Request\"}"}}''',
+)
+EXEC_400_PLAIN = (
+    r'''{"type":"error","message":"Bad Request"}''',
+    r'''{"type":"turn.failed","error":{"message":"Bad Request"}}''',
 )
 
 

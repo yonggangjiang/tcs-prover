@@ -161,15 +161,16 @@ class AccuracyTests(unittest.TestCase):
         # Owner decision (13 Nov 2026): on an API connection Claude Code's "API Error: 400" pauses as Codex's 400
         # invalid_request_error does (workflow_runner.settings_failure()); its other 400s stay retried. Codex 0.160
         # reports that 400 as the endpoint's error body alone, with no status (tests/codex_refusals.py).
-        self.assertIn("(**Request rejected by the API endpoint**; Codex reports it as the endpoint's error alone, of "
-                      'type `invalid_request_error`, and Claude Code as "API Error: 400" with the endpoint\'s message). '
+        self.assertIn("(**Request rejected by the API endpoint**; Codex reports it as the endpoint's error alone, "
+                      'whichever server wrote it, and Claude Code as "API Error: 400" with the endpoint\'s message). '
                       'Words such as "503", "429" or "capacity" inside that error are the endpoint\'s own (for example '
-                      '"Invalid \'input[512].content\'") and do not make it a passing failure.',
+                      '"Invalid \'input[512].content\'") and do not make it a passing failure; a 400 whose error is '
+                      'plain text ("Bad Request") cannot be told from Codex\'s own words and is retried.',
                       flat(DOCS / "retries.md"))
         trouble = flat(DOCS / "troubleshooting.md")
-        self.assertIn("- **Request rejected by the API endpoint** (HTTP 400; Codex shows only the endpoint's error, of "
-                      'type `invalid_request_error`, and Claude Code says "API Error: 400" and the endpoint\'s '
-                      "message): the endpoint refuses run requests as invalid.", trouble)
+        self.assertIn("- **Request rejected by the API endpoint** (HTTP 400; Codex shows only the endpoint's error, "
+                      'whichever server wrote it, for example vLLM\'s `"BadRequestError"`, and Claude Code says "API '
+                      'Error: 400" and the endpoint\'s message): the endpoint refuses run requests as invalid.', trouble)
         # Claude Code's own words after "API Error: 400" for a conversation whose tool calls and results do not match
         # stay retried too (workflow_runner._CLAUDE_HISTORY_MISMATCH).
         self.assertIn("A conversation too long for the model, a key out of credit, and Claude Code's own words for a "

@@ -79,9 +79,9 @@ resets. To use fewer at once, set a [running-jobs limit](batches.md#running-jobs
 - **401 · Missing API key**: the format, base URL and key do not match what the
   service expects.
 - **Request rejected by the API endpoint** (HTTP 400; Codex shows only the
-  endpoint's error, of type `invalid_request_error`, and Claude Code says "API
-  Error: 400" and the endpoint's message): the endpoint refuses run requests as
-  invalid. Edit the connection; an error-paused job resumes by itself once its
+  endpoint's error, whichever server wrote it, for example vLLM's
+  `"BadRequestError"`, and Claude Code says "API Error: 400" and the endpoint's
+  message): the endpoint refuses run requests as invalid. Edit the connection; an error-paused job resumes by itself once its
   connection's settings change. A conversation too long for the model, a key
   out of credit, and Claude Code's own words for a conversation whose tool calls
   and results do not match ("API Error: 400 due to tool use concurrency issues",
