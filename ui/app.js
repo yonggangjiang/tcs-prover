@@ -11013,7 +11013,7 @@ function recordStarted(value) {
 
 function recordsStore() {
   return (recordsStore.value ||= { rows: null, error: "", filter: "all", sort: "newest", timer: null, loading: false,
-    deleting: null, busy: false });
+    deleting: null, busy: false, items: new Map() });
 }
 
 function recordsEls() {
@@ -11107,11 +11107,17 @@ function renderRecords() {
   els.sort.value = store.sort;
   const shown = recordsShown(rows, store.filter, store.sort);
   const largest = Math.max(1, ...rows.map((row) => Number(row.sizeBytes) || 0));
-  const signature = JSON.stringify([shown, largest]);
-  if (els.list.dataset.signature !== signature) {
-    els.list.dataset.signature = signature;
-    els.list.replaceChildren(...shown.map((row) => recordRow(row, largest)));
-  }
+  // A row is drawn again only where what it shows changed, and the rows that stay are never taken out of the list:
+  // while a job's record grows, the focus stays where it was (on a row's Delete button, say).
+  const drawn = store.items;
+  const names = new Set(rows.map((row) => row.runFolder));
+  for (const name of [...drawn.keys()]) if (!names.has(name)) drawn.delete(name);
+  placeChildren(els.list, shown.map((row) => {
+    let item = drawn.get(row.runFolder);
+    if (!item) drawn.set(row.runFolder, item = mcNode("li", "rec-row rec-cols"));
+    drawRecordRow(item, row, largest);
+    return item;
+  }));
   const empty = store.rows === null ? "" : !rows.length
     ? "No records yet. Every job started from now on keeps one; jobs from before have none."
     : !shown.length ? (store.filter === "kept" ? "No record whose job is still listed." : "No record of a deleted job.")
@@ -11120,9 +11126,23 @@ function renderRecords() {
   els.empty.hidden = !empty;
 }
 
-function recordRow(row, largest) {
-  const item = mcNode("li", "rec-row rec-cols");
+// One record's row: built again only when its title, start or job changed; its size and bar follow the record.
+function drawRecordRow(item, row, largest) {
+  item.record = row;
   item.dataset.record = row.runFolder;
+  const key = JSON.stringify([row.runFolder, row.title, row.created, Boolean(row.jobExists)]);
+  if (item.dataset.key !== key) {
+    item.dataset.key = key;
+    item.replaceChildren(...recordCells(row));
+  }
+  const size = recordSize(row.sizeBytes);
+  const width = `${Math.max(1, Math.round(100 * (Number(row.sizeBytes) || 0) / largest))}%`;
+  const text = item.querySelector(".rec-size")?.querySelector("b"), bar = item.querySelector(".rec-bar")?.firstChild;
+  if (text && text.textContent !== size) text.textContent = size;
+  if (bar && bar.style.width !== width) bar.style.width = width;
+}
+
+function recordCells(row) {
   // The record's title opens its Model calls page (also a deleted job's).
   const title = mcNode("a", "rec-open", row.title || row.runFolder);
   title.href = `${location.pathname}?calls=${encodeURIComponent(row.runFolder)}`;
@@ -11132,9 +11152,7 @@ function recordRow(row, largest) {
     openModelCalls(row.runFolder, { from: "records" });
   };
   const name = mcNode("span", "rec-title", mcNode("strong", "", title), mcNode("span", "", row.runFolder));
-  const bar = mcNode("span", "rec-bar", mcNode("i"));
-  bar.firstChild.style.width = `${Math.max(1, Math.round(100 * (Number(row.sizeBytes) || 0) / largest))}%`;
-  const size = mcNode("span", "rec-size", mcNode("b", "", recordSize(row.sizeBytes)), bar);
+  const size = mcNode("span", "rec-size", mcNode("b"), mcNode("span", "rec-bar", mcNode("i")));
   const job = mcNode("span", `rec-job${row.jobExists ? "" : " gone"}`, row.jobExists ? "Kept" : "Deleted");
   if (row.jobExists) {
     const open = mcNode("a", "", "Open");
@@ -11149,9 +11167,9 @@ function recordRow(row, largest) {
   }
   const remove = mcButton("ghost compact danger rec-del", "Delete", "remove");
   remove.setAttribute("aria-label", `Delete the record of ${row.title || row.runFolder}`);
-  remove.onclick = () => askDeleteRecord(row);
-  item.append(name, mcNode("span", "rec-date", recordStarted(row.created)), size, job, mcNode("span", "r", remove));
-  return item;
+  // The record as last read (its size grows while its job runs).
+  remove.onclick = () => askDeleteRecord(remove.closest("li")?.record || row);
+  return [name, mcNode("span", "rec-date", recordStarted(row.created)), size, job, mcNode("span", "r", remove)];
 }
 
 // The confirmation: what the record is, what deleting it means for its job, and the space it frees.

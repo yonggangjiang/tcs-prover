@@ -421,6 +421,39 @@ assert.match($('recordsList').children[1].querySelector('.rec-open').href, /\?ca
 assert(requests.every((request) => request.token === 'session-token'));
 """.replace("RUN", json.dumps(RUN)))
 
+    def test_a_growing_record_keeps_the_rows_and_the_focus_of_the_records_page(self):
+        self.run_pages(r"""
+await openRecords();
+await settle();
+const list = $('recordsList');
+const rows = [...list.children];
+// The reader tabbed to the Delete button of the mixing record; its job runs, so its record grows.
+const button = rows[1].querySelector('.rec-del');
+button.focus();
+moves.length = 0;
+const grown = RECORDS.map((row) => row.runFolder === '2026-11-13_09-02-00_mixing' ? {...row, sizeBytes: 900000000} : row);
+answers['/records'] = {body: grown};
+timers.filter(([fn, ms]) => ms === 15000).at(-1)[0]();
+await settle();
+// The same rows, nothing taken out and put back: the button keeps the focus; the size and the bars follow the record.
+assert.deepEqual([...list.children], rows);
+assert.equal(moves.length, 0);
+assert.equal(document.activeElement, button);
+assert(button.isConnected);
+assert.equal(rows[1].querySelector('.rec-size').querySelector('b').textContent, '858.3 MB');
+assert.equal(rows[1].querySelector('.rec-bar').firstChild.style.width, '100%');
+assert.equal(rows[2].querySelector('.rec-bar').firstChild.style.width, '71%');
+// Sorted by size, the grown record goes first: the others are placed around the row with the focus.
+$('recordsSort').value = 'largest'; $('recordsSort').onchange();
+assert.deepEqual(list.children.map((item) => item.dataset.record),
+  ['2026-11-13_09-02-00_mixing', '2026-11-09_08-31-00_sensitivity', RUN]);
+assert(!moves.includes(rows[1]));
+assert.equal(document.activeElement, button);
+// Delete asks about the record as last read.
+button.onclick();
+assert.match($('recordDeleteFacts').textContent, /^2026-11-13_09-02-00_mixing · 858\.3 MB · started /);
+""".replace("RUN", json.dumps(RUN)), extra=f"const RECORDS = {json.dumps(RECORDS)};\n")
+
     def test_delete_asks_first_says_what_it_frees_and_shows_a_refusal(self):
         self.run_pages(r"""
 await openRecords();
