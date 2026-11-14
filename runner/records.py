@@ -75,6 +75,10 @@ LEFTOVER_QUIET_SECONDS = 120
 PACK_BYTES = 64 * 1024 * 1024
 # Decompressed pack members kept in memory for reading (bytes).
 MEMBER_CACHE_BYTES = 64 * 1024 * 1024
+# The full inputs (item sha256 lists) of a stored bundle's most recently read requests kept in memory, from which the
+# next request of each thread is rebuilt in one step (StoredBundle); an input no longer kept is rebuilt along its
+# chain again. Memory only: nothing is left out.
+RESOLVED_INPUTS_KEPT = 16
 # The longest first line of a Codex session file read to learn its thread (its session_meta: about 25 KB).
 SESSION_META_BYTES = 4 * 1024 * 1024
 # Payload kinds whose JSON is stored as a skeleton plus items (each item once): a request's input, instructions and
@@ -628,14 +632,21 @@ def rebuild_payload(objects, store, input_list=None):
 
 
 class StoredBundle:
-    """A trace bundle as the record keeps it: codex/<label>/<bundle>/payloads.jsonl and its byte copies."""
+    """A trace bundle as the record keeps it: codex/<label>/<bundle>/payloads.jsonl and its byte copies.
+
+    A request's input is mostly stored as a change to the input of its thread's previous request (split_payload()),
+    so the inputs of one thread form one chain as long as the thread: over a thousand requests in one long Codex
+    process of an API connection, which sends every request whole. resolve() follows a chain back without recursion;
+    the full inputs of the RESOLVED_INPUTS_KEPT payloads resolved last are kept, so the next request of a thread is
+    one step away.
+    """
 
     def __init__(self, record, label, name):
         self.record, self.label, self.name = record, label, name
         self.folder = record.folder / "codex" / label / name
         self.entries = {}  # payload path -> {"kind", "sha256", "size", "store", "thread"}
         self._size = 0
-        self._full = {}
+        self._full = {}  # payload path -> its full input (item sha256), the most recently resolved last
 
     def load(self):
         try:
@@ -665,20 +676,40 @@ class StoredBundle:
             _fsync(stream)
         self.load()
 
-    def resolve(self, refs, depth=0):
-        """The full list of item sha256 of an input stored as ``refs`` (a list, or a delta on an earlier payload)."""
+    def resolve(self, refs):
+        """The full list of item sha256 of an input stored as ``refs``: a list, or a change to an earlier payload's
+        input ({"base", "keep", "add"}), which may itself be one. The chain is followed back to a full list or a kept
+        one in a loop, never by recursion (whose depth Python limits to about a thousand)."""
 
-        if isinstance(refs, list):
-            return refs
-        if not isinstance(refs, dict) or depth > 100000:
-            raise ValueError("Unreadable input reference.")
-        base = refs.get("base")
-        if base not in self._full:
+        changes, seen = [], set()
+        while not isinstance(refs, list):
+            if not isinstance(refs, dict) or refs.get("base") in seen or not isinstance(refs.get("keep"), int) \
+                    or not isinstance(refs.get("add"), list):
+                raise ValueError("Unreadable input reference.")
+            base = refs["base"]
+            seen.add(base)
+            changes.append(refs)
+            if base in self._full:
+                refs = self._full[base]
+                continue
             entry = self.entries.get(base)
             if entry is None or entry.get("input") is None:
                 raise ValueError(f"Missing base payload {base}.")
-            self._full[base] = self.resolve(entry["input"], depth + 1)
-        return self._full[base][:refs["keep"]] + list(refs["add"])
+            refs = entry["input"]
+        full = refs
+        for change in reversed(changes):
+            full = full[:change["keep"]] + change["add"]
+        return full
+
+    def _resolved(self, path, entry):
+        """The full input of the stored request ``entry`` at ``path``, kept for the requests stored as changes to it."""
+
+        full = self.resolve(entry["input"])
+        self._full.pop(path, None)
+        self._full[path] = full
+        while len(self._full) > RESOLVED_INPUTS_KEPT:
+            self._full.pop(next(iter(self._full)))
+        return full
 
     def payload(self, path):
         """The exact bytes of one stored payload (KeyError when it is not stored)."""
@@ -687,14 +718,14 @@ class StoredBundle:
         if entry is None:
             self.load()
             entry = self.entries[path]
-        inputs = self.resolve(entry["input"]) if entry.get("input") is not None else None
+        inputs = self._resolved(path, entry) if entry.get("input") is not None else None
         return rebuild_payload(self.record.objects, entry["store"], inputs)
 
     def input(self, path):
         """The full input list (item sha256) of one stored request, or None."""
 
         entry = self.entries.get(path) or self.load().entries.get(path)
-        return self.resolve(entry["input"]) if entry and entry.get("input") is not None else None
+        return self._resolved(path, entry) if entry and entry.get("input") is not None else None
 
     def copy(self, name):
         """A byte copy of the raw bundle's manifest.json or trace.jsonl, or None."""

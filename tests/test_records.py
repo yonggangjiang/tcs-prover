@@ -364,6 +364,56 @@ class ModelCallViewTests(RecordCase):
                 model_calls.delete_record(name)
 
 
+class LongThreadTests(RecordCase):
+    """A Codex process of an API connection sends each request whole (over HTTP), which the record stores as a change
+    to the thread's previous request: one chain as long as the thread, over a thousand requests in a long process."""
+
+    LENGTH = 1500
+
+    def setUp(self):
+        super().setUp()
+        bundle = records.StoredBundle(self.record, self.trace.name, f"trace-11111111-{THREAD}")
+        skeleton = records.compact({"model": "gpt-6.1-sol", "input": None, "stream": True})
+        self.items = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": f"turn {n}"}]}
+                      for n in range(self.LENGTH)]
+        shas = [records._sha(records.compact(item)) for item in self.items]
+        entries, calls = [], []
+        for number in range(1, self.LENGTH + 1):
+            # Each request keeps the first item of the one before and adds its own turn.
+            refs = shas[:1] if number == 1 else {"base": f"payloads/{number - 1}.json", "keep": 1,
+                                                 "add": [shas[number - 1]]}
+            entries.append({"path": f"payloads/{number}.json", "kind": "inference_request", "sha256": "", "size": 0,
+                            "store": {"lists": {"input": "input"}, "values": {}, "skeleton": records._sha(skeleton)},
+                            "thread": THREAD, "input": refs})
+            calls.append({"program": "codex", "kind": "request", "process": self.trace.name, "bundle": bundle.name,
+                          "callId": f"call-{number}", "threadId": THREAD, "startedMs": 1794572964846 + 10 * number,
+                          "endedMs": 1794572964846 + 10 * number + 5, "model": "gpt-6.1-sol", "status": "completed",
+                          "request": f"payloads/{number}.json", "response": None, "usage": None})
+        with self.record.locked():
+            self.record.store({records._sha(records.compact(item)): records.compact(item) for item in self.items})
+            self.record.store({records._sha(skeleton): skeleton})
+            bundle.add(entries)
+            self.record.calls.append(calls)
+        self.last = f"c{self.LENGTH:06d}"
+
+    def test_the_last_request_of_a_long_thread_reads_back(self):
+        detail = model_calls.call_detail("run-1", self.last)
+        self.assertEqual(detail["sent"]["previousCallId"], f"c{self.LENGTH - 1:06d}")
+        self.assertEqual([view["item"] for view in detail["sent"]["newItems"]], [self.items[-1]])
+        self.assertTrue(detail["rawAvailable"])
+        raw = model_calls.call_raw("run-1", self.last)
+        self.assertEqual(json.loads(raw["request"])["input"], [self.items[0], self.items[-1]])
+
+    def test_the_training_record_of_a_long_thread_is_whole(self):
+        buffer = io.BytesIO()
+        model_calls.training_record("run-1", buffer)
+        archive = zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+        requests = [json.loads(line) for line in archive.read("requests.jsonl").splitlines()]
+        self.assertEqual(len(requests), self.LENGTH)
+        self.assertEqual(requests[-1]["request"]["input"], [self.items[0], self.items[-1]])
+        self.assertEqual(json.loads(archive.read("manifest.json"))["counts"]["requests"], self.LENGTH)
+
+
 class UntracedCompactionTests(RecordCase):
     def test_a_local_compaction_codex_leaves_untraced_is_a_row_with_its_summary(self):
         bundle = Bundle(self.trace)

@@ -740,7 +740,11 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   response payload is stored as its skeleton (the JSON with its `input`,
   `output_items`, `instructions` and `tools` set to null, keeping their place)
   plus item references, a request's input as a change to the thread's previous
-  one where it starts the same way; every other payload as one object. Each
+  one where it starts the same way (so an API connection's thread, whose
+  requests are sent whole, is one chain of changes as long as the thread: over
+  a thousand in a long process; `StoredBundle.resolve()` follows it in a loop,
+  keeping the last `RESOLVED_INPUTS_KEPT` (16) full inputs in memory); every
+  other payload as one object. Each
   stored payload is rebuilt from the record (`json.dumps(..., indent=2,
   ensure_ascii=False)`, which equals serde_json's pretty printer on every
   payload of the audit's captures) and compared byte for byte; one that differs
