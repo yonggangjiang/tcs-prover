@@ -538,7 +538,14 @@ class ModelUnavailable(ConfigurationError):
 
 
 class RequestRejected(ConfigurationError):
-    """An API model's endpoint refuses the request as invalid (HTTP 400): its settings do not fit the endpoint."""
+    """An API model's endpoint refuses the request as invalid (HTTP 400): its settings do not fit the endpoint.
+
+    ``reason`` is the endpoint's own words, as the message quotes them.
+    """
+
+    def __init__(self, message, reason=""):
+        super().__init__(message)
+        self.reason = reason
 
 
 # How the job page and the controller recognize these settings problems in a
@@ -613,7 +620,7 @@ def settings_failure(error, model=None):
         return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
                                f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
                                "under Models & API (or the endpoint); a job waiting for it continues once its "
-                               "settings change.")
+                               "settings change.", reason)
     return None
 
 
@@ -3922,13 +3929,18 @@ class MemberSessions:
 
 
 def member_problem(error, model):
-    """Why a team member's failed attempt needs a change of settings (no retry helps), else None (it is retried).
+    """Why a team member's failed attempt ends its assignment at once, else None (it is retried every minute).
 
     A missing program, a login or key the model cannot use, a model the account or catalog does not have, an
-    endpoint that refuses the request, and any other configuration error.
+    endpoint that refuses the request, and any other configuration error. When the member's API connection refused
+    the request (its endpoint rejects it as invalid, or refuses its key) it is a team.Refusal, whose report tells the
+    coordinator in the service's words that the problem may pass (team.REFUSED_REPORT); the member's record keeps the
+    failure's own words. A built-in model's refused login (its program's sign-in, no API connection) stays plain text.
     """
 
     failure = settings_failure(error, model)
+    if isinstance(failure, RequestRejected):
+        return team_module.Refusal(str(failure), failure.reason)
     if failure is not None:
         return str(failure)
     if isinstance(error, (FinalError, providers.ProviderError)):
@@ -3936,7 +3948,10 @@ def member_problem(error, model):
     if _cli_problem(error):
         return _failure_reason(redact(str(error)), 600) or str(error)
     if _plain_failure(redact(str(error))) == "authentication failed":
-        return "authentication failed: " + (_failure_reason(redact(str(error)), 300) or str(error))
+        reason = _failure_reason(redact(str(error)), 300) or str(error)
+        if providers.is_api_id(model):
+            return team_module.Refusal(f"authentication failed: {reason}", reason)
+        return f"authentication failed: {reason}"  # A built-in model's login.
     return None
 
 

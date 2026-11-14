@@ -307,6 +307,12 @@ Claude Code's own subagents.
   that folder. A failed model call is retried every minute without limit; a
   setting that cannot work (a program not installed, no sign-in, an unknown
   model) comes back to the coordinator as a failed assignment with the reason.
+  So does a request that a member's API connection refuses (its endpoint calls
+  the request invalid, or refuses its key), with the service's words; as such a
+  refusal can also be temporary, the report tells the coordinator that it may
+  be a temporary problem of the service or a wrong setting, and to keep the
+  work going by giving the assignment to another member, or to the same member
+  again later.
   Pause, Stop, the time limit and a restart stop the members with the
   coordinator; only their files stay.
 - **The team note.** `team_note` is added to the coordinator's first prompt,
