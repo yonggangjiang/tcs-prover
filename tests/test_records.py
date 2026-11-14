@@ -352,6 +352,15 @@ class ModelCallViewTests(RecordCase):
         self.assertEqual([call["inputEnd"] for call in windows[0]["calls"]], [3, 6])
         self.assertEqual(len(windows[0]["items"]), 8)
 
+    def test_a_training_record_that_fails_part_way_is_never_a_whole_archive(self):
+        buffer = io.BytesIO()
+        with mock.patch.object(records.Objects, "names", side_effect=OSError("The item index could not be read.")), \
+                self.assertRaises(OSError):
+            model_calls.training_record("run-1", buffer)
+        self.assertIn(b"requests.jsonl", buffer.getvalue())  # What was written before the failure went out ...
+        with self.assertRaises(zipfile.BadZipFile):  # ... but no central directory says it is whole.
+            zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+
     def test_records_are_listed_and_deleted(self):
         rows = model_calls.record_list(lambda name: name == "run-1")
         self.assertEqual([(row["runFolder"], row["title"], row["jobExists"]) for row in rows],

@@ -5,6 +5,7 @@ Everything here only reads, except delete_record(). Placeholders say what a call
 are computed here, for the view and the download alike, never stored.
 """
 
+import contextlib
 import gzip
 import hashlib
 import json
@@ -625,18 +626,41 @@ def delete_record(name):
 # --- The training download -------------------------------------------------------------------------------------------
 
 class _Counter:
-    """A write-only stream that counts what passes (zipfile writes to the response as it goes)."""
+    """A write-only stream that counts what passes (zipfile writes to the response as it goes).
+
+    cut() drops everything written after it: a download that fails part way never gets the archive's central
+    directory, so no ZIP reader takes what arrived for a whole archive.
+    """
 
     def __init__(self, stream):
-        self.stream, self.written = stream, 0
+        self.stream, self.written, self.cut_short = stream, 0, False
 
     def write(self, data):
+        if self.cut_short:
+            return len(data)
         self.stream.write(data)
         self.written += len(data)
         return len(data)
 
     def flush(self):
-        self.stream.flush()
+        if not self.cut_short:
+            self.stream.flush()
+
+    def cut(self):
+        self.cut_short = True
+
+
+@contextlib.contextmanager
+def _archive(out):
+    """A ZIP archive written to ``out`` (a _Counter) as it is made; when its block fails, ``out`` is cut before the
+    archive closes, so the central directory a close writes never reaches the download."""
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        try:
+            yield archive
+        except BaseException:
+            out.cut()
+            raise
 
 
 def _expanded_request(record, line, cache):
@@ -698,7 +722,7 @@ def training_record(name, stream):
     rounds = _rounds(transcript)
     counts = {"requests": 0, "items": 0, "trajectories": 0, "rounds": len(rounds)}
     item_names = set()
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+    with _archive(out) as archive:
         with archive.open("requests.jsonl", "w", force_zip64=True) as member:
             cache = {}
             for line in lines:

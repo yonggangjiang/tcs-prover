@@ -163,6 +163,20 @@ class RouteTests(AppCase):
         names = zipfile.ZipFile(io.BytesIO(body)).namelist()
         self.assertIn("requests.jsonl", names)
 
+    def test_a_training_record_that_fails_part_way_arrives_incomplete(self):
+        # The browser must not save a cut-short archive as a whole one: the body never gets its last chunk.
+        connection = http.client.HTTPConnection(server.HOST, self.http.server_port, timeout=20)
+        self.addCleanup(connection.close)
+        with mock.patch.object(records.Objects, "names", side_effect=OSError("The item index could not be read.")):
+            connection.request("GET", f"/jobs/{self.name}/training-record",
+                               headers={"Origin": self.http.origin, "X-TCS-Prover-Token": self.http.token})
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.getheader("Transfer-Encoding")), (200, "chunked"))
+            with self.assertRaises(http.client.IncompleteRead) as cut:
+                response.read()
+        with self.assertRaises(zipfile.BadZipFile):
+            zipfile.ZipFile(io.BytesIO(cut.exception.partial))
+
     def test_the_records_list_and_a_delete_that_waits_for_a_working_job(self):
         status, _, body = self.call("GET", "/records")
         self.assertEqual(status, 200)

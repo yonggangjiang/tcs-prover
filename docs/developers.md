@@ -827,7 +827,10 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   self-contained example per request with a WebSocket continuation's input
   expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window
   with each call's input boundary and outputs and the critic round's outcome;
-  `rounds.jsonl`; the transcript snapshot; `manifest.json`), `GET /records` and
+  `rounds.jsonl`; the transcript snapshot; `manifest.json`; sent in HTTP/1.1
+  chunks of about `CHUNK_BYTES`, 64 KiB: a download that fails part way gets
+  no last chunk, so the browser reports it failed, and its archive no central
+  directory, so no ZIP reader takes it for whole), `GET /records` and
   `DELETE /records/<run>` (409 while the job's runner, review or reply turn
   runs). They read the record folder, so a deleted job's record still answers.
   `recordState.problems` shows the newest `PROBLEMS_SHOWN` (50) distinct

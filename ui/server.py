@@ -12541,6 +12541,38 @@ class CountingReader:
         return data
 
 
+# A streamed response body without a known length (the training download) goes out in HTTP/1.1 chunks of about
+# this many bytes.
+CHUNK_BYTES = 64 * 1024
+
+
+class ChunkedWriter:
+    """A response body in HTTP/1.1 chunks of about CHUNK_BYTES; end() sends what is left and the last, empty chunk.
+
+    A body without its last chunk is incomplete for the client: a download that fails part way is reported failed.
+    """
+
+    def __init__(self, stream):
+        self.stream, self.buffer = stream, bytearray()
+
+    def write(self, data):
+        self.buffer += data
+        if len(self.buffer) >= CHUNK_BYTES:
+            self.flush()
+        return len(data)
+
+    def flush(self):
+        if self.buffer:
+            self.stream.write(b"%x\r\n" % len(self.buffer) + bytes(self.buffer) + b"\r\n")
+            self.buffer.clear()
+        self.stream.flush()
+
+    def end(self):
+        self.flush()
+        self.stream.write(b"0\r\n\r\n")
+        self.stream.flush()
+
+
 class Handler(BaseHTTPRequestHandler):
     """Serve the local UI and its job-specific JSON endpoints."""
 
@@ -12853,19 +12885,34 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[2] == "training-record" and not query:
                 if not records.valid_name(parts[1]) or not records.record_folder(parts[1]).is_dir():
                     raise model_calls.NotFound("This job has no record.")
+                # No length is known before the end. An HTTP/1.1 client (a browser) gets the ZIP in chunks and the
+                # last, empty chunk only once the whole archive is written, so a download that fails part way is
+                # reported failed; an HTTP/1.0 client's ends when the connection closes. Either way a failed archive
+                # lacks its central directory (model_calls._archive), and the connection closes after the body.
+                chunked = self.request_version == "HTTP/1.1"
+                if chunked:
+                    self.protocol_version = "HTTP/1.1"
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", f'attachment; filename="{parts[1]}-training-record.zip"')
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Security-Policy",
                                  "default-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+                if chunked:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
                 self.end_headers()
-                # No length is known before the end: the connection closes after the last byte.
                 self.close_connection = True
+                body = ChunkedWriter(self.wfile) if chunked else self.wfile
                 try:
-                    model_calls.training_record(parts[1], self.wfile)
-                except (OSError, ValueError):
-                    pass  # The download stops; the browser reports it incomplete.
+                    model_calls.training_record(parts[1], body)
+                except OSError:
+                    return None  # The browser went away or a record file could not be read: the download failed.
+                except Exception:  # noqa: BLE001 - the download failed; the server's log says why.
+                    traceback.print_exc()
+                    return None
+                if chunked:
+                    body.end()
                 return None
         except model_calls.NotFound as exc:
             return self.send({"error": str(exc)}, status=404)
