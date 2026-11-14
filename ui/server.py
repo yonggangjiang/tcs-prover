@@ -10998,15 +10998,17 @@ class Server(ThreadingHTTPServer):
         return needs
 
     def _setup_defaults(self):
-        """What a fresh New problem form runs: the default saved settings, else the built-in ones, per role."""
+        """What a fresh New problem form runs, per role: Default settings. Source "saved" once they differ from TCS
+        Prover's original settings (your choice); "built-in" while they are the original settings, which nobody chose
+        (also while they cannot be read or used, when new problems open with the original settings)."""
 
         try:
             listing = presets.listing()
         except Exception:
             listing = {}
-        saved = next((row for row in listing.get("presets", [])
-                      if row.get("isDefault") and not row.get("unusable") and isinstance(row.get("settings"), dict)),
-                     None)
+        default = listing.get("defaultSettings")
+        saved = default if (isinstance(default, dict) and not default.get("unusable") and not default.get("original")
+                            and isinstance(default.get("settings"), dict)) else None
         settings = saved["settings"] if saved else presets.builtin_settings()
         stages = normalize_workflow_stages(settings.get("workflowStages"))
         roles = []

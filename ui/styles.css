@@ -2005,8 +2005,8 @@ kbd {
 .advanced { margin-top: var(--space-5); border-top: 1px solid var(--line); }
 .advanced > summary { padding: 16px 0; font-size: var(--text-base); font-weight: 650; }
 .advanced-title { flex: none; }
-/* What is inside, as a quiet mono hint after the summary's chips (decorative: empty alt text). A chip that
-   marks something (saved settings other than the built-in ones, related works, a warning) takes its place. */
+/* What is inside, as a quiet mono hint after the summary's chips (decorative: empty alt text). A chip (related
+   works, a warning about saved settings) takes its place. */
 .advanced > summary::before {
   flex: 1 1 0;
   order: 1;
@@ -2024,9 +2024,9 @@ kbd {
 .advanced-icon { width: 17px; height: 17px; color: var(--ink-2); }
 .advanced > summary:hover { color: var(--accent-text); }
 .advanced > summary:hover .advanced-icon { color: currentColor; }
-/* The summary's chips, in view while the section is closed too (app.js renderAdvancedSummary): the saved
-   settings that fill the form and the related works. Neutral pills; an accent dot marks settings other than
-   the built-in ones and attached related works, an amber dot a warning (the words say which). */
+/* The summary's chips, in view while the section is closed too (app.js renderAdvancedSummary): the related works,
+   and saved settings that cannot be read or a loaded model that is not available. Neutral pills; an accent dot
+   marks attached related works, an amber dot a warning (the words say which). */
 .advanced-summary { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0;
   margin-left: 4px; }
 /* A long saved name wraps inside its chip, which then keeps the radius of a one-line pill (like the
@@ -2114,22 +2114,6 @@ kbd {
 .model-setting .provider-chip { grid-column: 1 / -1; align-self: start; justify-self: start; margin-top: 0; }
 .model-setting input[type="number"] { max-width: 6rem; font-family: var(--font-mono); font-size: var(--text-sm); }
 .model-setting .model-setting-help { grid-column: 1 / -1; margin: -4px 0 0; }
-/* A setting named by a span (a radio group's name), placed like the menus' labels. */
-.model-setting > .model-setting-label { align-self: start; padding-top: 1px; color: var(--ink-2); font-size: var(--text-sm);
-  font-weight: 600; }
-/* 6 · Goal loop: two choices, each with one line on what it means. */
-.goal-loop-choice { display: grid; gap: 8px; min-width: 0; }
-.goal-loop-option {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 8px;
-  align-items: start;
-  margin: 0;
-  cursor: pointer;
-}
-.goal-loop-copy { display: grid; gap: 2px; min-width: 0; }
-.goal-loop-option .goal-loop-name { color: var(--ink); font-size: var(--text-sm); font-weight: 600; line-height: 1.4; }
-.goal-loop-option .goal-loop-help { color: var(--ink-2); font-size: var(--text-xs); font-weight: 400; line-height: 1.45; }
 /* Proof author · subagent models: under both columns, one row per subagent (its name, then the roles' three menus,
    then the chip naming where its model runs). */
 .team-models { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr); }
@@ -3428,7 +3412,6 @@ kbd {
 .preset-dialog .help { margin: 0; }
 .preset-save-field label { margin-bottom: 6px; }
 .preset-summary { margin: -6px 0 0; color: var(--ink-3); font: var(--text-xs)/1.6 var(--font-mono); overflow-wrap: anywhere; }
-.preset-save-default { margin-top: 0; }
 #presetSaveError { margin: 0; overflow-wrap: anywhere; }
 .preset-dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); }
 .preset-load-status { margin: 0; color: var(--ink-2); font-size: var(--text-sm); overflow-wrap: anywhere; }
@@ -3467,8 +3450,12 @@ kbd {
   box-shadow: inset 2px 0 0 var(--waiting);
 }
 .preset-row.unusable { border-style: dashed; }
-/* Built-in settings close the list, set apart from what you saved. */
-.preset-row.builtin { margin-top: 6px; background: transparent; }
+/* Default settings open the list, set apart from the named settings; their line says what they are for. A row's
+   question (Reset, Make default) sits under its summary, its answers in the row's first columns. */
+.preset-row.default-settings { margin-bottom: 6px; }
+.preset-row-help { margin: 3px 0 0; color: var(--ink-2); font-size: var(--text-xs); line-height: 1.5; }
+.preset-row-question { margin: 8px 0 0; color: var(--ink); font-size: var(--text-sm); font-weight: 600;
+  overflow-wrap: anywhere; }
 .preset-rename { max-width: 32rem; min-height: 30px; padding: 4px 9px; font-size: var(--text-sm); }
 .preset-row > button { justify-self: stretch; }
 .preset-delete { color: var(--ink-2); }
@@ -3986,7 +3973,7 @@ kbd {
     background-position: calc(100% - 15px) calc(50% + 1px), calc(100% - 10px) calc(50% + 1px);
   }
   .model-setting { grid-auto-flow: row; grid-template-columns: minmax(0, 1fr); grid-template-rows: none; row-gap: 0; }
-  .model-setting > label, .model-setting > .model-setting-label { margin-top: 12px; margin-bottom: 4px; }
+  .model-setting > label { margin-top: 12px; margin-bottom: 4px; }
   .model-setting .provider-chip { margin-top: 8px; }
   .model-setting .model-setting-help { margin-top: 6px; }
   /* Each subagent's menus stack under its name, labelled as the roles' are. */
@@ -4040,9 +4027,11 @@ kbd {
   .preset-panel { padding: 13px 13px 13px 16px; }
   .preset-panel-actions { width: 100%; }
   .preset-panel-actions > button { flex: 1 1 auto; }
-  /* The summary: the title and the chevron on the first line, the chips on their own line under them. */
+  /* The summary: the title and the chevron on the first line, the chips on their own line under them; without a
+     chip, no second line. */
   .advanced > summary { flex-wrap: wrap; row-gap: 8px; }
   .advanced-summary { flex: 1 1 100%; order: 3; margin-left: 27px; }
+  .advanced-summary:empty { display: none; }
   .preset-list { display: flex; flex-direction: column; }
   .preset-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 10px 10px 12px; }
   .preset-row-copy { flex: 1 1 100%; padding-right: 0; }
@@ -4735,7 +4724,7 @@ kbd {
 .setup-card.tone-running { --tone: var(--running); }
 /* A program nothing needs now (app.js setupPill): its state in the same words, calm. The pill and the sign-in show a
    hollow neutral ring (a border, which forced colours keep), and the card has no mark on its top edge; only what new
-   problems, the saved default settings or a job need gets a warning colour. */
+   problems, your Default settings or a job need gets a warning colour. */
 .setup-view .tone-idle { --tone: var(--stopped); }
 .setup-view .job-status.tone-idle::before { border: 1.5px solid currentColor; background: none; }
 .setup-card.tone-idle::before { content: none; }
@@ -4986,11 +4975,9 @@ kbd {
 /* A deleted job's title: no page to lead to, and not the page on screen. */
 .crumb-job:disabled, .crumb-job:disabled:hover { opacity: 1; color: var(--ink-2); font-weight: 550; }
 
-/* The way in: two buttons in the Live activity card's head, before its filters (on a phone, under the title). */
+/* The way in: Model calls in the Live activity card's head, before its filters (on a phone, under the title). */
 @media (min-width: 600px) { .timeline-head:has(.mcb-entry-buttons) { align-items: center; } }
 .mcb-entry-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
-:is(#trainingRecordButton, #callsTrainingButton)[data-state="busy"] { color: var(--ink-2); }
-:is(#trainingRecordButton, #callsTrainingButton)[data-state="failed"] { color: var(--failed); }
 
 /* ---- Shared bits ---- */
 .mc-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
@@ -5233,11 +5220,10 @@ kbd {
   .rec-toolbar { align-items: stretch; }
 }
 /* Ink: no colour for a failed download, a rule of ink instead. */
-:root[data-theme="ink"] :is(#trainingRecordButton, #callsTrainingButton)[data-state="failed"] { color: var(--ink); text-decoration: underline; }
 @media (forced-colors: active) {
   .mc-withheld, .mc-full { border-color: CanvasText; background: Canvas; }
   .mcb-item[aria-current="true"]::before, .rec-bar i { background: Highlight; }
 }
 @media print {
-  .mcb-entry-buttons, #callsTrainingButton, .mc-detail-actions, .rec-del { display: none !important; }
+  .mcb-entry-buttons, .mc-detail-actions, .rec-del { display: none !important; }
 }

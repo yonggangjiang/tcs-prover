@@ -12,12 +12,13 @@ python3 web_ui.py statement.md
 
 This sends the whole file to the proof author, like turning off **Statement
 review** and keeping the other three stages on. It starts no web server and
-opens no browser. Without options it uses the built-in defaults (a default saved
-with **Save these settings…** applies only to the web form): 3 independent
-critics per round, 3 author subagents (so the author is a coordinator, see
-below), at most 2 consecutive edited critic passes (then one last review that
-cannot edit), no time limit, GPT 6.1 Sol at Max for every proof role, the
-built-in prompts, Standard speed and concise reasoning summaries.
+opens no browser. Without options it uses the built-in defaults (Default
+settings, saved with **Save these settings…**, apply only to the web form): 3
+independent critics per round, 3 author subagents (so the author is a
+coordinator, see below), at most 2 consecutive edited critic passes (then one
+last review that cannot edit), no time limit, GPT 6.1 Sol at Max for every
+proof role, the built-in prompts, Standard speed and concise reasoning
+summaries.
 
 With 1 or more author subagents the proof author is a coordinator: it does not
 prove the statement itself, but runs up to that many author subagents at a time,
@@ -152,37 +153,16 @@ the bug report to the author's normal repair loop.
 
 ## Reading a transcript
 
-`transcript.jsonl` is the complete machine-readable event log (of Codex's
-effective settings, which it reports at each start, it keeps only those TCS
-Prover sets or relies on: see
-[Job records](developers.md#job-records)). The transcript
-viewer shows workflow stages, public reasoning summaries, model messages,
-subagent and tool activity, critic checks and results, without protocol noise:
+`transcript.jsonl` in the run folder is the complete machine-readable event log
+(of Codex's effective settings, which it reports at each start, it keeps only
+those TCS Prover sets or relies on: see
+[Job records](developers.md#job-records)). The job page shows it: workflow
+stages, public reasoning summaries, model messages, subagent and tool activity,
+critic checks and results, never private chain-of-thought.
 
-```bash
-python3 transcript/view_transcript.py runs/2026-08-03_16-20-24_example/
-python3 transcript/view_transcript.py runs/2026-08-03_16-20-24_example/transcript.jsonl
-python3 transcript/view_transcript.py                       # newest run
-```
-
-The browser view has stage and activity filters, full-text search, root-only
-and compact views, expandable long entries, critic verdict cards, loading of the
-whole file with pause and resume, and live updates. It binds only to the local
-host and protects its local API with a random token per launch.
-
-For terminal or file output, use the text mode:
-
-```bash
-python3 transcript/view_transcript.py RUN --text
-python3 transcript/view_transcript.py RUN --text --follow
-python3 transcript/view_transcript.py RUN --output readable.txt
-```
-
-Text mode hides prompt bodies unless you add `--prompts`. `--stage solve`,
-`--stage critic`, `--root-only`, `--no-tools` and `--max-text 0` adjust the
-view; `--help` lists every option. Both views show the public reasoning
-summaries TCS Prover keeps, never private chain-of-thought, and read
-incrementally, so even very large transcripts fit.
+The maintainer's local checkout also has a terminal transcript viewer, kept
+locally and not published: `python3 transcript/view_transcript.py RUN` (`--text`
+for plain text, `--help` for its options).
 
 To run the workflow files directly with `workflow_runner.py` (which also has
 `--author-mode` to choose how the author works), see

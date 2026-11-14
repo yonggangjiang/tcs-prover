@@ -52,8 +52,9 @@ runs with. Its **Proof author** row ends with how the author works:
 
 A **Goal loop** row follows: *TCS Prover (editable texts; this job runs with the
 texts saved when it started)* or *Codex built-in (the Codex CLI's own goal mode)*,
-which jobs from before the setting and web-cutoff runs show (see
-[the goal loop](workflow.md#the-goal-loop)). A job whose author runs through
+which web-cutoff runs show, as do jobs from before TCS Prover's goal loop and
+jobs started with Codex built-in while the New problem form still offered it
+(see [the goal loop](workflow.md#the-goal-loop)). A job whose author runs through
 Claude Code (a Claude model, or an API model of the Anthropic format) reads
 *TCS Prover (Claude Code authors always use it)*, whatever loop the job
 recorded, as Claude Code has no goal mode of its own. **View this job's
@@ -470,14 +471,10 @@ and the call take turns (**All calls** goes back). A job with no record (one
 started before records were kept, or whose record you deleted) says so plainly,
 and leads back to the job while it is listed.
 
-**Training record**, on the Live activity card and the Model calls page,
-downloads the job's training record as one ZIP
-(`<run folder>-training-record.zip`): every request in full, every item once,
-each context window, each critic round, the transcript and the record's own
-files, such as the copied sessions, Claude Code's output and Codex's event logs
-and tool results, nothing replaced or left out. The button counts what arrived;
-a download that fails part way saves nothing, and the button and the page say
-it failed (the server's log says why, such as a record file it cannot read).
+No page offers the job's training record (one ZIP of every request in full,
+every item once, each context window, each critic round, the transcript and the
+record's own files): TCS Prover's route still makes it (see
+[Developers](developers.md#job-records)).
 
 ### Records
 

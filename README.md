@@ -103,12 +103,13 @@ retried every minute, without limit.
 | --- | --- |
 | [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
 | [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, the convention critic, LaTeX |
-| [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads, the model calls, the training record, the Records page |
+| [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads, the model calls, the Records page |
 | [Batches and folder runs](docs/batches.md) | Batches, related works shared with every problem in a batch, running a folder of statements, the running-jobs limit |
-| [Saved settings](docs/saved-settings.md) | Saving and loading New problem settings, and the default, under **Advanced settings** |
+| [Saved settings](docs/saved-settings.md) | Default settings, which new problems open with, and named New problem settings, under **Advanced settings** |
 | [Web search cutoff](docs/web-cutoff.md) | Runs with no web access, or with archives from before a date only |
 | [Sandbox and network](docs/sandbox.md) | What a run's models can read, write and reach |
 | [Retries and what needs you](docs/retries.md) | Automatic retries, restarts, checkpoints, continuing a job |
-| [Terminal runs](docs/terminal.md) | Proofs without a browser, every option, the transcript viewer |
+| [Terminal runs](docs/terminal.md) | Proofs without a browser, every option, reading a transcript |
 | [Troubleshooting](docs/troubleshooting.md) | Common problems and what to do |
 | [Developers and operators](docs/developers.md) | Project layout, workflow files, tests, the live gateway |
+| [Third-party notices](docs/third-party.md) | The adapted Time Travel Benchmark: its MIT license and what was adapted |

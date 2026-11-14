@@ -26,10 +26,10 @@ ui/
   server.py                 HTTP endpoints, job state and process management
   cli.py                    Startup and Markdown file and folder runs
   review.py                 Independent statement review
-  model_calls.py            The record routes: model calls, raw calls, training download, Records list
+  model_calls.py            The record routes: model calls, raw calls, training record (no button), Records list
   batches.py                Saved run folders shown as read-only batches
   named_batches.py          Batches made with New batch (runs/.controller/batches.json)
-  presets.py                Saved New problem settings (Advanced settings → Saved settings)
+  presets.py                Saved New problem settings: Default settings and named ones (Advanced settings)
   program_setup.py          The Setup page: program checks, installs, updates and sign-ins
   related_works.py          Related works given to the proof author
   retrieval.py              Web search cutoff setup for the page
@@ -38,7 +38,7 @@ ui/
   live_gateway.py           New page assets beside an existing controller
   legacy_overview.py        Overview fields of a controller from before the upgrade
   index.html, app.js, styles.css
-transcript/
+transcript/                 (kept locally, not published)
   view_transcript.py        Transcript reader, CLI and viewer server
   transcript_ui/            Transcript viewer HTML, JavaScript and CSS
 retrieval/
@@ -48,13 +48,15 @@ retrieval/
                             Broker transport, pacing, cache and URL discovery
   isolated_compiler.py      Sandboxed LaTeX compilation for historical runs
   validate_historical_search.py, audit_historical_trajectory.py
-                            Operator checks for historical batches
-experiments/
+                            Operator checks for historical batches (kept locally, not
+                            published; nothing TCS Prover runs imports them)
+experiments/                (kept locally, not published)
   firstproof-batch3/        Pinned First Proof inputs and manifest
   prepare_firstproof.py, launch_firstproof.py
-third_party/                Notes and license of the adapted Time Travel Benchmark
+third_party/                Notes and license of the adapted Time Travel Benchmark (kept locally, not
+                            published; the same texts are in docs/third-party.md)
 docs/                       These guides
-tests/                      Offline regression tests
+tests/                      Offline regression tests (kept locally, not published)
 ```
 
 The server starts the workflow runner in each job's private workspace with the
@@ -342,7 +344,7 @@ the problem-solving to its subagents. What the runner and the server add:
   note and without the `multi_agent` feature, and the status **No subagents with
   this model** says that the author works alone instead of coordinating. A Claude
   coordinator with the CLI's own subagents (a job from before TCS Prover's team,
-  or a rerun of one that keeps them, `legacyTeam`) gets the same single-author
+  or one made from it that keeps them, `legacyTeam`) gets the same single-author
   launch as `alone`, which
   `claude_cli.goal_session` uses when its CLI offers no subagent tool (`--bare`),
   saying so once per runner; one with TCS Prover's team keeps its team in
@@ -674,7 +676,7 @@ that every prompt and tool text is the user's to adjust. What the code does:
   holds none of) the event stays as Codex wrote it. Every record of one assignment, its
   retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
   `team.assignment_id()`): each run numbers its items from `item_0` again, so
-  the page and `transcript/view_transcript.py` keep an assignment's rows apart
+  the page and `transcript/view_transcript.py` (a local tool) keep an assignment's rows apart
   by it, and a later assignment never replaces an earlier one's. `k` follows
   the member's highest report number in the working folder
   (`team.highest_report()`), and each assignment creates its empty report file
@@ -760,12 +762,15 @@ that every prompt and tool text is the user's to adjust. What the code does:
 - **Old jobs and web cutoffs.** A job from before records no `goalLoop`: it is
   restored as `codex` with `authorTeam` null, so its launches pass `--goal-loop
   codex --author-team builtin` and no texts, also after a revision in place, and a
-  continuation of it keeps them. Its state says `legacyTeam: true`, and the
-  page's rerun of it (app.js `legacyTeamApplies()`, while the form keeps Codex
-  built-in and Same as the coordinator) sends `legacyTeam: true`: the new job
+  continuation of it keeps them. Its state says `legacyTeam: true`. A request
+  with `legacyTeam: true` (no page sends one any more) starts a new job that
   runs `codex` with the built-in subagents (`legacy_team`), saves its texts like
   any new job, and records `legacyTeam: true` in job-settings.json, so it, its
-  reruns and the jobs made from it keep them too. A web-cutoff coordinator
+  reruns and the jobs made from it keep them too. The New problem form has no
+  goal loop setting: it sends `goalLoop: "tcs"` for a new job (a rerun and saved
+  settings included) and, for a job it continues (a revision in place), the
+  loop that job recorded (app.js `selectedGoalLoop()`); saved settings hold no
+  `goalLoop` (one in a file saved before is dropped as it loads). A web-cutoff coordinator
   keeps the CLI's built-in subagents with the coordinator's model (status
   **Built-in subagents**); the server refuses Subagent models with a web
   cutoff.
@@ -1076,11 +1081,11 @@ writes a job's record, `ui/model_calls.py` reads it.
   when the count or the problems change; a call's detail is read once and read
   again when its row changes or, while a tool call of it has no output, when a
   later call of its own conversation is recorded, and drawn again only if it
-  changed), the Live activity card's **Model
-  calls · N** (the count at most every 10 s) and **Training record** (the
-  streamed ZIP read with `fetch()` and the token, counted as it arrives; a read
-  that fails saves nothing and says so). Every request goes outside the job
-  request queue. A call's outputs name their tool from the previous call,
+  changed) and the Live activity card's **Model
+  calls · N** (the count at most every 10 s). No page offers the training
+  record: `GET /jobs/<id>/training-record` downloads it with the session's
+  `X-TCS-Prover-Token` header (the owner asked for no button). Every request
+  goes outside the job request queue. A call's outputs name their tool from the previous call,
   which the page reads too. Both lists are drawn in place: a row is built once
   and drawn again only when what it shows changed, rows a filter or the words
   take out are kept to be put back, and the one with the focus never moves
@@ -1250,21 +1255,24 @@ younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's
 background read, never starts a process: it returns the last check of any age,
 and programs in state `checking` before the first) and lists, per
 program, its state, its actions with the exact command each dialog shows, and
-the commands to copy, with the default settings' roles (`defaults.source` is
-`saved` or `built-in`), the jobs that can still run and use it in their current
-or a later step (`Server._setup_stages_ahead`, which also decides the running
-jobs that hold an Update or a sign-in), and, for information only, the API
+the commands to copy, with Default settings' roles (`defaults.source` is
+`saved` once they differ from TCS Prover's original settings, else `built-in`,
+also while they cannot be read or used), the jobs that can still run and use it
+in their current or a later step (`Server._setup_stages_ahead`, which also
+decides the running jobs that hold an Update or a sign-in), and, for
+information only, the API
 connections of its format. The page adds the New problem form's selected roles
 while the form is open (app.js `setupNeeds`), and gives a warning (the sidebar
 count, the Overview notice, a red or amber mark) only to a program that the
-form, the saved default settings or such a job needs; the built-in settings and
-an API connection alone never make a program needed, and any other program is
-shown calmly (`tone-idle`). The one exception (`setupProblems`, kind `none`) is
+form, your Default settings or such a job needs; Default settings that are still
+the original settings and an API connection alone never make a program needed,
+and any other program is shown calmly (`tone-idle`). The one exception (`setupProblems`, kind `none`) is
 a computer with neither the Codex CLI nor Claude Code installed: one line says
 so, counted and on the Overview and at the top of Setup, until a program has a
 line of its own. Install offers its sign-in when that login will be used,
-including by the built-in settings while nothing is saved and the form is
-closed (`setupBuiltInSignIn`), and on a computer with neither program yet.
+including by Default settings that are still the original settings while the
+form is closed (`setupBuiltInSignIn`), and on a computer with neither program
+yet.
 `POST /setup/action` takes a program, an
 action and an option from fixed sets plus the command the dialog showed (a
 command that changed is refused with 409 and the new status; a program that
@@ -1285,7 +1293,8 @@ wait for one.
 
 ## Tests
 
-Run the regression suite without model calls:
+The tests are kept in the maintainer's local checkout and are not published, so
+these commands work only there. Run the regression suite without model calls:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v

@@ -148,8 +148,9 @@ mode). For archive search it shows the saved cutoff, the provider, author-only
 access and the broker's operation counts. *Pending* means an accepted call has
 no recorded end event; it does not mean the call is still running. Verified
 candidates are archive checks, not the number of sources the model received.
-These counters do not replace the trajectory audit and do not prove that the
-model's training knowledge is absent.
+These counters do not replace an audit of the sources each problem received
+(a local tool, below) and do not prove that the model's training knowledge is
+absent.
 
 ## Historical retrieval
 
@@ -226,10 +227,17 @@ the protected discovery helper. The Codex-only adaptation of
 [Time Travel Benchmark](https://github.com/trivikrama-madhusudhana/time-travel-benchmark)
 uses its controller-owned MCP gateway, asynchronous tool handling and event-log
 provenance checks, without OpenReward or a separate OpenAI API key; the
-[adaptation notes](../third_party/time-travel-benchmark/UPSTREAM.md) pin the
-reviewed upstream revision and explain the differences.
+[adaptation notes](third-party.md#adaptation-notes) pin the
+reviewed upstream revision and explain the differences, and
+[Third-party notices](third-party.md#license) carry its MIT license.
 
-## Checking and auditing
+## Checking and auditing (local tools)
+
+The two operator checks below are kept in the maintainer's local checkout and
+are not published (`retrieval/validate_historical_search.py` and
+`retrieval/audit_historical_trajectory.py`); nothing TCS Prover runs uses them.
+So are the scripts that prepared and launched the pinned First Proof batch
+(`experiments/`), which the paths below come from.
 
 Check real network availability through fresh broker processes, before starting
 proof models (after preparation and authentication):
@@ -262,17 +270,3 @@ by URL, exclusive cutoff, capture time and archived-body hash, flags unexpected
 retrieval tools, and separates failed or pending calls from valid empty
 results. It checks recorded provenance, not mathematical correctness or
 training knowledge; the gateway itself verifies bytes before returning content.
-
-## Pinned benchmark preparation
-
-`.venv/bin/python -m experiments.prepare_firstproof` prepares the ten pinned
-inputs in `experiments/firstproof-batch3/manifest.json` without model work.
-`.venv/bin/python -m experiments.launch_firstproof` checks configuration,
-isolation and compilation; `--start` releases the hold and launches the jobs.
-Both take `--problems P09 P10` for a subset. Use fresh run and controller
-folders for each batch (existing work is never overwritten), and regenerate
-policies on each host, since their paths are machine-specific. Generated runs,
-controller state, credentials and environments stay out of Git. Launches need
-macOS, because the isolated LaTeX compiler has only a macOS Seatbelt adapter
-(the Windows MXC adapter covers the model roles only), and the runtime canaries
-must pass: unavailable isolation blocks launch.

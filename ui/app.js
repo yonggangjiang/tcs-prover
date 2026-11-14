@@ -131,8 +131,7 @@ const ui = {
   authorSubagents: $("authorSubagents"),
   authorSubagentModelsLabel: $("authorSubagentModelsLabel"), authorSubagentModelsMode: $("authorSubagentModelsMode"),
   authorSubagentModelsHelp: $("authorSubagentModelsHelp"), authorTeamSetting: $("authorTeamSetting"),
-  authorTeamRows: $("authorTeamRows"), goalLoopTcs: $("goalLoopTcs"), goalLoopCodex: $("goalLoopCodex"),
-  goalLoopNote: $("goalLoopNote"),
+  authorTeamRows: $("authorTeamRows"),
   thinkingHours: $("thinkingHours"),
   speedMode: $("speedMode"),
   reasoningSummary: $("reasoningSummary"),
@@ -696,7 +695,7 @@ async function rerunWithStatement(statement) {
   const keys = ["runId", "reviewModel", "authorModel", "criticModel", "writerModel", "reviewEffort", "authorEffort",
     "criticEffort", "writerEffort", "reasoningEffort", "speedMode", "reasoningSummary", "retrievalMode",
     "retrievalCutoffUtc", "retrievalPolicyPath", "retrieval", "criticRounds", "criticCount", "authorSubagents",
-    "authorSubagentModels", "goalLoop", "goalLoopRecorded", "legacyTeam", "thinkingHours", "skipStatementReview",
+    "authorSubagentModels", "thinkingHours", "skipStatementReview",
     "statementReviewOnly", "promptSet", "promptEdits",
     ...Object.keys(promptLabels).map((name) => `${name}Prompt`)];
   const settings = Object.fromEntries(keys.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]));
@@ -4528,8 +4527,8 @@ function render(next) {
     syncPrompts(source);
     // The job's edited texts go with the new problem (see seedPromptOverrides).
     if (seed && typeof seedPromptOverrides === "function") seedPromptOverrides(seed.settings);
-    // Saved settings (see presetsFormOpened): a fresh form takes the default, when one is saved; a rerun
-    // pre-fill and a job sent back to the form keep their own settings.
+    // Saved settings (see presetsFormOpened): a fresh form takes Default settings; a rerun pre-fill and a job
+    // sent back to the form keep their own settings.
     if (typeof presetsFormOpened === "function") {
       presetsFormOpened(!seed && typeof composingProblem !== "undefined" && composingProblem && !currentJob);
     }
@@ -4559,11 +4558,7 @@ function render(next) {
     ui.criticCount.value = state.criticCount || 3;
     ui.authorSubagents.value = Number.isInteger(state.authorSubagents) ? state.authorSubagents
       : state.workflow?.settings?.author_subagents?.default ?? 3;
-    if (typeof applyTeamModels === "function") {
-      applyGoalLoop(state.goalLoop);
-      applyTeamModels(state.authorSubagentModels);
-      applyLegacyTeam(state.legacyTeam === true || state.goalLoopRecorded === false);
-    }
+    if (typeof applyTeamModels === "function") applyTeamModels(state.authorSubagentModels);
     ui.thinkingHours.value = state.thinkingHours ?? 0;
     restoreWorkflowStages(state);
     checkEdited();
@@ -4769,14 +4764,9 @@ function applyComposerSettings(source) {
   ui.authorSubagents.value = Number.isInteger(source.authorSubagents) ? source.authorSubagents : subagents.default ?? 3;
   ui.authorSubagents.min = subagents.minimum ?? 0;
   ui.authorSubagents.max = subagents.maximum ?? 10;
-  // The subagent models (a source without them: the coordinator's) and the goal loop (else TCS Prover's). A job from
-  // before the setting (goalLoopRecorded false), and one that kept its settings (legacyTeam), ran Codex's goal mode
-  // and the CLI's own subagents: a rerun of it keeps them (see legacyTeamApplies).
-  if (typeof applyTeamModels === "function") {
-    applyGoalLoop(source.goalLoop);
-    applyTeamModels(source.authorSubagentModels);
-    applyLegacyTeam(source.legacyTeam === true || source.goalLoopRecorded === false);
-  }
+  // The subagent models (a source without them: the coordinator's). The goal loop is no setting of the form: a new job
+  // runs TCS Prover's, and a job the form continues keeps its own (see selectedGoalLoop).
+  if (typeof applyTeamModels === "function") applyTeamModels(source.authorSubagentModels);
   ui.thinkingHours.value = source.thinkingHours ?? 0;
   ui.thinkingHours.min = hours.minimum ?? 0;
   // No maximum: any positive number of hours is a valid limit.
@@ -5609,21 +5599,7 @@ function syncModelMenus() {
 // run. Changing the number of subagents keeps the rows that remain and adds rows set to the coordinator's model; a
 // number still being typed only hides rows, which the field drops when it is left (its change event).
 function teamStore() {
-  return (teamStore.value ||= { mode: "same", rows: [], loop: "tcs", legacy: false });
-}
-
-// A rerun's settings of a job from before TCS Prover's goal loop and team (state.goalLoopRecorded false), or of one
-// that kept them (state.legacyTeam): that job ran Codex's goal mode and the CLI's own subagents, each with the
-// coordinator's model, and the rerun keeps them while the form keeps Codex built-in as the goal loop and "Same as the
-// coordinator" (the job then starts with legacyTeam, see proofJobSettings). Choosing TCS Prover's loop or a model for
-// each subagent gives TCS Prover's team, as for any new job.
-function applyLegacyTeam(value) {
-  teamStore().legacy = value === true;
-}
-
-function legacyTeamApplies() {
-  const store = teamStore();
-  return store.legacy && selectedGoalLoop() === "codex" && store.mode !== "each";
+  return (teamStore.value ||= { mode: "same", rows: [] });
 }
 
 function teamRole(index) {
@@ -5644,13 +5620,18 @@ function teamSize() {
 // for such a job whatever the form says, so the form shows them fixed (a rerun or a new problem can choose TCS
 // Prover's team).
 function revisesLegacyTeamJob() {
-  return Boolean(currentJob) && ["input", "reviewed"].includes(state?.phase)
-    && (state.goalLoopRecorded === false || state.legacyTeam === true);
+  return formContinuesJob() && (state.goalLoopRecorded === false || state.legacyTeam === true);
+}
+
+// Whether the form continues a job: a statement review sent back to the form, which Start runs again in the job's own
+// folder (not a rerun, which starts a new job).
+function formContinuesJob() {
+  return Boolean(currentJob) && ["input", "reviewed"].includes(state?.phase);
 }
 
 // Why every subagent must run the coordinator's model now, or "": a web cutoff (the server's words), whose
 // coordinator keeps the CLI's own subagents, or a job revised in place that keeps them (revisesLegacyTeamJob).
-// Either way the job runs Codex's goal mode too (selectedGoalLoop).
+// Either way the job runs Codex's goal mode too, as the server decides.
 function teamFixedReason() {
   return selectedRetrievalMode() === "historical" ? "With a web cutoff, author subagents use the coordinator's model."
     : revisesLegacyTeamJob() ? "This job started with the CLI's own author subagents, each running the coordinator's "
@@ -5727,18 +5708,13 @@ function teamRowElement(index) {
     syncEffortChoices(role);
     remember();
     renderRetrievalSettings();
-    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
   };
   ui[`${role}Model`].onchange = () => {
     syncEffortChoices(role);
     remember();
     renderRetrievalSettings();
-    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
   };
-  ui[`${role}Effort`].onchange = () => {
-    remember();
-    if (typeof renderAdvancedSummary === "function") renderAdvancedSummary();
-  };
+  ui[`${role}Effort`].onchange = remember;
   return row;
 }
 
@@ -5746,7 +5722,6 @@ function teamRowElement(index) {
 function renderTeamModels() {
   const select = ui.authorSubagentModelsMode;
   if (!select) return;
-  renderGoalLoop();
   const store = teamStore(), stages = selectedWorkflowStages(), count = teamSize();
   const offered = stages.author === true && count !== null && count >= 1;
   const fixed = teamFixedReason();
@@ -5755,10 +5730,7 @@ function renderTeamModels() {
   select.value = fixed ? "same" : store.mode;
   ui.authorSubagentModelsHelp.textContent = fixed
     || (store.mode === "each" ? "Choose a model and reasoning for each author subagent below: Codex CLI, Claude Code "
-      + "or an API connection." : legacyTeamApplies() ? "As in the job you are rerunning, which started before TCS "
-      + "Prover's team: the author subagents are the coordinator's own CLI subagents, each running the coordinator's "
-      + "model and reasoning. Choose for each, or TCS Prover as the goal loop, for TCS Prover's team."
-      : "Every author subagent runs the coordinator's model and reasoning.");
+      + "or an API connection." : "Every author subagent runs the coordinator's model and reasoning.");
   const each = offered && !fixed && store.mode === "each";
   show(ui.authorTeamSetting, each);
   if (!each) return;
@@ -5785,54 +5757,12 @@ function teamRolesShown() {
     ? Array.from({ length: count }, (_, index) => teamRole(index)) : [];
 }
 
-// The goal loop the form starts a job with: "tcs" (TCS Prover's loop, the default) or "codex" (the Codex CLI's
-// built-in goal mode). A web-cutoff job always runs Codex's goal mode (the server records "codex"): the form shows it
-// and keeps the choice made for when the cutoff is off again.
+// The goal loop a job from the form runs: no setting of the form (the owner removed "6 · Goal loop"). A new job,
+// also a rerun or one filled from saved settings, runs TCS Prover's ("tcs"); the server still runs a web-cutoff job
+// with Codex's goal mode. A job the form continues (a statement review sent back to the form, which Start runs again
+// in the job's own folder) keeps the loop it recorded: a continuing job's loop never changes.
 function selectedGoalLoop() {
-  return teamFixedReason() ? "codex" : teamStore().loop;
-}
-
-// A job's, a rerun's or saved settings' goal loop (else TCS Prover's); the radios follow with renderTeamModels.
-function applyGoalLoop(value) {
-  teamStore().loop = value === "codex" ? "codex" : "tcs";
-}
-
-function renderGoalLoop() {
-  if (!ui.goalLoopTcs) return;
-  const fixed = Boolean(teamFixedReason()), loop = selectedGoalLoop();
-  ui.goalLoopTcs.checked = loop === "tcs";
-  ui.goalLoopCodex.checked = loop === "codex";
-  ui.goalLoopTcs.disabled = fixed;
-  if (ui.goalLoopNote) {
-    ui.goalLoopNote.textContent = !fixed ? "" : selectedRetrievalMode() === "historical"
-      ? "Web-cutoff runs use Codex's goal mode." : "This job started with Codex's goal mode and keeps it when it is revised.";
-    show(ui.goalLoopNote, fixed);
-  }
-}
-
-// Whether the form's Proof author runs through Claude Code (a Claude model, or an API model of the Anthropic
-// format), which has no goal mode of its own: such an author always runs TCS Prover's goal loop (the Goal loop choice
-// is kept for a Codex author). As runsThroughClaudeCode() reads a job's author.
-function formAuthorUsesClaudeCode() {
-  const model = ui.authorModel.value;
-  const row = (state.workflow?.settings?.model_catalog || []).find((item) => item.id === model);
-  const provider = modelProvider(model);
-  return provider === "claude" || (provider === "api" && row?.format === "anthropic");
-}
-
-// The form's team for the Advanced settings summary ({text, chosen}), or null without one (no subagents, or a
-// number still being typed).
-function teamFormText() {
-  const count = teamSize();
-  if (!(count >= 1)) return null;
-  if ((legacyTeamApplies() && !teamFixedReason()) || revisesLegacyTeamJob()) {
-    // As Run settings name a job's CLI subagents.
-    return { text: `Coordinator, up to ${count} author subagent${count === 1 ? "" : "s"} at a time (the CLI's own)`,
-      chosen: true };
-  }
-  const models = teamModelsSetting();
-  const text = teamText(count, models && models.map((item) => teamModelLabel(item.model)));
-  return { text: `${text[0].toUpperCase()}${text.slice(1)}`, chosen: Boolean(models) };
+  return formContinuesJob() && state.goalLoop === "codex" ? "codex" : "tcs";
 }
 
 async function refresh() {
@@ -5872,8 +5802,8 @@ async function refresh() {
       batchCatalog = adoptBatchCatalog(catalog);
       renderBatchNavigation();
     }
-    // A fresh New problem form opens with the default saved settings: read them with its state (a failed
-    // read leaves the built-in settings and says why; see loadPresets).
+    // A fresh New problem form opens with Default settings: read them with its state (a failed read leaves
+    // TCS Prover's original settings and says why; see loadPresets).
     const presets = job ? null : loadPresets();
     const next = await request(jobPath("/state", {
       after: state.traceVersion || 0,
@@ -6063,11 +5993,9 @@ function proofJobSettings() {
     criticRounds: Number(ui.criticRounds.value),
     criticCount: Number(ui.criticCount.value),
     authorSubagents: Number(ui.authorSubagents.value),
-    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop; a rerun of a job from
-    // before TCS Prover's team keeps that job's (see legacyTeamApplies).
+    // Which model each author subagent runs (null: the coordinator's) and the author's goal loop (selectedGoalLoop).
     ...(typeof teamModelsSetting === "function"
-      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop(),
-        ...(legacyTeamApplies() ? { legacyTeam: true } : {}) } : {}),
+      ? { authorSubagentModels: teamModelsSetting(), goalLoop: selectedGoalLoop() } : {}),
     thinkingHours: Number(ui.thinkingHours.value),
     speedMode: ui.speedMode.value,
     reasoningSummary: ui.reasoningSummary.value,
@@ -6552,29 +6480,16 @@ ui.speedMode.onchange = updateModelSummary;
 ui.reasoningSummary.onchange = updateModelSummary;
 // The subagent models show while Author subagents is 1 or more; a number still being typed only hides rows, which
 // leaving the field drops (see teamStore).
-ui.authorSubagents.oninput = () => {
-  renderTeamModels();
-  renderAdvancedSummary();
-};
+ui.authorSubagents.oninput = renderTeamModels;
 ui.authorSubagents.onchange = () => {
   const count = teamSize();
   if (count !== null && teamStore().rows.length > count) teamStore().rows.length = count;
   renderTeamModels();
-  renderAdvancedSummary();
 };
 ui.authorSubagentModelsMode.onchange = () => {
   teamStore().mode = ui.authorSubagentModelsMode.value === "each" ? "each" : "same";
   renderTeamModels();
-  renderAdvancedSummary();
 };
-for (const input of [ui.goalLoopTcs, ui.goalLoopCodex]) {
-  input.onchange = () => {
-    if (input.checked) teamStore().loop = input.value === "codex" ? "codex" : "tcs";
-    // A rerun's CLI subagents follow the goal loop (see legacyTeamApplies).
-    renderTeamModels();
-    renderAdvancedSummary();
-  };
-}
 ui.retrievalMode.onchange = () => {
   renderRetrievalSettings();
   updateModelSummary();
@@ -8719,7 +8634,7 @@ syncAttentionAlerts();
 // command; its output (GET /setup/task) shows in a panel under the cards, with Stop. The same status feeds the
 // sidebar badge, the Overview's Setup notice, the role chips, the hints beside the role menus and Start, and the
 // links from jobs whose program is missing or signed out. Each of them warns only about a program that something
-// needs (setupNeeds): the New problem form, the saved default settings or a job that can still run; any other
+// needs (setupNeeds): the New problem form, your Default settings or a job that can still run; any other
 // program is shown calmly, whatever its state. Every text is set as text, never as markup. The
 // page's record lives on a function property (setupStore()): the first refresh() and the shell's first sync()
 // run before this part of the file.
@@ -8969,11 +8884,11 @@ function setupModelRow(catalog, role, model, on, label = "") {
     signIn: provider === "codex" || provider === "claude", connection: provider === "api" ? row?.sourceLabel || "" : "" };
 }
 
-// The author subagents of your default saved settings ("Choose for each"), as Setup rows: GET /setup lists the
-// default settings' roles, and the page adds their subagents (with the Author stage on and 1 or more of them).
+// The author subagents of your Default settings ("Choose for each"), as Setup rows: GET /setup lists Default
+// settings' roles, and the page adds their subagents (with the Author stage on and 1 or more of them).
 function setupDefaultMembers() {
   const store = typeof presetStore === "function" ? presetStore() : null;
-  const preset = store?.presets?.find((item) => item.id === store.defaultId && !item.unusable);
+  const preset = store?.defaultSettings && !store.defaultSettings.unusable ? store.defaultSettings : null;
   const settings = preset?.settings || {};
   const catalog = state?.workflow?.settings?.model_catalog;
   if (!Array.isArray(catalog) || !settings.workflowStages?.author || !(Number(settings.authorSubagents) >= 1)
@@ -8988,14 +8903,14 @@ function setupRoleName(row) {
   return setupWords().roles[row.role] || (row.member ? `Author subagent ${row.member}` : String(row.role));
 }
 
-// Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your saved
-// default settings), the saved default settings also while the form is open (kept apart, and only when they use the
-// program where the form does not, or its sign-in where the form does not), the jobs that can still run with it in
-// a stage still ahead (GET /setup), and the API connections of its format (listed only: a connection that no role or
-// job uses needs nothing). The built-in settings never count, as nobody chose them: a form that opens with them
-// counts as the form. A program is needed when one of these uses it, and must be signed in when one of them uses a
-// built-in model through it. A program nothing needs is never a warning: no badge, no notice, no warning colour
-// (setupPill, setupProblems).
+// Per program, what uses it now: the New problem roles (the form in this tab while it is open, else your Default
+// settings), your Default settings also while the form is open (kept apart, and only when they use the program
+// where the form does not, or its sign-in where the form does not), the jobs that can still run with it in a stage
+// still ahead (GET /setup), and the API connections of its format (listed only: a connection that no role or job
+// uses needs nothing). Default settings that are still TCS Prover's original settings never count, as nobody chose
+// them (GET /setup sends them as "built-in"): a form that opens with them counts as the form. A program is needed
+// when one of these uses it, and must be signed in when one of them uses a built-in model through it. A program
+// nothing needs is never a warning: no badge, no notice, no warning colour (setupPill, setupProblems).
 function setupNeeds() {
   const data = setupStore().data;
   const form = setupFormRoles();
@@ -9021,9 +8936,10 @@ function setupNeeds() {
   return needs;
 }
 
-// Whether the built-in settings, which new problems open with while nothing is saved, sign in through this program
-// (with the New problem form closed: an open form counts by itself). They never make a program needed (setupNeeds),
-// but they will use its login: Install offers the sign-in, and the calm sign-in line says so.
+// Whether Default settings that are still TCS Prover's original settings, which new problems open with while nothing
+// is saved, sign in through this program (with the New problem form closed: an open form counts by itself). They
+// never make a program needed (setupNeeds), but they will use its login: Install offers the sign-in, and the calm
+// sign-in line says so.
 function setupBuiltInSignIn(program, need) {
   const defaults = setupStore().data?.defaults;
   return !need.form && defaults?.source === "built-in"
@@ -9066,7 +8982,7 @@ function setupRoleGroups(rows) {
   }).join("; ");
 }
 
-// The programs that need setting up for what new problems, the saved default settings and jobs use (setupNeeds):
+// The programs that need setting up for what new problems, your Default settings and jobs use (setupNeeds):
 // {program, kind, title}. A program nothing needs never counts, whatever its state; neither does an unknown
 // sign-in, nor anything once the server said it has no Setup page.
 function setupProblems(needs = setupNeeds()) {
@@ -9315,7 +9231,7 @@ function setupCommandList(rows, help = "", scope = "") {
   return list;
 }
 
-// "What needs it": the New problem roles, the saved default settings (beside an open form, when they add a reason),
+// "What needs it": the New problem roles, your Default settings (beside an open form, when they add a reason),
 // the jobs (each a link), the API connections. A program nothing needs says so calmly, and, when it is missing or
 // does not run, what would need it: "Nothing uses it now · only needed for Claude models".
 function setupNeedList(program, need, problem, info) {
@@ -9434,9 +9350,9 @@ function setupProgramCard(program, info, need, task, problem) {
     // A warning only while something here uses a built-in model through it; otherwise calm, and why.
     const login = words.logins[program];
     const detail = need.rolesSignIn.length ? `New problems use your ${login} login`
-      : need.defaultsSignIn.length ? `Your default settings use your ${login} login`
+      : need.defaultsSignIn.length ? `Your Default settings use your ${login} login`
       : need.jobs.signIn ? `${need.jobs.signIn} ${need.jobs.signIn === 1 ? "job uses" : "jobs use"} your ${login} login`
-      : setupBuiltInSignIn(program, need) ? `New problems open with the built-in settings, which use your ${login} login`
+      : setupBuiltInSignIn(program, need) ? `New problems open with Default settings, which use your ${login} login`
       : need.connections.length || need.needed ? "Not needed: API connections need no sign-in."
       : "Not needed by your settings or jobs";
     signLine = [setupElement("span", `job-status tone-${need.signIn ? "waiting" : "idle"}`, "Not signed in"),
@@ -10038,8 +9954,8 @@ function renderSetupDialog() {
   els.dialogWarning.textContent = dialog.warning || "";
   els.dialogWarning.hidden = !dialog.warning;
   // Install, then sign in under the same confirmation, when the login will be used: by something here (setupNeeds),
-  // by the built-in settings (setupBuiltInSignIn), or on a computer with neither program yet, where the program
-  // installed first is the one whose models you will use.
+  // by Default settings that are still TCS Prover's original settings (setupBuiltInSignIn), or on a computer with
+  // neither program yet, where the program installed first is the one whose models you will use.
   const need = setupNeeds()[current.program];
   const then = current.action === "install" && Boolean(dialog.checkbox) && (need.signIn
     || setupBuiltInSignIn(current.program, need) || setupProblems().some((problem) => problem.kind === "none"));
@@ -10152,27 +10068,31 @@ async function copyText(button, text) {
 })();
 
 // Saved settings: the first panel of Advanced settings on the New problem card (GET and POST /presets,
-// ui/presets.py), named in the summary of Advanced settings too, which shows while they are closed.
-// Named sets of this form's settings, kept on this computer; one of them may be the default that
-// every fresh New problem form opens with. A rerun pre-fill and a job sent back to the form keep their
-// own settings, and switching to Models & API keeps the draft. Saved settings hold the stages, each
-// role's source, model and reasoning, author subagents, critics and rounds, the time limit, the web
-// search cutoff, speed and activity log detail; never the statement, related works or prompts, which
-// Load leaves as they are. The page's own record lives on a function property: the first refresh(),
-// which runs before the declarations below, already reads the list.
+// ui/presets.py). Default settings, which every fresh New problem form opens with, and named sets of this form's
+// settings, kept on this computer. Default settings are TCS Prover's original settings until they are saved; Save
+// goes back to where the form's settings came from (Default settings, or the named settings loaded) unless another
+// name is typed. A rerun pre-fill and a job sent back to the form keep their own settings, and switching to Models &
+// API keeps the draft. Saved settings hold the stages, each role's source, model and reasoning, author subagents,
+// critics and rounds, the time limit, the web search cutoff, speed and activity log detail; never the statement,
+// related works or prompts, which Load leaves as they are. The summary of Advanced settings names them only while
+// something is wrong (see renderPresetBar). The page's own record lives on a function property: the first
+// refresh(), which runs before the declarations below, already reads the list.
 function presetStore() {
   return (presetStore.value ||= {
-    loaded: false, unsupported: false, presets: [], defaultId: "", builtIn: null,
+    loaded: false, unsupported: false, presets: [], defaultSettings: null, builtIn: null,
     // Why the server cannot use its saved settings file (problem), or why the last read failed (error).
     problem: "", error: "",
-    // Where the form's settings came from ({kind: "builtin"}, {kind: "preset", id, name} or {kind: "job"}),
-    // and presetSignature() when the form last matched it: "· changed on this form" marks any difference.
-    current: { kind: "builtin" }, baseline: "",
-    // The note at the foot of the panel: a confirmation, or a warning (what a load could not keep: the
-    // models of `missing` roles).
-    note: "", warning: false, missing: 0, busy: false, renaming: "",
-    // What the summary of Advanced settings says about them (see renderPresetBar).
-    summary: { text: "Saved settings: built-in", tone: "quiet" },
+    // Where the form's settings came from: {kind: "default"} (Default settings), {kind: "preset", id, name},
+    // {kind: "job"}, or {kind: "original"} (TCS Prover's original settings, when a fresh form could not have Default
+    // settings), and presetSignature() when the form last matched it: "· changed on this form" marks any difference.
+    current: { kind: "default" }, baseline: "",
+    // The note at the foot of the panel: a confirmation, or a warning (what a load could not keep: the models of
+    // `missing` roles, which the summary names as `missingWhat`; or Default settings that cannot be used now).
+    note: "", warning: false, missing: 0, missingWhat: "", busy: false, renaming: "",
+    // The Load list's row whose Reset or Make default asks first, in the row itself (its id).
+    confirming: "",
+    // The summary of Advanced settings' chip about them, or null while nothing is wrong (see renderPresetBar).
+    summary: null,
     // The form problem a Save… showed on the page's error line (see showPresetFormProblem), and the panel's
     // button that gets the focus once a request ends, when its dialog closed meanwhile (see presetFocusBar).
     formProblem: "", refocus: null,
@@ -10193,6 +10113,12 @@ async function presetRequest(path, body) {
   presetStore().unsupported = response.status === 404;
   if (response.status === 404) throw new Error(presetUnsupportedText);
   if (!response.ok) throw new Error(data.error || `The request failed (HTTP ${response.status}).`);
+  // A server from before Default settings (restarted with an older TCS Prover, say) answers without them: it
+  // would keep this page's saves apart from what new problems open with. As one without saved settings.
+  if (!("defaultSettings" in data)) {
+    presetStore().unsupported = true;
+    throw new Error(presetUnsupportedText);
+  }
   return data;
 }
 
@@ -10202,10 +10128,17 @@ function presetNameKey(name) {
   return String(name).toLowerCase();
 }
 
+// Whether a name means Default settings: their name in any case, which named settings never have (is_default_name
+// in ui/presets.py).
+function presetIsDefaultName(name) {
+  return presetNameKey(String(name).trim()) === presetNameKey("Default settings");
+}
+
 function adoptPresets(data) {
   const store = presetStore();
   store.presets = Array.isArray(data.presets) ? data.presets : [];
-  store.defaultId = String(data.defaultId || "");
+  store.defaultSettings = data.defaultSettings && typeof data.defaultSettings === "object"
+    ? data.defaultSettings : null;
   if (data.builtIn?.settings) store.builtIn = data.builtIn;
   store.problem = String(data.problem || "");
   store.error = "";
@@ -10217,8 +10150,8 @@ function adoptPresets(data) {
   if (current) store.current.name = current.name;
 }
 
-// Read the list again; a failure leaves the form as it is (the built-in settings on a fresh form) and
-// the panel says why (the summary of Advanced settings too).
+// Read the list again; a failure leaves the form as it is (TCS Prover's original settings on a fresh form)
+// and the panel says why (the summary of Advanced settings too).
 async function loadPresets() {
   const store = presetStore();
   try {
@@ -10229,26 +10162,36 @@ async function loadPresets() {
   renderPresetBar();
 }
 
-// A New problem form opened (see render): a fresh one takes the default saved settings, when they can
-// be used; a rerun pre-fill or a job sent back to the form keeps the job's settings. While the list cannot
-// be read (refresh reads it first), the one this page read before may be out of date: a fresh form then
-// has the built-in settings, as when the page could never read it, and the panel and the summary say so.
+// A New problem form opened (see render): a fresh one takes Default settings; a rerun pre-fill or a job sent
+// back to the form keeps the job's settings. While the list cannot be read (refresh reads it first), the one
+// this page read before may be out of date: a fresh form then has TCS Prover's original settings (as the server
+// fills it), as when the page could never read it, and the panel and the summary say so. So does a fresh form
+// whose Default settings cannot be used now (saved by a newer TCS Prover, say), and the panel says why.
 function presetsFormOpened(fresh) {
   const store = presetStore();
   store.note = "";
   store.warning = false;
+  store.missing = 0;
   store.renaming = "";
-  const preset = fresh && !store.unsupported && !store.error
-    ? store.presets.find((item) => item.id === store.defaultId && !item.unusable) : null;
-  if (preset) applyPreset(preset);
-  else store.current = { kind: fresh ? "builtin" : "job" };
+  store.confirming = "";
+  const listed = fresh && !store.unsupported && !store.error ? store.defaultSettings : null;
+  if (listed && !listed.unusable) applyPreset(listed);
+  else if (!fresh) store.current = { kind: "job" };
+  else {
+    store.current = { kind: "original" };
+    if (listed) {
+      store.note = "Default settings cannot be used now, so this form has TCS Prover's original settings. "
+        + listed.problem;
+      store.warning = true;
+    }
+  }
   store.baseline = presetSignature();
   renderPresetBar();
 }
 
-// Load saved settings into the form. A role whose model is gone (an API model removed with its
-// connection, or a model TCS Prover no longer supports) gets GPT 6.1 Sol and keeps its reasoning
-// (lowered if that model lacks it), with a note; the saved settings themselves are never changed, so
+// Load saved settings (Default settings, or named ones) into the form. A role whose model is gone (an API
+// model removed with its connection, or a model TCS Prover no longer supports) gets GPT 6.1 Sol and keeps its
+// reasoning (lowered if that model lacks it), with a note; the saved settings themselves are never changed, so
 // they work again once the connection is added back. The server says which models are gone when it
 // lists the saved settings (unavailable); the menus, read with that list (see openPresetLoad), may
 // only lack one that was removed since.
@@ -10278,10 +10221,14 @@ function applyPreset(preset) {
     });
   }
   applyComposerSettings(settings);
-  store.current = { kind: "preset", id: preset.id, name: preset.name };
+  store.current = preset.id === "default" ? { kind: "default" } : { kind: "preset", id: preset.id, name: preset.name };
   store.note = missing.length ? presetMissingText(missing) : "";
   store.warning = missing.length > 0;
   store.missing = missing.length;
+  // The summary's words for what is not available: "author model", "author subagent 2 model", "2 models".
+  const [{ role } = {}] = missing;
+  store.missingWhat = missing.length > 1 ? `${missing.length} models`
+    : role ? `${/^member\d+$/.test(role) ? `author subagent ${role.slice(6)}` : role} model` : "";
 }
 
 function presetMissingText(missing) {
@@ -10306,20 +10253,17 @@ function presetSignature() {
     ...["review", "author", "critic", "writer"].flatMap((role) => [ui[`${role}Model`].value, ui[`${role}Effort`].value]),
     number(ui.authorSubagents), number(ui.criticCount), number(ui.criticRounds), number(ui.thinkingHours),
     ui.speedMode.value, ui.reasoningSummary.value, selectedRetrievalSettings(),
-    ...(typeof teamModelsSetting === "function" ? [teamModelsSetting(), selectedGoalLoop()] : [])]);
+    ...(typeof teamModelsSetting === "function" ? [teamModelsSetting()] : [])]);
 }
 
-// The settings a Save sends: a job's (proofJobSettings) without its prompts. A number field of a stage
-// that is off (hidden, and not checked at Start) goes as the built-in value when it is not valid; see
+// The settings a Save sends: a job's (proofJobSettings) without its prompts and goal loop. A number field of a stage
+// that is off (hidden, and not checked at Start) goes as TCS Prover's original value when it is not valid; see
 // presetNumberFields.
 function presetFormSettings() {
   const settings = proofJobSettings();
   delete settings.promptOverrides;
-  // A rerun's goal loop and subagents of a job from before are that job's, never saved settings'.
-  delete settings.legacyTeam;
-  // The goal loop chosen on the form, which it keeps while a web cutoff runs Codex's goal mode: saved settings
-  // loaded later without the cutoff use it (a web-cutoff job records Codex's goal mode anyway).
-  if ("goalLoop" in settings && typeof teamStore === "function") settings.goalLoop = teamStore().loop;
+  // The goal loop is no setting of the form (see selectedGoalLoop): saved settings never hold it.
+  delete settings.goalLoop;
   const builtIn = { authorSubagents: 3, criticCount: 3, criticRounds: 2, thinkingHours: 0,
     ...presetStore().builtIn?.settings };
   for (const { key, stage, problem } of presetNumberFields()) {
@@ -10330,8 +10274,8 @@ function presetFormSettings() {
 
 // The number fields saved settings hold: each one's setting, field, the stage that shows it, and why its
 // value cannot be saved (or ""). As at Start, a field is checked only while its stage is on; a Save keeps
-// a hidden field's value when it is valid, else the built-in value, which Start runs a stage that is off
-// with (ui/presets.py does the same).
+// a hidden field's value when it is valid, else TCS Prover's original value, which Start runs a stage that is
+// off with (ui/presets.py does the same).
 function presetNumberFields() {
   const whole = (input, what) => {
     const value = String(input.value).trim(), number = Number(value);
@@ -10457,68 +10401,52 @@ function presetGeneratedName(now = new Date()) {
   return name;
 }
 
-// The panel's line "Now using: <name> (default) · changed on this form", its note and its buttons, and what the
-// summary of Advanced settings says about them: the saved settings that filled the form (marked when they are
-// not the built-in ones, and as a warning when the note warns), "· changed" after an edit.
+// The panel's line "Now using: <name> · changed on this form", its note and its buttons, and the summary of
+// Advanced settings' chip about them (store.summary): shown only while something is wrong that the owner must see
+// with the panel closed. That is a loaded model that is not available ("Default settings: author model not
+// available"), or saved settings that cannot be read or used now: "Default settings not available" on a fresh form
+// that has TCS Prover's original settings instead, "Saved settings not available" on a form that other settings fill.
 function renderPresetBar() {
   const store = presetStore();
-  const current = store.current || { kind: "builtin" };
+  const current = store.current || { kind: "default" };
   const saved = current.kind === "preset" ? store.presets.find((item) => item.id === current.id && !item.unusable) : null;
   const deleted = current.kind === "preset" && !saved && store.loaded && !store.problem && !store.error;
   const changed = Boolean(store.baseline) && presetSignature() !== store.baseline;
   // A confirmation ("Saved as …") gives way to the next edit; a warning stays until the next load.
   if (changed && store.note && !store.warning) store.note = "";
-  const name = current.kind === "preset" ? saved?.name || current.name : "";
-  presetUi.name.textContent = current.kind === "job" ? "the job's settings" : name || "built-in settings";
-  presetUi.marks.textContent = (saved && saved.id === store.defaultId ? " (default)" : "")
-    + (deleted ? " (deleted)" : "") + (changed ? " · changed on this form" : "");
+  const name = { default: "Default settings", original: "TCS Prover's original settings",
+    job: "the job's settings" }[current.kind] || saved?.name || current.name || "";
+  presetUi.name.textContent = name;
+  presetUi.marks.textContent = (deleted ? " (deleted)" : "") + (changed ? " · changed on this form" : "");
   presetUi.bar.dataset.changed = String(changed);
   const note = store.note || (store.unsupported ? presetUnsupportedText : store.problem || store.error);
   // A live region that stays rendered: empty, it takes no room (styles.css).
   if (presetUi.note.textContent !== note) presetUi.note.textContent = note;
   const warning = Boolean(note) && !(store.note && !store.warning);
   presetUi.note.dataset.tone = warning ? "warning" : "info";
-  // Writes are refused while the file cannot be used; Built-in settings still load.
+  // Writes are refused while the file cannot be used; TCS Prover's original settings still load.
   presetUi.load.disabled = store.unsupported || store.busy;
   presetUi.save.disabled = presetUi.confirmSave.disabled = store.unsupported || store.busy || Boolean(store.problem);
-  // A warning in the summary always says what it is: a saved model that a load could not keep, or saved settings
-  // that cannot be read or used now (the note says why). A fresh form then has the built-in settings ("Saved
-  // settings: not available", see presetsFormOpened); a form that saved settings or a job filled keeps them, and
-  // the summary says so after their name.
-  const unavailable = Boolean(note) && !store.note;
-  const label = current.kind === "job" ? "Settings from the job"
-    : name ? `Saved settings: ${name}${deleted ? " (deleted)" : ""}`
-    : unavailable ? "Saved settings: not available" : "Saved settings: built-in";
-  const marks = [
-    unavailable && (current.kind === "job" || name) ? "saved settings not available" : "",
-    store.note && store.warning ? `${store.missing > 1 ? `${store.missing} models` : "model"} not available` : "",
-    changed ? "changed" : "",
+  const unreadable = Boolean(store.unsupported || store.problem || store.error);
+  const wrong = [
+    store.warning && store.missing ? `${current.kind === "default" ? "Default settings" : name}: ${store.missingWhat} `
+      + "not available" : "",
+    current.kind === "original" && (unreadable || store.defaultSettings?.unusable) ? "Default settings not available"
+      : unreadable ? "Saved settings not available" : "",
   ].filter(Boolean);
-  store.summary = { text: [label, ...marks].join(" · "),
-    tone: warning ? "warning" : current.kind === "builtin" ? "quiet" : "accent" };
+  store.summary = wrong.length ? { text: wrong.join(" · "), tone: "warning" } : null;
   renderAdvancedSummary();
 }
 
-// The summary line of Advanced settings, in view while they are closed too: the saved settings that filled the
-// form (see renderPresetBar) and the related works listed for the next problem, each a chip. The related
-// works' chip says when one is uploading or failed, and when the Author stage that reads them is off: a warning
-// always names its cause. Reads only function-held records: it may run before the declarations of this part of
-// the file.
+// The summary line of Advanced settings, in view while they are closed too: a warning about saved settings (see
+// renderPresetBar) and the related works listed for the next problem, each a chip; with neither, the quiet list of
+// what is inside. The related works' chip says when one is uploading or failed, and when the Author stage that
+// reads them is off: a warning always names its cause. Reads only function-held records: it may run before the
+// declarations of this part of the file.
 function renderAdvancedSummary() {
   const box = $("advancedSummary");
   if (!box) return;
-  const chips = [presetStore().summary];
-  // The author's goal loop and its team, while the Author stage is on: quiet with TCS Prover's loop and the
-  // coordinator's model for every subagent (the defaults), marked otherwise.
-  if (typeof teamFormText === "function" && ui.workflowAuthor.checked) {
-    // A Claude Code author always runs TCS Prover's loop (the choice is kept for a Codex author).
-    const claude = formAuthorUsesClaudeCode();
-    const loop = claude ? "tcs" : selectedGoalLoop();
-    chips.push({ text: `Goal loop: ${loop === "codex" ? "Codex built-in" : "TCS Prover"}${claude
-      ? " (Claude Code author)" : ""}`, tone: loop === "codex" ? "accent" : "quiet" });
-    const team = teamFormText();
-    if (team) chips.push({ text: team.text, tone: team.chosen ? "accent" : "quiet" });
-  }
+  const chips = [presetStore().summary].filter(Boolean);
   const items = typeof composerRelatedWorks === "function" ? composerRelatedWorks().items : [];
   if (items.length) {
     const failed = items.filter((item) => item.status === "failed").length;
@@ -10540,7 +10468,7 @@ function renderAdvancedSummary() {
     chip.className = "advanced-chip";
     chip.dataset.tone = tone;
     chip.textContent = text;
-    // The summary names the disclosure button: "Advanced settings, Saved settings: …, 2 related works".
+    // The summary names the disclosure button: "Advanced settings, 2 related works".
     const pause = document.createElement("span");
     pause.className = "visually-hidden";
     pause.textContent = ", ";
@@ -10548,15 +10476,27 @@ function renderAdvancedSummary() {
   }));
 }
 
+// Where a Save goes back to: the settings the form came from, Default settings (also when a fresh form could not
+// have them) or the named settings loaded (by their latest name: once deleted, a Save makes them again), or nowhere
+// for a job's settings. {name, id}: the name the Save dialog opens with, and the id it then replaces without asking.
+function presetSaveSource() {
+  const store = presetStore(), current = store.current || { kind: "default" };
+  if (current.kind === "default" || current.kind === "original") return { name: "Default settings", id: "default" };
+  if (current.kind !== "preset") return { name: "", id: "" };
+  const saved = store.presets.find((item) => item.id === current.id && !item.unusable);
+  return { name: saved?.name || current.name || "", id: saved?.id || "" };
+}
+
+// Save these settings…: the name the form's settings came from ("Default settings", or the loaded settings'
+// name), or for a job's settings none, with the name a Save then uses as the placeholder.
 function openPresetSave() {
   const store = presetStore();
   if (presetUi.save.disabled) return;
   const problem = presetFormProblem();
   if (problem) return showPresetFormProblem(problem);
   clearPresetFormProblem();
-  presetUi.saveName.value = "";
+  presetUi.saveName.value = presetSaveSource().name;
   presetUi.saveName.placeholder = presetGeneratedName();
-  presetUi.saveDefault.checked = true;
   presetUi.saveSummary.textContent = presetSummary(presetFormSettings(), presetFormLabels());
   show(presetUi.saveError, false);
   // Closing a modal dialog returns focus to what had it: the button that opened it (a click does not
@@ -10564,34 +10504,46 @@ function openPresetSave() {
   presetUi.save.focus();
   presetUi.saveDialog.showModal();
   presetUi.saveName.focus();
+  presetUi.saveName.select?.();
   // Saved settings may have changed in another tab: whether a name is taken depends on the list.
   loadPresets().then(() => {
     if (presetUi.saveDialog.open && !store.busy) presetUi.saveName.placeholder = presetGeneratedName();
   });
 }
 
+// Save: to Default settings under their name (any case), else under the name typed. Saving back to the settings the
+// form came from replaces them without asking; any other settings that have the name are replaced only once
+// confirmed, and Default settings too.
 async function savePreset(event) {
   event?.preventDefault();
   const store = presetStore();
   if (store.busy || presetUi.confirmSave.disabled) return;
   const name = presetUi.saveName.value.trim() || presetUi.saveName.placeholder || presetGeneratedName();
-  const clash = store.presets.find((item) => !item.unusable && presetNameKey(item.name) === presetNameKey(name));
-  if (clash && !confirm(`Replace the saved settings “${clash.name}”?`)) return;
-  const makeDefault = presetUi.saveDefault.checked;
-  const body = { name, settings: presetFormSettings(), makeDefault, ...(clash ? { replaceId: clash.id } : {}) };
-  // Replacing the default saved settings changes them too, ticked or not.
-  const changesDefault = makeDefault || Boolean(clash && clash.id === store.defaultId);
+  const source = presetSaveSource(), toDefault = presetIsDefaultName(name);
+  const clash = toDefault ? null
+    : store.presets.find((item) => !item.unusable && presetNameKey(item.name) === presetNameKey(name));
+  const own = toDefault ? source.id === "default" : Boolean(clash) && clash.id === source.id;
+  if (!own && toDefault && !confirm("Replace Default settings with this form's settings?")) return;
+  if (!own && clash && !confirm(`Replace the saved settings “${clash.name}”?`)) return;
+  const body = toDefault ? { name: "Default settings", settings: presetFormSettings() }
+    : { name, settings: presetFormSettings(), ...(clash ? { replaceId: clash.id } : {}) };
   setPresetBusy(true);
   show(presetUi.saveError, false);
   try {
     const data = await presetRequest("/presets", body);
     adoptPresets(data);
-    if (changesDefault) presetDefaultChanged();
-    const saved = store.presets.find((item) => item.id === data.savedId);
-    store.current = { kind: "preset", id: data.savedId, name: saved?.name || name };
+    if (toDefault) {
+      store.current = { kind: "default" };
+      store.note = "Saved to Default settings. New problems open with these settings.";
+      presetDefaultChanged();
+    } else {
+      const saved = store.presets.find((item) => item.id === data.savedId);
+      store.current = { kind: "preset", id: data.savedId, name: saved?.name || name };
+      store.note = `Saved as “${saved?.name || name}”.`;
+    }
     store.baseline = presetSignature();
-    store.note = `Saved as “${saved?.name || name}”.${makeDefault ? " New problems open with these settings." : ""}`;
     store.warning = false;
+    store.missing = 0;
     presetUi.saveDialog.close();
   } catch (error) {
     presetUi.saveError.textContent = error.message;
@@ -10650,16 +10602,18 @@ function presetButton(id, name, action, label, enabled, primary = false) {
   return button;
 }
 
-// One row of the Load list: the name (Default marked), a summary and any model that is gone, then
-// Load, Rename, Make default (or Remove default) and Delete in columns. Settings that cannot be used
-// say why and can only be deleted; Built-in settings can be loaded or made the default.
+// One row of the Load list: the name, a summary and any model that is gone, then Load, Rename, Make default and
+// Delete in columns. Default settings come first: Load, and Reset while they are not TCS Prover's original settings
+// (or cannot be used); Reset and Make default ask first in the row itself (store.confirming). Named settings that
+// cannot be used say why and can only be deleted. While the file cannot be read, TCS Prover's original settings
+// (id "original") take Default settings' place and can be loaded.
 function presetRow(preset) {
   const store = presetStore();
   const writable = !store.busy && !store.unsupported && !store.problem;
-  const builtIn = preset.id === "builtin";
-  const isDefault = builtIn ? !store.defaultId : !preset.unusable && preset.id === store.defaultId;
-  const renaming = store.renaming === preset.id;
-  const row = presetElement("li", `preset-row${preset.unusable ? " unusable" : ""}${builtIn ? " builtin" : ""}`);
+  const isDefault = preset.id === "default", original = preset.id === "original";
+  const renaming = store.renaming === preset.id, confirming = store.confirming === preset.id;
+  const row = presetElement("li", `preset-row${preset.unusable ? " unusable" : ""}${isDefault || original
+    ? " default-settings" : ""}`);
   row.dataset.preset = preset.id;
   const copy = presetElement("div", "preset-row-copy"), head = presetElement("div", "preset-row-head");
   if (renaming) {
@@ -10672,24 +10626,38 @@ function presetRow(preset) {
     input.setAttribute("aria-label", `New name for ${preset.name}`);
     head.append(input);
   } else head.append(presetElement("strong", "preset-row-name", preset.name));
-  if (isDefault && !renaming) head.append(presetElement("span", "badge preset-default-badge", "Default"));
   copy.append(head);
   if (preset.unusable) {
-    copy.append(presetElement("p", "preset-row-warning", `${preset.problem} These settings can only be deleted.`));
+    copy.append(presetElement("p", "preset-row-warning", isDefault ? `${preset.problem} New problems open with TCS `
+      + "Prover's original settings until you save to Default settings or reset them."
+      : `${preset.problem} These settings can only be deleted.`));
   } else {
     copy.append(presetElement("p", "preset-row-summary", preset.settings
       ? presetSummary(preset.settings, preset.labels) : "TCS Prover's own settings"));
+    if (isDefault) copy.append(presetElement("p", "preset-row-help", "New problems open with these settings."));
+    if (original) {
+      copy.append(presetElement("p", "preset-row-help", "New problems open with these settings until the saved "
+        + "settings can be read."));
+    }
     for (const missing of preset.unavailable || []) {
       copy.append(presetElement("p", "preset-row-warning", `${missing.text}; it loads GPT 6.1 Sol instead.`));
     }
   }
+  if (confirming) {
+    copy.append(presetElement("p", "preset-row-question", isDefault
+      ? "Put back TCS Prover's original settings as Default settings?"
+      : `Replace Default settings with “${preset.name}”?`));
+  }
   row.append(copy);
-  const cells = builtIn ? [["load", "Load", !store.busy, true], null,
-    isDefault ? null : ["builtin-default", "Make default", writable], null]
+  const cells = confirming ? [isDefault ? ["reset-confirm", "Reset", writable, true]
+    : ["default-confirm", "Replace", writable, true], ["confirm-cancel", "Cancel", !store.busy], null, null]
+    : original ? [["load", "Load", !store.busy, true], null, null, null]
+    : isDefault ? [preset.unusable ? null : ["load", "Load", !store.busy, true], null,
+      preset.unusable || !preset.original ? ["reset", "Reset", writable] : null, null]
     : preset.unusable ? [null, null, null, ["delete", "Delete", writable]]
     : renaming ? [["rename-save", "Save name", writable, true], ["rename-cancel", "Cancel", !store.busy], null, null]
-    : [["load", "Load", !store.busy, true], ["rename", "Rename", writable],
-      ["default", isDefault ? "Remove default" : "Make default", writable], ["delete", "Delete", writable]];
+    : [["load", "Load", !store.busy, true], ["rename", "Rename", writable], ["default", "Make default", writable],
+      ["delete", "Delete", writable]];
   for (const cell of cells) {
     row.append(cell ? presetButton(preset.id, preset.name, ...cell) : presetElement("span", "preset-cell"));
   }
@@ -10700,15 +10668,14 @@ function renderPresetList(focus = null) {
   const store = presetStore();
   const usable = store.presets.filter((item) => !item.unusable);
   const byName = (a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base", numeric: true });
-  const rows = [...usable.filter((item) => item.id === store.defaultId),
-    ...usable.filter((item) => item.id !== store.defaultId).sort(byName),
-    ...store.presets.filter((item) => item.unusable)].map(presetRow);
+  const first = store.defaultSettings || { id: "original",
+    name: store.builtIn?.name || "TCS Prover's original settings", settings: store.builtIn?.settings || null,
+    labels: store.builtIn?.labels || {} };
+  const rows = [first, ...usable.sort(byName), ...store.presets.filter((item) => item.unusable)].map(presetRow);
   if (store.loaded && !usable.length && !store.problem) {
-    rows.push(presetElement("li", "preset-empty", "No saved settings yet. Choose Save these settings… to keep this "
-      + "form's settings under a name."));
+    rows.splice(1, 0, presetElement("li", "preset-empty", "No named settings yet. To keep this form's settings under "
+      + "a name, choose Save these settings… and type a new name."));
   }
-  rows.push(presetRow({ id: "builtin", name: store.builtIn?.name || "Built-in settings",
-    settings: store.builtIn?.settings || null, labels: store.builtIn?.labels || {} }));
   presetUi.list.replaceChildren(...rows);
   // A re-drawn list keeps the focus on the same action (or the row's Load), else on Close.
   if (focus) {
@@ -10752,14 +10719,14 @@ function presetFocusBar(button) {
   if (!store.refocus) button.focus();
 }
 
-// The Setup page counts the default saved settings, also beside this form (setupNeeds): a change of them is read
-// there at once, from the server's last check of the programs (no program starts), not at its next minute's read.
+// The Setup page counts Default settings, also beside this form (setupNeeds): a change of them is read there at
+// once, from the server's last check of the programs (no program starts), not at its next minute's read.
 function presetDefaultChanged() {
   if (typeof loadSetup === "function") loadSetup("poll");
 }
 
 // A change made from the Load list; the list shows the server's answer (or, after a refusal, the
-// list as it is now) and the status line says what happened. ``changesDefault``: it may change the default.
+// list as it is now) and the status line says what happened. ``changesDefault``: it changes Default settings.
 async function presetListAction(path, body, done, focus, changesDefault = false) {
   const store = presetStore();
   if (store.busy) return;
@@ -10768,9 +10735,11 @@ async function presetListAction(path, body, done, focus, changesDefault = false)
     adoptPresets(await presetRequest(path, body));
     presetUi.loadStatus.textContent = done();
     store.renaming = "";
+    store.confirming = "";
     if (changesDefault) presetDefaultChanged();
   } catch (error) {
     presetUi.loadStatus.textContent = error.message;
+    store.confirming = "";
     if (!store.unsupported) {
       await loadPresets();
       if (store.error) presetUi.loadStatus.textContent = `${error.message} ${store.error}`;
@@ -10782,14 +10751,19 @@ async function presetListAction(path, body, done, focus, changesDefault = false)
 
 function loadPresetFromList(id) {
   const store = presetStore();
-  const preset = id === "builtin" ? null : store.presets.find((item) => item.id === id && !item.unusable);
-  if (preset) applyPreset(preset);
-  else {
+  const preset = id === "default" ? store.defaultSettings
+    : store.presets.find((item) => item.id === id && !item.unusable);
+  if (preset && !preset.unusable) applyPreset(preset);
+  else if (id === "original") {
     applyComposerSettings(store.builtIn?.settings || {});
-    store.current = { kind: "builtin" };
+    store.current = { kind: "original" };
     store.warning = false;
+    store.missing = 0;
+  } else return;
+  if (!store.warning) {
+    store.note = id === "default" ? "Loaded Default settings." : id === "original"
+      ? "Loaded TCS Prover's original settings." : `Loaded “${preset.name}”.`;
   }
-  if (!store.warning) store.note = `Loaded “${preset ? preset.name : "Built-in settings"}”.`;
   store.baseline = presetSignature();
   // Every number field now holds a saved value: a problem a Save… named is gone.
   clearPresetFormProblem();
@@ -10797,17 +10771,51 @@ function loadPresetFromList(id) {
   renderPresetBar();
 }
 
-// Make saved settings the default ("": the built-in settings); the focus stays on the row acted on.
-function setPresetDefault(id, row = id || "builtin") {
+// Reset ("default") and Make default ask first, in their row: the focus goes to its Cancel.
+function startPresetConfirm(id) {
+  const store = presetStore();
+  store.renaming = "";
+  store.confirming = id;
+  presetUi.loadStatus.textContent = "";
+  renderPresetList({ id, action: "confirm-cancel" });
+}
+
+function cancelPresetConfirm() {
+  const store = presetStore(), id = store.confirming;
+  store.confirming = "";
+  renderPresetList({ id, action: id === "default" ? "reset" : "default" });
+}
+
+// Copy named settings into Default settings (Make default), or with "" put back TCS Prover's original settings
+// (Reset). A form that Default settings filled and that has no edits takes the new ones too, so that "Now using:
+// Default settings" stays true; one with edits keeps them, marked changed until the next load or save.
+function setPresetDefault(id) {
   const store = presetStore();
   const name = store.presets.find((item) => item.id === id)?.name;
-  return presetListAction("/presets/default", { id }, () => (id ? `New problems now open with “${name}”.`
-    : "New problems now open with the built-in settings."),
-  { id: row, action: row === "builtin" ? "builtin-default" : "default" }, true);
+  const follows = ["default", "original"].includes(store.current?.kind);
+  const edited = follows && Boolean(store.baseline) && presetSignature() !== store.baseline;
+  return presetListAction("/presets/default", { id }, () => {
+    let also = "";
+    if (follows && !edited && store.defaultSettings && !store.defaultSettings.unusable) {
+      applyPreset(store.defaultSettings);
+      store.baseline = presetSignature();
+      if (!store.warning) store.note = "Loaded Default settings.";
+      also = " This form has them now too.";
+    } else if (follows) {
+      store.current = { kind: "default" };
+      // Never the form's own signature (a JSON array): "· changed on this form" stays.
+      store.baseline = "stale";
+    }
+    renderPresetBar();
+    return (id ? `Copied “${name}” to Default settings. New problems open with these settings.`
+      : "Default settings are TCS Prover's original settings again.") + also;
+  }, { id: id || "default", action: id ? "default" : "load" }, true);
 }
 
 function startPresetRename(id) {
-  presetStore().renaming = id;
+  const store = presetStore();
+  store.confirming = "";
+  store.renaming = id;
   presetUi.loadStatus.textContent = "";
   renderPresetList({ id, action: "rename" });
 }
@@ -10825,9 +10833,10 @@ function savePresetRename(id) {
   const preset = store.presets.find((item) => item.id === id);
   const clash = store.presets.find((item) => !item.unusable && item.id !== id
     && presetNameKey(item.name) === presetNameKey(name));
-  if (!name || clash) {
+  if (!name || clash || presetIsDefaultName(name)) {
     presetUi.loadStatus.textContent = !name ? "Enter a name."
-      : `Saved settings called “${clash.name}” already exist. Choose another name.`;
+      : clash ? `Saved settings called “${clash.name}” already exist. Choose another name.`
+      : "“Default settings” is the name of the settings new problems open with. Choose another name.";
     input?.focus();
     return;
   }
@@ -10835,14 +10844,13 @@ function savePresetRename(id) {
   return presetListAction("/presets/rename", { id, name }, () => `Renamed to “${name}”.`, { id, action: "rename" });
 }
 
+// Delete asks first; Default settings never change.
 function deletePresetFromList(id) {
   const store = presetStore();
   const preset = store.presets.find((item) => item.id === id);
   if (!preset) return;
-  const fallback = preset.id === store.defaultId ? "\n\nNew problems will open with the built-in settings." : "";
-  if (!confirm(`Delete the saved settings “${preset.name}”?${fallback}`)) return;
-  return presetListAction("/presets/delete", { id }, () => `Deleted “${preset.name}”.`, { id: "", action: "" },
-    preset.id === store.defaultId);
+  if (!confirm(`Delete the saved settings “${preset.name}”?`)) return;
+  return presetListAction("/presets/delete", { id }, () => `Deleted “${preset.name}”.`, { id: "", action: "" });
 }
 
 const presetUnsupportedText = "This TCS Prover server cannot save settings. Restart TCS Prover to update it.";
@@ -10850,7 +10858,7 @@ const presetUi = {
   card: ui.input.querySelector(".composer"), bar: $("presetBar"), name: $("presetName"), marks: $("presetMarks"),
   note: $("presetNote"), load: $("loadPresetButton"), save: $("savePresetButton"),
   saveDialog: $("presetSaveDialog"), saveForm: $("presetSaveForm"), saveName: $("presetSaveName"),
-  saveSummary: $("presetSaveSummary"), saveDefault: $("presetSaveDefault"), saveError: $("presetSaveError"),
+  saveSummary: $("presetSaveSummary"), saveError: $("presetSaveError"),
   cancelSave: $("cancelPresetSaveButton"), confirmSave: $("confirmPresetSaveButton"),
   loadDialog: $("presetLoadDialog"), closeLoad: $("closePresetLoadButton"), loadStatus: $("presetLoadStatus"),
   list: $("presetList"),
@@ -10864,21 +10872,25 @@ presetUi.closeLoad.onclick = () => presetUi.loadDialog.close();
 presetUi.saveDialog.addEventListener("close", () => presetFocusBar(presetUi.save));
 presetUi.loadDialog.addEventListener("close", () => {
   presetStore().renaming = "";
+  presetStore().confirming = "";
   presetFocusBar(presetUi.load);
 });
-// Escape while renaming ends the renaming, not the list.
+// Escape while renaming ends the renaming, and while Reset or Make default asks, the question; not the list.
 presetUi.loadDialog.addEventListener("cancel", (event) => {
-  if (!presetStore().renaming) return;
+  const store = presetStore();
+  if (!store.renaming && !store.confirming) return;
   event.preventDefault();
-  cancelPresetRename();
+  if (store.renaming) cancelPresetRename();
+  else cancelPresetConfirm();
 });
 presetUi.list.onclick = (event) => {
   const button = event.target.closest?.("button[data-preset-action]");
   if (!button || button.disabled) return;
   const id = button.dataset.presetId;
   ({ load: loadPresetFromList, rename: startPresetRename, "rename-save": savePresetRename,
-    "rename-cancel": cancelPresetRename, delete: deletePresetFromList, "builtin-default": () => setPresetDefault("", "builtin"),
-    default: (identity) => setPresetDefault(identity === presetStore().defaultId ? "" : identity, identity),
+    "rename-cancel": cancelPresetRename, delete: deletePresetFromList, reset: startPresetConfirm,
+    default: startPresetConfirm, "confirm-cancel": cancelPresetConfirm, "reset-confirm": () => setPresetDefault(""),
+    "default-confirm": setPresetDefault,
   })[button.dataset.presetAction]?.(id);
 };
 // Enter in the name being edited saves it (Escape ends the renaming, above); not an Enter that ends an
@@ -10915,7 +10927,7 @@ renderPresetBar();
 // /records), newest or largest first, and deletes one after an in-page confirmation (DELETE /records/<run folder>; the
 // server refuses while its job works). A record's Model calls page (?calls=<run folder>, from the job page's Live
 // activity card or a record's row) lists its calls beside the chosen one (GET /jobs/<id>/model-calls, .../<callId>,
-// .../<callId>/raw); both pages and the job page give its training download (GET /jobs/<id>/training-record).
+// .../<callId>/raw). No page offers the training record (GET /jobs/<id>/training-record): it downloads by its URL.
 // Every request goes outside the job request queue, with the session token. Contract:
 // ~/tcs-work/fixes/record-contract.md. The page's state lives on functions (recordsStore, callsStore), so that code
 // run before this part of the file (refresh, the first render) finds it.
@@ -11225,8 +11237,7 @@ function askDeleteRecord(row) {
   els.dialogList.replaceChildren(
     mcNode("li", "", "Removes every recorded model call of this job from this computer: ", strong, "."),
     mcNode("li", "", row.jobExists
-      ? "Its job stays, with its proof, files and activity log; its page then shows no model calls and offers no "
-        + "training record."
+      ? "Its job stays, with its proof, files and activity log; its page then shows no model calls."
       : "Its job was deleted earlier, so this record is the last copy of what its models were sent and answered."),
     mcNode("li", "", `Frees ${recordSize(row.sizeBytes)}.`));
   els.dialogError.hidden = true;
@@ -11290,70 +11301,7 @@ async function confirmDeleteRecord() {
   });
 })();
 
-// --- The training download ---
-
-// The job's training record as a ZIP (GET /jobs/<id>/training-record, streamed): the button counts what arrived. A
-// download that fails part way (the server ends it without its last chunk) makes the read fail: nothing is saved, the
-// button says "Download failed" and ``notice`` says why.
-async function downloadTrainingRecord(run, button, label, notice) {
-  if (!run || button.dataset.busy) return;
-  button.dataset.busy = "1";
-  button.dataset.state = "busy";
-  button.setAttribute("aria-busy", "true");
-  const say = (text) => { if (label.textContent !== text) label.textContent = text; };
-  say("Downloading…");
-  if (notice) notice.hidden = true;
-  try {
-    const response = await fetch(recordPath(run, "training-record"), {
-      headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" });
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.error || `HTTP ${response.status}`);
-    }
-    let blob;
-    const reader = response.body?.getReader?.();
-    if (reader) {
-      const parts = [];
-      let received = 0, shownAt = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parts.push(value);
-        received += value.length;
-        if (Date.now() - shownAt > 250) {
-          say(`Downloading… ${recordSize(received)}`);
-          shownAt = Date.now();
-        }
-      }
-      blob = new Blob(parts, { type: "application/zip" });
-    } else {
-      blob = await response.blob();
-    }
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${run}-training-record.zip`;
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    button.dataset.state = "done";
-    say("Training record");
-  } catch (error) {
-    button.dataset.state = "failed";
-    say("Download failed");
-    if (notice) {
-      notice.textContent = `The training record download failed (${error.message || "the connection closed"}); `
-        + "nothing was saved. Try again; the server's log says why.";
-      notice.hidden = false;
-    }
-  } finally {
-    delete button.dataset.busy;
-    button.removeAttribute("aria-busy");
-  }
-}
-
-// --- The job page's way in: "Model calls · N" and "Training record" on the Live activity card ---
+// --- The job page's way in: "Model calls · N" on the Live activity card ---
 
 function jobCallsStore() {
   return (jobCallsStore.value ||= { run: "", total: null, missing: false, readAt: 0, reading: false });
@@ -11361,14 +11309,13 @@ function jobCallsStore() {
 
 // The count follows the record: read at most every 10 s while the job's page is open (outside its request queue).
 function renderJobCallsEntry() {
-  const button = $("modelCallsButton"), text = $("modelCallsText"), training = $("trainingRecordButton");
-  if (!button || !text || !training) return;
+  const button = $("modelCallsButton"), text = $("modelCallsText");
+  if (!button || !text) return;
   const store = jobCallsStore(), run = currentJob;
   if (store.run !== run) Object.assign(store, { run, total: null, missing: false, readAt: 0 });
   const words = store.total === null ? "Model calls" : `Model calls · ${store.total.toLocaleString("en-US")}`;
   if (text.textContent !== words) text.textContent = words;
   button.title = store.missing ? "This job has no record of its model calls." : "";
-  training.hidden = store.missing || store.total === null;
   if (!run || store.reading || Date.now() - store.readAt < 10000) return;
   store.reading = true;
   recordRequest(`${recordPath(run, "model-calls")}?offset=0&limit=1`).then((data) => {
@@ -11385,11 +11332,7 @@ function renderJobCallsEntry() {
   });
 }
 
-(() => {
-  const button = $("modelCallsButton"), training = $("trainingRecordButton");
-  button.onclick = () => openModelCalls(currentJob, { from: "job" });
-  training.onclick = () => downloadTrainingRecord(currentJob, training, $("trainingRecordText"), ui.notice);
-})();
+$("modelCallsButton").onclick = () => openModelCalls(currentJob, { from: "job" });
 
 // --- Model calls ---
 
@@ -11402,8 +11345,7 @@ function callsStore() {
 function callsEls() {
   return (callsEls.value ||= { heading: $("callsHeading"), meta: $("callsMeta"), lede: $("callsLede"),
     notice: $("callsNotice"), problems: $("callsProblems"), empty: $("callsEmpty"), back: $("callsBackButton"),
-    backText: $("callsBackText"), training: $("callsTrainingButton"), trainingText: $("callsTrainingText"),
-    browser: $("callsBrowser"), words: $("callsFilterText"), filter: $("callsFilter"), count: $("callsCount"),
+    backText: $("callsBackText"), browser: $("callsBrowser"), words: $("callsFilterText"), filter: $("callsFilter"), count: $("callsCount"),
     list: $("callsList"), pane: $("callPane") });
 }
 
@@ -11725,7 +11667,6 @@ function renderCallsHead() {
   const job = store.job;
   const kept = callsJobKept();
   els.backText.textContent = kept ? "Back to the job" : "Back to Records";
-  els.training.hidden = store.missing || !store.loaded;
   const title = job?.title || store.run;
   if (ui.callsJobCrumb.textContent !== title) ui.callsJobCrumb.textContent = title;
   ui.callsJobCrumb.title = title;
@@ -12607,7 +12548,6 @@ async function downloadRawCall(row, button) {
     if (callsJobKept()) selectJob(store.run);
     else openRecords();
   };
-  els.training.onclick = () => downloadTrainingRecord(callsRecord, els.training, els.trainingText, els.notice);
   ui.callsJobCrumb.onclick = () => {
     const store = callsStore();
     if (!callsJobKept()) return;

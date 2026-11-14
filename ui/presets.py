@@ -1,9 +1,10 @@
-"""Saved New problem settings: named sets of the form's settings, one of which may be the default.
+"""Saved New problem settings: Default settings, which every fresh form opens with, and named sets of the form's settings.
 
 The New problem form saves and loads them (Save these settings… and Load saved
-settings… under Advanced settings → Saved settings), and every fresh form opens with
-the default; a rerun or a job sent back to the form keeps its own settings. Terminal
-runs never read them.
+settings… under Advanced settings → Saved settings). Default settings are one entry
+that is always there: TCS Prover's original settings (builtin_settings()) until they
+are saved, put back by Reset, or replaced by named settings' (Make default). A rerun or
+a job sent back to the form keeps its own settings. Terminal runs never read them.
 
 They live in <state>/new-problem-presets.json (runner.providers.PRESETS, beside the
 API model store): an owner-only file in an owner-only folder that no model sandbox can
@@ -18,11 +19,19 @@ address, kept only to name that model once it is gone. Never a statement, relate
 works, prompts, an API key or a URL. Its settings are checked as a job's are, except
 whether the models and the web cutoff can run now: Start checks that.
 
-File: {"version": 1, "defaultId": "p-…" or "", "presets": [{"id", "name", "createdAt",
-"updatedAt", "settings", "apiModels"}]}. A file that cannot be read, is damaged or
-comes from a newer version lists nothing, says why, and is never overwritten. One
-entry that cannot be used is listed as such (it can only be deleted) and every write
-keeps it as it was; so is every entry a write does not change.
+File: {"version": 1, "defaultId": "", "defaultSettings": {"settings", "apiModels",
+"updatedAt"}, "presets": [{"id", "name", "createdAt", "updatedAt", "settings",
+"apiModels"}]}. Without "defaultSettings", Default settings are TCS Prover's original
+settings, or, in a file from before Default settings, the named settings "defaultId"
+names (that version's default): the first write that would change them stores them as
+"defaultSettings" and clears "defaultId". The version stays 1, so an older TCS Prover
+still reads the file; it ignores "defaultSettings" and drops it at its first write.
+
+A file that cannot be read, is damaged or comes from a newer version lists nothing,
+says why, and is never overwritten. One entry that cannot be used is listed as such
+(it can only be deleted) and every write keeps it as it was; so is every entry a write
+does not change, and Default settings that cannot be used (a write that does not
+replace them keeps them; new problems open with the original settings meanwhile).
 """
 
 from collections import namedtuple
@@ -54,20 +63,33 @@ ROLES = ("review", "author", "critic", "writer")
 STAGES = {"review": "review", "author": "author", "critic": "critic", "writer": "writing"}
 # How warnings name a role ("Critic model not available: …"), as the form's stages do.
 ROLE_WORDS = {"review": "Reviewer", "author": "Author", "critic": "Critic", "writer": "Writer"}
-# What a preset keeps: the form's settings in its order (proofJobSettings() without promptOverrides).
+# What a preset keeps: the form's settings in its order (proofJobSettings() without promptOverrides and goalLoop).
+# Never the goal loop, which is no setting of the form: one that settings saved before hold is dropped as they load.
 SETTINGS = ("workflowStages", "reviewModel", "reviewEffort", "authorModel", "authorEffort", "authorSubagents",
             "criticModel", "criticEffort", "criticCount", "criticRounds", "writerModel", "writerEffort",
             "thinkingHours", "speedMode", "reasoningSummary", "retrievalMode", "retrievalCutoffUtc",
-            "goalLoop", "authorSubagentModels")
+            "authorSubagentModels")
 # What a preset keeps of each API model it names (from its catalog row): no key, no address.
 API_FIELDS = ("label", "model", "format", "sourceId", "sourceLabel")
-BUILTIN_NAME = "Built-in settings"
+# Default settings: how the page names them, and their id in its list. The name always means them: it is never
+# the name of named settings (a save under it saves Default settings, and a rename to it is refused).
+DEFAULT_NAME = "Default settings"
+DEFAULT_ID = "default"
+# TCS Prover's own settings (builtin_settings()): Default settings until they are saved, and after Reset.
+ORIGINAL_NAME = "TCS Prover's original settings"
 GONE = "Those saved settings no longer exist. Open Load saved settings… again to see the current list."
 _LOCK = threading.Lock()
 
 # One entry of the file: as read (item), its checked form (preset, None when it cannot be used),
 # why it cannot be used, and the id the page names it by (an unusable entry's reference).
 Row = namedtuple("Row", "item preset problem ref")
+# Default settings as the file has them: their settings and API model records, when they last changed, and what they
+# are: "saved" (the file's "defaultSettings"), "legacy" (named settings an older version's "defaultId" names),
+# "original" (nothing saved: TCS Prover's original settings), or "unusable" ("defaultSettings" that cannot be used now,
+# say saved by a newer TCS Prover with a model this one does not know: new problems open with the original settings).
+Default = namedtuple("Default", "settings api_models updated kind problem")
+# No "defaultSettings" in the file (MISSING), and a write that keeps them as read (KEEP).
+MISSING, KEEP = object(), object()
 
 
 class PresetError(ValueError):
@@ -92,7 +114,7 @@ def path():
 
 
 def builtin_settings():
-    """TCS Prover's own settings: what a fresh New problem form opens with while no default is saved."""
+    """TCS Prover's own settings: Default settings until they are saved, and after Reset."""
 
     server = _jobs()
     return {
@@ -105,9 +127,9 @@ def builtin_settings():
         "writerModel": server.DEFAULT_WRITER_MODEL, "writerEffort": server.DEFAULT_REASONING_EFFORT,
         "thinkingHours": server.DEFAULT_THINKING_HOURS, "speedMode": server.DEFAULT_SPEED,
         "reasoningSummary": server.DEFAULT_REASONING_SUMMARY, "retrievalMode": "live", "retrievalCutoffUtc": "",
-        # TCS Prover's goal loop, and "Same as the coordinator" for the author subagents' models. Saved settings
-        # from before have neither and load with these.
-        "goalLoop": server.DEFAULT_GOAL_LOOP, "authorSubagentModels": None,
+        # "Same as the coordinator" for the author subagents' models: saved settings from before have none and load
+        # with it.
+        "authorSubagentModels": None,
     }
 
 
@@ -185,13 +207,13 @@ def _cutoff(mode, cutoff):
 def valid_settings(values, *, stored=False):
     """The settings a preset keeps from ``values``, checked as the form's.
 
-    Unknown keys are dropped and missing ones take the built-in settings, so a preset
-    saved before a setting existed keeps loading. Models are kept for every role, also
-    for stages that are off. As at Start, a setting that only a stage that is off uses
-    (its role's model and reasoning, the author's subagents and time limit, the critics
-    and their rounds) is never refused: it is kept when it is valid, else it takes the
-    built-in value, which Start runs a stage that is off with. ``stored``: read from the
-    file (see _model()).
+    Unknown keys are dropped and missing ones take TCS Prover's original settings
+    (builtin_settings()), so a preset saved before a setting existed keeps loading. Models
+    are kept for every role, also for stages that are off. As at Start, a setting that only
+    a stage that is off uses (its role's model and reasoning, the author's subagents and
+    time limit, the critics and their rounds) is never refused: it is kept when it is
+    valid, else it takes the original value, which Start runs a stage that is off with.
+    ``stored``: read from the file (see _model()).
     """
 
     if not isinstance(values, dict):
@@ -230,10 +252,6 @@ def valid_settings(values, *, stored=False):
             settings["reasoningSummary"] = values["reasoningSummary"]
         settings["retrievalMode"], settings["retrievalCutoffUtc"] = _cutoff(
             values.get("retrievalMode", "live"), values.get("retrievalCutoffUtc", ""))
-        if "goalLoop" in values:
-            if values["goalLoop"] not in runtime.GOAL_LOOPS:
-                raise PresetError("Choose TCS Prover or Codex as the goal loop.")
-            settings["goalLoop"] = values["goalLoop"]
         settings["authorSubagentModels"] = _member_models(values.get("authorSubagentModels"), settings, stored)
     except PresetError:
         raise
@@ -273,13 +291,24 @@ def _models(settings):
               for number, entry in enumerate(settings.get("authorSubagentModels") or [], 1))]
 
 
-def _name(value):
-    """A preset's name: 1 to MAX_NAME_CHARS characters, without control characters."""
+def _name(value, *, new=False):
+    """A preset's name: 1 to MAX_NAME_CHARS characters, without control characters. ``new``: a name to save or
+    rename settings to, which is never Default settings' (named settings from before Default settings may have it:
+    they are listed with it, and can be renamed or deleted)."""
 
     try:
-        return providers._clean_text(value, "name", MAX_NAME_CHARS)
+        name = providers._clean_text(value, "name", MAX_NAME_CHARS)
     except providers.ProviderError as exc:
         raise PresetError(str(exc)) from None
+    if new and is_default_name(name):
+        raise PresetError(f"“{DEFAULT_NAME}” is the name of the settings new problems open with. Choose another name.")
+    return name
+
+
+def is_default_name(name):
+    """Whether a name means Default settings ("Default settings" in any case, as names are compared)."""
+
+    return isinstance(name, str) and name_key(name.strip()) == name_key(DEFAULT_NAME)
 
 
 def _stored_api_models(value):
@@ -308,6 +337,42 @@ def _stored(item):
             **{key: item[key] if isinstance(item.get(key), str) else "" for key in ("createdAt", "updatedAt")}}
 
 
+def _stored_default(item):
+    """Check the file's "defaultSettings"; refuse anything a save could not have written."""
+
+    if not isinstance(item, dict):
+        raise PresetError("These settings cannot be used: the entry is not an object.")
+    try:
+        settings = valid_settings(item.get("settings"), stored=True)
+    except PresetError as exc:
+        raise PresetError(f"These settings cannot be used: {exc}") from None
+    return Default(settings, _stored_api_models(item.get("apiModels")),
+                   item["updatedAt"] if isinstance(item.get("updatedAt"), str) else "", "saved", "")
+
+
+def _default(data):
+    """The file's Default settings (see Default): its "defaultSettings", else what an older version's default names,
+    else TCS Prover's original settings."""
+
+    item = data["default"]
+    if item is not MISSING and item is not None:
+        try:
+            return _stored_default(item)
+        except PresetError as exc:
+            return Default(builtin_settings(), {}, "", "unusable", str(exc))
+    legacy = _usable(data["rows"], data["defaultId"]) if data["defaultId"] else None
+    if legacy:
+        preset = legacy.preset
+        return Default(preset["settings"], preset["apiModels"], preset["updatedAt"], "legacy", "")
+    return Default(builtin_settings(), {}, "", "original", "")
+
+
+def _default_item(settings, api_models, updated):
+    """Default settings as the file keeps them ("defaultSettings")."""
+
+    return {"settings": settings, "apiModels": api_models, "updatedAt": updated}
+
+
 def _reference(index, item):
     """How the page names an entry that cannot be used: its position and a digest of its content."""
 
@@ -316,7 +381,8 @@ def _reference(index, item):
 
 
 def _load():
-    """The file read strictly: {"rows": [Row…], "defaultId": as written}; nothing when it does not exist.
+    """The file read strictly: {"rows": [Row…], "defaultId": as written, "default": its "defaultSettings" as written,
+    or MISSING}; nothing when it does not exist.
 
     Raises PresetsUnavailable when it exists but cannot be used: a symbolic link, unreadable,
     damaged, or written by a newer version.
@@ -329,7 +395,7 @@ def _load():
                                      "replace it with the file itself.")
         raw = file.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return {"rows": [], "defaultId": ""}
+        return {"rows": [], "defaultId": "", "default": MISSING}
     except (OSError, UnicodeError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
         raise PresetsUnavailable(f"Cannot read the saved settings file {file} ({reason}).") from None
@@ -357,18 +423,14 @@ def _load():
         seen.add(preset["id"])
         rows.append(Row(item, preset, "", preset["id"]))
     default = value.get("defaultId")
-    return {"rows": rows, "defaultId": default if isinstance(default, str) else ""}
+    return {"rows": rows, "defaultId": default if isinstance(default, str) else "",
+            "default": value.get("defaultSettings", MISSING)}
 
 
-def _effective_default(data):
-    """The default's id when it names saved settings that can be used, else ""."""
-
-    default = data["defaultId"]
-    return default if default and any(row.preset and row.preset["id"] == default for row in data["rows"]) else ""
-
-
-def _write(rows, default_id):
-    """Replace the file atomically (owner-only); entries a change did not touch are written as they were read."""
+def _write(data, *, rows=None, default_id=None, default_item=KEEP):
+    """Replace the file atomically (owner-only) with ``data`` as _load() read it and the changes given: the entries
+    (``rows``), "defaultId" and "defaultSettings" (MISSING: none). What a change did not touch is written as it was
+    read."""
 
     file = path()
     try:
@@ -377,7 +439,10 @@ def _write(rows, default_id):
         raise PresetError(str(exc)) from None
     if file.is_symlink():
         raise PresetsUnavailable(f"The saved settings file {file} is a symbolic link; replace it with the file itself.")
-    payload = {"version": VERSION, "defaultId": default_id, "presets": [row.item for row in rows]}
+    item = data["default"] if default_item is KEEP else default_item
+    payload = {"version": VERSION, "defaultId": data["defaultId"] if default_id is None else default_id,
+               **({} if item is MISSING else {"defaultSettings": item}),
+               "presets": [row.item for row in (data["rows"] if rows is None else rows)]}
     try:
         runtime._private_atomic_write(folder / providers.PRESETS,
                                       json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -485,7 +550,7 @@ def _unavailable(settings, api_models, resolve):
     return missing
 
 
-def _public(row, default, resolve):
+def _public(row, resolve):
     """One entry as the page lists it."""
 
     if row.preset is None:
@@ -495,29 +560,43 @@ def _public(row, default, resolve):
         return {"id": row.ref, "name": name[:MAX_NAME_CHARS] or "Unreadable saved settings", "unusable": True,
                 "problem": row.problem}
     preset = row.preset
-    return {"id": preset["id"], "name": preset["name"], "isDefault": preset["id"] == default,
+    return {"id": preset["id"], "name": preset["name"],
             "createdAt": preset["createdAt"], "updatedAt": preset["updatedAt"], "settings": preset["settings"],
             "labels": _labels(preset["settings"], preset["apiModels"], resolve),
             "unavailable": _unavailable(preset["settings"], preset["apiModels"], resolve)}
 
 
-def listing():
-    """The saved settings as the page shows them: {presets, defaultId, problem, builtIn}.
+def _public_default(default, builtin, resolve):
+    """Default settings as the page lists them. ``original``: they are TCS Prover's original settings (Reset has
+    nothing to put back, and Setup counts them as nobody's choice). Ones that cannot be used say why (problem); new
+    problems open with the original settings (``settings``) meanwhile."""
 
-    It never writes. A file that cannot be used lists nothing and says why (problem);
-    new problems then open with the built-in settings.
+    entry = {"id": DEFAULT_ID, "name": DEFAULT_NAME, "settings": default.settings, "updatedAt": default.updated,
+             "original": default.kind != "unusable" and default.settings == builtin,
+             "labels": _labels(default.settings, default.api_models, resolve),
+             "unavailable": _unavailable(default.settings, default.api_models, resolve)}
+    if default.kind == "unusable":
+        entry.update(unusable=True, problem=default.problem)
+    return entry
+
+
+def listing():
+    """The saved settings as the page shows them: {presets, defaultSettings, problem, builtIn}.
+
+    It never writes. A file that cannot be used lists nothing (defaultSettings None) and says
+    why (problem); new problems then open with TCS Prover's original settings (builtIn).
     """
 
     try:
         data, problem = _load(), ""
     except PresetsUnavailable as exc:
-        data = {"rows": [], "defaultId": ""}
-        problem = f"{exc} Until then new problems open with the built-in settings, and settings cannot be saved."
-    default, resolve = _effective_default(data), _resolver()
-    builtin = builtin_settings()
-    return {"presets": [_public(row, default, resolve) for row in data["rows"]], "defaultId": default,
+        data = None
+        problem = (f"{exc} Until then new problems open with {ORIGINAL_NAME}, and settings cannot be saved.")
+    resolve, builtin = _resolver(), builtin_settings()
+    return {"presets": [_public(row, resolve) for row in data["rows"]] if data else [],
+            "defaultSettings": _public_default(_default(data), builtin, resolve) if data else None,
             "problem": problem,
-            "builtIn": {"name": BUILTIN_NAME, "settings": builtin, "labels": _labels(builtin, {}, resolve)}}
+            "builtIn": {"name": ORIGINAL_NAME, "settings": builtin, "labels": _labels(builtin, {}, resolve)}}
 
 
 def _usable(rows, identity):
@@ -564,18 +643,33 @@ def _new_id(rows):
             return identity
 
 
-def save(name, settings, *, make_default=False, replace_id=""):
-    """Save the form's settings under a name and return their id.
+def _kept(data, target):
+    """``data`` with Default settings stored as "defaultSettings" when they are what an older version's default names
+    and ``target`` is that entry, which a change is about to replace or delete: Default settings keep its settings."""
 
-    A blank name gets "Saved settings N". A name already in use (ignoring case) is refused
-    unless ``replace_id`` names those settings, which are then replaced under their id.
-    ``make_default`` makes them the default; otherwise the default stays as it was.
+    default = _default(data)
+    if default.kind != "legacy" or not target or not target.preset or target.preset["id"] != data["defaultId"]:
+        return data
+    return {**data, "defaultId": "", "default": _default_item(default.settings, default.api_models, default.updated)}
+
+
+def save(name, settings, *, make_default=False, replace_id=""):
+    """Save the form's settings under a name and return their id (DEFAULT_ID for Default settings).
+
+    The name of Default settings (in any case) saves Default settings. A blank name gets
+    "Saved settings N". A name already in use (ignoring case) is refused unless
+    ``replace_id`` names those settings, which are then replaced under their id. Default
+    settings stay as they were, unless ``make_default`` (a page from before Default
+    settings: its "Set as default") also copies these settings into them.
     """
 
     if not isinstance(make_default, bool):
         raise PresetError("Say whether these settings become the default.")
     if name is not None and not isinstance(name, str):
         raise PresetError("The name must be text.")
+    if is_default_name(name):
+        save_default(settings)
+        return DEFAULT_ID
     settings = valid_settings(settings)
     with _locked():
         data = _load()
@@ -583,41 +677,57 @@ def save(name, settings, *, make_default=False, replace_id=""):
         target = _usable(rows, replace_id) if replace_id else None
         if replace_id and target is None:
             raise PresetError(GONE)
-        name = _name(name) if name and name.strip() else _fallback_name(rows)
+        name = _name(name, new=True) if name and name.strip() else _fallback_name(rows)
         _taken(rows, name, keep=target)
+        data = _kept(data, target)
         previous = target.preset if target else {}
         identity = previous["id"] if target else _new_id(rows)
         now = providers._now()
         item = {"id": identity, "name": name, "createdAt": previous.get("createdAt") or now, "updatedAt": now,
                 "settings": settings, "apiModels": _api_models(settings, previous.get("apiModels", {}), _resolver())}
         row = Row(item, _stored(item), "", identity)
-        _write([row if entry is target else entry for entry in rows] if target else [*rows, row],
-               identity if make_default else data["defaultId"])
+        rows = [row if entry is target else entry for entry in rows] if target else [*rows, row]
+        if make_default:
+            _write(data, rows=rows, default_id="", default_item=_default_item(settings, item["apiModels"], now))
+        else:
+            _write(data, rows=rows)
     return identity
 
 
+def save_default(settings):
+    """Save the form's settings as Default settings, which every fresh New problem form opens with."""
+
+    settings = valid_settings(settings)
+    with _locked():
+        data = _load()
+        previous = _default(data)
+        api_models = _api_models(settings, previous.api_models if previous.kind in ("saved", "legacy") else {},
+                                 _resolver())
+        _write(data, default_id="", default_item=_default_item(settings, api_models, providers._now()))
+
+
 def rename(identity, name):
-    """Give saved settings another name (one no other saved settings have, ignoring case)."""
+    """Give saved settings another name (one no other saved settings have, ignoring case, nor Default settings')."""
 
     with _locked():
         data = _load()
         target = _usable(data["rows"], identity)
         if target is None:
             raise PresetError(GONE)
-        name = _name(name)
+        name = _name(name, new=True)
         _taken(data["rows"], name, keep=target)
         item = {**target.item, "name": name, "updatedAt": providers._now()}
-        _write([Row(item, {**target.preset, "name": name}, "", target.ref) if row is target else row
-                for row in data["rows"]], data["defaultId"])
+        _write(data, rows=[Row(item, {**target.preset, "name": name}, "", target.ref) if row is target else row
+                           for row in data["rows"]])
 
 
 def delete(identity):
-    """Delete saved settings (also an entry that cannot be used); deleting the default leaves none.
+    """Delete saved settings (also an entry that cannot be used); Default settings never change.
 
-    Deleting the usable entry the default names clears the default. Otherwise the default stays
-    while an entry with its id is left: a copy of the default with the same id (listed as
-    unusable) goes without taking the default from the usable one, and a default whose own entry
-    cannot be used now (say, saved by a newer TCS Prover) stays until that entry is deleted.
+    Named settings that an older version's default names (see _default) leave their settings
+    in Default settings. A default of that older kind that names an entry that cannot be used
+    now (say, saved by a newer TCS Prover) stays until that entry is deleted, and a copy of the
+    default with the same id (listed as unusable) goes without taking it from the usable one.
     """
 
     with _locked():
@@ -625,25 +735,34 @@ def delete(identity):
         target = next((row for row in data["rows"] if isinstance(identity, str) and row.ref == identity), None)
         if target is None:
             raise PresetError(GONE)
+        data = _kept(data, target)
         rows = [row for row in data["rows"] if row is not target]
         default = data["defaultId"]
-        if (target.preset and target.preset["id"] == default) or not any(
-                isinstance(row.item, dict) and row.item.get("id") == default for row in rows):
+        if default and ((target.preset and target.preset["id"] == default) or not any(
+                isinstance(row.item, dict) and row.item.get("id") == default for row in rows)):
             default = ""
-        _write(rows, default)
+        _write(data, rows=rows, default_id=default)
 
 
 def set_default(identity):
-    """Make saved settings the default, or with "" the built-in settings (no saved default)."""
+    """Copy named settings into Default settings (Make default; the named settings stay), or with "" put back TCS
+    Prover's original settings (Reset)."""
 
     if not isinstance(identity, str):
         raise PresetError(GONE)
     with _locked():
         data = _load()
-        if identity and _usable(data["rows"], identity) is None:
+        if not identity:
+            # Nothing stored, and no older default: Default settings already are the original settings.
+            if data["default"] is not MISSING or data["defaultId"]:
+                _write(data, default_id="", default_item=MISSING)
+            return
+        target = _usable(data["rows"], identity)
+        if target is None:
             raise PresetError(GONE)
-        if identity != data["defaultId"]:
-            _write(data["rows"], identity)
+        settings = target.preset["settings"]
+        _write(data, default_id="", default_item=_default_item(
+            settings, _api_models(settings, target.preset["apiModels"], _resolver()), providers._now()))
 
 
 def _save_request(body):
@@ -664,7 +783,7 @@ def _delete_request(body):
 
 def _default_request(body):
     if "id" not in body:
-        raise PresetError("Choose saved settings to make the default, or the built-in settings.")
+        raise PresetError("Choose saved settings to copy into Default settings, or reset Default settings.")
     set_default(body["id"])
     return listing()
 

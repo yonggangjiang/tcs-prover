@@ -36,31 +36,32 @@ run through, and LaTeX, one card each:
 | LaTeX | whether `latexmk` and `pdflatex` are found, and their versions | the install command for your system, to run yourself |
 
 - **Needed by** lists the New problem roles (the form in this tab while it is
-  open, else your saved default settings), your saved default settings also
-  while the form is open if they use the program where the form does not, the
-  jobs that can still run and use it in their current or a later step (a job in
-  **Writing & polishing** no longer needs the program of its critic), and your
-  API connections. The built-in settings, which new problems open with when
-  none are saved, count only as the open form. API connections are only
-  listed: one needs its program installed but no sign-in, and only a role or a
-  job that uses it makes the program needed.
-- Only a program that the form, your saved default settings or such a job
+  open, else your [Default settings](saved-settings.md#default-settings)), your
+  Default settings also while the form is open if they use the program where
+  the form does not, the jobs that can still run and use it in their current or
+  a later step (a job in **Writing & polishing** no longer needs the program of
+  its critic), and your API connections. Default settings that are still TCS
+  Prover's original settings, as they are until you save to them, count only as
+  the open form. API connections are only listed: one needs its program
+  installed but no sign-in, and only a role or a job that uses it makes the
+  program needed.
+- Only a program that the form, your Default settings or such a job
   needs is a warning (a red or amber mark, the sidebar count, the Overview
   notice) when it is missing, does not run, is not on the jobs' path or, for a
   built-in model, is not signed in. Any other program is shown calmly, in the
   same words with a plain ring and no colour, for example *Not installed* with
   *Nothing uses it now · only needed for Claude models*, *No role or job uses it
   now* under an API connection, or *Not signed in · Not needed by your settings
-  or jobs* (*New problems open with the built-in settings, which use your
-  ChatGPT login* while nothing is saved and the New problem form is closed):
-  if you use only GPT models, Claude Code is never flagged. A calm
+  or jobs* (*New problems open with Default settings, which use your ChatGPT
+  login* while they are TCS Prover's original settings and the New problem form
+  is closed): if you use only GPT models, Claude Code is never flagged. A calm
   card keeps its **Install**, **Use it for jobs** and **Sign in** buttons, none
   of them highlighted.
 - On a computer with neither the Codex CLI nor Claude Code installed, no model
   can run, so one line says so (the sidebar count, the Overview and the top of
   Setup): *Neither the Codex CLI nor Claude Code is installed*, with which one
   each kind of model needs. It gives way to a program's own line as soon as
-  the form, your saved default settings or a job needs that program.
+  the form, your Default settings or a job needs that program.
 - Setup checks the programs exactly as jobs find and start them, with no model
   call: `codex --version`, `codex login status`, `claude --version`, `claude auth
   status`, `latexmk -v` and `pdflatex --version`. "Signed in" means a login is
@@ -86,8 +87,8 @@ run through, and LaTeX, one card each:
   `claude update`.
   **Then sign in** in the Install dialog starts the sign-in once the install
   works, under the same confirmation. It is offered when that login will be
-  used: by the New problem form, your saved default settings or a job, by the
-  built-in settings new problems open with while nothing is saved, or, on a
+  used: by the New problem form, your Default settings or a job (also while
+  Default settings are still TCS Prover's original settings), or, on a
   computer with neither program yet, by the program you install first.
 - A program you install here is used by new jobs at once, and by jobs already
   waiting for it: when its folder is not on TCS Prover's PATH, Setup remembers
@@ -123,7 +124,7 @@ run through, and LaTeX, one card each:
   and each step keeps its newest 2,000 lines (the panel says how many earlier
   lines it dropped).
 - The sidebar's Setup item counts the programs that need setting up and that
-  something needs (the New problem form while it is open, your saved default
+  something needs (the New problem form while it is open, your Default
   settings, the jobs that can still run and use them), and the Overview lists
   them; on a computer with neither the Codex CLI nor Claude Code, it counts the
   one line that says so. The chip of a role whose chosen model needs one, the

@@ -625,9 +625,7 @@ class BatchCatalog:
         state['trace'] = [] if after == version else list(records)
         state['traceTruncated'] = truncated
         state['traceNotice'] = ("Showing recent saved events. The complete history is in this job's "
-                                'transcript.jsonl in its run folder; read it with '
-                                'python3 transcript/view_transcript.py <run folder>.'
-                                if truncated else '')
+                                'transcript.jsonl in its run folder.' if truncated else '')
         state['timeLimitHistory'] = history
         state['processHealthSource'] = 'Saved batch (read only)'
         state['conversation'] = self._conversation(directory, state['readOnlyReason'])

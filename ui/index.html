@@ -48,7 +48,7 @@
           <p class="nav-label" id="navConfigureLabel">Configure</p>
           <ul class="nav-list" aria-labelledby="navConfigureLabel">
             <!-- Setup: the programs the models run through. The badge counts the programs that need setting up for
-                 what new problems, the saved default settings and jobs use (app.js renderSetupBadge); a program nothing
+                 what new problems, your Default settings and jobs use (app.js renderSetupBadge); a program nothing
                  uses never counts, except for the one line that says neither the Codex CLI nor Claude Code is
                  installed. The hidden words read it out. -->
             <li><a class="nav-item" href="/?setup=1" data-nav="setup" data-tip="Setup" data-tip-meta="Programs your models run through"><svg class="icon nav-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v7M5 6.75 8 9.75l3-3"/><path d="M2.75 10v2a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5v-2"/></svg><span class="nav-text">Setup</span><span id="navSetupBadge" class="nav-badge nav-badge-setup" aria-hidden="true" hidden></span><span id="navSetupWords" class="visually-hidden"></span></a></li>
@@ -145,7 +145,7 @@
               <button id="newProblemButton" class="primary" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 3v10M3 8h10"/></svg>New problem</button>
             </div>
           </div>
-          <!-- Programs that new problems, the saved default settings or jobs need and that are missing, do not run or
+          <!-- Programs that new problems, your Default settings or jobs need and that are missing, do not run or
                are not signed in, or the one line that says neither the Codex CLI nor Claude Code is installed, each
                with a link to Setup (app.js renderSetupBanner from GET /setup). -->
           <section id="setupBanner" class="attention-banner setup-banner" aria-labelledby="setupBannerHeading" hidden>
@@ -240,23 +240,25 @@
               <p id="workflowStageHelp" class="help">Click any stage to turn it on or off. Selected stages run from left to right.</p>
             </fieldset>
             <!-- Advanced settings: Saved settings first, then the related works, then the settings themselves. Its
-                 summary stays in view while it is closed: it names the saved settings that filled the form and
-                 counts the related works listed for this problem (app.js renderAdvancedSummary). -->
+                 summary stays in view while it is closed: it counts the related works listed for this problem, and
+                 warns when saved settings cannot be read or a loaded model is not available (app.js
+                 renderAdvancedSummary). -->
             <details id="advancedSettings" class="advanced">
-              <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg><span class="advanced-title">Advanced settings</span><span id="advancedSummary" class="advanced-summary"><span class="visually-hidden">, </span><span class="advanced-chip" data-tone="quiet">Saved settings: built-in</span></span></summary>
+              <summary><svg class="icon advanced-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg><span class="advanced-title">Advanced settings</span><span id="advancedSummary" class="advanced-summary"></span></summary>
               <div class="advanced-body">
-                <!-- Saved settings: what they are, which settings fill this form (a saved name, the built-in settings,
-                     or the job's own) with "(default)" and "· changed on this form" after an edit, and the buttons
-                     that save and load them (app.js; GET and POST /presets). The note at its foot says what a save or
-                     a load did, what a load could not keep, or why settings cannot be saved. -->
+                <!-- Saved settings: what they are, which settings fill this form (Default settings, a saved name, or
+                     the job's own) with "· changed on this form" after an edit, and the buttons that save and load
+                     them (app.js; GET and POST /presets). The note at its foot says what a save or a load did, what a
+                     load could not keep, or why settings cannot be saved. -->
                 <div id="presetBar" class="preset-panel" role="group" aria-labelledby="presetBarLabel"
                   aria-describedby="presetHelp">
                   <h3 id="presetBarLabel" class="preset-panel-title">Saved settings</h3>
-                  <p id="presetHelp" class="preset-panel-help">Save the workflow stages, models, limits and web search
-                    cutoff under a name to reuse them, and choose which saved settings new problems open with.</p>
+                  <p id="presetHelp" class="preset-panel-help">New problems open with Default settings. Save the
+                    workflow stages, models, limits and web search cutoff back to where they came from, or under a new
+                    name to reuse them.</p>
                   <div class="preset-panel-row">
                     <p class="preset-state"><span class="preset-state-label">Now using:</span>
-                      <span id="presetName" class="preset-name">built-in settings</span><span id="presetMarks" class="preset-marks"></span></p>
+                      <span id="presetName" class="preset-name">Default settings</span><span id="presetMarks" class="preset-marks"></span></p>
                     <div class="preset-panel-actions">
                       <button id="savePresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Save these settings…</button>
                       <button id="loadPresetButton" class="secondary compact" type="button" aria-haspopup="dialog">Load saved settings…</button>
@@ -364,26 +366,6 @@
                       </select>
                       <p id="authorSubagentModelsHelp" class="help model-setting-help">Every author subagent runs the
                         coordinator's model and reasoning.</p>
-                      <!-- How the author's turns follow one another: TCS Prover's own loop, whose texts the Prompts
-                           dialog edits, or the Codex CLI's built-in goal mode. -->
-                      <span id="goalLoopLabel" class="model-setting-label">6 · Goal loop</span>
-                      <div id="goalLoopChoice" class="goal-loop-choice" role="radiogroup" aria-labelledby="goalLoopLabel">
-                        <label class="goal-loop-option" for="goalLoopTcs">
-                          <input id="goalLoopTcs" type="radio" name="goalLoop" value="tcs" checked
-                            aria-describedby="goalLoopTcsHelp">
-                          <span class="goal-loop-copy"><span class="goal-loop-name">TCS Prover (editable texts)</span>
-                            <span id="goalLoopTcsHelp" class="goal-loop-help">TCS Prover starts every turn and sends
-                              the continuation itself, with the texts under Edit prompts.</span></span>
-                        </label>
-                        <label class="goal-loop-option" for="goalLoopCodex">
-                          <input id="goalLoopCodex" type="radio" name="goalLoop" value="codex"
-                            aria-describedby="goalLoopCodexHelp">
-                          <span class="goal-loop-copy"><span class="goal-loop-name">Codex built-in</span>
-                            <span id="goalLoopCodexHelp" class="goal-loop-help">The Codex CLI's own goal mode with its
-                              own texts, as before; Claude Code authors always use TCS Prover's loop.</span></span>
-                        </label>
-                      </div>
-                      <p id="goalLoopNote" class="help model-setting-help" hidden></p>
                     </div>
                     <!-- Choose for each: one row per author subagent ("Subagent 1" … N) with the roles' Source, Model
                          and Reasoning menus (app.js renderTeamModels builds the rows). Spans the grid under the
@@ -852,7 +834,7 @@
             <ol id="recordsList" class="rec-list" aria-label="Records"></ol>
             <p id="recordsEmpty" class="rec-empty" role="status" hidden></p>
             <p class="rec-foot">Deleting a record removes only the record: the job and its proof stay. The job's page then
-              shows no model calls and offers no training record.</p>
+              shows no model calls.</p>
           </div>
         </section>
 
@@ -870,7 +852,6 @@
             </div>
             <div class="page-actions">
               <button id="callsBackButton" class="ghost" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="m9.75 3.5-4.5 4.5 4.5 4.5"/></svg><span id="callsBackText">Back to the job</span></button>
-              <button id="callsTrainingButton" class="secondary" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg><span id="callsTrainingText">Training record</span></button>
             </div>
           </div>
           <p id="callsNotice" class="notice" role="alert" hidden></p>
@@ -1101,11 +1082,10 @@
                   <h2 id="activityHeading">Live activity</h2>
                   <p id="lastActivity">Waiting for the first update…</p>
                 </div>
-                <!-- The job's record of model calls: its own page (app.js openModelCalls) and the training download
-                     (downloadTrainingRecord); the count follows the record (renderJobCallsEntry). -->
+                <!-- The job's record of model calls: its own page (app.js openModelCalls); the count follows the
+                     record (renderJobCallsEntry). -->
                 <div class="mcb-entry-buttons">
                   <button id="modelCallsButton" class="secondary compact" type="button"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 4.25h7.5M6 8h7.5M6 11.75h7.5"/><path d="M2.75 4.25h.5M2.75 8h.5M2.75 11.75h.5"/></svg><span id="modelCallsText">Model calls</span></button>
-                  <button id="trainingRecordButton" class="ghost compact" type="button" hidden><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"/></svg><span id="trainingRecordText">Training record</span></button>
                 </div>
                 <div id="filters" class="filters" role="group" aria-label="Activity filters">
                   <button class="filter active" type="button" data-filter="all" aria-pressed="true">All</button>
@@ -1276,9 +1256,10 @@
       </form>
     </dialog>
 
-    <!-- Save these settings… (Advanced settings → Saved settings): the New problem form's settings under a name
-         (app.js; POST /presets). The name may stay empty: its placeholder is the name it then gets. Set as default
-         is ticked whenever it opens. -->
+    <!-- Save these settings… (Advanced settings → Saved settings): the New problem form's settings back to where
+         they came from, or under another name (app.js; POST /presets). The name opens as the settings' the form
+         came from ("Default settings", or the loaded settings' name), empty for a job's settings; left empty, the
+         placeholder is the name it gets. -->
     <dialog id="presetSaveDialog" class="prompt-dialog preset-dialog" aria-labelledby="presetSaveTitle">
       <form id="presetSaveForm" method="dialog">
         <div class="prompt-dialog-head">
@@ -1294,10 +1275,6 @@
             aria-describedby="presetSaveSummary">
         </div>
         <p id="presetSaveSummary" class="preset-summary"></p>
-        <label class="toggle-line preset-save-default" for="presetSaveDefault">
-          <input id="presetSaveDefault" type="checkbox" checked>
-          <span>Set as default — new problems open with these settings</span>
-        </label>
         <p id="presetSaveScope" class="help">Saves stages, models and reasoning, subagents, critics and rounds,
           time limit, web search cutoff, speed and activity log detail. Not saved: the statement, related works
           and edited prompts.</p>
@@ -1309,9 +1286,9 @@
       </form>
     </dialog>
 
-    <!-- Load saved settings… (Advanced settings → Saved settings): load saved New problem settings; rename, delete,
-         or make or stop being the default (app.js; GET and POST /presets). The list is read again whenever it opens;
-         Built-in settings come last. -->
+    <!-- Load saved settings… (Advanced settings → Saved settings): Default settings first (load, or reset to TCS
+         Prover's original settings), then named settings (load, rename, make default: copy into Default settings,
+         or delete) (app.js; GET and POST /presets). The list is read again whenever it opens. -->
     <dialog id="presetLoadDialog" class="prompt-dialog preset-dialog preset-load-dialog" aria-labelledby="presetLoadTitle">
       <div class="preset-dialog-body">
         <div class="prompt-dialog-head">

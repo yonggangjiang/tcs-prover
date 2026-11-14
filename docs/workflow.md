@@ -36,8 +36,8 @@ flowchart TD
 ## Settings and prompts
 
 **Advanced settings** on the New problem page start with
-[Saved settings](saved-settings.md) (save these settings under a name, load
-them, and choose the default new problems open with) and the
+[Saved settings](saved-settings.md) (the Default settings every new problem
+opens with, and settings saved under a name to load again) and the
 [related works](job-page.md#related-works) for the author. Then they hold each
 role's model and reasoning (see [Models and API connections](models.md)) and:
 
@@ -45,7 +45,6 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 | --- | --- | --- |
 | Author subagents | 3 | 0 to 10. 1 or more: an [author coordinator](#the-author-coordinator) runs up to that many author subagents at a time. 0: one author works alone, with no subagent tool. |
 | Subagent models | Same as the coordinator | With 1 or more author subagents. **Choose for each** gives each author subagent its own model and reasoning: a Codex CLI, Claude Code or API connection model, as the roles offer. See [the author's team](#the-authors-team). |
-| Goal loop | TCS Prover (editable texts) | Who runs the author's turns: TCS Prover, with the texts in **Edit prompts**, or **Codex built-in**, the Codex CLI's own goal mode as before. See [the goal loop](#the-goal-loop). |
 | Independent critics | 3 | Fresh critics the critic starts on each proof version, 1 to 10. |
 | Maximum consecutive critic rounds | 2 | Edited passes in a row before the final check, 1 to 100. |
 | Time limit in hours | 0 (none) | See [the job page](job-page.md#time-limit-and-progress-summary). |
@@ -156,11 +155,13 @@ check calculations; you do not need to ask the user."
 ### The goal loop
 
 The author, or the author coordinator, works toward one goal, a checked proof of
-the statement, in turns. **Goal loop** (in the Proof author's settings) chooses
-who runs those turns:
+the statement, in turns. Every new job from the New problem page runs them in
+TCS Prover's goal loop; the form has no setting for it (the
+[terminal](terminal.md)'s `-goalLoop codex` still chooses Codex's own goal
+mode):
 
-- **TCS Prover (editable texts)**, the default. TCS Prover starts every turn of
-  a Codex CLI author itself (the Codex CLI's own goal mode is off). After a turn
+- TCS Prover starts every turn of a Codex CLI author itself (the Codex CLI's
+  own goal mode is off). After a turn
   that did not end the goal it sends the next one, the `goal_continuation` text:
   `{continuation}` is the role's continuation prompt (placed first),
   `{objective}` the goal, `{elapsed}` the working time and `{limit}` the time
@@ -186,18 +187,18 @@ who runs those turns:
 - `codex_compact_prompt` holds the instructions the Codex CLI follows when it
   compacts a conversation; empty (the default) leaves the Codex CLI's own.
 - **Codex built-in** is the Codex CLI's own goal mode with its own texts,
-  unchanged, kept as a fallback. Jobs from before this setting run it (their
-  **Run settings** say *Codex built-in*), and so does every run with a
-  [web cutoff](web-cutoff.md): the form then shows it and says *Web-cutoff runs
-  use Codex's goal mode.*
-- **Rerun with suggested statement** on a job from before this setting keeps
-  what that job ran: **Codex built-in** as the goal loop and, for a coordinator,
-  the program's own subagents with the coordinator's model, which the help line
-  under **Subagent models** says. Choosing **TCS Prover** as the goal loop, or
-  **Choose for each**, gives the new job TCS Prover's team, as for any new job.
-- Such a job revised in place (its statement review sent back to the form) keeps
-  them: the form shows **Codex built-in** and **Same as the coordinator** fixed,
-  with a note saying so.
+  unchanged. Every run with a [web cutoff](web-cutoff.md) runs it, and so do
+  jobs from before TCS Prover's goal loop and jobs started with it while the
+  form still offered the choice: their **Run settings** say *Codex built-in*.
+- A job the form continues (its statement review sent back to the form, revised
+  in place) keeps the goal loop it recorded, never another one. A job from
+  before TCS Prover's goal loop also keeps, for a coordinator, the program's own
+  subagents with the coordinator's model: the form shows **Same as the
+  coordinator** fixed, with a note saying so.
+- Anything that starts a new job runs TCS Prover's goal loop, also **Rerun with
+  suggested statement** on a job that ran **Codex built-in** and settings saved
+  with it before: a rerun of a job from before TCS Prover's team gets TCS
+  Prover's team, as any new job does.
 
 ### The author coordinator
 
