@@ -41,6 +41,12 @@ _COMPACTIONS = {}  # session copy -> (signature, [(time, summary)])
 # session file, as a `compacted` record with the summary as its message (a remote compaction's message is empty).
 UNTRACED_COMPACTION = ("Codex 0.160 does not trace a local compaction (that of an API connection's model), so its "
                        "request is not recorded; its summary is, from the copied session file.")
+# What Codex itself sets on an item it sends again (Codex 0.160: core/src/session/mod.rs stamps each item it keeps in a
+# thread's history, core/src/client.rs prepares each one it sends): an id of its own for an item that came without one
+# (an API connection's answers have none), no id for one of another form, and metadata of its own (the turn, the time,
+# the kinds of the content, a tool result's metadata). An item sent again with only these changed is the same item: the
+# first real job's resumed author sent the summary turn's answer again with content_item_kinds added.
+CODEX_OWN_FIELDS = ("id", "internal_chat_message_metadata_passthrough")
 
 
 class NotFound(ValueError):
@@ -456,26 +462,42 @@ def _thread_calls(record, line):
     return sorted(same, key=lambda other: (other.get("startedMs") or 0, other["id"]))
 
 
-def _item_shas(record, line, field, bundles):
-    """The sha256 of each input item of a Codex call's request (``field`` "request") or of each output item of its
-    response ("response"): as the record stored them, else of the payload as read (a raw one while its process
-    runs)."""
+def _item_key(item):
+    """The sha256 that names ``item`` as the same item, whatever Codex itself set on it (CODEX_OWN_FIELDS)."""
+
+    if isinstance(item, dict) and any(field in item for field in CODEX_OWN_FIELDS):
+        item = {key: value for key, value in item.items() if key not in CODEX_OWN_FIELDS}
+    return records._sha(records.compact(item))
+
+
+def _item_keys(record, line, field, bundles, keys):
+    """The same-item key (_item_key()) of each input item of a Codex call's request (``field`` "request") or of each
+    output item of its response ("response"): of the items as the record stored them (``keys``: the keys known so far,
+    by the sha256 of an item's exact JSON, to which each one read is added), else of the payload as read (a raw one
+    while its process runs)."""
 
     path = line.get(field)
     if not path:
         return []
+    shas = None
     try:
         bundle = _bundle(record, line, bundles)
         entry = bundle.entries.get(path)
         if entry is not None:
             shas = (bundle.input(path) if field == "request"
                     else ((entry.get("store") or {}).get("lists") or {}).get("output_items"))
-            if isinstance(shas, list):
-                return list(shas)
     except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile, zlib.error, TypeError, AttributeError):
         pass
-    value = _json(_payload(record, line, field, bundles))
-    return _shas(_list(value, "input" if field == "request" else "output_items"))
+    if not isinstance(shas, list):
+        value = _json(_payload(record, line, field, bundles))
+        return [_item_key(item) for item in _list(value, "input" if field == "request" else "output_items")]
+    for sha in shas:
+        if sha not in keys:
+            try:
+                keys[sha] = _item_key(json.loads(record.objects.get(sha)))
+            except (KeyError, ValueError, OSError, EOFError, zlib.error, TypeError):
+                keys[sha] = sha  # An item the record cannot read is compared exactly.
+    return [keys[sha] for sha in shas]
 
 
 def _continued(record, line, bundles):
@@ -496,19 +518,21 @@ def _continued(record, line, bundles):
     return request.get("previous_response_id") if isinstance(request, dict) else None
 
 
-def _context(record, line, thread, bundles):
-    """The sha256 of every item a Codex request had: its whole input and its output items. A WebSocket continuation
-    sent only what was new since the response it continues, so that request's input and output are added, and so on
-    back along the chain, in a loop (a chain is as long as its process's requests of the thread)."""
+def _context(record, line, thread, bundles, keys):
+    """The same-item key (_item_keys()) of every item a Codex request had: its whole input and its output items. A
+    WebSocket continuation sent only what was new since the response it continues, so that request's input and output
+    are added, and so on back along the chain, in a loop (a chain is as long as its process's requests of the
+    thread)."""
 
     responses = {other["responseId"]: other for other in thread if other.get("responseId")}
-    shas, seen = [], set()
+    found, seen = [], set()
     while line is not None and line["id"] not in seen:
         seen.add(line["id"])
-        shas += _item_shas(record, line, "request", bundles) + _item_shas(record, line, "response", bundles)
+        found += (_item_keys(record, line, "request", bundles, keys)
+                  + _item_keys(record, line, "response", bundles, keys))
         continued = _continued(record, line, bundles)
         line = responses.get(continued) if continued else None
-    return shas
+    return found
 
 
 def _codex_detail(record, line):
@@ -528,13 +552,16 @@ def _codex_detail(record, line):
                         previous)
     elif previous is not None:
         # What the previous request had (its whole input and its output) is not new, each item as often as it had
-        # it: the rest of this input is, in order. A request of another process starts with its own tools item, and
-        # Codex resends an earlier output with metadata of its own, so neither is a prefix of this input.
-        known = collections.Counter(_context(record, previous, thread, bundles))
+        # it, and also when Codex sends it again with an id or metadata of its own (_item_key()): the rest of this
+        # input is, in order. A request of another process starts with its own tools item, so the previous request is
+        # not a prefix of this input.
+        own = [_item_key(item) for item in inputs]
+        keys = dict(zip(_shas(inputs), own))
+        known = collections.Counter(_context(record, previous, thread, bundles, keys))
         new_items = []
-        for item, sha in zip(inputs, _shas(inputs)):
-            if known[sha] > 0:
-                known[sha] -= 1
+        for item, key in zip(inputs, own):
+            if known[key] > 0:
+                known[key] -= 1
             else:
                 new_items.append(item)
     later = (_json(_payload(record, following, "request", bundles)) or {}).get("input") if following else None
@@ -935,22 +962,37 @@ class _Reader:
 
 class _Windows:
     """trajectories.jsonl, made as the requests go by: one window per context window of each Codex thread (a request
-    whose input does not start with its window's items so far starts a new one). Items are held as their numbers in
-    ``index`` (sha256 -> number, each item of the download once), which costs little memory."""
+    whose input does not start with its window's items so far, each compared as the same item whatever Codex itself
+    set on it, _item_key(), starts a new one). Items are held as their numbers in ``index`` (sha256 -> number, each
+    item of the download once), and so are their same-item keys (each item's computed once), which costs little
+    memory."""
 
     def __init__(self, index):
-        self.index, self.windows, self.current = index, [], {}
+        self.index, self.windows, self.current = index, [], {}  # current: thread -> (window, its items' key numbers)
+        self.same, self.keys = {}, {}  # item number -> its key's number; same-item key -> its number
 
-    def add(self, line, row, input_shas, output_shas):
-        inputs = [self.index.setdefault(sha, len(self.index)) for sha in input_shas]
-        outputs = [self.index.setdefault(sha, len(self.index)) for sha in output_shas]
-        window = self.current.get(_thread(line))
-        if window is None or inputs[:len(window["items"])] != window["items"]:
-            window = self.current[_thread(line)] = {"window": len(self.windows) + 1, "threadId": line.get("threadId"),
-                                                    "role": row.get("role"), "label": row.get("label"), "items": [],
-                                                    "calls": [], "outcome": None}
+    def _numbers(self, shas, items):
+        """The numbers of the items whose sha256 are ``shas`` (``items``: those items), each item's key numbered."""
+
+        numbers = [self.index.setdefault(sha, len(self.index)) for sha in shas]
+        for position, (sha, number) in enumerate(zip(shas, numbers)):
+            if number not in self.same:
+                key = _item_key(items[position]) if position < len(items) else sha
+                self.same[number] = self.keys.setdefault(key, len(self.keys))
+        return numbers
+
+    def add(self, line, row, input_shas, output_shas, inputs, outputs):
+        """One request: the sha256 of its input and output items and those items."""
+
+        inputs, outputs = self._numbers(input_shas, inputs), self._numbers(output_shas, outputs)
+        window, same = self.current.get(_thread(line), (None, None))
+        sent = [self.same[number] for number in inputs]
+        if window is None or sent[:len(same)] != same:
+            window = {"window": len(self.windows) + 1, "threadId": line.get("threadId"), "role": row.get("role"),
+                      "label": row.get("label"), "items": [], "calls": [], "outcome": None}
             self.windows.append(window)
         window["items"] = inputs + outputs
+        self.current[_thread(line)] = (window, sent + [self.same[number] for number in outputs])
         window["calls"].append({"id": line["id"], "inputEnd": len(inputs), "outputs": outputs, "role": row.get("role"),
                                 "label": row.get("label"), "round": None})
         window["last"] = row.get("time") or ""
@@ -1106,7 +1148,8 @@ def training_record(name, stream):
                     for sha in (*input_shas, *output_shas):
                         index.setdefault(sha, len(index))
                     if line.get("request"):
-                        windows.add(line, row, input_shas, output_shas)
+                        windows.add(line, row, input_shas, output_shas, _list(request, "input"),
+                                    _list(response, "output_items"))
                     example.update(request=request, inputExpanded=expanded, response=response,
                                    usage=(response.get("token_usage") if isinstance(response, dict) else None)
                                    or line.get("usage"),

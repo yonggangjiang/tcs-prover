@@ -891,11 +891,15 @@ writes a job's record, `ui/model_calls.py` reads it.
   author's thread goes on in a summary or reply turn's process and then in the
   resumed author's, and what is new is what this input has beyond that
   request's whole input and output, a WebSocket continuation's chain followed
-  back), `GET
+  back; an item Codex sends again with an id or metadata of its own, its `id`
+  or `internal_chat_message_metadata_passthrough`, is the same item,
+  `CODEX_OWN_FIELDS`), `GET
   /jobs/<id>/model-calls/<callId>/raw` (the exact request and response), `GET
   /jobs/<id>/training-record` (a streamed ZIP: `requests.jsonl`, one
   self-contained example per request with a WebSocket continuation's input
-  expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window
+  expanded; `items.jsonl`; `trajectories.jsonl`, one line per context window,
+  which a request goes on in when its input starts with the window's items,
+  each the same item as for the call detail,
   with each call's input boundary and outputs and the critic round's outcome;
   `rounds.jsonl`; the transcript snapshot; `record/`, the record's own files,
   so nothing it has is left out: `calls.jsonl`, `problems.jsonl`, `sources/`

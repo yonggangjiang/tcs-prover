@@ -591,7 +591,8 @@ class ThreadAcrossProcessesTests(RecordCase):
     author's: a call's previous request, and the next one with its tool calls' outputs, are its thread's in whichever
     process sent them."""
 
-    # A read-only turn's tools; the resent output of another process (Codex adds metadata of its own); the turns.
+    # A read-only turn's tools; the turns; the summary turn's answer as the resumed author's process sends it again
+    # (in the first real job: with content_item_kinds added to Codex's own metadata).
     SUMMARY_TOOLS = {"type": "additional_tools", "id": "at_2", "role": "developer",
                      "tools": [{"type": "namespace", "name": "functions", "tools": []}]}
     CELL_2 = {"type": "custom_tool_call", "id": "ctc_2", "status": "completed", "call_id": "call-2", "name": "exec",
@@ -600,8 +601,10 @@ class ThreadAcrossProcessesTests(RecordCase):
                      "output": [{"type": "input_text", "text": "1"}]}
     ASK = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Write a progress summary."}]}
     SUMMARY = {"type": "message", "id": "msg_3", "role": "assistant",
-               "content": [{"type": "output_text", "text": "Progress so far."}]}
-    RESENT = {**SUMMARY, "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["text"]}}
+               "content": [{"type": "output_text", "text": "Progress so far."}],
+               "internal_chat_message_metadata_passthrough": {"turn_id": "turn-2", "create_time": 1794621924.5}}
+    RESENT = {**SUMMARY, "internal_chat_message_metadata_passthrough": {
+        **SUMMARY["internal_chat_message_metadata_passthrough"], "content_item_kinds": ["unknown"]}}
     GO_ON = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Keep working."}]}
 
     def process(self, name, **labels):
@@ -643,9 +646,9 @@ class ThreadAcrossProcessesTests(RecordCase):
             "c000001": (None, [TOOLS, SYSTEM, PROMPT]),
             "c000002": ("c000001", [CELL_OUTPUT]),
             # Each item the previous request had, in its whole input or its output, is not new, once for each time it
-            # had it.
+            # had it, also when Codex sends it again with metadata of its own (the summary turn's answer).
             "c000003": ("c000002", [self.SUMMARY_TOOLS, self.CELL_2_OUTPUT, self.ASK, PROMPT]),
-            "c000004": ("c000003", [TOOLS, self.RESENT, self.GO_ON])})
+            "c000004": ("c000003", [TOOLS, self.GO_ON])})
         # The author's last call before the pause: its tool call's output is in the summary turn's request.
         received = model_calls.call_detail("run-1", "c000002")["received"]["items"]
         self.assertEqual([(view["item"], view["output"]) for view in received],
@@ -673,6 +676,76 @@ class ThreadAcrossProcessesTests(RecordCase):
         sent = model_calls.call_detail("run-1", "c000003")["sent"]
         self.assertEqual((sent["previousCallId"], [view["item"] for view in sent["newItems"]]),
                          ("c000002", [self.SUMMARY_TOOLS, self.ASK]))
+
+
+class ResentItemTests(RecordCase):
+    """Codex sends each earlier item of a thread again, with what it sets itself changed (CODEX_OWN_FIELDS): an id of
+    its own for an answer that came without one (an API connection's, as in the fake-server run of real Codex 0.160),
+    no id for one of another form, metadata of its own. Such an item is the same item: not new in the call detail, and
+    no new context window in the download."""
+
+    # A function call as an API connection answers it, with no id, and as Codex sends it again.
+    CALL = {"type": "function_call", "name": "team_members", "arguments": "{}", "call_id": "act-flat-1"}
+    CALL_SENT = {**CALL, "id": "fc_01a1d80a-3a18-7b70-af7c-e26637081af3"}
+    CALL_OUTPUT = {"type": "function_call_output", "id": "fco_01a1d80a-3a19-79f1-8e76-9cd6834da05c",
+                   "call_id": "act-flat-1", "output": "[]"}
+    # An answer whose id Codex does not send (not of the form <prefix>_<suffix>), and as Codex sends it again.
+    REPLY = {"type": "message", "id": "msg-1794625953829298000", "role": "assistant",
+             "content": [{"type": "output_text", "text": "The team is working."}]}
+    REPLY_SENT = {key: value for key, value in REPLY.items() if key != "id"}
+    # The user says the same twice: the second time is new, as the previous request had it once.
+    GO_ON = {"type": "message", "id": "msg_01a1d80a-e036-7cf2-94e8-18825d9f917e", "role": "user",
+             "content": [{"type": "input_text", "text": "Continue."}],
+             "internal_chat_message_metadata_passthrough": {"turn_id": "turn-2"}}
+    GO_ON_AGAIN = {**GO_ON, "id": "msg_01a1d80a-f000-7000-8000-000000000001",
+                   "internal_chat_message_metadata_passthrough": {"turn_id": "turn-3"}}
+
+    def test_an_item_codex_sends_again_with_its_own_id_or_metadata_is_not_new(self):
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        start = [TOOLS, SYSTEM, PROMPT]
+        bundle.call("call-a", request(start), [self.CALL])
+        bundle.call("call-b", request([*start, self.CALL_SENT, self.CALL_OUTPUT]), [self.REPLY])
+        bundle.call("call-c", request([*start, self.CALL_SENT, self.CALL_OUTPUT, self.REPLY_SENT, self.GO_ON]),
+                    [ANSWER])
+        bundle.call("call-d", request([*start, self.CALL_SENT, self.CALL_OUTPUT, self.REPLY_SENT, self.GO_ON, ANSWER,
+                                       self.GO_ON_AGAIN]), [ANSWER])
+        self.ingest(bundle)
+        news = {}
+        for row in model_calls.call_list("run-1")["calls"]:
+            sent = model_calls.call_detail("run-1", row["id"])["sent"]
+            news[row["id"]] = (sent["previousCallId"], [view["item"] for view in sent["newItems"]])
+        self.assertEqual(news, {"c000001": (None, start), "c000002": ("c000001", [self.CALL_OUTPUT]),
+                                "c000003": ("c000002", [self.GO_ON]), "c000004": ("c000003", [self.GO_ON_AGAIN])})
+        # One context window: each request's input starts with the window's items so far, sent again.
+        windows = [json.loads(line) for line in download().read("trajectories.jsonl").splitlines()]
+        self.assertEqual([[(call["id"], call["inputEnd"]) for call in window["calls"]] for window in windows],
+                         [[("c000001", 3), ("c000002", 5), ("c000003", 7), ("c000004", 9)]])
+
+    def test_an_item_of_a_payload_not_stored_yet_is_compared_the_same_way(self):
+        # A payload the record has not stored is read from the raw trace (a process that is running, or a payload the
+        # record could not store): its items are compared as the stored ones are.
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), [self.REPLY])
+        bundle.call("call-b", request([PROMPT, self.REPLY_SENT, self.GO_ON]), [ANSWER])
+        self.ingest(bundle)
+        response = self.record.calls.read()[0]["response"]
+        # As if the first call's response were not stored: its raw file is there, the record's entry is not.
+        raw = self.trace / bundle.folder.name / response
+        raw.parent.mkdir(parents=True)
+        raw.write_bytes(bundle.files[response])
+        load = records.StoredBundle.load
+
+        def without_response(stored):
+            load(stored)
+            stored.entries.pop(response, None)
+            return stored
+
+        with mock.patch.object(records.StoredBundle, "load", without_response):
+            sent = model_calls.call_detail("run-1", "c000002")["sent"]
+        self.assertEqual((sent["previousCallId"], [view["item"] for view in sent["newItems"]]),
+                         ("c000001", [self.GO_ON]))
 
 
 class Sink:
