@@ -609,16 +609,20 @@ _OTHER_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|AP
                            re.IGNORECASE)
 # Codex 0.160 reports every other status in words of its own around the endpoint's message ("unexpected status 401
 # Unauthorized: …, url: …", "exceeded retry limit, last status: 429 Too Many Requests", "We're currently experiencing
-# high demand, which may cause temporary errors." for a 500), never as the body alone. So a failure that is only error
-# bodies (_bare_error_body(): whole JSON objects with an "error" member, of any type, as OpenAI, Ollama and most
-# gateways write them, vLLM's and SGLang's {"object": "error", …}, or FastAPI's {"detail": …}; no HTTP status named
-# outside them, _ANY_STATUS) is an endpoint's HTTP 400 whatever its body says: a request it refuses on an API
-# connection, but for a conversation too long for the model (the usual words or "context_too_large"), a content
-# filter's refusal, and a passing condition named outside the bodies, never in them (a number such as the 512 of
-# "Invalid 'input[512].content'" is the endpoint's words, not a server error). A body that is plain text ("Bad
-# Request") cannot be told from Codex's own words, so it stays retried.
-_ANY_STATUS = re.compile(r"\b(?:unexpected status|last status:?|API Error:?|API status|HTTP|status code)\s*"
-                         r"[1-5]\d\d\b", re.IGNORECASE)
+# high demand, which may cause temporary errors." for a 500), never as the body alone; and a stream that ended with an
+# error partway (response.failed), after five retries of its own, as "stream disconnected before completion: <the
+# error's message>", also when that message is a JSON body (a proxy's {"detail": "Upstream request timed out"}: the
+# real Codex against a fake endpoint, through `codex exec --json` and the app-server alike, 14 Nov 2026). So a failure
+# that is only error bodies (_bare_error_body(): whole JSON objects with an "error" member, of any type, as OpenAI,
+# Ollama and most gateways write them, vLLM's and SGLang's {"object": "error", …}, or FastAPI's {"detail": …}, with
+# nothing outside them but whitespace and the runner's own words that lead a CLI's failure, _RUNNER_PREFIX) is an
+# endpoint's HTTP 400 whatever its body says: a request it refuses on an API connection, but for a conversation too
+# long for the model (the usual words or "context_too_large") and a content filter's refusal. The words of a passing
+# condition in it are the endpoint's (a number such as the 512 of "Invalid 'input[512].content'" is no server error).
+# Codex's own words around a body make the failure what they say: the status they name, or a lost stream, which is
+# retried. A body that is plain text ("Bad Request") cannot be told from Codex's own words, so it stays retried.
+_RUNNER_PREFIX = re.compile(r"\s*(?:(?:Codex|Claude) [\w-]+ failed|(?:Claude )?[Aa]uthor turn (?:failed|interrupted)|"
+                            r"(?:Author|Claude) reply turn (?:failed|interrupted))\s*:")
 # Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
 # conversation because its tool calls and tool results do not pair up (Claude Code 2.1.289 marks all three
 # api_error "tool_history_mismatch"): a fault in Claude Code's record of the conversation, not in the connection's
@@ -663,7 +667,9 @@ def _error_bodies(text):
 
 def _bare_error_body(text):
     """The text of a failure outside the error bodies it quotes (_error_bodies()) when it is only such bodies, as Codex
-    0.160 reports an endpoint's HTTP 400: one body at least, and outside them no HTTP status (_ANY_STATUS); else None.
+    0.160 reports an endpoint's HTTP 400: one body at least, and outside them nothing but whitespace and the runner's
+    words that lead a CLI's failure ("Codex review failed:", _RUNNER_PREFIX); else None. Codex's own words beside a
+    body ("stream disconnected before completion: {…}", "unexpected status 404 Not Found: {…}") are not that.
     """
 
     bodies = _error_bodies(text)
@@ -672,13 +678,14 @@ def _bare_error_body(text):
     ends = [0] + [end for _, end, _ in bodies]
     starts = [start for start, _, _ in bodies] + [len(text)]
     outside = "".join(text[end:start] for end, start in zip(ends, starts))
-    return None if _ANY_STATUS.search(outside) else outside
+    prefix = _RUNNER_PREFIX.match(outside)
+    return None if outside[prefix.end() if prefix else 0:].strip() else outside
 
 
 def _error_body_words(text, limit=300):
     """The endpoint's own words in the first error body that a failure quotes whole, on one line; else "".
 
-    Codex reports an endpoint's HTTP 400 as its JSON body alone (see _INVALID_REQUEST_BODY and _ANY_STATUS), which
+    Codex reports an endpoint's HTTP 400 as its JSON body alone (see _INVALID_REQUEST_BODY and _RUNNER_PREFIX), which
     api.openai.com writes over several lines: the words are its error's message (vLLM's at the top of its body, an
     "error" or "detail" that is text itself), as the connection's Test quotes it, else the body.
     """
@@ -704,8 +711,10 @@ def settings_failure(error, model=None):
     TCS Prover state that cannot be used (a ProviderError). The endpoint's
     words in such a message are its error's own message when the failure
     quotes its body. The words of a passing condition (429, a 5xx status,
-    capacity, ...) keep a failure retried, but in a failure that is only
-    error bodies only outside them (_bare_error_body()).
+    capacity, ...) keep a failure retried, but not one that is only error
+    bodies (_bare_error_body()), where they are the endpoint's words; Codex's
+    own words beside a body, such as those of a stream lost partway, make it
+    no such failure.
     These end a structured call and pause an author with a message saying
     what to change; every other failure keeps being retried.
     """
@@ -721,10 +730,10 @@ def settings_failure(error, model=None):
     if not isinstance(error, (Error, OSError)):
         return None
     text = redact(str(error))
-    # A failure that is only error bodies is an endpoint's HTTP 400 (see _ANY_STATUS): their words are the endpoint's
-    # message, so a passing condition counts only outside them.
-    outside = _bare_error_body(text)
-    if _context_window_failure(text) or _PASSING_CONDITION.search(text if outside is None else outside):
+    # A failure that is only error bodies is an endpoint's HTTP 400 (see _RUNNER_PREFIX): their words are the
+    # endpoint's message, so the words of a passing condition in them do not count.
+    bare = _bare_error_body(text) is not None
+    if _context_window_failure(text) or (not bare and _PASSING_CONDITION.search(text)):
         return None
     try:
         label = providers.model_label(model) if model else "the selected model"
@@ -737,7 +746,7 @@ def settings_failure(error, model=None):
                else "check that the model exists and that your login may use it")
         summary = f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason})."
         return ModelUnavailable(f"{summary} A retry cannot fix this: {fix}.", reason, summary)
-    bare_400 = outside is not None and "context_too_large" not in text.lower()
+    bare_400 = bare and "context_too_large" not in text.lower()
     if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text) or bare_400)
             and not _CLAUDE_HISTORY_MISMATCH.search(text) and not _CONTENT_FILTER.search(text)):
         summary = f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as invalid ({reason})."

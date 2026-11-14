@@ -32,6 +32,14 @@ request, the body alone again, with ports and IDs as printed:
   "Bad Request" (EXEC_400_PLAIN, which Codex reports as those words alone).
 With TCS Prover's RUST_LOG=error (workflow_runner.environment()), `codex exec`'s stderr held only "Reading additional
 input from stdin..." for these.
+
+Captured the same way by the review of 14 Nov 2026 (~/tcs-work/scratch/review-ready/out/codex1), with ports and IDs as
+printed: a stream that the endpoint started (HTTP 200) and ended with response.failed, whose error's message is a
+JSON body, as a proxy passes on its upstream's. Codex retried it five times itself ("Reconnecting... <n>/5"), then
+reported "stream disconnected before completion: <the message>", through `codex exec --json` (EXEC_STREAM_DETAIL,
+FastAPI's {"detail": "Upstream request timed out"}; EXEC_STREAM_ERROR_TEXT, an "error" that is text) and its
+app-server (APP_SERVER_STREAM_DETAIL: codexErrorInfo responseStreamDisconnected while it retried, then "other",
+willRetry false). Without the JSON (a message in plain words) Codex reported the same words around it.
 """
 
 import json
@@ -231,6 +239,77 @@ EXEC_400_DETAIL = (
 EXEC_400_PLAIN = (
     r'''{"type":"error","message":"Bad Request"}''',
     r'''{"type":"turn.failed","error":{"message":"Bad Request"}}''',
+)
+
+# The words of the stream's error in EXEC_STREAM_DETAIL and APP_SERVER_STREAM_DETAIL.
+STREAM_MESSAGE = "Upstream request timed out"
+EXEC_STREAM_DETAIL = (
+    r'''{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 3/5 (stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 4/5 (stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"})"}''',
+    r'''{"type":"error","message":"stream disconnected before completion: {\"detail\": \"Upstream request timed '''
+    r'''out\"}"}''',
+    r'''{"type":"turn.failed","error":{"message":"stream disconnected before completion: {\"detail\": \"Upstream '''
+    r'''request timed out\"}"}}''',
+)
+EXEC_STREAM_ERROR_TEXT = (
+    r'''{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: {\"error\": '''
+    r'''\"upstream connect error or disconnect/reset before headers\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 2/5 (stream disconnected before completion: {\"error\": '''
+    r'''\"upstream connect error or disconnect/reset before headers\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 3/5 (stream disconnected before completion: {\"error\": '''
+    r'''\"upstream connect error or disconnect/reset before headers\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 4/5 (stream disconnected before completion: {\"error\": '''
+    r'''\"upstream connect error or disconnect/reset before headers\"})"}''',
+    r'''{"type":"error","message":"Reconnecting... 5/5 (stream disconnected before completion: {\"error\": '''
+    r'''\"upstream connect error or disconnect/reset before headers\"})"}''',
+    r'''{"type":"error","message":"stream disconnected before completion: {\"error\": \"upstream connect error or '''
+    r'''disconnect/reset before headers\"}"}''',
+    r'''{"type":"turn.failed","error":{"message":"stream disconnected before completion: {\"error\": \"upstream '''
+    r'''connect error or disconnect/reset before headers\"}"}}''',
+)
+APP_SERVER_STREAM_DETAIL = (
+    r'''{"method":"error","params":{"error":{"message":"Reconnecting... 1/5","codexErrorInfo":'''
+    r'''{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before '''
+    r'''completion: {\"detail\": \"Upstream request timed out\"}","misalignment":null},"willRetry":true,'''
+    r'''"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37","turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},'''
+    r'''"emittedAtMs":1794674661998}''',
+    r'''{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","codexErrorInfo":'''
+    r'''{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before '''
+    r'''completion: {\"detail\": \"Upstream request timed out\"}","misalignment":null},"willRetry":true,'''
+    r'''"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37","turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},'''
+    r'''"emittedAtMs":1794674662187}''',
+    r'''{"method":"error","params":{"error":{"message":"Reconnecting... 3/5","codexErrorInfo":'''
+    r'''{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before '''
+    r'''completion: {\"detail\": \"Upstream request timed out\"}","misalignment":null},"willRetry":true,'''
+    r'''"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37","turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},'''
+    r'''"emittedAtMs":1794674662583}''',
+    r'''{"method":"error","params":{"error":{"message":"Reconnecting... 4/5","codexErrorInfo":'''
+    r'''{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before '''
+    r'''completion: {\"detail\": \"Upstream request timed out\"}","misalignment":null},"willRetry":true,'''
+    r'''"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37","turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},'''
+    r'''"emittedAtMs":1794674663435}''',
+    r'''{"method":"error","params":{"error":{"message":"Reconnecting... 5/5","codexErrorInfo":'''
+    r'''{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"stream disconnected before '''
+    r'''completion: {\"detail\": \"Upstream request timed out\"}","misalignment":null},"willRetry":true,'''
+    r'''"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37","turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},'''
+    r'''"emittedAtMs":1794674664921}''',
+    r'''{"method":"error","params":{"error":{"message":"stream disconnected before completion: {\"detail\": '''
+    r'''\"Upstream request timed out\"}","codexErrorInfo":"other","additionalDetails":null,"misalignment":null},'''
+    r'''"willRetry":false,"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37",'''
+    r'''"turnId":"01a1daf2-1a58-7251-bfc1-bc431962d988"},"emittedAtMs":1794674668032}''',
+    r'''{"method":"turn/completed","params":{"threadId":"01a1daf2-1a4c-74e3-b298-6a9bedb40e37",'''
+    r'''"turn":{"id":"01a1daf2-1a58-7251-bfc1-bc431962d988","items":[],"itemsView":"notLoaded",'''
+    r'''"status":"failed","error":{"message":"stream disconnected before completion: {\"detail\": \"Upstream '''
+    r'''request timed out\"}","codexErrorInfo":"other","additionalDetails":null,"misalignment":null},'''
+    r'''"startedAt":1794674661,"completedAt":1794674668,"durationMs":6054}},"emittedAtMs":1794674668033}''',
 )
 
 

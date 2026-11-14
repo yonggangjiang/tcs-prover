@@ -20,8 +20,10 @@ is no server error.
 
 Everything else stays retried every minute: an endpoint's 400 for a conversation too long for the model (in any of
 those bodies), a passing condition named outside the bodies, a body quoted under another HTTP status (a key refused
-with 401), a 400 whose body is plain text (which cannot be told from Codex's own words), and the same body from a
-built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test starts a model.
+with 401), a stream lost partway (Codex's "stream disconnected before completion: …" around the stream's error, also
+when that error is a JSON body), a 400 whose body is plain text (which cannot be told from Codex's own words), and the
+same body from a built-in model (the ChatGPT route). The stand-in programs replay the captured lines; no test starts
+a model.
 """
 
 import functools
@@ -185,6 +187,36 @@ class CapturedTextTests(jobs_test.Isolated):
         problem = runtime.settings_failure(runtime.Error(f"Codex member failed: {body}\n{body}"), self.model)
         self.assertIsInstance(problem, runtime.RequestRejected)
         self.assertEqual(problem.reason, "Upstream answered 503 for an unsupported parameter.")
+
+    def test_a_stream_lost_partway_is_retried_on_every_path_also_when_its_error_is_a_json_body(self):
+        # A stream that the endpoint ended with response.failed: Codex 0.160 retried it five times itself, then
+        # reported it in its own words around the error's message, "stream disconnected before completion: …", also
+        # when that message is a JSON body, as a proxy passes on its upstream's (EXEC_STREAM_DETAIL and the
+        # app-server's lines, EXEC_STREAM_ERROR_TEXT). It is no endpoint's 400 reported as its body alone but a lost
+        # stream: retried every minute, as the same failure in plain words is.
+        error = json.loads(captured.APP_SERVER_STREAM_DETAIL[-2])["params"]["error"]
+        turn = json.loads(captured.APP_SERVER_STREAM_DETAIL[-1])["params"]["turn"]["error"]
+        texts = {**self.texts(captured.EXEC_STREAM_DETAIL), "author": runtime._provider_message(error),
+                 "author turn": f"Author turn failed: {runtime._provider_message(turn)}",
+                 "reply turn": f"Author reply turn failed: {runtime._provider_message(turn)}",
+                 **{f"{path}, an error that is text": text
+                    for path, text in self.texts(captured.EXEC_STREAM_ERROR_TEXT).items()}}
+        body = '{"detail": "Upstream request timed out"}'
+        plain = {f"{path}, in plain words": text.replace(body, captured.STREAM_MESSAGE)
+                 for path, text in texts.items() if body in text}
+        self.assertEqual(len(plain), 6)
+        for path, text in {**texts, **plain}.items():
+            with self.subTest(path=path):
+                self.assertIn("stream disconnected before completion: ", text)
+                self.assertIsNone(runtime._bare_error_body(text))
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), self.model))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), self.model))
+                self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+        # The endpoint's 400 that Codex reports as its body alone is still refused, also after the runner's words.
+        for text in (captured.exec_text(captured.EXEC_400, "Codex review failed: "), author_text(),
+                     f"Author reply turn failed: {author_text()}"):
+            with self.subTest(text=text):
+                self.assertIsInstance(runtime.settings_failure(runtime.Error(text), self.model), runtime.RequestRejected)
 
     def test_a_passing_condition_outside_the_bodies_keeps_the_failure_retried(self):
         body = captured.exec_text(captured.EXEC_400)
@@ -369,6 +401,13 @@ class StructuredCallTests(retry_test.RetryCase):
         self.assertEqual(result, {"statement": "S", "notes": "ok"})
         self.assertEqual((len(self.execs()), self.waits()), (2, 60))
 
+    def test_a_stream_lost_partway_with_a_json_error_is_retried(self):
+        # "stream disconnected before completion: {"detail": "Upstream request timed out"}" (EXEC_STREAM_DETAIL).
+        self.script({"lines": captured.EXEC_STREAM_DETAIL}, {"answer": VALID})
+        result, _ = runtime.structured("Review S.", retry_test.SCHEMA, "review", model=self.model, effort="high")
+        self.assertEqual(result, {"statement": "S", "notes": "ok"})
+        self.assertEqual((len(self.execs()), self.waits()), (2, 60))
+
 
 class CapturedAppServer(retry_test.AppServer):
     """tests/test_model_retry.py's scripted app-server; a script {"captured": lines} answers turn/start with the lines
@@ -453,6 +492,15 @@ class AuthorTests(retry_test.RetryCase):
 
     def test_a_content_filter_s_refusal_is_retried_in_the_same_conversation(self):
         self.scripts[0] = {"captured": captured.APP_SERVER_400_FILTERED}
+        self.assertEqual(self.run_goal(launch=self.launcher(model=save_gateway())),
+                         {"outcome": "done", "output": "Full proof"})
+        self.assertEqual((len(self.servers), self.waits()), (2, 60))
+        self.assertFalse(self.statuses("Author paused") or self.statuses("Conversation replaced"))
+
+    def test_a_stream_lost_partway_with_a_json_error_is_retried_in_the_same_conversation(self):
+        # The app-server's lines of a stream that ended with response.failed (APP_SERVER_STREAM_DETAIL): no pause
+        # waiting for a change of settings, but a retry after a minute.
+        self.scripts[0] = {"captured": captured.APP_SERVER_STREAM_DETAIL}
         self.assertEqual(self.run_goal(launch=self.launcher(model=save_gateway())),
                          {"outcome": "done", "output": "Full proof"})
         self.assertEqual((len(self.servers), self.waits()), (2, 60))

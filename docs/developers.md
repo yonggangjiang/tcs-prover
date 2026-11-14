@@ -1125,17 +1125,23 @@ every other status in words of its own ("unexpected status 401 Unauthorized:
 …", "exceeded retry limit, last status: 429 …", "We're currently experiencing
 high demand …" for a 500), so a failure that is only error bodies
 (`_bare_error_body()`: whole JSON objects with an `error` member of any type,
-vLLM's and SGLang's `{"object": "error", …}`, FastAPI's `{"detail": …}`; no
-status named outside them, `_ANY_STATUS`) is a request the endpoint refuses on
-an API connection, except a conversation too long for the model (also vLLM's
-"maximum context length", CLIProxyAPI's `context_too_large`) and a content
-filter's refusal. In such a failure the words of a passing condition
-(`_PASSING_CONDITION`: a 5xx number, 429, capacity, overload, high demand,
-temporar…, rate limit) count only outside the bodies, so "Invalid
-'input[512].content'" is refused rather than retried every minute forever; the
-captured lines are in `tests/codex_refusals.py`. A 400 whose body is plain text
-("Bad Request", `EXEC_400_PLAIN`) cannot be told from Codex's own words and
-stays retried.
+vLLM's and SGLang's `{"object": "error", …}`, FastAPI's `{"detail": …}`;
+outside them nothing but whitespace and the runner's own words that lead a
+CLI's failure, such as "Codex review failed:", `_RUNNER_PREFIX`) is a request
+the endpoint refuses on an API connection, except a conversation too long for
+the model (also vLLM's "maximum context length", CLIProxyAPI's
+`context_too_large`) and a content filter's refusal. In such a failure the
+words of a passing condition (`_PASSING_CONDITION`: a 5xx number, 429,
+capacity, overload, high demand, temporar…, rate limit) are the endpoint's and
+do not count, so "Invalid 'input[512].content'" is refused rather than retried
+every minute forever. Codex's own words beside a body make the failure what
+they say: the status they name, or a stream lost partway, which Codex reports
+after five retries of its own as "stream disconnected before completion: <the
+stream's error>", also when that error is a JSON body (a proxy's `{"detail":
+"Upstream request timed out"}`, `EXEC_STREAM_DETAIL`): it is retried every
+minute, as the same failure in plain words is. The captured lines are in
+`tests/codex_refusals.py`. A 400 whose body is plain text ("Bad Request",
+`EXEC_400_PLAIN`) cannot be told from Codex's own words and stays retried.
 
 ## HTTP API notes
 

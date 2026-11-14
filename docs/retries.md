@@ -169,7 +169,11 @@ web-cutoff policy) and programming errors.
   store that cannot be read for a moment is retried like any failure, and so
   is a content filter's refusal (Claude Code's "API Error: 400 Output blocked
   by content filtering policy", or an OpenAI-format endpoint's 400 with the
-  code `content_filter`): no setting causes it, and a retry may pass.
+  code `content_filter`): no setting causes it, and a retry may pass. A stream
+  that the service ends with an error partway is retried too, also when Codex
+  quotes that error as a JSON object ("stream disconnected before completion:
+  {"detail": "Upstream request timed out"}", as a proxy may pass on its
+  upstream's error).
 - An author stopped by a safety check, or a Codex author whose saved thread ID is
   missing, waits for you (**Resume**, or **Continue proof author** for a missing
   thread ID).

@@ -197,6 +197,21 @@ class AccuracyTests(unittest.TestCase):
                       "filtering policy\", or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting "
                       "causes it, and a retry may pass.", flat(DOCS / "retries.md"))
 
+    def test_a_stream_lost_partway_is_said_to_be_retried_also_when_its_error_is_json(self):
+        # Codex 0.160 reports a stream that ended with response.failed in its own words around the error, "stream
+        # disconnected before completion: …", also when the error is a JSON body: a lost stream, retried, never a
+        # request the endpoint refuses (workflow_runner._bare_error_body(); tests/codex_refusals.py EXEC_STREAM_DETAIL).
+        self.assertIn("A stream that the service ends with an error partway is retried too, also when Codex quotes "
+                      "that error as a JSON object (\"stream disconnected before completion: {\"detail\": \"Upstream "
+                      "request timed out\"}\", as a proxy may pass on its upstream's error).", flat(DOCS / "retries.md"))
+        developers = flat(DOCS / "developers.md")
+        self.assertIn("outside them nothing but whitespace and the runner's own words that lead a CLI's failure, such "
+                      "as \"Codex review failed:\", `_RUNNER_PREFIX`)", developers)
+        self.assertIn("or a stream lost partway, which Codex reports after five retries of its own as \"stream "
+                      "disconnected before completion: <the stream's error>\", also when that error is a JSON body",
+                      developers)
+        self.assertNotIn("_ANY_STATUS", developers)
+
     def test_the_progress_log_s_version_times_are_named_with_their_limit(self):
         self.assertIn("\nPROGRESS_LOG_VERSIONS = 500\n", (ROOT / "ui" / "server.py").read_text(encoding="utf-8"))
         self.assertIn("the newest `PROGRESS_LOG_VERSIONS` (500)", flat(DOCS / "developers.md"))
