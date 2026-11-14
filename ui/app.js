@@ -11661,6 +11661,7 @@ function renderCallsList() {
     return item;
   });
   placeChildren(els.list, items);
+  renderCallSteps();
 }
 
 // What a call's row shows: it is drawn again when this changes.
@@ -11767,10 +11768,24 @@ async function showCall(id, { keepView = false, address = true } = {}) {
   renderCallPane(row, store.details.get(id));
 }
 
+// The calls the list shows just before and after call ``id`` (the nearest ones, also when the words or a filter left it
+// out), and its number.
+function callNeighbours(id) {
+  const number = callsStore().rows.findIndex((row) => row.id === id) + 1;
+  let previous = null, next = null;
+  for (const item of callsShown()) {
+    if (item.number < number) previous = item;
+    else if (item.number > number) {
+      next = item;
+      break;
+    }
+  }
+  return { previous, next, number };
+}
+
 function stepCall(offset) {
-  const shown = callsShown(), store = callsStore();
-  const index = shown.findIndex(({ row }) => row.id === store.selected);
-  const next = shown[index + offset];
+  const neighbours = callNeighbours(callsStore().selected);
+  const next = offset < 0 ? neighbours.previous : neighbours.next;
   if (!next) return false;
   showCall(next.row.id, { keepView: true }).then(() => {
     const button = [...callsEls().list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === next.row.id);
@@ -11790,29 +11805,23 @@ function renderCallPane(row = null, detail = undefined) {
   }
   const number = store.rows.indexOf(row) + 1;
   const [title, detailText] = callRole(row);
-  const shown = callsShown();
-  const index = shown.findIndex((item) => item.row.id === row.id);
-  const previous = shown[index - 1], next = shown[index + 1];
   const back = mcButton("ghost compact mcb-back", "All calls", "previous");
   back.onclick = () => {
     els.browser.dataset.view = "list";
     const button = [...els.list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === row.id);
     button?.focus({ preventScroll: false });
   };
-  const heading = mcNode("h2", "", `Call ${number} · ${title}${detailText ? `, ${detailText}` : ""} `, callStatus(row));
+  const heading = mcNode("h2", "", mcNode("span", "mcb-number", `Call ${number}`),
+    ` · ${title}${detailText ? `, ${detailText}` : ""} `, callStatus(row));
   heading.id = "callTitle";
   heading.tabIndex = -1;
   const ended = Number.isFinite(row.durationMs) && row.time ? new Date(new Date(row.time).getTime() + row.durationMs) : null;
   const meta = mcNode("p", "mc-meta", [callModel(row.model), row.program === "claude" ? "Claude Code" : "Codex CLI",
     row.time ? `${callClock(row.time)}${ended ? ` → ${callClock(ended)}` : ""}` : "time not recorded", row.id]
     .join(" · "));
-  const prev = mcButton("secondary compact", previous ? String(previous.number) : "", "previous");
-  prev.setAttribute("aria-label", previous ? `Previous call, ${previous.number}` : "No previous call");
-  prev.disabled = !previous;
+  const prev = mcButton("secondary compact", mcNode("span", "mcb-step-n"), "previous");
   prev.onclick = () => stepCall(-1);
-  const nextButton = mcButton("secondary compact", next ? String(next.number) : "", "next", true);
-  nextButton.setAttribute("aria-label", next ? `Next call, ${next.number}` : "No next call");
-  nextButton.disabled = !next;
+  const nextButton = mcButton("secondary compact", mcNode("span", "mcb-step-n"), "next", true);
   nextButton.onclick = () => stepCall(1);
   const actions = mcNode("div", "mc-detail-actions", mcNode("span", "mcb-step", prev, nextButton));
   const raw = detail && !detail.readError && detail.rawAvailable;
@@ -11830,7 +11839,29 @@ function renderCallPane(row = null, detail = undefined) {
   else if (detail.readError) body.append(mcNode("p", "notice", `This call could not be read: ${detail.readError}`));
   else body.append(...callBody(row, detail));
   pane.replaceChildren(bar, body);
+  renderCallSteps();
+}
+
+// The chosen call's number and its previous and next, as the list shows them now: they follow the words typed, a
+// filter and a call recorded, without the call being drawn again (what was opened in it stays open).
+function renderCallSteps() {
+  const store = callsStore(), pane = callsEls().pane;
+  const step = pane.querySelector(".mcb-step");
+  if (!step || !store.selected) return;
+  const { previous, next, number } = callNeighbours(store.selected);
+  if (!number) return;
+  const title = pane.querySelector(".mcb-number");
+  if (title && title.textContent !== `Call ${number}`) title.textContent = `Call ${number}`;
   pane.setAttribute("aria-label", `Call ${number}`);
+  const [back, forward] = step.querySelectorAll("button");
+  for (const [button, target, words] of [[back, previous, ["Previous call", "No previous call"]],
+    [forward, next, ["Next call", "No next call"]]]) {
+    const text = target ? String(target.number) : "";
+    const label = button.querySelector(".mcb-step-n");
+    if (label.textContent !== text) label.textContent = text;
+    button.setAttribute("aria-label", target ? `${words[0]}, ${target.number}` : words[1]);
+    button.disabled = !target;
+  }
 }
 
 // The parts of one call's view.
@@ -12404,24 +12435,19 @@ async function downloadRawCall(row, button) {
     callsStore().words = els.words.value;
     renderCallsList();
   });
+  // The chosen call's previous and next follow the list shown (renderCallSteps).
   els.filter.onclick = (event) => {
     const button = event.target.closest?.("[data-calls]");
     if (!button) return;
     callsStore().filter = button.dataset.calls;
     renderCallsList();
-    // The chosen call's previous and next follow the list shown.
-    const store = callsStore();
-    if (store.selected) showCall(store.selected, { keepView: true, address: false });
   };
   // Up and down step through the list while it has the focus.
   els.list.addEventListener("keydown", (event) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     if (!stepCall(event.key === "ArrowDown" ? 1 : -1)) return;
     event.preventDefault();
-    const id = (() => {
-      const shown = callsShown(), index = shown.findIndex(({ row }) => row.id === callsStore().selected);
-      return shown[index]?.row.id;
-    })();
+    const id = callsStore().selected;
     setTimeout(() => [...els.list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === id)?.focus(), 0);
   });
   els.back.onclick = () => {

@@ -449,7 +449,8 @@ The chosen call shows, from the top:
   as token probabilities and the details only the network carries.
 
 **Raw JSON** saves the call's exact request and response. Previous and next
-(and the arrow keys in the list) step through the calls; each call has its own
+(and the arrow keys in the list) step through the calls the list shows, and
+follow it as you type, filter or a call is recorded; each call has its own
 address. On a phone the list and the call take turns (**All calls** goes back).
 A job with no record (one started before records were kept, or whose record you
 deleted) says so plainly.

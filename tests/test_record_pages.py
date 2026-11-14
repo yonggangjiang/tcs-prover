@@ -727,6 +727,57 @@ assert.equal($('callsList').children.length, 8);
 assert(rows.every((item, index) => $('callsList').children[index] === item));
 """.replace("RUN", json.dumps(RUN)))
 
+    def test_previous_and_next_follow_the_words_the_filter_and_a_recorded_call(self):
+        self.run_pages(r"""
+await settle();
+await openModelCalls(RUN, {from: 'job'});
+await settle();
+const pane = () => $('callPane');
+const steps = () => pane().querySelector('.mcb-step').children.map((button) =>
+  [button.getAttribute('aria-label'), button.disabled]);
+const type = (words) => { $('callsFilterText').value = words; $('callsFilterText').dispatch('input'); };
+// Call 1 is chosen; typing "claude" leaves call 5 only: Next leads there, and says so.
+assert.deepEqual(steps(), [['No previous call', true], ['Next call, 2', false]]);
+type('claude');
+assert.equal($('callsList').children.length, 1);
+assert.deepEqual(steps(), [['No previous call', true], ['Next call, 5', false]]);
+assert.equal(pane().querySelector('.mcb-step').children[1].textContent, '5');
+pane().querySelector('.mcb-step').children[1].onclick();
+await settle();
+assert.equal(callsStore().selected, 'c000020');
+// A chosen call the words leave out: the nearest shown calls before and after it.
+type('');
+await showCall('c000016');
+await settle();
+type('critic');
+assert.deepEqual(steps(), [['Previous call, 7', false], ['No next call', true]]);
+pane().querySelector('.mcb-step').children[0].onclick();
+await settle();
+assert.equal(callsStore().selected, 'p000001');
+// The filter buttons too, and the pane is not drawn again for them: what was opened in it stays open.
+type('');
+await showCall('c000010');
+await settle();
+const drawn = pane().firstChild;
+$('callsFilter').onclick({target: $('callsFilter').querySelector('[data-calls="critics"]')});
+assert.deepEqual(steps(), [['Previous call, 2', false], ['Next call, 4', false]]);
+$('callsFilter').onclick({target: $('callsFilter').querySelector('[data-calls="members"]')});
+assert.deepEqual(steps(), [['No previous call', true], ['Next call, 5', false]]);
+assert.equal(pane().firstChild, drawn);
+$('callsFilter').onclick({target: $('callsFilter').querySelector('[data-calls="all"]')});
+// A call recorded before the chosen one: its number and its neighbours follow, the pane stays as it was.
+const base = '/jobs/' + RUN + '/model-calls';
+const more = [ROWS[0], {...ROWS[1], id: 'c000002', time: '2026-11-14T02:05:40Z'}, ...ROWS.slice(1)];
+answers[base + '?offset=0&limit=1'] = {body: {total: 9, calls: more.slice(0, 1), recordState: {available: true, problems: []}}};
+answers[base + '?offset=0&limit=1000'] = {body: {total: 9, calls: more, recordState: {available: true, problems: []}}};
+timers.filter(([fn, ms]) => ms === 5000).at(-1)[0]();
+await settle();
+assert.equal(pane().firstChild, drawn);
+assert.equal(pane().querySelector('h2').textContent, 'Call 4 · Critic coordinator, round 1 Done');
+assert.equal(pane().getAttribute('aria-label'), 'Call 4');
+assert.deepEqual(steps(), [['Previous call, 3', false], ['Next call, 5', false]]);
+""".replace("RUN", json.dumps(RUN)), extra=f"const ROWS = {json.dumps(ROWS)};\n")
+
     def test_a_live_jobs_list_grows_and_a_job_without_a_record_says_so(self):
         self.run_pages(r"""
 await settle();
