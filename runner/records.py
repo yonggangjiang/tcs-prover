@@ -111,6 +111,9 @@ _ROLLOUT = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{3
 # The content blocks in which Anthropic sends the reasoning it withholds (a summary at most, or only encrypted): a
 # Claude Code call line's "thinking" says whether its message had one.
 THINKING_BLOCKS = ("thinking", "redacted_thinking")
+# The output items that hold a model's reasoning, as the routes' hidden_reasoning reads them (OpenAI's reasoning items,
+# with raw text in "content" only from a provider that sends it; Anthropic's blocks): a Codex call line's "reasoning".
+REASONING_ITEMS = ("reasoning", *THINKING_BLOCKS)
 
 
 class RecordError(Exception):
@@ -803,6 +806,16 @@ class StoredBundle:
             return None
 
 
+def reasoning_facts(items):
+    """What a Codex call's output items hold of reasoning, its call line's "reasoning" (the list's hidden_reasoning, as
+    the call detail reads the items themselves): how many reasoning items came back, and whether one carried raw
+    reasoning text (its "content"), which OpenAI never sends and another provider may."""
+
+    reasoning = [item for item in items if isinstance(item, dict) and item.get("type") in REASONING_ITEMS]
+    return {"items": len(reasoning),
+            "rawText": any(bool(item.get("content")) for item in reasoning if item.get("type") == "reasoning")}
+
+
 class TraceIngest:
     """Stores one raw trace bundle (codex-trace/<label>/trace-<id>-<thread>/) into the record as Codex writes it.
 
@@ -887,7 +900,9 @@ class TraceIngest:
                 self._finish(calls)
             for call in calls:
                 if call.get("response") and call.get("usage") is None:
-                    call["usage"] = self._usage(call["response"])
+                    call["usage"], reasoning = self._answer(call["response"])
+                    if reasoning is not None:
+                        call["reasoning"] = reasoning
             if calls:
                 self.record.calls.append(calls)
                 self.ended.update(call["callId"] for call in calls)
@@ -1007,15 +1022,18 @@ class TraceIngest:
                         response=response.get("path") if isinstance(response, dict) else None)
             calls.append(call)
 
-    def _usage(self, path):
-        if not path:
-            return None
+    def _answer(self, path):
+        """(usage, reasoning) of a call's stored response (a failed or cancelled call's partial one too): its
+        token_usage, and what its output items hold of reasoning (reasoning_facts()); None for what cannot be read."""
+
         try:
             value = json.loads(self.stored.payload(path))
         except (KeyError, ValueError, OSError, EOFError, gzip.BadGzipFile):
-            return None
-        usage = value.get("token_usage") if isinstance(value, dict) else None
-        return usage if isinstance(usage, dict) else None
+            return None, None
+        if not isinstance(value, dict):
+            return None, None
+        usage, items = value.get("token_usage"), value.get("output_items")
+        return usage if isinstance(usage, dict) else None, reasoning_facts(items if isinstance(items, list) else [])
 
     def _finish(self, calls):
         """The process ended: close the open requests, keep the bundle's files, remove the raw bundle."""

@@ -91,7 +91,7 @@ class Bundle:
         self.event({"type": "thread_started", "thread_id": thread or self.thread, "agent_path": path,
                     "metadata_payload": meta})
 
-    def call(self, identity, body, response=None, thread=None, status="completed", text=None):
+    def call(self, identity, body, response=None, thread=None, status="completed", text=None, usage=USAGE):
         thread = thread or self.thread
         reference = self.payload("inference_request", body, text=text)
         self.event({"type": "inference_started", "inference_call_id": identity, "thread_id": thread,
@@ -106,7 +106,7 @@ class Bundle:
             return
         answer = self.payload("inference_response", {"response_id": f"resp_{identity}",
                                                      "upstream_request_id": f"req_{identity}",
-                                                     "token_usage": USAGE, "output_items": response})
+                                                     "token_usage": usage, "output_items": response})
         self.event({"type": "inference_completed", "inference_call_id": identity, "response_id": f"resp_{identity}",
                     "upstream_request_id": f"req_{identity}", "response_payload": answer}, thread)
 
@@ -529,6 +529,51 @@ class CallErrorTests(RecordCase):
                          [error for _, error in reasons])
         requests = [json.loads(line) for line in download().read("requests.jsonl").splitlines()]
         self.assertEqual([(example["status"], example["error"]) for example in requests], reasons)
+
+
+class CodexPlaceholderKindsTests(RecordCase):
+    def test_the_list_s_placeholder_kinds_are_its_detail_s(self):
+        # Reasoning items and tokens as OpenAI sends them; raw reasoning text from another provider, which Codex's
+        # trace keeps; a request cancelled while it streamed, whose partial answer has a reasoning item and no usage
+        # (Codex 0.160 writes none for it); an answer with no reasoning.
+        raw = {"type": "reasoning", "id": "rs_9", "summary": [],
+               "content": [{"type": "reasoning_text", "text": "RAW-REASONING the thoughts"}]}
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), [REASONING, ANSWER])
+        bundle.call("call-b", request([PROMPT, REASONING, ANSWER, PROMPT]), [raw, ANSWER])
+        reference = bundle.payload("inference_request", request([PROMPT]))
+        bundle.event({"type": "inference_started", "inference_call_id": "call-c", "thread_id": THREAD,
+                      "codex_turn_id": "turn-1", "model": "gpt-6.1-sol", "provider_name": "OpenAI",
+                      "request_payload": reference}, THREAD)
+        partial = bundle.payload("inference_response", {"response_id": None, "token_usage": None,
+                                                        "output_items": [REASONING]})
+        bundle.event({"type": "inference_cancelled", "inference_call_id": "call-c", "upstream_request_id": None,
+                      "reason": "response stream dropped before provider terminal event",
+                      "partial_response_payload": partial}, THREAD)
+        bundle.call("call-d", request([PROMPT]), [ANSWER], usage={**USAGE, "reasoning_output_tokens": 0})
+        self.ingest(bundle)
+        self.assertEqual([call["reasoning"] for call in self.record.calls.read()],
+                         [{"items": 1, "rawText": False}, {"items": 1, "rawText": True},
+                          {"items": 1, "rawText": False}, {"items": 0, "rawText": False}])
+        shown = ["token_probabilities", "network_only"]
+        expected = [["hidden_reasoning", *shown], shown, ["hidden_reasoning", *shown], shown]
+
+        def kinds():
+            rows = model_calls.call_list("run-1")["calls"]
+            for row in rows:
+                detail = model_calls.call_detail("run-1", row["id"])
+                self.assertEqual(row["placeholderKinds"],
+                                 list(dict.fromkeys(item["kind"] for item in detail["placeholders"])), row["id"])
+            return [(row["status"], row["placeholderKinds"]) for row in rows]
+
+        self.assertEqual(kinds(), list(zip(["completed", "completed", "cancelled", "completed"], expected)))
+        # A call line written by an earlier build does not say what came back of reasoning: its response does.
+        path = self.record.folder / "calls.jsonl"
+        older = [{key: value for key, value in json.loads(text).items() if key != "reasoning"}
+                 for text in path.read_text().splitlines()]
+        path.write_text("".join(json.dumps(line) + "\n" for line in older))
+        self.assertEqual(kinds(), list(zip(["completed", "completed", "cancelled", "completed"], expected)))
 
 
 class RoundTests(unittest.TestCase):

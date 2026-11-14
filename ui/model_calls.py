@@ -137,25 +137,22 @@ def _tokens(line):
             "output": usage.get("output_tokens"), "reasoning": usage.get("reasoning_output_tokens")}
 
 
-def _kinds(line, tokens, thinking=None):
-    """The kinds of a call's placeholders. A Claude Code call's are its detail's (_placeholders()), whose
-    hidden_reasoning says that its message came back with a thinking block: ``thinking``, else its call line's
-    "thinking" (a line written before 14 Nov 2026 has none: call_list() reads the stream for it)."""
+def _kinds(line, thinking=None, reasoning=None):
+    """The kinds of a call's placeholders as its detail has them (_placeholders()), from its call line, which says what
+    came back of reasoning: a Claude Code call's "thinking" (whether a thinking block came back), a Codex call's
+    "reasoning" (records.reasoning_facts() of its output items). A line written by an earlier build has neither:
+    call_list() reads the call's stream or response for it and gives ``thinking`` or ``reasoning``."""
 
-    kinds = []
     if line.get("status") == "not recorded":
         return ["web_cutoff_one_shot"]
     if line.get("status") == "trace format not recognized":
         return ["trace_format_not_recognized"]
     if line.get("program") == "claude":
-        blocks = [{"type": "thinking"}] if (line.get("thinking") if thinking is None else thinking) else []
-        return list(dict.fromkeys(placeholder["kind"] for placeholder in _placeholders(line, blocks, None)))
-    if (tokens.get("reasoning") or 0) > 0:
-        kinds.append("hidden_reasoning")
-    kinds.extend(["token_probabilities", "network_only"])
-    if line.get("status") == "interrupted":
-        kinds.append("interrupted")
-    return kinds
+        facts = {"items": int(bool(line.get("thinking") if thinking is None else thinking)), "rawText": False}
+    else:
+        facts = line.get("reasoning") if reasoning is None else reasoning
+    usage = line.get("usage") if isinstance(line.get("usage"), dict) else None
+    return list(dict.fromkeys(placeholder["kind"] for placeholder in _placeholders(line, [], usage, facts)))
 
 
 def _error(line):
@@ -178,10 +175,11 @@ def _row(line, labels):
     row = {"id": line["id"], "time": records._iso(started), "role": role, "label": label, "member": member,
            "model": line.get("model") or process.get("model"), "program": line.get("program") or "codex",
            "durationMs": duration, "tokens": tokens, "status": line.get("status") or "completed",
-           "error": _error(line), "placeholderKinds": _kinds(line, tokens), "kind": line.get("kind") or "request",
+           "error": _error(line), "placeholderKinds": _kinds(line), "kind": line.get("kind") or "request",
            "threadId": line.get("threadId")}
-    if line.get("program") == "claude" and "thinking" not in line:
-        row["_line"] = line  # Its kinds come from its stream (call_list()).
+    if (line.get("program") == "claude" and "thinking" not in line
+            or line.get("program") == "codex" and line.get("response") and "reasoning" not in line):
+        row["_line"] = line  # Written by an earlier build: its kinds come from its stream or response (call_list()).
     return row
 
 
@@ -292,7 +290,7 @@ def _problems(record):
 
 def _rows(record, summaries=False, lines=False):
     """Every row of the list, in time order (``summaries``: the untraced compactions keep their "_summary";
-    ``lines``: a Claude Code call whose line does not say whether a thinking block came back keeps its "_line")."""
+    ``lines``: a call whose line does not say what came back of reasoning keeps its "_line", _row())."""
 
     labels = _labels(record)
     rows = ([_row(line, labels) for line in record.calls.read()] + _placeholder_rows(record)
@@ -320,10 +318,16 @@ def call_list(name, offset=0, limit=DEFAULT_LIMIT):
     page = rows[offset:offset + limit]
     for row in page:
         line = row.pop("_line", None)
-        if line is not None:
-            # A Claude Code call line written before 14 Nov 2026: whether a thinking block came back is in its stream.
+        if line is None:
+            continue
+        if line.get("program") == "claude":
+            # Whether a thinking block came back is in the call's stream.
             thinking = any(block.get("type") in records.THINKING_BLOCKS for block in _claude_blocks(record, line))
-            row["placeholderKinds"] = _kinds(line, row["tokens"], thinking)
+            row["placeholderKinds"] = _kinds(line, thinking=thinking)
+        else:
+            # What came back of reasoning is in the call's response (a failed or cancelled call's partial one).
+            response = _json(_payload(record, line, "response"))
+            row["placeholderKinds"] = _kinds(line, reasoning=records.reasoning_facts(_list(response, "output_items")))
     return {"total": len(rows), "calls": page, "recordState": {"available": True, "problems": _problems(record)}}
 
 
@@ -685,8 +689,10 @@ def _claude_detail(record, line, kept=None):
             "rawAvailable": bool(lines), "error": _error(line)}
 
 
-def _placeholders(line, outputs, usage):
-    """Typed placeholders of what a call's record cannot hold (contract: Placeholder)."""
+def _placeholders(line, outputs, usage, facts=None):
+    """Typed placeholders of what a call's record cannot hold (contract: Placeholder). hidden_reasoning: a reasoning
+    item came back, or the call has reasoning tokens, and none carried raw reasoning text; ``facts``
+    (records.reasoning_facts()) say what came back of reasoning where ``outputs`` are not at hand (the list)."""
 
     claude = line.get("program") == "claude"
     company = "Anthropic" if claude else "OpenAI"
@@ -694,11 +700,10 @@ def _placeholders(line, outputs, usage):
     if line.get("status") == "trace format not recognized":
         return [{"kind": "trace_format_not_recognized", "facts": {}, "withheldBy": "Codex",
                  "why": "This Codex version's trace format is not one TCS Prover reads; its raw files are kept."}]
-    reasoning = [item for item in outputs if isinstance(item, dict) and item.get("type") in
-                 ("reasoning", "thinking", "redacted_thinking")]
-    raw_text = any(item.get("content") for item in reasoning if item.get("type") == "reasoning")
+    reasoning = [item for item in outputs if isinstance(item, dict) and item.get("type") in records.REASONING_ITEMS]
+    facts = facts if isinstance(facts, dict) else records.reasoning_facts(outputs)
     tokens = (usage or {}).get("reasoning_output_tokens") if isinstance(usage, dict) else None
-    if (reasoning or tokens) and not raw_text:
+    if (facts.get("items") or tokens) and not facts.get("rawText"):
         encrypted = any(item.get("encrypted_content") or item.get("signature") or item.get("data")
                         for item in reasoning)
         found.append({"kind": "hidden_reasoning", "facts": {"reasoningTokens": tokens, "encryptedCopyKept": encrypted},
