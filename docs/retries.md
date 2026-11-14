@@ -96,9 +96,11 @@ incompatible" while the retries continue, until it works again.
 ## What needs you
 
 Some causes need you although the job keeps retrying: an expired login, a usage
-limit, an API key the endpoint refuses, or a program that is not installed (or
-does not start), after the same failure three times in a row (also while a
-paused author's reply waits for it). The Overview then lists the job under
+limit or an API key the endpoint refuses, of any of the job's calls (a team
+member's, or a paused author's reply's: then the reply retries, and comes by
+itself once it is fixed), or a program that is not installed (or does not
+start), after the same failure three times in a row (also while a paused
+author's reply waits for it). The Overview then lists the job under
 **Needs your attention** with what to do, for example *Codex login needed: Sign
 in again on the Setup page, or run codex login in a terminal*, *Claude login
 needed: Sign in again on the Setup page, or run claude auth login in a
@@ -109,6 +111,24 @@ card and page say so, and the retries go on, so the job continues by itself once
 that is fixed: a program Setup installs is found by the waiting job at its next
 retry. **Models & API → Running jobs** can
 also show a browser notification when a job first needs you.
+
+A job whose model calls keep failing the same way is listed there too, while
+its retries go on every minute without limit: at once when the provider says
+that the account is out of credit (**Out of credit**, for example Claude Code's
+"Credit balance is too low", with the model's connection), or that a usage limit
+was reached, and otherwise once the same failure has repeated for 15 minutes
+(**Model calls keep failing**: which call, for how long, and the failure). The
+15 minutes count from the first failure of that kind; another failure starts
+them again (the numbers and request IDs in a provider's message do not make it
+another). This covers every role, a team member and a paused author's reply.
+The line goes as soon as a model call of it works again (the model's first
+output), and when its step or the job's runner ends. A call whose answer is
+checked (a critic's, the statement reviewer's, the convention critic's, the
+LaTeX editor's) works again only once an answer is accepted when its model had
+already worked in the failed attempt: an answer refused (*the answer is not
+valid JSON*, an unmet requirement) or set aside after failed subagent calls,
+or a stream that dropped after some output, keeps counting as the same failure
+through the next attempt's answer.
 
 A web-cutoff job held because its isolated LaTeX compiler is not ready (MacTeX
 missing, being updated or damaged, or the compiler's macOS sandbox check
@@ -136,7 +156,10 @@ web-cutoff policy) and programming errors.
   Error: 400" with the endpoint's message). Both list the job under **Needs your
   attention**. Such a job resumes by itself once its API connection's settings
   change; one whose built-in model is unavailable waits for **Resume**. A key
-  store that cannot be read for a moment is retried like any failure.
+  store that cannot be read for a moment is retried like any failure, and so
+  is a content filter's refusal (Claude Code's "API Error: 400 Output blocked
+  by content filtering policy", or an OpenAI-format endpoint's 400 with the
+  code `content_filter`): no setting causes it, and a retry may pass.
 - An author stopped by a safety check, or a Codex author whose saved thread ID is
   missing, waits for you (**Resume**, or **Continue proof author** for a missing
   thread ID).

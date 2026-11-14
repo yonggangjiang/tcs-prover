@@ -136,6 +136,17 @@ MAX_SOURCE_FILE_CHARS = 255
 # An error-paused author is resumed automatically after the same wait as
 # every other model-call retry (workflow_runner.MODEL_RETRY_SECONDS).
 AUTO_RESUME_SECONDS = runtime.MODEL_RETRY_SECONDS
+# A job whose model calls keep failing the same way is still retried every minute without limit, and is listed under
+# Needs your attention once the same failure has repeated for this long (owner's decision, 14 Nov 2026; an
+# out-of-credit or usage-limit message is listed at once). App._follow_failures() keeps each call's failure; the mark
+# clears when a model call succeeds.
+FAILING_ATTENTION_SECONDS = 15 * 60
+# The record kinds that end a step with its model's answer: a call of that stage that kept failing works again.
+STEP_RESULT_KINDS = {"review_result", "critic_result", "author_result", "final_result", "convention_result",
+                     "conversation_reply"}
+# A failed model call's plain words (workflow_runner._FAILURE_PATTERNS) that only you can fix: listed at once under
+# Needs your attention, whichever call has them (App.attention()).
+NEEDS_YOU_FAILURES = {"authentication failed", "usage limit reached"}
 # How often a running web-cutoff job's author sessions and discovery folders are copied into its record (seconds):
 # its discovery prunes a folder only once it is a day old (retrieval/historical_codex_discovery.py).
 RECORD_COPY_SECONDS = 600
@@ -413,6 +424,56 @@ def load_pause_checkpoint(run_dir):
 def finite_seconds(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value >= 0)
+
+
+def _short(text, limit=200):
+    """A failure's words for a line on the page: at most ``limit`` characters, a cut one ending with "…"."""
+
+    value = " ".join(str(text or "").split())
+    return value if len(value) <= limit else f"{value[:limit - 1].rstrip()}…"
+
+
+# The runner's plain words for a failure that names no cause (workflow_runner._FAILURE_PATTERNS): the provider's own
+# line says which failure it is.
+GENERIC_FAILURES = {"the CLI stopped unexpectedly"}
+
+
+def _failure_words(failure, reason=""):
+    """A failure in words for the page: the runner's plain words, with the provider's line after a generic one."""
+
+    failure, reason = str(failure or "").strip(), str(reason or "").strip()
+    return f"{failure}: {reason}" if failure in GENERIC_FAILURES and reason and reason != failure else failure
+
+
+def _failure_signature(failure, reason=""):
+    """What two failures of a model call share when it fails "the same way": the failure's words (_failure_words), in
+    lower case, without the IDs and numbers that change from one attempt to the next (a request ID, a count of
+    seconds). A provider that words one cause in several ways ("at capacity", "overloaded") fails the same way."""
+
+    value = _failure_words(failure, reason).lower()
+    value = re.sub(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", "#", value)
+    value = re.sub(r"\b(?=[\w-]*\d)[\w-]{12,}\b", "#", value)
+    value = re.sub(r"\d+(?:[.,:]\d+)*", "#", value)
+    return " ".join(value.split())
+
+
+def _model_output(record):
+    """Whether a runner record shows the model's own output: an item it produced (not the user's message or an
+    error), in a Codex event or Claude Code's events as the runner relays them. The runner counts an attempt with such
+    an item as one in which the model worked."""
+
+    if not isinstance(record, dict) or record.get("kind") != "codex_event" or not isinstance(record.get("event"), dict):
+        return False
+    event = record["event"]
+    name = event.get("method") or event.get("type")
+    if name in {"item/started", "item/completed"}:
+        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        item = params.get("item")
+    elif name in {"item.started", "item.updated", "item.completed"}:
+        item = event.get("item")
+    else:
+        return False
+    return isinstance(item, dict) and item.get("type") not in {None, "userMessage", "user_message", "error"}
 
 
 def saved_seconds(value, default):
@@ -2907,8 +2968,10 @@ def probe_web_search(entry, model, timeout=None):
     now = datetime.now(timezone.utc).isoformat()
     # A failure's message ends with a full stop: the editor shows it after "Web search through this connection stays
     # off:", and the service's own words go in parentheses, so that they never run into the editor's next sentence.
+    # What follows a colon goes on in lower case ("… the search service: the connection was refused …").
     if failure:
-        return {"ok": False, "at": now, "message": f"The test search could not reach the search service: {failure}"}
+        return {"ok": False, "at": now, "message": "The test search could not reach the search service: "
+                                                   f"{failure[:1].lower()}{failure[1:]}"}
     if len(data) > WEB_SEARCH_PROBE_MAX_BYTES:
         return {"ok": False, "at": now, "message": "The test search's answer is longer than "
                                                    f"{WEB_SEARCH_PROBE_MAX_BYTES // (1024 * 1024)} MiB; it was not read."}
@@ -2918,7 +2981,7 @@ def probe_web_search(entry, model, timeout=None):
     except ValueError:
         value = None
     if status is not None and 200 <= status < 300 and isinstance(value, dict) and isinstance(value.get("output"), str):
-        return {"ok": True, "at": now, "message": f"The probe search answered ({len(value['output']):,} characters)."}
+        return {"ok": True, "at": now, "message": f"The test search answered ({len(value['output']):,} characters)."}
     # An error page may quote the Authorization header it received: the connection's key goes before the clip, as in
     # the API Test (_api_test_text), since the message is kept with the connection and shown with it.
     excerpt = _api_test_text(text, entry["apiKey"])[:200]
@@ -3147,8 +3210,9 @@ class App:
         # Start of the runner's current retry wait, which is not active time.
         self._retry_wait_started = None
         # The model calls now waiting to retry, by activity (each labelled call waits separately), and
-        # each one's latest failed attempt with the time its failures began.
-        self._model_retries, self._retry_starts = {}, {}
+        # each one's latest failed attempt with the time its failures began; and the model calls whose last attempt
+        # failed, until one works again, each with the time its failure began to repeat (_follow_failures).
+        self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
         # The owner locks of this run while it may start a runner here (see ownership).
         self._claims = ownership.Claims()
         weakref.finalize(self, self._claims.release_all)
@@ -4311,7 +4375,7 @@ class App:
                     return
                 self.process = self.active_token = self.worker_token = None
                 self._end_retry_wait_locked()
-                self._model_retries, self._retry_starts = {}, {}
+                self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
                 self.state["modelRetry"] = None
                 if self.state["phase"] == "stopping":
                     self._finish_stopped_locked(None, "The reviewer was stopped before it produced a checked statement.")
@@ -4391,6 +4455,7 @@ class App:
                 record = self.parse_line(line, "review")
                 self.add_trace(record)
                 self._follow_model_retry(record)
+                self._follow_failures(record)
                 failure = self.failure_text(record)
                 if failure and not failure.startswith("Reconnecting..."):
                     # Prefer the precise provider error over the controller's
@@ -4451,7 +4516,7 @@ class App:
                 self.process = None
             # A reviewer that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
-            self._model_retries, self._retry_starts = {}, {}
+            self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
             self.state["modelRetry"] = None
             stopped = self.state["phase"] == "stopping"
             if valid:
@@ -4896,6 +4961,65 @@ class App:
                 # The latest wait that has not ended yet, if any.
                 self.state["modelRetry"] = next(reversed(waits.values()), None)
 
+    def _follow_failures(self, record, key_prefix=""):
+        """Keep each model call's failure while it keeps failing, for Needs your attention (attention()).
+
+        A call is the runner's retry key (its activity label, node or stage), a team member's assignment
+        ("member:<id>"), or with ``key_prefix`` a paused author's reply ("conversation:<id>:"). A failed attempt that
+        waits to retry (a "Retrying model call" status with its time, or a member's retry note) starts the call's
+        streak, or keeps it when the failure is the same as the last one (_failure_signature: its words without the
+        numbers and IDs that change between attempts); another failure starts it again. The streak ends once the call
+        works again: the model's output (an item of its own, as the runner counts a retry that worked), its step's
+        result or the next step, or the end of a member's assignment. A structured call whose model had worked in a
+        failed attempt (an answer that was refused or set aside, or a stream that dropped after some output: the
+        runner's failureKind and modelOutput) works again only once an answer is accepted: its next attempt's output
+        leaves the streak, as its runner keeps counting the call as failing (structured()).
+        """
+
+        if not isinstance(record, dict):
+            return
+        kind = record.get("kind")
+        member = record.get("subagentId") if isinstance(record.get("subagentId"), str) else ""
+        key = key_prefix + (f"member:{member}" if member else
+                            str(record.get("activityLabel") or record.get("node") or record.get("stage") or ""))
+        label = record.get("label")
+        failed = (kind == "status" and isinstance(label, str) and label.endswith(runtime.RETRY_LABEL)
+                  and finite_seconds(record.get("retryAt")))
+        member_failed = (kind == "diagnostic" and member and isinstance(record.get("failure"), str)
+                         and finite_seconds(record.get("retryAt")))
+        with self.lock:
+            streaks = getattr(self, "_failure_streaks", None)
+            if streaks is None:
+                streaks = self._failure_streaks = {}
+            if failed or member_failed:
+                now = time.time()
+                failure = str(record.get("failure") or "").strip() or "the model call failed"
+                reason = str(record.get("failureReason") or "").strip()
+                text = str(record.get("text") or "")
+                signature = _failure_signature(failure, reason)
+                previous = streaks.get(key)
+                since = previous["since"] if previous and previous["signature"] == signature else now
+                # Whether the model worked in this failed attempt (see above).
+                worked = (record.get("failureKind") in {"invalid_answer", "subagent"}
+                          or record.get("modelOutput") is True)
+                streaks[key] = {"failure": failure, "reason": reason, "signature": signature, "since": since,
+                                "last": now, "text": text, "stage": str(record.get("stage") or ""),
+                                "activity": str(record.get("activityLabel") or ""),
+                                "member": record.get("subagentMember") if member else None,
+                                "memberModel": str(record.get("subagentModel") or "") if member else "",
+                                "kind": str(record.get("failureKind") or ""), "worked": worked}
+            elif _model_output(record):
+                if not (streaks.get(key) or {}).get("worked"):
+                    streaks.pop(key, None)
+            elif kind in STEP_RESULT_KINDS or (kind == "status" and isinstance(label, str)
+                                               and label.startswith("Workflow step: ")):
+                stage = record.get("stage")
+                for name in [name for name, streak in streaks.items()
+                             if name.startswith(key_prefix) and streak["stage"] == stage and not streak["member"]]:
+                    streaks.pop(name)
+            elif kind == "status" and member and record.get("subagentState") in {"finished", "failed", "stopped"}:
+                streaks.pop(key, None)
+
     def _end_retry_wait_locked(self, now=None):
         """Leave a finished retry wait out of the current segment's active time."""
 
@@ -5132,13 +5256,20 @@ class App:
         removed model, a CLI that is not installed or does not work (also one
         that a paused author's reply waits for), a Codex author whose saved
         thread ID is missing, a safety stop, or a web-cutoff job held for its
-        LaTeX compiler (MacTeX). Retries of the causes that can pass by
-        themselves go on meanwhile.
+        LaTeX compiler (MacTeX); and a model call that keeps failing: at once
+        when its account is out of credit, otherwise once the same failure has
+        repeated for FAILING_ATTENTION_SECONDS (_failing_attention). Retries of
+        the causes that can pass by themselves go on meanwhile.
         """
 
         state = self.state if state is None else state
         phase, error = state.get("phase"), str(state.get("error") or "")
         retry = state.get("modelRetry") if isinstance(state.get("modelRetry"), dict) else None
+        streaks = self._failing_streaks(phase)
+        if retry is None and phase in {"reviewing", "running"} and streaks:
+            # Between two attempts of a call that keeps failing no call waits: its last failure still says why, so a
+            # job stays listed while its call is tried again.
+            retry = max(streaks, key=lambda streak: streak["last"])
         if retry and phase in {"reviewing", "running"}:
             cause, role = retry.get("failure") or "", TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
         elif phase == "paused":
@@ -5181,27 +5312,114 @@ class App:
             # earlier words "Claude CLI missing or incompatible" of a saved job or an older runner.
             return {"kind": "cli", "title": f"{runtime.CLI_NAMES[cli]} not installed or not working",
                     "retrying": True, "text": str(waiting.get("text") or failure)}
-        if cause not in {"authentication failed", "usage limit reached"}:
-            return None
+        # A login or a usage limit needs you at once whichever call has it: a team member's is listed also while
+        # another call waits to retry for another reason, or failed after it (the newest such call), and a paused
+        # author's reply's whatever paused the job.
+        pressing = [streak for streak in streaks if streak.get("failure") in NEEDS_YOU_FAILURES]
+        if cause not in NEEDS_YOU_FAILURES and pressing:
+            retry = max(pressing, key=lambda streak: streak["last"])
+            cause, role = retry["failure"], TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
+        if cause not in NEEDS_YOU_FAILURES:
+            return self._failing_attention(state, streaks)
         model = state.get(f"{role}Model") or ""
         try:
             api = providers.provider_kind(model) == providers.API
             name = providers.model_label(model) if api else "Claude" if providers.harness(model) == providers.CLAUDE else "Codex"
         except (providers.ProviderError, TypeError):
             api, name = False, "The CLI"
+        if retry and retry.get("memberModel"):
+            name = retry["memberModel"]  # A team member's own model.
         retrying = bool(retry) or bool(state.get("autoResumeAt"))
+        # A paused job's reply retries, not the job.
+        reply = bool(retry and retry.get("reply"))
+        goes_on = "the author's reply continues by itself" if reply else "the job continues by itself"
         if cause == "usage limit reached":
             return {"kind": "usage", "title": "Usage limit reached", "retrying": retrying,
-                    "text": f"{name} reports a usage limit. The job retries every {retry_interval_text()} and "
-                            "continues by itself when the limit resets."}
+                    "text": f"{name} reports a usage limit. "
+                            + (f"The author's reply is retried every {retry_interval_text()}" if reply
+                               else f"The job retries every {retry_interval_text()}")
+                            + " and continues by itself when the limit resets."}
         if api:
             return {"kind": "key", "title": "API key rejected", "retrying": retrying,
-                    "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; "
-                            "the job continues by itself."}
+                    "text": f"The endpoint of {name} rejected its key. Update the key under Models & API; {goes_on}."}
         # The page adds a link to Setup, where the program signs in again (or the terminal command does).
         command = "codex login" if name == "Codex" else "claude auth login"
         return {"kind": "login", "title": f"{name} login needed", "retrying": retrying,
-                "text": f"Sign in again on the Setup page, or run {command} in a terminal; the job continues by itself."}
+                "text": f"Sign in again on the Setup page, or run {command} in a terminal; {goes_on}."}
+
+    def _failing_streaks(self, phase):
+        """The model calls of the job's runner that keep failing (_follow_failures) while it runs, or of a paused
+        author's reply while the job is paused."""
+
+        with self.lock:
+            streaks = dict(getattr(self, "_failure_streaks", None) or {})
+        if phase in {"reviewing", "running"}:
+            return [streak for name, streak in streaks.items() if not name.startswith("conversation:")]
+        if phase == "paused":
+            return [{**streak, "reply": True} for name, streak in streaks.items() if name.startswith("conversation:")]
+        return []
+
+    def _failing_attention(self, state, streaks):
+        """A model call that keeps failing: out of credit at once, otherwise once the same failure has repeated for
+        FAILING_ATTENTION_SECONDS (the longest such call); else None. Its retries go on every minute meanwhile, and the
+        mark clears when a model call of it works again (_follow_failures)."""
+
+        interval = retry_interval_text()
+        # The failure's and the provider's words only: a refused answer's status quotes the model's answer, whose
+        # words are the model's (a proof may well speak of credits or funds), and the provider served that call.
+        credit = [streak for streak in streaks if streak.get("kind") != "invalid_answer"
+                  and any(runtime.out_of_credit(streak.get(field)) for field in ("failure", "reason"))]
+        if credit:
+            streak = max(credit, key=lambda item: item["last"])
+            words = next((streak.get(field) for field in ("reason", "failure")
+                          if runtime.out_of_credit(streak.get(field))), "") or streak.get("reason") or streak["failure"]
+            return {"kind": "credit", "title": "Out of credit", "retrying": True,
+                    "text": f"{self._streak_model_name(state, streak)} reports that its credit is used up "
+                            f"({_short(words)}). The job retries every {interval} and continues by itself once credit "
+                            "is added."}
+        now = time.time()
+        due = [streak for streak in streaks if now - streak["since"] >= FAILING_ATTENTION_SECONDS]
+        if not due:
+            return None
+        streak = min(due, key=lambda item: item["since"])
+        return {"kind": "failing", "title": "Model calls keep failing", "retrying": True,
+                "text": f"{self._streak_call(streak)} has failed the same way for "
+                        f"{runtime._span_text(now - streak['since'])} "
+                        f"({_short(_failure_words(streak['failure'], streak.get('reason')))}). "
+                        f"It is retried every {interval}, and the job continues by itself once a call works; a call "
+                        "is listed here once the same failure has repeated for "
+                        f"{retry_interval_text(FAILING_ATTENTION_SECONDS)}."}
+
+    @staticmethod
+    def _streak_call(streak):
+        """The call of a streak in words: "The model call of the critic coordinator", "The model call of author
+        subagent 2 (Lab Claude)", "The author's reply"."""
+
+        if streak.get("reply"):
+            return "The author's reply"
+        if streak.get("member"):
+            model = f" ({streak['memberModel']})" if streak.get("memberModel") else ""
+            return f"The model call of author subagent {streak['member']}{model}"
+        activity = streak.get("activity") or ""
+        if activity:
+            return f"The model call of the {activity[:1].lower()}{activity[1:]}"
+        name = runtime._call_name(streak.get("stage"))
+        return f"{name[:1].upper()}{name[1:]}"
+
+    @staticmethod
+    def _streak_model_name(state, streak):
+        """Whose account a streak's call bills: a team member's model, an API connection's name, or Claude or Codex
+        for a built-in model."""
+
+        if streak.get("member") and streak.get("memberModel"):
+            return streak["memberModel"]
+        model = state.get(f"{TRACE_STAGE_ROLES.get(streak.get('stage'), 'author')}Model") or ""
+        try:
+            if providers.provider_kind(model) == providers.API:
+                return providers.model_label(model)
+            return "Claude" if providers.harness(model) == providers.CLAUDE else "Codex"
+        except (providers.ProviderError, TypeError):
+            return "The model's provider"
 
     def waits_for_setup(self, program):
         """Whether this job now only waits for ``program``'s own Setup step: every model call of it in progress
@@ -6670,7 +6888,7 @@ class App:
             self.active_token = self.worker_token = None
             self._stop_in_place = False
             self._end_retry_wait_locked()
-            self._model_retries, self._retry_starts = {}, {}
+            self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
             self.state["modelRetry"] = None
             if stopped_in_place and not (restored is not None and restored["phase"] == "paused"
                                          and read_pause_object(self.run_dir).get("pauseCause") == "stopped"):
@@ -6736,6 +6954,7 @@ class App:
                     continue
                 entry = self.add_trace(record)
                 self._follow_model_retry(record)
+                self._follow_failures(record)
                 self._follow_author_question(record)
                 if convention_verdict(entry):
                     # The latest verdict decides: a new loophole verdict shows again, whatever the user did
@@ -6970,7 +7189,7 @@ class App:
             paused = self.state["phase"] == "pausing"
             # A runner that ended while waiting to retry: that wait was not active time.
             self._end_retry_wait_locked()
-            self._model_retries, self._retry_starts = {}, {}
+            self._model_retries, self._retry_starts, self._failure_streaks = {}, {}, {}
             self.state["modelRetry"] = None
             if self.process is process:
                 self.process = None
@@ -8210,6 +8429,8 @@ class App:
                     record.setdefault("node", "author")
                     record["conversationId"] = item_id
                     self.add_trace(record)
+                    # A reply whose model calls keep failing lists the paused job under Needs your attention.
+                    self._follow_failures(record, key_prefix=f"conversation:{item_id}:")
                     kind, label = record.get("kind"), record.get("label")
                     if kind == "status" and isinstance(label, str) and label.endswith(runtime.RETRY_LABEL):
                         retry_at = record.get("retryAt")
@@ -8258,6 +8479,10 @@ class App:
             if self.worker_token is token:
                 self.worker_token = None
             item = self._conversation_item_locked(item_id)
+            # The reply's runner ended: its calls no longer fail (a reply asked again starts afresh).
+            for name in [name for name in getattr(self, "_failure_streaks", {})
+                         if name.startswith(f"conversation:{item_id}:")]:
+                self._failure_streaks.pop(name)
             if not cancelled and item is not None and item["status"] == "running":
                 item.pop("retry", None)
                 if reply is not None:
@@ -12910,8 +13135,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = ChunkedWriter(self.wfile) if chunked else self.wfile
                 try:
                     model_calls.training_record(parts[1], body)
-                except OSError:
-                    return None  # The browser went away or a record file could not be read: the download failed.
+                except ConnectionError:
+                    return None  # The browser went away: nothing failed here.
+                except OSError as exc:
+                    # A record file that could not be read (its permissions, a disk error): the download failed, and
+                    # the page says that the server's log says why.
+                    print(f"The training record download of {parts[1]} failed: {exc}", file=sys.stderr, flush=True)
+                    return None
                 except Exception:  # noqa: BLE001 - the download failed; the server's log says why.
                     traceback.print_exc()
                     return None
@@ -12919,7 +13149,16 @@ class Handler(BaseHTTPRequestHandler):
                     body.end()
                 return None
         except model_calls.NotFound as exc:
-            return self.send({"error": str(exc)}, status=404)
+            body = {"error": str(exc)}
+            if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "model-calls":
+                # A job without a record (one from before records were kept, or whose record was deleted) is still
+                # listed: its Model calls page leads back to it, by its title.
+                with self.server.jobs_lock:
+                    app = self.server.jobs.get(parts[1])
+                body["jobExists"] = app is not None
+                if app is not None:
+                    body["title"] = app._record_title()
+            return self.send(body, status=404)
         except (ValueError, OSError) as exc:
             return self.send({"error": str(exc)}, status=400)
         return self.send({"error": "Not found."}, status=404)

@@ -157,25 +157,82 @@ class RouteTests(AppCase):
         self.assertEqual(self.call("GET", "/jobs/no-such-job/model-calls")[0], 404)
         self.assertEqual(self.call("GET", f"/jobs/{self.name}/model-calls?limit=0")[0], 400)
 
+    def test_a_listed_job_without_a_record_is_named_in_the_404(self):
+        # A job from before records were kept, or whose record was deleted: its Model calls page leads back to it.
+        old = self.new_app("Prove the old bound.\nIt has two lines.")
+        self.http.jobs[old.run_dir.name] = old
+        status, _, body = self.call("GET", f"/jobs/{old.run_dir.name}/model-calls?offset=0&limit=1000")
+        self.assertEqual((status, json.loads(body)),
+                         (404, {"error": "This job has no record.", "jobExists": True, "title": "Prove the old bound."}))
+        # A job that is not listed (deleted with its record), and a name no run folder has.
+        del self.http.jobs[old.run_dir.name]
+        status, _, body = self.call("GET", f"/jobs/{old.run_dir.name}/model-calls")
+        self.assertEqual((status, json.loads(body)), (404, {"error": "This job has no record.", "jobExists": False}))
+        status, _, body = self.call("GET", "/jobs/no-such-job/model-calls")
+        self.assertEqual((status, json.loads(body)["jobExists"]), (404, False))
+        # The other routes' 404 says only why.
+        status, _, body = self.call("GET", f"/jobs/{self.name}/model-calls/c999999")
+        self.assertEqual((status, json.loads(body)), (404, {"error": "Unknown model call."}))
+
     def test_the_training_record_is_a_zip_download(self):
         status, kind, body = self.call("GET", f"/jobs/{self.name}/training-record")
         self.assertEqual((status, kind), (200, "application/zip"))
         names = zipfile.ZipFile(io.BytesIO(body)).namelist()
         self.assertIn("requests.jsonl", names)
 
-    def test_a_training_record_that_fails_part_way_arrives_incomplete(self):
-        # The browser must not save a cut-short archive as a whole one: the body never gets its last chunk.
+    def failed_download(self):
+        """GET the training record, which fails part way: (what arrived, what the server's log got)."""
+
         connection = http.client.HTTPConnection(server.HOST, self.http.server_port, timeout=20)
         self.addCleanup(connection.close)
-        with mock.patch.object(records.Objects, "names", side_effect=OSError("The item index could not be read.")):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as log:
             connection.request("GET", f"/jobs/{self.name}/training-record",
                                headers={"Origin": self.http.origin, "X-TCS-Prover-Token": self.http.token})
             response = connection.getresponse()
             self.assertEqual((response.status, response.getheader("Transfer-Encoding")), (200, "chunked"))
             with self.assertRaises(http.client.IncompleteRead) as cut:
                 response.read()
+            connection.close()
+            for _ in range(100):
+                if log.getvalue():
+                    break
+                time.sleep(0.02)
+        return cut.exception.partial, log.getvalue()
+
+    def test_a_training_record_that_fails_part_way_arrives_incomplete(self):
+        # The browser must not save a cut-short archive as a whole one: the body never gets its last chunk.
+        with mock.patch.object(records.Objects, "names", side_effect=OSError("The item index could not be read.")):
+            partial, log = self.failed_download()
         with self.assertRaises(zipfile.BadZipFile):
-            zipfile.ZipFile(io.BytesIO(cut.exception.partial))
+            zipfile.ZipFile(io.BytesIO(partial))
+        self.assertEqual(log, f"The training record download of {self.name} failed: The item index could not be "
+                              "read.\n")
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "needs POSIX permissions")
+    def test_a_record_file_that_cannot_be_read_is_named_in_the_servers_log(self):
+        # The page says "Try again; the server's log says why": the log names the file and why it could not be read.
+        unreadable = records.record_folder(self.name) / "problems.jsonl"
+        unreadable.write_text('{"text": "A problem."}\n')
+        unreadable.chmod(0)
+        self.addCleanup(unreadable.chmod, 0o600)
+        partial, log = self.failed_download()
+        with self.assertRaises(zipfile.BadZipFile):
+            zipfile.ZipFile(io.BytesIO(partial))
+        self.assertRegex(log, rf"^The training record download of {self.name} failed: \[Errno 13\] Permission denied: "
+                              rf"'[^']*/problems\.jsonl'\n$")
+        # A browser that goes away is no failure of the server's: nothing is logged.
+        unreadable.chmod(0o600)
+        with mock.patch.object(server.model_calls, "training_record", side_effect=BrokenPipeError(32, "Broken pipe")):
+            connection = http.client.HTTPConnection(server.HOST, self.http.server_port, timeout=20)
+            self.addCleanup(connection.close)
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as quiet:
+                connection.request("GET", f"/jobs/{self.name}/training-record",
+                                   headers={"Origin": self.http.origin, "X-TCS-Prover-Token": self.http.token})
+                response = connection.getresponse()
+                with self.assertRaises(http.client.IncompleteRead):
+                    response.read()
+                time.sleep(0.1)
+            self.assertEqual(quiet.getvalue(), "")
 
     def test_the_records_list_and_a_delete_that_waits_for_a_working_job(self):
         status, _, body = self.call("GET", "/records")

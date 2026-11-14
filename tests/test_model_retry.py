@@ -179,6 +179,26 @@ class StructuredRetryTests(RetryCase):
         diagnostics = [event for event in self.events if event["kind"] == "diagnostic"]
         self.assertEqual([event["attempt"] for event in diagnostics], list(range(1, 26)))
 
+    def test_a_retry_says_when_the_model_worked_in_the_failed_attempt(self):
+        # The server keeps counting such a call as the same failure through its next attempt's output (an answer can
+        # still be refused, a stream drop after some output): App._follow_failures.
+        recorder, attempts = SessionRecorder(), []
+
+        def attempt(text, schema, stage, *args, **settings):
+            attempts.append(text)
+            if len(attempts) == 1:
+                recorder.open(settings["conversation"], "s-1", True)  # It streamed some output, then dropped.
+                raise runtime.Error("Codex review failed: stream disconnected before completion")
+            if len(attempts) == 2:
+                raise runtime.Error(f"Codex review failed: {CAPACITY}")  # Nothing came.
+            return VALID
+
+        with mock.patch.object(runtime, "run_structured_attempt", side_effect=attempt):
+            runtime.structured("Review S.", SCHEMA, "review")
+        first, second = self.notices()
+        self.assertIs(first["modelOutput"], True)
+        self.assertNotIn("modelOutput", second)
+
     def test_retries_are_spread_by_a_few_seconds_of_jitter(self):
         spread = []
 

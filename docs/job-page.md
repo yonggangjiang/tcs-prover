@@ -27,7 +27,11 @@ growing.* One mark shows where the run is:
 While the job works, the status card says when the last event arrived (*Last
 activity 2m 05s ago*) and, while something waits to retry, what waits and since
 when: a failed model call, a command that could not run (such as compiling the
-PDF without TeX), or saving a file.
+PDF without TeX), or saving a file. A job whose model calls keep failing the
+same way says so under its title, as the Overview lists it under **Needs your
+attention**: at once for an account out of credit or a usage limit, otherwise
+after 15 minutes of the same failure (see
+[Retries](retries.md#what-needs-you)); its retries go on every minute.
 
 **Run settings**, below the activity log, lists the models and settings the job
 runs with. Its **Proof author** row ends with how the author works:
@@ -408,12 +412,73 @@ and the coordinator's team members), with its model, tokens, timing and status.
   the author's session files and the discovery folders, and their one-shot
   calls are marked as not recorded.
 - **It outlives the job.** Deleting a job, and emptying the trash, leave its
-  record; nothing deletes a record by itself. TCS Prover's routes list the
-  records (`GET /records`), delete one (`DELETE /records/<run folder>`, refused
-  while the job works), list and show a job's model calls, and give the
-  training download (`GET /jobs/<run folder>/training-record`, a ZIP of every
-  request in full, every item once, each context window, each critic round,
-  the transcript and the record's own files, such as the copied sessions,
-  Claude Code's output and Codex's event logs and tool results, nothing
-  replaced or left out); the page's views of them are
-  still to come (see [Developers](developers.md#job-records)).
+  record; nothing deletes a record by itself. Only you delete one, on the
+  **Records** page (below).
+
+### Model calls
+
+**Model calls · 18** on the Live activity card (the count follows the record)
+opens the job's **Model calls** page: the list of its calls at the left, the
+chosen call at the right. Each row is one model request: its number, its role
+(*Coordinator · round 1*, *Member 2 · assignment 3*, *Independent critic ·
+round 1*), its start time, its model, how long it took and its tokens in and
+out, its status (a check mark when done, *Failed*, *Cancelled*,
+*Interrupted*, *Not recorded*) and a crossed-out eye when the provider kept
+its reasoning hidden. **All**, **Coordinator** (**Author** for a job without a
+coordinator), **Members** and **Critics** filter the list, and the search box
+keeps the rows whose role, model, status or failure has your words; a number
+counts as a whole number (*round 3* finds the round 3 calls, not call 213), and
+a number alone also finds the call with that number. While the
+job works, the list grows as calls are recorded (the page looks every 5
+seconds, every 30 once nothing changed for a minute).
+
+The chosen call shows, from the top:
+
+- why it failed or was cancelled, when it did;
+- how long it took, and its input (cached) and output (reasoning) tokens;
+- **Sent**: the instructions and the tools in one line each (**Show** opens
+  them), then only the items new since the previous call of the same
+  conversation, such as the output of the tool it called last; **Full
+  request** shows the whole request exactly as recorded (a Codex call's:
+  Claude Code's output does not carry the request it sent);
+- **Received**, in the order it came: the reasoning summary, the placeholder
+  *Hidden reasoning · N tokens* (OpenAI and Anthropic send no raw reasoning;
+  the encrypted copy that came back is kept), each code cell with the searches
+  and commands it ran (**Show the text it read** opens what a search
+  returned), each tool call with its output, and the answer. A request Claude
+  Code gave up on shows its report (*API Error: 400 …*) as Claude Code's, not
+  as an answer of the model;
+- usage, timing, and **Not in this record**: what this route cannot hold, such
+  as token probabilities and the details only the network carries.
+
+**Raw JSON** saves the call's exact request and response. Previous and next
+(and the arrow keys in the list) step through the calls the list shows, and
+follow it as you type, filter or a call is recorded; each call has its own
+address, which opens with its row in sight in the list. On a phone the list
+and the call take turns (**All calls** goes back). A job with no record (one
+started before records were kept, or whose record you deleted) says so plainly,
+and leads back to the job while it is listed.
+
+**Training record**, on the Live activity card and the Model calls page,
+downloads the job's training record as one ZIP
+(`<run folder>-training-record.zip`): every request in full, every item once,
+each context window, each critic round, the transcript and the record's own
+files, such as the copied sessions, Claude Code's output and Codex's event logs
+and tool results, nothing replaced or left out. The button counts what arrived;
+a download that fails part way saves nothing, and the button and the page say
+it failed (the server's log says why, such as a record file it cannot read).
+
+### Records
+
+**Records**, under Configure in the sidebar (with the size of all records),
+lists every record on this computer: its problem, when it started, its size
+with a bar, and whether its job is kept (**Open** goes to it) or was deleted.
+**All**, **Job kept** and **Job deleted** filter the list; **Newest first** or
+**Largest first** sort it. A record's title opens its Model calls page, also a
+deleted job's. **Delete** asks first, in the page: it says that this cannot be
+undone, whether the job stays (with its proof and files; its page then shows no
+model calls) or was deleted (this record is the last copy of what its models
+were sent and answered), and how much space it frees. A job that works keeps
+its record: stop it, or wait for its reply, before deleting it (the window says
+so). TCS Prover's routes behind these pages are in
+[Developers](developers.md#job-records).

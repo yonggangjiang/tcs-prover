@@ -624,7 +624,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   reports: a `team_wait` that the failed attempt's CLI was running ends without
   taking a report or an attention (`Team.release_waits()`, from goal_session's
   cleanup on both paths). A member's retry notes carry `attempt`, counted per
-  assignment, so only the first two stay pinned (`important_record()`). Records: **Author subagent started/finished/failed** with
+  assignment, so only the first two stay pinned (`important_record()`), and
+  the failure in plain words and the provider's line (`failure`,
+  `failureReason`: `describe_failure()`) with `retryAt`, so the server can list a
+  member that keeps failing under Needs your attention (see
+  [Repeating failures](#repeating-failures-and-needs-your-attention)). Records: **Author subagent started/finished/failed** with
   `subagentMember`, `subagentModel` and `subagentReport`, and the members'
   `codex_event` records (`root: false`). Every record of one assignment, its
   retry notes included, carries its id `subagentId` (`member-<n>-<k>`,
@@ -929,7 +933,9 @@ writes a job's record, `ui/model_calls.py` reads it.
 - **Routes** (the session token like every route; field names in
   `~/tcs-work/fixes/record-contract.md`): `GET /jobs/<id>/model-calls?offset=&limit=`
   (time order, `limit` 1 to 1,000, 100 by default; a failed or cancelled
-  call's reason, `error`, in its row and its detail as in `calls.jsonl`), `GET
+  call's reason, `error`, in its row and its detail as in `calls.jsonl`; a job
+  without a record gets 404 with `jobExists`, whether the job is listed, and
+  then its `title`, so that its page leads back to the job), `GET
   /jobs/<id>/model-calls/<callId>` (what was sent new, what came back, usage,
   placeholders; a code cell's nested tool calls from the trace; a Codex call's
   previous request is its thread's in whichever process sent it, as a paused
@@ -957,7 +963,9 @@ writes a job's record, `ui/model_calls.py` reads it.
   `manifest.json`; sent in HTTP/1.1
   chunks of about `CHUNK_BYTES`, 64 KiB: a download that fails part way gets
   no last chunk, so the browser reports it failed, and its archive no central
-  directory, so no ZIP reader takes it for whole), `GET /records` and
+  directory, so no ZIP reader takes it for whole; the server's log says why,
+  such as a record file that cannot be read, but not for a browser that went
+  away), `GET /records` and
   `DELETE /records/<run>` (409 while the job's runner, review or reply turn
   runs). They read the record folder, so a deleted job's record still answers.
   The download runs in the server, which hosts every job, so it is written in
@@ -977,6 +985,70 @@ writes a job's record, `ui/model_calls.py` reads it.
   service's `encrypted_output`), Claude Code's request (system prompt, tools,
   parameters) and its web search's inner request, and the input of a web-cutoff
   one-shot call.
+- **The pages** (`ui/app.js`, the part from `// --- Records and model calls` to
+  its end marker; `ui/styles.css`, the part named after option B; the owner's
+  layout pick of 13-14 Nov 2026): **Records** (`?records=1`, under Configure;
+  `GET /records`, every 15 s on the page and every minute elsewhere for the
+  sidebar's total; `DELETE /records/<run>` after the in-page confirmation, whose
+  409 shows in it), a record's **Model calls** (`?calls=<run folder>`, with
+  `&batch=` from a job's page and `&call=<id>` once a call is chosen; it reads
+  every page of 1,000 rows and the role menus' models once (`GET /api-models`,
+  for the models' names, as it reads no job's settings), then the count every
+  5 s, every 30 s once it stayed the same for a minute, and every page again
+  when the count or the problems change; a call's detail is read once and read
+  again when its row changes or, while a tool call of it has no output, when a
+  later call of its own conversation is recorded, and drawn again only if it
+  changed), the Live activity card's **Model
+  calls · N** (the count at most every 10 s) and **Training record** (the
+  streamed ZIP read with `fetch()` and the token, counted as it arrives; a read
+  that fails saves nothing and says so). Every request goes outside the job
+  request queue. A call's outputs name their tool from the previous call,
+  which the page reads too. Both lists are drawn in place: a row is built once
+  and drawn again only when what it shows changed, rows a filter or the words
+  take out are kept to be put back, and the one with the focus never moves
+  (`placeChildren()`), so a list that grows or a record that grows keeps the
+  focus and the list's place; a long record's rows out of sight are not laid
+  out (`content-visibility`). Opened (by a link, its address, a reload, Back
+  or Forward), the Model calls page scrolls its list to the chosen row.
+
+## Repeating failures and Needs your attention
+
+A model call that keeps failing is retried every minute without limit (see
+[Retries](retries.md)), and the server lists its job under Needs your attention
+meanwhile (owner's
+decision, 14 Nov 2026; `App.attention()`): at once when its failure's or the
+provider's words (`failure`, `failureReason`; never the status text, which
+quotes a refused answer, nor a refused answer's detail, which may quote the
+model's values) say the account is out of credit
+(`workflow_runner.out_of_credit()`: Claude Code's
+"Credit balance is too low", "insufficient credits" or "balance", "payment
+required") or a usage limit (or a login, `NEEDS_YOU_FAILURES`: whichever call
+has it, also while another call waits to retry for another reason or failed
+after it), otherwise once the same failure has repeated for
+`FAILING_ATTENTION_SECONDS` (15 minutes; kind `failing`, *Model calls keep
+failing*). `App._follow_failures()` keeps each call's failure while it keeps
+failing: a retry status with `retryAt` (keyed as the waits are: its
+`activityLabel`, `node` or `stage`), a member's retry note (`member:<id>`) or
+a paused author's reply's (`conversation:<id>:`); the same failure is the same
+plain words (`failure`, with the provider's line after a generic one such as
+"the CLI stopped unexpectedly") once request IDs and numbers are left out
+(`_failure_signature()`). The streak ends with the model's own output for that
+call (a `codex_event` item other than the user's message or an error, as the
+runner counts an attempt that worked), its step's result (`STEP_RESULT_KINDS`)
+or the next step (a `Workflow step:` status of its stage), the end of a
+member's assignment, or the runner's end. A structured call whose model worked
+in the failed attempt (`failureKind` `invalid_answer` or `subagent`, or the
+retry status's `modelOutput`, which `structured()` sets when the attempt
+streamed output before it failed) is still failing at its next attempt's
+output: as its runner counts it, it works again only once an answer is
+accepted, so a critic whose answers are refused every minute is listed after
+15 minutes. So the job stays listed
+between attempts (the usage and login lines too) and the list's notifications
+fire once. Out-of-credit words are not plain words of `_FAILURE_PATTERNS`: the
+retry notes the models read stay as they were. A content filter's refusal
+(`_CONTENT_FILTER`: "content filtering policy", `content_filter`, Azure's
+"content management policy") is never a request the endpoint refuses
+(`settings_failure()`), so it is retried like any passing failure.
 
 ## HTTP API notes
 
@@ -991,17 +1063,21 @@ are ignored.
 `webSearch` (off for every connection saved before it existed) turns on Codex
 0.160's own web search (web.run), which posts each search to `<base
 URL>/alpha/search` with the connection's key and request source. Saving it on
-(`POST /api-models` with `webSearch: true`) first sends one probe search
+(`POST /api-models` with `webSearch: true`) first sends one test search
 (`probe_web_search()`: `{id, model, commands: {search_query: [{q}]}, settings:
 {allowed_callers: ["direct"], external_web_access: true}, max_output_tokens:
 2500}`, the shape Codex sends); it stays on only if the answer is HTTP 2xx with
 a JSON object whose `output` is text (at most `WEB_SEARCH_PROBE_MAX_BYTES`, 4
 MiB, of the answer is read; a longer one is refused, saying so), and the
 connection keeps the result as
-`webSearchCheck` `{ok, at, message}`, which the editor shows (the connection's
-key is removed from the message, as from a Test's, since an error page may
-quote the header it received). A saved connection
-that stays the same (URL, key, request source, format) is not probed again. A
+`webSearchCheck` `{ok, at, message}`, which the editor shows after "Web search
+through this connection is on:" or "stays off:", the message's first word in
+lower case (*is on: the test search answered (514 characters).*; the
+connection's key is removed from the message, as from a Test's, since an error
+page may quote the header it received; a result saved in the earlier words,
+*The probe search answered …*, reads as *The test search answered …*). A saved
+connection that stays the same (URL, key, request source, format) is not
+tested again. A
 new live job records the connections of its models that have it on as
 `apiWebSearch` in its state and `job-settings.json`; every runner of the job
 gets `--set api_web_search=[...]` (the review worker `--api-web-search`), and
