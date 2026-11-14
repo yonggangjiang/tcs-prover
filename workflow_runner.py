@@ -4441,7 +4441,11 @@ def _codex_member_attempt(prompt, model, effort, summary, *, directory, conversa
             monitor.close()
             _finish_trace(trace)
             if completed is not None:
-                record(member_usage(completed, trace), False)
+                try:
+                    completed = member_usage(completed, trace)
+                except Exception:  # noqa: BLE001 - Codex's own event is recorded whatever the record could add.
+                    pass
+                record(completed, False)
         output = answer.read_text(encoding="utf-8", errors="replace") if answer.exists() else ""
         stopped = monitor.stopped("member")
         if stopped is not None:

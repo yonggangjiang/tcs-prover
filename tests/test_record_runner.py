@@ -289,6 +289,11 @@ class MemberUsageTests(RecordedJob):
         [call] = records.Record(self.record_folder).calls.read()
         self.assertEqual((call["status"], call.get("usage")), ("interrupted", None))
 
+    def test_a_usage_that_cannot_be_read_still_records_the_turn_as_codex_wrote_it(self):
+        with mock.patch.object(runtime, "member_usage", side_effect=OSError("record unreadable")):
+            completed, = [event for event in self.attempt() if event.get("type") == "turn.completed"]
+        self.assertEqual(completed, {"type": "turn.completed", "usage": self.CONVERSATION})
+
     def test_without_the_record_s_usage_the_turn_stays_as_codex_wrote_it(self):
         event = {"type": "turn.completed", "usage": dict(self.CONVERSATION)}
         self.assertEqual(runtime.member_usage(event, None), event)

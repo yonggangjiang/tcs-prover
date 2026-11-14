@@ -269,8 +269,9 @@ type a model id.
   runs send TCS Prover's team tools to a coordinator (a tool in the namespace
   `mcp__tcs`; for a model the Codex CLI runs as "Responses Lite", such as
   gpt-6.1-sol, in the same place of the request as the Codex CLI puts it), with
-  the first such model of the catalog, else its first model, and it says plainly
-  whether the model called the tool back with its namespace. When it did not
+  the first such model of the catalog, else its first model (one model per
+  Test, within its own 30-second deadline), and it says plainly whether the
+  model called the tool back with its namespace. When it did not
   (the endpoint refused the request, the model called the tool without its
   namespace, which the Codex CLI refuses, or called none), the line is a
   warning, and the saved connection's row keeps it: a coordinator on that

@@ -1830,7 +1830,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     watch_class = getattr(runtime, "CoordinatorWatch", None)
     team_watch = (watch_class(lambda kind, **fields: emit(kind, threadId=thread, **fields))
                   if coordinator and team is not None and watch_class is not None else None)
-    replies = set()
+    replies = {"last": None}  # The newest answer's message ID: its content blocks come one after another.
     held, told = {}, set()  # Live instructions that could not be sent, and those already reported.
     # The newest CLI message, and the control request that checks a quiet CLI still answers.
     activity = {"last": time.monotonic(), "probe": None, "at": None}
@@ -2652,8 +2652,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     if _session_id(message.get("uuid")):
                         state["anchor"] = str(message["uuid"]).lower()
                     reply = (message.get("message") or {}).get("id") if isinstance(message.get("message"), dict) else None
-                    if team_watch is not None and isinstance(reply, str) and reply and reply not in replies:
-                        replies.add(reply)  # Each content block of one answer comes in a message of its own.
+                    if team_watch is not None and isinstance(reply, str) and reply and reply != replies["last"]:
+                        replies["last"] = reply  # Each content block of one answer comes in a message of its own.
                         team_watch.model_call()
                 continue
             if kind == "control_response":
