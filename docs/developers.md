@@ -752,8 +752,11 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   is the payload file removed; the bundle goes when its process has ended and
   the byte copies of its manifest and event log read back. A request that never
   ended gets status `interrupted`. A bundle whose manifest or events are not of
-  schema version 1 (a later Codex) stays as it is, its requests marked `trace
-  format not recognized`. A process's trace folder is held with a `.claim` lock
+  schema version 1 (a later Codex: the installed one updates itself) stays as
+  it is, its requests marked `trace format not recognized` as their starts are
+  read, and the record's problems say so as soon as a running process's bundle
+  is found to be one, since its raw files then grow with the process. A
+  process's trace folder is held with a `.claim` lock
   while it runs; at the next start (`records.store_leftovers()`: every runner,
   review worker and reply turn of the job, the server for every record when it
   starts, and each snapshot) the folders nobody holds are stored, so a crash

@@ -239,6 +239,26 @@ class TraceIngestTests(RecordCase):
         self.assertEqual(listing["calls"][0]["placeholderKinds"], ["trace_format_not_recognized"])
         self.assertIn("their format is not recognized", " ".join(listing["recordState"]["problems"]))
 
+    def test_an_unknown_trace_format_is_shown_while_its_process_runs(self):
+        # The installed Codex updates itself: a long author process may write a format this code does not read,
+        # whose raw files then grow for hours.
+        bundle = Bundle(self.trace, schema=2)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), [ANSWER])
+        ingest = self.ingest(bundle, final=False)
+        listing = model_calls.call_list("run-1")
+        self.assertEqual([(row["status"], row["placeholderKinds"]) for row in listing["calls"]],
+                         [("trace format not recognized", ["trace_format_not_recognized"])])
+        self.assertTrue(any(self.trace.name in problem and "kept as Codex writes them" in problem
+                            for problem in listing["recordState"]["problems"]), listing["recordState"]["problems"])
+        bundle.call("call-b", request([PROMPT, ANSWER, PROMPT]), [ANSWER])
+        ingest.step()
+        ingest.step(final=True)
+        self.assertEqual([(call["callId"], call["status"]) for call in self.record.calls.read()],
+                         [("call-a", "trace format not recognized"), ("call-b", "trace format not recognized")])
+        self.assertTrue((bundle.folder / "payloads" / "2.json").is_file())  # Kept raw.
+        self.assertEqual(len((self.record.folder / "problems.jsonl").read_text().splitlines()), 1)
+
     def test_a_manifest_of_another_schema_version_alone_keeps_the_bundle_raw(self):
         bundle = Bundle(self.trace)
         bundle.thread_started()

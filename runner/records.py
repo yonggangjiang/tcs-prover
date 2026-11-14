@@ -767,8 +767,9 @@ class TraceIngest:
     file removed. A model request gets its line in calls.jsonl when its end event arrives; finish() gives the requests
     the process never ended status "interrupted", stores payload files no event named, keeps byte copies of the
     bundle's manifest.json and trace.jsonl and removes the raw bundle once those copies read back. A bundle whose
-    manifest or events are not of TRACE_SCHEMA_VERSION is left as it is; its requests are marked "trace format not
-    recognized".
+    manifest or events are not of TRACE_SCHEMA_VERSION is left as it is; its requests get lines with status "trace
+    format not recognized" as their starts are read, and the record's problems say so as soon as a running process's
+    bundle is found to be one (its raw files then grow with the process).
     """
 
     def __init__(self, record, label, raw):
@@ -782,7 +783,9 @@ class TraceIngest:
         self.ended = {line.get("callId") for line in record.calls.read()
                       if line.get("process") == label and line.get("bundle") == self.raw.name}
         self.recognized = None
-        self.unrecognized = []  # request starts seen in a bundle of an unknown format
+        self.unrecognized = []  # request starts of a bundle of an unknown format not given a line yet
+        self.starts = 0  # how many request starts of an unknown format were read
+        self.said = False  # whether the record's problems say that this bundle's format is not recognized
 
     def _check_manifest(self):
         manifest = read_json(self.raw / "manifest.json")
@@ -829,6 +832,13 @@ class TraceIngest:
             if entries:
                 self.stored.add(entries)
                 self._verify(entries)
+            if self.recognized is False:
+                self._unrecognized_calls(calls)
+                if not final and not self.said:
+                    self.said = True
+                    note_problem(self.record, f"The trace of Codex process {self.label} is in a format TCS Prover "
+                                              "does not read (another Codex version): its raw files are kept as Codex "
+                                              "writes them, and its calls are marked \"trace format not recognized\".")
             if final:
                 self._finish(calls)
             for call in calls:
@@ -842,6 +852,20 @@ class TraceIngest:
         payload = event.get("payload") if isinstance(event, dict) else None
         if isinstance(payload, dict) and payload.get("type") in REQUEST_STARTS:
             self.unrecognized.append(event)
+
+    def _unrecognized_calls(self, calls):
+        """Lines for the requests a bundle of an unknown format started since the last step."""
+
+        for event in self.unrecognized:
+            payload = event["payload"]
+            identity = payload.get("inference_call_id") or payload.get("compaction_request_id")
+            if isinstance(identity, str) and identity not in self.ended:
+                calls.append({"program": "codex", "kind": REQUEST_STARTS[payload["type"]],
+                              "process": self.label, "bundle": self.raw.name, "callId": identity,
+                              "threadId": payload.get("thread_id"), "startedMs": event.get("wall_time_unix_ms"),
+                              "model": payload.get("model"), "status": "trace format not recognized"})
+        self.starts += len(self.unrecognized)
+        self.unrecognized = []
 
     def _payload(self, reference, entries, thread=None):
         """Store the payload file an event names (once); return its path or None."""
@@ -953,15 +977,7 @@ class TraceIngest:
         """The process ended: close the open requests, keep the bundle's files, remove the raw bundle."""
 
         if not self.recognized:
-            for event in self.unrecognized:
-                payload = event["payload"]
-                identity = payload.get("inference_call_id") or payload.get("compaction_request_id")
-                if isinstance(identity, str) and identity not in self.ended:
-                    calls.append({"program": "codex", "kind": REQUEST_STARTS[payload["type"]],
-                                  "process": self.label, "bundle": self.raw.name, "callId": identity,
-                                  "threadId": payload.get("thread_id"), "startedMs": event.get("wall_time_unix_ms"),
-                                  "model": payload.get("model"), "status": "trace format not recognized"})
-            if not self.unrecognized and f"bundle:{self.raw.name}" not in self.ended:
+            if not self.starts and f"bundle:{self.raw.name}" not in self.ended:
                 calls.append({"program": "codex", "kind": "process", "process": self.label, "bundle": self.raw.name,
                               "callId": f"bundle:{self.raw.name}", "startedMs": _modified_ms(self.raw),
                               "status": "trace format not recognized"})
