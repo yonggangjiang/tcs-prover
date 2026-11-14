@@ -892,8 +892,10 @@ writes a job's record, `ui/model_calls.py` reads it.
   `retrieval.runtime.configuration()`: project files off, the login shell off,
   the commands' environment policy, the bundled skills turned off, the
   features, Windows' sandbox), of each only what that file set (the answer's
-  `user` layer, which the run's isolation check verifies is that file in the
-  Codex home TCS Prover gives the process) or the command line: never an entry
+  `user` layer: the process's HOME and CODEX_HOME are both the private home
+  TCS Prover makes for it, so no file of the user's can be that layer, and the
+  run's isolation check verifies it is that home's `config.toml`) or the
+  command line: never an entry
   another layer added beside them, nor Codex's own record of the project it
   trusts. Checked against the real Codex 0.160 app-server's answer in a
   web-cutoff preflight of the author and of a structured call (no model call):

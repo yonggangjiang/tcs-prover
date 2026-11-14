@@ -1893,7 +1893,10 @@ RECORDED_FEATURES = ("goals", "multi_agent", "multi_agent_v2", "fast_mode", "cod
 # it trusts, "projects", which it writes into that file).
 ISOLATION_SETTINGS = ("project_doc_max_bytes", "allow_login_shell", "shell_environment_policy", "skills", "features",
                       "windows")
-# The layer of the answer's origins that is TCS Prover's private configuration file in a web-cutoff run.
+# The layer of the answer's origins that is TCS Prover's private configuration file in a web-cutoff run: Codex's "user"
+# layer is the configuration file of its Codex home, and a web-cutoff process gets both CODEX_HOME and HOME set to the
+# private home TCS Prover made for it (retrieval.runtime.isolated_environment()), so no file of the user's can be that
+# layer; the run's isolation check (verify_rpc()) also refuses one that is not that home's config.toml.
 ISOLATION_LAYER = "user"
 # A whole answer to config/read has these fields (Codex 0.160: the effective settings, where each came from, and the
 # layers when asked for them); what recorded_settings() keeps of one has "config" and "leftOut".
