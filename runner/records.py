@@ -15,7 +15,8 @@ The server names a live job's record for its runner, review worker and reply tur
 none: their isolation is unchanged, and the server copies what they leave behind, copy_web_cutoff()). Records are
 never deleted automatically and outlive a deleted job; only the owner deletes one (delete_record()).
 
-Layout of <state>/records/<run folder name>/ (state = providers.state_directory()), owner-only:
+Layout of <state>/records/<run folder name>/ (state = providers.state_directory()), owner-only: every folder 0700 (an
+older record's are made so when it is next opened, Record), every file 0600:
 - manifest.json: the record's run folder, title, creation time and whether it is a web-cutoff run;
 - calls.jsonl: one line per model request (CallLog), written when the request ends; a request the program never
   finished (it was stopped or killed during the call) gets a line with status "interrupted";
@@ -190,17 +191,53 @@ def _fsync_folder(folder):
         os.close(descriptor)
 
 
-def _private_folder(path):
-    """Create an owner-only folder (and its parents) for the record."""
-
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+def _owner_only(folder):
     if os.name != "nt":
         try:
-            os.chmod(path, 0o700)
+            os.chmod(folder, 0o700)
         except OSError:
             pass
+
+
+def _private_folder(path):
+    """Create an owner-only folder (0700) for the record, and each missing folder above it owner-only too
+    (Path.mkdir(parents=True) gives the folders above the last one the default mode, 0755 under the usual umask)."""
+
+    path = Path(path)
+    missing, parent = [], path.parent
+    while parent != parent.parent and not parent.is_dir():
+        missing.append(parent)
+        parent = parent.parent
+    for folder in (*reversed(missing), path):
+        folder.mkdir(exist_ok=True, mode=0o700)
+        _owner_only(folder)
     return path
+
+
+_PRIVATE_TREES = set()  # The record folders whose every folder this process made owner-only (_private_tree())
+_PRIVATE_TREES_LOCK = threading.Lock()
+
+
+def _private_tree(folder):
+    """Make every folder of an existing record owner-only (0700), once per process: a record written before 14 Nov
+    2026 has folders of the default mode below its own (_private_folder() gave only the last folder of each path it
+    made its mode). A link is never followed."""
+
+    folder = Path(folder)
+    with _PRIVATE_TREES_LOCK:
+        if str(folder) in _PRIVATE_TREES:
+            return
+    if os.name == "nt" or os.path.islink(folder) or not folder.is_dir():
+        return
+    for directory, _, _ in os.walk(folder):
+        try:
+            mode = os.lstat(directory).st_mode
+        except OSError:
+            continue
+        if stat.S_ISDIR(mode) and stat.S_IMODE(mode) != 0o700:
+            _owner_only(directory)
+    with _PRIVATE_TREES_LOCK:
+        _PRIVATE_TREES.add(str(folder))
 
 
 def _open_private(path, mode):
@@ -486,13 +523,16 @@ class CallLog:
 
 
 class Record:
-    """One job's record folder (see the module's description)."""
+    """One job's record folder (see the module's description). Opening one (by a route, the Records list, a runner,
+    review worker or reply turn of its job, or the server's snapshot) makes every folder of an older record
+    owner-only (_private_tree())."""
 
     def __init__(self, folder):
         self.folder = Path(folder)
         self.objects = Objects(self.folder / "items")
         self.calls = CallLog(self.folder / "calls.jsonl")
         self._lock = FileLock(self.folder / ".lock")
+        _private_tree(self.folder)
 
     @classmethod
     def create(cls, folder, **manifest):

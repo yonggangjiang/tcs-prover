@@ -1021,5 +1021,82 @@ class StoreTests(RecordCase):
             self.assertEqual(fresh.get(sha), value)
 
 
+@unittest.skipIf(os.name == "nt", "POSIX modes")
+class FolderModeTests(RecordCase):
+    """Every folder of a record is owner-only (0700), each folder made above a new one too, under the usual umask
+    (022, with which Path.mkdir(parents=True) gives those 0755); an older record's are made so when it is next
+    opened."""
+
+    def setUp(self):
+        super().setUp()
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        change = mock.patch.object(records, "_PRIVATE_TREES", set())  # As a new process: no record opened yet.
+        change.start()
+        self.addCleanup(change.stop)
+
+    @staticmethod
+    def modes(folder):
+        """{path below ``folder``: mode} of ``folder`` and of every folder below it (links left out)."""
+
+        return {path.relative_to(folder).as_posix(): oct(path.stat().st_mode & 0o777)
+                for path in (folder, *folder.rglob("*")) if path.is_dir() and not path.is_symlink()}
+
+    def test_every_folder_a_record_makes_is_owner_only(self):
+        recorder = records.Recorder(records.record_folder("run-2"))
+        self.addCleanup(recorder.close)
+        record = recorder.record
+        # A Codex process's trace, stored when the process ends (codex/<label>/<bundle>/).
+        environment, process = recorder.codex_process({}, role="critic", label="Critic coordinator")
+        Bundle(environment[records.TRACE_ROOT_ENV]).standard()
+        process.finish()
+        # A Claude Code stream, a copied Codex session (sources/codex/<thread>/<yyyy>/<mm>/<dd>/) and a snapshot whose
+        # prompt set has a folder of its own.
+        stream = recorder.claude_stream(role="critic")
+        for line in stream_lines():
+            stream.line(json.dumps(line))
+        stream.finish()
+        home = self.root / "codex-home"
+        rollout(home / "sessions" / "2026" / "11" / "13" / f"rollout-2026-11-13T10-00-00-{THREAD}.jsonl",
+                {"id": THREAD, "session_id": THREAD})
+        self.assertTrue(recorder.keep_codex_session(home, THREAD))
+        prompts = self.root / "controller-prompts"
+        (prompts / "workflow").mkdir(parents=True)
+        (prompts / "workflow" / "author.txt").write_text("Prove it.", encoding="utf-8")
+        records.snapshot(record, prompts=prompts)
+        modes = self.modes(record.folder)
+        for made in (f"sources/codex/{THREAD}/2026/11/13", "codex", "codex-trace", "claude", "items",
+                     "transcript/prompts/workflow"):
+            self.assertIn(made, modes)
+        self.assertEqual({path: mode for path, mode in modes.items() if mode != "0o700"}, {})
+
+    def test_an_older_record_s_folders_are_made_owner_only_when_it_is_next_opened(self):
+        outside = self.root / "outside"
+        (outside / "inner").mkdir(parents=True)
+        for path in (outside, outside / "inner"):
+            path.chmod(0o755)
+        openings = {"run-old-1": lambda: model_calls.call_list("run-old-1"),
+                    "run-old-2": lambda: records.Record.create(records.record_folder("run-old-2")),
+                    "run-old-3": lambda: model_calls.record_list(lambda name: False)}
+        for name, opening in openings.items():
+            with self.subTest(name=name):
+                folder = records.record_folder(name)
+                # As a record written before 14 Nov 2026 left them: the folders above the last of each path its
+                # writer made have the default mode.
+                for relative in (f"sources/codex/{THREAD}/2026/11/13", "codex/20261113T000000-critic-abcdef/trace-1",
+                                 "transcript/prompts/workflow", "claude", "items"):
+                    (folder / relative).mkdir(parents=True)
+                records.write_atomic(folder / "manifest.json", b"{}\n")
+                (folder / "sources" / "elsewhere").symlink_to(outside, target_is_directory=True)
+                self.assertIn("0o755", self.modes(folder).values())
+                opening()
+                self.assertEqual(set(self.modes(folder).values()), {"0o700"})
+        # A link in a record, or in place of one, is never followed.
+        records.record_folder("run-link").symlink_to(outside, target_is_directory=True)
+        model_calls.call_list("run-link")
+        self.assertEqual([oct(path.stat().st_mode & 0o777) for path in (outside, outside / "inner")],
+                         ["0o755", "0o755"])
+
+
 if __name__ == "__main__":
     unittest.main()

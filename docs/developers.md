@@ -719,7 +719,12 @@ login's) carry none, and no setting turns the header off. `runner/records.py`
 writes a job's record, `ui/model_calls.py` reads it.
 
 - **Where.** `<state>/records/<run folder name>/` (`providers.state_directory()`,
-  `.tcs-prover/` by default), owner-only folders and files. The server makes it
+  `.tcs-prover/` by default), owner-only: every folder 0700, each one made above
+  a new folder too (`records._private_folder()`), every file 0600. A record
+  written before 14 Nov 2026 has folders of the default mode below its own; they
+  are made 0700 when it is next opened (a route, the Records list, a runner or a
+  snapshot of its job; `records._private_tree()`, once per process, never
+  through a link). The server makes it
   when a runner, review worker or reply turn of the job first starts and names it
   in `TCS_PROVER_RECORD` (`records.RECORD_ENV`) for that process; `environment()`
   removes the variable from every child, so no CLI or model command learns it. A
