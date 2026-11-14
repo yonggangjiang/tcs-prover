@@ -1071,12 +1071,11 @@ class TeamTests(TeamCase):
             self.assertTrue(head.startswith(f'Member 2 (lab-model) failed the assignment "{line}".'), head)
             self.assertEqual(text, refused_report(2, reason))
             self.assertEqual((self.run_dir / f"team/member-2/{count}-report.md").read_text(), text)
-        # The activity log's lines keep their words.
+        # The activity log's lines say what failed and end with the service's words: what a paused job is told (that
+        # a retry cannot fix it, and that a job waiting for it continues once its settings change) is not a member's.
         self.assertEqual(tuple(event["text"] for event in self.labelled("Author subagent failed")),
                          (f"{runtime.REQUEST_REJECTED_LABEL}: Lab gateway refuses the requests this job sends as "
-                          f"invalid ({rejected}). A retry cannot fix this: change its API connection's settings under "
-                          "Models & API (or the endpoint); a job waiting for it continues once its settings change.",
-                          f"authentication failed: {refused}"))
+                          f"invalid ({rejected}).", f"authentication failed: {refused}"))
         # Each ended at once, never retried.
         self.assertEqual(len([call for call in self.codex_calls() if "lab-model" in call["argv"]]), 2)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
@@ -1099,11 +1098,8 @@ class TeamTests(TeamCase):
         self.assertTrue(head.startswith('Member 1 (lab-model) failed the assignment "NOMODEL Lemma A".'), head)
         self.assertEqual(text, refused_report(1, reason))
         self.assertEqual((self.run_dir / "team/member-1/1-report.md").read_text(), text)
-        # The activity log's line keeps its words.
         failed, = self.labelled("Author subagent failed")
-        self.assertEqual(failed["text"], f"{runtime.MODEL_UNAVAILABLE_LABEL}: Lab gateway cannot be used ({reason}). "
-                                         "A retry cannot fix this: check its API connection under Models & API (Load "
-                                         "models lists the models its key can use).")
+        self.assertEqual(failed["text"], f"{runtime.MODEL_UNAVAILABLE_LABEL}: Lab gateway cannot be used ({reason}).")
         # It ended at once, never retried, and the member works when it gets the assignment again.
         self.assertEqual(len(self.codex_calls()), 1)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"

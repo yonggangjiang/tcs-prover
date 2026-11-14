@@ -41,10 +41,11 @@ import test_model_retry as retry_test
 KEY = "sk-gateway-0123456789abcdef"
 ENDPOINT_MESSAGE = captured.ENDPOINT_MESSAGE
 # What the job says for the OpenAI-format connection "Gateway": a structured call ends with it, the author pauses with
-# it, and a team member's activity-log line keeps it.
-REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid "
-            f"({ENDPOINT_MESSAGE}). A retry cannot fix this: change its API connection's settings under Models & API "
-            "(or the endpoint); a job waiting for it continues once its settings change.")
+# it; a team member's activity-log line says only what failed, ending with the endpoint's words (REJECTED_LINE).
+REJECTED_LINE = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid "
+                 f"({ENDPOINT_MESSAGE}).")
+REJECTED = (f"{REJECTED_LINE} A retry cannot fix this: change its API connection's settings under Models & API (or "
+            "the endpoint); a job waiting for it continues once its settings change.")
 # The endpoint's words for a model it does not have (EXEC_400_NO_MODEL, EXEC_404_NO_MODEL), and for a key it refuses.
 NO_MODEL = "The requested model 'lab-model' does not exist."
 NOT_FOUND = ("unexpected status 404 Not Found: The model `lab-model` does not exist or you do not have access to it., "
@@ -99,11 +100,11 @@ class CapturedTextTests(jobs_test.Isolated):
                 problem = runtime.settings_failure(runtime.Error(text), self.model)
                 self.assertIsInstance(problem, runtime.RequestRejected)
                 self.assertEqual(str(problem), REJECTED)
-                self.assertEqual(problem.reason, ENDPOINT_MESSAGE)
+                self.assertEqual((problem.reason, problem.summary), (ENDPOINT_MESSAGE, REJECTED_LINE))
                 self.assertFalse(runtime.retryable_failure(problem))
                 # A team member's assignment comes back as its API connection's refusal, with the endpoint's words.
                 self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
-                                 team.Refusal(REJECTED, ENDPOINT_MESSAGE))
+                                 team.Refusal(REJECTED_LINE, ENDPOINT_MESSAGE))
 
     def test_a_body_written_over_several_lines_is_refused_in_the_endpoint_words(self):
         for path, text in self.texts(captured.EXEC_400_INDENTED).items():
@@ -111,7 +112,7 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertIn('\n    "error": {\n        "message": ', text)
                 self.assertEqual(str(runtime.settings_failure(runtime.Error(text), self.model)), REJECTED)
                 self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
-                                 team.Refusal(REJECTED, ENDPOINT_MESSAGE))
+                                 team.Refusal(REJECTED_LINE, ENDPOINT_MESSAGE))
 
     def test_the_same_body_from_a_built_in_model_stays_retried(self):
         for path, text in {**self.texts(), "author": author_text()}.items():
@@ -151,18 +152,18 @@ class CapturedTextTests(jobs_test.Isolated):
 
     def test_a_model_the_endpoint_does_not_have_is_unavailable_and_a_members_refusal(self):
         for lines, reason in ((captured.EXEC_400_NO_MODEL, NO_MODEL), (captured.EXEC_404_NO_MODEL, NOT_FOUND)):
-            message = (f"{runtime.MODEL_UNAVAILABLE_LABEL}: Gateway cannot be used ({reason}). A retry cannot fix "
-                       "this: check its API connection under Models & API (Load models lists the models its key can "
-                       "use).")
+            line = f"{runtime.MODEL_UNAVAILABLE_LABEL}: Gateway cannot be used ({reason})."
             for path, text in self.texts(lines).items():
                 with self.subTest(reason=reason, path=path):
                     # The author and a structured call keep their message, with what to do.
                     problem = runtime.settings_failure(runtime.Error(text), self.model)
                     self.assertIsInstance(problem, runtime.ModelUnavailable)
-                    self.assertEqual((str(problem), problem.reason), (message, reason))
-                    # A team member on the API connection: the refusal's report, with the endpoint's words.
+                    self.assertEqual(str(problem), f"{line} A retry cannot fix this: check its API connection under "
+                                                   "Models & API (Load models lists the models its key can use).")
+                    self.assertEqual((problem.reason, problem.summary), (reason, line))
+                    # A team member on the API connection: the refusal's report, its line ending with the words.
                     self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
-                                     team.Refusal(message, reason))
+                                     team.Refusal(line, reason))
                     # A built-in model's unavailable model reports as before, with what to do.
                     self.assertEqual(runtime.member_problem(runtime.Error(text), "gpt-6.1-sol"),
                                      f"{runtime.MODEL_UNAVAILABLE_LABEL}: GPT 6.1 Sol cannot be used ({reason}). A "

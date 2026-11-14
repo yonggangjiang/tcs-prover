@@ -536,23 +536,25 @@ class HandoffRefused(Error):
 class ModelUnavailable(ConfigurationError):
     """The provider says the model does not exist or that this account cannot use it.
 
-    ``reason`` is the provider's own words, as the message quotes them.
+    ``reason`` is the provider's own words, as the message quotes them; ``summary`` is the message's first sentence,
+    which ends with them: what fails, without what to do about it.
     """
 
-    def __init__(self, message, reason=""):
+    def __init__(self, message, reason="", summary=""):
         super().__init__(message)
-        self.reason = reason
+        self.reason, self.summary = reason, summary or message
 
 
 class RequestRejected(ConfigurationError):
     """An API model's endpoint refuses the request as invalid (HTTP 400): its settings do not fit the endpoint.
 
-    ``reason`` is the endpoint's own words, as the message quotes them.
+    ``reason`` is the endpoint's own words, as the message quotes them; ``summary`` is the message's first sentence,
+    which ends with them: what fails, without what to do about it.
     """
 
-    def __init__(self, message, reason=""):
+    def __init__(self, message, reason="", summary=""):
         super().__init__(message)
-        self.reason = reason
+        self.reason, self.summary = reason, summary or message
 
 
 # How the job page and the controller recognize these settings problems in a
@@ -664,14 +666,14 @@ def settings_failure(error, model=None):
     if _MODEL_UNAVAILABLE.search(text):
         fix = ("check its API connection under Models & API (Load models lists the models its key can use)" if api
                else "check that the model exists and that your login may use it")
-        return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
-                                f"A retry cannot fix this: {fix}.", reason)
+        summary = f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason})."
+        return ModelUnavailable(f"{summary} A retry cannot fix this: {fix}.", reason, summary)
     if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text))
             and not _CLAUDE_HISTORY_MISMATCH.search(text)):
-        return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
-                               f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
-                               "under Models & API (or the endpoint); a job waiting for it continues once its "
-                               "settings change.", reason)
+        summary = f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as invalid ({reason})."
+        return RequestRejected(f"{summary} A retry cannot fix this: change its API connection's settings under "
+                               "Models & API (or the endpoint); a job waiting for it continues once its settings "
+                               "change.", reason, summary)
     return None
 
 
@@ -3986,13 +3988,15 @@ def member_problem(error, model):
     endpoint that refuses the request, and any other configuration error. When the member's API connection refused
     the request (its endpoint rejects it as invalid, says the model does not exist or that its key cannot use it, or
     refuses its key) it is a team.Refusal, whose report tells the coordinator in the service's words that the problem
-    may pass (team.REFUSED_REPORT); the member's record keeps the failure's own words. A built-in model's refused
-    login or unavailable model (its program's sign-in, no API connection) stays plain text.
+    may pass (team.REFUSED_REPORT); the member's record says what failed and ends with the service's words, without
+    the advice of a paused job (that a retry cannot fix it, or that a job waiting for it continues once its settings
+    change). A built-in model's refused login or unavailable model (its program's sign-in, no API connection) stays
+    plain text.
     """
 
     failure = settings_failure(error, model)
     if isinstance(failure, RequestRejected) or (isinstance(failure, ModelUnavailable) and providers.is_api_id(model)):
-        return team_module.Refusal(str(failure), failure.reason)
+        return team_module.Refusal(failure.summary, failure.reason)
     if failure is not None:
         return str(failure)
     if isinstance(error, (FinalError, providers.ProviderError)):

@@ -174,6 +174,10 @@ ENDPOINT_MESSAGE = "max_tokens: 64000 > 32000, which is the maximum allowed numb
 REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid (API Error: 400 "
             f"{ENDPOINT_MESSAGE}). A retry cannot fix this: change its API connection's settings under Models & API "
             "(or the endpoint); a job waiting for it continues once its settings change.")
+# What a team member's activity-log line says of it: what failed, ending with the endpoint's words (the rest of
+# REJECTED is what a paused job is told).
+REJECTED_LINE = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid "
+                 f"(API Error: 400 {ENDPOINT_MESSAGE}).")
 
 
 def replayed(line):
@@ -218,10 +222,10 @@ class CapturedTextTests(jobs_test.Isolated):
             self.assertEqual(str(runtime.settings_failure(runtime.Error(runner_text(CAPTURED_400[1], prefix)), model)),
                              REJECTED)
         # A team member's failed assignment: the coordinator reads the endpoint's words in a report that keeps the
-        # work going (team.REFUSED_REPORT); the member's record keeps the message.
-        self.assertEqual(problem.reason, f"API Error: 400 {ENDPOINT_MESSAGE}")
+        # work going (team.REFUSED_REPORT); the member's record says what failed, ending with them.
+        self.assertEqual((problem.reason, problem.summary), (f"API Error: 400 {ENDPOINT_MESSAGE}", REJECTED_LINE))
         self.assertEqual(runtime.member_problem(runtime.Error(text), model),
-                         team.Refusal(REJECTED, f"API Error: 400 {ENDPOINT_MESSAGE}"))
+                         team.Refusal(REJECTED_LINE, f"API Error: 400 {ENDPOINT_MESSAGE}"))
 
     def test_the_same_text_from_a_built_in_claude_model_stays_retried(self):
         text = runner_text(CAPTURED_400[1])
@@ -384,9 +388,9 @@ class TeamMemberTests(team_test.TeamCase):
         reason = f"API Error: 400 {ENDPOINT_MESSAGE}"
         self.assertTrue(report.endswith("\nREPORT:\n" + team_test.refused_report(1, reason)), report)
         self.assertNotIn("A retry cannot fix this", report)
-        # The activity log's line keeps its words.
+        # The activity log's line says what failed and ends with the endpoint's words.
         failed, = self.labelled("Author subagent failed")
-        self.assertEqual(failed["text"], REJECTED.replace("Gateway", "Lab Claude"))
+        self.assertEqual(failed["text"], REJECTED_LINE.replace("Gateway", "Lab Claude"))
         self.assertEqual(len(self.claude_starts()), 1)
         self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
                           and "retrying" in event.get("text", "")])

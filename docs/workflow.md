@@ -313,7 +313,8 @@ Claude Code's own subagents.
   refusal can also be temporary, the report tells the coordinator that it may
   be a temporary problem of the service or a wrong setting, and to keep the
   work going by giving the assignment to another member, or to the same member
-  again later.
+  again later. The member's line in the activity log says what failed and ends
+  with the service's words.
   Pause, Stop, the time limit and a restart stop the members with the
   coordinator; only their files stay.
 - **The team note.** `team_note` is added to the coordinator's first prompt,
