@@ -851,7 +851,11 @@ writes a job's record, `ui/model_calls.py` reads it.
   `transcript.json`, else a whole copy: an append that a crash or a full disk
   cut short is copied over, and until then readers take the members before it,
   `records.complete_members()`), `job-settings.json` and the controller's
-  `prompts/`.
+  `prompts/`. What it copies keeps of Codex's answers to `config/read` only
+  what the runner keeps now (`records.recorded_transcript()`, below): a
+  transcript written before 14 Nov 2026 holds them whole, and a snapshot taken
+  before then (its `transcript.json` lacks `settings`,
+  `records.SNAPSHOT_SETTINGS`) is copied whole again.
 - **Codex's settings in the transcript.** Codex's answer to `config/read` (at
   each start of an author, coordinator, reply or summary turn's app-server, at
   each liveness probe of TCS Prover's goal loop, and in a web-cutoff run's
@@ -860,7 +864,8 @@ writes a job's record, `ui/model_calls.py` reads it.
   server's command and environment (which can hold keys), the plugins and where
   each setting came from. TCS Prover acts on all of it, but `transcript.jsonl`
   (and so the record's snapshot and the training download) records only what it
-  sets or relies on (`workflow_runner.recorded_settings()`, about 3 KB): the
+  sets or relies on (`records.recorded_settings()`, with TCS Prover's
+  redaction `workflow_runner.recorded_settings()`, about 3 KB): the
   model, provider, reasoning, service tier, sandbox and approval, the permission
   profile in effect, web search, the context window and compaction limit, the
   features it sets, the subagent limits, every other setting the app-server's
@@ -871,7 +876,14 @@ writes a job's record, `ui/model_calls.py` reads it.
   saying how many other settings were left out; TCS Prover's redaction runs
   over it. No reader of the transcript needs more: the job page, the
   controller, the transcript viewer and the web-cutoff audit skip the answer,
-  and `retrieval.runtime.verify_rpc()` checks the answer itself.
+  and `retrieval.runtime.verify_rpc()` checks the answer itself. A transcript
+  written before 14 Nov 2026 holds each answer whole (about 76 KB in the first
+  real job): the record's snapshot of it and the training download keep the
+  same part of each (`records.recorded_transcript()`: a `codex_event` whose
+  `event` answers with a `config` table and its `origins`, rewritten as the
+  server writes a line, every other byte as it is), so neither carries the
+  user's whole configuration, an MCP server's environment or headers; the run
+  folder's own `transcript.jsonl` is left as it is.
 - **Web-cutoff runs.** Their isolation is unchanged: nothing is traced or
   streamed. `records.copy_web_cutoff()` copies the author's session files from
   the run's bundle (`<codexHome>/author/sessions`) and the discovery folders

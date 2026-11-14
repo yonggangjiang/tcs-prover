@@ -9,6 +9,8 @@ goal sessions run against the scripted app-server double of tests/test_goal_runt
 import ast
 import contextlib
 import copy
+import gzip
+import hashlib
 import io
 import json
 import os
@@ -19,6 +21,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import zipfile
 
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
@@ -616,6 +619,138 @@ class SettingsTranscriptTests(author_test.PipeCase):
                          ({"node_repl": {"enabled": False}, "docs": {"enabled": False},
                            f"gateway-{secret}": {"enabled": False}}, {"slack@openai-curated": {"enabled": False}},
                           {"_default": {"enabled": False}, "calendar": {"enabled": False}}))
+
+
+def transcript_line(entry):
+    """One transcript line as the server writes it (App.add_trace())."""
+
+    return json.dumps(entry, ensure_ascii=False) + "\n"
+
+
+def settings_line(identity, answer, stage="solve", **extra):
+    """A transcript line of an app-server's answer to config/read, as a runner from before 14 Nov 2026 recorded it
+    (``answer`` whole) or as the runner records it now (what recorded_settings() kept)."""
+
+    return transcript_line({"kind": "codex_event", "stage": stage, "node": "author", **extra,
+                            "event": {"id": identity, "result": answer}, "root": True,
+                            "time": "2026-11-14T03:05:17.064817+00:00"})
+
+
+class SettingsCopyTests(unittest.TestCase):
+    """A transcript written before 14 Nov 2026 holds Codex's whole answers to config/read (the user's whole Codex
+    configuration, MCP servers' environments and headers included): the record's snapshot of it and the training
+    download keep of each only what the runner keeps of one now (records.recorded_transcript()); the run folder's own
+    transcript.jsonl is left as it is."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        change = mock.patch.dict(os.environ, {providers.STORE_ENV: str(self.root / "state" / "api-models.json")})
+        change.start()
+        self.addCleanup(change.stop)
+        self.record = records.Record.create(records.record_folder("run-1"), title="A statement")
+        self.transcript = self.root / "run" / "transcript.jsonl"
+        self.transcript.parent.mkdir()
+        # As the first real job's transcript has them: the author's start, a reply turn's start, other events.
+        self.older = [
+            transcript_line({"kind": "status", "stage": "solve", "label": "Workflow step: author", "time": "t"}),
+            settings_line(2, CONFIG_ANSWER),
+            transcript_line({"kind": "codex_event", "stage": "solve", "node": "author",
+                             "event": {"id": 3, "result": {"thread": {"id": THREAD}}}, "root": True, "time": "t"}),
+            # Written by another writer, compact: kept byte for byte, as is every line that is not such an answer.
+            '{"kind":"diagnostic","stage":"solve","text":"Codex read its config: ∀ x, ünïcode"}\n',
+            transcript_line({"kind": "codex_event", "stage": "solve", "event": {"id": 4, "error": {
+                "code": -32603, "message": "config/read failed"}}, "time": "t"}),
+            settings_line(2, CONFIG_ANSWER, stage="conversation", conversationId="c_760e51ded6"),
+            # What the runner records now: kept as it is.
+            settings_line(5, runtime.recorded_settings(CONFIG_ANSWER)),
+        ]
+
+    def kept(self, lines):
+        """``lines`` as the record keeps them: each whole answer's result is what the runner records now."""
+
+        kept = []
+        for text in lines:
+            entry = json.loads(text)
+            result = entry.get("event", {}).get("result") if isinstance(entry.get("event"), dict) else None
+            if isinstance(result, dict) and "origins" in result:
+                entry["event"]["result"] = runtime.recorded_settings(result)
+                text = transcript_line(entry)
+            kept.append(text)
+        return "".join(kept).encode("utf-8")
+
+    def assert_private_left_out(self, data):
+        for private in PRIVATE:
+            self.assertNotIn(private.encode(), data, private)
+
+    def test_a_snapshot_keeps_of_each_whole_answer_only_what_the_runner_keeps_now(self):
+        self.transcript.write_text("".join(self.older), encoding="utf-8")
+        records.snapshot(self.record, self.transcript)
+        data = records.transcript_data(self.record)
+        self.assertEqual(data, self.kept(self.older))
+        self.assert_private_left_out(data)
+        self.assertLess(len(data), len("".join(self.older).encode()))
+        # The lines appended later (a liveness probe's answer, say) are kept the same way.
+        later = [settings_line(7, CONFIG_ANSWER), transcript_line({"kind": "status", "stage": "solve", "time": "u"})]
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write("".join(later))
+        records.snapshot(self.record, self.transcript)
+        data = records.transcript_data(self.record)
+        self.assertEqual(data, self.kept(self.older + later))
+        self.assert_private_left_out(data)
+        # The run folder's own transcript is left as it is.
+        self.assertEqual(self.transcript.read_text(encoding="utf-8"), "".join(self.older + later))
+
+    def test_a_snapshot_taken_before_is_copied_whole_again_with_only_those_settings(self):
+        # As a snapshot of an earlier build left it: the transcript as it came, and its state without "settings".
+        data = "".join(self.older).encode()
+        self.transcript.write_bytes(data)
+        folder = self.record.folder / "transcript"
+        records.write_atomic(folder / "transcript.jsonl.gz", gzip.compress(data, mtime=0))
+        records.write_atomic(folder / "transcript.json", json.dumps({
+            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "size": (folder / "transcript.jsonl.gz").stat().st_size}).encode())
+        later = [transcript_line({"kind": "status", "stage": "solve", "time": "u"})]
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write("".join(later))
+        records.snapshot(self.record, self.transcript)
+        kept = records.transcript_data(self.record)
+        self.assertEqual(kept, self.kept(self.older + later))
+        self.assert_private_left_out((folder / "transcript.jsonl.gz").read_bytes())
+        self.assert_private_left_out(gzip.decompress((folder / "transcript.jsonl.gz").read_bytes()))
+        self.assertEqual(json.loads((folder / "transcript.json").read_text())["settings"], records.SNAPSHOT_SETTINGS)
+
+    def test_the_download_of_a_snapshot_taken_before_keeps_only_those_settings(self):
+        data = "".join(self.older).encode()
+        folder = self.record.folder / "transcript"
+        records.write_atomic(folder / "transcript.jsonl.gz", gzip.compress(data, mtime=0))
+        buffer = io.BytesIO()
+        model_calls.training_record("run-1", buffer)
+        archive = zipfile.ZipFile(io.BytesIO(buffer.getvalue()))
+        kept = archive.read("transcript/transcript.jsonl")
+        self.assertEqual(kept, self.kept(self.older))
+        for name in archive.namelist():
+            self.assert_private_left_out(archive.read(name))
+
+    def test_only_a_whole_answer_to_config_read_is_kept_in_part(self):
+        answer = {"id": 2, "result": CONFIG_ANSWER}
+        self.assertTrue(records.settings_answer(answer))
+        # An answer as the runner records it now, a notification, a request of Codex and an error are no such answer.
+        for event in ({"id": 2, "result": runtime.recorded_settings(CONFIG_ANSWER)},
+                      {"method": "config/warning", "params": {"config": {}}},
+                      {"id": 9, "method": "item/tool/requestUserInput", "result": CONFIG_ANSWER},
+                      {"id": 2, "error": {"code": 1, "message": "no"}}, {"id": 2, "result": {"thread": {}}}):
+            self.assertFalse(records.settings_answer(event), event)
+        # An answer without its origins (fields of config/read only) is one; another answer with a "config" is not.
+        self.assertTrue(records.settings_answer({"id": 2, "result": {"config": {"model": "m"}}}))
+        self.assertFalse(records.settings_answer({"id": 2, "result": {"config": {}, "thread": {}}}))
+        # A lone surrogate (from a JSON escape), which the server writes escaped, stays escaped.
+        entry = json.loads(settings_line(2, copy.deepcopy(CONFIG_ANSWER)))
+        entry["event"]["result"]["config"]["model"] = "m\ud800"
+        kept = records.recorded_transcript((json.dumps(entry) + "\n").encode("ascii"))
+        self.assertIn(b'"model": "m\\ud800"', kept)
+        self.assertEqual(set(json.loads(kept)["event"]["result"]), {"config", "leftOut"})
 
 
 if __name__ == "__main__":

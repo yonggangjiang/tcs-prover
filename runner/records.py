@@ -1769,6 +1769,156 @@ def close():
         _RECORDER.close()
 
 
+# --- Codex's settings in the transcript ---------------------------------------------------------------------------------
+
+# What a job's transcript keeps of Codex's answer to config/read (recorded_settings(): the runner keeps it so, and the
+# record's snapshot and the training download keep a transcript written before it did so too, recorded_transcript()).
+# The answer holds the user's whole Codex configuration: in the first real job about 75 KB at each start of an
+# app-server, with every project folder the user trusts, each MCP server's command and environment (which can hold
+# keys), the plugins, and where each setting came from. What is kept are the effective settings the run relies on:
+# these (the context window and the compaction limit too, whoever set them: TCS Prover's command line for an API
+# connection's model, else the user) ...
+RECORDED_SETTINGS = ("model", "model_provider", "model_reasoning_effort", "model_reasoning_summary", "service_tier",
+                     "approval_policy", "sandbox_mode", "sandbox_workspace_write", "default_permissions",
+                     "web_search", "model_context_window", "model_auto_compact_token_limit",
+                     "model_auto_compact_token_limit_scope")
+# ... of these tables only the entries TCS Prover sets (the web search tool, the subagent limits) ...
+RECORDED_ENTRIES = {"tools": ("web_search",), "agents": ("enabled", "max_concurrent_threads_per_session", "max_depth")}
+# ... and of the features those it sets on an app-server's command line or in a thread's settings. Every other setting
+# the app-server's command line set is kept too (TCS Prover's own flags, whose origin is "sessionFlags": an API
+# connection's context window, compaction limit and provider entry, the variables its commands never inherit, a
+# workflow's features, ...); of the MCP servers only their names, never their definitions.
+RECORDED_FEATURES = ("goals", "multi_agent", "multi_agent_v2", "fast_mode", "code_mode", "shell_tool", "apps",
+                     "plugins", "view_image", "standalone_web_search")
+# A whole answer to config/read has these fields (Codex 0.160: the effective settings, where each came from, and the
+# layers when asked for them); what recorded_settings() keeps of one has "config" and "leftOut".
+SETTINGS_ANSWER_FIELDS = ("config", "origins", "layers")
+# What a record's transcript snapshot keeps of Codex's settings (transcript/transcript.json "settings"): a snapshot
+# without it was taken before 14 Nov 2026 and holds Codex's whole answers, so the next snapshot copies it whole again.
+SNAPSHOT_SETTINGS = 1
+
+
+def _settings_of_layer(config, origins, layer):
+    """The settings of ``config`` (Codex's effective settings) that one layer of the configuration set, as a tree of the
+    same shape. ``layer`` is the type the answer's origins name it by ("sessionFlags": the app-server's command line,
+    TCS Prover's own flags). ``origins`` names the layer each value came from by its path, the keys joined with dots
+    (an array's items by their index; a feature with settings of its own, set on or off, as features.<name>.enabled):
+    a value is kept when it, or a value below it, came from that layer, a table with only such entries."""
+
+    flagged = {path for path, origin in origins.items()
+               if isinstance(path, str) and isinstance(origin, dict) and isinstance(origin.get("name"), dict)
+               and origin["name"].get("type") == layer}
+    above = {path[:index] for path in flagged for index, character in enumerate(path) if character == "."}
+
+    def kept(table, prefix):
+        found = {}
+        for key, value in table.items():
+            path = prefix + str(key)
+            if isinstance(value, dict) and path in above:
+                inner = kept(value, path + ".")
+                if inner:
+                    found[key] = inner
+            elif path in flagged or path in above:
+                found[key] = value
+        return found
+
+    return kept(config, "")
+
+
+def _settings_union(first, second):
+    """Two trees of settings taken from one configuration, as one (neither is changed)."""
+
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return first
+    union = dict(first)
+    for key, value in second.items():
+        union[key] = _settings_union(union[key], value) if key in union else value
+    return union
+
+
+def recorded_settings(result):
+    """What a transcript records of Codex's answer to config/read (``result``): {"config", "leftOut"}. TCS Prover acts
+    on the whole answer, never on this.
+
+    Of the effective settings ("config") it keeps RECORDED_SETTINGS, the entries of RECORDED_ENTRIES, the features of
+    RECORDED_FEATURES, the permission profile in effect (the one default_permissions names), every other setting the
+    app-server's command line set (_settings_of_layer()) and the names of the MCP servers, never their commands,
+    environments or headers; "leftOut" says in one sentence how many other settings were left out, with where each
+    setting came from (the answer's origins and layers). No reader of the transcript needs more: the job page, the
+    controller, the transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py) skip the
+    answer, and the author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc()) read the
+    answer itself. The runner runs TCS Prover's redaction over what is kept (workflow_runner.recorded_settings()), as
+    over every transcript record.
+    """
+
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    origins = result.get("origins") if isinstance(result.get("origins"), dict) else {}
+    kept = {key: config[key] for key in RECORDED_SETTINGS if key in config}
+    for key, names in RECORDED_ENTRIES.items():
+        if key in config:
+            table = config[key]
+            kept[key] = {name: table[name] for name in names if name in table} if isinstance(table, dict) else table
+    if "features" in config:
+        features = config["features"]
+        kept["features"] = ({name: value for name, value in features.items() if name in RECORDED_FEATURES}
+                            if isinstance(features, dict) else features)
+    if "permissions" in config:
+        profiles, profile = config["permissions"], config.get("default_permissions")
+        kept["permissions"] = (({profile: profiles[profile]} if isinstance(profile, str) and profile in profiles
+                                else {}) if isinstance(profiles, dict) else profiles)
+    kept = _settings_union(kept, _settings_of_layer(config, origins, "sessionFlags"))
+    if "mcp_servers" in config:
+        servers = config["mcp_servers"]
+        # Names only, also of a server the command line set, and as values, which the redaction reads: a server's
+        # definition holds its command, environment and headers.
+        kept["mcp_servers"] = sorted(str(name) for name in servers) if isinstance(servers, dict) else servers
+    left = sum(1 for key in config if key not in kept)
+    return {"config": kept, "leftOut": (
+        f"TCS Prover records the Codex settings the run relies on and every setting it gave this app-server on its "
+        f"command line: {left} other setting{'' if left == 1 else 's'} of the configuration, the other entries of the "
+        f"tables kept in part, and where each setting came from were left out.")}
+
+
+def settings_answer(event):
+    """Whether the ``event`` of a transcript's codex_event record is a Codex app-server's whole answer to config/read
+    (the user's whole Codex configuration), as a runner from before 14 Nov 2026 recorded it: an answer ("id", no
+    "method") whose result has a "config" table and where each setting came from ("origins"), or only the fields of
+    such an answer (SETTINGS_ANSWER_FIELDS); never what recorded_settings() kept of one (its "leftOut")."""
+
+    if not isinstance(event, dict) or "method" in event or "id" not in event:
+        return False
+    result = event.get("result")
+    return (isinstance(result, dict) and isinstance(result.get("config"), dict) and "leftOut" not in result
+            and (isinstance(result.get("origins"), dict) or set(result) <= set(SETTINGS_ANSWER_FIELDS)))
+
+
+def recorded_transcript(data):
+    """Transcript bytes as the record keeps them (its snapshot, the training download): the result of each Codex
+    app-server's whole answer to config/read that a runner from before 14 Nov 2026 recorded as it came
+    (settings_answer()) is what recorded_settings() keeps of it, its line written as the server writes a transcript
+    line; every other byte is kept as it is, a line the runner already recorded so too. The run folder's own
+    transcript.jsonl is never changed."""
+
+    if b'"config"' not in data:
+        return data
+    lines = data.split(b"\n")
+    for index, line in enumerate(lines):
+        if b'"config"' not in line or b'"codex_event"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+        if not isinstance(entry, dict) or entry.get("kind") != "codex_event" or not settings_answer(entry.get("event")):
+            continue
+        entry["event"] = {**entry["event"], "result": recorded_settings(entry["event"]["result"])}
+        try:
+            lines[index] = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            lines[index] = json.dumps(entry).encode("ascii")  # A lone surrogate from a JSON escape stays escaped.
+    return b"\n".join(lines)
+
+
 # --- Snapshots and web-cutoff copies (by the server) -------------------------------------------------------------------
 
 def snapshot(record, transcript=None, job_settings=None, prompts=None):
@@ -1777,7 +1927,9 @@ def snapshot(record, transcript=None, job_settings=None, prompts=None):
     The transcript (append-only) is added to transcript/transcript.jsonl.gz as one more gzip member holding the
     complete lines written since the last snapshot, after a check that the copied part is unchanged and that the file
     is exactly as the last verified snapshot left it (else it is copied whole again: an append that a crash or a full
-    disk cut short leaves bytes that would break every later member); each new member is read back.
+    disk cut short leaves bytes that would break every later member); each new member is read back. What is copied
+    keeps of Codex's answers to config/read only what recorded_transcript() keeps (a transcript written before 14 Nov
+    2026 holds them whole), and a snapshot taken before that was kept so (SNAPSHOT_SETTINGS) is copied whole again.
     job-settings.json and the prompts/ folder are copied whole.
     """
 
@@ -1817,26 +1969,30 @@ def _snapshot_transcript(folder, source):
         size = target.stat().st_size
     except OSError:
         size = None
-    # Appended to only when the file has the size the last verified snapshot left (transcript.json "size").
+    # Appended to only when the file has the size the last verified snapshot left (transcript.json "size"), which kept
+    # Codex's settings as recorded_transcript() does ("settings"; "bytes" and "sha256" are the transcript's own).
     whole = not (size is not None and size == state.get("size") and 0 < copied <= len(data)
-                 and _sha(data[:copied]) == state.get("sha256"))
+                 and _sha(data[:copied]) == state.get("sha256") and state.get("settings") == SNAPSHOT_SETTINGS)
     if whole:
-        write_atomic(target, gzip.compress(data, mtime=0))
-        good = gzip.decompress(target.read_bytes()) == data
+        kept = recorded_transcript(data)
+        write_atomic(target, gzip.compress(kept, mtime=0))
+        good = gzip.decompress(target.read_bytes()) == kept
     elif copied == len(data):
         return
     else:
-        member = gzip.compress(data[copied:], mtime=0)
+        kept = recorded_transcript(data[copied:])
+        member = gzip.compress(kept, mtime=0)
         with _open_private(target, "ab") as stream:
             offset = stream.seek(0, os.SEEK_END)
             stream.write(member)
             _fsync(stream)
         with open(target, "rb") as stream:
             stream.seek(offset)
-            good = gzip.decompress(stream.read()) == data[copied:]
+            good = gzip.decompress(stream.read()) == kept
     if good:
         write_atomic(folder / "transcript.json", json.dumps({"bytes": len(data), "sha256": _sha(data),
-                                                             "size": target.stat().st_size}).encode())
+                                                             "size": target.stat().st_size,
+                                                             "settings": SNAPSHOT_SETTINGS}).encode())
     else:
         write_atomic(folder / "transcript.json", b"{}")  # The next snapshot copies it whole.
 
