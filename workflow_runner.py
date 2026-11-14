@@ -560,7 +560,7 @@ _PASSING_CONDITION = re.compile(r"capacity|overload|high demand|temporar|\b429\b
 # Code reports it, "API Error: 400 <the endpoint's message>" (Claude Code 2.1.289, from a fake endpoint). Claude Code
 # words a conversation too long for the model ("Prompt is too long …") and a key out of credit ("Credit balance is too
 # low") otherwise, with no "API Error: 400": both stay retried, as do the three 400s it reports in its own words after
-# "API Error: 400" (_CLAUDE_HISTORY_MISMATCH).
+# "API Error: 400" (_CLAUDE_HISTORY_MISMATCH) and a content filter's refusal (_CONTENT_FILTER).
 _REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid[_ ]request[\s\S]{0,600}?\b400\b|"
                                r"\bAPI Error: 400\b", re.IGNORECASE)
 # Claude Code's own words after "API Error: 400", in place of the endpoint's message, when the endpoint refuses the
@@ -570,6 +570,12 @@ _REJECTED_REQUEST = re.compile(r"\b400\b[\s\S]{0,600}?invalid[_ ]request|invalid
 _CLAUDE_HISTORY_MISMATCH = re.compile(r"\bAPI Error: 400 (?:due to tool use concurrency issues|orphaned tool_result "
                                       r"in conversation history|duplicate tool_use ID in conversation history)\b",
                                       re.IGNORECASE)
+# A provider's content filter that refused a request or blocked its answer: Claude Code's "API Error: 400 Output blocked
+# by content filtering policy" (Anthropic's invalid_request_error), and the same refusal from an OpenAI-format endpoint
+# (a 400 with the code "content_filter", Azure OpenAI's "... content management policy"). No setting of the connection
+# causes it and a retry may well pass, so it is retried every minute like any passing failure (owner's decision, 14 Nov
+# 2026); every other 400 of the endpoint stays a request it refuses.
+_CONTENT_FILTER = re.compile(r"content[ _-]?filter|content management policy", re.IGNORECASE)
 
 
 def settings_failure(error, model=None):
@@ -579,8 +585,8 @@ def settings_failure(error, model=None):
     use (ModelUnavailable), an API model's endpoint that refuses the request
     as invalid (RequestRejected; a conversation that is too long is not
     that, nor one whose tool calls and results Claude Code reports as not
-    pairing up), or private TCS Prover state that cannot be used (a
-    ProviderError).
+    pairing up, nor a content filter's refusal), or private TCS Prover state
+    that cannot be used (a ProviderError).
     These end a structured call and pause an author with a message saying
     what to change; every other failure keeps being retried.
     """
@@ -609,7 +615,8 @@ def settings_failure(error, model=None):
                else "check that the model exists and that your login may use it")
         return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
                                 f"A retry cannot fix this: {fix}.")
-    if api and _REJECTED_REQUEST.search(text) and not _CLAUDE_HISTORY_MISMATCH.search(text):
+    if (api and _REJECTED_REQUEST.search(text) and not _CLAUDE_HISTORY_MISMATCH.search(text)
+            and not _CONTENT_FILTER.search(text)):
         return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
                                f"invalid ({reason}). A retry cannot fix this: change its API connection's settings "
                                "under Models & API (or the endpoint); a job waiting for it continues once its "

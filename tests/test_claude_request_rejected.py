@@ -15,7 +15,9 @@ key out of credit, which Claude Code words itself (CAPTURED_TOO_LONG, CAPTURED_C
 same "API Error: 400" from a built-in Claude model (the subscription route). So does the same endpoint's 400 for a
 conversation whose tool calls and tool results do not pair up: Claude Code reports its own words after "API Error: 400"
 in place of the endpoint's message (CAPTURED_HISTORY, CAPTURED_ORPHANED, CAPTURED_DUPLICATE), a fault in its record of
-the conversation that no setting fixes. The stand-in CLI replays the captured lines with its own session ID
+the conversation that no setting fixes. So does a content filter's refusal, "API Error: 400 Output blocked by content
+filtering policy" (CONTENT_FILTER; owner's decision, 14 Nov 2026), also from an OpenAI-format endpoint: no setting
+causes it, and a retry may pass. The stand-in CLI replays the captured lines with its own session ID
 (tests/test_claude_cli.py); no test starts a model.
 """
 
@@ -168,6 +170,20 @@ HISTORY_TEXTS = {CAPTURED_HISTORY[1]: "API Error: 400 due to tool use concurrenc
                  CAPTURED_ORPHANED: "API Error: 400 orphaned tool_result in conversation history.",
                  CAPTURED_DUPLICATE: "API Error: 400 duplicate tool_use ID in conversation history."}
 ENDPOINT_MESSAGE = "max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for claude-gw"
+# Claude Code's words when Anthropic's content filter blocks the answer, as the owner reported them (14 Nov 2026): "API
+# Error: 400 Output blocked by content filtering policy". Not a capture: the captured 400's two lines with that message.
+FILTER_MESSAGE = "Output blocked by content filtering policy"
+CONTENT_FILTER = tuple(line.replace(ENDPOINT_MESSAGE, FILTER_MESSAGE) for line in CAPTURED_400)
+# The same refusal from an OpenAI-format endpoint as Codex reports a 400 (Azure OpenAI's content filter: its message and
+# the code "content_filter"), with and without an invalid_request_error type.
+OPENAI_FILTERED = (
+    'Codex review failed: unexpected status 400 Bad Request: {"error": {"message": "The response was filtered due to the '
+    "prompt triggering Azure OpenAI's content management policy. Please modify your prompt and retry.\", \"type\": "
+    '"invalid_request_error", "param": "prompt", "code": "content_filter", "status": 400}}',
+    'Codex review failed: unexpected status 400 Bad Request: {"error": {"message": "The response was filtered due to the '
+    "prompt triggering Azure OpenAI's content management policy.\", \"type\": null, \"param\": \"prompt\", \"code\": "
+    '"content_filter", "status": 400}}',
+)
 # What the job says for the Anthropic-format connection "Gateway" (the label of claude_test's API model).
 REJECTED = (f"{runtime.REQUEST_REJECTED_LABEL}: Gateway refuses the requests this job sends as invalid (API Error: 400 "
             f"{ENDPOINT_MESSAGE}). A retry cannot fix this: change its API connection's settings under Models & API "
@@ -240,6 +256,31 @@ class CapturedTextTests(jobs_test.Isolated):
             "Claude review failed: API Error: 400 messages.1: `tool_use` ids were found without `tool_result` blocks "
             "immediately after: toolu_01AbCdEfGhIjKlMn.\nAPI status 400."), model), runtime.RequestRejected)
 
+    def test_a_content_filter_refusal_stays_retried(self):
+        # Owner's decision (14 Nov 2026): "API Error: 400 Output blocked by content filtering policy" is no setting of
+        # the connection; it is retried every minute like any passing failure, by every role and a team member.
+        model = self.model()
+        self.assertEqual(runner_text(CONTENT_FILTER[1]), f"Claude review failed: API Error: 400 {FILTER_MESSAGE}\n"
+                                                          "API status 400.")
+        for prefix in ("Claude review failed: ", "Claude author turn failed: ", "Claude reply turn failed: "):
+            text = runner_text(CONTENT_FILTER[1], prefix)
+            with self.subTest(text=text):
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), model))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), model))
+                self.assertTrue(runtime.retryable_failure(runtime.Error(text)))
+        # The same refusal from an OpenAI-format endpoint, whatever type its 400 names.
+        openai = self.api_model()["id"]
+        for text in OPENAI_FILTERED:
+            with self.subTest(text=text):
+                self.assertIsNone(runtime.settings_failure(runtime.Error(text), openai))
+                self.assertIsNone(runtime.member_problem(runtime.Error(text), openai))
+        # Every other rule stays: the endpoint's other 400s are requests it refuses, in either format.
+        self.assertIsInstance(runtime.settings_failure(runtime.Error(runner_text(CAPTURED_400[1])), model),
+                              runtime.RequestRejected)
+        self.assertIsInstance(runtime.settings_failure(runtime.Error(
+            'Codex review failed: unexpected status 400 Bad Request: {"error": {"type": "invalid_request_error", '
+            '"message": "Unsupported parameter"}}'), openai), runtime.RequestRejected)
+
     def test_a_conversation_too_long_a_key_out_of_credit_429_overload_and_5xx_stay_retried(self):
         model = self.model()
         texts = [runner_text(CAPTURED_TOO_LONG), runner_text(CAPTURED_CREDIT)]
@@ -292,6 +333,43 @@ class ClaudeCodeRunTests(claude_test.FakeClaudeCase):
         self.assertEqual(result, {"statement": "S", "notes": ""})
         self.assertEqual(len(self.records("start")), 2)
         self.assertIn(runtime.RETRY_LABEL, self.labels())
+
+    def test_a_structured_call_blocked_by_the_content_filter_is_retried(self):
+        model = self.api_model()
+        self.script([refused(message=CONTENT_FILTER[0], result=CONTENT_FILTER[1]),
+                     ["init", {"structured": {"statement": "S", "notes": ""}}]])
+        result, _ = runtime.structured("Review.", claude_test.SCHEMA, "review", model=model)
+        self.assertEqual(result, {"statement": "S", "notes": ""})
+        self.assertEqual(len(self.records("start")), 2)
+        self.assertIn(runtime.RETRY_LABEL, self.labels())
+
+    def test_an_author_blocked_by_the_content_filter_is_retried(self):
+        model = self.api_model()
+        self.script([refused("echo", exits=False, message=CONTENT_FILTER[0], result=CONTENT_FILTER[1])])
+        with mock.patch.object(claude_cli, "sandbox_supported", return_value=True):
+            with self.assertRaises(runtime.WorkflowPaused) as paused:
+                next(self.goal(model=model))
+        self.assertTrue(paused.exception.reason.startswith(
+            f"Claude author turn failed: API Error: 400 {FILTER_MESSAGE}"), paused.exception.reason)
+        self.assertNotIn(runtime.REQUEST_REJECTED_LABEL, paused.exception.reason)
+        self.assertIsNotNone(paused.exception.retry)
+        self.assertFalse([event for event in self.events
+                          if event["kind"] == "status" and event.get("label") == "Author paused"])
+
+    def test_a_paused_authors_reply_blocked_by_the_content_filter_is_retried(self):
+        model = self.api_model()
+        session = "6a1d2f8e-3c4b-4d5e-8f9a-0b1c2d3e4f52"
+        self.script([refused("echo", exits=False, message=CONTENT_FILTER[0], result=CONTENT_FILTER[1]),
+                     conversation_test.claude_reply("Reply after a retry.")])
+        code = runtime.run_author_conversation(conversation_test.WORKFLOW, {
+            "author_model": model, "goal_thread_id": session, "goal_cwd": str(self.run_dir)},
+            {"schemaVersion": 1, "id": conversation_test.CONVERSATION_ID, "kind": "message", "text": "Which step?",
+             "notice": ""})
+        self.assertEqual(code, 0)
+        reply, = [event for event in self.events if event["kind"] == "conversation_reply"]
+        self.assertEqual(reply["text"], "Reply after a retry.")
+        self.assertEqual(len(self.records("start")), 2)
+        self.assertFalse([event for event in self.events if event.get("label") == "Author reply failed"])
 
     def test_the_author_pauses_with_the_message_and_no_retry(self):
         model = self.api_model()
@@ -381,6 +459,20 @@ class TeamMemberTests(team_test.TeamCase):
         model = self.anthropic_model()
         self.scenario.write_text(json.dumps({"turns": [
             refused(message=CAPTURED_HISTORY[0], result=CAPTURED_HISTORY[1]), ["init", {"emit": {
+                "type": "assistant", "parent_tool_use_id": None, "uuid": "m1",
+                "message": {"content": [{"type": "text", "text": "Lemma A holds."}]}}},
+                {"result": {"result": "Lemma A holds."}}]]}))
+        crew = self.crew([{"model": model, "effort": "high"}])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertIn("REPORT:\nLemma A holds.", report)
+        self.assertNotIn(runtime.REQUEST_REJECTED_LABEL, report)
+        self.assertEqual(len(self.claude_starts()), 2)
+
+    def test_a_member_blocked_by_the_content_filter_is_retried(self):
+        model = self.anthropic_model()
+        self.scenario.write_text(json.dumps({"turns": [
+            refused(message=CONTENT_FILTER[0], result=CONTENT_FILTER[1]), ["init", {"emit": {
                 "type": "assistant", "parent_tool_use_id": None, "uuid": "m1",
                 "message": {"content": [{"type": "text", "text": "Lemma A holds."}]}}},
                 {"result": {"result": "Lemma A holds."}}]]}))

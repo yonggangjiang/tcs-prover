@@ -85,7 +85,9 @@ resets. To use fewer at once, set a [running-jobs limit](batches.md#running-jobs
   out of credit, and Claude Code's own words for a conversation whose tool calls
   and results do not match ("API Error: 400 due to tool use concurrency issues",
   "… orphaned tool_result …", "… duplicate tool_use ID …") are retried every
-  minute instead.
+  minute instead. So is a content filter's refusal ("API Error: 400 Output
+  blocked by content filtering policy", or an OpenAI-format endpoint's 400 with
+  the code `content_filter`): no setting causes it, and a retry may pass.
 - OpenAI-format models need the native Codex binary on `PATH`: a `codex`
   launcher that replaces `CODEX_HOME` cannot run them.
 - Anthropic-format models run in bare mode (the activity log says why) when your

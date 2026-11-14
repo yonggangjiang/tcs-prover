@@ -136,7 +136,10 @@ web-cutoff policy) and programming errors.
   Error: 400" with the endpoint's message). Both list the job under **Needs your
   attention**. Such a job resumes by itself once its API connection's settings
   change; one whose built-in model is unavailable waits for **Resume**. A key
-  store that cannot be read for a moment is retried like any failure.
+  store that cannot be read for a moment is retried like any failure, and so
+  is a content filter's refusal (Claude Code's "API Error: 400 Output blocked
+  by content filtering policy", or an OpenAI-format endpoint's 400 with the
+  code `content_filter`): no setting causes it, and a retry may pass.
 - An author stopped by a safety check, or a Codex author whose saved thread ID is
   missing, waits for you (**Resume**, or **Continue proof author** for a missing
   thread ID).

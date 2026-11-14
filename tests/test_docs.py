@@ -171,6 +171,14 @@ class AccuracyTests(unittest.TestCase):
                       "conversation whose tool calls and results do not match (\"API Error: 400 due to tool use "
                       "concurrency issues\", \"… orphaned tool_result …\", \"… duplicate tool_use ID …\") are retried "
                       "every minute instead.", trouble)
+        # So is a content filter's refusal, in either format (owner's decision, 14 Nov 2026;
+        # workflow_runner._CONTENT_FILTER).
+        self.assertIn("So is a content filter's refusal (\"API Error: 400 Output blocked by content filtering policy\", "
+                      "or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting causes it, and a "
+                      "retry may pass.", trouble)
+        self.assertIn("so is a content filter's refusal (Claude Code's \"API Error: 400 Output blocked by content "
+                      "filtering policy\", or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting "
+                      "causes it, and a retry may pass.", flat(DOCS / "retries.md"))
 
     def test_structured_calls_without_subagents_are_said_to_have_codex_s_agents_off(self):
         # Owner decision (13 Nov 2026): `-c agents.enabled=false` for every structured call of Codex without the
