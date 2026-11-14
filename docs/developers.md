@@ -1010,7 +1010,9 @@ meanwhile (owner's
 decision, 14 Nov 2026; `App.attention()`): at once when its words say the
 account is out of credit (`workflow_runner.out_of_credit()`: Claude Code's
 "Credit balance is too low", "insufficient credits" or "balance", "payment
-required") or a usage limit, otherwise once the same failure has repeated for
+required") or a usage limit (or a login, `NEEDS_YOU_FAILURES`: whichever call
+has it, also while another call waits to retry for another reason or failed
+after it), otherwise once the same failure has repeated for
 `FAILING_ATTENTION_SECONDS` (15 minutes; kind `failing`, *Model calls keep
 failing*). `App._follow_failures()` keeps each call's failure while it keeps
 failing: a retry status with `retryAt` (keyed as the waits are: its

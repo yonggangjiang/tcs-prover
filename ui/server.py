@@ -144,6 +144,9 @@ FAILING_ATTENTION_SECONDS = 15 * 60
 # The record kinds that end a step with its model's answer: a call of that stage that kept failing works again.
 STEP_RESULT_KINDS = {"review_result", "critic_result", "author_result", "final_result", "convention_result",
                      "conversation_reply"}
+# A failed model call's plain words (workflow_runner._FAILURE_PATTERNS) that only you can fix: listed at once under
+# Needs your attention, whichever call has them (App.attention()).
+NEEDS_YOU_FAILURES = {"authentication failed", "usage limit reached"}
 # How often a running web-cutoff job's author sessions and discovery folders are copied into its record (seconds):
 # its discovery prunes a folder only once it is a day old (retrieval/historical_codex_discovery.py).
 RECORD_COPY_SECONDS = 600
@@ -5309,7 +5312,14 @@ class App:
             # earlier words "Claude CLI missing or incompatible" of a saved job or an older runner.
             return {"kind": "cli", "title": f"{runtime.CLI_NAMES[cli]} not installed or not working",
                     "retrying": True, "text": str(waiting.get("text") or failure)}
-        if cause not in {"authentication failed", "usage limit reached"}:
+        # A login or a usage limit needs you at once whichever call has it: a team member's is listed also while
+        # another call waits to retry for another reason, or failed after it (the newest such call).
+        pressing = [streak for streak in streaks if streak.get("failure") in NEEDS_YOU_FAILURES
+                    and phase in {"reviewing", "running"}]
+        if cause not in NEEDS_YOU_FAILURES and pressing:
+            retry = max(pressing, key=lambda streak: streak["last"])
+            cause, role = retry["failure"], TRACE_STAGE_ROLES.get(retry.get("stage"), "author")
+        if cause not in NEEDS_YOU_FAILURES:
             return self._failing_attention(state, streaks)
         model = state.get(f"{role}Model") or ""
         try:

@@ -277,6 +277,37 @@ class FailingCallTests(jobs_test.Isolated):
         self.follow(app, item_event())
         self.assertIsNone(app.attention())
 
+    def test_a_team_members_usage_limit_is_listed_at_once_whatever_the_other_calls_do(self):
+        app = self.running(stage="solve", activeNode="author")
+
+        def member_failed(number, model, failure, attempt=1):
+            return {"kind": "diagnostic", "stage": "solve", "node": "author", "subagentMember": number,
+                    "subagentModel": model, "subagentId": f"member-{number}-1", "attempt": attempt,
+                    "text": f"Member {number} ({model}): a model call failed ({failure}); retrying in 60 s, running "
+                            "the assignment again.", "failure": failure, "retryAt": START + 10**6}
+
+        # Member 1 (its own API connection) is at its usage limit while the coordinator's call waits to retry a
+        # connection that was lost.
+        self.follow(app, member_failed(1, "Lab Claude", "usage limit reached"))
+        self.now += 5
+        self.follow(app, retry("connection lost", activity="", stage="solve", node="author"))
+        attention = app.attention()
+        self.assertEqual((attention["kind"], attention["title"]), ("usage", "Usage limit reached"))
+        self.assertTrue(attention["text"].startswith("Lab Claude reports a usage limit."), attention)
+        # Listed every minute after, while member 2 fails later for another reason and the coordinator goes on.
+        for minute in range(1, 6):
+            self.now += 60
+            self.follow(app, member_failed(1, "Lab Claude", "usage limit reached", minute + 1))
+            self.now += 5
+            self.follow(app, member_failed(2, "Other gateway", "model at capacity", minute))
+            self.follow(app, retrying_now(minute + 2, activity="", stage="solve"))
+            self.assertEqual(app.attention()["kind"], "usage", minute)
+        # Member 1 works again: the others' failures are not yet 15 minutes old.
+        self.follow(app, {"kind": "codex_event", "stage": "solve", "node": "author", "root": False,
+                          "subagentId": "member-1-1", "subagentMember": 1,
+                          "event": {"type": "item.completed", "item": {"type": "agent_message", "text": "On it."}}})
+        self.assertIsNone(app.attention())
+
     def test_a_team_member_that_keeps_failing(self):
         app = self.running(stage="solve", activeNode="author")
 
