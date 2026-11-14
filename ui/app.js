@@ -97,12 +97,19 @@ let composingProblem = new URLSearchParams(location.search).get("new") === "1" &
 // keeps a New problem draft, with the batch it adds to, for when you go back. Code that a page may load in pieces
 // reads it as `typeof settingUp !== "undefined" && settingUp`.
 let settingUp = new URLSearchParams(location.search).get("setup") === "1" && !currentJob;
+// The Records page (?records=1, openRecords()) and a record's Model calls page (?calls=<run folder>, from a job's page
+// or a record's row; openModelCalls()): like Setup, each shows in place of the Overview, a batch or a job. Code that a
+// page may load in pieces reads them as `typeof viewingRecords !== "undefined" && viewingRecords`.
+let viewingRecords = new URLSearchParams(location.search).get("records") === "1" && !currentJob;
+let callsRecord = currentJob ? "" : new URLSearchParams(location.search).get("calls") || "";
 let batchCatalog = [];
 
 // Cache the small set of elements that the state renderer controls.
 const $ = (id) => document.getElementById(id);
 const ui = {
   input: $("inputPanel"), review: $("reviewPanel"), run: $("runPanel"), setupPanel: $("setupPanel"),
+  recordsPanel: $("recordsPanel"), callsPanel: $("callsPanel"), callsJobSep: $("callsJobSep"),
+  callsJobCrumb: $("callsJobCrumb"),
   notice: $("notice"), stoppedNote: $("stoppedNote"), problem: $("problem"), proposed: $("proposed"),
   introDescription: $("introDescription"),
   statementFields: $("statementFields"),
@@ -487,16 +494,23 @@ function renderBatchActions() {
 function renderBatchNavigation() {
   const batch = selectedBatch();
   const setup = typeof settingUp !== "undefined" && settingUp && !currentJob;
-  const browsing = !currentJob && !composingProblem && !setup;
+  const records = typeof viewingRecords !== "undefined" && viewingRecords && !currentJob;
+  const calls = typeof callsRecord !== "undefined" && Boolean(callsRecord) && !currentJob;
+  const browsing = !currentJob && !composingProblem && !setup && !records && !calls;
   show(ui.batchesPanel, browsing && !currentBatch);
   show(ui.jobsPanel, browsing && Boolean(currentBatch));
   if (ui.setupPanel) show(ui.setupPanel, setup);
-  show(ui.batchNavigation, !setup && Boolean(currentJob || currentBatch || composingProblem));
+  if (ui.recordsPanel) show(ui.recordsPanel, records);
+  if (ui.callsPanel) show(ui.callsPanel, calls);
+  show(ui.batchNavigation, !setup && !records && Boolean(currentJob || currentBatch || composingProblem || calls));
+  // A job's Model calls page names the job after its batch (renderCallsHead fills the crumb).
+  if (ui.callsJobSep) show(ui.callsJobSep, calls);
+  if (ui.callsJobCrumb) show(ui.callsJobCrumb, calls);
   // A batch the New problem page was adding to that is no longer listed has no name or page to lead to.
   show(ui.batchProblems, Boolean(currentBatch) && !composerBatchGone());
   ui.batchProblems.textContent = batch?.label || currentBatch;
   // From a job, or from the New problem page adding to it, the batch's crumb leads back to its page.
-  const below = Boolean(currentJob || composingProblem);
+  const below = Boolean(currentJob || composingProblem || calls);
   ui.batchProblems.disabled = !below;
   ui.batchProblems.setAttribute("aria-current", below ? "false" : "page");
   // The default batch says so in its name: only another server's current batch gets the badge.
@@ -512,11 +526,12 @@ function renderBatchNavigation() {
   ui.home.textContent = currentBatch ? "Back to problems" : "All batches";
   ui.reviewHome.textContent = ui.home.textContent;
   if (!currentJob) {
-    show(ui.input, composingProblem && !setup);
+    show(ui.input, composingProblem && !setup && !records && !calls);
     for (const panel of [ui.review, ui.run, ui.runOverview, ui.workflowRail, ui.activityToggle]) show(panel, false);
-    ui.globalStatus.textContent = setup ? "Setup" : composingProblem ? "New problem"
-      : currentBatch ? "Batch problems" : "Problem batches";
-    document.title = setup ? "Setup — TCS Prover" : composingProblem ? "New problem — TCS Prover"
+    ui.globalStatus.textContent = setup ? "Setup" : records ? "Records" : calls ? "Model calls"
+      : composingProblem ? "New problem" : currentBatch ? "Batch problems" : "Problem batches";
+    document.title = setup ? "Setup — TCS Prover" : records ? "Records — TCS Prover"
+      : calls ? "Model calls — TCS Prover" : composingProblem ? "New problem — TCS Prover"
       : currentBatch ? `${batch?.label || currentBatch} — TCS Prover` : "TCS Prover";
     ui.elapsed.textContent = "";
     ui.liveDot.classList.toggle("active", false);
@@ -659,6 +674,7 @@ async function selectBatch(batchId) {
   currentJob = "";
   composingProblem = false;
   settingUp = false;
+  viewingRecords = false; callsRecord = "";
   history.pushState(null, "", batchUrl(batchId));
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false); show(ui.batchStatus, false); renderBatchNavigation();
@@ -697,6 +713,7 @@ async function rerunWithStatement(statement) {
 // The New problem page, adding to ``batchId``: a batch whose jobs this server runs ("" is the default batch).
 async function newProblem(batchId = "") {
   currentBatch = batchId; currentJob = ""; composingProblem = true; settingUp = false;
+  viewingRecords = false; callsRecord = "";
   history.pushState(null, "", `${location.pathname}?new=1${batchId ? `&batch=${encodeURIComponent(batchId)}` : ""}`);
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView(); show(ui.notice, false); renderBatchNavigation();
@@ -782,6 +799,7 @@ function adoptJob(next) {
   currentBatch = next.batchId || next.batch?.id || "";
   composingProblem = false;
   settingUp = false;
+  viewingRecords = false; callsRecord = "";
   history.pushState(null, "", jobUrl(currentJob));
 }
 
@@ -813,6 +831,7 @@ function selectJob(runId) {
   currentJob = runId;
   composingProblem = false;
   settingUp = false;
+  viewingRecords = false; callsRecord = "";
   history.pushState(null, "", jobUrl(runId));
   clearJobView();
   clearTimeout(timer);
@@ -1182,7 +1201,9 @@ let pollNotice = "";
 
 async function loadJobs() {
   clearTimeout(jobsTimer);
-  if (currentJob || composingProblem || (typeof settingUp !== "undefined" && settingUp)) return;
+  if (currentJob || composingProblem || (typeof settingUp !== "undefined" && settingUp)
+      || (typeof viewingRecords !== "undefined" && viewingRecords)
+      || (typeof callsRecord !== "undefined" && callsRecord)) return;
   const batch = currentBatch;
   try {
     const catalog = await request("/batches");
@@ -1202,7 +1223,9 @@ async function loadJobs() {
     ui.notice.textContent = pollNotice = error.message;
     show(ui.notice, true);
   }
-  if (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp) && batch === currentBatch) {
+  if (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp)
+      && !(typeof viewingRecords !== "undefined" && viewingRecords)
+      && !(typeof callsRecord !== "undefined" && callsRecord) && batch === currentBatch) {
     jobsTimer = setTimeout(loadJobs, 2500);
   }
 }
@@ -5784,6 +5807,22 @@ async function refresh() {
     await loadSetup(true);
     return;
   }
+  // The Records page and a Model calls page read their own routes (and the batches, for the sidebar and the crumbs).
+  const records = typeof viewingRecords !== "undefined" && viewingRecords;
+  if (!currentJob && (records || (typeof callsRecord !== "undefined" && callsRecord))) {
+    // A job's Model calls page names its batch, as the job's page does: read the batches first.
+    if (!records && currentBatch && (!batchCatalog.length || !selectedBatch())) {
+      try {
+        batchCatalog = adoptBatchCatalog(await request("/batches"));
+      } catch (_) {
+        // The page shows the batch's ID meanwhile; the sidebar's next read names it.
+      }
+    }
+    renderBatchNavigation();
+    if (records) await loadRecords();
+    else await loadCalls(true);
+    return;
+  }
   const job = currentJob;
   const batch = currentBatch;
   if (!job && !composingProblem) {
@@ -5818,6 +5857,7 @@ async function refresh() {
     pollNotice = "";
     render(next);
     loadJobRecovery();
+    if (typeof renderJobCallsEntry === "function") renderJobCallsEntry();
   } catch (error) {
     if (job !== currentJob || batch !== currentBatch) return;
     // A link naming a batch its job is not in (one kept from before the list of batches was repaired, say):
@@ -6808,6 +6848,18 @@ window.onpopstate = () => {
   const wasComposing = composingProblem && !currentJob;
   currentJob = params.get("job") || "";
   const setup = params.get("setup") === "1" && !currentJob;
+  viewingRecords = params.get("records") === "1" && !currentJob && !setup;
+  callsRecord = currentJob || setup || viewingRecords ? "" : params.get("calls") || "";
+  if (viewingRecords || callsRecord) {
+    // The Records page or a Model calls page: the job view and its polls end; the page reads its own routes.
+    settingUp = false;
+    composingProblem = false;
+    currentBatch = params.get("batch") || "";
+    clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+    clearJobView(); show(ui.notice, false);
+    refresh();
+    return;
+  }
   if (setup) {
     // Setup keeps a New problem draft and the batch it adds to; anything else is left as on the way there.
     settingUp = true;
@@ -8092,11 +8144,13 @@ renderApiForm();
   sidebar.addEventListener("focusout", hideTip);
   sidebar.addEventListener("scroll", hideTip, true);
 
-  // Where the page is: home, a batch, a job, Setup (?setup=1), the composer, or Models & API (the
-  // composer's settings on their own, at ?new=1#models).
+  // Where the page is: home, a batch, a job, Setup (?setup=1), Records (?records=1), a record's Model calls
+  // (?calls=<run folder>), the composer, or Models & API (the composer's settings on their own, at ?new=1#models).
   function route() {
     if (currentJob) return "job";
     if (typeof settingUp !== "undefined" && settingUp) return "setup";
+    if (typeof viewingRecords !== "undefined" && viewingRecords) return "records";
+    if (typeof callsRecord !== "undefined" && callsRecord) return "calls";
     if (composingProblem) return location.hash === "#models" ? "models" : "new";
     return currentBatch ? "batch" : "home";
   }
@@ -8128,12 +8182,14 @@ renderApiForm();
       // Already composing: switch the view only, so the draft and its settings stay as they are.
       const from = route();
       settingUp = false;
+      viewingRecords = false; callsRecord = "";
       if (from !== (models ? "models" : "new")) history.pushState(null, "", url);
       if (from === "setup") renderBatchNavigation();
       sync();
       return;
     }
     settingUp = false;
+    viewingRecords = false; callsRecord = "";
     const loading = newProblem();
     if (models) history.replaceState(null, "", url);
     sync();
@@ -8147,6 +8203,7 @@ renderApiForm();
     else if (target === "batch") await selectBatch(item.dataset.batchId);
     else if (target === "new" || target === "models") await openComposer(target === "models");
     else if (target === "setup") await openSetup();
+    else if (target === "records") await openRecords();
     else if (target === "new-batch") openBatchDialog("create");
     else if (target === "prompts") {
       // Prompt edits apply to the next problem, so they are made from the composer.
@@ -8212,7 +8269,8 @@ renderApiForm();
   }
   function catalog() {
     // The page's own list on the home and batch pages, and wherever the page read it after the sidebar did.
-    const own = (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp))
+    const own = (!currentJob && !composingProblem && !(typeof settingUp !== "undefined" && settingUp)
+      && !(typeof viewingRecords !== "undefined" && viewingRecords) && !(typeof callsRecord !== "undefined" && callsRecord))
       || batchOptions().adopted > polledAdopted;
     return own && batchCatalog.length ? batchCatalog : polled || batchCatalog;
   }
@@ -8363,8 +8421,9 @@ renderApiForm();
   }
 
   function renderActive(where) {
-    // The New problem page adding to a batch marks that batch, not New problem (which adds to the default batch).
-    const inBatch = ["batch", "job"].includes(where) || (where === "new" && Boolean(currentBatch));
+    // The New problem page adding to a batch marks that batch, not New problem (which adds to the default batch);
+    // so does a job's Model calls page.
+    const inBatch = ["batch", "job", "calls"].includes(where) || (where === "new" && Boolean(currentBatch));
     for (const item of sidebar.querySelectorAll(".nav-item")) {
       const target = item.dataset.nav;
       const current = target === "batch"
@@ -8377,7 +8436,8 @@ renderApiForm();
   }
 
   function renderTitle(where) {
-    const words = { home: "Overview", new: "New problem", models: "Models & API", setup: "Setup", batch: "", job: "" };
+    const words = { home: "Overview", new: "New problem", models: "Models & API", setup: "Setup", batch: "", job: "",
+      records: "Records", calls: "Model calls" };
     const text = where === "job" ? (ui.runProblemTitle.textContent || "Problem") : words[where];
     setText(shell.title, text);
     shell.title.hidden = !text;
@@ -8437,12 +8497,13 @@ renderApiForm();
     applyView();
     if (where !== lastRoute) {
       // A new page: the sidebar counts are read again at once outside home and batch pages.
-      if (["job", "new", "models", "setup"].includes(where) && lastRoute !== "") polledAt = 0;
+      if (["job", "new", "models", "setup", "records", "calls"].includes(where) && lastRoute !== "") polledAt = 0;
       lastRoute = where;
     }
     // A hidden tab reads the counts only for notifications (when they are on), and less often.
     const due = Date.now() - polledAt > (document.hidden ? 30000 : 5000);
-    if (["job", "new", "models", "setup"].includes(where) && due && (!document.hidden || attentionAlertsOn())) pollBatches();
+    if (["job", "new", "models", "setup", "records", "calls"].includes(where) && due
+        && (!document.hidden || attentionAlertsOn())) pollBatches();
     // Until the first catalog arrives, the placeholders stay (an empty list would claim no batches).
     if (polled !== null || batchCatalog.length) {
       const batches = catalog();
@@ -8815,6 +8876,7 @@ async function openSetup() {
   const already = setupOnScreen();
   currentJob = "";
   settingUp = true;
+  viewingRecords = false; callsRecord = "";
   // A New problem draft stays, with the batch it adds to (see openComposer); otherwise Setup belongs to no batch.
   if (!composingProblem) currentBatch = "";
   if (!already) history.pushState(null, "", `${location.pathname}?setup=1`);
@@ -10804,3 +10866,1513 @@ renderPresetBar();
       ? { ...options, behavior: "auto" } : options);
   }
 })();
+
+// --- Records and model calls ---------------------------------------------------------------------------------------
+// The Records page (?records=1, under Configure) lists every job's record of model calls on this computer (GET
+// /records), newest or largest first, and deletes one after an in-page confirmation (DELETE /records/<run folder>; the
+// server refuses while its job works). A record's Model calls page (?calls=<run folder>, from the job page's Live
+// activity card or a record's row) lists its calls beside the chosen one (GET /jobs/<id>/model-calls, .../<callId>,
+// .../<callId>/raw); both pages and the job page give its training download (GET /jobs/<id>/training-record).
+// Every request goes outside the job request queue, with the session token. Contract:
+// ~/tcs-work/fixes/record-contract.md. The page's state lives on functions (recordsStore, callsStore), so that code
+// run before this part of the file (refresh, the first render) finds it.
+
+const MC_SVG = "http://www.w3.org/2000/svg";
+// Icon paths (16 × 16, stroked like the page's other icons).
+const MC_ICONS = {
+  hidden: ["M2 8s2.2-4 6-4 6 4 6 4-2.2 4-6 4-6-4-6-4Z", "c:8,8,1.75", "m3 13 10-10"],
+  probability: ["r:2.75,2.75,10.5,10.5,2", "M5.75 5.75h.01M10.25 10.25h.01M8 8h.01"],
+  network: ["M2.5 8h11M8 2.5c1.7 1.6 2.5 3.4 2.5 5.5S9.7 11.9 8 13.5M8 2.5C6.3 4.1 5.5 5.9 5.5 8s.8 3.9 2.5 5.5",
+    "c:8,8,5.5"],
+  summary: ["M3 4h10M3 7h10M3 10h7M3 13h5"],
+  terminal: ["M2.5 3.5h11v9h-11z", "m5 6.5 1.75 1.5L5 9.5M8.5 9.75H11"],
+  code: ["m5.5 4.5-3.5 3.5 3.5 3.5M10.5 4.5l3.5 3.5-3.5 3.5"],
+  search: ["c:7,7,4.25", "m10.25 10.25 3.25 3.25"],
+  tool: ["M9.9 2.6a3.1 3.1 0 0 0-3.2 4L2.8 10.5a1.25 1.25 0 0 0 1.77 1.77L8.4 8.4a3.1 3.1 0 0 0 4-3.2l-1.75 1.75-1.9-.5-.5-1.9Z"],
+  message: ["M13.5 10a1.5 1.5 0 0 1-1.5 1.5H5.25L2.5 14V3.5A1.5 1.5 0 0 1 4 2h8a1.5 1.5 0 0 1 1.5 1.5Z"],
+  previous: ["m9.75 3.5-4.5 4.5 4.5 4.5"],
+  next: ["m6.25 3.5 4.5 4.5-4.5 4.5"],
+  open: ["M9.5 2.5h4v4M13.5 2.5 8.25 7.75M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"],
+  download: ["M8 2.5v8M4.75 7.5 8 10.75l3.25-3.25M3 13.5h10"],
+  remove: ["M2.75 4.25h10.5M6.25 4.25v-1.5h3.5v1.5M4.25 4.25l.6 8.6a1 1 0 0 0 1 .9h4.3a1 1 0 0 0 1-.9l.6-8.6M6.75 7v4M9.25 7v4"],
+  warning: ["M8 2.5 14 13H2Z", "M8 6.5v3M8 11.25h.01"],
+};
+
+// A small stroked icon; a "c:x,y,r" entry is a circle, "r:x,y,w,h,rx" a rectangle, anything else a path.
+function mcIcon(name) {
+  const svg = document.createElementNS(MC_SVG, "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  for (const shape of MC_ICONS[name] || []) {
+    const [kind, values] = shape.split(":");
+    const node = document.createElementNS(MC_SVG, values ? (kind === "c" ? "circle" : "rect") : "path");
+    if (!values) node.setAttribute("d", shape);
+    else if (kind === "c") {
+      const [cx, cy, r] = values.split(",");
+      node.setAttribute("cx", cx); node.setAttribute("cy", cy); node.setAttribute("r", r);
+    } else {
+      const [x, y, width, height, rx] = values.split(",");
+      node.setAttribute("x", x); node.setAttribute("y", y); node.setAttribute("width", width);
+      node.setAttribute("height", height); node.setAttribute("rx", rx);
+    }
+    svg.append(node);
+  }
+  return svg;
+}
+
+// An element with a class and its text or child nodes (strings become text).
+function mcNode(tag, className = "", ...children) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  for (const child of children) {
+    if (child === null || child === undefined || child === false || child === "") continue;
+    node.append(typeof child === "string" || typeof child === "number" ? String(child) : child);
+  }
+  return node;
+}
+
+function mcButton(className, label, icon = "", after = false) {
+  const button = mcNode("button", className);
+  button.type = "button";
+  if (icon && !after) button.append(mcIcon(icon));
+  button.append(label);
+  if (icon && after) button.append(mcIcon(icon));
+  return button;
+}
+
+// GET (or DELETE) a record route with the session token: the answer's JSON; a refusal throws its words and status.
+async function recordRequest(path, method = "GET") {
+  const response = await fetch(path, { method, headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw Object.assign(new Error(data.error || `The request failed (HTTP ${response.status}).`),
+      { status: response.status });
+  }
+  return data;
+}
+
+function recordPath(run, ...rest) {
+  return `/jobs/${[run, ...rest].map((part) => encodeURIComponent(part)).join("/")}`;
+}
+
+// --- Numbers as the pages write them ---
+
+// A byte count with binary units, as the server writes sizes: "512 B", "3.4 KB", "214.6 MB", "1.49 GB".
+function recordSize(bytes, digits = 2) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1048576) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1073741824) return `${(value / 1048576).toFixed(1)} MB`;
+  return `${(value / 1073741824).toFixed(digits)} GB`;
+}
+
+// A token count in short: "512", "61.2k", "4.21M"; "–" when the route does not report it.
+function tokenShort(value) {
+  if (!Number.isFinite(value)) return "–";
+  if (value < 1000) return String(value);
+  if (value < 1e6) return `${(value / 1000).toFixed(1)}k`;
+  return `${(value / 1e6).toFixed(2)}M`;
+}
+
+function tokenFull(value) {
+  return Number.isFinite(value) ? value.toLocaleString("en-US") : "–";
+}
+
+// A call's time taken: "0.4s", "7.1s", "34s", "1m 52s", "4h 18m".
+function callDuration(ms) {
+  if (!Number.isFinite(ms)) return "";
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const total = Math.round(seconds), hours = Math.floor(total / 3600), minutes = Math.floor(total / 60) % 60;
+  return hours ? `${hours}h ${String(minutes).padStart(2, "0")}m` : `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
+}
+
+// A time of day in this browser's zone, with seconds ("10:51:08"), or tenths too ("10:51:08.4").
+function callClock(value, tenths = false) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (number) => String(number).padStart(2, "0");
+  const text = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return tenths ? `${text}.${Math.floor(date.getMilliseconds() / 100)}` : text;
+}
+
+// A record's start in this browser's zone: "13 Nov 2026 09:02".
+function recordStarted(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "–";
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][date.getMonth()];
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getDate()} ${month} ${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// --- Records ---
+
+function recordsStore() {
+  return (recordsStore.value ||= { rows: null, error: "", filter: "all", sort: "newest", timer: null, loading: false,
+    deleting: null, busy: false });
+}
+
+function recordsEls() {
+  return (recordsEls.value ||= { meta: $("recordsMeta"), notice: $("recordsNotice"), filter: $("recordsFilter"),
+    sort: $("recordsSort"), list: $("recordsList"), empty: $("recordsEmpty"), navSize: $("navRecordsSize"),
+    dialog: $("recordDeleteDialog"), dialogName: $("recordDeleteName"), dialogFacts: $("recordDeleteFacts"),
+    dialogList: $("recordDeleteList"), dialogError: $("recordDeleteError"), dialogConfirm: $("recordDeleteConfirm"),
+    dialogConfirmText: $("recordDeleteConfirmText"), dialogCancel: $("recordDeleteCancel") });
+}
+
+async function openRecords() {
+  const fromJob = Boolean(currentJob);
+  const already = viewingRecords && !currentJob;
+  currentJob = ""; currentBatch = ""; composingProblem = false; settingUp = false; callsRecord = "";
+  viewingRecords = true;
+  if (!already) history.pushState(null, "", `${location.pathname}?records=1`);
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+  if (fromJob) clearJobView();
+  show(ui.notice, false);
+  renderBatchNavigation();
+  await loadRecords();
+}
+
+// Read the list: on the Records page every 15 s, elsewhere every minute (the sidebar shows their size).
+async function loadRecords() {
+  const store = recordsStore();
+  clearTimeout(store.timer);
+  if (store.loading) return;
+  store.loading = true;
+  try {
+    const rows = await recordRequest("/records");
+    store.rows = Array.isArray(rows) ? rows : [];
+    store.error = "";
+  } catch (error) {
+    store.error = error.status === 404 ? "This TCS Prover keeps no records." : error.message;
+  } finally {
+    store.loading = false;
+  }
+  renderRecordsNav();
+  if (viewingRecords && !currentJob) renderRecords();
+  store.timer = setTimeout(() => {
+    if (!document.hidden || !(viewingRecords && !currentJob)) loadRecords();
+    else recordsStore().timer = setTimeout(loadRecords, 15000);
+  }, viewingRecords && !currentJob ? 15000 : 60000);
+}
+
+// The sidebar's Records item: the size of every record together.
+function renderRecordsNav() {
+  const store = recordsStore(), size = recordsEls().navSize;
+  if (!size) return;
+  const total = (store.rows || []).reduce((sum, row) => sum + (Number(row.sizeBytes) || 0), 0);
+  const text = store.rows && store.rows.length ? recordSize(total, 1) : "";
+  if (size.textContent !== text) size.textContent = text;
+  size.hidden = !text;
+  const item = size.closest(".nav-item");
+  if (item) item.dataset.tipMeta = text ? `Every model call, kept · ${text}` : "Every model call, kept";
+}
+
+// The rows a filter shows, sorted as chosen.
+function recordsShown(rows, filter, sort) {
+  const shown = rows.filter((row) => filter === "all" || (filter === "kept") === Boolean(row.jobExists));
+  return shown.sort(sort === "largest"
+    ? (a, b) => (Number(b.sizeBytes) || 0) - (Number(a.sizeBytes) || 0) || String(b.created).localeCompare(String(a.created))
+    : (a, b) => String(b.created).localeCompare(String(a.created)) || String(b.runFolder).localeCompare(String(a.runFolder)));
+}
+
+function renderRecords() {
+  const store = recordsStore(), els = recordsEls();
+  const rows = store.rows || [];
+  const total = rows.reduce((sum, row) => sum + (Number(row.sizeBytes) || 0), 0);
+  const deleted = rows.filter((row) => !row.jobExists).length;
+  const meta = store.rows === null ? [store.error ? "Records could not be read" : "Reading records…"]
+    : [`${rows.length} ${rows.length === 1 ? "record" : "records"}`, `${recordSize(total)} in all`,
+      ...(deleted ? [`${deleted} of deleted ${deleted === 1 ? "job" : "jobs"}`] : [])];
+  const metaKey = meta.join("|");
+  if (els.meta.dataset.key !== metaKey) {
+    els.meta.dataset.key = metaKey;
+    els.meta.replaceChildren(...meta.map((text) => mcNode("span", "", text)));
+  }
+  els.notice.textContent = store.error;
+  els.notice.hidden = !store.error;
+  const counts = { all: rows.length, kept: rows.length - deleted, deleted };
+  for (const button of els.filter.querySelectorAll("[data-records]")) {
+    const key = button.dataset.records;
+    button.setAttribute("aria-pressed", String(key === store.filter));
+    const count = button.querySelector(".seg-count");
+    if (count) count.textContent = store.rows === null ? "" : String(counts[key]);
+    button.classList.toggle("empty", key !== "all" && !counts[key]);
+  }
+  els.sort.value = store.sort;
+  const shown = recordsShown(rows, store.filter, store.sort);
+  const largest = Math.max(1, ...rows.map((row) => Number(row.sizeBytes) || 0));
+  const signature = JSON.stringify([shown, largest]);
+  if (els.list.dataset.signature !== signature) {
+    els.list.dataset.signature = signature;
+    els.list.replaceChildren(...shown.map((row) => recordRow(row, largest)));
+  }
+  const empty = store.rows === null ? "" : !rows.length
+    ? "No records yet. Every job started from now on keeps one; jobs from before have none."
+    : !shown.length ? (store.filter === "kept" ? "No record whose job is still listed." : "No record of a deleted job.")
+    : "";
+  if (els.empty.textContent !== empty) els.empty.textContent = empty;
+  els.empty.hidden = !empty;
+}
+
+function recordRow(row, largest) {
+  const item = mcNode("li", "rec-row rec-cols");
+  item.dataset.record = row.runFolder;
+  // The record's title opens its Model calls page (also a deleted job's).
+  const title = mcNode("a", "rec-open", row.title || row.runFolder);
+  title.href = `${location.pathname}?calls=${encodeURIComponent(row.runFolder)}`;
+  title.onclick = (event) => {
+    if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    openModelCalls(row.runFolder, { from: "records" });
+  };
+  const name = mcNode("span", "rec-title", mcNode("strong", "", title), mcNode("span", "", row.runFolder));
+  const bar = mcNode("span", "rec-bar", mcNode("i"));
+  bar.firstChild.style.width = `${Math.max(1, Math.round(100 * (Number(row.sizeBytes) || 0) / largest))}%`;
+  const size = mcNode("span", "rec-size", mcNode("b", "", recordSize(row.sizeBytes)), bar);
+  const job = mcNode("span", `rec-job${row.jobExists ? "" : " gone"}`, row.jobExists ? "Kept" : "Deleted");
+  if (row.jobExists) {
+    const open = mcNode("a", "", "Open");
+    open.href = `${location.pathname}?job=${encodeURIComponent(row.runFolder)}`;
+    open.setAttribute("aria-label", `Open the job ${row.title || row.runFolder}`);
+    open.onclick = (event) => {
+      if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      clearTimeout(recordsStore().timer);
+      selectJob(row.runFolder);
+    };
+    job.append(" ", open);
+  }
+  const remove = mcButton("ghost compact danger rec-del", "Delete", "remove");
+  remove.setAttribute("aria-label", `Delete the record of ${row.title || row.runFolder}`);
+  remove.onclick = () => askDeleteRecord(row);
+  item.append(name, mcNode("span", "rec-date", recordStarted(row.created)), size, job, mcNode("span", "r", remove));
+  return item;
+}
+
+// The confirmation: what the record is, what deleting it means for its job, and the space it frees.
+function askDeleteRecord(row) {
+  const store = recordsStore(), els = recordsEls();
+  store.deleting = row;
+  els.dialogName.textContent = row.title || row.runFolder;
+  els.dialogFacts.textContent = `${row.runFolder} · ${recordSize(row.sizeBytes)} · started ${recordStarted(row.created)}`;
+  const strong = mcNode("b", "", "this cannot be undone");
+  els.dialogList.replaceChildren(
+    mcNode("li", "", "Removes every recorded model call of this job from this computer: ", strong, "."),
+    mcNode("li", "", row.jobExists
+      ? "Its job stays, with its proof, files and activity log; its page then shows no model calls and offers no "
+        + "training record."
+      : "Its job was deleted earlier, so this record is the last copy of what its models were sent and answered."),
+    mcNode("li", "", `Frees ${recordSize(row.sizeBytes)}.`));
+  els.dialogError.hidden = true;
+  els.dialogError.textContent = "";
+  els.dialogConfirm.disabled = false;
+  els.dialogConfirmText.textContent = "Delete record";
+  if (!els.dialog.open) els.dialog.showModal();
+  els.dialogCancel.focus();
+}
+
+async function confirmDeleteRecord() {
+  const store = recordsStore(), els = recordsEls(), row = store.deleting;
+  if (!row || store.busy) return;
+  store.busy = true;
+  els.dialogConfirm.disabled = true;
+  els.dialogConfirmText.textContent = "Deleting…";
+  els.dialogError.hidden = true;
+  try {
+    await recordRequest(`/records/${encodeURIComponent(row.runFolder)}`, "DELETE");
+    store.rows = (store.rows || []).filter((item) => item.runFolder !== row.runFolder);
+    store.deleting = null;
+    els.dialog.close();
+    renderRecordsNav();
+    if (viewingRecords && !currentJob) renderRecords();
+    // Its row is gone: the page goes on from its main part.
+    document.getElementById("main")?.focus({ preventScroll: true });
+    loadRecords();
+  } catch (error) {
+    // A job that works keeps its record (409), and a record that could not be removed whole stays listed (400):
+    // the server's words say what to do first.
+    els.dialogError.textContent = `Not deleted: ${error.message}`;
+    els.dialogError.hidden = false;
+    els.dialogConfirmText.textContent = "Delete record";
+  } finally {
+    store.busy = false;
+    els.dialogConfirm.disabled = false;
+  }
+}
+
+(() => {
+  const els = recordsEls();
+  els.filter.onclick = (event) => {
+    const button = event.target.closest?.("[data-records]");
+    if (!button) return;
+    recordsStore().filter = button.dataset.records;
+    renderRecords();
+  };
+  els.sort.onchange = () => {
+    recordsStore().sort = els.sort.value === "largest" ? "largest" : "newest";
+    renderRecords();
+  };
+  els.dialogCancel.onclick = () => els.dialog.close();
+  els.dialogConfirm.onclick = confirmDeleteRecord;
+  els.dialog.addEventListener("close", () => {
+    const row = recordsStore().deleting;
+    recordsStore().deleting = null;
+    // Back to the row's Delete button, when it is still listed.
+    const button = row && [...els.list.querySelectorAll("li")].find((item) => item.dataset.record === row.runFolder)
+      ?.querySelector(".rec-del");
+    if (button) button.focus();
+  });
+})();
+
+// --- The training download ---
+
+// The job's training record as a ZIP (GET /jobs/<id>/training-record, streamed): the button counts what arrived. A
+// download that fails part way (the server ends it without its last chunk) makes the read fail: nothing is saved, the
+// button says "Download failed" and ``notice`` says why.
+async function downloadTrainingRecord(run, button, label, notice) {
+  if (!run || button.dataset.busy) return;
+  button.dataset.busy = "1";
+  button.dataset.state = "busy";
+  button.setAttribute("aria-busy", "true");
+  const say = (text) => { if (label.textContent !== text) label.textContent = text; };
+  say("Downloading…");
+  if (notice) notice.hidden = true;
+  try {
+    const response = await fetch(recordPath(run, "training-record"), {
+      headers: { "X-TCS-Prover-Token": sessionToken }, cache: "no-store" });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    let blob;
+    const reader = response.body?.getReader?.();
+    if (reader) {
+      const parts = [];
+      let received = 0, shownAt = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        received += value.length;
+        if (Date.now() - shownAt > 250) {
+          say(`Downloading… ${recordSize(received)}`);
+          shownAt = Date.now();
+        }
+      }
+      blob = new Blob(parts, { type: "application/zip" });
+    } else {
+      blob = await response.blob();
+    }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${run}-training-record.zip`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    button.dataset.state = "done";
+    say("Training record");
+  } catch (error) {
+    button.dataset.state = "failed";
+    say("Download failed");
+    if (notice) {
+      notice.textContent = `The training record download failed (${error.message || "the connection closed"}); `
+        + "nothing was saved. Try again; the server's log says why.";
+      notice.hidden = false;
+    }
+  } finally {
+    delete button.dataset.busy;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+// --- The job page's way in: "Model calls · N" and "Training record" on the Live activity card ---
+
+function jobCallsStore() {
+  return (jobCallsStore.value ||= { run: "", total: null, missing: false, readAt: 0, reading: false });
+}
+
+// The count follows the record: read at most every 10 s while the job's page is open (outside its request queue).
+function renderJobCallsEntry() {
+  const button = $("modelCallsButton"), text = $("modelCallsText"), training = $("trainingRecordButton");
+  if (!button || !text || !training) return;
+  const store = jobCallsStore(), run = currentJob;
+  if (store.run !== run) Object.assign(store, { run, total: null, missing: false, readAt: 0 });
+  const words = store.total === null ? "Model calls" : `Model calls · ${store.total.toLocaleString("en-US")}`;
+  if (text.textContent !== words) text.textContent = words;
+  button.title = store.missing ? "This job has no record of its model calls." : "";
+  training.hidden = store.missing || store.total === null;
+  if (!run || store.reading || Date.now() - store.readAt < 10000) return;
+  store.reading = true;
+  recordRequest(`${recordPath(run, "model-calls")}?offset=0&limit=1`).then((data) => {
+    if (jobCallsStore().run !== run) return;
+    Object.assign(jobCallsStore(), { total: Number(data.total) || 0, missing: false });
+  }, (error) => {
+    if (jobCallsStore().run !== run) return;
+    if (error.status === 404) Object.assign(jobCallsStore(), { total: null, missing: true });
+  }).finally(() => {
+    const now = jobCallsStore();
+    now.reading = false;
+    now.readAt = Date.now();
+    if (currentJob === run) renderJobCallsEntry();
+  });
+}
+
+(() => {
+  const button = $("modelCallsButton"), training = $("trainingRecordButton");
+  button.onclick = () => openModelCalls(currentJob, { from: "job" });
+  training.onclick = () => downloadTrainingRecord(currentJob, training, $("trainingRecordText"), ui.notice);
+})();
+
+// --- Model calls ---
+
+function callsStore() {
+  return (callsStore.value ||= { run: "", rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
+    selected: "", details: new Map(), raw: new Map(), filter: "all", words: "", timer: null, every: 5000, same: 0,
+    loading: false, from: "", job: null, generation: 0 });
+}
+
+function callsEls() {
+  return (callsEls.value ||= { heading: $("callsHeading"), meta: $("callsMeta"), lede: $("callsLede"),
+    notice: $("callsNotice"), problems: $("callsProblems"), empty: $("callsEmpty"), back: $("callsBackButton"),
+    backText: $("callsBackText"), training: $("callsTrainingButton"), trainingText: $("callsTrainingText"),
+    browser: $("callsBrowser"), words: $("callsFilterText"), filter: $("callsFilter"), count: $("callsCount"),
+    list: $("callsList"), pane: $("callPane") });
+}
+
+// Open a record's Model calls page; ``from`` says where it was opened ("job" or "records"), ``call`` a call to show.
+async function openModelCalls(run, { from = "", call = "" } = {}) {
+  if (!run) return;
+  const batch = from === "job" ? currentBatch : "";
+  currentJob = ""; composingProblem = false; settingUp = false; viewingRecords = false;
+  currentBatch = batch;
+  callsRecord = run;
+  const store = callsStore();
+  clearTimeout(store.timer);
+  Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [], selected: call,
+    details: new Map(), raw: new Map(), filter: "all", words: "", every: 5000, same: 0, from, job: null,
+    loading: false, generation: store.generation + 1 });
+  history.pushState(null, "", callsUrl(run, call));
+  clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
+  clearJobView();
+  show(ui.notice, false);
+  const els = callsEls();
+  els.words.value = "";
+  els.browser.dataset.view = call ? "detail" : "list";
+  renderBatchNavigation();
+  renderCallsList();
+  renderCallPane();
+  await loadCalls(true);
+  document.getElementById("main")?.focus({ preventScroll: true });
+}
+
+function callsUrl(run, call = "") {
+  const query = new URLSearchParams({ calls: run });
+  if (currentBatch) query.set("batch", currentBatch);
+  if (call) query.set("call", call);
+  return `${location.pathname}?${query}`;
+}
+
+// Read the record's calls, every page of 1,000 (the route's largest), then follow it: a look at its count every 5 s
+// while it changes (the list grows while the job runs), every 30 s once it has stayed the same for a minute.
+async function loadCalls(full = false) {
+  const store = callsStore(), run = callsRecord;
+  if (!run) return;
+  if (store.run !== run) {
+    // A Model calls page opened from its address (a reload, a link): it starts afresh.
+    Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
+      selected: new URLSearchParams(location.search).get("call") || "", details: new Map(), raw: new Map(),
+      every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1 });
+    const els = callsEls();
+    els.browser.dataset.view = store.selected ? "detail" : "list";
+  }
+  clearTimeout(store.timer);
+  if (store.loading) return;
+  store.loading = true;
+  const generation = store.generation;
+  try {
+    if (store.job === null) {
+      // Whose record it is: its title, and whether its job is still listed (GET /records).
+      try {
+        const listed = await recordRequest("/records");
+        if (Array.isArray(listed)) {
+          recordsStore().rows = listed;
+          renderRecordsNav();
+          store.job = listed.find((row) => row.runFolder === run) || { runFolder: run, title: "", jobExists: false };
+        }
+      } catch (_) {
+        store.job = { runFolder: run, title: "", jobExists: false };
+      }
+    }
+    let changed = full || !store.loaded;
+    if (!changed) {
+      const head = await recordRequest(`${recordPath(run, "model-calls")}?offset=0&limit=1`);
+      changed = Number(head.total) !== store.total
+        || JSON.stringify(head.recordState?.problems || []) !== JSON.stringify(store.problems);
+    }
+    if (changed) {
+      const rows = [];
+      let total = 0, problems = [];
+      for (let offset = 0; ; offset += 1000) {
+        const page = await recordRequest(`${recordPath(run, "model-calls")}?offset=${offset}&limit=1000`);
+        if (callsStore().generation !== generation) return;
+        rows.push(...(page.calls || []));
+        total = Number(page.total) || 0;
+        problems = page.recordState?.problems || [];
+        if (!(page.calls || []).length || rows.length >= total) break;
+      }
+      const before = new Map(store.rows.map((row) => [row.id, JSON.stringify(row)]));
+      Object.assign(store, { rows, total, problems, loaded: true, missing: false, error: "" });
+      // A call whose row changed is read again, and so is one whose tool calls had no output yet (an output comes
+      // with the next request of its conversation, which may just have been recorded).
+      for (const row of rows) {
+        const detail = store.details.get(row.id);
+        if (!detail) continue;
+        const waiting = (detail.received?.items || []).some((view) => ["custom_tool_call", "function_call", "tool_use"]
+          .includes(view.type) && !view.output);
+        if (before.get(row.id) !== JSON.stringify(row) || (waiting && rows.length !== before.size)) {
+          store.details.delete(row.id);
+        }
+      }
+      store.same = 0;
+      store.every = 5000;
+    } else if (++store.same >= 12) {
+      store.every = 30000;
+    }
+  } catch (error) {
+    if (callsStore().generation !== generation) return;
+    if (error.status === 404) Object.assign(store, { missing: true, loaded: true, rows: [], total: 0, error: "" });
+    else store.error = error.message;
+  } finally {
+    if (callsStore().generation === generation) store.loading = false;
+  }
+  if (callsStore().generation !== generation || callsRecord !== run) return;
+  renderCallsHead();
+  renderCallsList();
+  // The chosen call, else the first (shown beside the list; the phone shows the list first, and the address names
+  // only a call you chose). It is drawn again only when it changed: what was opened in it stays open meanwhile.
+  const chosen = store.selected || store.rows[0]?.id || "";
+  if (chosen && (chosen !== store.selected || !store.details.has(chosen))) {
+    await showCall(chosen, { keepView: true, address: Boolean(store.selected) });
+  } else if (!chosen) {
+    renderCallPane();
+  }
+  if (!store.missing) {
+    store.timer = setTimeout(() => {
+      if (callsRecord === run) loadCalls(false);
+    }, document.hidden ? Math.max(store.every, 30000) : store.every);
+  }
+}
+
+// The roles the filter groups: the author's own turns, its team's and subagents' calls, and the critics'.
+const CALL_GROUPS = {
+  author: ["author", "coordinator", "reply", "summary"],
+  members: ["member", "subagent"],
+  critics: ["critic", "independent critic", "convention critic"],
+};
+
+// [title, detail] of a row: "Coordinator", "round 1"; "Independent critic", "round 1 · independent_review";
+// "Member 2", "assignment 3"; "LaTeX editor", "".
+function callRole(row) {
+  const label = String(row.label || row.role || "Model call");
+  const round = /·\s*round (\d+)\s*$/.exec(label)?.[1] || "";
+  const base = label.replace(/\s*·\s*round \d+\s*$/, "");
+  const member = String(row.member || "");
+  const agent = member.startsWith("/") ? member.split("/").filter(Boolean).pop() || member
+    : member.length > 16 ? `${member.slice(0, 14)}…` : member;
+  const roundText = round ? `round ${round}` : "";
+  switch (row.role) {
+    case "independent critic": return ["Independent critic", [roundText, agent].filter(Boolean).join(" · ")];
+    case "subagent": return [`${base} subagent`, agent];
+    case "member": {
+      const assignment = /^member-\d+-(\d+)$/.exec(member)?.[1];
+      return [base, assignment ? `assignment ${assignment}` : ""];
+    }
+    case "reviewer": return ["Statement reviewer", roundText];
+    case "latex editor": return ["LaTeX editor", ""];
+    case "latex repair": return ["LaTeX repair", ""];
+    default: {
+      const words = /^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(base) ? base.replace(/_/g, " ") : base;
+      return [`${words.charAt(0).toUpperCase()}${words.slice(1)}`, roundText];
+    }
+  }
+}
+
+// A model as the menus name it ("GPT 6.1 Sol"), else as the call names it.
+function callModel(model) {
+  const id = String(model || "");
+  if (!id) return "Model not named";
+  const row = roleModelCatalog().find((item) => item.id === id || item.model === id);
+  const label = row?.label || (id.startsWith("api:") ? id.slice(4) : id);
+  return String(label).replace(/ — default$/, "");
+}
+
+const CALL_STATUS = {
+  completed: ["Done", "tone-done"], failed: ["Failed", "tone-failed"], cancelled: ["Cancelled", "tone-stopped"],
+  interrupted: ["Interrupted", "tone-paused"], "not recorded": ["Not recorded", "quiet"],
+  "trace format not recognized": ["Format not read", "quiet"],
+};
+
+function callStatus(row, glyphOnly = false) {
+  const [word, tone] = CALL_STATUS[row.status] || [String(row.status || "Unknown"), "quiet"];
+  const node = mcNode("span", `mc-st ${tone}${glyphOnly && row.status === "completed" ? " mcb-glyph" : ""}`, word);
+  node.title = word;
+  return node;
+}
+
+// What a row's record does not hold, in words (its withheld mark's title).
+function withheldText(row) {
+  const kinds = row.placeholderKinds || [];
+  const parts = [];
+  if (kinds.includes("hidden_reasoning")) {
+    parts.push(row.program === "claude" ? "Claude's thinking: only its summary"
+      : Number.isFinite(row.tokens?.reasoning) && row.tokens.reasoning
+        ? `${tokenFull(row.tokens.reasoning)} reasoning tokens hidden` : "reasoning hidden");
+  }
+  const others = [kinds.includes("token_probabilities") && "token probabilities",
+    kinds.includes("network_only") && "network details"].filter(Boolean);
+  if (others.length) parts.push(`${others.join(" and ")} not recorded`);
+  return parts.join("; ");
+}
+
+// The words a row is found by: its role, detail, model, program, status and failure.
+function callSearchText(row, number) {
+  const [title, detail] = callRole(row);
+  return [number, title, detail, row.role, row.label, row.member, callModel(row.model), row.model,
+    row.program === "claude" ? "Claude Code" : "Codex CLI", (CALL_STATUS[row.status] || [row.status])[0], row.error,
+    row.id].filter(Boolean).join(" ").toLowerCase();
+}
+
+function callsShown() {
+  const store = callsStore();
+  const words = store.words.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return store.rows.map((row, index) => ({ row, number: index + 1 })).filter(({ row, number }) =>
+    (store.filter === "all" || (CALL_GROUPS[store.filter] || []).includes(row.role))
+    && words.every((word) => callSearchText(row, number).includes(word)));
+}
+
+function renderCallsHead() {
+  const store = callsStore(), els = callsEls();
+  const rows = store.rows;
+  const sum = (key) => rows.reduce((total, row) => total + (Number.isFinite(row.tokens?.[key]) ? row.tokens[key] : 0), 0);
+  const known = (key) => rows.some((row) => Number.isFinite(row.tokens?.[key]));
+  const took = rows.reduce((total, row) => total + (Number.isFinite(row.durationMs) ? row.durationMs : 0), 0);
+  const meta = store.missing ? ["No record"] : !store.loaded ? ["Reading the record…"]
+    : [`${rows.length.toLocaleString("en-US")} ${rows.length === 1 ? "call" : "calls"}`,
+      ...(known("input") ? [`${tokenShort(sum("input"))} in${known("cached") ? ` (${tokenShort(sum("cached"))} cached)` : ""}`]
+        : []),
+      ...(known("output") ? [`${tokenShort(sum("output"))} out`] : []),
+      ...(took ? [`${callDuration(took)} of calls`] : [])];
+  const key = meta.join("|");
+  if (els.meta.dataset.key !== key) {
+    els.meta.dataset.key = key;
+    els.meta.replaceChildren(...meta.map((text) => mcNode("span", "", text)));
+  }
+  // Back to the job while it is listed, else to Records (a deleted job's record).
+  const job = store.job;
+  const kept = Boolean(job?.jobExists);
+  els.backText.textContent = kept ? "Back to the job" : "Back to Records";
+  els.training.hidden = store.missing || !store.loaded;
+  const title = job?.title || store.run;
+  if (ui.callsJobCrumb.textContent !== title) ui.callsJobCrumb.textContent = title;
+  ui.callsJobCrumb.title = title;
+  ui.callsJobCrumb.disabled = !kept;
+  els.notice.textContent = store.error ? `The record could not be read: ${store.error}` : "";
+  els.notice.hidden = !store.error;
+  // What the record could not do, newest last.
+  const problems = store.problems || [];
+  const problemKey = JSON.stringify(problems);
+  if (els.problems.dataset.key !== problemKey) {
+    els.problems.dataset.key = problemKey;
+    els.problems.replaceChildren(mcNode("strong", "", "What this record could not keep"),
+      mcNode("ul", "", ...problems.map((text) => mcNode("li", "", text))));
+  }
+  els.problems.hidden = !problems.length;
+  const empty = store.missing
+    ? "This job has no record of its model calls. Jobs started before TCS Prover kept records have none, and a "
+      + "record deleted on the Records page is gone."
+    : store.loaded && !rows.length ? "No model call recorded yet. Calls appear here as the job makes them." : "";
+  if (els.empty.textContent !== empty) els.empty.textContent = empty;
+  els.empty.hidden = !empty;
+  els.browser.hidden = !rows.length;
+}
+
+function renderCallsList() {
+  const store = callsStore(), els = callsEls();
+  const shown = callsShown();
+  // The author group's button names the coordinator when the job has one.
+  const coordinator = store.rows.some((row) => row.role === "coordinator");
+  for (const button of els.filter.querySelectorAll("[data-calls]")) {
+    const key = button.dataset.calls;
+    if (key === "author") button.textContent = coordinator ? "Coordinator" : "Author";
+    const on = key === store.filter;
+    button.classList.toggle("active", on);
+    button.setAttribute("aria-pressed", String(on));
+  }
+  const hidden = store.rows.length - shown.length;
+  const count = [`${shown.length.toLocaleString("en-US")} ${shown.length === 1 ? "call" : "calls"}`
+    + (hidden ? ` of ${store.rows.length.toLocaleString("en-US")}` : ""), "↑↓ steps"];
+  const countKey = count.join("|");
+  if (els.count.dataset.key !== countKey) {
+    els.count.dataset.key = countKey;
+    const mark = mcNode("span", "mc-hide", mcIcon("hidden"));
+    els.count.replaceChildren(`${count.join(" · ")} · `, mark, " reasoning the provider kept hidden");
+  }
+  const signature = JSON.stringify(shown.map(({ row, number }) => [row.id, number, row.status, row.label, row.model,
+    row.durationMs, row.tokens, row.placeholderKinds, row.time]));
+  if (els.list.dataset.signature === signature) return;
+  els.list.dataset.signature = signature;
+  els.list.replaceChildren(...shown.map(({ row, number }) => callRow(row, number)));
+}
+
+function callRow(row, number) {
+  const [title, detail] = callRole(row);
+  const button = mcNode("button", "mcb-item");
+  button.type = "button";
+  button.dataset.call = row.id;
+  button.setAttribute("aria-current", String(row.id === callsStore().selected));
+  const tokens = Number.isFinite(row.tokens?.input) || Number.isFinite(row.tokens?.output)
+    ? `${tokenShort(row.tokens?.input)} → ${tokenShort(row.tokens?.output)}` : "";
+  const numbers = mcNode("span", "mc-mono", row.durationMs !== null && row.durationMs !== undefined
+    ? mcNode("span", "mcb-dur", ` · ${callDuration(row.durationMs)}`) : "", tokens ? ` · ${tokens}` : "");
+  const end = mcNode("span", "mcb-end");
+  if ((row.placeholderKinds || []).includes("hidden_reasoning")) {
+    const mark = mcNode("span", "mc-hide mcb-hide", mcIcon("hidden"));
+    mark.title = withheldText(row);
+    end.append(mark);
+  }
+  end.append(callStatus(row, true));
+  button.append(mcNode("span", "mca-n", number), mcNode("span", "mcb-role", title, detail ? mcNode("small", "", ` · ${detail}`) : ""),
+    mcNode("span", "mca-time", callClock(row.time) || "–"), mcNode("span", "mcb-line2", callModel(row.model), numbers),
+    end);
+  button.setAttribute("aria-label", [`Call ${number}`, title, detail, callModel(row.model), callClock(row.time),
+    (CALL_STATUS[row.status] || [row.status])[0], withheldText(row)].filter(Boolean).join(", "));
+  button.onclick = () => showCall(row.id, { focusPane: false });
+  const item = mcNode("li");
+  item.append(button);
+  return item;
+}
+
+// Show call ``id``: its row marked, its address, its detail (read once and kept), on a phone in place of the list.
+async function showCall(id, { keepView = false, address = true } = {}) {
+  const store = callsStore(), els = callsEls(), run = callsRecord;
+  if (!run) return;
+  const changed = store.selected !== id;
+  store.selected = id;
+  if (changed && address) history.replaceState(null, "", callsUrl(run, id));
+  if (!keepView) els.browser.dataset.view = "detail";
+  for (const button of els.list.querySelectorAll("[data-call]")) {
+    button.setAttribute("aria-current", String(button.dataset.call === id));
+  }
+  const row = store.rows.find((item) => item.id === id);
+  if (!row) {
+    renderCallPane();
+    return;
+  }
+  if (!store.details.has(id)) {
+    renderCallPane(row, null);
+    try {
+      const detail = await recordRequest(recordPath(run, "model-calls", id));
+      store.details.set(id, detail);
+      if (store.details.size > 60) store.details.delete(store.details.keys().next().value);
+      // The outputs it sends name their tools from the call before it: read that call too (once), then draw again.
+      const previous = detail.sent?.previousCallId;
+      if (previous && !store.details.has(previous)
+          && (detail.sent?.newItems || []).some((view) => /_output$/.test(String(view.type || "")))) {
+        recordRequest(recordPath(run, "model-calls", previous)).then((value) => {
+          if (callsRecord !== run) return;
+          store.details.set(previous, value);
+          if (callsStore().selected === id) renderCallPane(row, store.details.get(id));
+        }, () => {});
+      }
+    } catch (error) {
+      if (callsRecord !== run || callsStore().selected !== id) return;
+      renderCallPane(row, { readError: error.message });
+      return;
+    }
+  }
+  if (callsRecord !== run || callsStore().selected !== id) return;
+  renderCallPane(row, store.details.get(id));
+}
+
+function stepCall(offset) {
+  const shown = callsShown(), store = callsStore();
+  const index = shown.findIndex(({ row }) => row.id === store.selected);
+  const next = shown[index + offset];
+  if (!next) return false;
+  showCall(next.row.id, { keepView: true }).then(() => {
+    const button = [...callsEls().list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === next.row.id);
+    button?.scrollIntoView?.({ block: "nearest" });
+  });
+  return true;
+}
+
+// The call pane: a bar (title, previous and next, the full request, the raw JSON), then what was sent and what came
+// back, usage, timing and what the record does not hold.
+function renderCallPane(row = null, detail = undefined) {
+  const store = callsStore(), els = callsEls();
+  const pane = els.pane;
+  if (!row) {
+    pane.replaceChildren(store.rows.length ? mcNode("p", "help mc-pane-empty", "Choose a call in the list.") : "");
+    return;
+  }
+  const number = store.rows.indexOf(row) + 1;
+  const [title, detailText] = callRole(row);
+  const shown = callsShown();
+  const index = shown.findIndex((item) => item.row.id === row.id);
+  const previous = shown[index - 1], next = shown[index + 1];
+  const back = mcButton("ghost compact mcb-back", "All calls", "previous");
+  back.onclick = () => {
+    els.browser.dataset.view = "list";
+    const button = [...els.list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === row.id);
+    button?.focus({ preventScroll: false });
+  };
+  const heading = mcNode("h2", "", `Call ${number} · ${title}${detailText ? `, ${detailText}` : ""} `, callStatus(row));
+  heading.id = "callTitle";
+  heading.tabIndex = -1;
+  const ended = Number.isFinite(row.durationMs) && row.time ? new Date(new Date(row.time).getTime() + row.durationMs) : null;
+  const meta = mcNode("p", "mc-meta", [callModel(row.model), row.program === "claude" ? "Claude Code" : "Codex CLI",
+    row.time ? `${callClock(row.time)}${ended ? ` → ${callClock(ended)}` : ""}` : "time not recorded", row.id]
+    .join(" · "));
+  const prev = mcButton("secondary compact", previous ? String(previous.number) : "", "previous");
+  prev.setAttribute("aria-label", previous ? `Previous call, ${previous.number}` : "No previous call");
+  prev.disabled = !previous;
+  prev.onclick = () => stepCall(-1);
+  const nextButton = mcButton("secondary compact", next ? String(next.number) : "", "next", true);
+  nextButton.setAttribute("aria-label", next ? `Next call, ${next.number}` : "No next call");
+  nextButton.disabled = !next;
+  nextButton.onclick = () => stepCall(1);
+  const actions = mcNode("div", "mc-detail-actions", mcNode("span", "mcb-step", prev, nextButton));
+  const raw = detail && !detail.readError && detail.rawAvailable;
+  if (raw) {
+    const full = mcButton("secondary compact", "Full request", "open");
+    full.onclick = () => toggleFullRequest(row, full);
+    const json = mcButton("secondary compact", "Raw JSON", "download");
+    json.onclick = () => downloadRawCall(row, json);
+    actions.append(full, json);
+  }
+  const bar = mcNode("div", "mcb-pane-bar", mcNode("div", "mcb-entry", back,
+    mcNode("div", "mc-detail-title", heading, meta)), actions);
+  const body = mcNode("div", "mc-detail");
+  if (!detail) body.append(mcNode("p", "help", "Reading this call…"));
+  else if (detail.readError) body.append(mcNode("p", "notice", `This call could not be read: ${detail.readError}`));
+  else body.append(...callBody(row, detail));
+  pane.replaceChildren(bar, body);
+  pane.setAttribute("aria-label", `Call ${number}`);
+}
+
+// The parts of one call's view.
+function callBody(row, detail) {
+  const parts = [];
+  const error = detail.error || row.error;
+  if (error || ["failed", "cancelled", "interrupted"].includes(row.status)) {
+    const word = row.status === "cancelled" ? "Cancelled" : row.status === "interrupted" ? "Interrupted" : "Failed";
+    parts.push(mcNode("div", "mc-error", mcIcon("warning"), mcNode("strong", "", word),
+      mcNode("span", "", error || (row.status === "interrupted"
+        ? "The program stopped during this call, so its response was never complete." : "No reason was recorded."))));
+  }
+  const usage = detail.usage && typeof detail.usage === "object" ? detail.usage : null;
+  const facts = mcNode("dl", "mc-facts");
+  const fact = (term, value, small = "") => facts.append(mcNode("div", "", mcNode("dt", "", term),
+    mcNode("dd", "", value, small ? mcNode("small", "", ` ${small}`) : "")));
+  if (Number.isFinite(row.durationMs)) fact("Took", callDuration(row.durationMs));
+  if (Number.isFinite(row.tokens?.input)) {
+    fact("Input", tokenFull(row.tokens.input), Number.isFinite(row.tokens.cached) ? `(${tokenFull(row.tokens.cached)} cached)` : "");
+  }
+  if (Number.isFinite(row.tokens?.output)) {
+    fact("Output", tokenFull(row.tokens.output),
+      Number.isFinite(row.tokens.reasoning) ? `(${tokenFull(row.tokens.reasoning)} reasoning)` : "");
+  }
+  if (facts.children.length) parts.push(facts);
+  parts.push(sentSection(row, detail), receivedSection(row, detail), callFoot(row, detail, usage));
+  return parts;
+}
+
+function sectionHead(title, note, ...extra) {
+  return mcNode("div", "mc-sec-head", mcNode("h3", "", title), note ? mcNode("p", "", note) : "", ...extra);
+}
+
+// What was sent: the instructions and the tools as one line each, then the items new since the previous call.
+function sentSection(row, detail) {
+  const store = callsStore();
+  const sent = detail.sent || {};
+  const items = Array.isArray(sent.newItems) ? sent.newItems : [];
+  const previous = sent.previousCallId ? store.rows.findIndex((item) => item.id === sent.previousCallId) + 1 : 0;
+  const unrecorded = ["not recorded", "trace format not recognized"].includes(row.status);
+  const note = unrecorded ? "Not recorded"
+    : previous ? `${items.length} ${items.length === 1 ? "item" : "items"} new since call ${previous} · the rest as before`
+    : sent.previousCallId ? `${items.length} ${items.length === 1 ? "item" : "items"} new since ${sent.previousCallId}`
+    : `${items.length} ${items.length === 1 ? "item" : "items"}: the first request of its conversation`;
+  const section = mcNode("section", "mc-sec mc-sent");
+  section.setAttribute("aria-label", "Sent");
+  section.append(sectionHead("Sent", note));
+  if (!unrecorded) {
+    const lines = mcNode("dl", "mc-sent-lines");
+    lines.append(instructionsLine(row, sent), toolsLine(row, sent));
+    section.append(lines);
+  }
+  // The full request, read and shown by the bar's button.
+  const full = mcNode("div", "mc-full");
+  full.hidden = true;
+  full.dataset.call = row.id;
+  section.append(full);
+  if (items.length) {
+    const list = mcNode("ol", "mc-items");
+    for (const view of items) list.append(callItem(view, { sent: true, row, previousCallId: sent.previousCallId }));
+    section.append(list);
+  }
+  return section;
+}
+
+function instructionsLine(row, sent) {
+  const line = mcNode("div");
+  const text = typeof sent.instructions === "string" ? sent.instructions : "";
+  const value = mcNode("dd");
+  if (text) {
+    value.append(mcNode("span", "mc-preview", text.replace(/\s+/g, " ").slice(0, 240)),
+      `${text.length.toLocaleString("en-US")} characters`);
+  } else {
+    value.append(row.program === "claude"
+      ? "Not recorded on this route: Claude Code's output does not carry the request it sent."
+      : "None at the top of this request: Codex sends its instructions as the developer messages among the items.");
+  }
+  line.append(mcNode("dt", "", "Instructions"), value);
+  if (text) line.append(showToggle(line, text));
+  return line;
+}
+
+// The names of a request's tools, those of a namespace (Codex's "functions") included.
+function toolNames(tools) {
+  const names = [];
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!tool || typeof tool !== "object") continue;
+    if (Array.isArray(tool.tools)) names.push(...toolNames(tool.tools));
+    else names.push(String(tool.name || tool.type || "tool"));
+  }
+  return names;
+}
+
+function toolsLine(row, sent) {
+  const line = mcNode("div");
+  const value = mcNode("dd");
+  const names = toolNames(sent.tools);
+  if (Array.isArray(sent.tools)) {
+    const shown = names.slice(0, 8);
+    value.append(mcNode("span", "mc-tools-names", shown.join(" · ") + (names.length > shown.length
+      ? ` · +${names.length - shown.length}` : "")), `${names.length} ${names.length === 1 ? "tool" : "tools"}`);
+  } else {
+    value.append(row.program === "claude"
+      ? "Not recorded on this route: Claude Code's output does not carry the request it sent."
+      : sent.previousCallId ? "None in this request: it goes on with the tools of the requests before it."
+      : "None in this request.");
+  }
+  line.append(mcNode("dt", "", "Tools"), value);
+  if (Array.isArray(sent.tools)) line.append(showToggle(line, JSON.stringify(sent.tools, null, 2), true));
+  return line;
+}
+
+// "Show" under a one-line summary: the whole text in a box below the line (and "Hide").
+function showToggle(line, text, mono = false) {
+  const button = mcButton("mc-link", "Show");
+  button.setAttribute("aria-expanded", "false");
+  button.onclick = () => {
+    let box = line.nextElementSibling?.classList?.contains("mc-shown") ? line.nextElementSibling : null;
+    if (box) {
+      box.remove();
+      button.textContent = "Show";
+      button.setAttribute("aria-expanded", "false");
+      return;
+    }
+    box = mcNode("div", "mc-shown", mcNode("pre", mono ? "mc-pre" : "mc-pre mc-prose", text));
+    line.after(box);
+    button.textContent = "Hide";
+    button.setAttribute("aria-expanded", "true");
+  };
+  return button;
+}
+
+// A long text: its first lines, and "Show all · N characters" for the rest.
+function longText(text, { className = "mc-pre", lines = 14, chars = 1600 } = {}) {
+  const value = String(text ?? "");
+  const cut = value.split("\n").slice(0, lines).join("\n");
+  const preview = cut.length > chars ? cut.slice(0, chars) : cut;
+  const pre = mcNode("pre", className, preview.length < value.length ? `${preview.replace(/\s+$/, "")}…` : value);
+  if (preview.length >= value.length) return pre;
+  const wrap = mcNode("div", "mc-long", pre);
+  const more = mcButton("mc-link mc-more", `Show all · ${value.length.toLocaleString("en-US")} characters`);
+  more.onclick = () => {
+    pre.textContent = value;
+    more.remove();
+  };
+  wrap.append(more);
+  return wrap;
+}
+
+// The text of a message's content (Codex: input_text and output_text parts; Claude: text blocks).
+function contentText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => typeof part === "string" ? part
+    : typeof part?.text === "string" ? part.text
+    : part?.type === "input_image" || part?.type === "image" ? "[image]" : "").filter(Boolean).join("\n\n");
+}
+
+// A tool output's text: a string, or the texts of its parts (Codex), or a Claude tool_result's content.
+function outputText(output) {
+  if (output === null || output === undefined) return "";
+  if (typeof output === "string") return output;
+  if (Array.isArray(output)) return contentText(output);
+  if (typeof output.output === "string") return output.output;
+  if (Array.isArray(output.output)) return contentText(output.output);
+  if (output.content !== undefined) return outputText(output.content);
+  return JSON.stringify(output, null, 2);
+}
+
+function itemCard(kind, icon, note, ...body) {
+  const head = mcNode("div", "mc-item-head", mcNode("span", "mc-kind", icon ? mcIcon(icon) : "", kind),
+    note ? mcNode("span", "mc-item-note", note) : "");
+  return mcNode("li", "mc-item", head, ...body);
+}
+
+function prettyJson(value) {
+  if (typeof value === "string") {
+    try { return JSON.stringify(JSON.parse(value), null, 2); } catch (_) { return value; }
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+// One item of a request's input or a response's output (contract: ItemView).
+function callItem(view, context) {
+  const item = view.item && typeof view.item === "object" ? view.item : {};
+  const type = view.type || item.type;
+  const sent = context.sent;
+  const fromCall = (previousCallId) => {
+    const number = previousCallId ? callsStore().rows.findIndex((row) => row.id === previousCallId) + 1 : 0;
+    return number ? `from call ${number}` : "";
+  };
+  switch (type) {
+    case "message": {
+      const role = item.role || "";
+      const text = contentText(item.content);
+      const kind = !sent ? (item.phase === "commentary" ? "Message" : "Answer")
+        : role === "developer" || role === "system" ? "Developer message"
+        : role === "assistant" ? "Earlier answer" : "User message";
+      const collapsed = sent && (role === "developer" || role === "system");
+      return itemCard(kind, "summary", item.phase === "commentary" ? "progress note" : "",
+        longText(text, collapsed ? { className: "mc-pre mc-prose", lines: 4, chars: 600 } : { className: "mc-pre mc-prose" }));
+    }
+    case "reasoning": {
+      const summary = (Array.isArray(item.summary) ? item.summary : []).map((part) => part?.text || "").filter(Boolean);
+      const raw = (Array.isArray(item.content) ? item.content : []).map((part) => part?.text || "").filter(Boolean);
+      if (!summary.length && !raw.length) {
+        return itemCard("Reasoning", "summary", "", mcNode("p", "mc-item-body mc-dim",
+          "No summary came back for this reasoning."));
+      }
+      const card = itemCard(raw.length ? "Reasoning" : "Reasoning summary", "summary", "");
+      if (summary.length) card.append(summaryText(summary.join("\n\n")));
+      if (raw.length) card.append(longText(raw.join("\n\n"), { className: "mc-pre mc-prose" }));
+      return card;
+    }
+    case "thinking":
+      return itemCard("Thinking summary", "summary", "", item.thinking ? summaryText(item.thinking)
+        : mcNode("p", "mc-item-body mc-dim", "No summary came back for this thinking."));
+    case "redacted_thinking":
+      return itemCard("Thinking", "hidden", "", mcNode("p", "mc-item-body mc-dim",
+        "Anthropic sent this thinking redacted; its encrypted copy is kept."));
+    case "custom_tool_call":
+      return item.name === "exec" ? codeCell(view) : toolCallCard(item.name, item.input, view.output, item.status);
+    case "function_call":
+      return toolCallCard(item.name, item.arguments, view.output, item.status);
+    case "tool_use":
+      return toolCallCard(item.name, item.input, view.output, "");
+    case "custom_tool_call_output":
+    case "function_call_output": {
+      const name = outputName(item.call_id, context.previousCallId);
+      return itemCard(type === "custom_tool_call_output" && (!name || name === "exec") ? "Output of a code cell"
+        : name ? `Output of ${name}` : "Output of a tool call", type === "custom_tool_call_output" ? "terminal" : "tool",
+        fromCall(context.previousCallId), longText(outputText(item.output)));
+    }
+    case "tool_result":
+      return itemCard("Tool result", "tool", item.is_error ? "an error" : "", longText(outputText(item.content)));
+    case "text":
+      return itemCard(sent ? "Text sent" : "Answer", "summary", "", longText(item.text, { className: "mc-pre mc-prose" }));
+    case "additional_tools": {
+      const names = toolNames(item.tools);
+      const card = itemCard("Tools of this conversation", "tool", `${names.length} ${names.length === 1 ? "tool" : "tools"}`);
+      card.append(mcNode("p", "mc-item-body mc-tools-names", names.join(" · ")));
+      return card;
+    }
+    case "agent_message":
+      return itemCard("Message from a subagent", "message", item.author || item.sender || "",
+        longText(contentText(item.content) || item.message || item.text || prettyJson(item), { className: "mc-pre mc-prose" }));
+    case "compaction":
+    case "compacted":
+      return itemCard("Compacted conversation", "summary", type === "compacted" ? "summary from the session file" : "",
+        longText(item.message || item.summary || contentText(item.content) || "No summary text.", { className: "mc-pre mc-prose" }));
+    case "web_search_call": {
+      const action = item.action && typeof item.action === "object" ? item.action : {};
+      return itemCard("Web search", "search", item.status || "", mcNode("p", "mc-item-body",
+        action.query || (Array.isArray(action.queries) ? action.queries.join(" · ") : "") || prettyJson(action)));
+    }
+    case "local_shell_call": {
+      const command = item.action?.command;
+      return itemCard("Command", "terminal", item.status || "", mcNode("pre", "mc-pre",
+        Array.isArray(command) ? command.join(" ") : prettyJson(item.action)), view.output ? longText(outputText(view.output)) : "");
+    }
+    default:
+      return itemCard(String(type || "Item"), "", "", longText(prettyJson(item)));
+  }
+}
+
+// The name of the tool whose output ``callId`` is, when the previous call that made it has been read.
+function outputName(callId, previousCallId) {
+  const previous = previousCallId ? callsStore().details.get(previousCallId) : null;
+  const made = (previous?.received?.items || []).find((view) => view.item?.call_id === callId);
+  return made?.item?.name ? String(made.item.name) : "";
+}
+
+// A reasoning summary: its leading "**Title**" in bold, the rest as text.
+function summaryText(text) {
+  const value = String(text || "").trim();
+  const match = /^\*\*(.+?)\*\*\s*/.exec(value);
+  const paragraph = mcNode("p", "mc-item-body mc-summary");
+  if (match) paragraph.append(mcNode("b", "", match[1]), value.length > match[0].length ? ` ${value.slice(match[0].length)}` : "");
+  else paragraph.append(value);
+  return paragraph;
+}
+
+// A tool call: its name, its input, and its output (from the next request of the conversation).
+function toolCallCard(name, input, output, status) {
+  const out = output && typeof output === "object" ? (output.output ?? output.content ?? output) : output;
+  const note = output ? "" : "no output recorded";
+  const card = itemCard(`Tool call · ${name || "tool"}`, "tool", [status && status !== "completed" ? status : "", note]
+    .filter(Boolean).join(" · "), longText(prettyJson(input ?? "")));
+  if (output) {
+    card.append(mcNode("div", "mc-output", mcNode("span", "mc-output-label", "Output"),
+      longText(outputText(out), { className: "mc-out" })));
+  }
+  return card;
+}
+
+// A code cell (Codex's exec): its script, then the tools it called, each with what came back, then its output.
+function codeCell(view) {
+  const item = view.item || {};
+  const nested = Array.isArray(view.nestedToolCalls) ? view.nestedToolCalls : [];
+  const head = mcNode("div", "mc-item-head", mcNode("span", "mc-kind", mcIcon("code"), "Code cell"),
+    mcNode("span", "mc-item-note", ["JavaScript", nested.length ? `${nested.length} ${nested.length === 1 ? "call" : "calls"} inside` : ""]
+      .filter(Boolean).join(" · ")));
+  const cell = mcNode("li", "mc-code", head, mcNode("pre", "", String(item.input ?? "")));
+  if (nested.length) cell.append(mcNode("ol", "mc-nested", ...nested.map(nestedCall)));
+  if (view.output) {
+    cell.append(mcNode("div", "mc-output", mcNode("span", "mc-output-label", "What the cell returned"),
+      longText(outputText(view.output), { className: "mc-out" })));
+  } else {
+    cell.append(mcNode("p", "mc-item-body mc-dim", "Its output is not recorded (no later request of this conversation)."));
+  }
+  return cell;
+}
+
+// The arguments a nested tool was called with (the invocation's payload), as an object when they parse.
+function nestedArguments(call) {
+  const payload = call.input?.payload;
+  const raw = payload?.arguments ?? payload?.input ?? call.input;
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch (_) { return raw; }
+  }
+  return raw;
+}
+
+// What a nested tool returned: the code-mode response's value (text, or an object such as a command's result).
+function nestedValue(call) {
+  const output = call.output;
+  return output && typeof output === "object" && "value" in output ? output.value : output;
+}
+
+function nestedCall(call) {
+  const tool = String(call.tool || "tool");
+  const args = nestedArguments(call);
+  const value = nestedValue(call);
+  const item = mcNode("li");
+  const head = (kind, icon, code, note) => mcNode("div", "mc-nested-head", mcNode("span", "mc-kind", mcIcon(icon), kind),
+    code ? mcNode("code", "", code) : "", note ? mcNode("span", "mc-item-note", note) : "");
+  const status = call.status && call.status !== "completed" ? call.status : "";
+  if (tool === "web.run" || tool === "web_search" || tool.endsWith("web_search")) {
+    const queries = (args && Array.isArray(args.search_query) ? args.search_query : []).map((query) => query?.q).filter(Boolean);
+    const other = args && typeof args === "object" ? Object.keys(args).filter((key) => key !== "search_query") : [];
+    const what = queries.length ? queries.join(" · ") : typeof args === "string" ? args : other.length
+      ? `${other.join(", ")}: ${JSON.stringify(Object.fromEntries(other.map((key) => [key, args[key]])))}` : "";
+    item.append(head(queries.length ? "Web search" : "Web", "search", what, status));
+    const text = typeof value === "string" ? value : value === null || value === undefined ? "" : prettyJson(value);
+    if (text) {
+      const shown = mcButton("mc-link", `Show the text it read · ${text.length.toLocaleString("en-US")} characters`);
+      shown.setAttribute("aria-expanded", "false");
+      shown.onclick = () => {
+        const open = shown.getAttribute("aria-expanded") === "true";
+        const box = item.querySelector(".mc-read");
+        if (open) {
+          box?.remove();
+          shown.textContent = `Show the text it read · ${text.length.toLocaleString("en-US")} characters`;
+        } else {
+          item.append(mcNode("pre", "mc-out mc-read", text));
+          shown.textContent = "Hide the text it read";
+        }
+        shown.setAttribute("aria-expanded", String(!open));
+      };
+      item.append(shown);
+    } else {
+      item.append(mcNode("p", "mc-item-body mc-dim", "Its result is not recorded."));
+    }
+    return item;
+  }
+  if (tool === "exec_command" || tool === "shell" || tool.endsWith("exec_command")) {
+    const command = args && typeof args === "object" ? (args.cmd ?? args.command) : args;
+    const result = value && typeof value === "object" ? value : null;
+    const notes = [Number.isFinite(result?.exit_code) ? `exit ${result.exit_code}` : "",
+      Number.isFinite(result?.wall_time_seconds) ? `${result.wall_time_seconds < 10 ? result.wall_time_seconds.toFixed(1)
+        : Math.round(result.wall_time_seconds)} s` : "", status].filter(Boolean).join(" · ");
+    item.append(head("Command", "terminal", Array.isArray(command) ? command.join(" ") : String(command ?? ""), notes));
+    const text = result ? (typeof result.output === "string" ? result.output : prettyJson(result))
+      : typeof value === "string" ? value : value === null || value === undefined ? "" : prettyJson(value);
+    if (text) item.append(longText(text, { className: "mc-out", lines: 10, chars: 1200 }));
+    return item;
+  }
+  item.append(head(tool, "tool", "", status));
+  if (args !== undefined && args !== null && args !== "") item.append(longText(prettyJson(args), { className: "mc-out", lines: 8 }));
+  if (value !== undefined && value !== null && value !== "") {
+    item.append(mcNode("span", "mc-output-label", "Returned"),
+      longText(typeof value === "string" ? value : prettyJson(value), { className: "mc-out", lines: 8 }));
+  }
+  return item;
+}
+
+// What came back, in order; the placeholder of hidden reasoning after the reasoning it stands for.
+function receivedSection(row, detail) {
+  const items = Array.isArray(detail.received?.items) ? detail.received.items : [];
+  const hidden = (detail.placeholders || []).find((item) => item?.kind === "hidden_reasoning");
+  const section = mcNode("section", "mc-sec mc-received");
+  section.setAttribute("aria-label", "Received");
+  const note = items.length ? `${items.length} ${items.length === 1 ? "item" : "items"}, in the order they came`
+    : ["failed", "cancelled", "interrupted"].includes(row.status) ? "Nothing came back" : "No item recorded";
+  section.append(sectionHead("Received", note));
+  const list = mcNode("ol", "mc-items");
+  const reasoning = items.map((view) => view.type || view.item?.type)
+    .reduce((last, type, index) => ["reasoning", "thinking", "redacted_thinking"].includes(type) ? index : last, -1);
+  if (hidden && reasoning < 0) list.append(withheldCard(hidden, row));
+  items.forEach((view, index) => {
+    list.append(callItem(view, { sent: false, row }));
+    if (hidden && index === reasoning) list.append(withheldCard(hidden, row));
+  });
+  for (const placeholder of detail.placeholders || []) {
+    // A call the record cannot show says so where its items would be.
+    if (["web_cutoff_one_shot", "trace_format_not_recognized", "compaction_not_traced", "interrupted"]
+      .includes(placeholder?.kind)) list.append(withheldCard(placeholder, row));
+  }
+  if (list.children.length) section.append(list);
+  return section;
+}
+
+const PLACEHOLDER_TITLES = {
+  hidden_reasoning: "Hidden reasoning", token_probabilities: "Token probabilities", network_only: "Network details",
+  web_cutoff_one_shot: "Not recorded", trace_format_not_recognized: "Trace format not read", interrupted: "Interrupted",
+  compaction_not_traced: "Compaction request not traced",
+};
+
+// What a placeholder says after its title in "Not in this record": "2,176 tokens, encrypted copy kept", "OpenAI refuses
+// them for reasoning models", "per-word arrival times, response headers, moderation notes: not recorded on this route".
+function placeholderLine(placeholder) {
+  const facts = placeholder.facts || {};
+  const details = Array.isArray(facts.details) ? facts.details.join(", ") : "";
+  switch (placeholder.kind) {
+    case "hidden_reasoning":
+      return [Number.isFinite(facts.reasoningTokens) && facts.reasoningTokens ? `${tokenFull(facts.reasoningTokens)} tokens` : "",
+        facts.encryptedCopyKept ? "encrypted copy kept" : "no encrypted copy came back"].filter(Boolean).join(", ");
+    case "token_probabilities":
+      return placeholder.withheldBy === "Anthropic" ? "Anthropic's API does not offer them"
+        : "OpenAI refuses them for reasoning models";
+    case "network_only":
+      return placeholder.withheldBy === "Claude Code"
+        ? `${details}: Claude Code's output does not carry the request it sent`
+        : `${details}: not recorded on this route`;
+    default:
+      return String(placeholder.why || "").replace(/\.$/, "");
+  }
+}
+const PLACEHOLDER_ICONS = { hidden_reasoning: "hidden", token_probabilities: "probability", network_only: "network" };
+
+// A placeholder's title with its facts: "Hidden reasoning · 2,176 tokens"; Claude Code's request: "Request sent".
+function placeholderTitle(placeholder) {
+  const facts = placeholder.facts || {};
+  if (placeholder.kind === "network_only" && placeholder.withheldBy === "Claude Code") return "The request Claude Code sent";
+  const title = PLACEHOLDER_TITLES[placeholder.kind] || String(placeholder.kind || "Not recorded");
+  if (placeholder.kind === "hidden_reasoning" && Number.isFinite(facts.reasoningTokens) && facts.reasoningTokens) {
+    return `${title} · ${tokenFull(facts.reasoningTokens)} tokens`;
+  }
+  return title;
+}
+
+// A clearly marked placeholder in the list of what came back: dashed, with the crossed-out eye.
+function withheldCard(placeholder, row) {
+  const why = String(placeholder.why || "");
+  const body = placeholder.kind === "hidden_reasoning"
+    ? `${placeholder.withheldBy || (row.program === "claude" ? "Anthropic" : "OpenAI")} does not return the model's own `
+      + `reasoning${row.program === "claude" ? " (only a summary of Claude's thinking)" : ", only its summary"}.`
+      + (placeholder.facts?.encryptedCopyKept ? " The record keeps the encrypted copy that came back; only the provider can "
+        + "read it." : "")
+    : why;
+  const card = mcNode("li", "mc-withheld", mcIcon(PLACEHOLDER_ICONS[placeholder.kind] || "hidden"),
+    mcNode("strong", "", placeholderTitle(placeholder)), mcNode("p", "", body));
+  return card;
+}
+
+// Usage, timing and what the record does not hold.
+function callFoot(row, detail, usage) {
+  const foot = mcNode("div", "mc-foot");
+  const list = (pairs) => mcNode("dl", "", ...pairs.flatMap(([term, value]) => [mcNode("dt", "", term), mcNode("dd", "", value)]));
+  const usagePairs = [];
+  if (usage) {
+    const add = (term, key) => { if (Number.isFinite(usage[key])) usagePairs.push([term, tokenFull(usage[key])]); };
+    add("Input", "input_tokens"); add("of it cached", "cached_input_tokens"); add("cache written", "cache_creation_input_tokens");
+    add("cache read", "cache_read_input_tokens"); add("Output", "output_tokens"); add("of it reasoning", "reasoning_output_tokens");
+    add("Total", "total_tokens");
+  }
+  foot.append(mcNode("div", "", mcNode("h4", "", "Usage"), usagePairs.length ? list(usagePairs)
+    : mcNode("p", "mc-dim", row.program === "claude" && row.status !== "failed"
+      ? "Claude Code's stream gives a message's usage at its start only." : "Not recorded for this call.")));
+  const ended = Number.isFinite(row.durationMs) && row.time ? new Date(new Date(row.time).getTime() + row.durationMs) : null;
+  const timing = [];
+  if (row.time) timing.push(["Sent", callClock(row.time, true)]);
+  if (ended) timing.push(["Finished", callClock(ended, true)]);
+  if (Number.isFinite(row.durationMs)) timing.push(["Took", callDuration(row.durationMs)]);
+  foot.append(mcNode("div", "", mcNode("h4", "", "Timing"), timing.length ? list(timing)
+    : mcNode("p", "mc-dim", row.program === "claude" ? "Claude Code's stream gives no time per request."
+      : "Not recorded for this call.")));
+  const placeholders = (detail.placeholders || []).filter((item) => item && typeof item === "object");
+  foot.append(mcNode("div", "", mcNode("h4", "", "Not in this record"), placeholders.length
+    ? mcNode("ul", "mc-notrec", ...placeholders.map((placeholder) => {
+      const line = placeholderLine(placeholder);
+      const title = placeholder.kind === "network_only" && placeholder.withheldBy === "Claude Code"
+        ? "The request Claude Code sent" : PLACEHOLDER_TITLES[placeholder.kind] || String(placeholder.kind || "Not recorded");
+      return mcNode("li", "", mcIcon(PLACEHOLDER_ICONS[placeholder.kind] || "hidden"),
+        mcNode("span", "", mcNode("b", "", title), line ? ` · ${line}` : ""));
+    })) : mcNode("p", "mc-dim", "Nothing withheld.")));
+  return foot;
+}
+
+// The full request, read once (GET .../raw) and shown in the Sent section: the exact request text, its JSON laid out.
+async function toggleFullRequest(row, button) {
+  const box = [...callsEls().pane.querySelectorAll(".mc-full")].find((node) => node.dataset.call === row.id);
+  if (!box) return;
+  if (!box.hidden) {
+    box.hidden = true;
+    button.setAttribute("aria-expanded", "false");
+    return;
+  }
+  box.hidden = false;
+  button.setAttribute("aria-expanded", "true");
+  box.replaceChildren(mcNode("p", "help", "Reading the full request…"));
+  try {
+    const raw = await rawCall(row);
+    if (!box.isConnected) return;
+    const request = raw.request;
+    if (request === null || request === undefined) {
+      box.replaceChildren(mcNode("p", "help", raw.format === "claude-stream"
+        ? "Claude Code's stream does not carry the request it sent; Raw JSON has the stream's lines of this call."
+        : "The record has no request text for this call."));
+      return;
+    }
+    let parsed = null;
+    try { parsed = JSON.parse(request); } catch (_) {}
+    const items = Array.isArray(parsed?.input) ? parsed.input.length : null;
+    const note = [`${request.length.toLocaleString("en-US")} characters`, items !== null ? `${items} input items` : "",
+      raw.format === "codex-trace" ? "exactly as Codex's trace wrote it" : ""].filter(Boolean).join(" · ");
+    box.replaceChildren(sectionHead("Full request", note), longText(parsed ? JSON.stringify(parsed, null, 2) : request,
+      { className: "mc-pre", lines: 60, chars: 20000 }));
+  } catch (error) {
+    if (box.isConnected) box.replaceChildren(mcNode("p", "notice", `The full request could not be read: ${error.message}`));
+  }
+}
+
+async function rawCall(row) {
+  const store = callsStore(), run = callsRecord;
+  if (store.raw.has(row.id)) return store.raw.get(row.id);
+  const raw = await recordRequest(recordPath(run, "model-calls", row.id, "raw"));
+  store.raw.set(row.id, raw);
+  if (store.raw.size > 6) store.raw.delete(store.raw.keys().next().value);
+  return raw;
+}
+
+// The call's exact request and response as a JSON file (GET .../raw as it answers).
+async function downloadRawCall(row, button) {
+  button.disabled = true;
+  try {
+    const raw = await rawCall(row);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(raw, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${callsRecord}-${row.id}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    const notice = callsEls().notice;
+    notice.textContent = `The raw JSON of this call could not be read: ${error.message}`;
+    notice.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+(() => {
+  const els = callsEls();
+  els.words.addEventListener("input", () => {
+    callsStore().words = els.words.value;
+    renderCallsList();
+  });
+  els.filter.onclick = (event) => {
+    const button = event.target.closest?.("[data-calls]");
+    if (!button) return;
+    callsStore().filter = button.dataset.calls;
+    renderCallsList();
+    // The chosen call's previous and next follow the list shown.
+    const store = callsStore();
+    if (store.selected) showCall(store.selected, { keepView: true, address: false });
+  };
+  // Up and down step through the list while it has the focus.
+  els.list.addEventListener("keydown", (event) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    if (!stepCall(event.key === "ArrowDown" ? 1 : -1)) return;
+    event.preventDefault();
+    const id = (() => {
+      const shown = callsShown(), index = shown.findIndex(({ row }) => row.id === callsStore().selected);
+      return shown[index]?.row.id;
+    })();
+    setTimeout(() => [...els.list.querySelectorAll("[data-call]")].find((item) => item.dataset.call === id)?.focus(), 0);
+  });
+  els.back.onclick = () => {
+    const store = callsStore();
+    clearTimeout(store.timer);
+    if (store.job?.jobExists) selectJob(store.run);
+    else openRecords();
+  };
+  els.training.onclick = () => downloadTrainingRecord(callsRecord, els.training, els.trainingText, els.notice);
+  ui.callsJobCrumb.onclick = () => {
+    const store = callsStore();
+    if (!store.job?.jobExists) return;
+    clearTimeout(store.timer);
+    selectJob(store.run);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && callsRecord && !currentJob) loadCalls(false);
+  });
+})();
+
+// The sidebar's size of every record: read once now, then with the list (loadRecords).
+if (!viewingRecords) loadRecords();
+// --- End of records and model calls ---------------------------------------------------------------------------------
