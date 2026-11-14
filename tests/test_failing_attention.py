@@ -544,6 +544,41 @@ class MemberNoteTests(team_test.TeamCase):
         self.assertTrue(attention["text"].startswith("claude-gw reports that its credit is used up (Credit balance is "
                                                      "too low)."), attention)
 
+    def test_a_members_refused_key_or_expired_login_ends_its_assignment_and_lists_nothing(self):
+        # As docs/retries.md says: a member's failed login or refused key is no failure that retries (member_problem()
+        # ends its assignment at once, with the report), so no retry note lists the job; a usage limit retries.
+        def attempt(failures):
+            def run(member, prompt, conversation, started, *, directory, settings, compact_prompt, record,
+                    retried=None, noted=None):
+                if failures:
+                    raise runtime.Error(failures.pop(0))
+                return "Lemma A holds."
+            return run
+
+        def assigned(model, failures):
+            with mock.patch.object(runtime, "member_attempt", side_effect=attempt(failures)), \
+                    mock.patch.object(runtime, "wait_before_retry", create=True):
+                crew = self.crew([{"model": model, "effort": "high"}])
+                crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
+                report, = self.collect(crew, 1)
+            app = server.App(runs=self.root / "runs", load_latest=False)
+            app.state.update(phase="running", stage="solve", activeNode="author", authorModel="gpt-6.1-sol")
+            for event in list(self.events):
+                app._follow_failures(event)
+            notes = [event for event in self.events if event.get("retryAt")]
+            self.events.clear()
+            return report, notes, app.attention()
+
+        for model, failure, said in (
+                (self.api_model(), "Codex member failed: unexpected status 401 Unauthorized: Incorrect API key "
+                                   "provided: sk-proj-****.", "its API connection refused the request"),
+                ("gpt-6.1-sol", "Codex member failed: unexpected status 401 Unauthorized: Your authentication token "
+                                "has expired. Please log in again.", "The assignment failed: authentication failed")):
+            with self.subTest(failure=failure):
+                report, notes, attention = assigned(model, [failure])
+                self.assertIn(said, report)
+                self.assertEqual((notes, attention), ([], None))
+
 
 if __name__ == "__main__":
     unittest.main()

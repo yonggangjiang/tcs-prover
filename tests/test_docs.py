@@ -197,6 +197,20 @@ class AccuracyTests(unittest.TestCase):
                       "filtering policy\", or an OpenAI-format endpoint's 400 with the code `content_filter`): no setting "
                       "causes it, and a retry may pass.", flat(DOCS / "retries.md"))
 
+    def test_a_team_members_login_or_refused_key_is_said_to_end_its_assignment_not_to_be_listed(self):
+        # workflow_runner.member_problem() ends a member's assignment at once for its failed login or refused key (an
+        # API member's as a team.Refusal), so no retry note lists the job; its usage limit is retried and listed
+        # (tests/test_failing_attention.py MemberNoteTests).
+        retries = flat(DOCS / "retries.md")
+        self.assertIn("Of a team member's calls only a usage limit is listed so, while the member's assignment "
+                      "retries: its expired login, a key its API connection refuses and a program it lacks end that "
+                      "assignment at once instead, with a report to the coordinator, which goes on with its team (see "
+                      "[the author's team](workflow.md#the-authors-team)); no retry waits for them, and the job is not "
+                      "listed for them.", retries)
+        self.assertNotIn("of any of the job's calls (a team member's", retries)
+        self.assertIn("a team member's failed login or refused key is never retried, as `member_problem()` ends its "
+                      "assignment at once, so of a member only a usage limit is listed", flat(DOCS / "developers.md"))
+
     def test_a_stream_lost_partway_is_said_to_be_retried_also_when_its_error_is_json(self):
         # Codex 0.160 reports a stream that ended with response.failed in its own words around the error, "stream
         # disconnected before completion: …", also when the error is a JSON body: a lost stream, retried, never a

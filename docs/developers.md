@@ -1102,7 +1102,9 @@ model's values) say the account is out of credit
 "Credit balance is too low", "insufficient credits" or "balance", "payment
 required") or a usage limit (or a login, `NEEDS_YOU_FAILURES`: whichever call
 has it, also while another call waits to retry for another reason or failed
-after it), otherwise once the same failure has repeated for
+after it; a team member's failed login or refused key is never retried, as
+`member_problem()` ends its assignment at once, so of a member only a usage
+limit is listed), otherwise once the same failure has repeated for
 `FAILING_ATTENTION_SECONDS` (15 minutes; kind `failing`, *Model calls keep
 failing*). `App._follow_failures()` keeps each call's failure while it keeps
 failing: a retry status with `retryAt` (keyed as the waits are: its
