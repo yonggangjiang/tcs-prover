@@ -1116,25 +1116,47 @@ class ClaudeStream:
     subagent by its tool-use id) and its usage. Its call line is written when a later line of the same agent, or the
     turn's result, shows it ended; at the end of the process the open ones are written too ("interrupted" when no
     result followed them). The file is synced at each call line.
+
+    What TCS Prover writes to the CLI's standard input (a structured call's or team member's prompt), which the stream
+    never repeats, is kept by sent_input() and belongs to the main agent's next request ("stdin" of its call line).
     """
 
     def __init__(self, recorder, label, labels):
         self.recorder, self.record, self.label = recorder, recorder.record, label
         folder = _private_folder(self.record.folder / "claude")
         self.path = folder / f"{label}.jsonl"
+        self.labels_path = folder / f"{label}.json"
         self.claim = FileLock(folder / f"{label}.claim")
         self.claim.acquire()
-        write_atomic(folder / f"{label}.json",
-                     (json.dumps({**labels, "process": label, "program": "claude", "startedMs": _now_ms()},
-                                 ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        self.labels = {**labels, "process": label, "program": "claude", "startedMs": _now_ms()}
+        write_atomic(self.labels_path, (json.dumps(self.labels, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
         self.stream = _open_private(self.path, "ab")
         self.count = 0
         self.lock = threading.Lock()
         self.open = {}  # message id -> call line so far
         self.order = []
         self.sent = {}  # agent -> line numbers of the user lines since its previous request
+        self.stdin = []  # sha256 of what was written to the CLI's input since the main agent's previous request
         self.session = None
         self.finished = False
+
+    def sent_input(self, text):
+        """Keep ``text``, written to the CLI's standard input (already redacted): stored once by its sha256 and named
+        in the process's labels (claude/<label>.json, "stdin"), so a stream finished at a later start has it too."""
+
+        data = str(text).encode("utf-8", "replace")
+        sha = _sha(data)
+        try:
+            with self.record.locked():
+                self.record.store({sha: data})
+                self.labels["stdin"] = [*self.labels.get("stdin", []), sha]
+                write_atomic(self.labels_path,
+                             (json.dumps(self.labels, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        except OSError as exc:
+            note_problem(self.record, f"The input of Claude Code process {self.label} could not be recorded ({exc}).")
+            return
+        with self.lock:
+            self.stdin.append(sha)
 
     def line(self, text):
         """Append one stream-json line (already redacted)."""
@@ -1176,6 +1198,8 @@ class ClaudeStream:
                     "requestId": message.get("request_id"),
                     "stream": {"file": f"claude/{self.label}.jsonl.gz", "lines": [number, number],
                                "sent": self.sent.pop(agent, [])}}
+                if agent is None and self.stdin:
+                    call["stream"]["stdin"], self.stdin = self.stdin, []  # The prompt it was sent first.
                 self.order.append(identity)
             call["stream"]["lines"][1] = number
             call["endedMs"] = _now_ms()
@@ -1545,6 +1569,8 @@ def finish_leftover_stream(record, path):
     replay = ClaudeStream.__new__(ClaudeStream)
     replay.recorder, replay.record, replay.label = None, record, label
     replay.open, replay.order, replay.sent, replay.session, replay.finished = {}, [], {}, None, False
+    labels = read_json(path.with_suffix(".json"), {})
+    replay.stdin = list(labels.get("stdin") or []) if isinstance(labels, dict) else []
     calls = []
     replay._write = lambda lines: calls.extend(lines)
     try:

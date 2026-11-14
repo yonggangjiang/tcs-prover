@@ -686,6 +686,33 @@ class ClaudeStreamTests(RecordCase):
         self.assertTrue((folder / "20261113T000000-author-abcdef.jsonl.gz").is_file())
         self.assertFalse((folder / "20261113T000000-author-abcdef.jsonl").exists())
 
+    def test_the_prompt_written_to_the_cli_s_input_is_the_first_request_s_input(self):
+        # A structured call or team member gets its prompt on standard input, which the stream never repeats.
+        prompt = "Review the proof in input.txt. CRITIC-PROMPT-MARKER"
+        stream = self.recorder().claude_stream(role="critic", label="Critic coordinator")
+        stream.sent_input(prompt)
+        for line in stream_lines():
+            stream.line(json.dumps(line))
+        stream.finish()
+        first = model_calls.call_detail("run-1", "c000001")
+        self.assertEqual([view["item"] for view in first["sent"]["newItems"]], [{"type": "text", "text": prompt}])
+        self.assertIsNone(first["sent"]["previousCallId"])
+        second = model_calls.call_detail("run-1", "c000002")
+        self.assertEqual([view["item"]["type"] for view in second["sent"]["newItems"]], ["tool_result"])
+        requests = [json.loads(line) for line in download().read("requests.jsonl").splitlines()]
+        self.assertEqual(requests[0]["sent"], [{"type": "text", "text": prompt}])
+
+    def test_a_stream_finished_at_a_later_start_keeps_its_prompt(self):
+        stream = records.Recorder(self.record.folder).claude_stream(role="member", label="Member 1")
+        stream.sent_input("MEMBER-ASSIGNMENT-MARKER")
+        stream.stream.write("".join(json.dumps(line) + "\n" for line in stream_lines()[:5]).encode())
+        stream.stream.close()
+        stream.claim.release()  # The runner died: nothing finished the stream.
+        records.store_leftovers(self.record)
+        first = model_calls.call_detail("run-1", "c000001")
+        self.assertEqual([view["item"] for view in first["sent"]["newItems"]],
+                         [{"type": "text", "text": "MEMBER-ASSIGNMENT-MARKER"}])
+
 
 def rollout(path, meta, records_after=()):
     path.parent.mkdir(parents=True, exist_ok=True)

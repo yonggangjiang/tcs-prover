@@ -1181,6 +1181,9 @@ def run_structured(prompt, schema, stage, model, effort, summary, *, timeout, ac
         try:
             monitor.start()
             monitor.send_input(prompt)
+            if stream is not None:
+                # Claude Code's stream does not repeat the prompt it read: the record keeps it for the first request.
+                stream.sent_input(record_scrub(prompt))
             for line in monitor.lines():
                 if stream is not None:
                     stream.line(record_scrub(line.rstrip("\n")))

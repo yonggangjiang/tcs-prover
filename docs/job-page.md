@@ -389,8 +389,9 @@ and the coordinator's team members), with its model, tokens, timing and status.
 - **What it holds.** For the Codex CLI, Codex's own full trace: each request
   exactly as sent (its instructions, tools and whole input), each response with
   OpenAI's encrypted reasoning, the scripts the model ran and the text its web
-  searches returned, stored once per item. For Claude Code, everything Claude
-  Code printed (with keys removed), its summarized thinking included: Claude
+  searches returned, stored once per item. For Claude Code, the prompt TCS
+  Prover gave it and everything Claude Code printed (with keys removed), its
+  summarized thinking included: Claude
   models are asked for it on API connections too when the job's reasoning
   summaries are Concise or Detailed. The programs' own session files are copied
   in before TCS Prover deletes any of them (a session whose copy fails is

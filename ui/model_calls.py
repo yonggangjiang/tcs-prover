@@ -15,6 +15,7 @@ import shutil
 import threading
 import time
 import zipfile
+import zlib
 
 from runner import records
 
@@ -527,6 +528,12 @@ def _claude_detail(record, line, kept=None):
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 results.setdefault(block.get("tool_use_id"), block)
     sent = []
+    for sha in stream.get("stdin") or ():
+        # What TCS Prover wrote to the CLI's input (the prompt of a structured call or team member), sent first.
+        try:
+            sent.append(_view({"type": "text", "text": record.objects.get(sha).decode("utf-8", "replace")}))
+        except (KeyError, ValueError, OSError, EOFError, zlib.error):
+            pass
     for number in stream.get("sent") or ():
         message = _json(lines[number]) if 0 <= number < len(lines) else None
         body = message.get("message") if isinstance(message, dict) else None

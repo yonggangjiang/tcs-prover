@@ -14,6 +14,7 @@ from unittest import mock
 from tests import isolated_state  # noqa: F401 - first: keeps private state out of the checkout.
 import workflow_runner as runtime
 from runner import claude_cli, records
+from ui import model_calls
 
 import test_claude_cli as claude_test
 
@@ -57,6 +58,10 @@ class ClaudeRecordTests(claude_test.FakeClaudeCase):
         self.assertEqual(self.saved(session), [])
         calls = records.Record(self.folder).calls.read()
         self.assertEqual([(call["program"], call["callId"]) for call in calls], [("claude", "msg_1")])
+        # The prompt went to the CLI's input, which its stream never repeats: the record keeps it for the request.
+        [prompt] = model_calls._claude_detail(records.Record(self.folder), calls[0])["sent"]["newItems"]
+        self.assertEqual(prompt["type"], "text")
+        self.assertIn("Review.", prompt["item"]["text"])
 
     def test_a_session_whose_copy_fails_is_kept(self):
         model = self.api_model()

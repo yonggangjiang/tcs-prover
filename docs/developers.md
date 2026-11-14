@@ -785,7 +785,11 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   `claude/<label>.jsonl` while the CLI runs and `.jsonl.gz` after
   (`records.ClaudeStream`). A request is one assistant message: its line in
   `calls.jsonl` names its stream lines and the user lines sent since the same
-  agent's previous request, and is written once a later line of that agent or
+  agent's previous request (a structured call's or team member's first request
+  also its prompt, which TCS Prover writes to the CLI's input and the stream
+  never repeats: `ClaudeStream.sent_input()` stores it once by sha256 and names
+  it in `claude/<label>.json`, its call line's `stdin`), and is written once a
+  later line of that agent or
   the turn's result shows it ended (`interrupted` when the CLI ended without a
   result after it). The stream gives no per-request output tokens (Claude
   Code's lines carry the message's starting usage). With **Concise** or
