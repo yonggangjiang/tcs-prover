@@ -532,6 +532,7 @@ class ProgressLogTests(ServerCase):
     def test_the_job_keeps_when_each_version_of_the_log_was_saved(self):
         # The coordinator dates none of its entries: the job keeps the time of each version it read, oldest first.
         self.assertEqual(server.PROGRESS_LOG_VERSIONS, 500)
+        self.app.collect_progress_log()  # Not written yet: the first version read is its first save.
         self.write(b"- Lemma 1 verified.\n")
         os.utime(self.memory / "progress.md", (1_800_000_000, 1_800_000_000))
         self.app.collect_progress_log()
@@ -558,13 +559,56 @@ class ProgressLogTests(ServerCase):
         again.collect_progress_log()
         self.assertEqual(again.state["coordinatorProgressVersions"], versions)
         self.assertEqual(server.saved_progress_log_versions(self.app.run_dir), versions)
-        # The newest PROGRESS_LOG_VERSIONS are kept.
+        # The newest PROGRESS_LOG_VERSIONS are kept, the first of them counting the versions saved before it.
         with mock.patch.object(server, "PROGRESS_LOG_VERSIONS", 3):
             for number in range(3, 6):
                 self.write(b"- Lemma %d verified.\n" % number)
                 self.app.collect_progress_log()
-        self.assertEqual([entry["chars"] for entry in self.app.state["coordinatorProgressVersions"]], [20, 20, 20])
-        self.assertEqual(len(json.loads(saved.read_text())), 3)
+            kept = self.app.state["coordinatorProgressVersions"]
+            self.assertEqual([entry["chars"] for entry in kept], [20, 20, 20])
+            self.assertEqual([entry.get("earlier") for entry in kept], [2, None, None])
+            self.assertEqual(json.loads(saved.read_text()), kept)
+            self.assertEqual(server.saved_progress_log_versions(self.app.run_dir), kept)
+            self.write(b"- Lemma 6 verified.\n")
+            self.app.collect_progress_log()
+            self.assertEqual(self.app.state["coordinatorProgressVersions"][0]["earlier"], 3)
+
+    def test_a_log_that_existed_when_first_read_says_its_earlier_saves_are_not_counted(self):
+        # A job from before the version times, or one run while no TCS Prover server read its log: the server's
+        # first read finds the log saved already, and how often it was saved before is not known.
+        self.write(b"- Lemma 1 verified.\n")
+        os.utime(self.memory / "progress.md", (1_800_000_000, 1_800_000_000))
+        self.app.collect_progress_log()
+        first, = self.app.state["coordinatorProgressVersions"]
+        self.assertEqual((first["at"], first.get("existed")), ("2027-01-15T08:00:00+00:00", True))
+        self.write(b"- Lemma 1 verified.\n- Lemma 2 verified.\n")
+        self.app.collect_progress_log()
+        versions = self.app.state["coordinatorProgressVersions"]
+        self.assertEqual([entry.get("existed") for entry in versions], [True, None])
+        # A restarted server reads the same, and keeps the mark on the first version it keeps.
+        self.assertEqual(server.saved_progress_log_versions(self.app.run_dir), versions)
+        with mock.patch.object(server, "PROGRESS_LOG_VERSIONS", 1):
+            self.write(b"- Lemma 3 verified.\n")
+            self.app.collect_progress_log()
+            kept, = self.app.state["coordinatorProgressVersions"]
+            self.assertEqual((kept.get("earlier"), kept.get("existed")), (2, True))
+
+    def test_a_versions_file_longer_than_the_limit_keeps_its_newest_and_counts_the_others(self):
+        saved = server.controller_directory(self.app.run_dir) / server.PROGRESS_LOG_VERSIONS_FILE
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        entries = [{"version": f"v{number}", "at": f"2027-01-15T08:{number // 60:02d}:{number % 60:02d}+00:00",
+                    "chars": number} for number in range(server.PROGRESS_LOG_VERSIONS + 2)]
+        entries[0].update(earlier=7, existed=True)
+        saved.write_text(json.dumps(entries))
+        versions = server.saved_progress_log_versions(self.app.run_dir)
+        self.assertEqual(len(versions), server.PROGRESS_LOG_VERSIONS)
+        self.assertEqual((versions[0]["version"], versions[0]["earlier"], versions[0]["existed"]), ("v2", 9, True))
+        self.assertNotIn("earlier", versions[1])
+        # Marks are a count and True only.
+        entries[0].update(earlier=True, existed="yes")
+        saved.write_text(json.dumps(entries[:3]))
+        self.assertEqual(server.saved_progress_log_versions(self.app.run_dir),
+                         [{key: entry[key] for key in ("version", "at", "chars")} for entry in entries[:3]])
 
     def test_state_polls_carry_the_logs_version_and_the_page_fetches_its_text(self):
         self.write(("- 1 h: Lemma 1 verified.\n" * 4000).encode())

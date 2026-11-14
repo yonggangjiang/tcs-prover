@@ -123,7 +123,11 @@ prompt asks it to keep. A line above it says
 - Under the log, *Saved 5 times, last at 14:50:46* opens the time of each saved
   version, oldest first, as TCS Prover read the file (about once a second;
   versions saved within that second count as one). The coordinator's entries
-  carry no dates of their own; the newest 500 versions' times are kept.
+  carry no dates of their own. The times of the newest 500 versions are kept:
+  past 500 the count goes on, and the times say *Only the newest 500 times are
+  kept*. A log that already existed when TCS Prover first read it (a job from
+  before these times, or one run while no TCS Prover server read it) reads
+  *Saved at least …*: its earlier saves are not counted.
 - Until the coordinator writes the file, the card says *The coordinator has not
   written its progress log yet.*
 - With a model that has no subagent tool, the author of a coordinator job works

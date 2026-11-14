@@ -468,7 +468,13 @@ the problem-solving to its subagents. What the runner and the server add:
   versions saved within one tick are one), the newest `PROGRESS_LOG_VERSIONS`
   (500), in the controller folder's `progress-log-versions.json` (owner-only;
   `saved_progress_log_versions()` reads it for a restarted server and a saved
-  batch). The page lists their times under the log.
+  batch). The page lists their times under the log. The first entry says what
+  came before it (`trim_progress_log_versions()`): `earlier`, how many versions
+  were saved before it whose times are no longer kept (the page's count adds
+  them and names the limit), and `existed: true` when the log was there already
+  as the job's first version was read and this server never saw it absent
+  (`App._progress_absent`): its earlier saves are unknown, and the page says
+  "at least".
 
 ## TCS Prover's goal loop and team
 

@@ -1192,17 +1192,41 @@ def read_progress_log(workspace, signature=None):
 
 def saved_progress_log_versions(run_dir):
     """When each saved version of a run's progress log was saved, as its controller folder keeps them
-    (PROGRESS_LOG_VERSIONS_FILE): [{"version", "at", "chars"}], oldest first; [] when there is none to read."""
+    (PROGRESS_LOG_VERSIONS_FILE): [{"version", "at", "chars"}], oldest first, the first with what came before it
+    ("earlier", "existed": see trim_progress_log_versions()); [] when there is none to read."""
 
     try:
         path = controller_directory(run_dir) / PROGRESS_LOG_VERSIONS_FILE
         saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() and not path.is_symlink() else []
     except (OSError, ValueError):
         saved = []
-    return [{"version": entry["version"], "at": entry["at"], "chars": entry.get("chars")}
-            for entry in (saved if isinstance(saved, list) else [])
-            if isinstance(entry, dict) and isinstance(entry.get("version"), str)
-            and isinstance(entry.get("at"), str)][-PROGRESS_LOG_VERSIONS:]
+    versions = [{"version": entry["version"], "at": entry["at"], "chars": entry.get("chars")}
+                for entry in (saved if isinstance(saved, list) else [])
+                if isinstance(entry, dict) and isinstance(entry.get("version"), str)
+                and isinstance(entry.get("at"), str)]
+    first = next((entry for entry in (saved if isinstance(saved, list) else []) if isinstance(entry, dict)), {})
+    if versions:
+        earlier = first.get("earlier")
+        if type(earlier) is int and earlier > 0:
+            versions[0]["earlier"] = earlier
+        if first.get("existed") is True:
+            versions[0]["existed"] = True
+    return trim_progress_log_versions(versions)
+
+
+def trim_progress_log_versions(versions):
+    """``versions`` (oldest first) cut to the newest PROGRESS_LOG_VERSIONS, in place. Its first entry says what came
+    before it: "earlier", how many versions were saved before it whose times are no longer kept, and "existed"
+    (True), that the log already existed when this job's versions were first read, so that how often it was saved
+    before is not known (the page says "at least")."""
+
+    dropped = len(versions) - PROGRESS_LOG_VERSIONS
+    if dropped > 0:
+        first = versions[0]
+        earlier = (first.get("earlier") or 0) + dropped
+        del versions[:dropped]
+        versions[0] = {**versions[0], "earlier": earlier, **({"existed": True} if first.get("existed") is True else {})}
+    return versions
 
 
 def delivered_repair(record):
@@ -3445,6 +3469,9 @@ class App:
         # controller folder when first needed.
         self._progress_signature = self._progress_log = None
         self._progress_versions = None
+        # The run folder whose author's working folder this server saw without a progress log, so that the log's
+        # first version it reads is its first save (not one that "existed", see trim_progress_log_versions()).
+        self._progress_absent = None
         # A Stop of the statement review or a later step that settles in place (see _stop_step_in_place_locked).
         self._stop_in_place = False
         # Whether the activity log said that the job's record could not be made, and when a web-cutoff run's files
@@ -8311,9 +8338,13 @@ class App:
                 return
             # A state rebuilt since (a new step of the job) shows no log: it is read again.
             known = self._progress_signature if self.state.get("coordinatorProgress") is not None else None
-            workspace = self._author_workspace()
+            workspace, run = self._author_workspace(), str(self.run_dir)
         # The file system is read outside the lock: polls never wait for it.
         signature = progress_log_signature(workspace)
+        if signature is None:
+            with self.lock:
+                if str(self.run_dir) == run:
+                    self._progress_absent = run  # Its first version will be its first save.
         if signature == known:
             return
         log = read_progress_log(workspace, signature) if signature is not None else None
@@ -8327,7 +8358,10 @@ class App:
 
     def _progress_log_versions(self, log):
         """When each version of the progress log was saved, with ``log`` (read_progress_log()) added when its version
-        is new: [{"version", "at", "chars"}], oldest first, the newest PROGRESS_LOG_VERSIONS (under the job lock).
+        is new: [{"version", "at", "chars"}], oldest first, the newest PROGRESS_LOG_VERSIONS, the first saying what
+        came before it (trim_progress_log_versions(); under the job lock). A log that this server never saw absent
+        and of which no version is kept yet (a job from before the version times, one run while no server read it)
+        existed already: its first version here is not its first save.
 
         Kept in the controller folder (PROGRESS_LOG_VERSIONS_FILE, owner-only), so a restart keeps them; a file that
         cannot be read or written leaves the times of this server's own reads.
@@ -8337,8 +8371,10 @@ class App:
             self._progress_versions = (str(self.run_dir), saved_progress_log_versions(self.run_dir))
         versions = self._progress_versions[1]
         if log is not None and (not versions or versions[-1]["version"] != log["version"]):
-            versions.append({"version": log["version"], "at": log["updatedAt"], "chars": log["chars"]})
-            del versions[:-PROGRESS_LOG_VERSIONS]
+            existed = not versions and self._progress_absent != str(self.run_dir)
+            versions.append({"version": log["version"], "at": log["updatedAt"], "chars": log["chars"],
+                             **({"existed": True} if existed else {})})
+            trim_progress_log_versions(versions)
             try:
                 self._save_controlled(PROGRESS_LOG_VERSIONS_FILE, json.dumps(versions) + "\n", run_copy=False)
             except (OSError, runtime.Error):

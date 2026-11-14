@@ -469,6 +469,24 @@ await draw({coordinatorProgressVersions: [{version: 'v1', at: at(23, 10, 2, 1)}]
 const yesterday = new Date(at(23, 10, 2, 1)).toLocaleDateString([], {day: 'numeric', month: 'short'});
 assert.deepEqual(versions(), {hidden: false, summary: `Saved once, last at ${yesterday} 23:10:02`,
   text: `Each saved version, oldest first: ${yesterday} 23:10:02.`});
+// The server keeps the newest 500 times: their first counts the versions saved before it, which the count includes,
+// and the line names the limit.
+const kept = Array.from({length: 500}, (_, number) => ({version: `v${number}`,
+  at: at(10, Math.floor(number / 60), number % 60)}));
+kept[0] = {...kept[0], earlier: 734};
+await draw({coordinatorProgressVersions: kept});
+assert.equal(versions().summary, 'Saved 1,234 times, last at 10:08:19');
+assert.ok(versions().text.startsWith('Only the newest 500 times are kept, oldest first: 10:00:00, 10:00:01, '));
+assert.ok(versions().text.endsWith(', 10:08:19.'));
+// A log that existed when TCS Prover first read it (a job from before the version times): earlier saves unknown.
+await draw({coordinatorProgressVersions: [{version: 'v1', at: at(14, 45, 35), existed: true}]});
+assert.deepEqual(versions(), {hidden: false, summary: 'Saved at least once, last at 14:45:35',
+  text: 'Each saved version, oldest first: 14:45:35. The log already existed when TCS Prover first read it, so earlier '
+    + 'saves are not counted.'});
+await draw({coordinatorProgressVersions: [{...kept[0], existed: true}, ...kept.slice(1)]});
+assert.equal(versions().summary, 'Saved at least 1,234 times, last at 10:08:19');
+assert.ok(versions().text.endsWith('. The log already existed when TCS Prover first read it, so earlier saves are not '
+  + 'counted.'));
 // No log (yet, or any more): no versions either.
 await draw({coordinatorProgress: null});
 assert.equal(versions().hidden, true);

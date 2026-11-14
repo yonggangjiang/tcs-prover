@@ -5259,11 +5259,21 @@ function renderProgressLog() {
     ? `Showing the last ${shown.toLocaleString("en-US")} characters; the whole file${size} is ${where}.` : "";
   if (ui.progressLogNote.textContent !== note) ui.progressLogNote.textContent = note;
   show(ui.progressLogNote, Boolean(note));
-  const versions = progressLogVersionTimes(state.coordinatorProgressVersions);
-  const summary = versions.length ? `Saved ${versions.length === 1 ? "once" : `${versions.length} times`}, last at `
-    + versions[versions.length - 1] : "";
+  // The server keeps the newest 500 times: its first entry counts the versions saved before it ("earlier"), and says
+  // when the log already existed as TCS Prover first read it ("existed"), so that earlier saves are not counted.
+  const saved = Array.isArray(state.coordinatorProgressVersions) ? state.coordinatorProgressVersions : [];
+  const versions = progressLogVersionTimes(saved);
+  const earlier = Number.isInteger(saved[0]?.earlier) && saved[0].earlier > 0 ? saved[0].earlier : 0;
+  const existed = saved[0]?.existed === true;
+  const count = versions.length + earlier;
+  const summary = versions.length ? `Saved ${existed ? "at least " : ""}${count === 1 ? "once"
+    : `${count.toLocaleString("en-US")} times`}, last at ${versions[versions.length - 1]}` : "";
   if (ui.progressLogVersionsSummary.textContent !== summary) ui.progressLogVersionsSummary.textContent = summary;
-  const times = versions.length ? `Each saved version, oldest first: ${versions.join(", ")}.` : "";
+  const times = !versions.length ? "" : [earlier
+    ? `Only the newest ${versions.length.toLocaleString("en-US")} times are kept, oldest first: ${versions.join(", ")}.`
+    : `Each saved version, oldest first: ${versions.join(", ")}.`,
+  existed ? "The log already existed when TCS Prover first read it, so earlier saves are not counted." : ""]
+    .filter(Boolean).join(" ");
   if (ui.progressLogVersionsText.textContent !== times) ui.progressLogVersionsText.textContent = times;
   show(ui.progressLogVersions, Boolean(progress && versions.length));
 }
