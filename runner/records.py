@@ -108,6 +108,9 @@ _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
 LOGIN_FILES = ("auth.json", ".credentials.json")
 # A Codex session file: rollout-<YYYY-MM-DDThh-mm-ss>-<thread id>[_<segment id>].jsonl, compressed .jsonl.zst.
 _ROLLOUT = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl(?:\.zst)?\Z")
+# The content blocks in which Anthropic sends the reasoning it withholds (a summary at most, or only encrypted): a
+# Claude Code call line's "thinking" says whether its message had one.
+THINKING_BLOCKS = ("thinking", "redacted_thinking")
 
 
 class RecordError(Exception):
@@ -1170,7 +1173,8 @@ class ClaudeStream:
 
     Each line is appended as the CLI wrote it, after TCS Prover's redaction. A model request is one assistant message
     (its id): its lines, the user lines sent since the previous request of the same agent (the main agent, or one
-    subagent by its tool-use id) and its usage. Its call line is written when a later line of the same agent, or the
+    subagent by its tool-use id), its usage and whether it had a thinking block ("thinking", THINKING_BLOCKS: the
+    model-calls list's hidden_reasoning). Its call line is written when a later line of the same agent, or the
     turn's result, shows it ended; at the end of the process the open ones are written too ("interrupted" when no
     result followed them). The file is synced at each call line.
 
@@ -1264,6 +1268,7 @@ class ClaudeStream:
                     "model": self.model if failed else body.get("model"),
                     "status": "failed" if failed else "interrupted",
                     "usage": None if failed else body.get("usage"), "requestId": message.get("request_id"),
+                    "thinking": False,
                     "stream": {"file": f"claude/{self.label}.jsonl.gz", "lines": [number, number],
                                "sent": self.sent.pop(agent, [])}}
                 if failed:
@@ -1275,6 +1280,11 @@ class ClaudeStream:
                 self.order.append(identity)
             call["stream"]["lines"][1] = number
             call["endedMs"] = _now_ms()
+            # Claude Code writes each content block of the message as a line of its own.
+            content = body.get("content")
+            if any(isinstance(block, dict) and block.get("type") in THINKING_BLOCKS
+                   for block in (content if isinstance(content, list) else ())):
+                call["thinking"] = True
         elif kind == "user":
             self.retries.pop(agent, None)
             for other in list(self.open):
@@ -1304,7 +1314,7 @@ class ClaudeStream:
         call = {"program": "claude", "kind": "request", "process": self.label,
                 "callId": message["uuid"] if isinstance(message.get("uuid"), str) else f"{self.label}:{number}",
                 "threadId": self.session, "agentPath": agent, "startedMs": now, "endedMs": now, "model": self.model,
-                "status": "failed", "error": error, "usage": None, "requestId": None,
+                "status": "failed", "error": error, "usage": None, "requestId": None, "thinking": False,
                 "stream": {"file": f"claude/{self.label}.jsonl.gz", "lines": [number, number],
                            "sent": list(self.sent.get(agent, []))}}
         if agent is None and self.stdin:

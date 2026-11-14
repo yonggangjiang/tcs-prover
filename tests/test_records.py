@@ -503,6 +503,32 @@ class UntracedCompactionTests(RecordCase):
         self.assertEqual(detail["received"]["items"][0]["item"]["message"], "HANDOFF SUMMARY of the work so far")
         self.assertEqual(detail["placeholders"][0]["withheldBy"], "Codex")
         self.assertEqual(model_calls.call_list("run-1")["calls"][1]["id"], rows[1]["id"])  # Stable.
+        self.assertEqual((rows[1]["error"], detail["error"]), (None, None))
+
+
+class CallErrorTests(RecordCase):
+    def test_a_failed_or_cancelled_call_says_why_in_the_list_the_detail_and_the_download(self):
+        bundle = Bundle(self.trace)
+        bundle.thread_started()
+        bundle.call("call-a", request([PROMPT]), status="failed")
+        # Codex 0.160 cancels a request whose stream the provider dropped (the first real job's author, paused).
+        reference = bundle.payload("inference_request", request([PROMPT]))
+        bundle.event({"type": "inference_started", "inference_call_id": "call-b", "thread_id": THREAD,
+                      "codex_turn_id": "turn-1", "model": "gpt-6.1-sol", "provider_name": "OpenAI",
+                      "request_payload": reference}, THREAD)
+        bundle.event({"type": "inference_cancelled", "inference_call_id": "call-b", "upstream_request_id": None,
+                      "reason": "response stream dropped before provider terminal event",
+                      "partial_response_payload": None}, THREAD)
+        bundle.call("call-c", request([PROMPT]), [ANSWER])
+        self.ingest(bundle)
+        reasons = [("failed", "stream closed before response.completed"),
+                   ("cancelled", "response stream dropped before provider terminal event"), ("completed", None)]
+        rows = model_calls.call_list("run-1")["calls"]
+        self.assertEqual([(row["status"], row["error"]) for row in rows], reasons)
+        self.assertEqual([model_calls.call_detail("run-1", row["id"])["error"] for row in rows],
+                         [error for _, error in reasons])
+        requests = [json.loads(line) for line in download().read("requests.jsonl").splitlines()]
+        self.assertEqual([(example["status"], example["error"]) for example in requests], reasons)
 
 
 class RoundTests(unittest.TestCase):
@@ -851,6 +877,57 @@ class ClaudeStreamTests(RecordCase):
                              [{"type": "text", "text": "Review."}], call_id)
         rows = {row["id"]: row for row in model_calls.call_list("run-1")["calls"]}
         self.assertEqual((rows["c000003"]["role"], rows["c000003"]["member"]), ("independent critic", "toolu_9"))
+
+    def test_a_failed_call_says_why_in_the_list_and_the_detail(self):
+        # An attempt the CLI sends again, then its report of the request it gave up on.
+        stream = self.recorder().claude_stream(role="critic", model="api:gateway-claude")
+        for line in [{"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-opus-5-5"},
+                     {"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 1, "retry_delay_ms": 600,
+                      "error_status": 529, "error": "overloaded", "session_id": "s-1", "uuid": "u-1"},
+                     {"type": "assistant", "parent_tool_use_id": None, "session_id": "s-1", "error": "unknown",
+                      "is_api_error_message": True, "uuid": "f2f55e24-8d4b-4ddd-b944-52133fbffd31",
+                      "message": {"id": "5facec45-8185-47be-add4-1fcef5727334", "model": "<synthetic>",
+                                  "content": [{"type": "text", "text": "API Error: 400 INJECTED-400"}],
+                                  "usage": {"input_tokens": 0, "output_tokens": 0}}},
+                     {"type": "result", "subtype": "success", "is_error": True, "session_id": "s-1"}]:
+            stream.line(json.dumps(line))
+        stream.finish()
+        reasons = [("failed", "529 overloaded"), ("failed", "API Error: 400 INJECTED-400")]
+        rows = model_calls.call_list("run-1")["calls"]
+        self.assertEqual([(row["status"], row["error"]) for row in rows], reasons)
+        self.assertEqual([model_calls.call_detail("run-1", row["id"])["error"] for row in rows],
+                         [error for _, error in reasons])
+
+    def test_the_list_s_placeholder_kinds_are_its_detail_s(self):
+        # msg_1 came back with a thinking block, msg_2 with text alone, msg_3 with a redacted one and never ended.
+        redacted = {"type": "assistant", "parent_tool_use_id": None, "session_id": "s-1",
+                    "message": {"id": "msg_3", "model": "claude-opus-5-5",
+                                "content": [{"type": "redacted_thinking", "data": "ENCRYPTED"}],
+                                "usage": {"input_tokens": 100, "output_tokens": 1}}}
+        stream = self.recorder().claude_stream(role="author")
+        for line in [*stream_lines()[:5], redacted]:
+            stream.line(json.dumps(line))
+        stream.finish()
+        expected = [["hidden_reasoning", "token_probabilities", "network_only"],
+                    ["token_probabilities", "network_only"],
+                    ["hidden_reasoning", "token_probabilities", "network_only", "interrupted"]]
+
+        def kinds():
+            rows = model_calls.call_list("run-1")["calls"]
+            for row in rows:
+                detail = model_calls.call_detail("run-1", row["id"])
+                self.assertEqual(row["placeholderKinds"],
+                                 list(dict.fromkeys(item["kind"] for item in detail["placeholders"])), row["id"])
+            return [row["placeholderKinds"] for row in rows]
+
+        self.assertEqual(kinds(), expected)
+        self.assertEqual([call["thinking"] for call in self.record.calls.read()], [True, False, True])
+        # A call line written before 14 Nov 2026 does not say whether a thinking block came back: its stream does.
+        path = self.record.folder / "calls.jsonl"
+        older = [{key: value for key, value in json.loads(text).items() if key != "thinking"}
+                 for text in path.read_text().splitlines()]
+        path.write_text("".join(json.dumps(line) + "\n" for line in older))
+        self.assertEqual(kinds(), expected)
 
     def test_the_prompt_written_to_the_cli_s_input_is_the_first_request_s_input(self):
         # A structured call or team member gets its prompt on standard input, which the stream never repeats.

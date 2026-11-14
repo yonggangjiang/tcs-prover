@@ -131,18 +131,35 @@ def _tokens(line):
             "output": usage.get("output_tokens"), "reasoning": usage.get("reasoning_output_tokens")}
 
 
-def _kinds(line, tokens):
+def _kinds(line, tokens, thinking=None):
+    """The kinds of a call's placeholders. A Claude Code call's are its detail's (_placeholders()), whose
+    hidden_reasoning says that its message came back with a thinking block: ``thinking``, else its call line's
+    "thinking" (a line written before 14 Nov 2026 has none: call_list() reads the stream for it)."""
+
     kinds = []
     if line.get("status") == "not recorded":
         return ["web_cutoff_one_shot"]
     if line.get("status") == "trace format not recognized":
         return ["trace_format_not_recognized"]
-    if (tokens.get("reasoning") or 0) > 0 or line.get("program") == "claude" and line.get("status") != "failed":
+    if line.get("program") == "claude":
+        blocks = [{"type": "thinking"}] if (line.get("thinking") if thinking is None else thinking) else []
+        return list(dict.fromkeys(placeholder["kind"] for placeholder in _placeholders(line, blocks, None)))
+    if (tokens.get("reasoning") or 0) > 0:
         kinds.append("hidden_reasoning")
     kinds.extend(["token_probabilities", "network_only"])
     if line.get("status") == "interrupted":
         kinds.append("interrupted")
     return kinds
+
+
+def _error(line):
+    """Why a call failed or was cancelled, as calls.jsonl has it (Codex's error or reason, Claude Code's report or a
+    retried attempt's status and error), else None."""
+
+    error = line.get("error")
+    if error is None or error == "":
+        return None
+    return error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
 
 
 def _row(line, labels):
@@ -152,11 +169,14 @@ def _row(line, labels):
     started, ended = line.get("startedMs"), line.get("endedMs")
     duration = (ended - started if line.get("program") == "codex" and isinstance(started, int)
                 and isinstance(ended, int) and ended >= started else None)
-    return {"id": line["id"], "time": records._iso(started), "role": role, "label": label, "member": member,
-            "model": line.get("model") or process.get("model"), "program": line.get("program") or "codex",
-            "durationMs": duration, "tokens": tokens, "status": line.get("status") or "completed",
-            "placeholderKinds": _kinds(line, tokens), "kind": line.get("kind") or "request",
-            "threadId": line.get("threadId")}
+    row = {"id": line["id"], "time": records._iso(started), "role": role, "label": label, "member": member,
+           "model": line.get("model") or process.get("model"), "program": line.get("program") or "codex",
+           "durationMs": duration, "tokens": tokens, "status": line.get("status") or "completed",
+           "error": _error(line), "placeholderKinds": _kinds(line, tokens), "kind": line.get("kind") or "request",
+           "threadId": line.get("threadId")}
+    if line.get("program") == "claude" and "thinking" not in line:
+        row["_line"] = line  # Its kinds come from its stream (call_list()).
+    return row
 
 
 def _placeholder_rows(record):
@@ -176,8 +196,8 @@ def _placeholder_rows(record):
         rows.append({"id": f"p{number:06d}", "time": _record_time(entry), "role": role, "label": label,
                      "member": None, "model": entry.get("model"), "program": "codex", "durationMs": None,
                      "tokens": {"input": None, "cached": None, "output": None, "reasoning": None},
-                     "status": "not recorded", "placeholderKinds": ["web_cutoff_one_shot"], "kind": "request",
-                     "threadId": None})
+                     "status": "not recorded", "error": None, "placeholderKinds": ["web_cutoff_one_shot"],
+                     "kind": "request", "threadId": None})
     return rows
 
 
@@ -233,8 +253,8 @@ def _compaction_rows(record, labels):
             rows.append({"id": identity, "time": time_text, "role": role, "label": label, "member": member,
                          "model": line.get("model"), "program": "codex", "durationMs": None,
                          "tokens": {"input": None, "cached": None, "output": None, "reasoning": None},
-                         "status": "not recorded", "placeholderKinds": ["compaction_not_traced"], "kind": "compaction",
-                         "threadId": line["threadId"], "_summary": summary})
+                         "status": "not recorded", "error": None, "placeholderKinds": ["compaction_not_traced"],
+                         "kind": "compaction", "threadId": line["threadId"], "_summary": summary})
     return rows
 
 
@@ -264,16 +284,19 @@ def _problems(record):
     return problems[-PROBLEMS_SHOWN:]
 
 
-def _rows(record, summaries=False):
-    """Every row of the list, in time order (``summaries``: the untraced compactions keep their "_summary")."""
+def _rows(record, summaries=False, lines=False):
+    """Every row of the list, in time order (``summaries``: the untraced compactions keep their "_summary";
+    ``lines``: a Claude Code call whose line does not say whether a thinking block came back keeps its "_line")."""
 
     labels = _labels(record)
     rows = ([_row(line, labels) for line in record.calls.read()] + _placeholder_rows(record)
             + _compaction_rows(record, labels))
     rows.sort(key=lambda row: (row["time"] or "", row["id"]))
-    if not summaries:
-        for row in rows:
+    for row in rows:
+        if not summaries:
             row.pop("_summary", None)
+        if not lines:
+            row.pop("_line", None)
     return rows
 
 
@@ -287,9 +310,15 @@ def call_list(name, offset=0, limit=DEFAULT_LIMIT):
         raise ValueError("offset and limit must be whole numbers.") from exc
     if offset < 0 or not 1 <= limit <= MAX_LIMIT:
         raise ValueError(f"offset must be 0 or more and limit 1 to {MAX_LIMIT}.")
-    rows = _rows(record)
-    return {"total": len(rows), "calls": rows[offset:offset + limit],
-            "recordState": {"available": True, "problems": _problems(record)}}
+    rows = _rows(record, lines=True)
+    page = rows[offset:offset + limit]
+    for row in page:
+        line = row.pop("_line", None)
+        if line is not None:
+            # A Claude Code call line written before 14 Nov 2026: whether a thinking block came back is in its stream.
+            thinking = any(block.get("type") in records.THINKING_BLOCKS for block in _claude_blocks(record, line))
+            row["placeholderKinds"] = _kinds(line, row["tokens"], thinking)
+    return {"total": len(rows), "calls": page, "recordState": {"available": True, "problems": _problems(record)}}
 
 
 # --- One call -----------------------------------------------------------------------------------------------------------
@@ -527,7 +556,8 @@ def _codex_detail(record, line):
                      "previousCallId": previous["id"] if previous else None},
             "received": {"items": received}, "usage": usage,
             "placeholders": _placeholders(line, outputs, usage),
-            "rawAvailable": bool(line.get("request")) and _payload(record, line, "request", bundles) is not None}
+            "rawAvailable": bool(line.get("request")) and _payload(record, line, "request", bundles) is not None,
+            "error": _error(line)}
 
 
 def _stream_name(line):
@@ -568,16 +598,27 @@ def _stream_lines(record, line, kept=None):
     return []
 
 
+def _claude_blocks(record, line, kept=None, lines=None):
+    """The content blocks of a Claude Code call's assistant message, from its stream lines (``lines``: the stream's,
+    when the caller has them)."""
+
+    lines = _stream_lines(record, line, kept) if lines is None else lines
+    stream = line.get("stream") if isinstance(line.get("stream"), dict) else {}
+    first, last = (stream.get("lines") or [0, -1])[:2]
+    blocks = []
+    for text in lines[first:last + 1]:
+        message = _json(text)
+        body = message.get("message") if isinstance(message, dict) else None
+        if isinstance(body, dict) and body.get("id") == line.get("callId"):
+            blocks.extend(block for block in body.get("content") or () if isinstance(block, dict))
+    return blocks
+
+
 def _claude_detail(record, line, kept=None):
     lines = _stream_lines(record, line, kept)
     stream = line.get("stream") if isinstance(line.get("stream"), dict) else {}
     first, last = (stream.get("lines") or [0, -1])[:2]
-    messages = [_json(text) for text in lines[first:last + 1]]
-    blocks = []
-    for message in messages:
-        body = (message or {}).get("message") if isinstance(message, dict) else None
-        if isinstance(body, dict) and body.get("id") == line.get("callId"):
-            blocks.extend(block for block in body.get("content") or () if isinstance(block, dict))
+    blocks = _claude_blocks(record, line, lines=lines)
     results = {}
     for text in lines[last + 1:]:
         message = _json(text)
@@ -613,7 +654,7 @@ def _claude_detail(record, line, kept=None):
             "received": {"items": [_view(block, results.get(block.get("id")) if block.get("type") == "tool_use"
                                          else None) for block in blocks]},
             "usage": usage, "placeholders": _placeholders(line, blocks, usage),
-            "rawAvailable": bool(lines)}
+            "rawAvailable": bool(lines), "error": _error(line)}
 
 
 def _placeholders(line, outputs, usage):
@@ -668,7 +709,7 @@ def call_detail(name, call_id):
     if line.get("status") == "trace format not recognized":
         return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
                 "received": {"items": []}, "usage": None, "placeholders": _placeholders(line, [], None),
-                "rawAvailable": False}
+                "rawAvailable": False, "error": _error(line)}
     return _codex_detail(record, line)
 
 
@@ -682,13 +723,13 @@ def _unrecorded_detail(row):
                 "received": {"items": [_view(summary)]}, "usage": None,
                 "placeholders": [{"kind": "compaction_not_traced", "facts": {"summaryChars": len(row["_summary"])},
                                   "withheldBy": "Codex", "why": UNTRACED_COMPACTION}],
-                "rawAvailable": False}
+                "rawAvailable": False, "error": None}
     return {"sent": {"instructions": None, "tools": None, "newItems": [], "previousCallId": None},
             "received": {"items": []}, "usage": None,
             "placeholders": [{"kind": "web_cutoff_one_shot", "facts": {"label": row["label"]},
                               "withheldBy": "TCS Prover",
                               "why": "Not recorded: web-cutoff one-shot calls leave no files."}],
-            "rawAvailable": False}
+            "rawAvailable": False, "error": None}
 
 
 def call_raw(name, call_id):
@@ -1051,7 +1092,7 @@ def training_record(name, stream):
             for line in lines:
                 row = rows.get(line["id"], {})
                 example = {key: row.get(key) for key in ("id", "time", "role", "label", "member", "model",
-                                                         "program", "status")}
+                                                         "program", "status", "error")}
                 if line.get("program") == "claude":
                     detail = _claude_detail(record, line, streams)
                     if last_of_stream.get(_stream_name(line)) == line["id"]:
@@ -1076,7 +1117,7 @@ def training_record(name, stream):
                     detail = _unrecorded_detail(row)
                     received = [view["item"] for view in detail["received"]["items"]]
                     member.write(json.dumps({**{key: row[key] for key in ("id", "time", "role", "label", "member",
-                                                                           "model", "program", "status")},
+                                                                           "model", "program", "status", "error")},
                                              "request": None, "response": {"items": received} if received else None,
                                              "placeholders": detail["placeholders"]},
                                             ensure_ascii=False).encode("utf-8") + b"\n")

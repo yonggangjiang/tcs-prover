@@ -206,6 +206,7 @@ class WebCutoffPlaceholderTests(AppCase):
                          [("critic", "not recorded", ["web_cutoff_one_shot"])])
         detail = server.model_calls.call_detail(app.run_dir.name, listing["calls"][0]["id"])
         self.assertEqual(detail["placeholders"][0]["why"], "Not recorded: web-cutoff one-shot calls leave no files.")
+        self.assertEqual((listing["calls"][0]["error"], detail["error"]), (None, None))
 
 
 if __name__ == "__main__":

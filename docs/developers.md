@@ -820,8 +820,10 @@ writes a job's record, `ui/model_calls.py` reads it.
   agent's previous request (a structured call's or team member's first request
   also its prompt, which TCS Prover writes to the CLI's input and the stream
   never repeats: `ClaudeStream.sent_input()` stores it once by sha256 and names
-  it in `claude/<label>.json`, its call line's `stdin`), and is written once a
-  later line of that agent or
+  it in `claude/<label>.json`, its call line's `stdin`) and says whether the
+  message had a thinking block (`thinking`, the list's `hidden_reasoning`; for
+  a line written before 14 Nov 2026 the list reads the stream), and is written
+  once a later line of that agent or
   the turn's result shows it ended (`interrupted` when the CLI ended without a
   result after it). A request that failed is `failed`: Claude Code's own
   report of one it gave up on (an assistant message with
@@ -881,7 +883,8 @@ writes a job's record, `ui/model_calls.py` reads it.
   `interrupted`, `compaction_not_traced` (a local compaction, above).
 - **Routes** (the session token like every route; field names in
   `~/tcs-work/fixes/record-contract.md`): `GET /jobs/<id>/model-calls?offset=&limit=`
-  (time order, `limit` 1 to 1,000, 100 by default), `GET
+  (time order, `limit` 1 to 1,000, 100 by default; a failed or cancelled
+  call's reason, `error`, in its row and its detail as in `calls.jsonl`), `GET
   /jobs/<id>/model-calls/<callId>` (what was sent new, what came back, usage,
   placeholders; a code cell's nested tool calls from the trace; a Codex call's
   previous request is its thread's in whichever process sent it, as a paused
