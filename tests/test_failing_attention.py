@@ -267,6 +267,40 @@ class FailingCallTests(jobs_test.Isolated):
                 self.assertTrue(runtime.out_of_credit(words))
         self.assertFalse(runtime.out_of_credit("model at capacity"))
 
+    def test_a_refused_answer_that_speaks_of_credits_is_no_account_out_of_credit(self):
+        # A proof by the accounting method: the critic's answer, which the runner refused, says "out of credits". Its
+        # retry status quotes the answer ("The model said: …"); the account is fine.
+        records = []
+        refused = runtime.InvalidAnswer("the answer does not meet the response requirements",
+                                        detail="Unmet response requirement: bugs must be empty when the verdict is pass")
+        refused.raw = ('{"verdict": "pass", "bugs": "Case 2: after the merge the root is out of credits, so the '
+                       'amortized bound is not shown.", "fixes": "", "solution": "Proof..."}')
+        # And a schema check whose detail quotes the model's value.
+        quoted = runtime.InvalidAnswer("the verdict field must be one of pass, reject",
+                                       detail="Structured output field verdict: 'insufficient funds' is not one of "
+                                              "['pass', 'reject']")
+        with mock.patch.object(runtime, "emit", side_effect=lambda kind, stage, **fields: records.append(
+                {"kind": kind, "stage": stage, **fields})), mock.patch.object(runtime, "MODEL_RETRY_SECONDS", 0):
+            runtime.wait_before_retry({}, "critic", 2, refused, activity="Critic coordinator")
+            runtime.wait_before_retry({}, "critic", 2, quoted, activity="Convention critic")
+        first, _, second, _ = records
+        self.assertIn("The model said: ", first["text"])
+        self.assertIn("out of credits", first["text"])
+        for status in (first, second):
+            app = self.running()
+            self.follow(app, status)
+            self.assertIsNone(app.attention(), status)
+            # It is a failure like any other: listed once it has repeated for 15 minutes.
+            for minute in range(15):
+                self.now += 60
+                self.follow(app, {**status, "retryAttempt": minute + 3})
+            self.assertEqual(app.attention()["kind"], "failing")
+        # The provider's own words still say it, also a subagent's (an answer set aside after its calls failed).
+        app = self.running()
+        self.follow(app, retry("2 subagent calls failed (Credit balance is too low)", failureKind="subagent",
+                               failureReason=CREDIT))
+        self.assertEqual(app.attention()["kind"], "credit")
+
     def test_a_usage_limit_stays_listed_between_its_attempts(self):
         app = self.running()
         self.follow(app, retry("usage limit reached"))

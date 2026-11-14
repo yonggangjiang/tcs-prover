@@ -5007,7 +5007,7 @@ class App:
                                 "activity": str(record.get("activityLabel") or ""),
                                 "member": record.get("subagentMember") if member else None,
                                 "memberModel": str(record.get("subagentModel") or "") if member else "",
-                                "worked": worked}
+                                "kind": str(record.get("failureKind") or ""), "worked": worked}
             elif _model_output(record):
                 if not (streaks.get(key) or {}).get("worked"):
                     streaks.pop(key, None)
@@ -5365,8 +5365,10 @@ class App:
         mark clears when a model call of it works again (_follow_failures)."""
 
         interval = retry_interval_text()
-        credit = [streak for streak in streaks if any(runtime.out_of_credit(streak.get(field))
-                                                      for field in ("failure", "reason", "text"))]
+        # The failure's and the provider's words only: a refused answer's status quotes the model's answer, whose
+        # words are the model's (a proof may well speak of credits or funds), and the provider served that call.
+        credit = [streak for streak in streaks if streak.get("kind") != "invalid_answer"
+                  and any(runtime.out_of_credit(streak.get(field)) for field in ("failure", "reason"))]
         if credit:
             streak = max(credit, key=lambda item: item["last"])
             words = next((streak.get(field) for field in ("reason", "failure")

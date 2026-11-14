@@ -1007,8 +1007,11 @@ writes a job's record, `ui/model_calls.py` reads it.
 A model call that keeps failing is retried every minute without limit (see
 [Retries](retries.md)), and the server lists its job under Needs your attention
 meanwhile (owner's
-decision, 14 Nov 2026; `App.attention()`): at once when its words say the
-account is out of credit (`workflow_runner.out_of_credit()`: Claude Code's
+decision, 14 Nov 2026; `App.attention()`): at once when its failure's or the
+provider's words (`failure`, `failureReason`; never the status text, which
+quotes a refused answer, nor a refused answer's detail, which may quote the
+model's values) say the account is out of credit
+(`workflow_runner.out_of_credit()`: Claude Code's
 "Credit balance is too low", "insufficient credits" or "balance", "payment
 required") or a usage limit (or a login, `NEEDS_YOU_FAILURES`: whichever call
 has it, also while another call waits to retry for another reason or failed
