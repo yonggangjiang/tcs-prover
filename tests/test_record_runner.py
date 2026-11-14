@@ -653,13 +653,14 @@ def settings_line(identity, answer, stage="solve", **extra):
                             "time": "2026-11-14T03:05:17.064817+00:00"})
 
 
-def snapshot_taken_before(record, data):
+def snapshot_taken_before(record, data, cut_short=b""):
     """Give ``record`` a transcript snapshot of ``data`` as an earlier build took it: as it came, its state
-    (transcript.json) without "settings". Returns the snapshot's folder."""
+    (transcript.json) without "settings"; ``cut_short``: what an append that a crash or a full disk cut short left
+    after it, which the state does not count. Returns the snapshot's folder."""
 
     folder = record.folder / "transcript"
     member = gzip.compress(data, mtime=0)
-    records.write_atomic(folder / "transcript.jsonl.gz", member)
+    records.write_atomic(folder / "transcript.jsonl.gz", member + cut_short)
     records.write_atomic(folder / "transcript.json", json.dumps({
         "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "size": len(member)}).encode())
     return folder
@@ -758,10 +759,11 @@ class SettingsCopyTests(unittest.TestCase):
         self.assert_private_left_out(gzip.decompress((folder / "transcript.jsonl.gz").read_bytes()))
         self.assertEqual(json.loads((folder / "transcript.json").read_text())["settings"], records.SNAPSHOT_SETTINGS)
 
-    def old_snapshot(self, data):
-        """The record's snapshot of ``data`` as an earlier build took it: as it came, its state without "settings"."""
+    def old_snapshot(self, data, cut_short=b""):
+        """The record's snapshot of ``data`` as an earlier build took it: as it came, its state without "settings"
+        (``cut_short``: see snapshot_taken_before())."""
 
-        return snapshot_taken_before(self.record, data)
+        return snapshot_taken_before(self.record, data, cut_short)
 
     def test_a_snapshot_taken_before_keeps_only_those_settings_once_the_record_is_next_opened(self):
         # The job never runs again, so no snapshot replaces it: opening the record does it (the Records list here).
@@ -787,6 +789,25 @@ class SettingsCopyTests(unittest.TestCase):
             records.Record(self.record.folder)
         self.assertEqual((folder / "transcript.jsonl.gz").stat().st_ino, inode)
         self.assertEqual(self.transcript.read_text(encoding="utf-8"), "".join(self.older + later))
+
+    def test_a_snapshot_taken_before_whose_last_append_was_cut_short_keeps_only_those_settings_once_opened(self):
+        # An earlier build's last append, which a crash or a full disk cut short: the state names the size before it,
+        # and the file no longer reads as one gzip stream. Opening the record keeps of the members that read back
+        # whole only those settings and leaves out the member cut short; the next snapshot copies the transcript whole.
+        data = "".join(self.older).encode()
+        later = [settings_line(7, CONFIG_ANSWER), transcript_line({"kind": "status", "stage": "solve", "time": "u"})]
+        appended = gzip.compress("".join(later).encode(), mtime=0)
+        self.transcript.write_bytes(data + "".join(later).encode())
+        folder = self.old_snapshot(data, cut_short=appended[:len(appended) // 2])
+        with mock.patch.object(records, "_KEPT_SNAPSHOTS", set()):  # As a new process: the record is not opened yet.
+            model_calls.record_list(lambda name: False)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older))
+        self.assert_private_left_out((folder / "transcript.jsonl.gz").read_bytes())
+        self.assert_private_left_out(gzip.decompress((folder / "transcript.jsonl.gz").read_bytes()))
+        self.assertEqual(json.loads((folder / "transcript.json").read_text()), {"settings": records.SNAPSHOT_SETTINGS})
+        records.snapshot(self.record, self.transcript)
+        self.assertEqual(records.transcript_data(self.record), self.kept(self.older + later))
+        self.assertEqual(gzip_members((folder / "transcript.jsonl.gz").read_bytes()), 1)  # Copied whole.
 
     def test_a_crash_while_the_snapshot_is_written_again_leaves_it_as_it_was(self):
         folder = self.old_snapshot("".join(self.older).encode())
