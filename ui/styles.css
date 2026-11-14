@@ -3678,6 +3678,9 @@ kbd {
 /* A saved test's failure: the × stays beside the first line while the message wraps. */
 .api-model-row > .api-test-result { grid-column: 2 / -1; flex-wrap: nowrap; align-items: baseline; }
 .api-model-row > .api-test-result > span { min-width: 0; }
+/* Its team tools' warning (the last Test reached the models, not with the team tools, or could not check them) takes
+   the same place: in the first, auto-sized column it would widen to the sentence and squeeze every row's name. */
+.api-model-row > .api-test-warning { grid-column: 2 / -1; margin-top: 0; }
 .api-test-result {
   display: flex;
   flex-wrap: wrap;
@@ -3906,8 +3909,8 @@ kbd {
   .api-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .api-model-row > .api-model-glyph { align-self: flex-start; }
   .api-model-row > .api-model-copy { flex: 1 1 calc(100% - 52px); }
-  /* Reading order: the chips, a saved failure's message, then the buttons. */
-  .api-model-row > .api-test-result { flex-basis: 100%; order: 1; }
+  /* Reading order: the chips, a saved failure's message or team tools' warning, then the buttons. */
+  .api-model-row > :is(.api-test-result, .api-test-warning) { flex-basis: 100%; order: 1; }
   .api-model-row > .api-model-actions { order: 2; margin-left: auto; }
 }
 @media (max-width: 899px) {

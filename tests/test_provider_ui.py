@@ -346,6 +346,37 @@ class ProviderMarkupTests(unittest.TestCase):
         self.assertIn("box-shadow: inset 2px 0 0 var(--waiting);", warnings[0][1])
         self.assertTrue(warnings[1][0].startswith(':root[data-theme="ink"]'))
 
+    def test_every_line_under_a_connection_s_row_spans_the_columns_after_its_glyph(self):
+        # At 1000 px and wider every row shares the list's five columns (a subgrid: glyph, name, format, status,
+        # buttons), which its five items fill. A line the row adds under them (its saved failure, its team tools'
+        # warning) is placed in the first, auto-sized column unless it spans the others: it then widens to its
+        # sentence and squeezes every row's name to nothing, one character per line, in every theme. Narrower, the
+        # row is a flex row: the line takes a row of its own, before the buttons.
+        source = APP.read_text(encoding="utf-8")
+        row = source[source.index("function apiModelRow(connection) {"):source.index("function apiLimitsText(")]
+        lines = set(re.findall(r'item\.append\(apiElement\("p", "([\w-]+)', row))
+        self.assertEqual(lines, {"api-test-result", "api-test-warning"})
+        styles = re.sub(r"/\*.*?\*/", "", (ROOT / "ui" / "styles.css").read_text(encoding="utf-8"), flags=re.S)
+        narrow_start = styles.index("@media (max-width: 999px) {")
+        narrow_end = styles.index("\n}\n", narrow_start)
+        wide = styles[:narrow_start] + styles[narrow_end:]
+        narrow = styles[narrow_start:narrow_end]
+
+        def declarations(css, name):
+            found = {}
+            for head, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+                selectors = " ".join(head.split())
+                if re.fullmatch(rf"\.api-model-row > (?:\.{name}|:is\([^)]*\.{name}\b[^)]*\))", selectors):
+                    found.update((key.strip(), " ".join(value.split())) for key, value in
+                                 (item.split(":", 1) for item in body.split(";") if ":" in item))
+            return found
+
+        for name in sorted(lines):
+            with self.subTest(line=name):
+                self.assertEqual(declarations(wide, name).get("grid-column"), "2 / -1")
+                placed = declarations(narrow, name)
+                self.assertEqual((placed.get("flex-basis"), placed.get("order")), ("100%", "1"))
+
     def test_slice_markers_used_by_the_ui_tests_occur_once(self):
         # Every UI test cuts app.js by marker text; a second copy of a marker silently moves a slice.
         source = APP.read_text(encoding="utf-8")
