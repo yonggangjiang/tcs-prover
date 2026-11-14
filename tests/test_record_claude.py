@@ -63,6 +63,22 @@ class ClaudeRecordTests(claude_test.FakeClaudeCase):
         self.assertEqual(prompt["type"], "text")
         self.assertIn("Review.", prompt["item"]["text"])
 
+    def test_a_session_the_cli_never_saved_is_neither_a_problem_nor_kept(self):
+        # Claude Code is missing (it updates itself) for every attempt: each registered a session it never saved.
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}), self.assertRaises(Exception):
+            runtime.structured("Review.", claude_test.SCHEMA, "review", model="claude-opus-5-5", attempts=3)
+        diagnostics = [event.get("text", "") for event in self.events if event.get("kind") == "diagnostic"]
+        self.assertFalse([text for text in diagnostics if "Could not delete" in text], diagnostics)
+        self.assertFalse((self.folder / "problems.jsonl").exists())
+        # A session that was saved is still copied before it goes.
+        config = self.root / "claude-config"
+        session = "3c91969e-c89a-4995-be2e-55e1728578af"
+        (config / "projects" / "-work").mkdir(parents=True)
+        (config / "projects" / "-work" / f"{session}.jsonl").write_text("{}\n", encoding="utf-8")
+        self.assertTrue(claude_cli.session_deleter(config)(session))
+        self.assertEqual(records.read_source(self.folder / "sources" / "claude" / "-work" / f"{session}.jsonl.gz"),
+                         b"{}\n")
+
     def test_a_session_whose_copy_fails_is_kept(self):
         model = self.api_model()
         self.script([["init", {"structured": {"statement": "S", "notes": ""}}]])

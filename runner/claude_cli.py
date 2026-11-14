@@ -1344,7 +1344,9 @@ def session_deleter(config_dir):
         if not _session_id(session_id):
             return False
         recorder = records.recorder()
-        if recorder is not None and not recorder.keep_claude_session(config_dir, session_id):
+        # A session the CLI never saved (it could not start, or ended before saving) has nothing to copy or delete.
+        if recorder is not None and records.claude_session_files(config_dir, session_id) \
+                and not recorder.keep_claude_session(config_dir, session_id):
             return False  # Kept: the record could not copy it (its problems say why).
         try:
             folders = set()

@@ -774,7 +774,10 @@ nothing on the network changed. `runner/records.py` writes a job's record,
   `projects/<project>/<session>.jsonl` with its `subagents/` and
   `tool-results/`) into `sources/codex/<thread>/` or `sources/claude/` and reads
   each copy back (copies are gzip-compressed); a session whose copy fails is not
-  deleted. The author's or
+  deleted. A Claude session the CLI never saved (it could not start, or ended
+  before saving, as while Claude Code updates itself) has nothing to copy or
+  delete, and is neither a problem of the record nor reported as kept. The
+  author's or
   coordinator's own Codex thread (with its subagents' threads) and Claude
   session are copied when its session ends without a retry (Pause, Stop, the
   time limit, the end of the work) and after each reply turn, only the files
