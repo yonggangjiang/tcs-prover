@@ -361,6 +361,15 @@ API_TEST_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, 
 # one model of the connection: the first Lite one of its list, else its first.
 TEAM_TOOL_TEST_NAMESPACE = f"mcp__{team_module.SERVER_NAME}"
 TEAM_TOOL_TEST_TOOL = "report_result"
+# The answers to that request which say nothing about the team tools, so that they stay not checked (ok None), and
+# the end of the message's sentence: a status that may pass (500 stands for every 5xx) and a refused key or model.
+# No answer within the deadline leaves them not checked too; any other refusal (400, 422, ...) is theirs only when
+# the same request without them is answered.
+TEAM_TOOL_TEST_UNCHECKED_STATUSES = {
+    **dict.fromkeys((408, 425, 429, 500), "which may pass. Test again later."),
+    **dict.fromkeys((401, 403, 404), "a refusal of the key or of this model, which says nothing about the team "
+                                     "tools."),
+}
 TEAM_TOOL_TEST_PROMPT = ('This is a connection test. Call the report_result tool with {"ok": true}, and do nothing '
                          "else.")
 # Real runs ask for long answers; an endpoint that caps the output lower fails them.
@@ -2822,9 +2831,11 @@ def _api_test_request(entry, effort=None):
     return path, headers, json.dumps(body).encode("utf-8")
 
 
-def team_tool_test_request(entry, model, effort):
+def team_tool_test_request(entry, model, effort, tools=True):
     """Path, headers and body of the Test's request shaped as runs send TCS Prover's team tools (see
-    TEAM_TOOL_TEST_NAMESPACE), and the form it takes: "additional_tools" for a Lite model, else "tools"."""
+    TEAM_TOOL_TEST_NAMESPACE), and the form it takes: "additional_tools" for a Lite model, else "tools". Without
+    ``tools`` it is the same request without them (no namespace, tool_choice or parallel_tool_calls), which tells
+    whether an endpoint that refuses the request refuses its team tools (probe_team_tools())."""
 
     lite = runtime.codex_lite_model(model)
     namespace = {"type": "namespace", "name": TEAM_TOOL_TEST_NAMESPACE,
@@ -2837,11 +2848,12 @@ def team_tool_test_request(entry, model, effort):
             "reasoning": {"effort": effort, "summary": DEFAULT_REASONING_SUMMARY,
                           **({"context": "all_turns"} if lite else {})},
             "input": [*([{"type": "additional_tools", "id": f"at_{uuid.uuid4()}", "role": "developer",
-                          "tools": [namespace]}] if lite else []),
+                          "tools": [namespace]}] if lite and tools else []),
                       {"type": "message", "role": "user",
                        "content": [{"type": "input_text", "text": TEAM_TOOL_TEST_PROMPT}]}],
-            **({} if lite else {"tools": [namespace]}),
-            "tool_choice": "auto", "parallel_tool_calls": False, **({"max_output_tokens": output} if output else {})}
+            **({} if lite or not tools else {"tools": [namespace]}),
+            **({"tool_choice": "auto", "parallel_tool_calls": False} if tools else {}),
+            **({"max_output_tokens": output} if output else {})}
     headers = {**_api_connection_headers(entry), "Accept": "text/event-stream"}
     return (_api_endpoint_path(entry, "responses"), headers, json.dumps(body).encode("utf-8"),
             "additional_tools" if lite else "tools")
@@ -2850,7 +2862,12 @@ def team_tool_test_request(entry, model, effort):
 def probe_team_tools(entry, models, effort=None, timeout=None):
     """Whether an OpenAI-format connection passes on TCS Prover's team tools as runs send them: {ok, model, form,
     message, at} for one model of ``models`` (the connection's list: its first Lite model, else its first; see
-    TEAM_TOOL_TEST_NAMESPACE), or None without a model. The key never shows in the message."""
+    TEAM_TOOL_TEST_NAMESPACE), or None without a model. The key never shows in the message.
+
+    ``ok`` is None (not checked) when the answer says nothing about the team tools: no answer within the deadline,
+    a status that may pass or a refusal of the key or the model (TEAM_TOOL_TEST_UNCHECKED_STATUSES), or another
+    refusal that the same request without the team tools gets too; another refusal is theirs only when that request
+    is answered."""
 
     if not models:
         return None
@@ -2866,7 +2883,9 @@ def probe_team_tools(entry, models, effort=None, timeout=None):
               "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     named = f"{TEAM_TOOL_TEST_NAMESPACE}.{TEAM_TOOL_TEST_TOOL}"
     if status is None:
-        message = f"The request with team tools for {model} failed: {failure}"
+        result["ok"] = None
+        message = (f"The team tools were not checked: the request with them for {model} failed. {failure} Test again "
+                   "later.")
     elif not 200 <= status < 300:
         try:
             value = json.loads(text)
@@ -2874,11 +2893,25 @@ def probe_team_tools(entry, models, effort=None, timeout=None):
             value = None
         # The service's words go in parentheses and the message ends with a full stop, so that they never run into
         # its next sentence, within the MAX_TEST_MESSAGE_CHARS a connection keeps.
-        sent = "an additional_tools item" if form == "additional_tools" else "the request's tools"
-        message = _api_test_quoted(
-            f"The endpoint refused the request with team tools for {model}, sent in {sent} ",
-            _api_test_status_words(status, value, text, entry["apiKey"]),
-            ". A coordinator on this connection could not reach its team.")
+        words = _api_test_status_words(status, value, text, entry["apiKey"])
+        unchecked = TEAM_TOOL_TEST_UNCHECKED_STATUSES.get(500 if 500 <= status < 600 else status)
+        if unchecked is None:
+            # Another refusal: the team tools' only when the endpoint answers the same request without them.
+            plain = _api_test_send(entry, path, headers, team_tool_test_request(entry, model, effort, tools=False)[2],
+                                   timeout)
+            answered = plain[0] is not None and 200 <= plain[0] < 300 and not _api_test_tool_calls(plain[2])[1]
+            unchecked = None if answered else ("and so did the same request without them, so the refusal is not "
+                                               "of the team tools.")
+        if unchecked is not None:
+            result["ok"] = None
+            message = _api_test_quoted(f"The team tools were not checked: the request with them for {model} failed ",
+                                       words, f", {unchecked}")
+        else:
+            sent = "an additional_tools item" if form == "additional_tools" else "the request's tools"
+            message = _api_test_quoted(
+                f"The endpoint refused the request with team tools for {model}, sent in {sent} ", words,
+                ", but answers the same request without them. A coordinator on this connection could not reach its "
+                "team.")
     else:
         calls, error = _api_test_tool_calls(text)
         called = next(((name, space) for name, space in calls if name in (TEAM_TOOL_TEST_TOOL, named.replace(

@@ -7580,8 +7580,9 @@ function apiModelRow(connection) {
   }
   item.append(glyph, copy, format, status, actions);
   if (test && !test.ok) item.append(apiElement("p", "api-test-result error", apiTestText(test)));
-  // Its last Test reached the models but not with TCS Prover's team tools: a coordinator could not use its team.
-  else if (test?.teamTools && test.teamTools.ok === false) {
+  // Its last Test reached the models but not with TCS Prover's team tools (a coordinator could not use its team), or
+  // could not tell (ok null: the answer said nothing about them).
+  else if (test?.teamTools && test.teamTools.ok !== true) {
     item.append(apiElement("p", "api-test-warning", test.teamTools.message || "Team tools did not reach the model."));
   }
   return item;

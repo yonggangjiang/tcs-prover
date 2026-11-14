@@ -237,6 +237,20 @@ class AccuracyTests(unittest.TestCase):
         self.assertIn("It runs with the catalog's first Lite model, else its first, and passes only when a "
                       "`function_call` comes back with `name` `report_result` and `namespace` `mcp__tcs`",
                       flat(DOCS / "developers.md"))
+        # An answer that says nothing about the team tools leaves them not checked (server.probe_team_tools()).
+        code = (ROOT / "ui" / "server.py").read_text(encoding="utf-8")
+        self.assertIn('    **dict.fromkeys((408, 425, 429, 500), "which may pass. Test again later."),\n', code)
+        self.assertIn("    **dict.fromkeys((401, 403, 404), ", code)
+        self.assertIn("An answer that says nothing about the team tools leaves them *not checked*, a warning too, with "
+                      "what came back: no answer within the deadline, a failure that may pass (HTTP 408, 425, 429 or "
+                      "5xx, such as a proxy's \"cooling down\"), a refused key or model (401, 403, 404), or a refusal "
+                      "of the same request without the tool as well.", models)
+        self.assertIn("`ok` is null (not checked) when the answer says nothing about the team tools: no answer within "
+                      "the deadline, a status of `TEAM_TOOL_TEST_UNCHECKED_STATUSES` (408, 425, 429 and every 5xx, "
+                      "which may pass; 401, 403 and 404, a refused key or model), or another refusal (400, 422, …) "
+                      "that the same request without the tools (`team_tool_test_request(tools=False)`: no namespace, "
+                      "`tool_choice` or `parallel_tool_calls`) gets as well; another refusal is theirs only when that "
+                      "request is answered.", flat(DOCS / "developers.md"))
 
     def test_the_coordinator_s_warnings_are_named_with_their_limits(self):
         # A coordinator that cannot use its team is listed under Needs your attention while its run goes on

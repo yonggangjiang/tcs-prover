@@ -1219,9 +1219,16 @@ item (role `developer`) with `reasoning.context` `"all_turns"`; both streamed,
 its first, and passes only when a `function_call` comes back with `name`
 `report_result` and `namespace` `mcp__tcs` (Codex refuses a call without it:
 "unsupported call"). The result is `teamTools` `{ok, model, form, message,
-at}`, recorded in the connection's `lastTest`; the editor adds its sentence
-after the outcome, as a warning when it failed, and the connection's row keeps
-that warning.
+at}`, recorded in the connection's `lastTest`; `ok` is null (not checked) when
+the answer says nothing about the team tools: no answer within the deadline, a
+status of `TEAM_TOOL_TEST_UNCHECKED_STATUSES` (408, 425, 429 and every 5xx,
+which may pass; 401, 403 and 404, a refused key or model), or another refusal
+(400, 422, …) that the same request without the tools
+(`team_tool_test_request(tools=False)`: no namespace, `tool_choice` or
+`parallel_tool_calls`) gets as well; another refusal is theirs only when that
+request is answered. The editor adds its sentence after the outcome, as a
+warning when it failed or was not checked, and the connection's row keeps that
+warning.
 
 **The Setup page.** `GET /setup` checks the programs (it reuses a check
 younger than 10 minutes; `?refresh=1` checks again; `?cached=1`, the page's

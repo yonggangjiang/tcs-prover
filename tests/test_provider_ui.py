@@ -1169,6 +1169,17 @@ const rowWith = (teamTools) => {
 assert.deepEqual(rowWith({ok: false, message: failed}), [failed]);
 assert.deepEqual(rowWith({ok: true, message: passed}), []);
 assert.deepEqual(rowWith(undefined), []);
+// An answer that said nothing about the team tools (a passing 429, a model the key cannot use) left them not checked
+// (ok null): the editor and the row say so, as a warning too.
+const unchecked = 'The team tools were not checked: the request with them for gpt-6.1-sol failed (HTTP 429: All '
+  + 'credentials for model gpt-6.1-sol are cooling down), which may pass. Test again later.';
+assert.deepEqual(rowWith({ok: null, message: unchecked}), [unchecked]);
+$('apiModelTestButton').onclick();
+sent[3].reply(200, {ok: true, status: 200, message: 'Found 2 models.', latencyMs: 8,
+  teamTools: {ok: null, model: 'gpt-6.1-sol', form: 'additional_tools', message: unchecked}});
+await settle();
+assert.deepEqual(parts(), [['', 'Connected · 8 ms'], ['api-test-detail', 'Found 2 models.'],
+  ['api-test-warning', unchecked]]);
 """)
 
     def test_saved_key_edit_refresh_remove_and_secret_binding(self):

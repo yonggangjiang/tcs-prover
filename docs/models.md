@@ -272,10 +272,15 @@ type a model id.
   the first such model of the catalog, else its first model (one model per
   Test, within its own 30-second deadline), and it says plainly whether the
   model called the tool back with its namespace. When it did not
-  (the endpoint refused the request, the model called the tool without its
-  namespace, which the Codex CLI refuses, or called none), the line is a
-  warning, and the saved connection's row keeps it: a coordinator on that
-  connection could not use its team.
+  (the endpoint refused the request but answers the same request without the
+  tool, the model called the tool without its namespace, which the Codex CLI
+  refuses, or called none), the line is a warning, and the saved connection's
+  row keeps it: a coordinator on that connection could not use its team. An
+  answer that says nothing about the team tools leaves them *not checked*, a
+  warning too, with what came back: no answer within the deadline, a failure
+  that may pass (HTTP 408, 425, 429 or 5xx, such as a proxy's "cooling down"),
+  a refused key or model (401, 403, 404), or a refusal of the same request
+  without the tool as well.
 - **Edit** fills the form with the saved settings; the key stays saved and is
   never shown. **Remove** deletes the connection, its key and its model choices;
   saved jobs keep their model ids and show a warning until it is back. Removing a

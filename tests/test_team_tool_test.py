@@ -8,7 +8,10 @@ Codex 0.160 sends the team tools (as captured from the real Codex against a scri
 (gpt-6.1-sol and the other names of its catalog) in an additional_tools input item, with reasoning context
 "all_turns"; the model must call a tool back with its namespace, or Codex refuses the call ("unsupported call"). The
 Test runs with the connection's first Lite model, else its first, and passes only when the call comes back with its
-namespace. Offline: a local endpoint plays the connection.
+namespace. An answer that says nothing about the team tools leaves them not checked (ok None): no answer, a status
+that may pass (408, 425, 429, 5xx: CLIProxyAPI's credentials "cooling down"), a refused key or model (401, 403, 404),
+and another refusal that the same request without the team tools gets as well. Offline: a local endpoint plays the
+connection.
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -92,6 +95,19 @@ TEXT = [{"type": "response.created", "response": {"id": "resp_1"}},
         {"type": "response.completed", "response": {"id": "resp_1"}}]
 
 
+def with_tools(body):
+    """Whether a request carries the team tools (in its tools, or in an additional_tools item)."""
+
+    return "tools" in body or any(item.get("type") == "additional_tools" for item in body.get("input", []))
+
+
+def with_tools_refused(status, value, plain=TEXT):
+    """An endpoint's answer that refuses a request with the team tools (``status``, ``value``) and answers ``plain``
+    to the same request without them."""
+
+    return lambda body: (status, value) if with_tools(body) else (200, plain)
+
+
 class ProbeTests(unittest.TestCase):
     def endpoint(self, models, answer):
         endpoint = Endpoint(models, answer)
@@ -156,35 +172,104 @@ class ProbeTests(unittest.TestCase):
                 self.assertIn(expected, result["message"])
 
     def test_a_refused_request_says_so_in_the_endpoint_s_words_without_the_key(self):
-        endpoint = self.endpoint(["gpt-6.1-sol"], lambda body: (400, {"error": {
+        endpoint = self.endpoint(["gpt-6.1-sol"], with_tools_refused(400, {"error": {
             "message": f"Unknown input item type 'additional_tools' (key {KEY}).", "type": "invalid_request_error"}}))
         result = server.probe_team_tools(self.entry(endpoint), endpoint.models)
         self.assertFalse(result["ok"])
         self.assertEqual(result["message"], "The endpoint refused the request with team tools for gpt-6.1-sol, sent in "
                                             "an additional_tools item (HTTP 400: Unknown input item type "
-                                            "'additional_tools' (key [redacted]).). A coordinator on this connection "
-                                            "could not reach its team.")
+                                            "'additional_tools' (key [redacted]).), but answers the same request "
+                                            "without them. A coordinator on this connection could not reach its team.")
         self.assertNotIn(KEY, result["message"])
         self.assertIsNone(server.probe_team_tools(self.entry(endpoint), []))
 
     def test_a_refusal_s_message_ends_with_a_full_stop_within_what_a_connection_keeps(self):
         # The service's words in parentheses: words without a full stop of their own never run into the next
         # sentence, and long ones are clipped so that the message keeps its end (a connection keeps 300 characters).
+        tail = ", but answers the same request without them. A coordinator on this connection could not reach its team."
         for words, expected in (
                 ("Unsupported parameter: 'tools'", "The endpoint refused the request with team tools for lab-model, "
-                 "sent in the request's tools (HTTP 400: Unsupported parameter: 'tools'). A coordinator on this "
-                 "connection could not reach its team."),
+                 f"sent in the request's tools (HTTP 400: Unsupported parameter: 'tools'){tail}"),
                 ("", "The endpoint refused the request with team tools for lab-model, sent in the request's tools "
-                 "(HTTP 400). A coordinator on this connection could not reach its team.")):
-            endpoint = self.endpoint(["lab-model"], lambda body, words=words: (
+                 f"(HTTP 400){tail}")):
+            endpoint = self.endpoint(["lab-model"], with_tools_refused(
                 400, {"error": {"message": words, "type": "invalid_request_error"}} if words else b""))
             with self.subTest(words=words):
                 self.assertEqual(server.probe_team_tools(self.entry(endpoint), endpoint.models)["message"], expected)
-        endpoint = self.endpoint(["lab-model"], lambda body: (400, {"error": {"message": "Unsupported tool. " * 40}}))
+        endpoint = self.endpoint(["lab-model"], with_tools_refused(400, {"error": {"message": "Unsupported tool. " * 40}}))
         message = server.probe_team_tools(self.entry(endpoint), endpoint.models)["message"]
         self.assertEqual(len(message), providers.MAX_TEST_MESSAGE_CHARS)
         self.assertIn("(HTTP 400: Unsupported tool. Unsupported tool.", message)
-        self.assertTrue(message.endswith("…). A coordinator on this connection could not reach its team."))
+        self.assertTrue(message.endswith(f"…){tail}"))
+
+    def test_an_answer_that_says_nothing_about_the_team_tools_leaves_them_not_checked(self):
+        # A status that may pass (CLIProxyAPI's 429 "cooling down", a 503, a 500, a timeout of the upstream) and a
+        # refused key or model (a model of the list that this key cannot use) claim nothing about the team tools:
+        # not checked (ok None), with what came back, and no second request.
+        cases = (
+            (429, "All credentials for model gpt-6.1-sol are cooling down", "which may pass. Test again later."),
+            (503, "auth_unavailable", "which may pass. Test again later."),
+            (500, "Internal error", "which may pass. Test again later."),
+            (408, "Upstream timed out", "which may pass. Test again later."),
+            (404, "The model `gpt-6.1-sol` does not exist or you do not have access to it.",
+             "a refusal of the key or of this model, which says nothing about the team tools."),
+            (401, "Invalid API key", "a refusal of the key or of this model, which says nothing about the team tools."),
+            (403, "Forbidden", "a refusal of the key or of this model, which says nothing about the team tools."))
+        for status, words, ending in cases:
+            endpoint = self.endpoint(["gpt-6.1-sol"], lambda body, status=status, words=words: (
+                status, {"error": {"message": words, "type": "error"}}))
+            with self.subTest(status=status):
+                result = server.probe_team_tools(self.entry(endpoint), endpoint.models)
+                self.assertIsNone(result["ok"])
+                self.assertEqual(result["message"], "The team tools were not checked: the request with them for "
+                                                    f"gpt-6.1-sol failed (HTTP {status}: {words}), {ending}")
+                self.assertEqual(len(endpoint.team_requests()), 1)
+        # No answer at all.
+        closed = self.endpoint(["gpt-6.1-sol"], lambda body: (200, TEXT))
+        entry = self.entry(closed)
+        closed.close()
+        result = server.probe_team_tools(entry, ["gpt-6.1-sol"], timeout=5)
+        self.assertIsNone(result["ok"])
+        self.assertEqual(result["message"], "The team tools were not checked: the request with them for gpt-6.1-sol "
+                                            "failed. The connection was refused (ConnectionRefusedError). Test again "
+                                            "later.")
+
+    def test_another_refusal_is_the_team_tools_only_when_the_same_request_without_them_is_answered(self):
+        refusal = {"error": {"message": "Unsupported value: 'max' is not supported with this model.",
+                             "type": "invalid_request_error"}}
+        for answer, ok, ending in (
+                (with_tools_refused(400, refusal), False,
+                 ", but answers the same request without them. A coordinator on this connection could not reach its "
+                 "team."),
+                # Refused without them too: the request's other settings, not its team tools.
+                (lambda body: (400, refusal), None,
+                 ", and so did the same request without them, so the refusal is not of the team tools."),
+                # Answered without them, but its stream failed: not answered either.
+                (with_tools_refused(422, refusal, [{"type": "response.failed", "response": {
+                    "error": {"message": "upstream busy"}}}]), None,
+                 ", and so did the same request without them, so the refusal is not of the team tools.")):
+            endpoint = self.endpoint(["gpt-6.1-sol"], answer)
+            with self.subTest(ok=ok, ending=ending):
+                result = server.probe_team_tools(self.entry(endpoint), endpoint.models, effort="high")
+                self.assertIs(result["ok"], ok)
+                self.assertTrue(result["message"].endswith(ending), result["message"])
+                with_tools, without = endpoint.team_requests()
+                # The same request without the team tools: no additional_tools item, tool choice or parallel calls;
+                # everything else as before.
+                self.assertEqual([item["type"] for item in without["input"]], ["message"])
+                self.assertEqual(with_tools["input"][1], without["input"][0])
+                for name in ("tools", "tool_choice", "parallel_tool_calls"):
+                    self.assertNotIn(name, without)
+                self.assertEqual({key: value for key, value in with_tools.items()
+                                  if key not in ("input", "tool_choice", "parallel_tool_calls")},
+                                 {key: value for key, value in without.items() if key != "input"})
+                self.assertEqual(without["reasoning"]["context"], "all_turns")
+        # A model that does not run as Responses Lite: the request without its tools has none either.
+        endpoint = self.endpoint(["lab-model"], with_tools_refused(400, refusal))
+        self.assertFalse(server.probe_team_tools(self.entry(endpoint), endpoint.models)["ok"])
+        with_tools, without = endpoint.team_requests()
+        self.assertIn("tools", with_tools)
+        self.assertNotIn("tools", without)
 
 
 class RouteTests(unittest.TestCase):
@@ -214,6 +299,20 @@ class RouteTests(unittest.TestCase):
         last = providers.api_connection(saved["id"], cached=False)["lastTest"]
         self.assertEqual(last["teamTools"]["message"], result["teamTools"]["message"])
         self.assertFalse(last["teamTools"]["ok"])
+
+    def test_a_test_whose_team_tool_request_said_nothing_about_them_records_them_not_checked(self):
+        endpoint = Endpoint(["gpt-6.1-sol"], lambda body: (429, {"error": {
+            "message": "All credentials for model gpt-6.1-sol are cooling down", "type": "rate_limit_error"}}))
+        self.addCleanup(endpoint.close)
+        saved = self.http.save_api_model({"format": "openai", "baseUrl": endpoint.base, "apiKey": KEY,
+                                          "label": "Proxy"})["connection"]
+        result = self.http.probe_api_model({"id": saved["id"], "format": "openai", "baseUrl": endpoint.base})
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["teamTools"]["ok"])
+        last = providers.api_connection(saved["id"], cached=False)["lastTest"]
+        self.assertIsNone(last["teamTools"]["ok"])
+        self.assertEqual(last["teamTools"]["message"], result["teamTools"]["message"])
+        self.assertTrue(last["teamTools"]["message"].startswith("The team tools were not checked: "))
 
     def test_an_anthropic_connection_s_test_sends_no_team_tool_request(self):
         endpoint = Endpoint(["claude-gw"], lambda body: (500, {}))
