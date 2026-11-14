@@ -41,13 +41,14 @@ TEXTS = {name: text for name, text in runtime.load_workflow(WORKFLOW)["prompts"]
 
 # The lines the real Codex 0.160 printed when an OpenAI-format API connection refused the request (tests/
 # codex_refusals.py): its endpoint's HTTP 400 invalid_request_error (a request it rejects as invalid), which Codex
-# reports as the endpoint's body alone, and its HTTP 401 (a key it refuses), in Codex's words "unexpected status 401
-# Unauthorized: …".
-CODEX_REFUSALS = {"REJECTED": codex_refusals.EXEC_400, "BADKEY": codex_refusals.EXEC_401}
+# reports as the endpoint's body alone, its HTTP 400 model_not_found (a model it does not have), reported the same
+# way, and its HTTP 401 (a key it refuses), in Codex's words "unexpected status 401 Unauthorized: …".
+CODEX_REFUSALS = {"REJECTED": codex_refusals.EXEC_400, "NOMODEL": codex_refusals.EXEC_400_NO_MODEL,
+                  "BADKEY": codex_refusals.EXEC_401}
 # A stand-in `codex` for a team member's `codex exec --json`: it logs its call, reports a saved session and answers
 # from its prompt; like Codex 0.160, each run numbers its items from item_0 again. Markers in the prompt choose a
 # failure: SLOW (works until stopped), FAIL-ONCE (a model-call failure after some work, once per run folder), NOLOGIN
-# (a login the CLI refuses), REJECTED and BADKEY (the refusals of CODEX_REFUSALS, whose lines it prints).
+# (a login the CLI refuses), REJECTED, NOMODEL and BADKEY (the refusals of CODEX_REFUSALS, whose lines it prints).
 FAKE_CODEX = f"REFUSALS = {CODEX_REFUSALS!r}\n" + r'''
 import json, os, sys, time, uuid
 argv = sys.argv[1:]
@@ -623,8 +624,9 @@ MEMBER_SETTINGS = {"speed": "standard", "summary": "concise"}
 
 def refused_report(member, reason):
     """The report the coordinator gets when member ``member``'s API connection refused the request (its endpoint
-    rejected it as invalid, or refused its key) with ``reason``, the service's words: the owner's wording of 14 Nov
-    2026, spelled out here so that any change of it shows."""
+    rejected it as invalid, said the model does not exist or that its key cannot use it, or refused its key) with
+    ``reason``, the service's words: the owner's wording of 14 Nov 2026, spelled out here so that any change of it
+    shows."""
 
     return (f"Member {member}'s assignment failed: its API connection refused the request ({reason}). This may be a "
             "temporary problem of the service or a wrong setting. Keep the work going: give this assignment to "
@@ -1082,6 +1084,31 @@ class TeamTests(TeamCase):
         # The member is idle, and works when it gets the assignment again.
         self.assertIn('member 2: lab-model (API connection "Lab gateway"): idle', crew.call("team_members", {}))
         crew.call("team_assign", {"member": 2, "assignment": "Lemma A"})
+        report, = self.collect(crew, 1)
+        self.assertTrue(report.endswith("\nREPORT:\nReport of lab-model: Lemma A"), report)
+
+    def test_an_api_connection_without_the_model_fails_the_assignment_with_the_same_report(self):
+        # An endpoint that says the model does not exist (or that this key cannot use it) is a refusal of the member's
+        # API connection too, as the owner's wording of 14 Nov 2026 says it; the author and a structured call still
+        # read "Model unavailable: … A retry cannot fix this: …" (tests/test_codex_request_rejected.py).
+        reason = "The requested model 'lab-model' does not exist."
+        crew = self.crew([{"model": self.api_model(), "effort": "medium"}])
+        crew.call("team_assign", {"member": 1, "assignment": "NOMODEL Lemma A"})
+        report, = self.collect(crew, 1)
+        head, _, text = report.partition("\nREPORT:\n")
+        self.assertTrue(head.startswith('Member 1 (lab-model) failed the assignment "NOMODEL Lemma A".'), head)
+        self.assertEqual(text, refused_report(1, reason))
+        self.assertEqual((self.run_dir / "team/member-1/1-report.md").read_text(), text)
+        # The activity log's line keeps its words.
+        failed, = self.labelled("Author subagent failed")
+        self.assertEqual(failed["text"], f"{runtime.MODEL_UNAVAILABLE_LABEL}: Lab gateway cannot be used ({reason}). "
+                                         "A retry cannot fix this: check its API connection under Models & API (Load "
+                                         "models lists the models its key can use).")
+        # It ended at once, never retried, and the member works when it gets the assignment again.
+        self.assertEqual(len(self.codex_calls()), 1)
+        self.assertFalse([event for event in self.events if event["kind"] == "diagnostic"
+                          and "retrying" in event.get("text", "")])
+        crew.call("team_assign", {"member": 1, "assignment": "Lemma A"})
         report, = self.collect(crew, 1)
         self.assertTrue(report.endswith("\nREPORT:\nReport of lab-model: Lemma A"), report)
 

@@ -308,7 +308,8 @@ Claude Code's own subagents.
   setting that cannot work (a program not installed, no sign-in, an unknown
   model) comes back to the coordinator as a failed assignment with the reason.
   So does a request that a member's API connection refuses (its endpoint calls
-  the request invalid, or refuses its key), with the service's words; as such a
+  the request invalid, says that the model does not exist or that its key
+  cannot use it, or refuses its key), with the service's words; as such a
   refusal can also be temporary, the report tells the coordinator that it may
   be a temporary problem of the service or a wrong setting, and to keep the
   work going by giving the assignment to another member, or to the same member

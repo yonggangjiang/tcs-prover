@@ -534,7 +534,14 @@ class HandoffRefused(Error):
 
 
 class ModelUnavailable(ConfigurationError):
-    """The provider says the model does not exist or that this account cannot use it."""
+    """The provider says the model does not exist or that this account cannot use it.
+
+    ``reason`` is the provider's own words, as the message quotes them.
+    """
+
+    def __init__(self, message, reason=""):
+        super().__init__(message)
+        self.reason = reason
 
 
 class RequestRejected(ConfigurationError):
@@ -658,7 +665,7 @@ def settings_failure(error, model=None):
         fix = ("check its API connection under Models & API (Load models lists the models its key can use)" if api
                else "check that the model exists and that your login may use it")
         return ModelUnavailable(f"{MODEL_UNAVAILABLE_LABEL}: {label} cannot be used ({reason}). "
-                                f"A retry cannot fix this: {fix}.")
+                                f"A retry cannot fix this: {fix}.", reason)
     if (api and (_REJECTED_REQUEST.search(text) or _invalid_request_body(text))
             and not _CLAUDE_HISTORY_MISMATCH.search(text)):
         return RequestRejected(f"{REQUEST_REJECTED_LABEL}: {label} refuses the requests this job sends as "
@@ -3977,13 +3984,14 @@ def member_problem(error, model):
 
     A missing program, a login or key the model cannot use, a model the account or catalog does not have, an
     endpoint that refuses the request, and any other configuration error. When the member's API connection refused
-    the request (its endpoint rejects it as invalid, or refuses its key) it is a team.Refusal, whose report tells the
-    coordinator in the service's words that the problem may pass (team.REFUSED_REPORT); the member's record keeps the
-    failure's own words. A built-in model's refused login (its program's sign-in, no API connection) stays plain text.
+    the request (its endpoint rejects it as invalid, says the model does not exist or that its key cannot use it, or
+    refuses its key) it is a team.Refusal, whose report tells the coordinator in the service's words that the problem
+    may pass (team.REFUSED_REPORT); the member's record keeps the failure's own words. A built-in model's refused
+    login or unavailable model (its program's sign-in, no API connection) stays plain text.
     """
 
     failure = settings_failure(error, model)
-    if isinstance(failure, RequestRejected):
+    if isinstance(failure, RequestRejected) or (isinstance(failure, ModelUnavailable) and providers.is_api_id(model)):
         return team_module.Refusal(str(failure), failure.reason)
     if failure is not None:
         return str(failure)

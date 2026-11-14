@@ -7,9 +7,10 @@ request (workflow_runner.settings_failure(), RequestRejected), as Claude Code's 
 (tests/test_claude_request_rejected.py), the owner's decision of 13 Nov 2026: a structured call ends after its first
 attempt, the author pauses with a message that says to change the connection's settings (a job waiting for it
 continues once they change), a paused author's reply fails as a settings problem, and a team member's assignment comes
-back to the coordinator as its API connection's refusal (team.REFUSED_REPORT, the owner's wording of 14 Nov 2026).
-The endpoint's words in these messages are its error's message, also when it writes its body over several lines, as
-api.openai.com does; so are they when the endpoint says that the model does not exist ("Model unavailable").
+back to the coordinator as its API connection's refusal (team.REFUSED_REPORT, the owner's wording of 14 Nov 2026; so
+does an endpoint that says the model does not exist, which the author and a structured call report as "Model
+unavailable"). The endpoint's words in these messages are its error's message, also when it writes its body over
+several lines, as api.openai.com does.
 
 Everything else stays retried every minute: the same endpoint's 400 for a conversation too long for the model, a body
 that names a passing condition (429, overload, 5xx), one quoted under another HTTP status (a key refused with 401), and
@@ -148,18 +149,20 @@ class CapturedTextTests(jobs_test.Isolated):
                 self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
                                  team.Refusal(f"authentication failed: {reason}", reason))
 
-    def test_a_model_the_endpoint_does_not_have_is_unavailable_in_the_endpoint_words(self):
+    def test_a_model_the_endpoint_does_not_have_is_unavailable_and_a_members_refusal(self):
         for lines, reason in ((captured.EXEC_400_NO_MODEL, NO_MODEL), (captured.EXEC_404_NO_MODEL, NOT_FOUND)):
             message = (f"{runtime.MODEL_UNAVAILABLE_LABEL}: Gateway cannot be used ({reason}). A retry cannot fix "
                        "this: check its API connection under Models & API (Load models lists the models its key can "
                        "use).")
             for path, text in self.texts(lines).items():
                 with self.subTest(reason=reason, path=path):
+                    # The author and a structured call keep their message, with what to do.
                     problem = runtime.settings_failure(runtime.Error(text), self.model)
                     self.assertIsInstance(problem, runtime.ModelUnavailable)
-                    self.assertEqual(str(problem), message)
-                    # A team member's assignment comes back with the whole message.
-                    self.assertEqual(runtime.member_problem(runtime.Error(text), self.model), message)
+                    self.assertEqual((str(problem), problem.reason), (message, reason))
+                    # A team member on the API connection: the refusal's report, with the endpoint's words.
+                    self.assertEqual(runtime.member_problem(runtime.Error(text), self.model),
+                                     team.Refusal(message, reason))
                     # A built-in model's unavailable model reports as before, with what to do.
                     self.assertEqual(runtime.member_problem(runtime.Error(text), "gpt-6.1-sol"),
                                      f"{runtime.MODEL_UNAVAILABLE_LABEL}: GPT 6.1 Sol cannot be used ({reason}). A "

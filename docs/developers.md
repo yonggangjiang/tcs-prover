@@ -615,7 +615,8 @@ that every prompt and tool text is the user's to adjust. What the code does:
   model or connection) goes to the coordinator as the report of a failed
   assignment, "The assignment failed: <the problem>", and the member is idle.
   An API connection that refuses the request (its endpoint rejects it as
-  invalid, HTTP 400 `RequestRejected`, or refuses its key: a failed
+  invalid, HTTP 400 `RequestRejected`; says that the model does not exist or
+  that its key cannot use it, `ModelUnavailable`; or refuses its key: a failed
   authentication, HTTP 401 or 403), with Codex or Claude Code, ends the
   assignment the same way, as a `team.Refusal`, but such a refusal can pass (a
   proxy refuses requests while its own login refreshes), so its report is the
@@ -623,10 +624,11 @@ that every prompt and tool text is the user's to adjust. What the code does:
   assignment failed: its API connection refused the request (<reason>). This
   may be a temporary problem of the service or a wrong setting. Keep the work
   going: give this assignment to another member, or give it to member <n> again
-  later." `<reason>` is the service's own words (`RequestRejected.reason`, or
-  the 401 text), without the author's "A retry cannot fix this ..." sentence;
-  the member's **Author subagent failed** line keeps the failure's full text. A
-  built-in model's refused login is a failed login, reported as above.
+  later." `<reason>` is the service's own words (the error's `reason`, or the
+  401 text), without the author's "A retry cannot fix this ..." sentence; the
+  member's **Author subagent failed** line keeps the failure's full text. A
+  built-in model's refused login or unavailable model is reported as above,
+  "The assignment failed: …" with the whole message.
   Claude Code first retries a failed API request inside the member's run
   (`CLAUDE_CODE_RETRY_WATCHDOG`; Claude Code 2.1.289 retried a refused key up to
   300 times, about 35 s apart): each retry is a diagnostic of that member
