@@ -11335,7 +11335,7 @@ function renderJobCallsEntry() {
 function callsStore() {
   return (callsStore.value ||= { run: "", rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
     selected: "", details: new Map(), raw: new Map(), filter: "all", words: "", timer: null, every: 5000, same: 0,
-    loading: false, from: "", job: null, generation: 0, items: new Map(), stale: new Set() });
+    loading: false, from: "", job: null, generation: 0, items: new Map(), stale: new Set(), catalog: null });
 }
 
 function callsEls() {
@@ -11357,7 +11357,7 @@ async function openModelCalls(run, { from = "", call = "" } = {}) {
   clearTimeout(store.timer);
   Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [], selected: call,
     details: new Map(), raw: new Map(), filter: "all", words: "", every: 5000, same: 0, from, job: null,
-    loading: false, generation: store.generation + 1, items: new Map(), stale: new Set() });
+    loading: false, generation: store.generation + 1, items: new Map(), stale: new Set(), catalog: null });
   history.pushState(null, "", callsUrl(run, call));
   clearTimeout(timer); clearInterval(clock); clearTimeout(jobsTimer);
   clearJobView();
@@ -11389,7 +11389,7 @@ async function loadCalls(full = false) {
     Object.assign(store, { run, rows: [], total: 0, loaded: false, missing: false, error: "", problems: [],
       selected: new URLSearchParams(location.search).get("call") || "", details: new Map(), raw: new Map(),
       every: 5000, same: 0, from: "", job: null, loading: false, generation: store.generation + 1, items: new Map(),
-      stale: new Set() });
+      stale: new Set(), catalog: null });
     const els = callsEls();
     els.browser.dataset.view = store.selected ? "detail" : "list";
     els.list.replaceChildren();
@@ -11402,15 +11402,21 @@ async function loadCalls(full = false) {
   const generation = store.generation;
   try {
     if (store.job === null) {
-      // Whose record it is: its title, and whether its job is still listed (GET /records).
-      try {
-        const listed = await recordRequest("/records");
-        if (Array.isArray(listed)) {
-          recordsStore().rows = listed;
-          renderRecordsNav();
-          store.job = listed.find((row) => row.runFolder === run) || { runFolder: run, title: "", jobExists: false };
-        }
-      } catch (_) {
+      // Whose record it is: its title, and whether its job is still listed (GET /records); and the names the menus
+      // give the models (GET /api-models), which this page has not read otherwise: "Claude Opus 5.5", not
+      // "claude-opus-5-5".
+      const [listed, menus] = await Promise.allSettled([recordRequest("/records"),
+        store.catalog ? Promise.resolve(null) : recordRequest("/api-models")]);
+      if (callsStore().generation !== generation) return;
+      if (menus.status === "fulfilled" && Array.isArray(menus.value?.model_catalog)) {
+        store.catalog = menus.value.model_catalog;
+      }
+      if (listed.status === "fulfilled" && Array.isArray(listed.value)) {
+        recordsStore().rows = listed.value;
+        renderRecordsNav();
+        store.job = listed.value.find((row) => row.runFolder === run)
+          || { runFolder: run, title: "", jobExists: false };
+      } else if (listed.status === "rejected") {
         store.job = { runFolder: run, title: "", jobExists: false };
       }
     }
@@ -11550,11 +11556,13 @@ function callRole(row) {
   }
 }
 
-// A model as the menus name it ("GPT 6.1 Sol"), else as the call names it.
+// A model as the menus name it ("GPT 6.1 Sol", "Claude Opus 5.5": the catalog this page read, else the page's own),
+// else as the call names it.
 function callModel(model) {
   const id = String(model || "");
   if (!id) return "Model not named";
-  const row = roleModelCatalog().find((item) => item.id === id || item.model === id);
+  const named = (rows) => (Array.isArray(rows) ? rows : []).find((item) => item.id === id || item.model === id);
+  const row = named(callsStore().catalog) || named(roleModelCatalog());
   const label = row?.label || (id.startsWith("api:") ? id.slice(4) : id);
   return String(label).replace(/ — default$/, "");
 }

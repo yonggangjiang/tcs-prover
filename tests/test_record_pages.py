@@ -193,7 +193,8 @@ const ui = {notice: $('notice'), callsJobCrumb: $('callsJobCrumb')};
 const show = (element, visible) => { element.hidden = !visible; };
 const views = [];
 const clearJobView = () => views.push('clear'), renderBatchNavigation = () => views.push('nav');
-const roleModelCatalog = () => [{id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol — default'}, {id: 'claude-opus-5-5', label: 'Claude Opus 5.5'}];
+// The page's own model names (the markup's Codex options: these pages read no job's settings).
+const roleModelCatalog = () => [{id: 'gpt-6.1-sol', label: 'GPT 6.1 Sol — default'}, {id: 'gpt-6-luna', label: 'GPT 6 Luna'}];
 const jobs = [];
 const selectJob = (run) => { jobs.push(run); currentJob = run; callsRecord = ''; };
 // The markup's filter groups (index.html).
@@ -209,6 +210,14 @@ for (const [key, label] of [['all', 'All'], ['author', 'Coordinator'], ['members
 const navItem = new Element('a'); navItem.className = 'nav-item'; navItem.append($('navRecordsSize'));
 """
 
+# The role menus' models as GET /api-models gives them (runner/providers.py BUILTIN_MODELS, an API connection's model).
+MODEL_CATALOG = [
+    {"id": "gpt-6.1-sol", "label": "GPT 6.1 Sol", "provider": "codex"},
+    {"id": "gpt-6-luna", "label": "GPT 6 Luna", "provider": "codex"},
+    {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "claude"},
+    {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": "claude"},
+    {"id": "api:lab-gateway:claude-gw", "label": "Lab gateway · claude-gw", "provider": "api", "model": "claude-gw"},
+]
 # Three records: two whose job is listed, one of a deleted job.
 RECORDS = [
     {"runFolder": RUN, "title": "Prove that the sum of two odd integers is even.", "created": "2026-11-14T02:05:16.726Z",
@@ -340,6 +349,7 @@ def answers(**extra):
     base = f"/jobs/{RUN}/model-calls"
     table = {
         "/records": {"body": RECORDS},
+        "/api-models": {"body": {"connections": [], "model_catalog": MODEL_CATALOG}},
         f"{base}?offset=0&limit=1000": {"body": {"total": len(ROWS), "calls": ROWS,
                                                   "recordState": {"available": True, "problems": []}}},
         f"{base}?offset=0&limit=1": {"body": {"total": len(ROWS), "calls": ROWS[:1],
@@ -636,6 +646,41 @@ assert.deepEqual(shown(), ['c000021']);
 $('callsFilterText').value = 'latex editor';
 $('callsFilterText').dispatch('input');
 assert.deepEqual(shown(), ['c000016']);
+""".replace("RUN", json.dumps(RUN)))
+
+    def test_a_call_names_its_model_as_the_menus_do_also_on_a_page_opened_by_its_address(self):
+        self.run_pages(r"""
+// The page opened from its address (a reload, a link): no job's settings were read, only the record and the menus.
+callsRecord = RUN;
+location.search = 'calls=' + RUN + '&call=c000020';
+await loadCalls(true);
+await settle();
+const items = () => $('callsList').children.map((item) => item.firstChild);
+// Claude Code's call names its model as the menus do, in its row, its label, the pane and the words it is found by.
+assert.equal(items()[4].querySelector('.mcb-line2').textContent, 'Claude Opus 5.5 · 41.2k → –');
+assert.match(items()[4].getAttribute('aria-label'), /, Claude Opus 5\.5, Claude Code, /);
+assert.equal($('callPane').querySelector('.mc-meta').textContent.split(' · ').slice(0, 2).join(' · '),
+  'Claude Opus 5.5 · Claude Code');
+$('callsFilterText').value = 'opus';
+$('callsFilterText').dispatch('input');
+assert.deepEqual($('callsList').children.map((item) => item.firstChild.dataset.call), ['c000020']);
+// Read once for the page: the looks at the count leave it.
+const menus = () => requests.filter((request) => request.path === '/api-models').length;
+assert.equal(menus(), 1);
+timers.filter(([fn, ms]) => ms === 5000).at(-1)[0]();
+await settle();
+assert.equal(menus(), 1);
+// An API connection's model is named by its connection's row (the call names the model the endpoint serves).
+answers['/jobs/' + RUN + '/model-calls?offset=0&limit=1000'].body.calls[4].model = 'claude-gw';
+await openModelCalls(RUN, {from: 'job'});
+await settle();
+assert.equal(items()[4].querySelector('.mcb-line2').textContent, 'Lab gateway · claude-gw · 41.2k → –');
+// A server that gives no menus: the page's own names, else the call's.
+delete answers['/api-models'];
+await openModelCalls(RUN, {from: 'records'});
+await settle();
+assert.equal(items()[4].querySelector('.mcb-line2').textContent, 'claude-gw · 41.2k → –');
+assert.equal(items()[1].querySelector('.mcb-line2').textContent.split(' · ')[0], 'GPT 6.1 Sol');
 """.replace("RUN", json.dumps(RUN)))
 
     def test_a_number_in_the_words_is_a_whole_number_and_alone_also_a_calls_number(self):
