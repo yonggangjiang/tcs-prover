@@ -4450,16 +4450,58 @@ def structured(
 # What a job's transcript keeps of Codex's answer to config/read (recorded_settings()). The answer holds the user's
 # whole Codex configuration: in the first real job about 75 KB at each start of an app-server, with every project
 # folder the user trusts, each MCP server's command and environment (which can hold keys), the plugins, and where each
-# setting came from. The transcript keeps the effective settings TCS Prover sets or relies on: these ...
+# setting came from. The transcript keeps the effective settings the run relies on: these (the context window and the
+# compaction limit too, whoever set them: TCS Prover's command line for an API connection's model, else the user) ...
 RECORDED_SETTINGS = ("model", "model_provider", "model_reasoning_effort", "model_reasoning_summary", "service_tier",
                      "approval_policy", "sandbox_mode", "sandbox_workspace_write", "default_permissions",
-                     "web_search", "model_auto_compact_token_limit_scope")
+                     "web_search", "model_context_window", "model_auto_compact_token_limit",
+                     "model_auto_compact_token_limit_scope")
 # ... of these tables only the entries TCS Prover sets (the web search tool, the subagent limits) ...
 RECORDED_ENTRIES = {"tools": ("web_search",), "agents": ("enabled", "max_concurrent_threads_per_session", "max_depth")}
-# ... and of the features those it sets on an app-server's command line or in a thread's settings, and any other the
-# command line set (a workflow's features: the answer's origins name "sessionFlags").
+# ... and of the features those it sets on an app-server's command line or in a thread's settings. Every other setting
+# the app-server's command line set is kept too (TCS Prover's own flags, whose origin is "sessionFlags": an API
+# connection's context window, compaction limit and provider entry, the variables its commands never inherit, a
+# workflow's features, ...); of the MCP servers only their names, never their definitions.
 RECORDED_FEATURES = ("goals", "multi_agent", "multi_agent_v2", "fast_mode", "code_mode", "shell_tool", "apps",
                      "plugins", "view_image", "standalone_web_search")
+
+
+def _command_line_settings(config, origins):
+    """The settings of ``config`` (Codex's effective settings) that the app-server's command line set, TCS Prover's
+    own flags, as a tree of the same shape. ``origins`` names the layer each value came from by its path, the keys
+    joined with dots (an array's items by their index; a feature with settings of its own, set on or off, as
+    features.<name>.enabled), "sessionFlags" for the command line: a value is kept when it, or a value below it, came
+    from there, a table with only such entries."""
+
+    flagged = {path for path, origin in origins.items()
+               if isinstance(path, str) and isinstance(origin, dict) and isinstance(origin.get("name"), dict)
+               and origin["name"].get("type") == "sessionFlags"}
+    above = {path[:index] for path in flagged for index, character in enumerate(path) if character == "."}
+
+    def kept(table, prefix):
+        found = {}
+        for key, value in table.items():
+            path = prefix + str(key)
+            if isinstance(value, dict) and path in above:
+                inner = kept(value, path + ".")
+                if inner:
+                    found[key] = inner
+            elif path in flagged or path in above:
+                found[key] = value
+        return found
+
+    return kept(config, "")
+
+
+def _settings_union(first, second):
+    """Two trees of settings taken from one configuration, as one (neither is changed)."""
+
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return first
+    union = dict(first)
+    for key, value in second.items():
+        union[key] = _settings_union(union[key], value) if key in union else value
+    return union
 
 
 def recorded_settings(result):
@@ -4467,13 +4509,13 @@ def recorded_settings(result):
     answer, never on this.
 
     Of the effective settings ("config") it keeps RECORDED_SETTINGS, the entries of RECORDED_ENTRIES, the features of
-    RECORDED_FEATURES and those the app-server's command line set, the permission profile in effect (the one
-    default_permissions names) and the names of the MCP servers, never their commands, environments or headers;
-    "leftOut" says in one sentence how many other settings were left out, with where each setting came from (the
-    answer's origins and layers). No reader of the transcript needs more: the job page, the controller, the
-    transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py) skip the answer, and the
-    author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc()) read the answer itself.
-    TCS Prover's redaction (redacted()) runs over what is kept, as emit() runs it over every record.
+    RECORDED_FEATURES, the permission profile in effect (the one default_permissions names), every other setting the
+    app-server's command line set (_command_line_settings()) and the names of the MCP servers, never their commands,
+    environments or headers; "leftOut" says in one sentence how many other settings were left out, with where each
+    setting came from (the answer's origins and layers). No reader of the transcript needs more: the job page, the
+    controller, the transcript viewer and the web-cutoff audit (retrieval/audit_historical_trajectory.py) skip the
+    answer, and the author's thread settings and a web-cutoff run's checks (retrieval.runtime.verify_rpc()) read the
+    answer itself. TCS Prover's redaction (redacted()) runs over what is kept, as emit() runs it over every record.
     """
 
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
@@ -4485,25 +4527,23 @@ def recorded_settings(result):
             kept[key] = {name: table[name] for name in names if name in table} if isinstance(table, dict) else table
     if "features" in config:
         features = config["features"]
-        flagged = {path.split(".")[1] for path, origin in origins.items()
-                   if isinstance(path, str) and path.startswith("features.") and isinstance(origin, dict)
-                   and isinstance(origin.get("name"), dict) and origin["name"].get("type") == "sessionFlags"}
-        kept["features"] = ({name: value for name, value in features.items()
-                             if name in RECORDED_FEATURES or name in flagged}
+        kept["features"] = ({name: value for name, value in features.items() if name in RECORDED_FEATURES}
                             if isinstance(features, dict) else features)
     if "permissions" in config:
         profiles, profile = config["permissions"], config.get("default_permissions")
         kept["permissions"] = (({profile: profiles[profile]} if isinstance(profile, str) and profile in profiles
                                 else {}) if isinstance(profiles, dict) else profiles)
+    kept = _settings_union(kept, _command_line_settings(config, origins))
     if "mcp_servers" in config:
         servers = config["mcp_servers"]
-        # Names only, and as values, which the redaction reads: a server's definition holds its command, environment
-        # and headers.
+        # Names only, also of a server the command line set, and as values, which the redaction reads: a server's
+        # definition holds its command, environment and headers.
         kept["mcp_servers"] = sorted(str(name) for name in servers) if isinstance(servers, dict) else servers
     left = sum(1 for key in config if key not in kept)
     return redacted({"config": kept, "leftOut": (
-        f"TCS Prover records only the Codex settings it sets or relies on: {left} other setting"
-        f"{'' if left == 1 else 's'} of the configuration, and where each setting came from, were left out.")})
+        f"TCS Prover records the Codex settings the run relies on and every setting it gave this app-server on its "
+        f"command line: {left} other setting{'' if left == 1 else 's'} of the configuration, the other entries of the "
+        f"tables kept in part, and where each setting came from were left out.")})
 
 
 class RPC:

@@ -857,8 +857,12 @@ writes a job's record, `ui/model_calls.py` reads it.
   (and so the record's snapshot and the training download) records only what it
   sets or relies on (`workflow_runner.recorded_settings()`, about 3 KB): the
   model, provider, reasoning, service tier, sandbox and approval, the permission
-  profile in effect, web search, the features it sets, the subagent limits and
-  the MCP servers' names, never their definitions, with `leftOut`, one sentence
+  profile in effect, web search, the context window and compaction limit, the
+  features it sets, the subagent limits, every other setting the app-server's
+  command line set (origin `sessionFlags`: an API connection's provider entry,
+  the variables its commands never inherit, the commands' temp folder; of a
+  table only those entries, never the user's own beside them) and the MCP
+  servers' names, never their definitions, with `leftOut`, one sentence
   saying how many other settings were left out; TCS Prover's redaction runs
   over it. No reader of the transcript needs more: the job page, the
   controller, the transcript viewer and the web-cutoff audit skip the answer,

@@ -468,8 +468,9 @@ KEPT_SETTINGS = {
                  "fast_mode": False, "js_repl": True},
     "mcp_servers": ["docs", "node_repl"],
 }
-LEFT_OUT = ("TCS Prover records only the Codex settings it sets or relies on: 7 other settings of the configuration, "
-            "and where each setting came from, were left out.")
+LEFT_OUT = ("TCS Prover records the Codex settings the run relies on and every setting it gave this app-server on its "
+            "command line: 7 other settings of the configuration, the other entries of the tables kept in part, and "
+            "where each setting came from were left out.")
 # What the user's configuration holds that the run does not need: none of it reaches the transcript.
 PRIVATE = ("MCP-ENV-SECRET", "MCP-HEADER-SECRET", "PROVIDER-HEADER-SECRET", "SHELL-ENV-SECRET", "private-client",
            "slack@openai-curated", "researcher.toml", "users-own", "remote_plugin", "notify")
@@ -505,6 +506,59 @@ class SettingsRecordTests(unittest.TestCase):
                                     {"id": 2, "result": {"thread": {}}},
                                     {"id": 3, "error": {"code": -32603, "message": "busy"}}])
         self.assertEqual(rpc.methods, {})
+
+    def test_every_setting_tcs_prover_s_command_line_gave_the_app_server_is_kept(self):
+        # An API connection's model: provider_arguments() gives its app-server the context window, the compaction limit,
+        # TCS Prover's own provider entry and the variables its commands never inherit, which Codex 0.160 reports with
+        # these origins (captured from the real app-server's config/read with those flags).
+        answer = copy.deepcopy(CONFIG_ANSWER)
+        flags = {"name": {"type": "sessionFlags"}, "version": "sha256:3"}
+        user = {"name": {"type": "user", "file": "/Users/someone/.codex/config.toml"}, "version": "sha256:2"}
+        provider = {"name": "TCS Prover", "base_url": "https://gateway.example/v1", "model_catalog_url": None,
+                    "env_key": "TCS_PROVER_API_TOKEN", "experimental_bearer_token": None, "wire_api": "responses",
+                    "http_headers": {"User-Agent": "TCS-Prover"}, "env_http_headers": None,
+                    "requires_openai_auth": False, "supports_websockets": False,
+                    "supports_standalone_web_search": False}
+        answer["config"].update(
+            model_provider="tcs_api", model_context_window=200000, model_auto_compact_token_limit=147200,
+            suppress_unstable_features_warning=True,
+            model_providers={**answer["config"]["model_providers"], "tcs_api": provider},
+            shell_environment_policy={"inherit": None, "ignore_default_excludes": False,
+                                      "exclude": ["TCS_PROVER_API_TOKEN", "OPENAI_API_KEY"],
+                                      "set": {"DEPLOY_TOKEN": "SHELL-ENV-SECRET"}})
+        answer["origins"].update({path: flags for path in (
+            "model_provider", "model_context_window", "model_auto_compact_token_limit",
+            "suppress_unstable_features_warning", "model_providers.tcs_api.name", "model_providers.tcs_api.base_url",
+            "model_providers.tcs_api.env_key", "model_providers.tcs_api.wire_api",
+            "model_providers.tcs_api.http_headers.User-Agent", "model_providers.tcs_api.requires_openai_auth",
+            "model_providers.tcs_api.supports_websockets", "shell_environment_policy.ignore_default_excludes",
+            "shell_environment_policy.exclude.0", "shell_environment_policy.exclude.1",
+            # A definition of an MCP server is never kept, whoever set it.
+            "mcp_servers.node_repl.command", "mcp_servers.node_repl.env.BROWSER_TOKEN")})
+        answer["origins"].update({"shell_environment_policy.set.DEPLOY_TOKEN": user,
+                                  "model_providers.gateway.base_url": user,
+                                  "model_providers.gateway.http_headers.X-Key": user})
+        kept = runtime.recorded_settings(answer)
+        self.assertEqual(kept["config"], {
+            **KEPT_SETTINGS, "model_provider": "tcs_api", "model_context_window": 200000,
+            "model_auto_compact_token_limit": 147200, "suppress_unstable_features_warning": True,
+            "model_providers": {"tcs_api": {key: provider[key] for key in (
+                "name", "base_url", "env_key", "wire_api", "http_headers", "requires_openai_auth",
+                "supports_websockets")}},
+            "shell_environment_policy": {"ignore_default_excludes": False,
+                                         "exclude": ["TCS_PROVER_API_TOKEN", "OPENAI_API_KEY"]}})
+        self.assertEqual(kept["leftOut"], LEFT_OUT.replace("7 other settings", "5 other settings"))
+        for private in PRIVATE:
+            self.assertNotIn(private, json.dumps(kept), private)
+
+    def test_the_context_window_and_the_compaction_limit_are_kept_whoever_set_them(self):
+        # A built-in model's are the user's settings, or none (Codex's own for the model).
+        answer = copy.deepcopy(CONFIG_ANSWER)
+        answer["config"].update(model_context_window=400000, model_auto_compact_token_limit=None)
+        answer["origins"]["model_context_window"] = {
+            "name": {"type": "user", "file": "/Users/someone/.codex/config.toml"}, "version": "sha256:2"}
+        kept = runtime.recorded_settings(answer)["config"]
+        self.assertEqual((kept["model_context_window"], kept["model_auto_compact_token_limit"]), (400000, None))
 
     def test_tcs_prover_s_redaction_runs_over_what_is_kept(self):
         secret = "registered-key-0d6f1a9c2b7e"
