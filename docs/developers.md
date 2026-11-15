@@ -34,6 +34,7 @@ ui/
   related_works.py          Related works given to the proof author
   retrieval.py              Web search cutoff setup for the page
   ownership.py              One owner per run, one server per runs folder
+  local_host.py             The addresses the page opens at: loopback, any port (forwarded)
   current_run.py            The current-run selection
   live_gateway.py           New page assets beside an existing controller
   legacy_overview.py        Overview fields of a controller from before the upgrade
@@ -1305,8 +1306,8 @@ where jobs find it, what made it or a file of your own where OpenAI's installer
 writes, is checked again first); `GET
 /setup/task?id=&after=N` returns a step's state and its output after line N;
 `POST /setup/stop` and `POST /setup/input` (the code Claude Code's sign-in page
-shows) act on a step. Every route needs the session token, the exact Host and a
-matching Origin. Each step runs with no terminal (a new session, or a new
+shows) act on a step. Every route needs the session token, a loopback Host
+(`127.0.0.1`, `localhost` or `[::1]`, on any port) and an Origin matching it. Each step runs with no terminal (a new session, or a new
 process group without a window on Windows), its output cleaned of escape codes,
 keys and tokens. Stop asks its process group, and every process group its
 descendants started, to end, and ends them after 10 seconds (on Windows,

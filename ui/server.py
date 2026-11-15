@@ -36,6 +36,7 @@ from retrieval import runtime as retrieval_runtime
 from runner import claude_cli, prompt_catalog, providers, records
 from runner import team as team_module
 from . import model_calls, named_batches, ownership, presets, program_setup, related_works, retrieval
+from .local_host import same_origin, trusted_host
 from .review import REVIEW_PROMPT
 
 
@@ -13190,12 +13191,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def authorized(self):
-        """Accept only this exact local origin and its secret request header."""
+        """Accept only a page at a loopback address (any port: it may be forwarded) and its secret request header."""
 
-        if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
-            return False
-        origin = self.headers.get("Origin")
-        if origin and origin != self.server.origin:
+        host = self.headers.get("Host")
+        if not trusted_host(host) or not same_origin(self.headers.get("Origin"), host):
             return False
         token = self.headers.get("X-TCS-Prover-Token", "")
         return bool(token) and secrets.compare_digest(token, self.server.token)
@@ -13206,7 +13205,7 @@ class Handler(BaseHTTPRequestHandler):
         request = urlsplit(self.path)
         query = parse_qs(request.query, keep_blank_values=True)
         run_id = (query.get("job") or [""])[0]
-        if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
+        if not trusted_host(self.headers.get("Host")):
             return self.send({"error": "Untrusted local host."}, status=403)
         if any(len(values) != 1 for values in query.values()):
             return self.send({"error": "Duplicate request parameters are not allowed."}, status=400)
@@ -13488,7 +13487,7 @@ class Handler(BaseHTTPRequestHandler):
         """DELETE /records/<runFolder>: remove one job record (the page asks first)."""
 
         request = urlsplit(self.path)
-        if self.headers.get("Host") != f"{HOST}:{self.server.server_port}":
+        if not trusted_host(self.headers.get("Host")):
             return self.send({"error": "Untrusted local host."}, status=403)
         if not self.authorized():
             return self.send({"error": "Open TCS Prover from its launch URL."}, status=403)

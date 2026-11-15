@@ -15,6 +15,13 @@ while TCS Prover runs, this opens the right link instead of starting a second
 copy (`--no-browser` prints it). The key is kept in `.tcs-prover/sessions/`, so
 tabs left open keep working after a restart on the same port.
 
+**The page says "Untrusted local host."** The address names something other
+than this computer. TCS Prover answers at `127.0.0.1` and `localhost`, on any
+port, so it also works through a forwarded port: VS Code Remote forwards one
+when it opens the link in your own browser, or run
+`ssh -L 8765:127.0.0.1:8765 <server>` and open `localhost:8765`. Keep the `#`
+access key of the printed link.
+
 **"TCS Prover is already running at …".** One server serves a runs folder, and
 starting a second one opens the first one's page instead. When
 `.experiment-control/current-run.json` selects a batch, the same command opens

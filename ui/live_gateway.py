@@ -19,6 +19,8 @@ import shutil
 import threading
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from .local_host import same_origin, trusted_host
+
 
 HOST = '127.0.0.1'
 UI = Path(__file__).resolve().parent
@@ -292,10 +294,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def authorized(self):
-        origin = self.headers.get('Origin')
+        # Any loopback address and port (a forwarded port too), as on the controller (ui/local_host.py).
+        host = self.headers.get('Host')
         token = self.headers.get('X-TCS-Prover-Token', '')
-        return (self.headers.get('Host') == f'{HOST}:{self.server.server_port}'
-                and (not origin or origin == self.server.origin)
+        return (trusted_host(host) and same_origin(self.headers.get('Origin'), host)
                 and bool(token) and secrets.compare_digest(token, self.server.token))
 
     def parsed_request(self):
@@ -347,7 +349,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.headers.get('Host') != f'{HOST}:{self.server.server_port}':
+            if not trusted_host(self.headers.get('Host')):
                 raise GatewayError('Untrusted local host.', 403)
             path, query = self.parsed_request()
             if path in STATIC:
