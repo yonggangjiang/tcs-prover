@@ -10056,7 +10056,7 @@ def check_clis(models, directory=None):
             else:
                 path = located_cli(codex, name, model, stage)
             result = subprocess.run([path, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                                     env=environment(), timeout=CLI_CHECK_SECONDS)
         except CLIUnavailable as exc:
             problems.append(str(exc))  # What to install, and that the job continues by itself.
@@ -10064,10 +10064,14 @@ def check_clis(models, directory=None):
         except (Error, OSError, subprocess.SubprocessError) as exc:
             problems.append(f"{CLI_NAMES[name]} missing or incompatible: {exc} {retried}")
             continue
-        version = _clipped(" ".join(result.stdout.split()), 200)
+        # The version is what the CLI prints on stdout: Codex 0.160 writes warnings such as "WARNING: failed to clean
+        # up stale arg0 temp dirs" to stderr, which would otherwise be remembered as part of it and named as a CLI
+        # change at the job's next start. A CLI that prints its version on stderr only is read there.
+        version = _clipped(" ".join((result.stdout or "").split()) or " ".join((result.stderr or "").split()), 200)
         if result.returncode or not version:
+            output = _clipped(" ".join(f"{result.stdout or ''} {result.stderr or ''}".split()), 200)
             problems.append(f"{CLI_NAMES[name]} missing or incompatible: `{Path(path).name} --version` exited with code "
-                            f"{result.returncode}" + (f" ({version})." if version else ".") + f" {retried}")
+                            f"{result.returncode}" + (f" ({output})." if output else ".") + f" {retried}")
             continue
         found[name] = {"path": path, "version": version}
     record = directory / CLI_VERSIONS_FILENAME
