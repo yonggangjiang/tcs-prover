@@ -94,6 +94,12 @@ ENTRIES = (
      "Appended to the coordinator's first prompt when its subagents are TCS Prover's team; {members} lists them."),
     ("team_member", "Team", "Member assignment",
      "What a team member receives for an assignment or a follow-up; {assignment} is the coordinator's text."),
+    ("team_examiner", "Team", "Examiner instructions",
+     "The whole instruction of the examiner: a seat beside the authors that TCS Prover starts itself while an author "
+     "works (about once an hour, once an author has reported), each time in a fresh conversation with the "
+     "coordinator's model. Its report reaches the coordinator through team_wait. Empty: the team has no examiner."),
+    ("team_examiner_note", "Team", "What the coordinator is told about the examiner",
+     "Added to the description of team_wait when the team has an examiner."),
     ("team_tool_members", "Team tools", "team_members tool", "The description of team_members."),
     ("team_tool_assign", "Team tools", "team_assign tool", "The description of team_assign."),
     ("team_tool_assign_member", "Team tools", "team_assign: member", "The description of team_assign's member."),

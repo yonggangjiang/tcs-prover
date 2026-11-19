@@ -71,6 +71,14 @@ MEMBER_LABELS = {"started": "Author subagent started", "finished": "Author subag
                  "failed": "Author subagent failed"}
 TASK_CHARS = 200
 TEAM_FOLDER = "team"
+# The examiner (Team's ``examiner``): a seat beside the authors whose only task is to examine the whole run, in a
+# fresh conversation each time, with the team_examiner text as its whole instruction. TCS Prover starts an
+# examination itself, never the coordinator: when the coordinator assigns work or waits, an author is working, the
+# examiner is idle, some author has reported before, and the last examination began at least this long ago.
+EXAMINATION_SECONDS = 60 * 60
+EXAMINER_TASK = "Examination of the whole run"
+# The list of assignments and reports with their times, which the examiner reads: team/timeline.md.
+TIMELINE_FILE = "timeline.md"
 # A report's file name in its member's folder (team/member-<n>/<k>-report.md): k is the assignment's number.
 REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
 # A Windows reparse point whose tag has this bit names another file: a symlink, a junction or a similar link, which
@@ -470,8 +478,14 @@ class Team:
 
     def __init__(self, members, *, prompts, directory, attempt, configuration, emit, render, retry_note,
                  retry_seconds=60, stop_process=None, conversation=None, discard=None, unavailable=None,
-                 describe=None):
+                 describe=None, examiner=None):
         self.members = {entry["member"]: _Member(entry) for entry in members}
+        # The examiner's seat (an entry like a member's, numbered after the members), or None: without the
+        # team_examiner text there is none. The coordinator's tools cannot address it.
+        self.examiner = (_Member(examiner) if examiner and str(prompts.get("team_examiner") or "").strip()
+                         and examiner["member"] not in self.members else None)
+        self.examined = 0.0   # time.time() as the last examination began
+        self.reported = False  # an author of this team has finished an assignment
         self.prompts, self.directory = prompts, Path(directory)
         self.attempt, self.configuration, self.emit, self.render = attempt, configuration, emit, render
         self.retry_note, self.retry_seconds = retry_note, retry_seconds
@@ -507,7 +521,10 @@ class Team:
                 "member": member("team_tool_assign_member"),
                 "assignment": {"type": "string", "description": p["team_tool_assign_assignment"]}},
                 ["member", "assignment"])},
-            {"name": "team_wait", "description": p["team_tool_wait"], "inputSchema": schema({
+            {"name": "team_wait", "description": p["team_tool_wait"] + (
+                " " + p["team_examiner_note"].strip()
+                if self.examiner is not None and str(p.get("team_examiner_note") or "").strip() else ""),
+             "inputSchema": schema({
                 "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": WAIT_MINUTES,
                                     "description": p["team_tool_wait_timeout_minutes"]}}, [])},
             {"name": "team_followup", "description": p["team_tool_followup"], "inputSchema": schema({
@@ -549,7 +566,13 @@ class Team:
 
     def listing(self):
         with self.cond:
-            return "\n".join(self._state_line(member) for member in self.members.values())
+            lines = [self._state_line(member) for member in self.members.values()]
+            if self.examiner is not None:
+                seat = self.examiner
+                state = ("idle" if seat.state == "idle" else "stopping" if seat.state == "stopping"
+                         else f"examining the run since {_clock(seat.since)}")
+                lines.append(f"examiner: {seat.label} ({seat.program}): {state}")
+            return "\n".join(lines)
 
     def running(self):
         return sum(1 for member in self.members.values() if member.state != "idle")
@@ -568,7 +591,8 @@ class Team:
         self.emit("status", label=MEMBER_LABELS[state], authorSubagent=True,
                   subagentId=member.assignment, subagentTask=member.task,
                   subagentState=state, subagentsRunning=self.running(), subagentMember=member.number,
-                  subagentModel=member.label, text=text, **fields)
+                  subagentModel=member.label, text=text,
+                  **({"subagentExaminer": True} if member is self.examiner else {}), **fields)
 
     def assign(self, number, assignment, fork_from=None, kind="assignment"):
         if not isinstance(assignment, str) or not assignment.strip():
@@ -598,8 +622,46 @@ class Team:
                                              name=f"team-member-{number}", daemon=True)
             self._record(member, "started", member.task)
             member.thread.start()
+            self._timeline(f"member {number}: {kind} {member.assignment} starts", assignment)
+            self._examine()
         return (f"Member {number} started the {kind} \"{member.task}\" at {_clock(member.since)}. Collect its report "
                 "with team_wait.")
+
+    def _examine(self):
+        """Start an examination when one is due (EXAMINATION_SECONDS); called with the lock held."""
+
+        seat = self.examiner
+        if (seat is None or self.closed is not None or seat.state != "idle" or not self.running()
+                or time.time() - self.examined < EXAMINATION_SECONDS):
+            return
+        if not self.reported and not any(reported(self.directory, number) for number in self.members):
+            return  # Nothing to examine yet: no author has reported.
+        self.reported = True
+        seat.state, seat.task, seat.since = "working", EXAMINER_TASK, time.time()
+        self.examined = seat.since
+        seat.count = max(seat.count, highest_report(self.directory, seat.number)) + 1
+        seat.assignment = assignment_id(seat.number, seat.count)
+        try:
+            reserve_report(self.directory, seat.number, seat.count)
+        except (OSError, ValueError):
+            pass
+        seat.cancel, seat.stop_reason, seat.process = threading.Event(), None, None
+        seat.thread = threading.Thread(target=self._run, args=(seat, seat.count, self.prompts["team_examiner"], None),
+                                       name="team-examiner", daemon=True)
+        self._record(seat, "started", seat.task)
+        seat.thread.start()
+        self._timeline(f"examiner: examination {seat.assignment} starts")
+
+    def _timeline(self, head, body=""):
+        """Add an entry to team/timeline.md, which the examiner reads (only with an examiner; best effort)."""
+
+        if self.examiner is None:
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        try:
+            append_timeline(self.directory, f"\n## {stamp}: {head}\n" + (f"\n{body.strip()}\n" if body.strip() else ""))
+        except (OSError, ValueError):
+            pass
 
     def followup(self, number, message):
         with self.cond:
@@ -633,6 +695,7 @@ class Team:
             raise TeamError(f"timeout_minutes must be 1 to {WAIT_MINUTES}.")
         deadline = time.monotonic() + minutes * 60
         with self.cond:
+            self._examine()
             generation = self.wait_generation
             if self.attention_reason is not None and time.monotonic() - self.attention_reason[1] > ATTENTION_SECONDS:
                 self.attention_reason = None  # It reached the coordinator before this wait began.
@@ -685,7 +748,8 @@ class Team:
             if self.closed is not None:
                 return
             self.closed = reason
-            working = [member for member in self.members.values() if member.state != "idle"]
+            working = [member for member in (*self.members.values(), *filter(None, [self.examiner]))
+                       if member.state != "idle"]
             for member in working:
                 member.state, member.stop_reason = "stopping", reason
                 member.cancel.set()
@@ -792,9 +856,16 @@ class Team:
         with self.cond:
             member.state, member.process, member.thread = "idle", None, None
             closing = self.closed is not None
-            head = (f"Member {member.number} ({member.label}) "
-                    + ("stopped" if stopped else "failed" if state == "failed" else "finished")
-                    + f" the assignment \"{member.task}\".")
+            outcome = "stopped" if stopped else "failed" if state == "failed" else "finished"
+            if member is self.examiner:
+                head = (f"The examiner ({member.label}) {outcome} its examination of the whole run."
+                        if state == "finished" else f"The examiner's ({member.label}) examination {outcome}.")
+            else:
+                head = f"Member {member.number} ({member.label}) {outcome} the assignment \"{member.task}\"."
+                self.reported = self.reported or state == "finished"
+            self._timeline((f"examiner: examination {member.assignment}" if member is self.examiner
+                            else f"member {member.number}: {member.assignment}")
+                           + f" {outcome}" + (f"; report: {relative}" if path else ""))
             where = f"Report file: {relative}" if path else f"The report could not be saved ({problem})."
             if not closing:
                 # Shown by the next team_wait, cut to its share of the answer (report_shares()).
@@ -918,6 +989,41 @@ def highest_report(directory, number):
     except (OSError, ValueError):
         return 0
     return max((int(found.group(1)) for found in map(REPORT_FILE.fullmatch, names) if found), default=0)
+
+
+def reported(directory, number):
+    """Whether member ``number`` has a report file with text under ``directory`` (a reservation is empty)."""
+
+    folder = Path(directory, TEAM_FOLDER, f"member-{number}")
+    try:
+        for name in os.listdir(folder):
+            if REPORT_FILE.fullmatch(name):
+                info = os.lstat(folder / name)
+                if stat.S_ISREG(info.st_mode) and info.st_size > 0:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def append_timeline(directory, text):
+    """Append ``text`` to team/timeline.md under ``directory``, owner-only, never through a link."""
+
+    folder = Path(directory, TEAM_FOLDER)
+    try:
+        os.mkdir(folder, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(folder)
+    if _linked(info) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"{folder} is not a folder")
+    descriptor = os.open(folder / TIMELINE_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+    with os.fdopen(descriptor, "ab") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("the timeline is not a plain file")
+        stream.write(text.encode("utf-8"))
 
 
 def reserve_report(directory, number, count):

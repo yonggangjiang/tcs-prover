@@ -117,14 +117,16 @@ HARNESS_TEXTS = {
     "claude_goal_harness": {"objective"},
     "codex_compact_prompt": None, "codex_coordinator_note": None,
     "team_note": {"members"}, "team_member": {"assignment"},
+    "team_examiner": None, "team_examiner_note": None,
     "team_tool_members": None, "team_tool_assign": None, "team_tool_assign_member": None,
     "team_tool_assign_assignment": None, "team_tool_wait": None, "team_tool_wait_timeout_minutes": None,
     "team_tool_followup": None, "team_tool_followup_member": None, "team_tool_followup_message": None,
     "team_tool_stop": None, "team_tool_stop_member": None,
 }
-# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions) and the note for
-# a Codex coordinator (empty: none is sent).
-EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note")
+# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions), the note for
+# a Codex coordinator (empty: none is sent), and the examiner's instruction and what the coordinator is told of it
+# (no instruction: the team has no examiner).
+EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note", "team_examiner", "team_examiner_note")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -4526,8 +4528,10 @@ def member_usage(event, trace):
             "modelCalls": own.get("calls")}
 
 
-def start_team(members, *, prompts, directory, settings, stage, node_name):
+def start_team(members, *, prompts, directory, settings, stage, node_name, examiner=None):
     """The author coordinator's team (runner/team.Team) of ``members`` (team.team_members()), ready for its tools.
+
+    ``examiner`` is the examiner's seat (an entry like a member's), which the team starts itself (team.Team).
 
     Its members' records and events go to the run's records as the coordinator's subagents (stage ``stage``, node
     ``node_name``), each with its member's number and model and its assignment's id (subagentId,
@@ -4583,7 +4587,7 @@ def start_team(members, *, prompts, directory, settings, stage, node_name):
                      render=render_template, retry_note=AUTHOR_RETRY_NOTE, retry_seconds=MODEL_RETRY_SECONDS,
                      stop_process=stop_process, conversation=conversation, discard=sessions.discard,
                      unavailable=lambda error: isinstance(error, ConversationUnavailable),
-                     describe=describe_failure)
+                     describe=describe_failure, examiner=examiner)
 
 
 def save_final_input(statement, solution, directory=None):
@@ -9289,9 +9293,15 @@ def _execute(workflow, state, options, prompts):
                             members = team_module.team_members(models, settings["model"], settings["effort"], count)
                             crew = teams.get(current)
                             if crew is None or crew.closed is not None:
+                                # The examiner's seat, with the coordinator's model, numbered after the members
+                                # (only with a team_examiner text: a job from before has none).
+                                examiner = None
+                                if str(texts.get("team_examiner") or "").strip():
+                                    examiner = {**team_module.team_members(
+                                        None, settings["model"], settings["effort"], 1)[0], "member": len(members) + 1}
                                 crew = teams[current] = start_team(members, prompts=texts, directory=directory,
                                                                    settings=settings, stage=stage_name,
-                                                                   node_name=current)
+                                                                   node_name=current, examiner=examiner)
                             # Its members are TCS Prover's: the coordinator gets no subagent tool of its CLI.
                             features = [feature for feature in features if feature != "multi_agent"]
                             note = team_module.team_note(texts["team_note"], members, render_template)

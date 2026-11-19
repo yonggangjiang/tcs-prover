@@ -484,9 +484,14 @@ that every prompt and tool text is the user's to adjust. What the code does:
   coordinator's `thread/start` and `thread/resume` when it has TCS Prover's
   team: a developer message after Codex's own instructions, which cancels their
   60-second commentary and 60-second wait rules for the run; empty sends none;
-  these two are the only prompts that may be empty), `team_note`
-  (`{members}`), `team_member`
-  (`{assignment}`) and one description per team tool and argument
+  these two and the examiner's two are the only prompts that may be empty),
+  `team_note` (`{members}`), `team_member` (`{assignment}`), `team_examiner`
+  (the whole instruction of the team's examiner, a seat `runner/team.Team`
+  starts itself in `assign()` and `wait()`: `Team._examine()`,
+  `EXAMINATION_SECONDS`; `workflow_runner` gives the seat the coordinator's
+  model and the number after the members; empty: no examiner),
+  `team_examiner_note` (added to `team_wait`'s description when there is an
+  examiner) and one description per team tool and argument
   (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
   checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
   turn fills in `{message}` and nothing in a progress summary; the related works

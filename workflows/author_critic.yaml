@@ -372,6 +372,19 @@ prompts:
 
   # EDIT TEAM TOOLS HERE: the descriptions of the coordinator's team tools (TCS Prover's MCP server "tcs") and of their
   # arguments, as the coordinator reads them. No placeholders; used as written.
+  # EDIT EXAMINER HERE: the examiner's whole instruction. The examiner is a seat beside the authors that TCS Prover
+  # itself starts while an author works (about once an hour, once an author has reported), each time in a fresh
+  # conversation with the coordinator's model; examining the run is its only task, and its report reaches the
+  # coordinator through team_wait like an assignment's. Leave it empty to run without an examiner.
+  team_examiner: |-
+    You are the examiner of a team that works on the statement in checked-statement.md in this folder: a coordinator who assigns the work and author subagents who do the mathematics. You are not a member of the team and you do not try to prove the statement yourself. This folder is the team's working directory: its memory folder holds the team's notes and its progress log, team/ holds the authors' reports in order, team/timeline.md lists the assignments and reports with their times, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
+
+    Examine the whole trajectory and judge whether the team is making steady progress towards resolving the problem as time grows. Decide what would have to change for the team to be closer to a solution, and how that has moved over the whole trajectory: has it moved since several hours ago, and is the team doing again something it already did? Then say what the team should do next.
+
+    Your final reply is your report to the coordinator: make it specific enough to be checked (file names, lemma names, times). Do not change any file.
+  # What the coordinator is told about the examiner: added to the description of team_wait when there is one.
+  team_examiner_note: |-
+    An examiner also works beside your authors: TCS Prover starts it itself from time to time while an author works, in a fresh conversation whose only task is to examine the whole run so far, and its report comes with this tool like an assignment's.
   team_tool_members: |-
     List your team's members: each member's number, its model and the program that runs it, and its state (idle; working on an assignment, named by its first line, since a given time; or stopping). Check it before you assign work, so that no member stays idle.
   team_tool_assign: |-
@@ -391,7 +404,7 @@ prompts:
   team_tool_followup_message: |-
     The follow-up for the member.
   team_tool_stop: |-
-    Stop a member's current assignment. Its report then says that it was stopped (the files it wrote stay), and the member is idle for a new assignment. Use it when a line of work no longer pays off.
+    Stop a member's current assignment. Its report then says that it was stopped (the files it wrote stay), and the member is idle. A stopped member keeps its conversation: team_followup continues it with everything it did and learned there, so stopping a member and following up is the way to tell a working member something it needs to know now. Use team_assign afterwards instead when the line of work no longer pays off.
   team_tool_stop_member: |-
     The member's number, as team_members lists it (1 is the first member).
 

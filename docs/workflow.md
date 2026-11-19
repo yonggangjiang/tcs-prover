@@ -245,7 +245,9 @@ progress stalls or slows.
   of its own at fixed times. What it examines, and when, is for its prompt to
   say. (Until 15 November 2026 it got an hourly time check with the elapsed
   time; the activity log of a job from then still shows those lines as
-  **Author coordinator time check**.)
+  **Author coordinator time check**.) The one thing TCS Prover starts by itself
+  is the team's [examiner](#the-authors-team), whose report the coordinator
+  collects like an author's.
 - **Handing in.** A final reply that names no proof file (no `PROOF_FILE`
   pointer, see below) is not handed to the critic: the activity log shows the
   reply as the coordinator's own line, then an **Author coordinator report** line
@@ -302,6 +304,27 @@ Claude Code's own subagents.
   that neither applies to an unattended run; how long it waits is then its own
   choice. An empty note sends nothing. Claude Code coordinators, and
   coordinators without TCS Prover's team, get no note.
+- **The examiner.** A coordinator in a long run was found to hold only part of
+  what the same model finds when examining the run is its only task. The team
+  therefore has one more seat, the examiner, which TCS Prover starts itself:
+  when the coordinator assigns work or waits while an author is working, the
+  examiner is idle, some author has reported before, and the last examination
+  began at least an hour ago. Each examination is a fresh run of the
+  coordinator's model, one turn long, in the same working folder; its whole
+  instruction is `team_examiner` (**Edit prompts → Team**: judge whether the
+  team makes steady progress, whether it has moved since several hours ago,
+  whether it repeats itself, and what it should do next; change no file). Its
+  final reply is its report, saved as `team/member-<N+1>/<k>-report.md`, and
+  `team_wait` returns it like an author's report, usually while the author is
+  still working. The coordinator cannot assign or stop the examiner;
+  `team_members` lists it last, and the description of `team_wait` says that it
+  exists (`team_examiner_note`). For the examiner the team keeps
+  `team/timeline.md`: every assignment with its text and every report, with
+  their times. An empty `team_examiner` runs the team without an examiner. A job
+  started before the examiner existed has no text of its own for it, so it
+  takes the workflow file's when it is next resumed, and its timeline starts
+  then. The activity log shows an examination as author subagent N+1 with the
+  task *Examination of the whole run*.
 - **Assignments.** Each is a fresh run of the member's model, one turn long, in
   the author's working folder (the folder the coordinator works in, with the
   author's sandbox, network rule and credentials), with no subagents of its own.
