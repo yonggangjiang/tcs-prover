@@ -902,7 +902,7 @@ def main():
                   "continue the job there.", file=sys.stderr)
             return 1
         link = openable_link(exc.url) if exc.url else ""
-        print(link if args.no_browser and link else f"TCS Prover is already running at {link}." if link else str(exc))
+        print(link if args.no_browser and link else f"TCS Prover is already running at {link}" if link else str(exc))
         if link and not args.no_browser:
             webbrowser.open(link)
         return 0
