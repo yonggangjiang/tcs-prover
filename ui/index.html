@@ -306,7 +306,9 @@
                       <label for="reviewModel">2 · Model</label>
                       <select id="reviewModel" aria-describedby="reviewModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
-                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6.2-sol" selected>GPT 6.2 Sol — default</option>
+                          <option value="gpt-6.2-astra">GPT 6.2 Astra</option>
+                          <option value="gpt-6.1-sol">GPT 6.1 Sol</option>
                           <option value="gpt-6-astra">GPT 6 Astra</option>
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
@@ -332,7 +334,9 @@
                       <label for="authorModel">2 · Model</label>
                       <select id="authorModel" aria-describedby="authorModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
-                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6.2-sol" selected>GPT 6.2 Sol — default</option>
+                          <option value="gpt-6.2-astra">GPT 6.2 Astra</option>
+                          <option value="gpt-6.1-sol">GPT 6.1 Sol</option>
                           <option value="gpt-6-astra">GPT 6 Astra</option>
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
@@ -390,7 +394,9 @@
                       <label for="criticModel">2 · Model</label>
                       <select id="criticModel" aria-describedby="criticModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
-                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6.2-sol" selected>GPT 6.2 Sol — default</option>
+                          <option value="gpt-6.2-astra">GPT 6.2 Astra</option>
+                          <option value="gpt-6.1-sol">GPT 6.1 Sol</option>
                           <option value="gpt-6-astra">GPT 6 Astra</option>
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
@@ -416,7 +422,9 @@
                       <label for="writerModel">2 · Model</label>
                       <select id="writerModel" aria-describedby="writerModelProvider">
                         <optgroup label="Codex CLI" data-provider="codex">
-                          <option value="gpt-6.1-sol" selected>GPT 6.1 Sol — default</option>
+                          <option value="gpt-6.2-sol" selected>GPT 6.2 Sol — default</option>
+                          <option value="gpt-6.2-astra">GPT 6.2 Astra</option>
+                          <option value="gpt-6.1-sol">GPT 6.1 Sol</option>
                           <option value="gpt-6-astra">GPT 6 Astra</option>
                           <option value="gpt-6-sol">GPT 6 Sol</option>
                           <option value="gpt-6-luna">GPT 6 Luna</option>
@@ -434,7 +442,7 @@
                     </div>
                   </div>
                   <p id="modelHelp" class="help">
-                    GPT 6.1 Sol at Max is the default for every role. Each menu offers only the
+                    GPT 6.2 Sol at Max is the default for every role. Each menu offers only the
                     reasoning levels the chosen model supports. Codex CLI and Claude Code models use
                     the logins on this computer; add your own endpoints under API models below.
                   </p>
@@ -662,7 +670,7 @@
             <!-- A program the selected roles need that is missing or signed out: a start still works (app.js). -->
             <p id="startSetupHint" class="help setup-hint" role="status" hidden></p>
             <div class="composer-actions">
-              <p id="modelSummary" class="model-summary">6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer</p>
+              <p id="modelSummary" class="model-summary">6.2 Sol/Max review · 6.2 Sol/Max author, critic, writer</p>
               <div class="composer-buttons">
                 <button id="runFolderButton" class="secondary" type="button"
                   aria-describedby="runFolderHelp"><svg class="icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4.5V12a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H8L6.5 3.5H3a1 1 0 0 0-1 1Z"/></svg>Run a folder…</button>

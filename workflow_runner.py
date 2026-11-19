@@ -62,7 +62,7 @@ OFFERED_MODELS = providers.offered_models()
 # it keep working, so it stays accepted but is no longer offered.
 LEGACY_MODELS = providers.LEGACY_CODEX_MODELS
 MODELS = OFFERED_MODELS + LEGACY_MODELS
-MODEL, EFFORT = "gpt-6.1-sol", "max"
+MODEL, EFFORT = "gpt-6.2-sol", "max"
 EFFORTS = providers.CODEX_EFFORTS
 # Efforts no longer offered, still accepted from saved jobs, scripts and flags (see chosen_effort()).
 RETIRED_EFFORTS = providers.RETIRED_EFFORTS
@@ -895,7 +895,7 @@ def chosen_model(value):
     if known:
         return value
     if providers.replacement_for_removed(value):
-        raise Error("DeepSeek is no longer supported; choose another model, for example gpt-6.1-sol.")
+        raise Error("DeepSeek is no longer supported; choose another model, for example gpt-6.2-sol.")
     shown = repr(value)[:80] if isinstance(value, str) else type(value).__name__
     raise Error(
         f"Unknown model {shown}. Choose {', '.join(OFFERED_MODELS)}, or an api:<id> model "
@@ -2035,7 +2035,11 @@ def provider_arguments(model):
 # namespace (models-manager/src/manager.rs:855-905); a model it finds none for runs as not Lite
 # (models-manager/src/model_info.rs:98-139). An API connection's model gets this catalog's entry: Codex fetches no
 # model list from a custom provider (manager.rs:539-553).
+# The GPT 6.2 models came after that catalog: Codex gets their entries from its service's model list, which marks
+# both as Responses Lite too (read on 19 Nov 2026). Codex 0.160 cannot run them with a ChatGPT sign-in (the service
+# answers "not supported when using Codex with a ChatGPT account"); Codex 0.170 can.
 CODEX_CATALOG_LITE = {
+    "gpt-6.2-sol": True, "gpt-6.2-astra": True,
     "gpt-6-astra": True, "gpt-6.1-sol": True, "gpt-6-sol": True, "gpt-6-luna": True, "gpt-5.6-sol": True,
     "gpt-5.6-terra": True, "gpt-5.6-luna": True, "gpt-daybreak-blue-latest": True, "gpt-daybreak-red-latest": True,
     "codex-auto-review": True, "gpt-5.5": False,

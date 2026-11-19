@@ -1453,6 +1453,7 @@ function validateRetrievalSettings({ folder = false } = {}) {
 function updateModelSummary() {
   // Model ids share suffixes ("sol", "luna"), so name every known model.
   const modelNames = new Map([
+    ["gpt-6.2-sol", "6.2 Sol"], ["gpt-6.2-astra", "6.2 Astra"],
     ["gpt-6.1-sol", "6.1 Sol"], ["gpt-6-astra", "Astra"],
     ["gpt-6-sol", "6 Sol"], ["gpt-6-luna", "6 Luna"],
     ["gpt-5.6-sol", "5.6 Sol"], ["gpt-5.6-terra", "5.6 Terra"],
@@ -4535,10 +4536,10 @@ function render(next) {
   }
   if (reviewReady && (previousPhase !== phase || reviewPending)) {
     syncModelMenus();
-    setChoice(ui.reviewModel, state.reviewModel || "gpt-6.1-sol");
-    setChoice(ui.authorModel, state.authorModel || "gpt-6.1-sol");
-    setChoice(ui.criticModel, state.criticModel || "gpt-6.1-sol");
-    setChoice(ui.writerModel, state.writerModel || "gpt-6.1-sol");
+    setChoice(ui.reviewModel, state.reviewModel || "gpt-6.2-sol");
+    setChoice(ui.authorModel, state.authorModel || "gpt-6.2-sol");
+    setChoice(ui.criticModel, state.criticModel || "gpt-6.2-sol");
+    setChoice(ui.writerModel, state.writerModel || "gpt-6.2-sol");
     ui.reviewEffort.value = state.reviewEffort || "max";
     ui.authorEffort.value = state.authorEffort || state.reasoningEffort || "max";
     ui.criticEffort.value = state.criticEffort || state.reasoningEffort || "max";
@@ -4740,10 +4741,10 @@ function applyComposerSettings(source) {
   const critics = state.workflow?.settings?.critic_count || {};
   const hours = state.workflow?.settings?.thinking_hours || {};
   syncModelMenus();
-  setChoice(ui.reviewModel, source.reviewModel || "gpt-6.1-sol");
-  setChoice(ui.authorModel, source.authorModel || "gpt-6.1-sol");
-  setChoice(ui.criticModel, source.criticModel || "gpt-6.1-sol");
-  setChoice(ui.writerModel, source.writerModel || "gpt-6.1-sol");
+  setChoice(ui.reviewModel, source.reviewModel || "gpt-6.2-sol");
+  setChoice(ui.authorModel, source.authorModel || "gpt-6.2-sol");
+  setChoice(ui.criticModel, source.criticModel || "gpt-6.2-sol");
+  setChoice(ui.writerModel, source.writerModel || "gpt-6.2-sol");
   ui.reviewEffort.value = source.reviewEffort || "max";
   ui.authorEffort.value = source.authorEffort || source.reasoningEffort || "max";
   ui.criticEffort.value = source.criticEffort || source.reasoningEffort || "max";
@@ -5567,22 +5568,22 @@ function syncModelMenus() {
   const replaced = [], roles = ["review", "author", "critic", "writer"];
   for (const role of roles) {
     const select = ui[`${role}Model`];
-    let value = select.value || "gpt-6.1-sol";
+    let value = select.value || "gpt-6.2-sol";
     let row = catalog.find((item) => item.id === value);
     if (!row && value.startsWith("api:")) {
-      value = "gpt-6.1-sol";
+      value = "gpt-6.2-sol";
       row = catalog.find((item) => item.id === value);
       replaced.push(role);
     }
     syncRoleModelMenu(role, row ? modelSourceId(row) : modelProvider(value), value);
   }
-  // The author subagents' choices are kept the same way (an API model that is gone: GPT 6.1 Sol); their menus follow
+  // The author subagents' choices are kept the same way (an API model that is gone: GPT 6.2 Sol); their menus follow
   // with the next renderRetrievalSettings (see renderTeamModels), which every caller runs next.
   if (typeof teamStore === "function") {
     teamStore().rows.forEach((choice, index) => {
       const row = catalog.find((item) => item.id === choice.model);
       if (!row && String(choice.model).startsWith("api:")) {
-        choice.model = "gpt-6.1-sol";
+        choice.model = "gpt-6.2-sol";
         replaced.push(teamRole(index));
       }
     });
@@ -5653,7 +5654,7 @@ function teamRows(count) {
   const store = teamStore();
   if (!Number.isInteger(count) || count < 0) return store.rows;
   while (store.rows.length < count) {
-    store.rows.push({ model: ui.authorModel.value || "gpt-6.1-sol", effort: ui.authorEffort.value || "max" });
+    store.rows.push({ model: ui.authorModel.value || "gpt-6.2-sol", effort: ui.authorEffort.value || "max" });
   }
   return store.rows;
 }
@@ -10190,7 +10191,7 @@ function presetsFormOpened(fresh) {
 }
 
 // Load saved settings (Default settings, or named ones) into the form. A role whose model is gone (an API
-// model removed with its connection, or a model TCS Prover no longer supports) gets GPT 6.1 Sol and keeps its
+// model removed with its connection, or a model TCS Prover no longer supports) gets GPT 6.2 Sol and keeps its
 // reasoning (lowered if that model lacks it), with a note; the saved settings themselves are never changed, so
 // they work again once the connection is added back. The server says which models are gone when it
 // lists the saved settings (unavailable); the menus, read with that list (see openPresetLoad), may
@@ -10205,7 +10206,7 @@ function applyPreset(preset) {
     const listed = (preset.unavailable || []).find((item) => item.role === role && !item.member);
     const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
     if (!gone) continue;
-    settings[`${role}Model`] = "gpt-6.1-sol";
+    settings[`${role}Model`] = "gpt-6.2-sol";
     missing.push({ role, label: listed?.label || preset.labels?.[model] || model });
   }
   // An author subagent's removed API model the same way ("author subagent 2"): the server lists it with its member
@@ -10217,7 +10218,7 @@ function applyPreset(preset) {
       const gone = listed || (model.startsWith("api:") && Array.isArray(catalog) && !catalog.some((row) => row.id === model));
       if (!gone) return item;
       missing.push({ role: `member${index + 1}`, label: listed?.label || preset.labels?.[model] || model });
-      return { ...item, model: "gpt-6.1-sol" };
+      return { ...item, model: "gpt-6.2-sol" };
     });
   }
   applyComposerSettings(settings);
@@ -10235,7 +10236,7 @@ function presetMissingText(missing) {
   const roles = { review: "reviewer", author: "author", critic: "critic", writer: "writer",
     ...Object.fromEntries(missing.filter(({ role }) => /^member\d+$/.test(role))
       .map(({ role }) => [role, `author subagent ${role.slice(6)}`])) };
-  const fallback = "GPT 6.1 Sol, which runs through the Codex CLI. The saved settings are unchanged.";
+  const fallback = "GPT 6.2 Sol, which runs through the Codex CLI. The saved settings are unchanged.";
   if (missing.length === 1) {
     const [{ role, label }] = missing;
     return `${roles[role][0].toUpperCase()}${roles[role].slice(1)} model not available (${label}), so the ${roles[role]} `
@@ -10640,7 +10641,7 @@ function presetRow(preset) {
         + "settings can be read."));
     }
     for (const missing of preset.unavailable || []) {
-      copy.append(presetElement("p", "preset-row-warning", `${missing.text}; it loads GPT 6.1 Sol instead.`));
+      copy.append(presetElement("p", "preset-row-warning", `${missing.text}; it loads GPT 6.2 Sol instead.`));
     }
   }
   if (confirming) {

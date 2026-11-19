@@ -63,11 +63,14 @@ except ImportError:  # Not Windows.
 RECORD_ENV = "TCS_PROVER_RECORD"
 # <state>/records holds one folder per job (its run folder's name).
 RECORDS = "records"
-# Codex 0.160's opt-in trace (codex-rs/rollout-trace): a root folder in which each root session writes one bundle
+# Codex's opt-in trace (codex-rs/rollout-trace): a root folder in which each root session writes one bundle
 # trace-<trace id>-<thread id>/ (manifest.json, trace.jsonl, payloads/<n>.json), its spawned subagents in the same
-# bundle. Bundles of manifest and event schema version 1 are understood (TRACE_SCHEMA_VERSION).
+# bundle. Bundles of manifest and event schema versions 1 (Codex 0.160) and 2 (Codex 0.170) are understood
+# (TRACE_SCHEMA_VERSIONS). Version 2 adds four events (recording_completed, thread_resumed, history_item_accepted,
+# stdin_target_resolved) and a field of tool calls; its model request, response and compaction events and its payload
+# files are those of version 1 (raw_event.rs, bundle.rs and payload.rs at the tags rust-v0.160.0 and rust-v0.170.0).
 TRACE_ROOT_ENV = "CODEX_ROLLOUT_TRACE_ROOT"
-TRACE_SCHEMA_VERSION = 1
+TRACE_SCHEMA_VERSIONS = (1, 2)
 SCHEMA_VERSION = 1
 # How often the trace of a running Codex process is read for requests that ended (seconds).
 TRACE_POLL_SECONDS = 5
@@ -919,7 +922,7 @@ class TraceIngest:
     file removed. A model request gets its line in calls.jsonl when its end event arrives; finish() gives the requests
     the process never ended status "interrupted", stores payload files no event named, keeps byte copies of the
     bundle's manifest.json and trace.jsonl and removes the raw bundle once those copies read back. A bundle whose
-    manifest or events are not of TRACE_SCHEMA_VERSION is left as it is; its requests get lines with status "trace
+    manifest or events are not of TRACE_SCHEMA_VERSIONS is left as it is; its requests get lines with status "trace
     format not recognized" as their starts are read, and the record's problems say so as soon as a running process's
     bundle is found to be one (its raw files then grow with the process).
     """
@@ -946,7 +949,7 @@ class TraceIngest:
         manifest = read_json(self.raw / "manifest.json")
         if manifest is None:
             return None  # Not written yet (or unreadable: finish() decides).
-        return isinstance(manifest, dict) and manifest.get("schema_version") == TRACE_SCHEMA_VERSION
+        return isinstance(manifest, dict) and manifest.get("schema_version") in TRACE_SCHEMA_VERSIONS
 
     def step(self, final=False):
         """Store what the bundle holds now; with ``final`` (the process ended) everything, then remove it."""
@@ -979,7 +982,7 @@ class TraceIngest:
             calls, entries = [], []
             for event in events:
                 if not self.recognized or not isinstance(event, dict) \
-                        or event.get("schema_version") != TRACE_SCHEMA_VERSION:
+                        or event.get("schema_version") not in TRACE_SCHEMA_VERSIONS:
                     self.recognized = False
                     self._note_unrecognized(event)
                     continue

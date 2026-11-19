@@ -45,6 +45,8 @@ DEFAULT_EFFORT = "max"
 
 # Menu order; the first Codex entry stays the default model.
 BUILTIN_MODELS = (
+    {"id": "gpt-6.2-sol", "label": "GPT 6.2 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
+    {"id": "gpt-6.2-astra", "label": "GPT 6.2 Astra", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6.1-sol", "label": "GPT 6.1 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-astra", "label": "GPT 6 Astra", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-sol", "label": "GPT 6 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
@@ -62,8 +64,8 @@ _LEGACY_MODELS = (
     {"id": "gpt-5.6-terra", "label": "GPT 5.6 Terra (older)", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-5.6-luna", "label": "GPT 5.6 Luna (older)", "provider": CODEX, "efforts": CODEX_EFFORTS},
 )
-REMOVED_MODEL_REPLACEMENTS = {"deepseek-v4-pro": "gpt-6.1-sol", "deepseek/deepseek-v4-pro": "gpt-6.1-sol"}
-REMOVED_MODEL_WARNING = "DeepSeek is no longer supported; this role now uses GPT 6.1 Sol."
+REMOVED_MODEL_REPLACEMENTS = {"deepseek-v4-pro": "gpt-6.2-sol", "deepseek/deepseek-v4-pro": "gpt-6.2-sol"}
+REMOVED_MODEL_WARNING = "DeepSeek is no longer supported; this role now uses GPT 6.2 Sol."
 
 API_ID_PREFIX = "api:"
 API_SLUG = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")

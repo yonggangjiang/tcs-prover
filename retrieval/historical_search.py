@@ -84,7 +84,7 @@ DISCOVERY_CACHE_SECONDS = 900.0
 # A second discovery attempt within one call needs at least this much of its budget.
 DISCOVERY_RETRY_RESERVE_SECONDS = 60.0
 # The run's author model comes first, then the pinned model, then these.
-DISCOVERY_FALLBACK_MODELS = ('gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
+DISCOVERY_FALLBACK_MODELS = ('gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna')
 DISCOVERY_MODEL_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 UNAVAILABLE_MODEL_SECONDS = 3600.0
 LIMITATION = ('Historical-content approximation: current search ranking and any discovery model '

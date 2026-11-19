@@ -89,7 +89,7 @@ it opens, so connections added or removed in another tab count.
   prompts and the batch the problem goes into stay as they are, and none of them
   is ever saved. Neither is an API key or address: saved settings hold model ids,
   plus each API model's name and connection name to describe it if it is removed.
-- A saved setting that names a removed API model loads that role with GPT 6.1 Sol
+- A saved setting that names a removed API model loads that role with GPT 6.2 Sol
   (which runs through the Codex CLI), and a note in the panel names the role and
   the missing model. The saved settings are not changed, and work as saved again
   once the connection is added back under the same display name.
@@ -105,7 +105,7 @@ it opens, so connections added or removed in another tab count.
 - TCS Prover's original settings use *Same as the coordinator* for the
   [subagent models](workflow.md#the-authors-team), and so do saved settings
   from before that setting existed. A saved subagent model of a removed API
-  connection loads as GPT 6.1 Sol with a note, as a role's does (*Author
+  connection loads as GPT 6.2 Sol with a note, as a role's does (*Author
   subagent 2 model not available …*).
 - Settings saved while the form still offered a goal loop may hold one: it is
   left out as they load, without a note, and the job runs TCS Prover's goal

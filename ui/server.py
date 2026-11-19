@@ -1970,7 +1970,7 @@ PUBLIC_GRAPH = {
         },
         "review_reasoning_effort": DEFAULT_REVIEW_EFFORT,
         "revision_reasoning_effort": DEFAULT_REVIEW_EFFORT,
-        "model_summary": "6.1 Sol/Max review · 6.1 Sol/Max author, critic, writer",
+        "model_summary": "6.2 Sol/Max review · 6.2 Sol/Max author, critic, writer",
         "critic_rounds": {
             "default": DEFAULT_CRITIC_ROUNDS,
             "minimum": 1,

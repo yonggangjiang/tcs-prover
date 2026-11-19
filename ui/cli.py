@@ -951,7 +951,7 @@ def main():
             print(f"Cannot resume saved job: {exc}", file=sys.stderr)
             return 1
         if resume_app.state.get("settingsWarning"):
-            # For example, a saved DeepSeek role now runs as GPT 6.1 Sol.
+            # For example, a saved DeepSeek role now runs as GPT 6.2 Sol.
             print(f"Note: {resume_app.state['settingsWarning']}", file=sys.stderr, flush=True)
     # A URL fragment stays in the browser; JavaScript sends it as a secret header.
     job_query = (
