@@ -11,7 +11,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import workflow_runner as runtime
 from . import ownership
@@ -649,6 +649,23 @@ def _interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
+def openable_link(url):
+    """The link the launcher prints and opens: ``url`` with its access key (the fragment) as ?launch=<key> instead.
+
+    Link openers can drop a URL's fragment on the way to the browser: VS Code's remote terminal opens links (its
+    $BROWSER helper, a click on a link in the terminal) through a forwarded port without the part after "#", and the
+    page then says "Open TCS Prover from its launch URL." They keep the query, from which the page takes the key and
+    removes it from the address bar at once, as it does with a fragment (ui/app.js). A link without a fragment is
+    returned as it is.
+    """
+
+    parts = urlsplit(url)
+    if not parts.fragment:
+        return url
+    query = urlencode([*parse_qsl(parts.query, keep_blank_values=True), ("launch", parts.fragment)])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, ""))
+
+
 def _handle_signals(hangup):
     """Make SIGTERM stop like Ctrl-C, and SIGHUP do `hangup`; return the previous handlers."""
 
@@ -868,9 +885,10 @@ def main():
             print(f"Cannot open the current run: {exc}", file=sys.stderr)
             return 1
         if selection.attached:
-            print(selection.url if args.no_browser else f"TCS Prover is already running at {selection.url}")
+            link = openable_link(selection.url)
+            print(link if args.no_browser else f"TCS Prover is already running at {link}")
             if not args.no_browser:
-                webbrowser.open(selection.url)
+                webbrowser.open(link)
             return 0
         selected_runs = selection.runs_root
     ownership.ROLE = "web server"
@@ -883,9 +901,10 @@ def main():
             print(f"Cannot resume saved job: TCS Prover is already running at {exc.url or 'another port'}; "
                   "continue the job there.", file=sys.stderr)
             return 1
-        print(exc.url if args.no_browser and exc.url else str(exc))
-        if exc.url and not args.no_browser:
-            webbrowser.open(exc.url)
+        link = openable_link(exc.url) if exc.url else ""
+        print(link if args.no_browser and link else f"TCS Prover is already running at {link}." if link else str(exc))
+        if link and not args.no_browser:
+            webbrowser.open(link)
         return 0
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
@@ -957,7 +976,7 @@ def main():
     job_query = (
         f"?job={quote(resume_app.state['runId'])}" if resume_app else ""
     )
-    url = f"{server.origin}/{job_query}#{server.token}"
+    url = openable_link(f"{server.origin}/{job_query}#{server.token}")
     # Flush before blocking: with --no-browser this line may be the only copy
     # of the session URL, and a pipe or log file would otherwise hold it back.
     print(f"TCS Prover is ready at {url}\nPress Ctrl-C to stop.", flush=True)

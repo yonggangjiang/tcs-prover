@@ -84,11 +84,18 @@ const appearance = (() => {
 function launchToken(fragment) {
   return /^[A-Za-z0-9_-]{32,}$/.test(fragment) && !document.getElementById(fragment) ? fragment : "";
 }
-const launchFragment = launchToken(location.hash.slice(1));
+// The launcher's link carries the token as ?launch=<token> (web_ui.py): link openers such as VS Code's remote
+// terminal keep a query but drop the fragment. Either form is taken once and removed from the address bar.
+const launchFragment = launchToken(location.hash.slice(1))
+  || launchToken(new URLSearchParams(location.search).get("launch") || "");
 const sessionToken = launchFragment || sessionStorage.getItem("tcs-prover-token") || "";
-if (launchFragment) {
-  sessionStorage.setItem("tcs-prover-token", sessionToken);
-  history.replaceState(null, "", location.pathname + location.search);
+if (launchFragment) sessionStorage.setItem("tcs-prover-token", sessionToken);
+const launchQuery = new URLSearchParams(location.search);
+const launchInHash = launchToken(location.hash.slice(1));
+if (launchInHash || launchQuery.has("launch")) {
+  launchQuery.delete("launch");
+  const search = launchQuery.toString();
+  history.replaceState(null, "", location.pathname + (search ? `?${search}` : "") + (launchInHash ? "" : location.hash));
 }
 let currentJob = new URLSearchParams(location.search).get("job") || "";
 let currentBatch = new URLSearchParams(location.search).get("batch") || "";

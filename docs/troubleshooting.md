@@ -10,17 +10,22 @@ older system or Conda interpreter. Each checkout needs its own `.venv`: another
 worktree or clone does not bring one along.
 
 **The page says "Open TCS Prover from its launch URL."** The address lacks the
-access key that follows `#` in the printed link. Run `python3 web_ui.py` again:
-while TCS Prover runs, this opens the right link instead of starting a second
-copy (`--no-browser` prints it). The key is kept in `.tcs-prover/sessions/`, so
-tabs left open keep working after a restart on the same port.
+access key that the printed link carries as `?launch=…` (or after `#` in a link
+from before 19 November 2026). Run `python3 web_ui.py` again: while TCS Prover
+runs, this opens the right link instead of starting a second copy
+(`--no-browser` prints it). The page takes the key from the link and removes it
+from the address bar at once. A link with the key after `#` can lose it on the
+way: VS Code's remote terminal opens links through a forwarded port without the
+part after `#`, which is why the launcher's link has it as `?launch=`. The key is
+kept in `.tcs-prover/sessions/`, so tabs left open keep working after a restart on
+the same port.
 
 **The page says "Untrusted local host."** The address names something other
 than this computer. TCS Prover answers at `127.0.0.1` and `localhost`, on any
 port, so it also works through a forwarded port: VS Code Remote forwards one
 when it opens the link in your own browser, or run
-`ssh -L 8765:127.0.0.1:8765 <server>` and open `localhost:8765`. Keep the `#`
-access key of the printed link.
+`ssh -L 8765:127.0.0.1:8765 <server>` and open `localhost:8765`. Keep the
+access key of the printed link (`?launch=…`).
 
 **"TCS Prover is already running at …".** One server serves a runs folder, and
 starting a second one opens the first one's page instead. When
