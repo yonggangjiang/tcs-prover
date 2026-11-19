@@ -20,7 +20,7 @@ asymptotic goal in the statement.
 ```mermaid
 flowchart TD
     S["Optional statement review"] --> A["Persistent author: a coordinator of author subagents, or one author"]
-    A -- "continue research; hourly time checks" --> A
+    A -- "continue research" --> A
     A -- "complete candidate" --> C["Critic + its independent critics"]
     C -- "reject: exact bugs and reset rounds" --> A
     C -- "edited pass: next round, read-only at the maximum" --> C
@@ -179,8 +179,8 @@ mode):
   call is a **Goal status** line in the activity log, such as **Goal status ·
   blocked**, with the author's note and what TCS Prover does next.
 - Everything else works as before: the time limit, Pause, Stop, Resume, live
-  instructions, chat, the coordinator's time checks, compaction, the hand-in
-  rules and retries every minute without limit.
+  instructions, chat, compaction, the hand-in rules and retries every minute
+  without limit.
 - Claude Code has no goal mode of its own, so a Claude Code author always runs
   in TCS Prover's loop; its harness note (`claude_goal_harness`, with
   `{objective}`) is one of the editable texts.
@@ -216,8 +216,7 @@ progress stalls or slows.
   `{author_subagents}` is the number of author subagents). Its goal, continuation, reopen,
   compaction, resume, repair and summary prompts are `coordinator_goal`,
   `coordinator_continuation`, `coordinator_reopen`, `coordinator_compaction`,
-  `coordinator_resume`, `coordinator_repair` and `coordinator_summary`, and
-  `coordinator_checkin` is its time check. The goal and the continuation point
+  `coordinator_resume`, `coordinator_repair` and `coordinator_summary`. The goal and the continuation point
   back to the coordinator prompt in one line (Codex repeats the goal in each of
   its automatic turns); reopen, compaction, resume and repair repeat the whole
   first prompt under `ORIGINAL COORDINATOR PROMPT`. `coordinator_report`
@@ -242,14 +241,11 @@ progress stalls or slows.
   The coordinator keeps the team's memory there as it sees fit; its prompt asks
   it to keep a log of the team's progress in `memory/progress.md`, which the job
   page shows as the [progress log](job-page.md#progress-log).
-- **Time checks.** Every hour of the job's working time (the clock of the time
-  limit: carried across resumes, without paused time, sleep or retry waits),
-  TCS Prover sends the coordinator a time check as a live instruction with the
-  elapsed time and the time limit, such as "Elapsed: 5 h 12 min. Time limit: 24
-  h, about 18 h 48 min left." The first comes at 1 hour; a job resumed at 5 h 20
-  min gets its next one at 6 hours. None is sent while the job pauses or stops,
-  or during a progress summary or a reply. The activity log shows each as
-  **Author coordinator time check**, and keeps these lines listed.
+- **Nothing on a schedule.** TCS Prover sends a working coordinator no message
+  of its own at fixed times. What it examines, and when, is for its prompt to
+  say. (Until 15 November 2026 it got an hourly time check with the elapsed
+  time; the activity log of a job from then still shows those lines as
+  **Author coordinator time check**.)
 - **Handing in.** A final reply that names no proof file (no `PROOF_FILE`
   pointer, see below) is not handed to the critic: the activity log shows the
   reply as the coordinator's own line, then an **Author coordinator report** line
@@ -266,11 +262,9 @@ progress stalls or slows.
   summaries too), and the activity log, **Run settings** and the place of the
   progress log say so.
 - **Claude Code**, with its own subagents (a coordinator job from before the
-  team), runs the subagents in the foreground: a live instruction, a time check
-  or a chat message reaches a Claude coordinator when its running subagents
-  report. Time checks never pile up meanwhile: the next is written once the
-  coordinator has read the last, with the time of its writing. With TCS
-  Prover's team, `team_wait` returns as soon as one arrives.
+  team), runs the subagents in the foreground: a live instruction or a chat
+  message reaches a Claude coordinator when its running subagents report. With
+  TCS Prover's team, `team_wait` returns as soon as one arrives.
 - **Progress summaries** (at the time limit, or with **Summarize progress**) use
   `coordinator_summary`: from the team's memory, what has been verified, what
   remains open and why, and the most promising next steps. Like every reply of
@@ -295,10 +289,19 @@ Claude Code's own subagents.
   server `tcs`): `team_members` (each member's model and what it is doing),
   `team_assign` (an assignment for an idle member, returning at once),
   `team_wait` (the next reports, waiting up to 30 minutes at a time; it returns
-  early for a live instruction, a chat message or a time check),
+  early for a live instruction or a chat message),
   `team_followup` (continues a member's last assignment in the same
   conversation) and `team_stop`. Their descriptions, and their arguments', are
   the `team_tool_*` texts in **Edit prompts → Team tools**.
+- **Waiting.** The Codex CLI's own instructions ask its model for a commentary
+  update at least every 60 seconds and for no wait longer than 60 seconds. A
+  coordinator that follows them wakes every minute while its team works, and
+  each time its whole conversation goes to the model again. A Codex coordinator
+  therefore also gets a short note after those instructions
+  (`codex_coordinator_note` in **Edit prompts → Coordinator**), which says
+  that neither applies to an unattended run; how long it waits is then its own
+  choice. An empty note sends nothing. Claude Code coordinators, and
+  coordinators without TCS Prover's team, get no note.
 - **Assignments.** Each is a fresh run of the member's model, one turn long, in
   the author's working folder (the folder the coordinator works in, with the
   author's sandbox, network rule and credentials), with no subagents of its own.

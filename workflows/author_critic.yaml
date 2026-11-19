@@ -15,7 +15,7 @@ nodes:
     # coordinator prompt, and these lifecycle prompts replace the author's; the others stay shared. 0 runs the author alone.
     coordinator:
       prompt: coordinator
-      lifecycle: {goal: coordinator_goal, continuation: coordinator_continuation, reopen: coordinator_reopen, compaction: coordinator_compaction, resume: coordinator_resume, repair: coordinator_repair, summary: coordinator_summary, checkin: coordinator_checkin, report: coordinator_report}
+      lifecycle: {goal: coordinator_goal, continuation: coordinator_continuation, reopen: coordinator_reopen, compaction: coordinator_compaction, resume: coordinator_resume, repair: coordinator_repair, summary: coordinator_summary, report: coordinator_report}
     task: state.statement
     marker: '[STATEMENT]'
     resume: {solution: state.solution, bugs: state.report.bugs, round: state.round}
@@ -209,7 +209,7 @@ prompts:
     Your conversation will be compacted from time to time, and whatever is not written down is lost, including what your subagents are doing. Keep the team's memory in the memory folder of your working directory, organized as you see fit. You should observe and decide how the memory should be maintained, so that the author team with this memory can make steady progress along the time, instead of circulating or being stuck. Keep a log of the team's progress in memory/progress.md; the user reads it on the job page.
 
     EXAMINING PROGRESS
-    The whole trajectory of all your and the author team's memory is in transcript.jsonl in your working directory for you to examine the progress (it is large, so search it rather than read it whole). There are no clear criteria on the progress towards an open problem, and you are responsible to use the trajectory and the memory to judge yourself about whether the team is making steady progress towards resolving the problem as time grows (TCS Prover sends you the elapsed time in a time check every hour). If you realize any ill behavior that the progress is blocked or growing slowly with the time, you should examine the prompt, how you organize the team, and the memory of your design, to try to guide the team back to steady progress.
+    The trajectory of the run is everything you and the authors have done so far: your assignments, the authors' reports, and the files in your working directory and its memory folder. transcript.jsonl there is the complete raw record of every step, and it is very large. Always keep the whole trajectory in mind, however long it grows, not only the latest report or the last hour. It is far too much to read at once, so find your own way to do this that keeps working as it grows: you may write scripts that extract what matters, read it part by part and keep summaries, or do anything else that works. Do this while the authors work, so that when a report comes back you already know where the whole run stands and no author waits long for its next assignment. There are no clear criteria on the progress towards an open problem, and you are responsible to use the trajectory and the memory to judge yourself about whether the team is making steady progress towards resolving the problem as time grows. Decide yourself what would have to change for the team to be closer to a solution, and keep track of how that has moved over the whole trajectory. Make this judgement every time a report comes back: has it moved since several hours ago, and is the team doing again something it already did? Then decide what the team does next, and give the author the context and instructions it needs to build on what the team already has. If you realize any ill behavior, that the progress is not growing or the team is repeating itself, do not put it down to the difficulty of the problem: examine how you instruct the authors, how you organize the team and the memory of your design, find what causes it, change that, and check later whether the change helped.
 
     HANDING IN
     When the team has a complete proof that has been checked, write it to proof.md and reply with exactly this line and nothing else:
@@ -248,12 +248,6 @@ prompts:
     {original_prompt}
   coordinator_summary: |-
     The work is paused. Write a progress summary for the user from the team's memory: what has been verified so far, with precise statements, and where it is written; what remains open or uncertain, and why; and the most promising next steps. Do not continue the work, start subagents or change any files in this turn.
-  # EDIT TIME CHECK HERE.
-  # Sent to the working coordinator every hour of the job's working time (a live instruction): {elapsed} is that
-  # time, {limit} the time limit and what is left of it, or that there is none.
-  coordinator_checkin: |-
-    [TIME CHECK FROM TCS PROVER]
-    Elapsed: {elapsed}. {limit}
   # EDIT REPORT ANSWER HERE: placeholders as for the author's lifecycle prompts.
   # Sent instead of the continuation when a coordinator's final reply names no proof file (it is kept as a
   # progress report and never reaches the critic).
@@ -353,6 +347,12 @@ prompts:
   # compacts the conversation of a Codex author, coordinator or team member. Empty (the default): Codex's own. No
   # placeholders.
   codex_compact_prompt: ''
+  # EDIT CODEX COORDINATOR NOTE HERE: sent to a Codex coordinator with TCS Prover's team as a developer message, after
+  # Codex's own instructions. Those tell the model not to leave the user without a commentary update for more than 60
+  # seconds and to avoid blocking waits longer than 60 seconds, so a coordinator woke every minute while its team
+  # worked, and about half of its model calls only waited. Empty: no note is sent. No placeholders.
+  codex_coordinator_note: |-
+    This run is unattended: no user reads your commentary or waits for you while it runs. Two of your instructions therefore do not apply to this run: that the user should not be left without a commentary update for more than 60 seconds, and that blocking sleep or wait calls longer than 60 seconds should be avoided.
 
   # EDIT TEAM HERE: appended to the coordinator's first prompt (after the related works), so that {original_prompt}
   # carries it into the later prompts. {members} is the list of members, one line each
@@ -381,7 +381,7 @@ prompts:
   team_tool_assign_assignment: |-
     The complete assignment: everything the member needs to know, since it sees nothing else of your conversation.
   team_tool_wait: |-
-    Wait for reports from your team. Returns as soon as an assignment finishes or fails, with every assignment that finished since the last wait, each once: the member, its report (its final reply) and the path of the saved report file; or, when none finishes in time, at the timeout with the members' states. Waiting is part of your normal work as the coordinator: prefer long waits (up to 30 minutes) to repeated short ones. The wait also ends early when TCS Prover sends you a live instruction, a chat message or a time check, which follows this result.
+    Wait for reports from your team. Returns as soon as an assignment finishes or fails, with every assignment that finished since the last wait, each once: the member, its report (its final reply) and the path of the saved report file; or, when none finishes in time, at the timeout with the members' states. Waiting is part of your normal work as the coordinator: prefer long waits (up to 30 minutes) to repeated short ones. The wait also ends early when TCS Prover sends you a live instruction or a chat message, which follows this result.
   team_tool_wait_timeout_minutes: |-
     How long to wait, in minutes: 1 to 30; 30 when omitted.
   team_tool_followup: |-

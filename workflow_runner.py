@@ -91,11 +91,11 @@ _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 _GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "chat", "related_works", "handoff_refused",
                             "subagents")
 # The lifecycle prompts a goal node's coordinator binding may replace (the author coordinator, see author_mode()),
-# "checkin", its hourly time check, and "report", the answer to a reply that is not a hand-in (the continuation
-# when absent), which only a coordinator binding has. The chat framing (rendered by the
-# controller) and the subagents note of an author that works alone stay the author's.
+# and "report", the answer to a reply that is not a hand-in (the continuation when absent), which only a
+# coordinator binding has. The chat framing (rendered by the controller) and the subagents note of an author that
+# works alone stay the author's.
 _COORDINATOR_LIFECYCLE = (*_GOAL_LIFECYCLE, "reopen", "summary", "conversation", "related_works", "handoff_refused",
-                          "checkin", "report")
+                          "report")
 # How the proof author works (--author-mode): "coordinator" runs the node's coordinator binding, "author" the author
 # alone; "auto", the default, runs the coordinator when Author subagents is 1 or more.
 AUTHOR_MODES = ("auto", "coordinator", "author")
@@ -109,20 +109,22 @@ GOAL_LOOPS = ("tcs", "codex")
 # from before and web-cutoff runs keep. Options without the setting run "builtin", as before.
 AUTHOR_TEAMS = ("tcs", "builtin")
 # TCS Prover's own texts in the workflow's prompts that no node binds (the goal loop, update_goal, Claude Code's
-# goal note, Codex's compaction summary, the team), with the placeholders each may use; None: used as written.
+# goal note, Codex's compaction summary, the note for a Codex coordinator, the team), with the placeholders each
+# may use; None: used as written.
 HARNESS_TEXTS = {
     "goal_continuation": {"continuation", "objective", "elapsed", "limit"},
     "goal_tool_update_goal": None, "goal_tool_update_goal_status": None, "goal_tool_update_goal_note": None,
     "claude_goal_harness": {"objective"},
-    "codex_compact_prompt": None,
+    "codex_compact_prompt": None, "codex_coordinator_note": None,
     "team_note": {"members"}, "team_member": {"assignment"},
     "team_tool_members": None, "team_tool_assign": None, "team_tool_assign_member": None,
     "team_tool_assign_assignment": None, "team_tool_wait": None, "team_tool_wait_timeout_minutes": None,
     "team_tool_followup": None, "team_tool_followup_member": None, "team_tool_followup_message": None,
     "team_tool_stop": None, "team_tool_stop_member": None,
 }
-# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions).
-EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt",)
+# The prompts that may be empty: Codex's compact_prompt (empty: Codex's own summary instructions) and the note for
+# a Codex coordinator (empty: none is sent).
+EMPTY_ALLOWED_PROMPTS = ("codex_compact_prompt", "codex_coordinator_note")
 _GOAL_STAGES = {"initial": "solve", "resume": "repair", "failure": "failure"}
 # Where TCS Prover cannot read the author's proof file safely (Windows; see
 # proof_handoff.file_handoff_supported()), the runner adds this note after the
@@ -250,17 +252,16 @@ STEER_RETRY_SECONDS = 60
 
 # The author coordinator (see author_mode()). The runner creates MEMORY_FOLDER
 # in its working directory, where its prompt asks it to keep the team's memory
-# and the dated log PROGRESS_LOG, which the job page shows. It gets a time
-# check (its "checkin" prompt, a live instruction) every
-# COORDINATOR_CHECKIN_SECONDS of the job's working time, on the clock of the
-# time limit (see workflow_elapsed()). A final reply that names no proof file
+# and the dated log PROGRESS_LOG, which the job page shows. TCS Prover sends it
+# nothing on a schedule: what it examines, and when, is its prompt's business.
+# A final reply that names no proof file
 # is not handed to the critic: its first COORDINATOR_REPORT_CHARS characters
 # are shown as a "Coordinator report" status (the whole reply stays in the
 # activity log as the coordinator's message), and the coordinator continues.
 MEMORY_FOLDER = "memory"
 PROGRESS_LOG = "progress.md"
-COORDINATOR_CHECKIN_SECONDS = 3600
 COORDINATOR_REPORT_CHARS = 1600
+# The status of a time check, which jobs from before 15 Nov 2026 have in their transcripts (none is sent now).
 COORDINATOR_CHECKIN_LABEL = "Coordinator time check"
 COORDINATOR_REPORT_LABEL = "Coordinator report"
 # A coordinator that cannot use TCS Prover's team fails loudly without stopping the run (CoordinatorWatch): its
@@ -2951,34 +2952,6 @@ class _SessionSubagents:
                                     source="session")
 
 
-class TimeChecks:
-    """When the author coordinator gets its next time check (its "checkin" prompt).
-
-    A check is due at every whole ``interval`` (COORDINATOR_CHECKIN_SECONDS) of the job's working time
-    (``elapsed()``, workflow_elapsed()), the first at 1 h. A new runner starts after the working time it
-    starts with, ``start`` (its --elapsed-seconds; without it, the working time now): a job resumed at 5 h
-    20 min gets its next check at 6 h, also when its runner starts at the critic and the author's session
-    begins only after the review, so an hour that passed during the review is not skipped. An attempt that
-    continues an earlier one of the same runner after a model-call failure goes on after that attempt's last
-    check (``last``, a count of intervals, kept in its retry details). Checks that came due while none could
-    be sent are one check, sent with the time of its sending.
-    """
-
-    def __init__(self, elapsed, interval, last=None, start=None):
-        self.elapsed, self.interval = elapsed, interval
-        start = start if isinstance(start, (int, float)) and not isinstance(start, bool) else elapsed()
-        self.last = last if type(last) is int else int(start // interval)
-
-    def due(self):
-        """The working time in seconds when a check is due now, else None."""
-
-        now = self.elapsed()
-        return now if now >= (self.last + 1) * self.interval else None
-
-    def sent(self, elapsed):
-        self.last = max(self.last + 1, int(elapsed // self.interval))
-
-
 # Codex 0.160's words in its app-server's error output for a tool call it cannot route (core/src/tools/router.rs):
 # "ERROR codex_core::tools::router: error=unsupported call: mcp__tcs__team_members" for the flattened name, and the
 # namespace and name run together for a tool its namespace does not have ("mcp__tcsteam_status") or a namespace no
@@ -5528,16 +5501,10 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     With ``coordinator`` the thread is the author coordinator (author_mode()),
     which its "Goal started" or "Goal resumed" status says (authorModeEffective
     "coordinator"): its app-server gets the coordinator's hint and, outside a web-cutoff run,
-    its default wait (author_limits()); it gets the "checkin" prompt as a live instruction at
-    each time check (TimeChecks), while a root turn runs and no pause or stop
-    is under way (one that comes due between turns goes with the next turn;
-    one Codex refuses is sent again in the next turn), recorded as a
-    "Coordinator time check" status; and where proof files can be read
+    its default wait (author_limits()); and where proof files can be read
     (proof_handoff.file_handoff_supported()) a final reply that names no
     proof file (names_proof_file()) is not handed on: it is recorded as a
-    "Coordinator report" status, and the continuation prompt follows. An
-    unexpected failure of the time checks ends them, with a diagnostic that
-    says so; it never stops the watcher.
+    "Coordinator report" status, and the continuation prompt follows.
 
     Who runs the goal loop is the ``goal_loop`` option (GOAL_LOOPS). "codex"
     is Codex's goal mode, as described above. "tcs" (a live run only; a
@@ -5551,13 +5518,13 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     session): "complete" with the turn's final reply hands that reply on,
     exactly as a complete goal does in Codex's goal mode; "blocked" and
     "paused" are recorded ("Goal status") and the continuation follows. Every
-    other duty (time limit, pause, stop, resume, live instructions, chat, time
-    checks, compaction re-anchor, hand-in guard, retries, records) stays as
+    other duty (time limit, pause, stop, resume, live instructions, chat,
+    compaction re-anchor, hand-in guard, retries, records) stays as
     above; no thread/goal request is sent.
 
     A coordinator with ``team`` (team.Team: TCS Prover's team in place of
     Codex's subagent tool, see _execute) gets its team tools from the same
-    server; a live instruction or time check sent to it ends a running
+    server; a live instruction sent to it ends a running
     team_wait early (Team.attention()), and an end that is not retried
     (pause, stop, time limit, the end of the work) stops the team's members.
     An author or coordinator without the multi_agent feature (one that works
@@ -5643,13 +5610,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     # and why the subagents still running end with this attempt (its app-server stops, and they with it).
     subagents, rollout = AuthorSubagents(emit), None
     ending = {"reason": "It stopped when the author's Codex session ended."}
-    # The coordinator's time checks (TimeChecks), and the turn in which Codex did not take one: it is sent again
-    # in the next turn.
-    checks = (TimeChecks(lambda: getattr(runtime, "workflow_elapsed", workflow_elapsed)(options),
-                         getattr(runtime, "COORDINATOR_CHECKIN_SECONDS", COORDINATOR_CHECKIN_SECONDS),
-                         continued.get("checked"), options.get("elapsed_seconds"))
-              if coordinator and "checkin" in prompts else None)
-    check_refused = {"turn": None}
     # Where proof files can be read, a final reply of the coordinator must name one to be handed on.
     guarded = bool(coordinator) and proof_handoff.file_handoff_supported()
     # TCS Prover's MCP server: its update_goal (TCS Prover's goal loop) and the coordinator's team tools.
@@ -5763,8 +5723,8 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         return True
 
     def steer(instruction, identity, kind="steer"):
-        """Send ``instruction`` into the running turn: a live instruction ("steer"), the re-anchor after a
-        compaction ("compaction") or a time check ("checkin", recorded by its caller)."""
+        """Send ``instruction`` into the running turn: a live instruction ("steer") or the re-anchor after a
+        compaction ("compaction")."""
 
         entry = (identity, instruction, kind)
         sent = []
@@ -5785,37 +5745,15 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             raise
         if kind != "steer":
             state["steered"] = True
-        if team is not None and kind in ("steer", "checkin"):
+        if team is not None and kind == "steer":
             # A running team_wait returns now, so that the instruction is not held up behind it.
-            team.attention("a live instruction" if kind == "steer" else "a time check")
+            team.attention("a live instruction")
         if kind == "compaction":
             emit("request", label="Author context re-anchor after compaction", text=instruction, threadId=thread)
         elif kind == "steer":
             # The controller recognizes a restored instruction by its command id.
             emit("request", label="Live author instruction sent", text=instruction, threadId=thread,
                  steerId=identity)
-
-    def send_check():
-        """Send the coordinator's time check into the running turn when one is due."""
-
-        elapsed = checks.due()
-        if elapsed is None:
-            return
-        turn, previous = state["turn"], checks.last
-        instruction = checkin_text(prompts["checkin"], elapsed,
-                                   controlled_author_hours(options.get("author_limit_file"),
-                                                           options.get("thinking_hours", DEFAULT_AUTHOR_HOURS)),
-                                   runtime.workflow_remaining(options))
-        checks.sent(elapsed)  # Before the request: Codex may refuse it at once (see the main loop).
-        try:
-            steer(instruction, (previous, turn), "checkin")
-        except (runtime.Error, OSError) as exc:
-            checks.last, check_refused["turn"] = previous, turn
-            emit("diagnostic", text=f"Could not send the time check ({exc}); it is sent again when the next turn "
-                                    "starts.", threadId=thread)
-            return
-        emit("status", label=COORDINATOR_CHECKIN_LABEL, elapsedSeconds=int(elapsed), text=instruction,
-             threadId=thread)
 
     def check(kind):
         probe["at"] = time.monotonic()  # Before sending: the answer may arrive at once.
@@ -5851,7 +5789,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         return None
 
     def watch():
-        nonlocal checks  # An unexpected failure of the time checks ends them (see below).
         pause_started = None
         interrupted_turn = None
         while not stop.wait(0.1):
@@ -5914,12 +5851,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 runtime.stop_process(process)
                 return
             if state["turn"]:
-                if checks is not None and not pausing.is_set() and state["turn"] != check_refused["turn"]:
-                    try:
-                        send_check()
-                    except Exception as exc:  # noqa: BLE001 - the watcher also pauses and ends the author.
-                        checks = None
-                        emit("diagnostic", text=f"The coordinator's time checks stopped: {exc}", threadId=thread)
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
                 if (command and not held_back(command[0])
                         and not any(item[0] == command[0] for item in list(pending_steers.values()))):
@@ -6007,6 +5938,16 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
             summary=summary, features=features, classic=classic, emit=emit, environment=child_environment,
             goals=not tcs, servers={team_module.SERVER_NAME: service.codex_server()} if service is not None else None,
             compact_prompt=texts.get("codex_compact_prompt", ""), builtin_agents="multi_agent" in features)
+        note = texts.get("codex_coordinator_note", "") if coordinator and team is not None else ""
+        if isinstance(note, str) and note.strip():
+            # A developer message after Codex's own instructions, at thread/start and at every thread/resume.
+            # Codex 0.160's instructions tell the model not to leave the user without a commentary update for more
+            # than 60 seconds and to avoid blocking waits longer than 60 seconds; a coordinator that follows them
+            # wakes every minute while its team works (four 14-hour runs: every one of 1,190 team_wait calls asked
+            # for 1 minute, and 41-53% of the coordinator's model calls only waited). With the default note, which
+            # says that neither applies to an unattended run, coordinators chose waits of 5 to 15 minutes
+            # themselves. Not for a coordinator without TCS Prover's team (a web-cutoff run, a job from before).
+            thread_options["developerInstructions"] = note
         if sandbox is not None and hasattr(runtime, "author_confinement_check"):
             runtime.author_confinement_check(rpc, sandbox=sandbox, directory=directory, emit=emit)
         if classic:
@@ -6111,11 +6052,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                         pending_compaction = instruction
                         emit("diagnostic", text=f"Codex did not accept the context re-anchor ({reason}); it is sent "
                                                 "again when the next turn starts.")
-                    elif kind == "checkin":
-                        # Due again, in the next turn.
-                        checks.last, check_refused["turn"] = min(checks.last, identity[0]), identity[1]
-                        emit("diagnostic", text=f"Codex did not accept the time check ({reason}); it is sent again "
-                                                "when the next turn starts.", threadId=thread)
                     else:
                         hold(identity, f"Codex did not accept the live instruction ({reason})")
                 elif kind == "steer":
@@ -6291,7 +6227,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                   "rewind": {"turn": state["turn_id"]} if reverted else None,
                                   "steer": state["steer"], "pending_compaction": pending_compaction,
                                   "refusal": final["refusal"], "classic_shell": classic or (tools and not policy),
-                                  "checked": checks.last if checks is not None else None,
                                   "warned": team_watch.shown() if team_watch is not None else [],
                                   "team_worked": team_watch.team_worked if team_watch is not None else False}
                 if thread and _context_window_failure(failure):
@@ -7910,14 +7845,13 @@ def _lifecycle_fields(key, fields):
 
     They are what the code fills the prompt in with: the goal's ``fields`` for the prompts of the goal session, and
     for the others only their own. The note on a refused submission gets its reason, the subagents note their
-    number, the chat framing the message and its answer file, and the coordinator's time check the elapsed time and
-    the time limit. The paused author's reply turns (run_author_conversation()) fill in the reply's {message} and
+    number, and the chat framing the message and its answer file. The paused author's reply turns (run_author_conversation()) fill in the reply's {message} and
     nothing in the progress summary, which is still a template (a brace is written twice). None: the related works
     note, which is appended to the first prompt as written.
     """
 
     return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
-            else {"message", "answer_file"} if key == "chat" else {"elapsed", "limit"} if key == "checkin"
+            else {"message", "answer_file"} if key == "chat"
             else {"message"} if key == "conversation" else set() if key == "summary"
             else None if key == "related_works" else fields)
 
@@ -8054,27 +7988,13 @@ def workflow_elapsed(options):
 
 
 def _clock_text(seconds):
-    """A working time as a time check states it: "45 min", "5 h", "5 h 12 min" (whole minutes, rounded down)."""
+    """A working time in words: "45 min", "5 h", "5 h 12 min" (whole minutes, rounded down)."""
 
     minutes = max(0, int(seconds // 60))
     if minutes < 60:
         return f"{minutes} min"
     hours, minutes = divmod(minutes, 60)
     return f"{hours} h {minutes} min" if minutes else f"{hours} h"
-
-
-def checkin_text(template, elapsed, hours, remaining):
-    """The coordinator's time check: ``template`` (its "checkin" prompt) with {elapsed} and {limit} filled in.
-
-    ``hours`` is the job's time limit (0: none) and ``remaining`` the seconds left of it (workflow_remaining()).
-    """
-
-    if not hours:
-        limit = "No time limit."
-    else:
-        left = f"about {_clock_text(remaining)} left" if remaining >= 60 else "less than 1 min left"
-        limit = f"Time limit: {_clock_text(hours * 3600)}, {left}."
-    return render_template(template, {"elapsed": _clock_text(elapsed), "limit": limit})
 
 
 def goal_limit_text(hours, remaining):
@@ -9089,7 +9009,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
     # The latest known way to continue; a session that fails early reports less.
     known = {"thread": options.get("goal_thread_id"), "stage": stage, "values": None, "steer": None,
              "pending_compaction": None, "anchor": None, "instruction": None, "rewind": None,
-             "replace": None, "refusal": None, "classic_shell": False, "checked": None, "warned": [],
+             "replace": None, "refusal": None, "classic_shell": False, "warned": [],
              "team_worked": False}
     failing_since = None
     with retry_clock(options).call(stage):
@@ -9106,8 +9026,6 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                 for key in ("thread", "stage", "values", "steer", "pending_compaction", "anchor"):
                     if retry.get(key):
                         known[key] = retry[key]
-                if type(retry.get("checked")) is int:
-                    known["checked"] = retry["checked"]  # The coordinator's last time check (TimeChecks).
                 if isinstance(retry.get("warned"), list):
                     known["warned"] = retry["warned"]  # The coordinator's warnings still listed (CoordinatorWatch).
                 # A team call of the coordinator worked in an earlier attempt: its team runs on (CoordinatorWatch).
@@ -9151,7 +9069,7 @@ def _goal_step(sessions, name, launch, initial_instruction, options, step, stage
                              "instruction": known["instruction"], "rewind": known["rewind"],
                              "pending_compaction": known["pending_compaction"], "anchor": known["anchor"],
                              "attempt": attempt, "refusal": known["refusal"], "classic_shell": known["classic_shell"],
-                             "checked": known["checked"], "warned": known["warned"],
+                             "warned": known["warned"],
                              "team_worked": known["team_worked"]}
                 if rewind.get("fresh") or known["replace"]:
                     # The conversation's first turn produced nothing (a new

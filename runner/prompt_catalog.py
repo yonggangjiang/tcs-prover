@@ -65,11 +65,13 @@ ENTRIES = (
      "Replaces the critic-rejection message for the coordinator."),
     ("coordinator_summary", "Coordinator", "Coordinator progress summary",
      "Replaces the progress summary for the coordinator."),
-    ("coordinator_checkin", "Coordinator", "Time check",
-     "Sent to the working coordinator every hour of working time: {elapsed} and {limit}."),
     ("coordinator_report", "Coordinator", "Answer to a report",
      "Sent in place of the continuation when the coordinator's final reply names no proof file (it is kept as a "
      "progress report)."),
+    ("codex_coordinator_note", "Coordinator", "Note for a Codex coordinator",
+     "Sent to a Codex coordinator with TCS Prover's team as a developer message after Codex's own instructions, "
+     "which ask for a commentary update every 60 seconds and for no wait longer than 60 seconds; the note says "
+     "that neither applies to an unattended run. Empty: no note is sent."),
     ("goal_continuation", "Goal loop", "Goal continuation",
      "Goal loop TCS Prover: the next turn after every turn of a Codex author or coordinator that did not end its "
      "goal. {continuation} is the continuation (or the answer to a report), {objective} the goal, {elapsed} the "

@@ -196,8 +196,9 @@ system.
 prompts that replace the author's of the same key (a mapping, or a list of keys
 that name prompts of their own names). It may bind `goal`, `continuation`,
 `compaction`, `repair`, `resume`, `reopen`, `summary`, `conversation`,
-`related_works`, `handoff_refused` and `checkin`, the hourly time check, which
-only this binding has (it may name `{elapsed}` and `{limit}`); every other prompt
+`related_works`, `handoff_refused` and `report`, the answer to a reply that is
+not a hand-in, which only this binding has (it may name what `continuation`
+may); every other prompt
 may name exactly what its author counterpart may, and the prompts it does not
 bind stay the author's (the bundled one leaves `conversation`, `chat`,
 `related_works` and `handoff_refused` shared). The run's `author_mode` option
@@ -359,28 +360,11 @@ the problem-solving to its subagents. What the runner and the server add:
   author starts. The page then says that the author works alone (Run settings,
   and one line in place of the progress log), and the paused author's reply turns
   get `--author-mode author`, so its summary uses the author's prompt.
-- **Time checks.** Every whole hour of the job's working time
-  (`workflow_elapsed()`, the clock of the time limit: `--elapsed-seconds` plus
-  this runner's time without its retry waits; the server keeps machine sleep out
-  of the elapsed seconds), the first at 1 h, the runner sends the `checkin`
-  prompt as a live instruction (`TimeChecks`): `{elapsed}` reads like `5 h 12 min`
-  or `45 min`, `{limit}` like `Time limit: 24 h, about 18 h 48 min left.` or `No
-  time limit.` A new runner starts after the time it starts with (resumed at 5 h
-  20 min, the next check is at 6 h); a retry after a model-call failure goes on
-  after the failed attempt's last check (`checked` in its retry details). Codex
-  gets it by `turn/steer` while a root turn runs; one that comes due between turns
-  goes with the next turn, and one Codex refuses is sent again in the next turn.
-  Claude Code gets it as a stream-json user message, as a live instruction, one
-  at a time: Claude takes written input in only at its next step (not while its
-  subagents run in the foreground), so no check is written while Claude has not
-  taken in the last one, and the next goes once it has, with the time of its
-  writing; one given up on at the end of a turn (as a live instruction would be)
-  is sent again in the next turn. None is sent while the author pauses or stops,
-  or in a reply turn. Each is a status record **Coordinator time check** with
-  `elapsedSeconds` and the text sent (Claude Code: when Claude takes it in).
-  Checks that came due while none could be sent are one check. An unexpected
-  failure of the time checks ends them with a diagnostic that says so; the
-  author's watcher goes on pausing, stopping and delivering live instructions.
+- **Nothing on a schedule.** The runner sends a working coordinator no message
+  of its own at fixed times. The hourly time check of jobs started before 15
+  November 2026 (a `checkin` binding, `TimeChecks`) is gone; their transcripts
+  keep its status records (**Coordinator time check**, with `elapsedSeconds`
+  and the text sent), which the page still shows.
 - **Hand-in guard.** Where proof files can be read
   (`proof_handoff.file_handoff_supported()`), a final reply of the coordinator
   that names no proof file (`names_proof_file()`, which counts a pointer
@@ -430,7 +414,7 @@ the problem-solving to its subagents. What the runner and the server add:
   `Agent(fork)` (`claude_cli.SUBAGENT_ENVIRONMENT`, `SUBAGENT_DENIED`). Anthropic
   does not document these variables: they were read from the Claude Code
   2.1.289 bundle, and need checking again whenever Claude Code changes. A known
-  limit of foreground subagents: a live instruction, a time check or a chat
+  limit of foreground subagents: a live instruction or a chat
   message reaches a working Claude coordinator only once its running subagents
   have reported.
 - **The page's live window.** The events of the subagents' own conversations
@@ -495,8 +479,13 @@ that every prompt and tool text is the user's to adjust. What the code does:
   with `_status` and `_note` (Codex 0.160's `update_goal` description and status
   argument; the note is TCS Prover's), `claude_goal_harness` (`{objective}`; the
   former `claude_cli.GOAL_HARNESS_PROMPT`, which stays the fallback of a workflow
-  without it), `codex_compact_prompt` (Codex's `compact_prompt`; empty, the only
-  prompt that may be, passes nothing), `team_note` (`{members}`), `team_member`
+  without it), `codex_compact_prompt` (Codex's `compact_prompt`; empty passes
+  nothing), `codex_coordinator_note` (the `developerInstructions` of a Codex
+  coordinator's `thread/start` and `thread/resume` when it has TCS Prover's
+  team: a developer message after Codex's own instructions, which cancels their
+  60-second commentary and 60-second wait rules for the run; empty sends none;
+  these two are the only prompts that may be empty), `team_note`
+  (`{members}`), `team_member`
   (`{assignment}`) and one description per team tool and argument
   (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
   checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
@@ -531,7 +520,7 @@ that every prompt and tool text is the user's to adjust. What the code does:
   with a final reply in the same turn hands that reply on; `blocked` and
   `paused` are recorded as **Goal status** (`goalStatus`, `note`) and the work
   goes on. The liveness probe is `config/read`. Pause, Stop, the time limit,
-  resume, live instructions, chat, time checks, the compaction re-anchor, the
+  resume, live instructions, chat, the compaction re-anchor, the
   hand-in guard and the retries are as before. Reply turns of a `tcs` thread
   reopen it without the goals feature. Web-cutoff runs always use `codex`: their
   audited configuration (retrieval/runtime.py) has no place for TCS Prover's
@@ -606,7 +595,7 @@ that every prompt and tool text is the user's to adjust. What the code does:
   the longer ones), each cut one with a note naming its file, because Codex
   0.160 cuts a tool's answer beyond its models' 10,000-token output budget out
   of the middle; it ends
-  early when TCS Prover sends a live instruction or a time check, or one came in
+  early when TCS Prover sends a live instruction, or one came in
   the 10 s before it began), `team_followup(member, message)` (continues the
   member's last conversation; refused while it works or without one) and
   `team_stop(member)`. Each assignment is a one-shot run (`member_attempt()`):
@@ -773,7 +762,7 @@ that every prompt and tool text is the user's to adjust. What the code does:
   and token; Codex keeps no MCP settings with a thread, so a reply turn, which
   passes none, reopens it without TCS Prover's tools); `--disable goals` leaves
   no goal tool of Codex; while a tool call is pending it accepts `turn/steer`
-  and answers `config/read` (a live instruction or time check ends a running
+  and answers `config/read` (a live instruction ends a running
   `team_wait` and reaches the model as its next user message), and
   `turn/interrupt` ends the turn, the members stopping with it; `codex exec fork`
   continues a member's conversation; `compact_prompt` (thread setting or `-c`)

@@ -94,8 +94,8 @@ SUBAGENT_REFUSALS = ("limit reached", "available agents:", "denied by permission
 # SUBAGENT_DENIED does in the private settings file. With a number of subagents the CLI also gets
 # CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS (at most that many at once; 20 by default) and
 # CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1 (subagents start none of their own; 3 levels by default). With foreground
-# subagents a running Claude coordinator reads a live instruction, a time check or a chat message only once its
-# running subagents have reported.
+# subagents a running Claude coordinator reads a live instruction or a chat message only once its running
+# subagents have reported.
 SUBAGENT_ENVIRONMENT = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", "CLAUDE_CODE_FORK_SUBAGENT": "0"}
 SUBAGENT_DENIED = ("Agent(fork)",)
 # Pre-approved writes stay inside the working directory; Edit rules cover Write.
@@ -1724,14 +1724,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
       status records of its subagents (workflow_runner.AuthorSubagents); with
       the subagent tool the CLI gets SUBAGENT_ENVIRONMENT and SUBAGENT_DENIED;
     - with ``coordinator`` (the author coordinator, see
-      workflow_runner.author_mode()) the "checkin" prompt is written as a user
-      message at each time check (workflow_runner.TimeChecks) while a turn
-      runs and no pause or stop is under way, one at a time (the next once
-      Claude took the last in: checks that came due meanwhile are one, with
-      the time of its writing; one that comes due between turns goes with the
-      next turn; one given up on, as a live instruction would be, is sent
-      again, and Claude may still take the first copy in), recorded as a
-      "Coordinator time check" status when Claude takes it in;
+      workflow_runner.author_mode()),
       where proof files can be read, a final answer that names no proof file
       (workflow_runner.names_proof_file()) is recorded as a "Coordinator
       report" status and continued, never handed on. A CLI that offers no
@@ -1749,7 +1742,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     a control request, which this session answers (answer_server(), each tool
     call on a thread of its own), because Claude Code drops every other kind
     of --mcp-config server under --safe-mode. It loads in --bare mode too, so
-    such a coordinator never works ``alone``. A live instruction or time check
+    such a coordinator never works ``alone``. A live instruction
     written to it ends a running team_wait early (team.Team.attention()), and
     an end that is not retried stops the team's members.
     """
@@ -1847,12 +1840,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
     retry = None
     safety_stop = False
     environment = copies = None
-    # The status records of the root's own subagents, the coordinator's time checks (start_checks()), the turn in
-    # which a check could not be written (it is sent again in the next turn), and whether a final answer must name
-    # a proof file to be handed on.
+    # The status records of the root's own subagents, and whether a final answer must name a proof file to be
+    # handed on (start_guard()).
     tracker = getattr(runtime, "AuthorSubagents", None)
     subagents = tracker(lambda kind, **fields: emit(kind, **fields)) if tracker is not None else None
-    checks, check_failed, guarded = None, {"turn": None}, False
+    guarded = False
     # Why the subagents still running end with this attempt (its CLI stops, and they with it).
     ending = {"reason": "It stopped when the author's Claude Code session ended."}
 
@@ -1933,52 +1925,11 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         # The controller recognizes a restored instruction by its command id.
         emit("request", label="Live author instruction sent", text=instruction, threadId=session, steerId=identity)
 
-    def start_checks(last):
-        """The coordinator's time checks and hand-in guard, once the launch knows whether it coordinates."""
+    def start_guard():
+        """The coordinator's hand-in guard, once the launch knows whether it coordinates."""
 
-        nonlocal checks, guarded
-        schedule = getattr(runtime, "TimeChecks", None)
-        if coordinator and "checkin" in prompts and schedule is not None:
-            checks = schedule(lambda: runtime.workflow_elapsed(options),
-                              getattr(runtime, "COORDINATOR_CHECKIN_SECONDS", 3600), last,
-                              options.get("elapsed_seconds"))
+        nonlocal guarded
         guarded = bool(coordinator) and proof_handoff.file_handoff_supported() and hasattr(runtime, "names_proof_file")
-
-    def stop_checks(failure):
-        """End the time checks after an unexpected failure, and say so: the watcher must keep its other duties."""
-
-        nonlocal checks
-        checks = None
-        emit("diagnostic", text=f"The coordinator's time checks stopped: {failure}", threadId=thread)
-
-    def send_check():
-        """Write the coordinator's time check into the running turn when one is due (under the lock).
-
-        One at a time: Claude takes written input in only at its next step, so while its foreground subagents
-        work (for hours, maybe) every check written would reach it together, each with its own stale time. The
-        next check is written once Claude took this one in, with the time of its writing; it is recorded as a
-        "Coordinator time check" status when Claude takes it in (consumed()).
-        """
-
-        if any(item[0] == "checkin" for item in list(pending.values())):
-            return
-        elapsed = checks.due()
-        if elapsed is None:
-            return
-        hours = runtime.controlled_author_hours(options.get("author_limit_file"),
-                                                options.get("thinking_hours", getattr(runtime, "DEFAULT_AUTHOR_HOURS", 0)))
-        instruction = runtime.checkin_text(prompts["checkin"], elapsed, hours, runtime.workflow_remaining(options))
-        previous = checks.last
-        checks.sent(elapsed)
-        try:
-            # (the last check before it, its working time, its text)
-            send_user(instruction, "checkin", (previous, int(elapsed), instruction))
-            if team is not None:
-                team.attention("a time check")
-        except (OSError, ValueError) as exc:
-            checks.last, check_failed["turn"] = previous, state["turn"]
-            emit("diagnostic", text=f"Could not send the time check ({exc}); it is sent again when the next turn "
-                                    "starts.", threadId=thread)
 
     def follow_subagents(message):
         """The root's Agent (or Task) calls and their results: the status records of its subagents."""
@@ -2033,17 +1984,12 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
         began = not state["running"]
         if began:
             begin_turn(f"turn-{uuid.uuid4().hex[:12]}")
-        if item[0] in {"steer", "compaction", "checkin"} and not unexpected:
+        if item[0] in {"steer", "compaction"} and not unexpected:
             state["steered"] = True
         if item[0] == "steer":
             state["steer"] = item[1]
             emit("status", label="Author instruction accepted", authorSteerDelivered=item[1],
                  text="The current conversation has received the live instruction.", threadId=thread)
-        if item[0] == "checkin":
-            # Recorded as Claude takes it in (a copy given up on too: it reached the coordinator after all).
-            _, elapsed, text = item[1]
-            emit("status", label=getattr(runtime, "COORDINATOR_CHECKIN_LABEL", "Coordinator time check"),
-                 elapsedSeconds=elapsed, text=text, threadId=thread)
         return began
 
     def answer_server(message):
@@ -2157,14 +2103,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                     team_watch.team = False
                     emit("diagnostic", text=f"The coordinator's team warnings stopped: {exc}", threadId=thread)
             if state["active"] and state["running"] and state["turn"]:
-                if checks is not None and not pausing.is_set() and state["turn"] != check_failed["turn"]:
-                    with lock:
-                        # Rechecked under the lock that ends turns, as for a live instruction below.
-                        if state["active"] and state["running"] and state["turn"] and not pausing.is_set():
-                            try:
-                                send_check()
-                            except Exception as exc:  # noqa: BLE001 - the watcher also pauses and ends the author.
-                                stop_checks(exc)
                 command = runtime.pending_author_steer(options.get("author_steer_file"), state["steer"])
                 if not command:
                     continue
@@ -2387,7 +2325,7 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                 alone["noted"] = True  # Said once per runner: retries reuse this launch.
                 runtime.note_no_subagent_tool(stages["initial"], model, settings.get("subagents"), coordinator=True,
                                               bare=True)
-        start_checks(continued.get("checked"))
+        start_guard()
         denied = disallowed_tools()
         protected, protected_paths = protected_settings(directory)
         if subagent_tool:
@@ -2491,8 +2429,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                                 item = given_up[key] = pending.pop(key)
                                 if item[0] == "compaction":
                                     state["carried"] = item[1]
-                                elif item[0] == "checkin" and checks is not None:
-                                    checks.last = min(checks.last, item[1][0])  # Due again, in the next turn.
                             emit("diagnostic", text="Queued author input was not picked up; a live instruction is "
                                                     "offered again later and a re-anchor leads the next turn.")
                         structured, finished = finished["structured"], None
@@ -2764,7 +2700,6 @@ def goal_session(runtime, prompt, *, prompts, settings, options, features=(),
                          "instruction": state["instruction"] or None, "delivered": state["delivered"],
                          "output": state["output"], "anchor": state["anchor"], "rewind": rewind,
                          "rewind_failed": rewind_failed, "steer": state["steer"], "pending_compaction": undelivered,
-                         "checked": checks.last if checks is not None else None,
                          "warned": team_watch.shown() if team_watch is not None else [],
                          "team_worked": team_watch.team_worked if team_watch is not None else False}
                 if thread and getattr(runtime, "_context_window_failure", lambda error: False)(exc):
