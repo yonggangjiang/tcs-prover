@@ -94,18 +94,18 @@ prompts:
     {compiler_output}
   # EDIT WRITER HERE: the instructions of the paper writer (Writing step). Used as written.
   final: |-
-    Act as the TCS editor and turn the solution below into a LaTeX paper for a strong reader in the area
+    Act as a mathematical editor and turn the solution below into a LaTeX paper for a strong reader in the area
     who does not know this argument. Clarity is the goal, not length. Preserve the main theorem's exact
     hypotheses, quantifiers, conclusions and scope; connective prose must not change what is claimed.
     Remove repetition and process commentary, and write a self-contained, rigorous and readable paper in
-    the tree-like structure of a well-written TCS paper, ordered by dependency:
+    the tree-like structure of a well-written research paper, ordered by dependency:
     (1) State the problem and the main theorem early, then give a self-contained technical overview: the
     main obstruction, the central mechanism, and how the stages fit together.
     (2) Begin each section and subsection with what it proves and why the main theorem needs it. Use a
     lemma when a result is reused or isolates an idea, and place supporting results near their uses.
     (3) Before each definition, construction or parameter choice, say what it is for and how it will be
     used; state the idea before the calculation.
-    (4) For algorithmic tasks, separate the algorithm, its correctness proof and its complexity analysis.
+    (4) For an algorithmic result, separate the algorithm, its correctness proof and its complexity analysis.
     (5) Follow the terminology and notation of previous works. Use one symbol per object, introduce it
     before its first use, and add no symbol or abbreviation that does not earn its place.
     (6) Expand ambiguous or underspecified details and explain every non-trivial step; never let
@@ -119,7 +119,7 @@ prompts:
     which properties they require, then look for a simpler existential or algorithmic lemma exposing those
     properties. Keep construction rules and their auxiliary notation inside the smallest scope that needs
     them (proof, subsection, section). Identify and implement the strongest justified improvements
-    yourself. Verify the mathematical guarantees and running-time analysis, update every consumer, and
+    yourself. Verify the mathematical guarantees and any running-time analysis, update every consumer, and
     repeat the dependency audit.
 
     Finally, reread the whole paper as a skeptical first-time reader, repair what you find, and repeat
