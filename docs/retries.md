@@ -5,9 +5,8 @@
 Every failed model call is retried automatically every minute (plus up to five
 seconds, so that many jobs do not retry in the same instant), with no attempt
 limit, so a job keeps going through provider outages without you. This covers
-every role: the statement reviewer, the proof author, the critic, the convention
-critic, the LaTeX editor and its compile repairs, and the paused author's
-replies.
+every role: the statement reviewer, the proof author, the critic, the LaTeX
+editor and its compile repairs, and the paused author's replies.
 
 A failure is anything that interrupts a call: a provider error such as "model at
 capacity", overloaded, 429 or 5xx; a dropped stream; a program that crashes or
@@ -24,8 +23,7 @@ no proof).
   once, and **Pause** (while the author works) pauses the job instead of
   retrying. The first retries of a call stay pinned in the activity log; the
   rest stay in the recent window and in `transcript.jsonl`.
-- **Slow calls.** A structured call (reviewer, critic, convention critic, LaTeX
-  editor) is never stopped while it works: an attempt is stopped and retried only
+- **Slow calls.** A structured call (reviewer, critic, LaTeX editor) is never stopped while it works: an attempt is stopped and retried only
   after its program has written nothing for an hour, or two hours while a critic
   waits for its subagents (Codex is silent then and allows such a wait an hour).
 - **A silent author.** A turn with no event for 30 minutes gets a cheap check (no
@@ -139,8 +137,7 @@ them again (the numbers and request IDs in a provider's message do not make it
 another). This covers every role, a team member and a paused author's reply.
 The line goes as soon as a model call of it works again (the model's first
 output), and when its step or the job's runner ends. A call whose answer is
-checked (a critic's, the statement reviewer's, the convention critic's, the
-LaTeX editor's) works again only once an answer is accepted when its model had
+checked (a critic's, the statement reviewer's, the LaTeX editor's) works again only once an answer is accepted when its model had
 already worked in the failed attempt: an answer refused (*the answer is not
 valid JSON*, an unmet requirement) or set aside after failed subagent calls,
 or a stream that dropped after some output, keeps counting as the same failure

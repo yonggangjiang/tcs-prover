@@ -240,10 +240,6 @@ const ui = {
   runHealth: $("runHealth"), runNextStep: $("runNextStep"), runLatestAction: $("runLatestAction"),
   runSettingsWarning: $("runSettingsWarning"), runAttention: $("runAttention"),
   runTimeLimitNote: $("runTimeLimitNote"), runActivityAge: $("runActivityAge"),
-  conventionWarning: $("conventionWarning"), conventionWarningRound: $("conventionWarningRound"),
-  conventionWarningLoophole: $("conventionWarningLoophole"),
-  conventionWarningStatement: $("conventionWarningStatement"), conventionWarningCopy: $("conventionWarningCopy"),
-  conventionWarningRerun: $("conventionWarningRerun"), conventionWarningIgnore: $("conventionWarningIgnore"),
   statementHeading: $("statementHeading"), runStatement: $("runStatement"),
   originalStatementDetails: $("originalStatementDetails"), runOriginalStatement: $("runOriginalStatement"),
   runMetadata: $("runMetadata"), resultPanel: $("resultPanel"), resultHeading: $("resultHeading"),
@@ -1125,13 +1121,6 @@ function renderJobs(jobs) {
       tags.className = "job-tags";
       tags.textContent = `From ${job.sourceFile}`;
       copy.append(tags);
-    }
-    // The convention critic's loophole warning, until it is ignored on the job page.
-    if (job.loopholeWarning) {
-      const tag = document.createElement("small");
-      tag.className = "job-tags job-loophole";
-      tag.textContent = "Loophole warning";
-      copy.append(tag);
     }
     const retrieval = document.createElement("small");
     retrieval.className = `job-retrieval ${retrievalConfiguration(job).mode}`;
@@ -2620,8 +2609,8 @@ function completedRunOutcome(job) {
   const outcome = (label, tone, summary, ended, at = node) => ({label, tone, summary, ended, node: at});
   if (job.manuallyStopped) {
     // The step it stopped at: the active one when it belongs to the stopped stage (Compile PDF in
-    // Writing & polishing, the convention critic in the critic's stage), else the stage's first step.
-    const steps = {review: ["statement_reviewer"], solve: ["author"], repair: ["author"], critic: ["critic", "convention"],
+    // Writing & polishing), else the stage's first step.
+    const steps = {review: ["statement_reviewer"], solve: ["author"], repair: ["author"], critic: ["critic"],
       final: ["latex_editor", "latex_compile"], failure: ["failure_summary"]}[job.stoppedStage] || [];
     return outcome("Stopped", "stopped", "You stopped this job. Its checkpoints remain available.",
       "stopped by you", steps.includes(node) ? node : steps[0] || node);
@@ -2647,11 +2636,9 @@ function completedRunOutcome(job) {
   }
   if (job.resultKind === "proof") {
     // Writing & polishing was not selected: the proof stages' result is the job's result.
-    // The convention critic, when it ran, checked the accepted proof last.
     return stages.critic
       ? outcome("Proof accepted", "done", "The critic accepted the proof. Writing & polishing was not selected "
-        + "for this run, so no PDF was made.", "accepted by the critic; writing not selected",
-        node === "convention" ? "convention" : "critic")
+        + "for this run, so no PDF was made.", "accepted by the critic; writing not selected", "critic")
       : outcome("Proof written (not reviewed)", "done", "The proof author wrote a proof. The critic was not "
         + "selected for this run, so no one reviewed it, and Writing & polishing was not selected, so no PDF "
         + "was made.", "proof written; critic and writing not selected", "author");
@@ -2696,8 +2683,9 @@ function jobTone(job) {
 // this run did not select (the author of a prepared critic-only job) is the first selected step, where
 // the run starts. Steps outside the stages (the saved progress) stay as they are.
 function railNode(node, stages) {
-  const name = node === "latex_repair" ? "latex_compile" : node || "";
-  const steps = [["statement_reviewer", "review"], ["author", "author"], ["critic", "critic"], ["convention", "critic"],
+  // The convention critic of a job from before (a step removed on 20 Nov 2026) ran in the critic's stage.
+  const name = node === "latex_repair" ? "latex_compile" : node === "convention" ? "critic" : node || "";
+  const steps = [["statement_reviewer", "review"], ["author", "author"], ["critic", "critic"],
     ["latex_editor", "writing"], ["latex_compile", "writing"]];
   const stage = steps.find(([step]) => step === name)?.[1];
   if (!stage || stages?.[stage] !== false) return name;
@@ -2725,7 +2713,7 @@ function stoppedByUser(job) {
 
 // The workflow steps in words, as the lists and the job page name where a job stopped (the server's STEP_WORDS).
 const STEP_WORDS = { statement_reviewer: "statement review", author: "proof author", critic: "critic",
-  convention: "convention critic", latex_editor: "LaTeX editor", latex_compile: "PDF compilation",
+  latex_editor: "LaTeX editor", latex_compile: "PDF compilation",
   latex_repair: "PDF compilation", failure_summary: "failure summary" };
 
 // Whether the stopped author's automatic progress summary at the time limit is queued or being written.
@@ -3083,10 +3071,7 @@ function renderRunOverview() {
       : stages.writing ? "The author is searching for a complete proof. The writing stage will polish its result."
       : "The author is searching for a complete proof. This workflow finishes with its result.",
     repair: "The author is addressing critic objections. A revised candidate returns to independent review.",
-    critic: state.activeNode === "convention"
-      ? "The convention critic checks whether the accepted proof does what you most likely want. It only warns; "
-        + (stages.writing ? "writing follows either way." : "the run then ends either way.")
-      : stages.author ? "The critic starts independent critics on the candidate and decides. Rejected proofs return to the author."
+    critic: stages.author ? "The critic starts independent critics on the candidate and decides. Rejected proofs return to the author."
       : "The critic starts independent critics on the supplied work and reports any unresolved errors. The Author stage is off.",
     final: "The accepted proof is being formatted and compiled. Source and PDF downloads appear when compilation succeeds.",
   };
@@ -3137,7 +3122,6 @@ function renderRunOverview() {
     else ui.runAttention.textContent = attention;
   }
   show(ui.runAttention, Boolean(attention));
-  renderConventionWarning();
   renderRetrievalOverview();
   const tabTitle = ui.runProblemTitle.textContent;
   const pageTitle = `${ui.runStage.textContent} · ${tabTitle.length > 80 ? `${tabTitle.slice(0, 79)}…` : tabTitle} — TCS Prover`;
@@ -3149,8 +3133,7 @@ function renderRunOverview() {
   const changed = Boolean(original && original.trim() !== statement.trim());
   show(ui.originalStatementDetails, changed);
   if (ui.runOriginalStatement.textContent !== (original || "")) ui.runOriginalStatement.textContent = original || "";
-  // A role's row: its model and effort, then its own settings, then where the model runs (the critic's
-  // source covers the convention critic too).
+  // A role's row: its model and effort, then its own settings, then where the model runs.
   const roleRow = (role, model, effort, extras = "") => {
     const [modelLine, sourceLine] = roleModelText(role, model, effort);
     return `${modelLine}${extras}\n${sourceLine}`;
@@ -3233,26 +3216,6 @@ function renderRunOverview() {
     ui.resultPanel.dataset.identity = identity;
     ui.resultPanel.open = final || ["proof", "needs-revision", "failure"].includes(state.resultKind);
   }
-}
-
-// The convention critic's latest loophole warning, near the top of the job, until the user ignores
-// it (the server keeps it, and whether it was ignored, in the job's state). The run goes on as normal.
-function renderConventionWarning() {
-  const box = ui.conventionWarning;
-  if (!box) return;
-  const warning = state.conventionWarning;
-  const open = Boolean(warning && typeof warning === "object" && !warning.dismissed && warning.loophole);
-  show(box, open);
-  if (!open) return;
-  const round = Number.isInteger(warning.round) ? `Found in critic round ${warning.round}` : "Found by the convention critic";
-  const meta = `${round}${warning.time ? ` · ${localDateTime(warning.time)}` : ""}`;
-  if (ui.conventionWarningRound.textContent !== meta) ui.conventionWarningRound.textContent = meta;
-  if (ui.conventionWarningLoophole.textContent !== warning.loophole) ui.conventionWarningLoophole.textContent = warning.loophole;
-  const statement = warning.suggestedStatement || "";
-  if (ui.conventionWarningStatement.textContent !== statement) ui.conventionWarningStatement.textContent = statement;
-  box.dataset.warning = warning.time || "";
-  // Ignoring changes the job; a saved batch is read-only. A rerun only opens the composer.
-  show(ui.conventionWarningIgnore, !state.readOnly);
 }
 
 // Group the recorded critic calls by author submission, retaining every input.
@@ -4046,15 +4009,15 @@ function renderWorkflow() {
     ? {review: true, author: false, critic: false, writing: false}
     : latexOnly ? {review: false, author: false, critic: false, writing: true}
     : {review: !startsAtAuthor && !criticResume, author: true, critic: true, writing: true});
-  const stageOf = {statement_reviewer: "review", author: "author", critic: "critic", convention: "critic",
+  const stageOf = {statement_reviewer: "review", author: "author", critic: "critic",
     latex_editor: "writing", latex_compile: "writing"};
   const offStage = name => name === "failure_summary" ? !(stages.author || stages.critic) : !stages[stageOf[name]];
   // The selected steps are numbered in the order they run.
-  const numbers = new Map(["statement_reviewer", "author", "critic", "convention", "latex_editor", "latex_compile"]
+  const numbers = new Map(["statement_reviewer", "author", "critic", "latex_editor", "latex_compile"]
     .filter(name => !offStage(name)).map((name, index) => [name, String(index + 1)]));
   // Labels of the steps that the server's graph of this run leaves out.
   const labels = {statement_reviewer: "Statement reviewer", author: "Proof author", critic: "Independent critic",
-    convention: "Convention critic", latex_editor: "LaTeX editor", latex_compile: "Compile PDF",
+    latex_editor: "LaTeX editor", latex_compile: "Compile PDF",
     failure_summary: "Saved progress"};
   const seenInThisJob = new Set((state.trace || []).map(
     (entry) => entry.node || nodeFromStage(entry.stage)
@@ -4079,10 +4042,6 @@ function renderWorkflow() {
   );
   // Where the run is now, waits, paused or ended, and why (see workflowPosition).
   const position = workflowPosition(stages, authorRepairing);
-  // A finished job from before the convention critic went past its step without running it.
-  const conventionPredatesJob = state.phase === "done" && stages.critic && !seen.has("convention")
-    && !trace.some(entry => entry.kind === "convention_result")
-    && (["latex_editor", "latex_compile"].some(name => seen.has(name)) || state.resultKind === "proof");
   const makeNode = (name, overrides = {}) => {
     const item = overrides.item || nodes[name] || {label: labels[name], description: ""};
     const number = name === "failure_summary" ? "!" : numbers.get(name) || "–";
@@ -4106,7 +4065,7 @@ function renderWorkflow() {
       : seen.has(name) ? "complete" : "";
     const status = overrides.status ?? (limitStop ? "limit" : userStopped ? "stopped" : paused ? "paused"
       : active ? "active" : failed ? "failed"
-      : (unselected || name === "convention" && conventionPredatesJob) && !seen.has(name) ? "disabled" : settled);
+      : unselected && !seen.has(name) ? "disabled" : settled);
     row.className = `workflow-node ${status}`;
     row.dataset.node = name;
     if (status === "active") row.setAttribute("aria-current", "step");
@@ -4155,7 +4114,6 @@ function renderWorkflow() {
       critic: stages.author === false
         ? "The critic starts independent critics on the supplied work and reports unresolved errors."
         : "The critic starts independent critics on the candidate and decides; rejected proofs return to the author.",
-      convention: "Checks once whether the accepted proof does what you most likely want; it only warns.",
       latex_compile: "Compile, fix errors, and retry until a PDF is ready.",
     };
     description.textContent = descriptions[name] || item.description;
@@ -4166,18 +4124,6 @@ function renderWorkflow() {
     if (name === "author" && authorRepairing && current
         && ["running", "pausing", "paused", "stopping"].includes(state.phase)) {
       noteText = noteText ? `${noteText} · repairing critic objections` : "Repairing critic objections";
-    }
-    // The position mark says what the running (or paused) convention critic does; its note gives its verdict,
-    // and points to the warning only while the page shows it.
-    if (name === "convention" && !noteText && !unselected) {
-      const latestConvention = trace.findLast(entry => entry.kind === "convention_result" && entry.root !== false);
-      const warning = state.conventionWarning;
-      const warned = Boolean(warning && typeof warning === "object" && !warning.dismissed && warning.loophole);
-      noteText = active || paused || userStopped ? "" : failed ? "Check interrupted"
-        : latestConvention?.verdict === "loophole" ? (warned ? "May exploit a loophole: see the warning above"
-          : `May exploit a loophole${warning?.dismissed ? " (warning ignored)" : ""}; see the critic review history`)
-          : latestConvention?.verdict === "faithful" ? "Faithful to the statement"
-            : conventionPredatesJob ? "Not run (older job)" : "";
     }
     // A paused critic step names the round that stays open, not the verdict of an earlier one.
     if (name === "critic" && !noteText && !unselected) {
@@ -4282,7 +4228,7 @@ function renderWorkflow() {
   selfRoute.textContent = `↻ PASS with changes → next round (limit ${state.criticRounds || 2})`;
   const author = makeNode("author");
   const critic = makeNode("critic");
-  // Every accepted proof goes on to the convention critic.
+  // Every accepted proof goes on to Writing & polishing (or the end).
   const passStem = element("li", "critic-pass-stem", !stages.critic);
   passStem.setAttribute("aria-hidden", "true");
   loopNodes.append(
@@ -4291,21 +4237,14 @@ function renderWorkflow() {
   loop.append(loopTitle, loopNodes);
   if (!stages.author && !stages.critic) loop.classList.add("not-selected");
 
-  // Accepted proofs go to the convention critic, then to Writing & polishing; interruptions retain saved
-  // progress.
+  // Accepted proofs go to Writing & polishing; interruptions retain saved progress.
   const branch = document.createElement("li");
   branch.className = "workflow-branch";
   const passRoute = arrow(stages.critic ? "Unchanged PASS or edited PASS at limit"
     : stages.author ? "The author's proof, not reviewed" : "The supplied writing", true);
   passRoute.classList.add("critic-pass");
-  // After the critic, the route leads to the convention critic; without it, straight on to writing.
-  if (!(stages.critic || (stages.author && stages.writing))) passRoute.classList.add("not-selected");
-  // The convention critic checks the accepted proof once, before writing or the end (rows set in styles.css).
-  const convention = makeNode("convention");
-  convention.classList.add("convention-node");
-  const conventionRoute = arrow(stages.critic ? "Whatever its verdict" : "Next stage");
-  conventionRoute.classList.add("convention-route");
-  if (!stages.writing || !(stages.author || stages.critic)) conventionRoute.classList.add("not-selected");
+  // After the critic (or the author without it), the route leads on to writing.
+  if (!(stages.writing && (stages.author || stages.critic))) passRoute.classList.add("not-selected");
   const writing = element("li", "workflow-loop writing-group", !stages.writing);
   const writingTitle = document.createElement("strong");
   writingTitle.className = "loop-title";
@@ -4319,7 +4258,7 @@ function renderWorkflow() {
     writingNodes.append(compileRoute, makeNode("latex_compile"));
   }
   writing.append(writingTitle, writingNodes);
-  branch.append(loop, passRoute, convention, conventionRoute, writing);
+  branch.append(loop, passRoute, writing);
   failureRoute.className = "flow-arrow interruption-route";
   failureRoute.textContent = "On interruption or time limit ↓";
   branch.append(failureRoute, failureNode);
@@ -4336,11 +4275,13 @@ function renderWorkflow() {
 }
 
 // How long step ``name`` has worked, pauses left out: the server's count up to the state it sent (state.stepTimes,
-// see follow_step_times), and since then for the step that works now. A LaTeX repair counts as Compile PDF.
+// see follow_step_times), and since then for the step that works now. A LaTeX repair counts as Compile PDF, and the
+// convention critic of a job from before (a step removed on 20 Nov 2026) as the critic.
 function stepSeconds(name) {
   const times = state.stepTimes;
   if (!times || typeof times.seconds !== "object" || !times.seconds) return 0;
-  const parts = name === "latex_compile" ? ["latex_compile", "latex_repair"] : [name];
+  const parts = name === "latex_compile" ? ["latex_compile", "latex_repair"]
+    : name === "critic" ? ["critic", "convention"] : [name];
   let total = parts.reduce((sum, part) => sum + (Number(times.seconds[part]) || 0), 0);
   if (times.running && parts.includes(times.node) && ["reviewing", "running", "stopping", "pausing"].includes(state.phase)) {
     total += Math.max(0, Date.now() - stateReceivedAt) / 1000;
@@ -4401,7 +4342,6 @@ function workflowStepText(node, authorRepairing = false) {
   const step = node === "statement_reviewer" ? "Checking the statement"
     : node === "author" ? (authorRepairing ? "Repairing critic objections" : "Working on the proof")
     : node === "critic" ? criticStepText()
-    : node === "convention" ? "Checking the accepted proof"
     : node === "latex_editor" ? "Writing the LaTeX document"
     : node === "latex_compile" ? (state.activeNode === "latex_repair" ? "Fixing LaTeX errors" : "Compiling the PDF")
     : node === "failure_summary" ? "Saving progress" : "Working";
@@ -6786,19 +6726,6 @@ ui.downloadPdf.onclick = () => downloadArtifact(ui.downloadPdf, "pdf");
 ui.downloadProof.onclick = () => downloadArtifact(ui.downloadProof, "proof", "approved-proof.md");
 ui.downloadSource.onclick = () => downloadArtifact(ui.downloadSource, "source", "latex-source.tex");
 ui.downloadTranscript.onclick = () => downloadArtifact(ui.downloadTranscript, "jsonl", "transcript.jsonl", "/transcript");
-// The convention critic's loophole warning: copy or rerun with its suggested statement, or ignore it.
-ui.conventionWarningCopy.onclick = async () => {
-  const text = state.conventionWarning?.suggestedStatement || "";
-  try {
-    await navigator.clipboard.writeText(text);
-    ui.conventionWarningCopy.textContent = "Copied";
-  } catch (_) {
-    ui.conventionWarningCopy.textContent = "Select the text to copy";
-  }
-  setTimeout(() => { ui.conventionWarningCopy.textContent = "Copy"; }, 2000);
-};
-ui.conventionWarningRerun.onclick = () => rerunWithStatement(state.conventionWarning?.suggestedStatement || "");
-ui.conventionWarningIgnore.onclick = () => act("/dismiss-convention-warning", { time: state.conventionWarning?.time || "" });
 ui.home.onclick = goHome;
 ui.reviewHome.onclick = goHome;
 ui.allBatches.onclick = () => selectBatch("");

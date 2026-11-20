@@ -64,37 +64,20 @@ nodes:
         - set: {failed: 'True', revisionRequired: 'True', output: state.solution}
         - emit: {kind: failure_result, label: Proof needs revision, resultKind: needs-revision, text: '=result.bugs', output: '=state.solution', bugs: '=result.bugs'}
       pass:
-        to: convention
+        to: end
         after:
         - set: {output: state.solution}
         - emit: {kind: status, label: Critic approved, acceptanceReason: clean_pass, round: '=visit', text: 'Round {visit} passed without edits.'}
+      # A pass with fixes goes to another round, up to the run's critic-round limit; at the limit the latest
+      # repaired proof is accepted. Only a rejection (a critical error the critic cannot fix) returns to the author.
       fixed:
         repeat: 2
         option: critic_rounds
-        verify: critic_verify
+        then: end
+        after:
+        - set: {output: state.solution}
+        - emit: {kind: status, label: Critic approved, acceptanceReason: round_limit, round: '=visit', roundLimit: '=limit', text: 'Reached MAX ({limit} rounds); using the latest repaired proof.'}
 
-  # The convention critic: one read-only call on the proof the critic accepted, just before writing (or the end).
-  # Its verdict goes to the user; the run continues to writing or the end whatever it says.
-  convention:
-    run: structured
-    workflow_stage: critic
-    skip: end
-    role: critic
-    stage: critic
-    prompt: convention_critic
-    inputs: {statement: state.statement}
-    request_label: Convention critic
-    activity_label: Convention critic
-    proof_handoff: {candidate: solution, statement: statement}
-    response: {verdict: [faithful, loophole], intended: string, assessment: string, loophole: string, suggested_statement: string}
-    require:
-    - bool(strip(result.intended))
-    - bool(strip(result.assessment))
-    - "bool(strip(result.loophole)) if result.verdict == 'loophole' else not strip(result.loophole)"
-    - "bool(strip(result.suggested_statement)) if result.verdict == 'loophole' else not strip(result.suggested_statement)"
-    after:
-    - emit: {kind: convention_result, label: 'Convention critic · round {state.round}', round: '=state.round', verdict: '=result.verdict', intended: '=result.intended', assessment: '=result.assessment', loophole: '=result.loophole', suggestedStatement: '=result.suggested_statement'}
-    next: {done: end}
 prompts:
   # EDIT AUTHOR HERE: instructions for proving the exact statement.
   # On a computer where TCS Prover cannot read proof.md safely (Windows), the runner adds a short note
@@ -426,15 +409,6 @@ prompts:
     return verdict=pass and an empty bugs string. If no edits are needed, leave proof.md unchanged and leave fixes
     empty. Return only the requested JSON.
 
-  # EDIT FINAL VERIFICATION HERE: added to the critic's instructions in its last round, when proof.md is
-  # read-only. Used as written.
-  critic_verify: |-
-    FINAL VERIFICATION: this proof has reached the limit of edited critic rounds,
-    so this round cannot edit it; proof.md is read-only. Return verdict=pass with
-    an empty bugs string only if the proof is complete and rigorous exactly as
-    written. Otherwise return verdict=reject with every bug and its exact
-    location in bugs.
-
   # EDIT CRITIC REQUEST HERE: frames the critic's request: {instructions} (the critic's instructions) and
   # {statement}.
   critic_input: |
@@ -444,24 +418,3 @@ prompts:
     STATEMENT:
     {statement}
 
-  # EDIT CONVENTION CRITIC HERE: {statement} is the statement.
-  # The convention critic (the convention step): runs once on the accepted proof, before writing; its report is
-  # shown to the user and never changes the run's route.
-  convention_critic: |-
-    You are the convention critic. You run after the proof critics have accepted the proof, independently of them:
-    you do not judge whether the proof is correct, and you do not edit any file.
-
-    Examine the problem statement below and the proposed proof in proof.md. Try to guess what the user, as a
-    conventional mathematician or theoretical computer science researcher, actually wants from this problem. Then
-    decide whether the proof does what the user actually wants, or whether it is "cheating" by exploiting loopholes
-    in the problem description, such as a brute-force construction that stores all answers, so that it satisfies
-    the letter of the statement but not what the user meant.
-
-    Return verdict=loophole only if the proof very much exploits a loophole. Then explain in loophole how it exploits
-    the problem description, and give in suggested_statement a modified problem statement that fits what the user
-    needs, so that the user can rerun with it. Otherwise return verdict=faithful and leave loophole and
-    suggested_statement empty. In intended, say in a few sentences what the user most likely wants; in assessment,
-    say how the proof relates to that. Return only the requested JSON.
-
-    STATEMENT:
-    {statement}

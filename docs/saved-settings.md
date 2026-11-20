@@ -24,9 +24,9 @@ form's settings back to them, or under a name of their own to load again later.
 
 Default settings fill every fresh New problem form, including a `?new=1` page
 and **New problem in this batch**. Until you save to them, they are TCS
-Prover's original settings. **Rerun with suggested statement** and a job sent
-back to the form keep their own settings, and switching between New problem
-and **Models & API** keeps what you edited.
+Prover's original settings. A job sent back to the form keeps its own
+settings, and switching between New problem and **Models & API** keeps what
+you edited.
 
 - The name *Default settings*, in any case, always means them: no saved
   settings can be given it. Saved settings from an earlier version that already

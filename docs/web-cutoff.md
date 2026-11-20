@@ -9,7 +9,7 @@
 | On | a UTC timestamp, such as `2026-10-02T14:13:12Z` | The author can search and read verified archives from strictly before that instant, and nothing else from the web. |
 
 **Off.** Live web search is on for the author, the statement reviewer, the
-critic, the convention critic and the LaTeX editor, including structured
+critic and the LaTeX editor, including structured
 retries and subagents. The runner sets Codex's
 [`web_search="live"`](https://learn.chatgpt.com/docs/config-file/config-reference)
 for new and resumed sessions, and Claude Code models get the WebSearch and
@@ -98,7 +98,7 @@ the native sandbox of the author and of the structured roles.
 
 Every model process of a timestamp run is checked this way: the author and its
 paused replies (which use the author's own audited launch), the critic and its
-subagents, the convention critic and the LaTeX writer. The LaTeX compile runs in
+subagents, and the LaTeX writer. The LaTeX compile runs in
 a separate isolated compiler, which repeats its MacTeX and sandbox checks before
 every compile; a source it refuses ends the job with `final.tex` and a "PDF not
 compiled" note. After a compile that fails, it also compiles its small test
@@ -127,8 +127,8 @@ critic's progress line says only that its critics have started.
   changes nothing here: no trace and no stream is taken. TCS Prover copies what
   the run leaves behind, the author's session files from the run's own folder
   and the URL discovery folders, every 10 minutes while it runs and when it
-  pauses, stops or ends; its one-shot calls (the critic, the convention critic,
-  the LaTeX writer) write no files, and its record says so. Of the settings
+  pauses, stops or ends; its one-shot calls (the critic, the LaTeX writer) write
+  no files, and its record says so. Of the settings
   Codex reports at each start, the transcript and the record keep those TCS
   Prover sets, with the isolation settings it writes into the run's private
   Codex configuration (project files off, the login shell off, the commands'

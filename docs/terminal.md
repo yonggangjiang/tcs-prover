@@ -15,8 +15,8 @@ review** and keeping the other three stages on. It starts no web server and
 opens no browser. Without options it uses the built-in defaults (Default
 settings, saved with **Save these settings…**, apply only to the web form): 3
 independent critics per round, 3 author subagents (so the author is a
-coordinator, see below), at most 2 consecutive edited critic passes (then one
-last review that cannot edit), no time limit, GPT 6.2 Sol at Max for every
+coordinator, see below), at most 2 consecutive edited critic passes (the
+second accepts its repaired proof), no time limit, GPT 6.2 Sol at Max for every
 proof role, the built-in prompts, Standard speed and concise reasoning
 summaries.
 
@@ -68,14 +68,14 @@ python3 web_ui.py statement.md --author-model gpt-6-astra --speed-mode standard
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `-criticRounds N` | `2` | Maximum consecutive edited critic passes; then one last critic round that cannot edit must pass the latest solution unchanged or reject it. `1` to `100`. An unchanged pass accepts at once. A rejection returns to the author and resets the count. |
-| `-criticCount N` | `3` | Independent critics the critic starts as its subagents on each proof version before it decides: `1` to `10`. Every round, including the last one that cannot edit, starts this many fresh critics. |
+| `-criticRounds N` | `2` | Maximum consecutive edited critic passes; an edited pass at the limit accepts the latest repaired solution. `1` to `100`. An unchanged pass accepts at once. A rejection (a critical error the critic cannot fix) returns to the author and resets the count. |
+| `-criticCount N` | `3` | Independent critics the critic starts as its subagents on each proof version before it decides: `1` to `10`. Every round starts this many fresh critics. |
 | `-authorSubagents N` | `3` | Author subagents, `0` to `10`. With `1` or more the proof author is a coordinator that runs up to N author subagents at a time (see above); `0` gives it no subagent tool, and it works alone. |
 | `-authorSubagentModels JSON` | the author's model | The model of each author subagent: a JSON list of exactly `-authorSubagents` entries `{"model": MODEL, "effort": LEVEL}`, with any model `-authorModel` accepts, for example `'[{"model": "gpt-6.1-sol", "effort": "max"}, {"model": "claude-opus-5-5", "effort": "high"}, {"model": "gpt-6-astra", "effort": "max"}]'`. Omitted: every author subagent runs the author's model and reasoning. Not with a web cutoff. |
 | `-goalLoop LOOP` | `tcs` | Who runs a Codex author's goal loop: `tcs`, TCS Prover (it sends the editable goal continuation after every turn that did not end the goal, and the author ends it with `update_goal`), or `codex`, Codex's built-in goal mode. Claude Code authors always run TCS Prover's loop. |
 | `-thinkingHours HOURS` | `0` | Time limit in hours of the job's active work: `0` (the default) for none, or any positive number. Reaching it stops the proof author; the critic and LaTeX steps after a submission always finish, so an accepted proof is never cut off. Saved work is kept. |
 | `-authorModel MODEL` | `gpt-6.2-sol` | Author model: Codex CLI `gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, or `gpt-6-luna`; Claude Code `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`; or a discovered model's `api:<id>` selection from **Models & API → API connections**. The older `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` are still accepted so saved runs and scripts keep working, but the web page no longer lists them. |
-| `-criticModel MODEL` | `gpt-6.2-sol` | Critic model (it also runs the convention critic); same choices as the author. |
+| `-criticModel MODEL` | `gpt-6.2-sol` | Critic model; same choices as the author. |
 | `-writerModel MODEL` | `gpt-6.2-sol` | LaTeX writer model; same choices as the author. |
 | `-reasoningEffort LEVEL` | `max` | Fallback reasoning for all three roles: `low`, `medium`, `high`, `xhigh`, or `max`. The retired `ultra` is still accepted and runs as `max`. |
 | `-authorEffort LEVEL` | shared effort | Only the author's reasoning. |
@@ -147,9 +147,9 @@ This loads the saved complete proof, checked statement and role prompts into a
 new job in the web page, with fresh critics. Its author, should the critic send
 the proof back, keeps the saved job's Author subagents and the way that author
 worked, unless you give `-authorSubagents`. An unchanged pass goes on to the
-LaTeX editor; edited passes repeat up to the maximum, then one last round that
-cannot edit must pass the proof unchanged; a rejection returns the candidate and
-the bug report to the author's normal repair loop.
+LaTeX editor; edited passes repeat up to the maximum, where the latest repaired
+proof is accepted; a rejection returns the candidate and the bug report to the
+author's normal repair loop.
 
 ## Reading a transcript
 

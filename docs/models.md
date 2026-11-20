@@ -4,8 +4,7 @@ Every role (statement reviewer, proof author, critic, LaTeX writer) runs through
 one of two programs on your computer: the **Codex CLI** (the default) or
 **Claude Code**. They provide the author's conversation and every model call.
 GPT 6.2 Sol at Max reasoning and Standard speed is the default for every role (GPT 6.2 needs the Codex CLI
-0.170 or later: older versions refuse it with a ChatGPT sign-in),
-and the critic's choice also covers the convention critic. The author
+0.170 or later: older versions refuse it with a ChatGPT sign-in). The author
 coordinator's subagents run the coordinator's model, or with **Subagent models →
 Choose for each** a model of their own each, from the same sources (see
 [the author's team](workflow.md#the-authors-team)).

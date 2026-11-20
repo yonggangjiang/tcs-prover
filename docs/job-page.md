@@ -15,8 +15,8 @@ front only when it is not today (*14:05*, *19 Nov 22:32*); durations read
 ## Status
 
 The workflow rail always shows the whole workflow: Statement reviewer, Proof
-author, Independent critic, Convention critic and Writing & polishing (LaTeX
-editor, Compile PDF). Stages not selected for the run are muted. For an
+author, Independent critic and Writing & polishing (LaTeX editor, Compile
+PDF). Stages not selected for the run are muted. For an
 [author coordinator](workflow.md#the-author-coordinator), the Proof author step
 reads *Coordinates up to 3 author subagents and checks that progress keeps
 growing.* Each step that has worked shows on its right how long, without the
@@ -283,8 +283,8 @@ changing your Codex CLI or Claude Code login.
 **Stop** works like reaching the time limit. While the proof author works, it
 may finish its current step for up to 30 seconds (**Author stopping**); then its
 program is stopped and its conversation is kept. Pressing the button again
-(**Stop now**) stops it at once. During the statement review, the critic, the
-convention critic or the LaTeX steps, Stop ends that step at once.
+(**Stop now**) stops it at once. During the statement review, the critic or the
+LaTeX steps, Stop ends that step at once.
 
 Either way the job then shows **Stopped**, never Paused or Time limit reached.
 It keeps everything it saved, never continues by itself, takes no running slot
@@ -411,7 +411,7 @@ Every job keeps a record of its model calls in `.tcs-prover/records/<run
 folder>/`, apart from its run folder: what was sent to the model and what came
 back, for each request of every role (the statement reviewer, the author or
 coordinator and its replies and progress summaries, the critic and its
-independent critics, the convention critic, the LaTeX writer and its repairs,
+independent critics, the LaTeX writer and its repairs,
 and the coordinator's team members), with its model, tokens, timing and status.
 
 - **What it holds.** For the Codex CLI, Codex's own full trace: each request

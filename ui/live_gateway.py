@@ -37,8 +37,7 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 BATCH_WORKS_ROUTES = {'/batch-related-works', '/batch-related-works/add'}
 # Actions the earlier controller does not have.
 UPDATED_CONTROL_ROUTES = {'/related-works/add', '/ask-author', '/author-summary', '/stop-author-reply',
-                          '/answer-author-question', '/dismiss-author-question', '/dismiss-convention-warning',
-                          '/chat'}
+                          '/answer-author-question', '/dismiss-author-question', '/chat'}
 LEGACY_UNSUPPORTED = 'This job belongs to the earlier controller, which does not support this action.'
 MAX_DISCARDED_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024

@@ -2319,62 +2319,6 @@ kbd {
   white-space: pre-line;
 }
 .job-warning { max-width: 80ch; }
-/* The convention critic's loophole warning: a neutral card with the amber attention rule, the
-   suggested statement in a sunken well, and its actions. The run itself goes on. */
-.convention-warning {
-  display: grid;
-  gap: 6px;
-  padding: var(--space-4) var(--space-5);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  box-shadow: inset 3px 0 0 var(--waiting);
-}
-.convention-warning[hidden] { display: none; }
-.convention-warning h2 { font-size: var(--text-md); line-height: 1.4; }
-.convention-warning h2::before {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  margin-right: 9px;
-  border-radius: 1.5px;
-  background: var(--waiting);
-  content: "";
-  transform: rotate(45deg) translateY(-2px);
-}
-.convention-warning h3 { margin-top: var(--space-2); font-size: var(--text-sm); font-weight: 650; }
-.convention-warning-meta { color: var(--ink-3); font: 500 var(--text-xs)/1.5 var(--font-mono); }
-.convention-warning-text { max-width: 80ch; color: var(--ink); font-size: var(--text-sm); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
-.convention-warning-suggestion { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
-.convention-warning-suggestion h3 { margin-top: var(--space-2); }
-.convention-warning-statement {
-  max-height: 18rem;
-  overflow: auto;
-  margin: 0;
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  color: var(--ink);
-  background: var(--tint);
-  font: var(--text-sm)/1.6 var(--font-prose);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.convention-warning-note { margin-top: var(--space-1); color: var(--ink-2); font-size: var(--text-sm); }
-.convention-warning-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
-/* Job list: the warning stays visible until it is ignored on the job page. */
-.job-tags.job-loophole { color: var(--ink); font-weight: 600; }
-.job-tags.job-loophole::before {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  margin-right: 7px;
-  border-radius: 1px;
-  background: var(--waiting);
-  content: "";
-  transform: rotate(45deg);
-  vertical-align: 1px;
-}
 
 /* The now-card: what is happening and the controls for it. A firmer hairline sets it apart. */
 .run-view { display: flex; flex-direction: column; gap: var(--space-3); }
@@ -3101,22 +3045,8 @@ kbd {
   transform: translate(-50%, -50%) rotate(-90deg);
 }
 .critic-pass { grid-column: 1; grid-row: 2; margin: 0 0 0 50px; }
-/* The convention critic's step, between the accepted proof and Writing & polishing, which moves two rows down. */
-.convention-node { position: relative; grid-column: 1; grid-row: 3; margin-left: 40px; }
-.convention-node::before { position: absolute; z-index: 1; top: -1px; left: 10px; height: 15px; border-left: 1px solid var(--field-line); content: ""; }
-.convention-node .node-dot::before {
-  position: absolute;
-  top: -9px;
-  left: 5px;
-  width: 10px;
-  height: 8px;
-  background: var(--field-line);
-  clip-path: polygon(0 0, 100% 0, 50% 100%);
-  content: "";
-}
-.convention-route { grid-column: 1; grid-row: 4; margin-left: 50px; }
 /* Writing & polishing: the LaTeX editor and Compile PDF, in a group like the loop above it. */
-.workflow-loop.writing-group { grid-row: 5; margin-left: 28px; }
+.workflow-loop.writing-group { grid-row: 3; margin-left: 28px; }
 .group-nodes { margin: 0; padding: 0; list-style: none; }
 .group-nodes > .flow-arrow { margin-left: 10px; }
 
@@ -4338,7 +4268,7 @@ kbd {
 .jobs-status:empty { display: none; }
 .toggle-line { display: flex; align-items: center; gap: 9px; margin-top: var(--space-3); font-size: var(--text-sm); font-weight: 600; }
 .toggle-line input { flex: none; }
-:root[data-theme="ink"] :is(.attention-banner, .job-attention, .convention-warning) { box-shadow: inset 2px 0 0 var(--ink); }
+:root[data-theme="ink"] :is(.attention-banner, .job-attention) { box-shadow: inset 2px 0 0 var(--ink); }
 :root[data-theme="ink"] .api-models-problem { box-shadow: inset 2px 0 0 var(--ink); }
 :root[data-theme="ink"] .api-model-form[data-key-state="other-server"] .api-saved-key-row { box-shadow: inset 2px 0 0 var(--ink); }
 

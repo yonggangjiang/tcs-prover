@@ -5,8 +5,7 @@
 On macOS, and on Linux where bubblewrap works (see
 [Linux](#linux)), every model process of a run is confined to its own folders:
 the proof author (and its replies while paused), the critic and its subagents,
-the convention critic, the LaTeX writer and its repairs, and the statement
-reviewer. On Linux this holds for Codex roles; a Claude Code role's shell is not
+the LaTeX writer and its repairs, and the statement reviewer. On Linux this holds for Codex roles; a Claude Code role's shell is not
 confined there yet (see [Claude Code](#claude-code)).
 
 - **Read:** its workspace (the author's run folder, or for a continuation the
@@ -29,8 +28,8 @@ confined there yet (see [Claude Code](#claude-code)).
   Claude. On Linux, where Codex's sandbox can protect only an entry that
   exists, TCS Prover makes `related-works/` before the author starts, and a
   `pause.json` the run folder lacks can be created there (TCS Prover relies on
-  its own copy). The statement reviewer, the critic's final check and the paused
-  author's replies write nothing in their workspace. The author writes its
+  its own copy). The statement reviewer and the paused author's replies write
+  nothing in their workspace. The author writes its
   answers to your chat messages in `chat/` of its workspace.
 - **Neither:** other runs, the TCS Prover checkout and its private state, your
   home folder, other volumes, `/tmp`, `/var/tmp` and the shared temp folder. On
@@ -95,8 +94,7 @@ not been checked with these rules there), and the activity log says so: "On
 Linux run confinement covers Codex roles only; this run's Claude Code shell can
 read files outside its folder." Neither the file tools nor the shell can change the controller's files
 in the run folder, `related-works/` or the `.codex`, `.agents`, `.git` and `.aws`
-folders. The statement reviewer, the critic's subagents and the convention
-critic only read; the critic and the LaTeX writer also edit their own copy of
+folders. The statement reviewer and the critic's subagents only read; the critic and the LaTeX writer also edit their own copy of
 `proof.md` or `latex-source.tex`.
 
 ## Network
@@ -104,13 +102,11 @@ critic only read; the critic and the LaTeX writer also edit their own copy of
 In a live run (Web search cutoff off) every model process can reach the
 internet, Codex or Claude: the proof author and its subagents, its replies
 while paused and its progress summary, the statement reviewer, the critic with
-its independent critics and its final check, the convention critic, and the
-LaTeX writer and its repairs.
+its independent critics, and the LaTeX writer and its repairs.
 
 - **With a shell** a process reaches any host: the proof author, and with Codex
-  also the author's replies and summary, the critic and its subagents, its final
-  check, the convention critic, and the LaTeX writer and its repairs (on Linux
-  and Windows not the final check and the convention critic, see below).
+  also the author's replies and summary, the critic and its subagents, and the
+  LaTeX writer and its repairs.
 - **Without a shell** a process reaches the internet only through its web search
   tools: the statement reviewer, and with Claude every role but the proof author
   itself (its replies and summary included).
@@ -180,11 +176,7 @@ job records in `.tcs-prover/records/`, which hold every job's model calls.
 
 The Codex author, its replies and progress summary, the critic with its
 subagents, and the LaTeX writer and its repairs follow the same network rule as
-on macOS. Only the legacy read-only mode of Codex's one-off calls (`codex exec`)
-has no network setting, so the commands of the critic's final check (with its
-subagents) and of the convention critic stay offline there even in a live run;
-their native web search still works. Codex on these systems can also write to
-`related-works/`.
+on macOS. Codex on these systems can also write to `related-works/`.
 
 ## Outside the confinement
 

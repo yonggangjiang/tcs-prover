@@ -5,13 +5,17 @@ the statement reviewer, in ui/review.py; this module names them, groups them, sa
 placeholders it may use, and checks an edit as the runner checks it before a launch (workflow_runner.prompt_rules()).
 
 A catalog name is the key of a job's promptOverrides and promptSet. The per-job prompts that existed before keep their
-keys (review, author, coordinator, critic, convention, final); every other text uses its name in the workflow.
+keys (review, author, coordinator, critic, final); every other text uses its name in the workflow. Jobs from before
+may also hold a RETIRED text, which nothing uses any more.
 """
 
 GROUPS = ("Statement review", "Author", "Coordinator", "Goal loop", "Team", "Team tools", "Critic", "Writer", "Other")
 
 # Catalog names whose workflow prompt has another name, and the texts that live outside the workflows.
-WORKFLOW_NAMES = {"convention": "convention_critic"}
+WORKFLOW_NAMES = {}
+# Texts that jobs from before saved but that no step uses any more: the convention critic's (a step removed on
+# 20 Nov 2026). A job made from such a job leaves them out (problems() does not know them).
+RETIRED = frozenset({"convention"})
 REVIEW = "review"
 
 # (name, group, label, when it is used), in display order. A workflow prompt not listed here is shown in "Other".
@@ -116,12 +120,8 @@ ENTRIES = (
     ("team_tool_stop_member", "Team tools", "team_stop: member", "The description of team_stop's member."),
     ("critic", "Critic", "Critic instructions",
      "The critic's instructions in every critic round; {count} is the number of independent critics."),
-    ("critic_verify", "Critic", "Final verification",
-     "Added to the critic's instructions in its last round, when it may no longer edit the proof."),
     ("critic_input", "Critic", "Critic request",
      "Frames the critic's request: {instructions} and the {statement}."),
-    ("convention", "Critic", "Convention critic",
-     "The convention critic's prompt, once on the accepted proof; {statement} is the statement."),
     ("final", "Writer", "Writer instructions", "The instructions of the paper writer (Writing step)."),
     ("solution_input", "Writer", "Writer request",
      "Frames the writer's request: {instructions}, the {statement} and the {solution}."),

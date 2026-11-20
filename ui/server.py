@@ -150,6 +150,7 @@ AUTO_RESUME_SECONDS = runtime.MODEL_RETRY_SECONDS
 # clears when a model call succeeds.
 FAILING_ATTENTION_SECONDS = 15 * 60
 # The record kinds that end a step with its model's answer: a call of that stage that kept failing works again.
+# (convention_result: the convention critic's verdict, a step of jobs from before 20 Nov 2026.)
 STEP_RESULT_KINDS = {"review_result", "critic_result", "author_result", "final_result", "convention_result",
                      "conversation_reply"}
 # A failed model call's plain words (workflow_runner._FAILURE_PATTERNS) that only you can fix: listed at once under
@@ -201,7 +202,7 @@ MAX_CHAT_ANSWER_CHARS = 100_000
 CHAT_ANSWER_READ_BYTES = 4 * MAX_CHAT_ANSWER_CHARS + 4
 # The workflow steps in words, as the lists and the job page name where a job stopped.
 STEP_WORDS = {"statement_reviewer": "statement review", "author": "proof author", "critic": "critic",
-              "convention": "convention critic", "latex_editor": "LaTeX editor", "latex_compile": "PDF compilation",
+              "latex_editor": "LaTeX editor", "latex_compile": "PDF compilation",
               "latex_repair": "PDF compilation", "failure_summary": "failure summary"}
 # A statement review the user stopped returns to its input, which says how it runs again there: a first review
 # to the composer (Start workflow), a revision to the earlier review with the feedback (Retry with feedback).
@@ -212,7 +213,6 @@ STOPPED_CONTINUE_DESCRIPTIONS = {
     "author": "Continues the proof author in this same job, in its saved conversation. The time already used still "
               "counts.",
     "critic": "Runs the critic step again in this same job, on the same saved proof.",
-    "convention": "Runs the convention critic again in this same job, on the accepted proof.",
     "latex_editor": "Runs the LaTeX editor again in this same job, from the same accepted proof.",
     "latex_compile": "Compiles the saved LaTeX source again in this same job.",
     "latex_repair": "Compiles the saved LaTeX source again in this same job.",
@@ -231,8 +231,6 @@ CHAT_NOTE_REVIEWED = "The proof author starts after you approve the statement. Y
 CHAT_NOTE_PREPARED = "You can talk to the proof author once this job starts."
 CHAT_NOTE_CRITIC = ("The critic is reviewing the author's proof. If it sends the proof back, the author works again "
                     "and you can write to it then.")
-CHAT_NOTE_CONVENTION = ("The convention critic is checking the accepted proof. The proof author does not work again "
-                        "in this run.")
 CHAT_NOTE_LATEX = ("The accepted proof is being written up in LaTeX. The proof author does not work again in this "
                    "run.")
 CHAT_NOTE_OTHER = "Another step is working. You can talk to the proof author when it works again."
@@ -1580,8 +1578,6 @@ def default_prompts():
         "review": REVIEW_PROMPT,
         "author": author_critic["author"],
         "critic": author_critic["critic"],
-        # The convention critic's prompt (its own step after the critic accepts); a template with {statement}.
-        "convention": author_critic["convention_critic"],
         "final": runtime.builtin_workflow("clean_up")["prompts"]["final"],
         # The author coordinator's first prompt (its coordinator binding's); a template with {author_subagents}.
         # A workflow edited to bind none has none, which only a coordinator job needs (see _workflow_options).
@@ -1687,7 +1683,8 @@ def web_team_options(body, source=None):
 
     overrides = body.get("promptOverrides") if isinstance(body.get("promptOverrides"), dict) else {}
     saved = (source or {}).get("promptSet") if isinstance((source or {}).get("promptSet"), dict) else {}
-    texts = {name: text for name, text in {**saved, **overrides}.items() if name not in PROMPT_ROLES}
+    texts = {name: text for name, text in {**saved, **overrides}.items()
+             if name not in PROMPT_ROLES and name not in prompt_catalog.RETIRED}
     legacy = body.get("legacyTeam") is True or (source is not None and (
         source.get("goalLoopRecorded") is False or source.get("goalLoop") not in runtime.GOAL_LOOPS
         or source.get("legacyTeam") is True))
@@ -1829,6 +1826,7 @@ TRACE_LIMIT = 1500
 # the critic's independent critics) keep a window of their own, beside TRACE_LIMIT, so a busy team of subagents never
 # pushes the coordinator's own records out of the page's live window. transcript.jsonl keeps every record.
 SUBAGENT_TRACE_LIMIT = 300
+# A job from before 20 Nov 2026 can hold a convention_result: the verdict of its convention critic, a step since removed.
 PINNED_KINDS = {
     "request", "review_result", "critic_result", "author_result",
     "final_result", "failure_result", "partial_result", "diagnostic", "error", "convention_result",
@@ -1838,54 +1836,6 @@ PINNED_KINDS = {
 PINNED_LIMIT, PINNED_HEAD, PINNED_SLACK = 2000, 200, 500
 LASTING_KINDS = {"review_result", "critic_result", "author_result", "final_result", "failure_result",
                  "partial_result", "convention_result"}
-
-
-def convention_verdict(record):
-    """Whether one transcript record is a verdict of the convention critic (a root convention_result)."""
-
-    return isinstance(record, dict) and record.get("kind") == "convention_result" and record.get("root") is not False
-
-
-def convention_warning(record):
-    """The loophole warning one convention critic record raises, or None.
-
-    Only a verdict of loophole with its explanation and suggested statement
-    warns (a faithful verdict shows only in the critic review history). The
-    job keeps its latest verdict's warning: a later faithful verdict (on a
-    later accepted proof) closes an earlier warning. The warning keeps its
-    round and the record's time, which identify it: the user ignores this
-    very warning, and a later loophole verdict shows again.
-    """
-
-    if not convention_verdict(record):
-        return None
-    fields = {key: record.get(key) for key in ("intended", "assessment", "loophole", "suggestedStatement")}
-    if (record.get("verdict") != "loophole" or not all(isinstance(value, str) for value in fields.values())
-            or not fields["loophole"].strip() or not fields["suggestedStatement"].strip()):
-        return None
-    number = record.get("round")
-    return {"round": number if type(number) is int and number > 0 else None,
-            "time": record.get("time") if isinstance(record.get("time"), str) else "",
-            **fields, "dismissed": False}
-
-
-def saved_convention_warning(value):
-    """A loophole warning as job-settings.json saved it (convention_warning()), or None when it is not one."""
-
-    fields = ("time", "intended", "assessment", "loophole", "suggestedStatement")
-    if (not isinstance(value, dict) or not all(isinstance(value.get(key), str) for key in fields)
-            or not value["loophole"].strip() or not value["suggestedStatement"].strip()):
-        return None
-    number = value.get("round")
-    return {"round": number if type(number) is int and number > 0 else None,
-            **{key: value[key] for key in fields}, "dismissed": value.get("dismissed") is True}
-
-
-def same_convention_warning(saved, warning):
-    """Whether a saved warning (job-settings.json) is this warning, so its dismissal still applies."""
-
-    return (isinstance(saved, dict) and isinstance(warning, dict) and saved.get("dismissed") is True
-            and saved.get("time") == warning["time"] and saved.get("round") == warning["round"])
 
 
 def subagent_record(record):
@@ -2059,13 +2009,6 @@ PUBLIC_GRAPH = {
             "description": "One critic starts independent critics as its subagents, weighs their reports and fixes "
                            "the valid issues. Unfixable issues return to the author.",
         },
-        "convention": {
-            "label": "Convention critic", "short_label": "Convention",
-            "stage": "critic",
-            "description": "Checks once, after the critic accepts the proof and before writing, whether the proof "
-                           "does what a mathematician would want or exploits a loophole in the statement. It only "
-                           "warns; the run continues either way.",
-        },
         "latex_editor": {
             "label": "LaTeX editor", "short_label": "Polish", "stage": "final",
             "description": "Polishes the passing proof into a complete LaTeX document.",
@@ -2099,7 +2042,7 @@ PUBLIC_GRAPH = {
         {
             "from": "critic", "to": "critic",
             "label": "Recheck repair",
-            "when": "the critic fixes all bugs; at the round limit the recheck cannot edit",
+            "when": "the critic fixes all bugs, until the round limit, where the repaired proof is accepted",
             "prompt_change": "Send the repaired proof to the critic and new independent critics.",
         },
         {
@@ -2108,13 +2051,8 @@ PUBLIC_GRAPH = {
             "prompt_change": "Send unresolved bugs back to the proof author.",
         },
         {
-            "from": "critic", "to": "convention",
-            "label": "Check conventions", "when": "critic accepts the proof",
-            "prompt_change": "Send the accepted proof and the statement to the convention critic.",
-        },
-        {
-            "from": "convention", "to": "latex_editor",
-            "label": "Format reviewed proof", "when": "the convention critic has answered, whatever its verdict",
+            "from": "critic", "to": "latex_editor",
+            "label": "Format reviewed proof", "when": "critic accepts the proof",
             "prompt_change": "Send the independently reviewed solution to the LaTeX editor.",
         },
         {
@@ -2167,10 +2105,10 @@ REVIEW_ONLY_GRAPH = {
 WORKFLOW_STAGES = ("review", "author", "critic", "writing")
 STAGE_ROLES = {"review": "review", "author": "author", "critic": "critic", "writing": "writer"}
 ROLE_STAGES = {role: stage for stage, role in STAGE_ROLES.items()}
-PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "convention": "critic", "final": "writer",
+PROMPT_ROLES = {"review": "review", "author": "author", "critic": "critic", "final": "writer",
                 "coordinator": "author"}
 # The per-job prompts of the proof stages, saved as prompts/<name>.txt and passed as --<name>-prompt-file.
-PROOF_PROMPTS = ("author", "critic", "convention", "final", "coordinator")
+PROOF_PROMPTS = ("author", "critic", "final", "coordinator")
 
 
 def recorded_author_mode(author_subagents, requested=None):
@@ -2269,14 +2207,14 @@ def workflow_graph(stages):
     if stages["author"]:
         enabled.append("author")
     if stages["critic"]:
-        enabled.extend(("critic", "convention"))
+        enabled.append("critic")
     if stages["writing"]:
         enabled.extend(("latex_editor", "latex_compile", "latex_repair"))
     nodes = {name: PUBLIC_GRAPH["nodes"][name] for name in enabled}
     if stages["author"] or stages["critic"]:
         nodes["failure_summary"] = PUBLIC_GRAPH["nodes"]["failure_summary"]
     edges = [edge for edge in PUBLIC_GRAPH["edges"] if edge["from"] in nodes and edge["to"] in nodes]
-    sequence = [name for name in ("statement_reviewer", "author", "critic", "convention", "latex_editor")
+    sequence = [name for name in ("statement_reviewer", "author", "critic", "latex_editor")
                 if name in nodes]
     for previous, following in zip(sequence, sequence[1:]):
         if not any(edge["from"] == previous and edge["to"] == following for edge in edges):
@@ -2453,8 +2391,6 @@ def empty_state(trace=None, trace_version=0):
         "pauseCause": "",
         # The critic rejected the latest proof and the paused author has not received its report.
         "criticFeedbackPending": False,
-        # The latest loophole warning of the convention critic (see convention_warning), or None.
-        "conventionWarning": None,
         # A conversation turn compacted the author's context: the next Resume sends the full resume prompt.
         "pendingReanchor": False,
         # Related works added while paused; the author is told with the next message or at Resume.
@@ -2478,7 +2414,6 @@ def empty_state(trace=None, trace_version=0):
         "reviewPrompt": prompts["review"],
         "authorPrompt": prompts["author"],
         "criticPrompt": prompts["critic"],
-        "conventionPrompt": prompts["convention"],
         "finalPrompt": prompts["final"],
         "coordinatorPrompt": prompts["coordinator"],
         "criticRounds": DEFAULT_CRITIC_ROUNDS,
@@ -3629,7 +3564,7 @@ class App:
             "sourceFile", "apiModels", "replacedRoles", "launchQueued", "queuedAt", "launchError",
             "goalThreadId", "goalWorkspace", "goalResume", "authorSteerDelivered", "elapsedSeconds", "resumedAt",
             "authorRepairDelivered", "pendingReanchor", "relatedWorksPending", "folderBatch", "authorQuestion",
-            "timeLimitHistory", "conventionWarning", "resumeQueuedAt",
+            "timeLimitHistory", "resumeQueuedAt",
             "goalLoop", "authorSubagentModels", "authorTeam", "legacyTeam", "apiWebSearch",
         )
         # The solver rechecks historical settings while UI events persist
@@ -4245,7 +4180,7 @@ class App:
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
         review_model=DEFAULT_REVIEW_MODEL, review_effort=None,
         review_prompt=None, include_review=True,
         speed_mode=DEFAULT_SPEED,
@@ -4288,7 +4223,7 @@ class App:
         reasoning_summary = str(reasoning_summary or "")
         supplied_prompts = {
             "review": review_prompt, "author": author_prompt,
-            "critic": critic_prompt, "convention": convention_prompt, "final": final_prompt,
+            "critic": critic_prompt, "final": final_prompt,
             "coordinator": coordinator_prompt,
         }
         defaults = default_prompts()
@@ -4344,11 +4279,6 @@ class App:
             except ValueError as exc:
                 raise ValueError(f"The critic prompt cannot be used ({exc}). Write {{count}} where the number of "
                                  "independent critics goes, and double any other brace: {{ and }}.") from exc
-            try:
-                runtime._template_parts(prompts["convention"], {"statement", "instructions"})
-            except ValueError as exc:
-                raise ValueError(f"The convention critic prompt cannot be used ({exc}). Write {{statement}} where "
-                                 "the statement goes, and double any other brace: {{ and }}.") from exc
         try:
             critic_rounds = runtime.critic_limit(critic_rounds) if stages["critic"] else DEFAULT_CRITIC_ROUNDS
         except runtime.Error as exc:
@@ -4441,8 +4371,7 @@ class App:
             ),
             "authorPrompt": prompts["author"],
             "criticPrompt": prompts["critic"],
-            "conventionPrompt": prompts["convention"],
-            "finalPrompt": prompts["final"],
+                "finalPrompt": prompts["final"],
             "coordinatorPrompt": prompts["coordinator"],
             "criticRounds": critic_rounds,
             "criticCount": critic_count,
@@ -4466,7 +4395,7 @@ class App:
         review_effort=None, author_effort=None,
         critic_effort=None, writer_effort=None,
         review_prompt=None, author_prompt=None,
-        critic_prompt=None, final_prompt=None, convention_prompt=None,
+        critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         review_only=False,
@@ -4513,7 +4442,7 @@ class App:
             author_effort = DEFAULT_REASONING_EFFORT
             critic_effort = DEFAULT_REASONING_EFFORT
             writer_effort = DEFAULT_REASONING_EFFORT
-            author_prompt = critic_prompt = final_prompt = convention_prompt = coordinator_prompt = None
+            author_prompt = critic_prompt = final_prompt = coordinator_prompt = None
             critic_rounds = DEFAULT_CRITIC_ROUNDS
             critic_count = DEFAULT_CRITIC_COUNT
             author_subagents = DEFAULT_AUTHOR_SUBAGENTS
@@ -4532,7 +4461,6 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
-            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             review_model=review_model,
             review_effort=review_effort,
@@ -4875,7 +4803,7 @@ class App:
             author_effort=state["authorEffort"], critic_effort=state["criticEffort"],
             writer_effort=state["writerEffort"], review_prompt=state["reviewPrompt"],
             author_prompt=state["authorPrompt"], critic_prompt=state["criticPrompt"],
-            convention_prompt=state.get("conventionPrompt"), coordinator_prompt=state.get("coordinatorPrompt"),
+            coordinator_prompt=state.get("coordinatorPrompt"),
             final_prompt=state["finalPrompt"], speed_mode=state["speedMode"],
             reasoning_summary=state["reasoningSummary"], workflow_stages=saved_workflow_stages(state),
             original_content=state.get("originalContent"), source_file=state.get("sourceFile"),
@@ -6682,7 +6610,7 @@ class App:
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         continuation_source="", stopped_stage="",
@@ -6747,7 +6675,6 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
-            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
@@ -7024,7 +6951,7 @@ class App:
         writer_model=DEFAULT_WRITER_MODEL,
         reasoning_effort=DEFAULT_REASONING_EFFORT,
         author_effort=None, critic_effort=None, writer_effort=None,
-        author_prompt=None, critic_prompt=None, final_prompt=None, convention_prompt=None,
+        author_prompt=None, critic_prompt=None, final_prompt=None,
         speed_mode=DEFAULT_SPEED,
         reasoning_summary=DEFAULT_REASONING_SUMMARY,
         retrieval_mode="live", retrieval_cutoff_utc="",
@@ -7054,7 +6981,6 @@ class App:
             writer_effort=writer_effort,
             author_prompt=author_prompt,
             critic_prompt=critic_prompt,
-            convention_prompt=convention_prompt,
             final_prompt=final_prompt,
             speed_mode=speed_mode,
             reasoning_summary=reasoning_summary,
@@ -7295,12 +7221,6 @@ class App:
                 self._follow_failures(record)
                 self._follow_coordinator_warnings(entry)
                 self._follow_author_question(record)
-                if convention_verdict(entry):
-                    # The latest verdict decides: a new loophole verdict shows again, whatever the user did
-                    # with an earlier one, and a faithful verdict on a later accepted proof closes it.
-                    with self.lock:
-                        self.state["conventionWarning"] = convention_warning(entry)
-                        self._save_job_settings(self.state)
                 if (record.get("kind") == "critic_result" and record.get("root") is not False
                         and isinstance(record.get("report"), dict) and record["report"].get("verdict") == "reject"):
                     critic_feedback = True
@@ -7623,7 +7543,7 @@ class App:
         While the proof author works, the first Stop lets it finish its current step for up to the runner's
         interrupt grace (the pause mechanism, cause "stopped"); a second Stop, a Stop while it pauses, and
         ``at_once`` (the terminal's Ctrl-C) stop it at once. Either way its saved conversation is kept and
-        nothing resumes by itself. The statement review, the critic, the convention critic and the LaTeX steps
+        nothing resumes by itself. The statement review, the critic and the LaTeX steps
         stop at once and are rebuilt from their saved input, as after a restart. When the records of a stop in
         place cannot be written, the job ends as stopped, as in earlier versions: never is a runner left working.
         """
@@ -8040,23 +7960,6 @@ class App:
                 "turnEnded": question["turnEndedAt"] is not None,
                 "closesAt": question["askedAt"] + AUTHOR_QUESTION_WAIT_SECONDS}
 
-    def dismiss_convention_warning(self, identity=None):
-        """Ignore the convention critic's loophole warning; a later round's new warning shows again.
-
-        ``identity`` is the time of the warning the page showed: a newer one
-        that replaced it meanwhile is not ignored by that click.
-        """
-
-        with self.lock:
-            self._check_owned_here()
-            warning = self.state.get("conventionWarning")
-            if not isinstance(warning, dict) or warning.get("dismissed"):
-                raise ValueError("There is no loophole warning to ignore.")
-            if identity is not None and identity != warning.get("time"):
-                raise ValueError("A newer loophole warning replaced the one you ignored; it is shown now.")
-            self.state["conventionWarning"] = {**warning, "dismissed": True}
-            self._save_job_settings(self.state)
-
     # --- Time limit ----------------------------------------------------------------------------------------------
 
     def _time_limit_exhausted_locked(self, elapsed=None):
@@ -8178,7 +8081,7 @@ class App:
                                                     go="continue" if cause in {"stopped", "time-limit"} else "resume")
             return CHAT_NOTE_HELD_AFTER.format(held=held, step=STEP_WORDS.get(node, "current"))
         if phase == "running":
-            return (CHAT_NOTE_CRITIC if node == "critic" else CHAT_NOTE_CONVENTION if node == "convention"
+            return (CHAT_NOTE_CRITIC if node == "critic"
                     else CHAT_NOTE_LATEX if node in {"latex_editor", "latex_compile", "latex_repair"}
                     else CHAT_NOTE_OTHER)
         return {"reviewing": CHAT_NOTE_REVIEWING, "reviewed": CHAT_NOTE_REVIEWED, "prepared": CHAT_NOTE_PREPARED,
@@ -9608,13 +9511,12 @@ def restore_record(record):
         return {"kind": kind}
     if kind == "status" and record.get("label") in {"Critic approved", "Stop requested", "Statement review failed"}:
         return {key: record.get(key) for key in ("kind", "stage", "label", "node", "time", "text", "stopInPlace")}
-    if kind == "convention_result":
-        # The convention critic answered: its step is over (see interrupted_stage_checkpoint).
-        return {key: record.get(key) for key in ("kind", "stage", "round", "verdict", "time")}
     return None
 
 
 # Steps that start again from their exact saved input when a restart interrupts them.
+# (The convention critic of a job from before 20 Nov 2026, a step since removed, continues as the critic step that
+# had accepted the proof: with writing, or not at all.)
 INTERRUPTIBLE_NODES = {"critic", "convention", "latex_editor", "latex_compile", "latex_repair"}
 
 
@@ -9687,7 +9589,7 @@ def interrupted_stage_checkpoint(run_dir, node, state, records, running=None):
 
     try:
         if node in {"critic", "convention"}:
-            author = critic = approved = convention = None
+            author = critic = approved = None
             for index, record in enumerate(records):
                 if record.get("kind") == "author_result":
                     author = index
@@ -9695,30 +9597,14 @@ def interrupted_stage_checkpoint(run_dir, node, state, records, running=None):
                     critic = (index, record)
                 elif record.get("kind") == "status" and record.get("label") == "Critic approved":
                     approved = index
-                elif record.get("kind") == "convention_result":
-                    convention = index
-            latest = max((index for index in (author, critic[0] if critic else None, approved, convention)
+            latest = max((index for index in (author, critic[0] if critic else None, approved)
                           if index is not None), default=None)
-            if latest is not None and latest == convention:
-                # The convention critic answered just before the runner ended: the LaTeX editor is next,
-                # when the writing stage is selected.
+            if latest is not None and latest == approved:
+                # The critic approved the proof just before the runner ended: the LaTeX editor is next, when the
+                # writing stage is selected.
                 if not state["workflowStages"]["writing"]:
                     return None
                 return interrupted_stage_checkpoint(run_dir, "latex_editor", state, records)
-            if latest is not None and latest == approved:
-                # The critic approved the proof just before the runner ended, or the convention critic was
-                # interrupted: it checks the accepted proof again.
-                report = critic[1].get("report") if critic is not None else None
-                accepted = report.get("solution") if isinstance(report, dict) else None
-                if not isinstance(accepted, str) or not accepted.strip():
-                    accepted = interrupted_critic_candidate(run_dir, records)
-                if not accepted.strip():
-                    return None
-                return {"node": "convention", "stage": "critic",
-                        "state": {"statement": saved_statement(run_dir), "solution": accepted.strip(),
-                                  "output": accepted.strip(), "round": critic[1].get("round") if critic else None},
-                        "error": "The convention critic was interrupted when its process ended; it checks the "
-                                 "accepted proof again automatically."}
             report = critic[1].get("report") if critic is not None and latest == critic[0] else None
             if isinstance(report, dict) and report.get("verdict") == "reject":
                 # The critic rejected the proof just before the runner ended: the author repairs it,
@@ -9806,8 +9692,6 @@ def restore_saved_app(app, *, owned=True):
 
     settings_path = controlled_path(run_dir, JOB_SETTINGS_FILENAME)
     persisted_settings = set()
-    # The loophole warning as last saved: whether the user ignored it (the transcript holds the warning itself).
-    saved_warning = None
     # Roles whose saved model was removed (DeepSeek) and now runs as its replacement.
     replaced_roles, settings_warnings = set(), []
     settings_unreadable = False
@@ -9898,7 +9782,6 @@ def restore_saved_app(app, *, owned=True):
                     state["authorSubagentModels"] = team_module.validated_team(settings.get("authorSubagentModels"))
                 except ValueError:
                     state["authorSubagentModels"] = None
-            saved_warning = settings.get("conventionWarning")
     except FileNotFoundError:
         pass
     except (OSError, UnicodeError, ValueError, RecursionError):
@@ -10035,13 +9918,6 @@ def restore_saved_app(app, *, owned=True):
         kept = restore_record(record)
         if kept is not None:
             relevant.append(kept)
-        if convention_verdict(record):
-            # The latest verdict's warning (None after a faithful one); an ignored one stays ignored
-            # (see same_convention_warning).
-            warning = convention_warning(record)
-            if warning is not None:
-                warning["dismissed"] = same_convention_warning(saved_warning, warning)
-            state["conventionWarning"] = warning
         if record.get("kind") == "request" or str(record.get("label", "")).startswith("Workflow step: "):
             ended_with_error = False
         goal_thread = goal_thread_from_record(record)
@@ -10633,7 +10509,6 @@ def saved_critic_source(path):
         "solution": solution,
         "author_prompt": prompts["author"],
         "critic_prompt": prompts["critic"],
-        "convention_prompt": prompts["convention"],
         "final_prompt": prompts["final"],
         "coordinator_prompt": prompts["coordinator"],
     }
@@ -10917,12 +10792,11 @@ class Server(ThreadingHTTPServer):
     # waits in phase input or reviewed).
     SETUP_LIVE_PHASES = {"reviewing", "reviewed", "prepared", "running", "pausing", "stopping", "paused"}
     # The stages still ahead of a job at a step (PUBLIC_GRAPH): the critic sends a rejected proof back to the author,
-    # the convention critic (the critic's model) passes to the writer whatever it says, and the LaTeX steps only
-    # repeat each other. At another step (the statement review, or none yet), and in a phase before the run (a
+    # and the LaTeX steps only repeat each other. At another step (the statement review, or none yet), and in a phase before the run (a
     # statement review, a queued job), every stage is ahead.
     SETUP_STEP_PHASES = {"running", "pausing", "stopping", "paused"}
     SETUP_STAGES_AHEAD = {"author": {"author", "critic", "writing"}, "critic": {"author", "critic", "writing"},
-                          "failure_summary": {"author", "critic", "writing"}, "convention": {"critic", "writing"},
+                          "failure_summary": {"author", "critic", "writing"},
                           "latex_editor": {"writing"}, "latex_compile": {"writing"}, "latex_repair": {"writing"}}
 
     def _setup(self):
@@ -11797,7 +11671,6 @@ class Server(ThreadingHTTPServer):
             critic_prompt=settings.get(
                 "criticPrompt", source["critic_prompt"]
             ),
-            convention_prompt=settings.get("conventionPrompt", source["convention_prompt"]),
             final_prompt=settings.get("finalPrompt", source["final_prompt"]),
             coordinator_prompt=settings.get("coordinatorPrompt", source.get("coordinator_prompt")),
             speed_mode=settings.get("speedMode", DEFAULT_SPEED),
@@ -11840,7 +11713,6 @@ class Server(ThreadingHTTPServer):
             writer_effort=options.get("writerEffort"),
             author_prompt=options.get("authorPrompt"),
             critic_prompt=options.get("criticPrompt"),
-            convention_prompt=options.get("conventionPrompt"),
             final_prompt=options.get("finalPrompt"),
             coordinator_prompt=options.get("coordinatorPrompt"),
             speed_mode=options.get("speedMode", DEFAULT_SPEED),
@@ -12602,7 +12474,6 @@ class Server(ThreadingHTTPServer):
                 review_prompt=source_state["reviewPrompt"],
                 author_prompt=source_state["authorPrompt"],
                 critic_prompt=source_state["criticPrompt"],
-                convention_prompt=source_state.get("conventionPrompt"),
                 final_prompt=source_state["finalPrompt"],
                 coordinator_prompt=source_state.get("coordinatorPrompt"),
                 review_only=source_state["statementReviewOnly"],
@@ -12626,7 +12497,6 @@ class Server(ThreadingHTTPServer):
                 "writer_effort": source_state["writerEffort"],
                 "author_prompt": source_state["authorPrompt"],
                 "critic_prompt": source_state["criticPrompt"],
-                "convention_prompt": source_state.get("conventionPrompt"),
                 "final_prompt": source_state["finalPrompt"],
                 "coordinator_prompt": source_state.get("coordinatorPrompt"),
                 "workflow_stages": {**source_state["workflowStages"], "review": False},
@@ -12716,9 +12586,6 @@ class Server(ThreadingHTTPServer):
             job["authorQuestionOpen"] = bool(state.get("authorQuestion"))
             # Why the job needs you (it keeps retrying meanwhile when it can), and when it tries next.
             job["needsAttention"] = state.get("needsAttention")
-            # The convention critic's loophole warning, until the user ignores it.
-            warning = state.get("conventionWarning")
-            job["loopholeWarning"] = isinstance(warning, dict) and not warning.get("dismissed")
             job["autoResumeAt"] = state.get("autoResumeAt") or 0
             retry = state.get("modelRetry") if isinstance(state.get("modelRetry"), dict) else {}
             job["retryAt"] = retry.get("retryAt") or 0
@@ -13711,8 +13578,6 @@ class Handler(BaseHTTPRequestHandler):
                 app.stop_author_reply(body.get("id"))
             elif request.path == "/related-works/add":
                 app.add_related_works(body.get("uploads"), self.server._uploads())
-            elif request.path == "/dismiss-convention-warning":
-                app.dismiss_convention_warning(body.get("time"))
             elif request.path == "/stop":
                 app.stop()
             elif request.path == "/pause":

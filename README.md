@@ -85,9 +85,7 @@ and `irm https://claude.ai/install.ps1 | iex`.
    every text it sends, editable for the next job.
 3. **Critic.** A critic starts independent critics (3 by default) that hunt for
    bugs, fixes what it can, and sends critical errors back to the author.
-4. **Convention critic.** Checks once that the accepted proof does what you most
-   likely meant, and warns if it exploits a loophole.
-5. **Writing.** A LaTeX writer turns the proof into a paper and compiles the PDF.
+4. **Writing.** A LaTeX writer turns the proof into a paper and compiles the PDF.
 
 Each stage can be turned off. On the job page, **Talk to the author** sends the
 author messages and shows its answers; **Pause** and **Resume** hold and
@@ -102,7 +100,7 @@ retried every minute, without limit.
 | Guide | What it covers |
 | --- | --- |
 | [Models and API connections](docs/models.md) | The Setup page, Codex CLI, Claude Code, API keys, which program each model needs |
-| [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, the convention critic, LaTeX |
+| [The workflow](docs/workflow.md) | Statement review, the author and the author coordinator, the critic, LaTeX |
 | [The job page](docs/job-page.md) | Status, the progress log, the chat, Pause, Summary, Stop, the time limit, related works, downloads, the model calls, the Records page |
 | [Batches and folder runs](docs/batches.md) | Batches, related works shared with every problem in a batch, running a folder of statements, the running-jobs limit |
 | [Saved settings](docs/saved-settings.md) | Default settings, which new problems open with, and named New problem settings, under **Advanced settings** |

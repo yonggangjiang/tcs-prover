@@ -979,8 +979,7 @@ def context_cache_arguments():
 
 # The per-job prompts a launch passes as --<role>-prompt-file, and the workflow prompt each replaces (the
 # coordinator's is the first prompt of the author coordinator, see author_mode()).
-PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "convention": "convention_critic", "final": "final",
-                       "coordinator": "coordinator"}
+PROMPT_FILE_OPTIONS = {"author": "author", "critic": "critic", "final": "final", "coordinator": "coordinator"}
 
 
 def prompt_file(path, default):
@@ -2670,7 +2669,7 @@ def structured_limits(features, subagents=None):
     """The agent settings of one structured `codex exec` call: subagent_limits(), and for a call without the
     multi_agent feature also Codex's agents off (agents.enabled = false).
 
-    The statement reviewer, the convention critic, the LaTeX editor and its repair start no subagent. Without that
+    The statement reviewer, the LaTeX editor and its repair start no subagent. Without that
     setting Codex 0.160 still offers a model of multi-agent version 2 (GPT 6.x) its collaboration tools there, and
     only the session limit of one thread refuses a spawn. The critic, which starts its independent critics as Codex
     subagents, keeps them. A web-cutoff call's preflight checks these same settings (retrieval_environment()).
@@ -4065,20 +4064,16 @@ def run_structured_attempt(
 # The record's labels of each workflow node's model calls: role (as the model-calls list names it) by node name; any
 # other node is named by itself. Its label is the node's activity or request label, else RECORD_LABELS' name for the
 # node (the LaTeX steps of workflows/clean_up.yaml name none), else the node's name.
-RECORD_ROLES = {"critic": "critic", "convention": "convention critic", "latex_editor": "latex editor",
-                "latex_repair": "latex repair"}
+RECORD_ROLES = {"critic": "critic", "latex_editor": "latex editor", "latex_repair": "latex repair"}
 RECORD_LABELS = {"latex_editor": "LaTeX editor", "latex_repair": "LaTeX repair"}
 _RECORD_PROBLEM_SAID = []
 
 
 def _record_round(node, visit, state):
-    """The round of a workflow step's model calls in the record's labels, as the activity log names it: the convention
-    critic checks the critic's latest round (its result reads "Convention critic · round <n>"); a LaTeX repair has
-    none (it is reached from the compiler, so each repair is a first visit); any other step's is its visit (the
+    """The round of a workflow step's model calls in the record's labels, as the activity log names it: a LaTeX repair
+    has none (it is reached from the compiler, so each repair is a first visit); any other step's is its visit (the
     critic's visit is its round)."""
 
-    if node == "convention":
-        return state.get("round") if isinstance(state.get("round"), int) else None
     return None if node == "latex_repair" else visit
 
 
@@ -9552,7 +9547,7 @@ def _capture_unreviewed_proof(workflow, state, options):
         if snapshot is not None:
             candidate = snapshot.text
         state[handoff["candidate"]] = state["output"] = candidate
-        # The critic and the convention critic share the submission: it is captured once.
+        # The submission is captured once.
         return
 
 

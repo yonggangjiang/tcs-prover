@@ -312,7 +312,7 @@ class BatchCatalog:
         return sorted(cards, key=lambda card: (not card['current'], card['id'] != ORIGINAL_BATCH, card['label']))
 
     def _summary(self, directory):
-        from .server import saved_convention_warning, saved_workflow_stages
+        from .server import saved_workflow_stages
 
         # Controller state is read whole: a paused job must never look finished.
         settings = self._json(directory, 'job-settings.json', None)
@@ -351,8 +351,6 @@ class BatchCatalog:
                        and not (failed and failed.st_size) and _text(pause.get('status')) == 'running')
         # Why a paused job paused (the time limit, the user, an error, ...), as the live job page says it.
         cause = _text(pause.get('pauseCause')) if phase == 'paused' else ''
-        # The convention critic's loophole warning as the job saved it; the list tags it until it was ignored.
-        warning = saved_convention_warning(settings.get('conventionWarning'))
         return {'runId': directory.name, 'phase': phase, 'draft': draft, 'title': draft.split('\n', 1)[0],
                 'sourceFile': _text(settings.get('sourceFile')), 'startedAt': started,
                 'lastActivityAt': last_activity, 'finishedAt': last_activity,
@@ -370,7 +368,6 @@ class BatchCatalog:
                                else 'needs-revision' if failed and settings.get('revisionRequired') is True
                                else 'failure' if failed and failed.st_size else
                                'review' if settings.get('resultKind') == 'review' else ''),
-                'conventionWarning': warning, 'loopholeWarning': bool(warning and not warning['dismissed']),
                 'settingsWarning': '', 'launchHold': _text(settings.get('launchHold')),
                 'retrieval': retrieval, 'retrievalMode': retrieval['mode'],
                 'retrievalCutoffUtc': retrieval['cutoffExclusiveUtc'], 'retrievalPolicyPath': '',

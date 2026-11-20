@@ -23,9 +23,8 @@ flowchart TD
     A -- "continue research" --> A
     A -- "complete candidate" --> C["Critic + its independent critics"]
     C -- "reject: exact bugs and reset rounds" --> A
-    C -- "edited pass: next round, read-only at the maximum" --> C
-    C -- "accepted proof" --> V["Convention critic (warns only)"]
-    V --> L["LaTeX editor"]
+    C -- "edited pass: next round, accepted at the maximum" --> C
+    C -- "accepted proof" --> L["LaTeX editor"]
     L --> T["Compile PDF"]
     T -- "compilation errors" --> F["Minor LaTeX fixes"]
     F --> T
@@ -46,7 +45,7 @@ role's model and reasoning (see [Models and API connections](models.md)) and:
 | Author subagents | 3 | 0 to 10. 1 or more: an [author coordinator](#the-author-coordinator) runs up to that many author subagents at a time. 0: one author works alone, with no subagent tool. |
 | Subagent models | Same as the coordinator | With 1 or more author subagents. **Choose for each** gives each author subagent its own model and reasoning: a Codex CLI, Claude Code or API connection model, as the roles offer. See [the author's team](#the-authors-team). |
 | Independent critics | 3 | Fresh critics the critic starts on each proof version, 1 to 10. |
-| Maximum consecutive critic rounds | 2 | Edited passes in a row before the final check, 1 to 100. |
+| Maximum consecutive critic rounds | 2 | Edited passes in a row, 1 to 100; at the limit the latest repaired proof is accepted. |
 | Time limit in hours | 0 (none) | See [the job page](job-page.md#time-limit-and-progress-summary). |
 | Generation speed | Standard | **Fast** applies to Codex CLI models only. |
 | Activity log detail | Concise summaries | **Status only**, or concise or detailed public summaries of the models' reasoning. Private chain-of-thought is never shown or saved. |
@@ -80,15 +79,11 @@ the file is fixed.
   summaries (**Progress summary**, **Coordinator progress summary**) have no
   placeholders but are filled in like the others, so a brace is written twice
   there too, and **Reply to a message** has only `{message}`; any other text
-  without placeholders (a tool description, **Final verification**, **Related
-  works**) is sent as written, braces included. The
+  without placeholders (a tool description, **Related works**) is sent as
+  written, braces included. The
   edits apply to the job you are about to start only: they are never remembered
   in the browser, carried into the next new problem or kept in
-  [saved settings](saved-settings.md). **Rerun with suggested statement** takes
-  along the texts that were edited for the job (those that still differ from
-  today's defaults); its other texts were the defaults of its day and give way
-  to today's. A job that saved no record of its edits (one from before) takes
-  along every text it saved that differs from today's defaults.
+  [saved settings](saved-settings.md).
 - **Each job keeps its texts.** A new job saves the whole set it runs with (the
   defaults and your edits) in its folders, and beside it which of them you
   edited, and reads its own copy every time it starts, resumes or continues, so
@@ -393,8 +388,7 @@ replies `PROOF_FILE: proof.md`.
   on every computer.
 - **Snapshot.** Before review, TCS Prover captures the file and gives every
   critic call `proof.md`, `statement.md` and a manifest with SHA-256 hashes in a
-  fresh workspace of its own. The critic's subagents and the convention critic
-  only read that snapshot.
+  fresh workspace of its own. The critic's subagents only read that snapshot.
 - **Refused before review:** a missing, linked, unsafe, non-UTF-8, empty or
   larger-than-8-MiB proof file, a proof larger than 8 MiB or than the critic
   model's context window (when its settings record one), and a `PROOF_FILE` in
@@ -430,17 +424,16 @@ plain explanation, never turned into a rejection.
 **Rounds.**
 - An unchanged pass (a **clean pass**) accepts the proof at once.
 - A **pass with fixes** sends the new version to another round with fresh
-  critics, up to **Maximum consecutive critic rounds** (default 2). At that
-  maximum, one more round reviews the latest version read-only (the **final
-  check**): it passes it unchanged or rejects it. Unreviewed edits are never
-  accepted.
+  critics, up to **Maximum consecutive critic rounds** (default 2). A pass with
+  fixes in the last round accepts that repaired version ("Reached MAX (2 rounds);
+  using the latest repaired proof."); the edits of that round are not reviewed
+  again.
 - A rejection returns the latest safely repaired candidate and the exact
   unresolved bugs to the author and resets the count. With the author off, the
   job ends as **Proof needs revision**, keeping the candidate and the objections.
   Writing never starts from a rejected proof.
 - An interrupted round (a pause, **Stop**, a crash or a restart) runs again from
-  its saved input as the same round, with new subagents; an interrupted final
-  check stays read-only. A continuation in a new job starts a fresh critic.
+  its saved input as the same round, with new subagents. A continuation in a new job starts a fresh critic.
 - Model review is not formal proof verification.
 
 **Failed subagents.** Codex reports a failed subagent of version-1 models (such
@@ -456,9 +449,10 @@ log says so.
 submission of the author into a review cycle. Each round shows the critic's one
 decision (**Clean pass**, **Pass with fixes** or **Rejected**), what it fixed,
 the critical bugs, and for a round that changed the proof a collapsed **Show
-changes to the proof** with the diff. The round that accepted the proof also
-shows the **Convention critic**. The critic's exact input and raw decision stay
-below, collapsed. The independent critics' own reports are not shown: the critic
+changes to the proof** with the diff. The critic's exact input and raw decision
+stay below, collapsed. (A job started before 20 Nov 2026 may also show the
+verdict of its **Convention critic**, a step since removed, under the round that
+accepted the proof.) The independent critics' own reports are not shown: the critic
 reads them and makes the one decision.
 
 - A round interrupted and resumed stays one round, marked **resumed**. A paused
@@ -483,8 +477,8 @@ reads them and makes the one decision.
 
 Only the critic and, with **Author subagents** 1 or more, the author (an author
 coordinator, or the author of a job from before coordinator mode) have
-subagents; the statement reviewer, the convention critic, the LaTeX writer and
-the paused author's replies have none.
+subagents; the statement reviewer, the LaTeX writer and the paused author's
+replies have none.
 
 An author coordinator with [TCS Prover's team](#the-authors-team) has exactly
 N members, each working on one assignment at a time (`team_assign` refuses a
@@ -498,7 +492,7 @@ Checked with Codex 0.160 against a local stand-in for the model API:
 | `features.multi_agent_v2.max_concurrent_threads_per_session` = N + 1 | Version-2 models (GPT 6.x, GPT 5.6 Sol and Terra): at most N subagents at once, counting subagents of subagents ("agent thread limit reached"). A call without subagents gets N = 0: with `multi_agent` off Codex still lists its collaboration tools to these models, unless `agents.enabled` is false (below). |
 | `agents.max_concurrent_threads_per_session` = N, `agents.max_depth` = 1 | Version-1 models (API models and others): at most N subagents at once, and subagents get no subagent tool. |
 | `features.multi_agent_v2.multi_agent_mode_hint_text` | Replaces Codex's "Do not spawn sub-agents unless the user … explicitly ask …" hint with one that allows up to N subagents without asking; the author coordinator's hint also says that delegating is its task, that waiting for its subagents is part of its work, and that each starts fresh. |
-| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement reviewer, the convention critic, the LaTeX writer and its repair (a `-c` flag), and the thread of an author that works alone or with TCS Prover's team. Its model is offered none of Codex's collaboration tools. |
+| `agents.enabled` = false | A Codex process that starts no subagent of Codex: the statement reviewer, the LaTeX writer and its repair (a `-c` flag), and the thread of an author that works alone or with TCS Prover's team. Its model is offered none of Codex's collaboration tools. |
 
 On version-2 models the author coordinator also gets
 `features.multi_agent_v2.default_wait_timeout_ms` = 1800000, so its waits for
@@ -524,40 +518,6 @@ process, and the isolation check refuses any other agent setting.
 They read the snapshot with shell tools, with outside file access, networking,
 native search and MCP turned off. There the snapshot stays read-only, and the
 critic returns the complete proof in its answer.
-
-## The convention critic
-
-Once the critic has accepted a proof and the run is about to hand it to
-**Writing & polishing** (or, without writing, just before the run ends), the
-convention critic checks the accepted proof once, exactly what the writer
-receives, together with the statement. Rejected rounds and passes that go on to
-another round never run it.
-
-It guesses what a conventional mathematician or theoretical computer science
-researcher wants from the statement, and judges whether the proof does that or
-"cheats" by exploiting a loophole in the problem description, such as a
-brute-force construction that stores all answers. It is its own workflow step
-(`convention` in `workflows/author_critic.yaml`): a read-only call with the
-critic's model and reasoning and the critic's sandbox, network and web-cutoff
-rules, without subagents. Its prompt is `convention_critic`; the prompt editor's
-**Convention critic** tab changes it for one job.
-
-Its verdict never changes the route: the run continues to writing, or to the
-end, once it has answered. A failed call is retried every minute, and a run
-paused or interrupted in this step runs it again on resume.
-
-- **loophole**: a warning at the top of the job page says how the proof exploits
-  the statement and suggests a statement (with **Copy**). **Rerun with suggested
-  statement** opens the New problem page with that statement and this job's
-  settings, with the **Author** stage on, in the job's batch while that batch
-  takes problems; it starts nothing. **Ignore** dismisses the warning. Until then
-  the job list tags the job **Loophole warning**.
-- **faithful**: shown only in the critic review history, under the round that
-  accepted the proof. A faithful verdict on a later accepted proof closes an
-  earlier warning.
-
-The latest verdict, its round and whether it was ignored survive restarts; a
-saved (read-only) batch shows them too, without **Ignore**.
 
 ## LaTeX writing
 

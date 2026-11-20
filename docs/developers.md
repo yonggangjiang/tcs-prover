@@ -14,7 +14,7 @@ too old.
 web_ui.py                   Web page and terminal-run launcher (uses the checkout's .venv)
 workflow_runner.py          Graph engine, model transport and workflow CLI
 workflows/
-  author_critic.yaml        Author, critic and convention critic: prompts, response shapes, logic
+  author_critic.yaml        Author and critic: prompts, response shapes, logic
   clean_up.yaml             LaTeX writing: prompts, response shape, logic
 runner/
   providers.py              Model registry and the private API model store
@@ -143,15 +143,14 @@ the entry point.
   [The author coordinator](#the-author-coordinator)).
 - Every structured call of Codex runs without Codex's goals feature
   (`--disable goals`, `structured_tool_arguments()`): the statement reviewer,
-  the critic with its independent critics, the convention critic, and the LaTeX
-  editor and repair. Codex 0.160's `codex exec` otherwise offers the call and
+  the critic with its independent critics, and the LaTeX editor and repair. Codex 0.160's `codex exec` otherwise offers the call and
   the subagents it starts Codex's goal tools (`create_goal`, `get_goal`,
   `update_goal`), which start Codex's goal mode inside a one-shot call (checked
   with the real Codex against a scripted model server). A web-cutoff call gets
   the same flag; its isolation check (the preflight's `config/read`) is
   unchanged, and the historical discovery call had the feature off already.
-- A structured call of Codex without subagents (the statement reviewer, the
-  convention critic, and the LaTeX editor and repair) also has Codex's agents
+- A structured call of Codex without subagents (the statement reviewer, and the
+  LaTeX editor and repair) also has Codex's agents
   off (`-c agents.enabled=false`, `structured_limits()`). Without it Codex 0.160
   offered GPT 6.1 Sol its collaboration tools (`spawn_agent`, `wait_agent`, ...)
   and its multi-agent instructions there too, where only the session limit of
@@ -163,7 +162,7 @@ the entry point.
   the structured role and of a critic snapshot passes, and `--strict-config`
   accepts the flag.
 - A structured node with `proof_handoff` gets the proof snapshot as read-only
-  files (the convention critic uses this without `edit`). With `edit` and
+  files. With `edit` and
   `proof_handoff` its result also has `proofChanged` and `proofDiff` (or, for a
   long diff, `proofDiffFile` and `proofDiffNote`).
 - Bundled nodes declare `workflow_stage: author`, `critic` or `writing`, plus a
@@ -504,8 +503,9 @@ that every prompt and tool text is the user's to adjust. What the code does:
 - **Each job keeps its texts.** A new job records `promptSet` (every catalog
   text after the user's edits) in `prompts/prompt-set.json` of its controller
   and run folders; every launch rewrites the controller's copy from the job's
-  state and passes `--prompt-set-file` (catalog names; the runner maps
-  `convention` to `convention_critic`), reply turns and the writer included, and
+  state and passes `--prompt-set-file` (catalog names; a job from before may
+  hold the retired `convention` text, which nothing uses), reply turns and the
+  writer included, and
   chat messages use the job's `chat` text. A job from before has no `promptSet`
   (`goalLoopRecorded: false`) and reads the live workflow, as before. Beside the
   set, `promptEdits` (`prompts/prompt-edits.json`, `job_prompt_edits()`) keeps
@@ -847,7 +847,7 @@ writes a job's record, `ui/model_calls.py` reads it.
   `index.jsonl`; a pack member is written and synced before its index line);
   `codex/<label>/process.json` (who the process was: role, node, round, label,
   member, model; the round as the activity log names it, so the critic's visit,
-  the critic round the convention critic checks, and none for a LaTeX repair,
+  and none for a LaTeX repair,
   `workflow_runner._record_round()`; the label the node's activity or request
   label, else `RECORD_LABELS`' "LaTeX editor" and "LaTeX repair" for the LaTeX
   steps, which name none, as the Model calls list also names an older record's
@@ -864,7 +864,7 @@ writes a job's record, `ui/model_calls.py` reads it.
   (`workflow_runner._record_codex()`): the author's or coordinator's
   app-server, each reply and summary turn's, every structured `codex exec` call
   (statement reviewer, critic with its independent critics, which share its
-  bundle, convention critic, LaTeX editor and repair) and every team member's.
+  bundle, LaTeX editor and repair) and every team member's.
   Codex 0.160 then writes the exact request bodies (system prompt, tools, full
   input, schema, settings), the output items (encrypted reasoning included),
   response and request ids, usage, the code cells with each nested tool call's

@@ -607,8 +607,8 @@
                       step="1" value="2" aria-describedby="roundHelp">
                     <p id="roundHelp" class="help">
                       Default 2. An unchanged PASS proceeds at once; an edited PASS repeats until
-                      the limit, then a last review that cannot edit must pass the proof unchanged.
-                      Unfixable issues return to the author and reset the count.
+                      the limit, where the latest repaired proof is accepted. Only a critical error
+                      the critic cannot fix returns to the author, and resets the count.
                     </p>
                   </div>
                   <div id="criticCountSetting" class="field">
@@ -904,24 +904,6 @@
             <p id="runSettingsWarning" class="job-warning" role="status" hidden></p>
             <p id="runAttention" class="job-warning job-attention-note" role="status" hidden></p>
           </header>
-
-          <!-- The convention critic's latest loophole warning (state.conventionWarning) until the user ignores it. -->
-          <section id="conventionWarning" class="convention-warning" aria-labelledby="conventionWarningTitle" role="status" hidden>
-            <h2 id="conventionWarningTitle">Convention critic: the proof may exploit a loophole in the problem statement</h2>
-            <p id="conventionWarningRound" class="convention-warning-meta"></p>
-            <h3>How it exploits the statement:</h3>
-            <p id="conventionWarningLoophole" class="convention-warning-text"></p>
-            <div class="convention-warning-suggestion">
-              <h3>Suggested statement:</h3>
-              <button id="conventionWarningCopy" class="ghost compact" type="button">Copy</button>
-            </div>
-            <pre id="conventionWarningStatement" class="convention-warning-statement"></pre>
-            <p class="convention-warning-note">Consider rerunning with a statement that says what you want. This is only a warning: the run continues as normal.</p>
-            <div class="convention-warning-actions">
-              <button id="conventionWarningRerun" class="secondary" type="button">Rerun with suggested statement</button>
-              <button id="conventionWarningIgnore" class="ghost" type="button">Ignore</button>
-            </div>
-          </section>
 
           <!-- Statement review: the decision first, the evidence beside it. -->
           <section id="reviewPanel" class="review-view card" aria-labelledby="reviewHeading" hidden>
