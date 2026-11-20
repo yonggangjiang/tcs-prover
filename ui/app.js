@@ -984,7 +984,7 @@ function teamText(count, labels) {
 }
 
 function retryText(job) {
-  const at = (seconds) => new Date(seconds * 1000).toLocaleTimeString();
+  const at = (seconds) => timeText(seconds * 1000, { seconds: true });
   if (job.phase === "paused" && job.autoResumeAt > 0) return `Automatic retry at ${at(job.autoResumeAt)}`;
   if (job.phase === "prepared" && job.launchQueued && job.autoResumeAt > 0) {
     return `Next start attempt at ${at(job.autoResumeAt)}`;
@@ -1003,9 +1003,13 @@ function renderJobs(jobs) {
       ...job, retrieval: retrievalSummary({ ...job, retrieval }),
       lastActivityAt: job.phase === "done" ? lastActivityAt : "",
     }))]);
-  if (ui.jobsList.dataset.signature === signature) return;
+  if (ui.jobsList.dataset.signature === signature) {
+    renderJobActiveTimes(jobs);
+    return;
+  }
   ui.jobsList.dataset.signature = signature;
   ui.jobsList.replaceChildren();
+  jobActiveNodes.clear();
   const tally = {};
   for (const job of jobs) {
     // Jobs stopped at their time limit or by you are counted apart from paused and finished ones (see jobTone).
@@ -1053,16 +1057,21 @@ function renderJobs(jobs) {
       : labels[job.phase] || job.phase;
     const times = document.createElement("small");
     times.className = "job-times";
-    const localTime = (value) => value
-      ? new Date(value).toLocaleString([], {
-        year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit", second: "2-digit",
-      }) : "—";
     const finished = job.finishedAt
       || (job.phase === "done" ? job.lastActivityAt : "");
     times.textContent = queued ? "Queued · starts when a running slot is free"
       : job.phase === "prepared" ? "Prepared research workspace · No model session started"
-      : `Started ${localTime(job.startedAt)}${finished ? ` · Finished ${localTime(finished)}` : ""}`;
+      // To the second, so that jobs of the same title stay apart.
+      : `Started ${localDateTime(job.startedAt, { seconds: true })}`
+        + (finished ? ` · Finished ${localDateTime(finished, { seconds: true })}` : "");
+    if (!queued && job.phase !== "prepared") {
+      // The time the job's models worked, pauses left out (written by renderJobActiveTimes at every update).
+      const active = document.createElement("span");
+      active.className = "job-active";
+      active.title = "Active time: how long the job's models have worked, without the time it was paused or stopped";
+      times.append(active);
+      jobActiveNodes.set(job.runId, active);
+    }
     copy.append(title, status);
     // The running author asked something; the job page shows the question (answering is optional).
     if (job.authorQuestionOpen) {
@@ -1145,7 +1154,7 @@ function renderJobs(jobs) {
         const checkpointMeta = document.createElement("small");
         checkpointMeta.className = "checkpoint-meta";
         checkpointMeta.textContent = `${checkpoint.status || "ready"} · `
-          + localTime(checkpoint.completedAt);
+          + localDateTime(checkpoint.completedAt);
         const checkpointDescription = document.createElement("small");
         checkpointDescription.className = "checkpoint-description";
         checkpointDescription.textContent = checkpoint.description || "";
@@ -1200,6 +1209,21 @@ function renderJobs(jobs) {
     actions.append(open, separate, continueButton, resume, remove);
     item.append(copy, actions);
     ui.jobsList.append(item);
+  }
+  renderJobActiveTimes(jobs);
+}
+
+// Each job card's active time (activeElapsedSeconds), written at every update of the list without rebuilding it:
+// " · Active 3h 7m". jobActiveNodes holds the card's place for it, by run ID.
+const jobActiveNodes = new Map();
+
+function renderJobActiveTimes(jobs) {
+  for (const job of jobs) {
+    const node = jobActiveNodes.get(job.runId);
+    if (!node) continue;
+    const text = Number.isFinite(job.activeElapsedSeconds) && job.activeElapsedSeconds > 0
+      ? ` · Active ${durationText(job.activeElapsedSeconds)}` : "";
+    if (node.textContent !== text) node.textContent = text;
   }
 }
 
@@ -2066,21 +2090,9 @@ function openJobPrompts() {
   return openPromptEditor({ job: true });
 }
 
+// A time with seconds, as the activity cards show it (see timeText): "22:32:24", "19 Nov 22:32:24".
 function clockText(date) {
-  return date
-    ? new Date(date).toLocaleTimeString([], {
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-    })
-    : "";
-}
-
-function elapsedText(start, end = Date.now(), previousSeconds = 0) {
-  if (!start) return "";
-  const seconds = Math.max(0, Math.floor(previousSeconds + (new Date(end) - new Date(start)) / 1000));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const rest = seconds % 60;
-  return hours ? `${hours}h ${minutes}m` : `${minutes}m ${String(rest).padStart(2, "0")}s`;
+  return timeText(date, { seconds: true });
 }
 
 function nodeFromStage(stage) {
@@ -2750,11 +2762,41 @@ function limitSettingText(hours) {
     : "No time limit";
 }
 
-function localDateTime(value) {
-  return value ? new Date(value).toLocaleString([], {
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  }) : "—";
+// Times and durations look the same on every page. A time: a 24-hour clock in this browser's time zone, with the day
+// in front only when it is not today: "22:32", "19 Nov 22:32", "14 Nov 2025 08:40" (with seconds "22:32:24").
+// ``value`` is an ISO time, a Date or milliseconds; "" for none or an unreadable one.
+function timeText(value, { seconds = false } = {}) {
+  if (value === null || value === undefined || value === "") return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (number) => String(number).padStart(2, "0");
+  const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}${seconds ? `:${pad(date.getSeconds())}` : ""}`;
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) return clock;
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][date.getMonth()];
+  const day = `${date.getDate()} ${month}`;
+  return date.getFullYear() === now.getFullYear() ? `${day} ${clock}` : `${day} ${date.getFullYear()} ${clock}`;
+}
+
+// A duration: "45s", "12m 05s", "3h 7m", "2d 4h", "3d".
+function durationText(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60), hours = Math.floor(total / 3600);
+  if (!hours) return `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
+  return hours < 48 ? `${hours}h ${minutes % 60}m` : `${Math.floor(hours / 24)}d${hours % 24 ? ` ${hours % 24}h` : ""}`;
+}
+
+// How long ago, from a number of seconds: "just now", "45s ago", "2m 05s ago", "3h 7m ago", "2d 4h ago"; to the
+// minute ("just now", "12m ago") for a line that is not written again every second.
+function ageText(seconds, { minutes = false } = {}) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < (minutes ? 60 : 2)) return "just now";
+  return `${minutes && total < 3600 ? `${Math.floor(total / 60)}m` : durationText(total)} ago`;
+}
+
+function localDateTime(value, { seconds = false } = {}) {
+  return timeText(value, { seconds }) || "—";
 }
 
 function runElapsedSeconds() {
@@ -2768,11 +2810,7 @@ function runElapsedSeconds() {
   return Number(state.elapsedSeconds || 0) + Math.max(0, (new Date(end) - new Date(start)) / 1000);
 }
 
-function durationText(seconds) {
-  const total = Math.max(0, Math.floor(seconds));
-  const hours = Math.floor(total / 3600), minutes = Math.floor(total / 60) % 60;
-  return hours ? `${hours}h ${minutes}m` : `${minutes}m ${String(total % 60).padStart(2, "0")}s`;
-}
+
 
 // The time limit's history as the server records it (state.timeLimitHistory, oldest first): a change
 // of the limit, a pause at it, the progress summary written at that pause, and the Resume after it.
@@ -4083,7 +4121,15 @@ function renderWorkflow() {
     copy.className = "node-copy";
     const title = document.createElement("strong");
     title.textContent = item.label;
-    copy.append(title);
+    // The step's name, and on its right the time it has worked (renderStepTimes writes it).
+    const head = document.createElement("div");
+    head.className = "node-head";
+    const spent = document.createElement("span");
+    spent.className = "node-time";
+    spent.dataset.step = name;
+    spent.title = "Time this step has worked, pauses left out";
+    head.append(title, spent);
+    copy.append(head);
     if (position?.node === name) {
       // "Now", "Paused here", "Stopped here" (at the time limit), "Ended here" or where it waits, with the
       // step or the reason.
@@ -4286,6 +4332,30 @@ function renderWorkflow() {
   ui.workflowNodes.replaceChildren(reviewer, approved, branch);
   // Only an attached, open list can scroll, so restore its position after the swap.
   if (criticHistoryList) criticHistoryList.scrollTop = criticHistoryScroll;
+  renderStepTimes();
+}
+
+// How long step ``name`` has worked, pauses left out: the server's count up to the state it sent (state.stepTimes,
+// see follow_step_times), and since then for the step that works now. A LaTeX repair counts as Compile PDF.
+function stepSeconds(name) {
+  const times = state.stepTimes;
+  if (!times || typeof times.seconds !== "object" || !times.seconds) return 0;
+  const parts = name === "latex_compile" ? ["latex_compile", "latex_repair"] : [name];
+  let total = parts.reduce((sum, part) => sum + (Number(times.seconds[part]) || 0), 0);
+  if (times.running && parts.includes(times.node) && ["reviewing", "running", "stopping", "pausing"].includes(state.phase)) {
+    total += Math.max(0, Date.now() - stateReceivedAt) / 1000;
+  }
+  return total;
+}
+
+// Each Workflow step's time ("3h 7m"; nothing for a step that has not worked), written every second while the page's
+// clock runs (renderClock), without rebuilding the rail.
+function renderStepTimes() {
+  for (const node of ui.workflowNodes?.querySelectorAll?.(".node-time") || []) {
+    const seconds = stepSeconds(node.dataset.step);
+    const text = seconds >= 1 ? durationText(seconds) : "";
+    if (node.textContent !== text) node.textContent = text;
+  }
 }
 
 // Where the run stands on the workflow rail: the step working now, the step it waits or is paused at,
@@ -4384,7 +4454,7 @@ function criticStepText() {
 // Why a paused job (or one stopped at its time limit) stopped where it did, in plain words.
 function pauseCauseText() {
   const retry = state.autoResumeAt > 0
-    ? `; it retries by itself at ${new Date(state.autoResumeAt * 1000).toLocaleTimeString()}` : "";
+    ? `; it retries by itself at ${timeText(state.autoResumeAt * 1000, { seconds: true })}` : "";
   const error = String(state.error || "").trim().replace(/\.$/, "");
   if (state.pauseCause === "time-limit") {
     const reached = (Array.isArray(state.timeLimitHistory) ? state.timeLimitHistory : [])
@@ -4410,7 +4480,7 @@ function renderClock() {
       (Date.now() - new Date(state.lastActivityAt)) / 1000
     ));
     const working = ["reviewing", "running", "stopping", "pausing"].includes(state.phase);
-    const age = ago < 2 ? "just now" : `${durationText(ago)} ago`;
+    const age = ageText(ago);
     const activity = working && state.processAlive
       ? `Local process running · last public event ${age}`
       : `Last public event ${age}`;
@@ -4422,6 +4492,8 @@ function renderClock() {
   }
   renderActivityAge();
   renderAuthorLimitHint();
+  // The working step's time counts up (see renderStepTimes).
+  if (typeof renderStepTimes === "function") renderStepTimes();
 }
 
 // The now-card says whether a working job is stuck: when its last event arrived and, while a failed
@@ -4434,9 +4506,9 @@ function renderActivityAge() {
   const ago = state.lastActivityAt ? Math.max(0, Math.floor((Date.now() - new Date(state.lastActivityAt)) / 1000)) : NaN;
   const text = !working ? "" : [
     retry ? `Waiting to retry ${retryWaitText(retry)} (retries every minute`
-      + (Number.isFinite(since.getTime()) ? ` since ${since.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : ")")
+      + (Number.isFinite(since.getTime()) ? ` since ${timeText(since)})` : ")")
       : "",
-    Number.isFinite(ago) ? `Last activity ${ago < 2 ? "just now" : `${durationText(ago)} ago`}` : "",
+    Number.isFinite(ago) ? `Last activity ${ageText(ago)}` : "",
   ].filter(Boolean).join(" · ");
   if (ui.runActivityAge.textContent !== text) ui.runActivityAge.textContent = text;
   ui.runActivityAge.hidden = !text;
@@ -4630,7 +4702,7 @@ function render(next) {
   }
   if (phase === "paused" && state.autoResumeAt) {
     // While the author replies, the automatic retry waits for the reply (a reply that keeps failing is stopped).
-    const retryTime = new Date(state.autoResumeAt * 1000).toLocaleTimeString();
+    const retryTime = timeText(state.autoResumeAt * 1000, { seconds: true });
     ui.runDescription.textContent += replyBusy && state.autoResumeAt * 1000 <= Date.now()
       ? " The automatic retry follows the author's reply. Choose Keep paused to cancel retries."
       : ` Automatic retry at ${retryTime}. Choose Keep paused to cancel retries.`;
@@ -4639,7 +4711,7 @@ function render(next) {
   if (["reviewing", "running"].includes(phase) && state.modelRetry?.text && !state.error) {
     const next = Number(state.modelRetry.retryAt);
     ui.runDescription.textContent = state.modelRetry.text
-      + (Number.isFinite(next) && next > 0 ? ` Next attempt at ${new Date(next * 1000).toLocaleTimeString()}.` : "");
+      + (Number.isFinite(next) && next > 0 ? ` Next attempt at ${timeText(next * 1000, { seconds: true })}.` : "");
   }
   show(ui.roundBadge, Boolean(state.round && ["critic", "author"].includes(state.activeNode)));
   ui.roundBadge.textContent = roundBadgeText(state);
@@ -4840,9 +4912,7 @@ function userStopDescription(canTalk) {
 
 // Conversation times are epoch seconds; "" when unknown.
 function conversationClock(value, seconds = false) {
-  const date = new Date(typeof value === "number" ? value * 1000 : value || NaN);
-  if (!value || !Number.isFinite(date.getTime())) return "";
-  return seconds ? date.toLocaleTimeString() : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return value ? timeText(typeof value === "number" ? value * 1000 : value, { seconds }) : "";
 }
 
 // A byte count as the server writes it (related_works.size_text): "512 B", "3.4 KB", "5.0 MB".
@@ -5228,11 +5298,8 @@ function renderProgressLog() {
   // When the coordinator last changed the file: epoch seconds (or milliseconds), or an ISO time.
   const raw = progress?.updatedAt;
   const updated = typeof raw === "number" ? (raw > 1e11 ? raw : raw * 1000) : Date.parse(raw ?? "");
-  const minutes = Number.isFinite(updated) ? Math.floor(Math.max(0, Date.now() - updated) / 60000) : NaN;
-  const ago = !Number.isFinite(minutes) ? "" : minutes < 1 ? "updated just now"
-    : minutes < 60 ? `updated ${minutes} min ago`
-    : minutes < 48 * 60 ? `updated ${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""} ago`
-    : `updated ${Math.floor(minutes / 1440)} days ago`;
+  const seconds = Number.isFinite(updated) ? Math.max(0, Date.now() - updated) / 1000 : NaN;
+  const ago = Number.isFinite(seconds) ? `updated ${ageText(seconds, { minutes: true })}` : "";
   const meta = ["Written by the author coordinator in memory/progress.md", ago].filter(Boolean).join(" · ");
   if (ui.progressLogMeta.textContent !== meta) ui.progressLogMeta.textContent = meta;
   show(ui.progressLogMeta, Boolean(progress));
@@ -5279,14 +5346,8 @@ function renderProgressLog() {
 // The local times at which the versions of the progress log were saved ({at: an ISO time}, oldest first): "14:45:35",
 // or "13 Nov 23:10:02" for a day other than today. An entry without a readable time is left out.
 function progressLogVersionTimes(versions) {
-  const today = new Date().toDateString();
   return (Array.isArray(versions) ? versions : []).map((entry) => Date.parse(entry?.at ?? ""))
-    .filter((time) => Number.isFinite(time)).map((time) => {
-      const date = new Date(time);
-      const clock = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-      return date.toDateString() === today ? clock
-        : `${date.toLocaleDateString([], { day: "numeric", month: "short" })} ${clock}`;
-    });
+    .filter((time) => Number.isFinite(time)).map((time) => timeText(time, { seconds: true }));
 }
 
 // Fetch the text of the progress log of ``job`` (the job on screen), whose state names version ``asked``, then draw
@@ -7471,9 +7532,7 @@ function noteApiFormEdit() {
   if (apiShownTest) showApiResult("stale", "Connection details changed", "Test this connection again.");
 }
 function apiTestTime(value) {
-  const date = new Date(value);
-  return Number.isFinite(date.getTime())
-    ? date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  return timeText(value);
 }
 
 function renderApiModels() {
@@ -9481,7 +9540,7 @@ function renderSetup() {
   // failed, never "Checking…" that goes on).
   const parts = store.checking ? ["Checking…"] : !data ? [store.error ? "Could not check" : "Checking…"] : [
     ...["codex", "claude", "latex"].map((program) => setupMetaPart(program, data.programs?.[program], store.tasks[program])),
-    `checked ${data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}`];
+    `checked ${data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }) : "—"}`];
   if (store.missing) parts.splice(0, parts.length);
   const meta = parts.join("|");
   if (els.meta.dataset.key !== meta) {

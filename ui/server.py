@@ -691,6 +691,50 @@ def follow_author_mode(effective, record):
                 "reason": str(record.get("text") or "")}
     return effective
 
+# The records that start a job's runner again after it waited (the gap before one is never work), and those after
+# which it waits (follow_step_times).
+STEP_START_LABELS = frozenset({"Resume requested", "Historical run continued", "Automatic resume",
+                               "Queued job started"})
+STEP_END_LABELS = frozenset({"Author paused", "Author stopped", "Author stopped for safety", "Stop requested"})
+STEP_END_KINDS = frozenset({"final_result", "failure_result", "workflow_result", "review_result"})
+
+
+def follow_step_times(times, record):
+    """How long each workflow step has worked, after one more transcript record (in the transcript's order).
+
+    {"seconds": {node: seconds}, "node": the step working now, "running": whether it works, "at": the epoch time
+    of the last record}. A step works from its "Workflow step: <node>" record (or the Resume that continues it,
+    or the statement review's first record) to the next step's. The time the job waits is left out: after the
+    author paused or stopped, a Stop, or a final, failure or review result, until a step works again, and always
+    the gap before a record that starts the runner again (a restart that ended a runner leaves no record of its
+    own). The paused author's replies and related-works notes neither start nor end a step. The job page adds the
+    seconds since "at" to the working step while the job runs.
+    """
+
+    if not isinstance(record, dict) or controller_note(record):
+        return times
+    try:
+        moment = datetime.fromisoformat(str(record.get("time"))).timestamp()
+    except ValueError:
+        return times
+    previous = times if isinstance(times, dict) and isinstance(times.get("seconds"), dict) else {
+        "seconds": {}, "node": "", "running": False, "at": None}
+    seconds, node, running = dict(previous["seconds"]), previous.get("node") or "", previous.get("running") is True
+    label = record.get("label") if record.get("kind") == "status" and record.get("root") is not False else None
+    start = label in STEP_START_LABELS
+    at = previous.get("at")
+    if running and node and isinstance(at, (int, float)) and not start:
+        seconds[node] = seconds.get(node, 0.0) + max(0.0, moment - at)
+    if isinstance(label, str) and label.startswith("Workflow step: ") and isinstance(record.get("node"), str):
+        node, running = record["node"], True
+    elif start:
+        node, running = (record.get("node") if isinstance(record.get("node"), str) and record["node"] else node), True
+    elif record.get("stage") == "review" and record.get("root") is not False and record.get("kind") != "review_result":
+        node, running = "statement_reviewer", True
+    if label in STEP_END_LABELS or (record.get("kind") in STEP_END_KINDS and record.get("root") is not False):
+        running = False
+    return {"seconds": seconds, "node": node, "running": running, "at": moment}
+
 
 def saved_time_limit_history(value):
     """The valid events of a saved time-limit history, oldest first ([] when it is damaged)."""
@@ -2486,6 +2530,8 @@ def empty_state(trace=None, trace_version=0):
         # While a critic round runs: its independent critics, those finished, and whether the
         # coordinator was asked (see follow_critic_progress).
         "criticProgress": None,
+        # How long each workflow step has worked, pauses left out (see follow_step_times); None before a record.
+        "stepTimes": None,
         "stage": "",
         "activeNode": "",
         "round": 0,
@@ -3922,6 +3968,7 @@ class App:
             self.state["criticProgress"] = follow_critic_progress(self.state.get("criticProgress"), entry,
                                                                   self.state.get("criticCount"))
             self.state["authorModeEffective"] = follow_author_mode(self.state.get("authorModeEffective"), entry)
+            self.state["stepTimes"] = follow_step_times(self.state.get("stepTimes"), entry)
             history = self.state.setdefault("timeLimitHistory", [])
             if follow_time_limit(history, entry) and self.run_dir:
                 # Saved batches read only recent records: the job settings keep the whole history.
@@ -4029,6 +4076,14 @@ class App:
             state["workerActive"] = self.has_active_worker()
             state["processAlive"] = bool(self.process is not None and self.process.poll() is None)
             state["activeElapsedSeconds"] = self._elapsed_seconds()
+            # The working step's time runs up to now (the job page counts on from here; see follow_step_times).
+            times = state.get("stepTimes")
+            if (isinstance(times, dict) and times.get("running") and times.get("node")
+                    and isinstance(times.get("at"), (int, float)) and state["phase"] in ACTIVE_PHASES):
+                now = time.time()
+                seconds = dict(times["seconds"])
+                seconds[times["node"]] = seconds.get(times["node"], 0.0) + max(0.0, now - times["at"])
+                state["stepTimes"] = {**times, "seconds": seconds, "at": now}
             paused = state["phase"] in {"paused", "pausing"}
             checkpoint = read_pause_object(run_dir) if paused and run_dir else {}
             state["pauseCause"] = str(checkpoint.get("pauseCause") or "") if paused else ""
@@ -9964,6 +10019,7 @@ def restore_saved_app(app, *, owned=True):
     for record in _iter_run_records(run_dir):
         follow_time_limit(state["timeLimitHistory"], record)
         state["authorModeEffective"] = follow_author_mode(state.get("authorModeEffective"), record)
+        state["stepTimes"] = follow_step_times(state.get("stepTimes"), record)
         if controller_note(record):
             continue
         label = record.get("label")

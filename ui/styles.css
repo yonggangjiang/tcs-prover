@@ -2961,6 +2961,14 @@ kbd {
 .node-position .position-text { color: var(--ink); font-weight: 600; }
 .node-copy { min-width: 0; overflow-wrap: anywhere; }
 .node-copy strong { display: block; color: var(--ink); font-size: var(--text-sm); font-weight: 650; }
+/* A step's name, and on its right the time it has worked (renderStepTimes). */
+.node-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.node-head > strong { min-width: 0; }
+.node-copy .node-head > .node-time {
+  flex: none; margin-top: 0; color: var(--ink-2); font-family: var(--font-mono);
+  font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.node-head > .node-time:empty { display: none; }
 .workflow-node:not(:is(.active, .complete, .paused, .limit, .stopped, .failed, .warning, .rejected, .reviewed)) .node-copy strong { color: var(--ink-2); }
 .node-copy span { display: block; margin-top: 2px; font-size: var(--text-xs); line-height: 1.45; }
 /* Only the current step explains itself; the others show their status notes. */

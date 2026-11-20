@@ -4,8 +4,13 @@ Open a job from its batch on the Overview or in the sidebar. The page shows the
 exact checked statement (and your wording when it differs), the stage, the
 active time and the time left, the local process status, recent public activity
 and **Run settings** (the models and settings the job runs with). Job cards show
-the full local start and finish time, with seconds, so repeated titles stay
-apart.
+the start and finish time, with seconds, so repeated titles stay apart, and the
+job's active time: how long its models worked, without the time it was paused
+or stopped (*Started 19 Nov 22:32:24 · Active 12h 53m*).
+
+Times are in your browser's time zone, on a 24-hour clock, with the day in
+front only when it is not today (*14:05*, *19 Nov 22:32*); durations read
+*45s*, *12m 05s*, *3h 7m* or *2d 4h*.
 
 ## Status
 
@@ -14,7 +19,10 @@ author, Independent critic, Convention critic and Writing & polishing (LaTeX
 editor, Compile PDF). Stages not selected for the run are muted. For an
 [author coordinator](workflow.md#the-author-coordinator), the Proof author step
 reads *Coordinates up to 3 author subagents and checks that progress keeps
-growing.* One mark shows where the run is:
+growing.* Each step that has worked shows on its right how long, without the
+time the job waited (paused, stopped, or waiting for a Resume); the working
+step's time counts up. Over a job they add up to its active time. One mark shows
+where the run is:
 
 | Mark | Meaning |
 | --- | --- |
