@@ -355,7 +355,7 @@ def bash_temp(tools, workspace, runtime):
     The CLI's PrivateSettings remove it with the settings file.
     """
 
-    if "Bash" not in tools or not confinement.supported():
+    if "Bash" not in tools or not confinement.claude_supported():
         return None
     try:
         return confinement.claude_temp(workspace)

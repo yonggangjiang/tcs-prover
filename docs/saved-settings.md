@@ -117,10 +117,11 @@ it opens, so connections added or removed in another tab count.
 Saved settings live in `.tcs-prover/new-problem-presets.json` on this computer
 (with `new-problem-presets.lock`, which keeps two saves from losing each other):
 an owner-only file that no model sandbox can write, so no model can change the
-settings your next problem opens with. On macOS no model sandbox can read it
-either, and Claude Code's sandbox cannot read it anywhere; on Linux and Windows
-a Codex role can read it (see
-[Sandbox and network](sandbox.md#linux-and-windows)). It holds no keys.
+settings your next problem opens with. On macOS and on Linux with bubblewrap no
+model sandbox can read it either, and Claude Code's sandbox cannot read it
+anywhere; on Windows and on Linux without bubblewrap a Codex role can read it
+(see [Sandbox and network](sandbox.md#windows-and-linux-without-bubblewrap)). It
+holds no keys.
 
 - Default settings are kept in the same file. A TCS Prover from before Default
   settings still reads the file but not them: it opens new problems as it did

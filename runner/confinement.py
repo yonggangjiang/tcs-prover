@@ -1,4 +1,4 @@
-"""Per-run read/write confinement of model processes (macOS).
+"""Per-run read/write confinement of model processes (macOS, and Linux with bubblewrap).
 
 Every model process of a run (the author's goal session and its conversation
 turns, and every structured call) may read only its workspace, a private temp
@@ -6,11 +6,13 @@ folder and the system and toolchain folders that commands need, and may write
 only its workspace (minus the entries that stay read-only, PROTECTED_ENTRIES)
 and that temp folder. Other runs, the checkout, the home folder, /tmp,
 /var/tmp and the shared $TMPDIR stay out of reach. Codex enforces this with a
-permission profile (workflow_runner.private_permissions()); Claude's Bash with
-its sandbox settings (claude_cli.sandbox_settings()), while --restricted keeps
-Claude's file tools in the working directory and deny rules keep them off the
-protected entries (claude_cli.protected_settings()). Other platforms keep
-their legacy sandboxes (see supported()). In a live run every model process
+permission profile (workflow_runner.private_permissions()), with Seatbelt on
+macOS and with bubblewrap on Linux; Claude's Bash with its sandbox settings
+(claude_cli.sandbox_settings(); on macOS only, see claude_supported()), while
+--restricted keeps Claude's file tools in the working directory and deny rules
+keep them off the protected entries (claude_cli.protected_settings()). Other
+platforms, and Linux without a bubblewrap that can make its sandbox, keep their
+legacy sandboxes (see supported()). In a live run every model process
 reaches the internet (workflow_runner.live_network()); a Codex process with
 network access can also connect to localhost and to any Unix socket whose
 path it knows. No model process, on any platform, gets the variables that
@@ -27,6 +29,22 @@ ignores TMPDIR (`mktemp -p "$TMPDIR"` works), and so do the heredocs of
 macOS's /bin/sh and /bin/bash (bash 3.2): they use /var/tmp or /tmp when
 writable and otherwise the current folder, so they work only where the
 current folder is writable. Codex runs a model's commands in zsh.
+
+Verified with Codex 0.170 and `codex sandbox` (no model) on Linux (Ubuntu
+24.04, kernel 6.8, the system's bubblewrap 0.9, which Codex runs from PATH and
+AppArmor's bwrap profile lets make user namespaces): the same profile holds.
+":minimal" is /bin, /etc, /lib, /lib64, /sbin, /usr, /dev and /proc, so /var
+(with /var/tmp), /run, /opt and the home folder stay out, and /tmp is an
+empty, unwritable folder. The sandbox's root is a fresh folder with only what
+the profile grants: a folder on the way to a granted one, such as the runs
+folder, shows only the entries on the way (the run's own folder and
+.controller), never another run. Codex runs its own binary in the sandbox
+(codex-linux-sandbox), so the folder Codex is installed in is granted
+(codex_packages()), and /etc/resolv.conf, a link into /run on systemd
+systems, needs its target granted for any name to resolve (system_files()).
+Commands get their own process namespace, so `lsof -U` lists no other
+process's sockets, and reach a Unix socket only in a folder they can read; with
+network access they share the computer's network, localhost included.
 """
 
 import atexit
@@ -37,6 +55,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -56,6 +75,13 @@ TOOLCHAIN_FOLDERS = (
     "/Library/Frameworks/Python.framework", "/System/Library/Perl", "/Library/Perl",
     "~/.elan", "~/opt/anaconda3",
 )
+# The same on Linux, where ":minimal" already has /usr (with /usr/local) and /etc: a TeX Live or
+# Conda in /opt, the formats Debian's TeX Live generates in /var/lib/texmf, and the toolchains in
+# the home folder (Lean's elan, Conda, programs and Python packages installed with --user).
+LINUX_TOOLCHAIN_FOLDERS = (
+    "/opt/texlive", "/opt/conda", "/var/lib/texmf",
+    "~/.elan", "~/miniconda3", "~/miniforge3", "~/anaconda3", "~/.local/bin", "~/.local/lib",
+)
 # Files the controller writes into the run folder (it keeps its own copies outside it and relies
 # on those) and the user's related works (a folder run hard-links one copy into every job).
 CONTROLLER_FILES = ("job-settings.json", "pause.json", "checked-statement.md", "prompts", "related-works")
@@ -68,8 +94,16 @@ PROTECTED_FOLDERS = (*retrieval_runtime.PROTECTED_DIRECTORIES, "prompts", "relat
 # with network access can connect to any Unix socket whose path it knows, so no model process gets
 # them (without_agents()), confined or in a legacy sandbox elsewhere.
 AGENT_VARIABLES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO")
-# Codex's own programs: the codex binary (apply_patch runs it) and its bundled rg and zsh.
+# Codex's own programs: the codex binary (apply_patch runs it) and its bundled rg and zsh. On
+# Linux also its standalone installation (~/.local/share/codex/<version>/: bin/codex and the
+# bundled rg), whose binary every confined command starts with (codex-linux-sandbox).
 CODEX_PACKAGES = "~/.codex/packages"
+LINUX_CODEX_PACKAGES = ("~/.codex/packages", "~/.local/share/codex")
+# The folders ":minimal" grants on Linux (verified with Codex 0.170), and the system files that
+# may be links out of them: /etc/resolv.conf points into /run on systemd systems.
+LINUX_MINIMAL = ("/bin", "/etc", "/lib", "/lib64", "/sbin", "/usr")
+LINUX_SYSTEM_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/localtime",
+                      "/etc/ssl/certs/ca-certificates.crt")
 # Claude Code's native binaries: its shell runs rg (and grep, find) through the claude binary.
 CLAUDE_VERSIONS = "~/.local/share/claude/versions"
 # The private temp folders made here are named <prefix><owner's PID>-<8 characters>, so the
@@ -88,8 +122,13 @@ CLAUDE_DENIED_READS = ("/Volumes", "/private/tmp", "/private/var/tmp", "/private
 CLAUDE_DENIED_WRITES = ("/tmp/claude", "/private/tmp/claude")
 # The command of the startup check may take this long.
 CHECK_TIMEOUT_MS = 10000
-UNSUPPORTED_NOTICE = ("Run confinement is enforced on macOS only; this run's model can read files outside its "
-                      "folder.")
+UNSUPPORTED_NOTICE = ("Run confinement is enforced on macOS, and on Linux with bubblewrap (bwrap); this run's "
+                      "model can read files outside its folder.")
+# On Linux the Codex roles are confined, Claude Code's shell not yet (claude_supported()).
+CLAUDE_UNSUPPORTED_NOTICE = ("On Linux run confinement covers Codex roles only; this run's Claude Code shell can "
+                             "read files outside its folder.")
+# A bubblewrap that cannot make its sandbox (no user namespaces) answers within this time.
+BUBBLEWRAP_CHECK_SECONDS = 10
 
 
 class ConfinementError(RuntimeError):
@@ -97,9 +136,45 @@ class ConfinementError(RuntimeError):
 
 
 def supported():
-    """Whether model processes run confined (macOS Seatbelt); elsewhere the legacy sandboxes apply."""
+    """Whether Codex's model processes run confined: macOS (Seatbelt), or Linux where bubblewrap works.
+
+    Elsewhere the legacy sandboxes apply.
+    """
+
+    if sys.platform == "darwin":
+        return True
+    return sys.platform.startswith("linux") and bubblewrap_works()
+
+
+def claude_supported():
+    """Whether Claude Code's shell runs confined: macOS only (its Linux sandbox is not verified with these rules)."""
 
     return sys.platform == "darwin"
+
+
+_BUBBLEWRAP = {}
+
+
+def bubblewrap_works():
+    """Whether the bubblewrap on PATH can make the sandbox Codex makes (Linux; checked once per process).
+
+    Codex's Linux sandbox runs `bwrap` from PATH. It needs user namespaces,
+    which a kernel or an AppArmor rule may refuse (Ubuntu 24.04 grants them
+    to /usr/bin/bwrap only); then this is False and runs keep the legacy
+    sandboxes, with the activity log saying so (UNSUPPORTED_NOTICE).
+    """
+
+    if "works" not in _BUBBLEWRAP:
+        bwrap = shutil.which("bwrap")
+        try:
+            works = bool(bwrap) and subprocess.run(
+                [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-user", "--unshare-pid", "--unshare-net",
+                 "--", "/bin/true"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=BUBBLEWRAP_CHECK_SECONDS).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            works = False
+        _BUBBLEWRAP["works"] = works
+    return _BUBBLEWRAP["works"]
 
 
 def _resolved(entry):
@@ -107,18 +182,111 @@ def _resolved(entry):
 
 
 def toolchain_folders(home_only=False):
-    """The TOOLCHAIN_FOLDERS that exist (resolved), or only those in the home folder."""
+    """The TOOLCHAIN_FOLDERS (on Linux LINUX_TOOLCHAIN_FOLDERS) that exist (resolved), or only those in the home folder."""
 
-    found = [_resolved(entry) for entry in TOOLCHAIN_FOLDERS
+    entries = LINUX_TOOLCHAIN_FOLDERS if sys.platform.startswith("linux") else TOOLCHAIN_FOLDERS
+    found = [_resolved(entry) for entry in entries
              if (not home_only or entry.startswith("~")) and os.path.isdir(os.path.expanduser(entry))]
     return list(dict.fromkeys(found))
 
 
-def codex_packages():
-    """Codex's installed programs ([] when Codex is installed elsewhere)."""
+def codex_packages(executable=None):
+    """Codex's installed programs ([] when Codex is installed elsewhere).
 
-    path = _resolved(CODEX_PACKAGES)
-    return [path] if path.is_dir() else []
+    On Linux also the installation of ``executable``, the Codex that runs
+    (its real path's <root>/bin/codex when <root> holds codex-package.json or
+    package.json, else the binary itself): Codex starts its own binary in the
+    sandbox, so a Codex installed elsewhere than LINUX_CODEX_PACKAGES works too.
+    """
+
+    if not sys.platform.startswith("linux"):
+        path = _resolved(CODEX_PACKAGES)
+        return [path] if path.is_dir() else []
+    found = [_resolved(entry) for entry in LINUX_CODEX_PACKAGES if os.path.isdir(os.path.expanduser(entry))]
+    if executable:
+        binary = _resolved(executable)
+        root = binary.parent.parent
+        if binary.parent.name == "bin" and any((root / name).is_file() for name in ("codex-package.json",
+                                                                                     "package.json")):
+            found.append(root)
+        elif binary.is_file():
+            found.append(binary)
+    minimal = [Path(folder) for folder in LINUX_MINIMAL]
+    found = [path for path in found if not any(_inside(path, folder) for folder in minimal)]
+    # Drop one inside another (a version folder of ~/.local/share/codex).
+    return [path for path in dict.fromkeys(found) if not any(other != path and _inside(path, other) for other in found)]
+
+
+def system_files():
+    """On Linux, the targets of LINUX_SYSTEM_FILES that lie outside ":minimal" (/etc/resolv.conf's in /run); else []."""
+
+    if not sys.platform.startswith("linux"):
+        return []
+    found = []
+    for entry in LINUX_SYSTEM_FILES:
+        target = _resolved(entry)
+        if target.is_file() and not any(_inside(target, Path(folder)) for folder in LINUX_MINIMAL):
+            found.append(target)
+    return list(dict.fromkeys(found))
+
+
+def existing_entries(profile, workspace):
+    """On Linux, ``profile`` naming only the protected entries of ``workspace`` that exist; elsewhere it unchanged.
+
+    Codex 0.170's Linux sandbox bind-mounts each entry a profile names under
+    ":workspace_roots", and for one that is missing it puts an empty
+    placeholder file in the workspace for the command's lifetime: commands
+    of two processes in the same folder then race (one removes the
+    placeholder while the other's bubblewrap still needs it, "bwrap: Can't
+    find source path"), and a process killed meanwhile leaves the file
+    behind. Codex's own project folders (.codex, .agents, .git, .aws) are
+    mounted differently and need no source. The controller folders are made
+    before the author starts (controller_folders()), so in a run folder
+    this leaves out only a missing pause.json, which the controller never
+    reads back from there (its own copy is the one it relies on).
+    """
+
+    if not profile or workspace is None or not sys.platform.startswith("linux"):
+        return profile
+    roots = profile.get("filesystem", {}).get(":workspace_roots")
+    if not isinstance(roots, dict):
+        return profile
+    kept = {name: access for name, access in roots.items()
+            if name == "." or name in retrieval_runtime.PROTECTED_DIRECTORIES
+            or os.path.lexists(os.path.join(workspace, name))}
+    return {**profile, "filesystem": {**profile["filesystem"], ":workspace_roots": kept}}
+
+
+def controller_folders(workspace):
+    """On Linux, make the run folder's controller folders (prompts, related-works) that are missing, owner-only.
+
+    They then exist for as long as the run's model processes do, so their
+    profile names them without a placeholder (existing_entries()); an empty
+    related-works folder is what TCS Prover makes for a first related work
+    anyway (ui/related_works.py). Elsewhere nothing is made.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return
+    for name in PROTECTED_FOLDERS:
+        if name in retrieval_runtime.PROTECTED_DIRECTORIES:
+            continue
+        try:
+            os.mkdir(os.path.join(workspace, name), 0o700)
+        except FileExistsError:
+            pass
+
+
+def shared_temp_folders():
+    """The shared temp folder that ":minimal" may grant besides /tmp, denied again: /private/var/tmp, or /var/tmp."""
+
+    return ["/var/tmp"] if sys.platform.startswith("linux") else ["/private/var/tmp"]
+
+
+def slash_tmp_folder():
+    """/tmp as the sandbox sees it: /private/tmp on macOS."""
+
+    return Path("/private/tmp") if sys.platform == "darwin" else Path("/tmp")
 
 
 def claude_versions():
@@ -147,8 +315,13 @@ def confined_environment(environment, temp):
     return {**without_agents(environment), **temp_environment(temp)}
 
 
-def _inside(path, folder):
+def inside(path, folder):
+    """Whether ``path`` is ``folder`` or lies in it (both as given, not resolved)."""
+
     return path == folder or folder in path.parents
+
+
+_inside = inside
 
 
 def _outside_workspace(folder, workspace):
@@ -205,9 +378,36 @@ def private_folder(path, workspace):
     return _check_folder(folder, workspace)
 
 
-def fresh_folder(prefix, parent=None, workspace=None):
-    """A new owner-only temp folder named after this process (resolved; its caller removes it), outside ``workspace``."""
+def call_parent():
+    """The folder that holds the folders of model calls (their snapshots, private temp folders): None for the system's.
 
+    On Linux a folder of TCS Prover's own, owner-only, outside /tmp
+    ($XDG_CACHE_HOME or ~/.cache, then tcs-prover/tmp): Codex 0.170's
+    sandbox there mounts its empty /tmp (the profile denies /tmp) over the
+    folders the profile lets a command read, and mounts only the ones it may
+    write again on top, so a read-only snapshot in /tmp could not be read.
+    None (the system's temp folder) elsewhere, and when that folder cannot
+    be made; workflow_runner.private_permissions() then leaves /tmp to a
+    call whose read-only folder is in it.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return None
+    folder = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tcs-prover" / "tmp"
+    try:
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return _check_folder(Path(os.path.realpath(folder)), None)
+    except (ConfinementError, OSError):
+        return None
+
+
+def fresh_folder(prefix, parent=None, workspace=None):
+    """A new owner-only temp folder named after this process (resolved; its caller removes it), outside ``workspace``.
+
+    Without a ``parent`` it is made in call_parent(), else the system's temp folder.
+    """
+
+    parent = parent if parent is not None else call_parent()
     folder = Path(os.path.realpath(tempfile.mkdtemp(prefix=f"{prefix}{os.getpid()}-", dir=parent)))
     try:
         return _check_folder(folder, workspace)
@@ -251,7 +451,8 @@ def sweep_temps(alive):
 
     if not supported():
         return
-    for parent in dict.fromkeys((tempfile.gettempdir(), CLAUDE_TEMP_PARENT)):
+    for parent in dict.fromkeys(str(folder) for folder in (call_parent() or tempfile.gettempdir(),
+                                                            tempfile.gettempdir(), CLAUDE_TEMP_PARENT)):
         try:
             entries = list(Path(parent).iterdir())
         except OSError:
@@ -292,19 +493,25 @@ def startup_check(execute, *, workspace, temp, writable, profile, checkout=None)
 
     ``execute(params)`` sends one command/exec request to the app-server
     (whose commands run as the model's do) and returns its result. The
-    command, made of Apple system tools only, must read the workspace (and
-    write it when ``writable``) and write and read the private temp folder
+    command, made of system tools only, must read the workspace (and write
+    it when ``writable``) and write and read the private temp folder
     ``temp``; it must not read a controller file next to the temp folder or
     a file of this checkout, list the folder holding the workspace, or write
-    /tmp. Raises ConfinementError when the report is missing or the sandbox
-    did not hold; the caller retries and never starts the model unconfined.
+    /tmp. On Linux that folder can be listed, as bubblewrap shows the
+    folders on the way to the granted ones: there the listing must not name
+    a file the check puts next to the workspace, as another run's folder
+    would be. Raises ConfinementError when the report is missing or the
+    sandbox did not hold; the caller retries and never starts the model
+    unconfined.
     """
 
     nonce = uuid.uuid4().hex
     workspace, temp = Path(os.path.realpath(workspace)), Path(os.path.realpath(temp))
     marker = f".tcs-confinement-{nonce}"
     inside, written, scratch = workspace / marker, workspace / f"{marker}-written", temp / marker
-    outside, slash_tmp = temp.parent / marker, Path("/private/tmp") / f"{marker}-written"
+    outside, slash_tmp = temp.parent / marker, slash_tmp_folder() / f"{marker}-written"
+    linux = sys.platform.startswith("linux")
+    sibling = workspace.parent / f"{marker}-sibling"
     checkout = Path(checkout) if checkout else Path(__file__).resolve()
     q = lambda path: shlex.quote(str(path))
     probes = {
@@ -316,12 +523,13 @@ def startup_check(execute, *, workspace, temp, writable, profile, checkout=None)
         "slashTmpWrite": f"printf %s {q(nonce)} > {q(slash_tmp)}",
     }
     if workspace.parent != Path(workspace.anchor):
-        probes["parentList"] = f"/bin/ls {q(workspace.parent)}"
+        probes["parentList"] = (f"/bin/ls -a {q(workspace.parent)} | /bin/grep -qxF {q(sibling.name)}" if linux
+                                else f"/bin/ls {q(workspace.parent)}")
     expected = {"nonce": nonce, **{key: key in ("workspaceRead", "tempWrite") for key in probes},
                 "workspaceWrite": bool(writable)}
     created = []
     try:
-        for path in (inside, outside):
+        for path in (inside, outside, *([sibling] if linux and "parentList" in probes else [])):
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             created.append(path)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -329,7 +537,7 @@ def startup_check(execute, *, workspace, temp, writable, profile, checkout=None)
         result = execute({"command": _report_command(nonce, probes), "cwd": str(workspace),
                           "permissionProfile": profile, "timeoutMs": CHECK_TIMEOUT_MS})
     finally:
-        for path in (*created, written, scratch, slash_tmp):
+        for path in (*created, written, scratch, slash_tmp, sibling):
             try:
                 if path.is_file() and not path.is_symlink():
                     path.unlink()

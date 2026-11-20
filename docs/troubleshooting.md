@@ -178,9 +178,13 @@ before Default settings saved settings in the same file: it drops them (see
 as empty; running jobs keep the settings they read last, and waiting jobs try
 again every minute. An entry listed with a reason can be repaired or removed.
 
-**On Linux or Windows the activity log says "Run confinement is enforced on
-macOS only".** That is expected: there the models can read files outside their
-run folder. See [Sandbox and network](sandbox.md#linux-and-windows).
+**The activity log says "Run confinement is enforced on macOS, and on Linux
+with bubblewrap (bwrap)".** On Windows that is expected: there the models can
+read files outside their run folder. On Linux it means `bwrap` is missing or
+cannot make its sandbox; install bubblewrap (`sudo apt install bubblewrap`) and
+start the job again. See [Sandbox and network](sandbox.md#linux). "On Linux run
+confinement covers Codex roles only" means a Claude Code role's shell in the run
+can read your files.
 
 **A job was deleted by mistake.** Its run folder stays in `runs/.trash/` for 30
 days, so its files can still be copied from there.

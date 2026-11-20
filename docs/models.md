@@ -359,9 +359,10 @@ another path, relative to the checkout). The browser only ever receives the hint
 - Transcript records are also cleaned of every key the runner knows (any value
   of at least 8 characters), so a gateway error that echoes a key shows
   `[redacted]`.
-- On macOS no model sandbox can read the key store. On Linux and Windows a Codex
-  role's shell can (see [Sandbox and network](sandbox.md#linux-and-windows)):
-  there, store only keys that the models you run with the Codex CLI may see.
+- On macOS and on Linux with bubblewrap no model sandbox can read the key store.
+  On Windows and on Linux without bubblewrap a Codex role's shell can (see
+  [Sandbox and network](sandbox.md#windows-and-linux-without-bubblewrap)): there,
+  store only keys that the models you run with the Codex CLI may see.
 
 ### Run settings and saved jobs
 

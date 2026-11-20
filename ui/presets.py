@@ -9,9 +9,10 @@ a job sent back to the form keeps its own settings. Terminal runs never read the
 They live in <state>/new-problem-presets.json (runner.providers.PRESETS, beside the
 API model store): an owner-only file in an owner-only folder that no model sandbox can
 write, with the rest of the private state (providers.private_paths()), so that a model
-can never change the settings the next problem opens with. On macOS no model sandbox
-can read it either, and Claude Code's sandbox cannot anywhere; Codex's legacy
-sandboxes on Linux and Windows can read it (docs/sandbox.md). It holds no keys.
+can never change the settings the next problem opens with. On macOS and on Linux
+with bubblewrap no model sandbox can read it either, and Claude Code's sandbox cannot
+anywhere; Codex's legacy sandboxes on Windows and on Linux without bubblewrap can
+read it (docs/sandbox.md). It holds no keys.
 
 A preset holds what the form sends with a job (proofJobSettings() in ui/app.js)
 without its prompts, plus a description of each API model it names, without key or

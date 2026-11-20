@@ -183,6 +183,11 @@ CONTROLLER_FILES = confinement.CONTROLLER_FILES
 # Proof snapshots in the temp folder: the newest are kept for diagnosis, older
 # ones are removed once they are a day old (see run_structured_attempt()).
 SNAPSHOT_PREFIX = "tcs-proof-review-"
+# The workspace of a structured call that edits a file (_edit_workspace()).
+EDIT_PREFIX = "tcs-edit-"
+# In confinement.call_parent() (Linux) no system cleanup removes a call folder, as it would in /tmp:
+# editing calls' folders beyond SNAPSHOTS_KEPT go once this old.
+EDIT_FOLDER_DAYS = 7
 SNAPSHOTS_KEPT = 50
 
 HISTORICAL_CODEX_ONLY = "Web cutoff timestamps require Codex CLI models for every proof role."
@@ -2148,8 +2153,10 @@ def legacy_read_only_policy(live):
     return {"type": "readOnly", "networkAccess": bool(live)}
 
 
-def private_permissions(base, model, *, codex_home=None, live=False):
-    """The Codex permission profile that confines one model process of a run (macOS); None elsewhere.
+def private_permissions(base, model, *, codex_home=None, live=False, workspace=None):
+    """The Codex permission profile that confines one model process of a run (macOS, Linux with bubblewrap).
+
+    None elsewhere (see confinement.supported()).
 
     `base` ":workspace" lets commands write the workspace (the author, a
     structured call that edits a file), ":read-only" only read it (other
@@ -2172,9 +2179,15 @@ def private_permissions(base, model, *, codex_home=None, live=False):
     the sockets of the user's other processes (lsof): the variables that
     name the user's agents are left out (confinement.AGENT_VARIABLES), but
     their sockets stay reachable (docs/sandbox.md says so). Verified with Codex
-    0.160's macOS Seatbelt sandbox: other platforms return None and keep the
-    legacy sandbox modes (legacy_network_arguments(),
-    legacy_read_only_policy(), docs/sandbox.md).
+    0.160's macOS Seatbelt sandbox and Codex 0.170's Linux bubblewrap sandbox,
+    where the profile also grants the folder the Codex that runs is installed
+    in (Codex starts its own binary in the sandbox), denies /var/tmp instead of
+    /private/var/tmp and grants /etc/resolv.conf's target in /run, without
+    which no name resolves (confinement.codex_packages(), system_files()); a
+    command there can reach a Unix socket only in a folder it can read (or,
+    with network access, an abstract one) and sees no other process. Other
+    platforms return None and keep the legacy sandbox modes
+    (legacy_network_arguments(), legacy_read_only_policy(), docs/sandbox.md).
     """
 
     if not confinement.supported():
@@ -2186,11 +2199,38 @@ def private_permissions(base, model, *, codex_home=None, live=False):
     homes = [Path(codex_home)] if codex_home else []
     if not api:
         homes.append(Path.home() / ".codex")
+    # Linux: Codex's helpers of the same kind are in tmp/arg0-linux.
+    helpers = ("arg0", "arg0-linux") if sys.platform.startswith("linux") else ("arg0",)
+    # Linux: the Codex that runs, found as codex() finds it but without its CLIUnavailable (callers count
+    # those lookups); a standalone install is granted anyway (confinement.LINUX_CODEX_PACKAGES).
+    executable = None
+    if sys.platform.startswith("linux"):
+        try:
+            executable = shutil.which("codex") or providers.remembered_program("codex")
+        except (OSError, ValueError, providers.ProviderError):
+            executable = None
+    readable = [*confinement.toolchain_folders(), *confinement.codex_packages(executable), *confinement.system_files(),
+                *(Path(os.path.realpath(home)) / "tmp" / helper for home in homes for helper in helpers)]
+    denied = list(dict.fromkeys(paths))
+    if sys.platform.startswith("linux"):
+        # bubblewrap shows only what the profile grants, so a path outside every granted folder needs no
+        # deny entry, and one whose folder is not there or read-only (in /tmp, say) would stop every
+        # command ("bwrap: Can't mkdir parents"): only those inside a granted folder are denied again.
+        granted = [*map(Path, confinement.LINUX_MINIMAL), *readable]
+        denied = [path for path in denied if any(confinement.inside(Path(os.path.realpath(path)), folder)
+                                                 for folder in granted)]
+    # Linux: Codex 0.170 mounts the denied /tmp over what the profile lets a command only read in it (a
+    # read-only call folder, a CODEX_HOME's helpers there). Such a call keeps an empty /tmp of its own
+    # instead, which is gone when the command ends; the real /tmp stays out of its sight either way.
+    in_tmp = [*readable, *([Path(workspace)] if workspace is not None and base == ":read-only" else [])]
+    hide_tmp = not (sys.platform.startswith("linux") and any(
+        confinement.inside(Path(os.path.realpath(path)), confinement.slash_tmp_folder()) for path in in_tmp))
     filesystem = {
-        ":minimal": "read", ":slash_tmp": "deny", "/private/var/tmp": "deny", ":tmpdir": "write",
-        **{str(path): "read" for path in (*confinement.toolchain_folders(), *confinement.codex_packages())},
-        **{os.path.join(os.path.realpath(home), "tmp", "arg0"): "read" for home in homes},
-        **{str(path): "deny" for path in dict.fromkeys(paths)},
+        ":minimal": "read", **({":slash_tmp": "deny"} if hide_tmp else {}),
+        **{path: "deny" for path in confinement.shared_temp_folders()},
+        ":tmpdir": "write",
+        **{str(path): "read" for path in readable},
+        **{str(path): "deny" for path in denied},
         # The controller's files in the run folder stay read-only.
         ":workspace_roots": {".": "write" if base == ":workspace" else "read",
                              **{name: "read" for name in confinement.PROTECTED_ENTRIES}},
@@ -2198,7 +2238,8 @@ def private_permissions(base, model, *, codex_home=None, live=False):
     profile = {"filesystem": filesystem}
     if live:
         profile["network"] = {"enabled": True}
-    return profile
+    # Linux: only the protected entries that exist (see confinement.existing_entries()).
+    return confinement.existing_entries(profile, workspace)
 
 
 def _toml_inline(value):
@@ -2209,10 +2250,11 @@ def _toml_inline(value):
     return str(value).lower() if isinstance(value, bool) else toml_string(value)
 
 
-def private_permission_arguments(base, model, *, codex_home=None, profile=None, live=False):
+def private_permission_arguments(base, model, *, codex_home=None, profile=None, live=False, workspace=None):
     """Flags that define and select private_permissions() (or `profile`); empty where unsupported."""
 
-    profile = private_permissions(base, model, codex_home=codex_home, live=live) if profile is None else profile
+    profile = (private_permissions(base, model, codex_home=codex_home, live=live, workspace=workspace)
+               if profile is None else profile)
     if profile is None:
         return []
     return [
@@ -2247,7 +2289,7 @@ def _confined_call(writable, model, environment, policy, workspace, live=None):
     live = live_network() if live is None else live
     flags = private_permission_arguments(
         ":workspace" if writable else ":read-only", model, codex_home=(environment or {}).get("CODEX_HOME"),
-        live=live)
+        live=live, workspace=workspace)
     if not flags:
         legacy = ["-s", "workspace-write", *legacy_network_arguments(live)] if writable else ["-s", "read-only"]
         # With network access a command could use the agents, as with the confined profile.
@@ -3703,6 +3745,12 @@ def _prune_snapshots():
     """
 
     retrieval_runtime.prune_folders(tempfile.gettempdir(), SNAPSHOT_PREFIX + "*", SNAPSHOTS_KEPT)
+    parent = confinement.call_parent()
+    if parent is not None:
+        # Linux: TCS Prover's own folder outside /tmp (see confinement.call_parent()).
+        retrieval_runtime.prune_folders(parent, SNAPSHOT_PREFIX + "*", SNAPSHOTS_KEPT)
+        retrieval_runtime.prune_folders(parent, EDIT_PREFIX + "*", SNAPSHOTS_KEPT,
+                                        minimum_age=EDIT_FOLDER_DAYS * 24 * 3600)
 
 
 def _write_snapshot(workspace, input_files):
@@ -3858,8 +3906,9 @@ def _edit_workspace(conversation, input_files, edit_file, stage, features=()):
         if resumed:
             raise ConversationUnavailable("The working files that the saved conversation used are gone.")
     if workspace is None:
-        prefix = "tcs-proof-review-" if input_files is not None else "tcs-edit-"
-        workspace = conversation.workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix=prefix)), readonly)
+        prefix = SNAPSHOT_PREFIX if input_files is not None else EDIT_PREFIX
+        workspace = conversation.workspace = _write_snapshot(
+            Path(tempfile.mkdtemp(prefix=prefix, dir=confinement.call_parent())), readonly)
         if input_files is not None:
             _snapshot_ready(stage, workspace, input_files, writable=True, features=features)
     _place_edit_file(workspace, edit_file.name, edit_file.base if conversation.resume else
@@ -3995,7 +4044,8 @@ def run_structured_attempt(
             conversation.forget()
         if workspace is None:
             _prune_snapshots()
-            workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX)), input_files)
+            workspace = _write_snapshot(Path(tempfile.mkdtemp(prefix=SNAPSHOT_PREFIX, dir=confinement.call_parent())),
+                                        input_files)
             _snapshot_ready(stage, workspace, input_files, features=features)
             if conversation is not None:
                 conversation.workspace = workspace
@@ -5174,6 +5224,11 @@ def _author_sandbox(runtime, options, *, directory, policy, model, read_only=Fal
                 else confinement.runner_folder(directory))
     except (confinement.ConfinementError, OSError, TypeError, ValueError) as exc:
         raise runtime.Error(f"Cannot prepare the run's private temp folder, so the author does not start: {exc}") from exc
+    try:
+        confinement.controller_folders(directory)
+    except OSError as exc:
+        raise runtime.Error(f"Cannot prepare the run folder's related-works folder, so the author does not start: "
+                            f"{exc}") from exc
     return {"base": base, "temp": temp}
 
 
@@ -5257,8 +5312,9 @@ def _author_app_server(runtime, *, directory, policy, role, model, settings, fea
         if sandbox is not None:
             child_environment = confinement.confined_environment(child_environment, sandbox["temp"])
             temp_environment = confinement.temp_environment(sandbox["temp"])
-            confined = [*private_permission_arguments(sandbox["base"], model, profile=runtime.private_permissions(
-                sandbox["base"], model, codex_home=child_environment.get("CODEX_HOME"), live=live)),
+            confined = [*private_permission_arguments(sandbox["base"], model, profile=confinement.existing_entries(
+                runtime.private_permissions(sandbox["base"], model, codex_home=child_environment.get("CODEX_HOME"),
+                                            live=live), directory)),
                 # Also for a user's shell_environment_policy that passes on only some variables (inherit = "core").
                 *[part for name, value in temp_environment.items()
                   for part in ("-c", f"shell_environment_policy.set.{name}={toml_string(value)}")]]
@@ -5408,8 +5464,8 @@ def _author_thread_options(runtime, rpc, *, directory, policy, role, model, sett
     # the user's [sandbox_workspace_write] settings carries over: network follows the run's search mode.
     permissions = getattr(runtime, "private_permissions", None)
     base = ":read-only" if read_only else ":workspace"
-    private = permissions(base, model, codex_home=(environment or {}).get("CODEX_HOME"),
-                          live=live_network(directory)) if permissions else None
+    private = confinement.existing_entries(permissions(base, model, codex_home=(environment or {}).get("CODEX_HOME"),
+                                                       live=live_network(directory)), directory) if permissions else None
     if private is not None:
         thread_options.pop("sandbox")
         thread_options["permissions"] = PRIVATE_PERMISSIONS
@@ -9950,8 +10006,9 @@ def check_clis(models, directory=None):
     is named too. A CLI that is not installed is named with the role and
     model that need it (missing_cli_text). Nothing waits: model calls retry
     every minute until the CLI works. Web-cutoff runs check their pinned
-    binary in their own preflight instead. Where model processes cannot be
-    confined to their run (not macOS), a diagnostic says so.
+    binary in their own preflight instead. Where a model's processes cannot be
+    confined to their run (other than macOS and Linux with bubblewrap; on
+    Linux a Claude Code shell), a diagnostic says so, once.
     """
 
     directory = Path(directory or Path.cwd())
@@ -9966,6 +10023,7 @@ def check_clis(models, directory=None):
     # CLI -> (stage, model, API model?) of the first model that needs it; a built-in Codex model
     # first, as its calls look for Codex on PATH only.
     needs = {}
+    claude_unconfined = confinement.supported() and not confinement.claude_supported()
     for entry in models:
         stage, model = entry if isinstance(entry, tuple) else ("", entry)
         try:
@@ -9976,6 +10034,9 @@ def check_clis(models, directory=None):
             continue
         if name not in needs or (needs[name][2] and not api):
             needs[name] = (stage, model, api)
+    if claude_unconfined and "Claude" in needs:
+        # Linux: the Codex roles run confined, a Claude Code shell keeps its legacy reads.
+        emit("diagnostic", "workflow", text=confinement.CLAUDE_UNSUPPORTED_NOTICE)
     found, problems = {}, []
     retried = "Model calls retry every minute until it works."
     for name, (stage, model, api) in needs.items():
