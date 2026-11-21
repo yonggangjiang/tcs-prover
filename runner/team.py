@@ -86,6 +86,16 @@ REPORT_FILE = re.compile(r"([0-9]+)-report\.md")
 NAME_SURROGATE_TAG = 0x20000000
 # The start of the report of a stopped assignment; {reason} says who stopped it.
 STOPPED_REPORT = "This assignment was stopped. {reason}"
+# What the coordinator's next team_wait says of an assignment that a pause (the user's, or a restart of TCS Prover)
+# stopped, after the run resumes (Team.restore()): the member's files stay, and its conversation can be continued.
+INTERRUPTED_REPORT = ("The run was paused or TCS Prover restarted while this assignment was working, so it was "
+                      "stopped. The files it wrote stay in the working directory, and team_followup continues its "
+                      "conversation with everything it did there.")
+INTERRUPTED_FRESH_REPORT = ("The run was paused or TCS Prover restarted while this assignment was working, so it was "
+                            "stopped before it started a conversation. Any files it wrote stay in the working "
+                            "directory; give the assignment again with team_assign.")
+# The key of the workflow state under which a paused run keeps its teams (Team.carry()), by node name.
+TEAM_CARRY = "carried_teams"
 # The report of an assignment whose member's API connection refused the request (a Refusal): {member} is the member's
 # number, {reason} the service's own words (the owner's wording, 14 Nov 2026). Such a refusal can pass (a proxy that
 # refuses requests while its own login refreshes) as well as come from a wrong setting, so the report asks the
@@ -198,6 +208,27 @@ def team_note(template, members, render):
 
     lines = "\n".join(f"- member {item['member']}: {item['modelLabel']} ({item['program']})" for item in members)
     return render(template, {"members": lines})
+
+
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _uuid(value):
+    """Whether ``value`` is a canonical UUID (a CLI session id)."""
+
+    return isinstance(value, str) and bool(_UUID.fullmatch(value))
+
+
+def _excerpt(text, limit=600):
+    """``text`` on one line, cut to about ``limit`` characters keeping its start and its end: a CLI's error often
+    begins with harmless warnings and names its cause last (20 Nov 2026: a coordinator shown only the first 300
+    characters saw a configuration warning and guessed the wrong cause of a failed follow-up)."""
+
+    text = " / ".join(line.strip() for line in str(text).strip().splitlines() if line.strip())
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    return f"{text[:head].rstrip()} … {text[-(limit - head):].lstrip()}"
 
 
 def _task_line(text):
@@ -504,6 +535,8 @@ class Team:
         # Raised by release_waits(): a team_wait that began before ends without taking a report or an attention.
         self.wait_generation = 0
         self.closed = None
+        # The authors close() stopped mid-assignment: {member, task, report}; carried over by carry().
+        self.interrupted = []
 
     # The tools, as the coordinator's CLI lists them.
     def tools(self):
@@ -750,6 +783,9 @@ class Team:
             self.closed = reason
             working = [member for member in (*self.members.values(), *filter(None, [self.examiner]))
                        if member.state != "idle"]
+            self.interrupted = [{"member": member.number, "task": member.task,
+                                 "report": f"{TEAM_FOLDER}/member-{member.number}/{report_name(member.count)}"}
+                                for member in working if member is not self.examiner]
             for member in working:
                 member.state, member.stop_reason = "stopping", reason
                 member.cancel.set()
@@ -761,6 +797,56 @@ class Team:
             if member.thread is not None:
                 member.thread.join(timeout=10)
         self.discard()
+
+    def carry(self):
+        """What a paused run keeps of this team for its next runner (TEAM_CARRY in the workflow state, which TCS Prover
+        saves with the pause and gives back on resume): each author's last conversation, so that team_followup
+        continues it after a pause or a restart of TCS Prover, and the assignments close() stopped. None when there
+        is nothing to keep."""
+
+        with self.cond:
+            conversations = {str(member.number): {**member.conversation, "program": member.program}
+                             for member in self.members.values()
+                             if member.conversation and member.conversation.get("session")}
+            interrupted = list(self.interrupted)
+        if not conversations and not interrupted:
+            return None
+        return {"conversations": conversations, "interrupted": interrupted}
+
+    def restore(self, saved):
+        """Take over what carry() kept of the previous runner's team: each author's last conversation (for the same
+        member number and program), and a note for the next team_wait on each assignment that the pause stopped
+        (INTERRUPTED_REPORT)."""
+
+        if not isinstance(saved, dict):
+            return
+        conversations = saved.get("conversations") if isinstance(saved.get("conversations"), dict) else {}
+        interrupted = saved.get("interrupted") if isinstance(saved.get("interrupted"), list) else []
+        with self.cond:
+            for key, value in conversations.items():
+                member = self.members.get(int(key)) if str(key).isdigit() else None
+                if (member is None or not isinstance(value, dict) or not _uuid(value.get("session"))
+                        or value.get("program") != member.program or member.conversation):
+                    continue
+                member.conversation = {"session": value["session"].lower(), "harness": value.get("harness")}
+            for entry in interrupted:
+                member = (self.members.get(entry.get("member")) if isinstance(entry, dict)
+                          and isinstance(entry.get("member"), int) else None)
+                if member is None:
+                    continue
+                task = str(entry.get("task") or "")[:300]
+                report = str(entry.get("report") or "")
+                if not re.fullmatch(rf"{TEAM_FOLDER}/member-{member.number}/[0-9]+-report\.md", report):
+                    report = ""
+                resumable = bool(member.conversation)
+                self.done.append({
+                    "head": f"Member {member.number} ({member.label}) was stopped on the assignment \"{task}\" when "
+                            "the run paused.",
+                    "where": f"Report file: {report}" if report else "No report file was saved.",
+                    "text": INTERRUPTED_REPORT if resumable else INTERRUPTED_FRESH_REPORT,
+                    "file": report or None,
+                })
+            self.cond.notify_all()
 
     def _register(self, member, cancel):
         def process(popen):
@@ -796,7 +882,7 @@ class Team:
                               subagentId=assignment_id(member.number, count))
                     continue
                 if not cancel.is_set() and self.unavailable(exc):
-                    failure = f"its conversation could not be continued ({str(exc).strip()[:300]})"
+                    failure = f"its conversation could not be continued ({_excerpt(exc)})"
                     break
                 if not cancel.is_set():
                     problem = self.configuration(exc, member)
@@ -806,7 +892,7 @@ class Team:
                     worked = bool(getattr(conversation, "session_id", None) and getattr(conversation, "output", False)
                                   and getattr(conversation, "confirmed", False))
                     self.emit("diagnostic", text=f"Member {member.number} ({member.label}): a model call failed "
-                                                 f"({str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__}); "
+                                                 f"({_excerpt(exc) if str(exc).strip() else type(exc).__name__}); "
                                                  f"retrying in {self.retry_seconds:g} s"
                                                  + (", continuing its conversation." if worked else
                                                     ", running the assignment again."),

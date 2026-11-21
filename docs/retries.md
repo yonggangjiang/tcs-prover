@@ -23,9 +23,16 @@ no proof).
   once, and **Pause** (while the author works) pauses the job instead of
   retrying. The first retries of a call stay pinned in the activity log; the
   rest stay in the recent window and in `transcript.jsonl`.
-- **Slow calls.** A structured call (reviewer, critic, LaTeX editor) is never stopped while it works: an attempt is stopped and retried only
-  after its program has written nothing for an hour, or two hours while a critic
-  waits for its subagents (Codex is silent then and allows such a wait an hour).
+- **Slow calls.** A structured call (reviewer, critic, LaTeX editor) and an author
+  team member's assignment are never stopped while they work: an attempt is
+  stopped and retried only after its program has written nothing for an hour, or
+  two hours while a critic waits for its subagents (Codex is silent then and
+  allows such a wait an hour), or when its program stays alive but returns no
+  model event: none within 5 minutes of its start, or none for 20 minutes after
+  the last one (an hour more while it waits for its subagents). Calls normally
+  go under two minutes without an event; a program stuck below the model (on 20
+  November 2026, Codex's database on a network disk) kept writing log lines for
+  46 minutes without one.
 - **A silent author.** A turn with no event for 30 minutes gets a cheap check (no
   model call). An unanswered check (after 1 minute), or a request Codex leaves
   unanswered for 10 minutes, ends the attempt, and the retry reopens the same

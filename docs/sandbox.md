@@ -160,9 +160,12 @@ sandbox); if there is no `bwrap` or it cannot make one, the run keeps the legacy
 modes below. To get the confinement, install bubblewrap (`sudo apt install
 bubblewrap` on Debian and Ubuntu); on Ubuntu 24.04 AppArmor lets only
 `/usr/bin/bwrap` make user namespaces, which the package's profile allows. The
-author's sandbox check (above) runs before every start either way. Codex's
-sandbox leaves the empty folders `.agents`, `.aws`, `.codex` and `.git` in the
-run folder: the places it keeps read-only for every command.
+author's sandbox check (above) runs before every start either way. TCS Prover
+makes the empty folders `.agents`, `.aws`, `.codex` and `.git` in the run
+folder, and in each model call's own folder, before a confined Codex process
+starts there: the places the sandbox keeps read-only for every command, which
+Codex also needs to find when it continues a conversation (a team member's
+follow-up, a retried call). Git treats an empty `.git` as no repository.
 
 ## Windows, and Linux without bubblewrap
 

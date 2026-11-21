@@ -231,7 +231,8 @@ def system_files():
 
 
 def existing_entries(profile, workspace):
-    """On Linux, ``profile`` naming only the protected entries of ``workspace`` that exist; elsewhere it unchanged.
+    """On Linux, ``profile`` naming only the protected entries of ``workspace`` that exist, after making Codex's
+    project folders there (project_folders()); elsewhere it unchanged.
 
     Codex 0.170's Linux sandbox bind-mounts each entry a profile names under
     ":workspace_roots", and for one that is missing it puts an empty
@@ -239,9 +240,13 @@ def existing_entries(profile, workspace):
     of two processes in the same folder then race (one removes the
     placeholder while the other's bubblewrap still needs it, "bwrap: Can't
     find source path"), and a process killed meanwhile leaves the file
-    behind. Codex's own project folders (.codex, .agents, .git, .aws) are
-    mounted differently and need no source. The controller folders are made
-    before the author starts (controller_folders()), so in a run folder
+    behind. Codex's own project folders (.codex, .agents, .git, .aws) stay in
+    the profile whatever exists, so that a model can never create one (a
+    planted .codex/config.toml would start commands outside the sandbox); their
+    commands mount them without a source, but loading a conversation to
+    continue it (`codex exec fork`, thread/fork) needs each one to exist, so
+    project_folders() makes the missing ones first. The controller folders are
+    made before the author starts (controller_folders()), so in a run folder
     this leaves out only a missing pause.json, which the controller never
     reads back from there (its own copy is the one it relies on).
     """
@@ -251,10 +256,33 @@ def existing_entries(profile, workspace):
     roots = profile.get("filesystem", {}).get(":workspace_roots")
     if not isinstance(roots, dict):
         return profile
+    project_folders(workspace, [name for name in roots if name in retrieval_runtime.PROTECTED_DIRECTORIES])
     kept = {name: access for name, access in roots.items()
             if name == "." or name in retrieval_runtime.PROTECTED_DIRECTORIES
             or os.path.lexists(os.path.join(workspace, name))}
     return {**profile, "filesystem": {**profile["filesystem"], ":workspace_roots": kept}}
+
+
+def project_folders(workspace, names=retrieval_runtime.PROTECTED_DIRECTORIES):
+    """Make Codex's project folders ``names`` (.codex, .agents, .git, .aws) that are missing in ``workspace``: empty
+    and owner-only, read-only to every model process (private_permissions()).
+
+    On 20 Nov 2026 an author's follow-up failed at launch because the run folder had no .git yet: Codex 0.170 loads
+    the conversation it continues through its Linux sandbox, whose bubblewrap needs every such folder the profile
+    names ("bwrap: Can't find source path …/.git"). Empty folders are what a confined run folder ends up with anyway,
+    and what a web-cutoff run makes for every role (retrieval_runtime.verify_protected_directories()); git treats an
+    empty .git as no repository. An entry that exists (a file or a link included) is left as it is, and a folder that
+    cannot be made leaves the call to fail as before.
+    """
+
+    for name in names:
+        path = os.path.join(workspace, name)
+        if os.path.lexists(path):
+            continue
+        try:
+            os.mkdir(path, 0o700)
+        except OSError:
+            pass
 
 
 def controller_folders(workspace):

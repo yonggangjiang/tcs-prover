@@ -338,7 +338,11 @@ Claude Code's own subagents.
   again later. The member's line in the activity log says what failed and ends
   with the service's words.
   Pause, Stop, the time limit and a restart stop the members with the
-  coordinator; only their files stay.
+  coordinator; their files stay. A paused run also keeps each author's last
+  conversation with its saved state (in `pause.json`, which no model can
+  write): when it resumes, the coordinator's next `team_wait` names each
+  assignment that the pause or restart stopped, and `team_followup` continues
+  that member's conversation with everything it did there.
 - **When the coordinator cannot use its team, or does not wait for it.** The
   job is listed under **Needs your attention** while the work goes on, and the
   activity log keeps the warning, when the coordinator makes 10 model calls, or

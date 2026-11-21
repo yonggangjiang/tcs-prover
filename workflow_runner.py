@@ -1324,6 +1324,71 @@ def api_codex_home(workspace=None):
         raise Error(f"Cannot prepare the private Codex home for API models: {exc}") from exc
 
 
+# Codex's own databases (its thread index, logs, goals and memories, in SQLite) go on this machine's disk when its
+# Codex home is on a network file system. SQLite's locks over a network file system can block every Codex process: on
+# 20 Nov 2026 one Codex process stuck in network I/O kept the lock of ~/.codex/state_5.sqlite, Codex calls slowed to
+# minutes per step and then none could start. Codex 0.170 reads CODEX_SQLITE_HOME and builds a missing database from
+# the sessions in its Codex home (about a minute, once), so saved conversations keep resuming. Each Codex home gets
+# an owner-only folder under LOCAL_STATE_ROOT_ENV (default /var/tmp/tcs-prover-<uid>); a CODEX_SQLITE_HOME the user
+# set is kept, and nothing changes when the home is on a local disk or no safe local folder can be made.
+CODEX_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
+LOCAL_STATE_ROOT_ENV = "TCS_PROVER_LOCAL_STATE"
+NETWORK_FILE_SYSTEMS = frozenset({
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "9p", "ceph", "lustre", "gpfs", "beegfs", "glusterfs",
+    "fuse.glusterfs", "fuse.sshfs", "fuse.s3fs", "fuse.rclone",
+})
+
+
+def _file_system_type(path):
+    """The file system type of the mount that holds ``path`` (/proc/self/mounts), or None where it cannot be told."""
+
+    try:
+        target = os.path.realpath(path)
+        best, kind = "", None
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as mounts:
+            for line in mounts:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                # Spaces and other characters of a mount point are written as octal escapes (\040).
+                point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
+                if (target == point or target.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
+                    best, kind = point, fields[2]
+        return kind
+    except OSError:
+        return None
+
+
+def _owned_folder(folder):
+    """Make ``folder`` an owner-only folder of this user; False when it is a link, not a folder or another user's."""
+
+    try:
+        folder.mkdir(mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.chmod(folder, 0o700)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
+def local_codex_sqlite_home(codex_home):
+    """The local folder for the databases of Codex home ``codex_home`` (see CODEX_SQLITE_HOME_ENV), or None."""
+
+    if _file_system_type(codex_home) not in NETWORK_FILE_SYSTEMS or not hasattr(os, "getuid"):
+        return None
+    root = Path(os.environ.get(LOCAL_STATE_ROOT_ENV) or f"/var/tmp/tcs-prover-{os.getuid()}")
+    key = hashlib.sha256(os.path.realpath(codex_home).encode("utf-8")).hexdigest()[:16]
+    folders = (root, root / "codex-sqlite", root / "codex-sqlite" / key)
+    if not root.parent.is_dir() or _file_system_type(root.parent) in NETWORK_FILE_SYSTEMS:
+        return None
+    if not all(_owned_folder(folder) for folder in folders):
+        return None
+    return folders[-1]
+
+
 def environment(model=None):
     """Use inherited provider credentials with quiet, predictable child logging."""
 
@@ -1343,6 +1408,10 @@ def environment(model=None):
             # credential; the provider authenticates only with the token.
             env["OPENAI_API_KEY"] = CUSTOM_PROVIDER_LOGIN_PLACEHOLDER
         env["CODEX_HOME"] = str(api_codex_home())
+    if not env.get(CODEX_SQLITE_HOME_ENV):
+        local = local_codex_sqlite_home(env.get("CODEX_HOME") or str(Path.home() / ".codex"))
+        if local is not None:
+            env[CODEX_SQLITE_HOME_ENV] = str(local)
     # Inherited debug logs could bypass the structured-event privacy filter.
     env["RUST_LOG"] = "error"
     env.pop("LOG_FORMAT", None)
@@ -3481,6 +3550,16 @@ class CodexRollout:
 # stall watchdog allows this much more silence.
 CODEX_LONGEST_WAIT_SECONDS = 3600
 
+# A request whose CLI is alive and writes lines but returns no model event is stuck in the CLI or below it. On 20 Nov
+# 2026 Codex's databases on a network file system blocked: a critic coordinator returned no event for 46 minutes while
+# its CLI kept writing (so the output watchdog above never fired), and an author's CLI never started its thread for
+# 48 minutes. Calls normally go under two minutes without an event. The watchdog stops a request that has returned
+# no event at all within STRUCTURED_START_STALL_SECONDS of its start, or none for STRUCTURED_EVENT_STALL_SECONDS
+# (CODEX_LONGEST_WAIT_SECONDS more while its root agent waits for its subagents); it is retried like any stalled
+# attempt.
+STRUCTURED_START_STALL_SECONDS = 300
+STRUCTURED_EVENT_STALL_SECONDS = 1200
+
 
 class RequestMonitor:
     """Stall watchdog, liveness heartbeat and output readers of one structured CLI request.
@@ -3488,10 +3567,12 @@ class RequestMonitor:
     Shared by the Codex and Claude transports. start() arms the watchdog and
     the heartbeat before the prompt is written, so a CLI that never reads a
     long prompt is stopped too. Every line the CLI writes counts as activity:
-    the watchdog stops the CLI only after `timeout` seconds without any
+    the watchdog stops the CLI after `timeout` seconds without any
     (STRUCTURED_STALL_SECONDS by default), CODEX_LONGEST_WAIT_SECONDS more
-    while its root agent waits for its subagents (waiting()), or after
-    `deadline` seconds (the workflow time limit). lines() yields the CLI's
+    while its root agent waits for its subagents (waiting()), after
+    `deadline` seconds (the workflow time limit), or when it returns no model
+    event (observed()) for the STRUCTURED_START_STALL_SECONDS /
+    STRUCTURED_EVENT_STALL_SECONDS limits, however much else it writes. lines() yields the CLI's
     output without waiting for a process it started that keeps the output
     open after it ended; close() always stops the CLI and everything it
     started.
@@ -3507,8 +3588,10 @@ class RequestMonitor:
         self.activity_label, self.cli = activity_label, cli
         self.redact = redact or (lambda value: value)
         self.timed_out = threading.Event()
-        # The watchdog stopped the CLI because it wrote nothing for `quiet_seconds` (else: the deadline).
+        # The watchdog stopped the CLI because it wrote nothing, or returned no model event (`silent`), for
+        # `quiet_seconds` (else: the deadline).
         self.stalled = False
+        self.silent = False
         self.quiet_seconds = self.timeout
         # The root agent's open waits for its subagents (their item ids).
         self._waits = set()
@@ -3536,15 +3619,21 @@ class RequestMonitor:
             with self._lock:
                 limit = self.timeout + (CODEX_LONGEST_WAIT_SECONDS if self._waits else 0)
                 quiet = limit - (now - self._active_at)
+                # No model event: since the start (none yet) or since the last one.
+                event_limit = (STRUCTURED_START_STALL_SECONDS if not self._progress["eventCount"] else
+                               STRUCTURED_EVENT_STALL_SECONDS + (CODEX_LONGEST_WAIT_SECONDS if self._waits else 0))
+                silence = event_limit - (now - self._progress["lastEventAt"])
             left = math.inf if self.deadline is None else self._started_at + self.deadline - now
-            if min(quiet, left) <= 0:
+            if min(quiet, silence, left) <= 0:
                 if self.process.poll() is None:
                     self.stalled = left > 0
-                    self.quiet_seconds = limit
+                    self.silent = self.stalled and silence <= 0 and quiet > 0
+                    self.quiet_seconds = event_limit if self.silent else limit
                     self.timed_out.set()
                     stop_process(self.process)
                 return
-            if self._stop.wait(min(quiet, left)):
+            # At most a second at a time: the first event replaces the start limit by the event limit.
+            if self._stop.wait(min(quiet, silence, left, 1.0)):
                 return
 
     def _relay_heartbeat(self):
@@ -3655,6 +3744,10 @@ class RequestMonitor:
             return None
         if not self.stalled:
             return StructuredAttemptTimeout(f"The {stage} model call reached the workflow time limit.")
+        if self.silent:
+            return StructuredAttemptTimeout(
+                f"The {stage} model call returned no event for {_duration_text(self.quiet_seconds)} while its "
+                f"{self.cli} process stayed alive; the attempt was stopped.", self.quiet_seconds)
         return StructuredAttemptTimeout(f"The {stage} model wrote no output for {_duration_text(self.quiet_seconds)}; "
                                         "the attempt was stopped.", self.quiet_seconds)
 
@@ -3691,7 +3784,7 @@ class RequestMonitor:
         """Arm the watchdog and the heartbeat; call it before send_input()."""
 
         with self._lock:
-            self._started_at = self._active_at = time.monotonic()
+            self._started_at = self._active_at = self._progress["lastEventAt"] = time.monotonic()
         self._watchdog.start()
         if self.heartbeat:
             self._heartbeat.start()
@@ -9357,6 +9450,12 @@ def _execute(workflow, state, options, prompts):
                                 crew = teams[current] = start_team(members, prompts=texts, directory=directory,
                                                                    settings=settings, stage=stage_name,
                                                                    node_name=current, examiner=examiner)
+                                # What a pause kept of the previous runner's team at this step (Team.carry()).
+                                carried = state.get(team_module.TEAM_CARRY)
+                                if isinstance(carried, dict):
+                                    crew.restore(carried.pop(current, None))
+                                    if not carried:
+                                        state.pop(team_module.TEAM_CARRY, None)
                             # Its members are TCS Prover's: the coordinator gets no subagent tool of its CLI.
                             features = [feature for feature in features if feature != "multi_agent"]
                             note = team_module.team_note(texts["team_note"], members, render_template)
@@ -9500,6 +9599,15 @@ def _execute(workflow, state, options, prompts):
             _step_visit(state, current, visits, verify)
         state["paused"] = True
         state.pop("failed", None)
+        # The coordinator's team at this step: its authors' conversations and the assignments the pause stopped go
+        # with the saved state to the next runner, whose team takes them over (Team.carry(), Team.restore()).
+        state.pop(team_module.TEAM_CARRY, None)
+        crew = teams.get(current)
+        if crew is not None:
+            crew.close("It stopped when the run paused.")
+            kept = crew.carry()
+            if kept:
+                state[team_module.TEAM_CARRY] = {current: kept}
         thread_id = getattr(exc, "thread_id", None) or options.get("goal_thread_id")
         emit("workflow_paused", node.get("stage", current), node=current, state=state,
              reason=reason, threadId=thread_id,

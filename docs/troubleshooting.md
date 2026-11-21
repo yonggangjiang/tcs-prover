@@ -117,6 +117,19 @@ change).
 conversation and no private copy could restore it. To keep conversations longer,
 set `"cleanupPeriodDays": 365` in `~/.claude/settings.json`.
 
+**Codex calls slow down to minutes per step, or fail with "pool timed out while
+waiting for an open connection".** Codex keeps its own databases (its list of
+conversations, logs, goals) as SQLite files, by default in `~/.codex`. On a home
+folder on a network file system (NFS, SMB and the like) one Codex process stuck
+in network I/O can keep their lock, and every other Codex process then waits
+for it. TCS Prover therefore gives the Codex processes it starts a folder on
+this computer's disk for these databases when their Codex home is on a network
+file system (`CODEX_SQLITE_HOME`, `/var/tmp/tcs-prover-<uid>/codex-sqlite/`;
+set `TCS_PROVER_LOCAL_STATE` to use another local folder, or `CODEX_SQLITE_HOME`
+yourself to choose it). The conversations themselves stay in the Codex home,
+so saved conversations keep resuming; Codex builds the databases there once,
+in about a minute. Codex used outside TCS Prover keeps using `~/.codex`.
+
 ## Jobs
 
 **No PDF.** The job waits at **Compile PDF** with *Waiting to retry a command
