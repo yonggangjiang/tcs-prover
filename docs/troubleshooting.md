@@ -195,9 +195,7 @@ again every minute. An entry listed with a reason can be repaired or removed.
 with bubblewrap (bwrap)".** On Windows that is expected: there the models can
 read files outside their run folder. On Linux it means `bwrap` is missing or
 cannot make its sandbox; install bubblewrap (`sudo apt install bubblewrap`) and
-start the job again. See [Sandbox and network](sandbox.md#linux). "On Linux run
-confinement covers Codex roles only" means a Claude Code role's shell in the run
-can read your files.
+start the job again. See [Sandbox and network](sandbox.md#linux).
 
 **A job was deleted by mistake.** Its run folder stays in `runs/.trash/` for 30
 days, so its files can still be copied from there.

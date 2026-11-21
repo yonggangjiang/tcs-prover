@@ -10110,8 +10110,8 @@ def check_clis(models, directory=None):
     model that need it (missing_cli_text). Nothing waits: model calls retry
     every minute until the CLI works. Web-cutoff runs check their pinned
     binary in their own preflight instead. Where a model's processes cannot be
-    confined to their run (other than macOS and Linux with bubblewrap; on
-    Linux a Claude Code shell), a diagnostic says so, once.
+    confined to their run (other than macOS and Linux with bubblewrap), a
+    diagnostic says so, once.
     """
 
     directory = Path(directory or Path.cwd())
@@ -10126,7 +10126,6 @@ def check_clis(models, directory=None):
     # CLI -> (stage, model, API model?) of the first model that needs it; a built-in Codex model
     # first, as its calls look for Codex on PATH only.
     needs = {}
-    claude_unconfined = confinement.supported() and not confinement.claude_supported()
     for entry in models:
         stage, model = entry if isinstance(entry, tuple) else ("", entry)
         try:
@@ -10137,9 +10136,6 @@ def check_clis(models, directory=None):
             continue
         if name not in needs or (needs[name][2] and not api):
             needs[name] = (stage, model, api)
-    if claude_unconfined and "Claude" in needs:
-        # Linux: the Codex roles run confined, a Claude Code shell keeps its legacy reads.
-        emit("diagnostic", "workflow", text=confinement.CLAUDE_UNSUPPORTED_NOTICE)
     found, problems = {}, []
     retried = "Model calls retry every minute until it works."
     for name, (stage, model, api) in needs.items():

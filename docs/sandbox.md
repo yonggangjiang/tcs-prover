@@ -5,8 +5,8 @@
 On macOS, and on Linux where bubblewrap works (see
 [Linux](#linux)), every model process of a run is confined to its own folders:
 the proof author (and its replies while paused), the critic and its subagents,
-the LaTeX writer and its repairs, and the statement reviewer. On Linux this holds for Codex roles; a Claude Code role's shell is not
-confined there yet (see [Claude Code](#claude-code)).
+the LaTeX writer and its repairs, and the statement reviewer. This holds for
+Codex and for Claude Code roles (see [Claude Code](#claude-code)).
 
 - **Read:** its workspace (the author's run folder, or for a continuation the
   source run's folder it works in; for the other roles their call's own folder,
@@ -45,7 +45,7 @@ prompts rewritten from them. The run folder keeps copies the author may read.
 **Temp folders.** `$TMPDIR` names the private temp folder. The author's is
 `runs/.controller/<run>/tmp/`, kept for the whole run and deleted with the job.
 Each attempt of every other call gets a fresh one that is removed when the
-attempt ends. A Claude shell uses a short `/tmp/tcs-prover-…` folder of its own
+attempt ends. A Claude shell uses a short `/tmp/tcs-…` folder of its own
 (Claude Code needs a short path there), removed when the program ends; one that
 a killed process left is removed at the next start. In a web-cutoff run every
 model process gets a fresh one (see [Web search cutoff](web-cutoff.md)).
@@ -77,9 +77,9 @@ call (web-cutoff runs) are deleted when the call ends.
 **Job records.** `.tcs-prover/records/` holds every job's record of its model
 calls (see [The job page](job-page.md#the-record-of-every-model-call)). It is
 not among the entries above (keeping models away from it was left for later):
-on macOS and on Linux with bubblewrap no run's Codex model reads it all the same,
-as they read nothing of the checkout; on Windows, on Linux without bubblewrap,
-and through a Claude Code shell on Linux a live run's model could (see below). A record
+on macOS and on Linux with bubblewrap no run's model reads it all the same,
+as they read nothing of the checkout; on Windows and on Linux without
+bubblewrap a live run's model could (see below). A record
 never holds a login: the copy a web-cutoff URL discovery call keeps while it
 runs is left out of the discovery folders it copies.
 
@@ -88,11 +88,22 @@ runs is left out of the discovery folders it copies.
 The proof author's file tools are confined to its run folder, and its shell runs
 in Claude's sandbox (macOS, or Linux with `bwrap` and `socat`; elsewhere the
 author gets file tools only). The sandbox can neither read nor write
-`.tcs-prover/`; on macOS the shell reads only its run folder and private temp
-folder. On Linux it still reads your other files (Claude Code's own sandbox has
-not been checked with these rules there), and the activity log says so: "On
-Linux run confinement covers Codex roles only; this run's Claude Code shell can
-read files outside its folder." Neither the file tools nor the shell can change the controller's files
+`.tcs-prover/`; on macOS, and on Linux where bubblewrap works, the shell reads
+only its run folder, its private temp folder, the system and the software
+folders above, and writes only the first two.
+
+On Linux every other folder of the root (`/home`, `/tmp`, `/var`, `/run`,
+`/opt`, `/mnt`, mounted volumes) is an empty folder to the shell. A command
+can write there, but nothing reaches the disk and the next command does not
+find it, so scratch files belong in `$TMPDIR` or the run folder. TCS Prover
+does not hand Claude Code the environment variables that look like
+credentials there (a name with `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`
+or `CREDENTIAL`, or a URL with a password; proxy settings stay), and the
+shell does not get Claude Code's own login. On macOS Claude Code removes
+credentials from the shell's environment itself. Checked with Claude Code
+2.1.330 and 2.1.301.
+
+Neither the file tools nor the shell can change the controller's files
 in the run folder, `related-works/` or the `.codex`, `.agents`, `.git` and `.aws`
 folders. The statement reviewer and the critic's subagents only read; the critic and the LaTeX writer also edit their own copy of
 `proof.md` or `latex-source.tex`.

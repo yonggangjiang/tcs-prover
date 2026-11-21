@@ -17,11 +17,12 @@ Isolation, verified against Claude Code 2.1.289 (see tests/test_claude_cli.py):
 - Bash runs only inside the Claude sandbox (failIfUnavailable, no unsandboxed
   escape; network to every host in a live run only, none in a web-cutoff
   run); CLAUDE_CODE_SUBPROCESS_ENV_SCRUB removes credentials
-  from its environment, and the sandbox can neither read nor write TCS
+  from its environment (on Linux TCS Prover does, see child_environment()),
+  and the sandbox can neither read nor write TCS
   Prover's private state (the API model store and every settings folder)
-  nor write the protected entries. On macOS it reads only its working
-  directory, a private temp folder and the system, and writes only those two
-  (see sandbox_settings());
+  nor write the protected entries. On macOS, and on Linux with bubblewrap,
+  it reads only its working directory, a private temp folder and the system,
+  and writes only those two (see sandbox_settings());
 - API models run in a private configuration folder of their run folder
   (CLAUDE_CONFIG_DIR, see claude_home()), so the subscription login is never
   read: its credentials file, its keychain entry (whose name Claude derives
@@ -106,6 +107,15 @@ PLAIN_RULE_PATH = re.compile(r"/[A-Za-z0-9 ._~@/-]*\Z")
 # The user's own subscription login may be located through these; API models
 # start from an environment without any Claude or Anthropic variable.
 SUBSCRIPTION_ENVIRONMENT = ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")
+# The credentials a Claude Code process itself runs with: the subscription's token, and an API
+# model's key, which reaches it through its private settings file (gateway_environment()). On
+# Linux the Bash sandbox unsets them before each command (sandbox_settings()).
+OWN_CREDENTIALS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+# What a credential's variable looks like (without_credentials()): its name, or a URL that
+# carries a password. The proxy variables are kept even so.
+CREDENTIAL_NAME = re.compile(r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
+URL_PASSWORD = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+PROXY_VARIABLES = ("http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy")
 HISTORICAL_MESSAGE = "Web cutoff timestamps require Codex CLI models for every proof role."
 # Informational lines the CLI prints on every run.
 HARMLESS_STDERR = ("[claude-code:unrecognized_model]", "Permission mode forced to default")
@@ -314,30 +324,50 @@ def sandbox_settings(hidden, read_only=(), *, workspace=None, temp=None, live=Fa
 
     ``read_only`` paths stay readable but not writable (the run folder's
     protected entries, protected_settings()). With a private ``temp``
-    folder (bash_temp(), macOS) Bash reads only its ``workspace``, that
-    folder, the system and the toolchains: the home folder, other volumes,
-    the shared temp folders, the checkout and the folder holding the
-    workspace (the other runs) are denied, and only the workspace (its
-    Edit(./**) rule) and the temp folder are writable; Claude's own
-    /tmp/claude is not. Without one, Bash reads everything except ``hidden``.
+    folder (bash_temp(): macOS, and Linux with bubblewrap) Bash reads only
+    its ``workspace``, that folder, the system and the toolchains: the home
+    folder, other volumes, the shared temp folders, the checkout and the
+    folder holding the workspace (the other runs) are denied, and only the
+    workspace (its Edit(./**) rule) and the temp folder are writable;
+    Claude's own /tmp/claude is not. On macOS the denied folders are named
+    one by one; on Linux every folder of the root but the system's is denied
+    (confinement.claude_denied_reads()), as Codex's profile grants nothing
+    else, and what is allowed lies inside them. Without a temp folder, Bash
+    reads everything except ``hidden``.
 
     Network follows the run's search mode (``live``, search_is_live()), as
     the search tools do: a live run allows every host (SANDBOX_ALL_HOSTS),
     any other run none. The strict allowlist never asks for a host.
+
+    On Linux, where no Claude process gets CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+    (child_environment()), the sandbox unsets Claude Code's own credentials
+    (OWN_CREDENTIALS) before each command.
     """
 
     hidden = [str(path) for path in hidden]
     filesystem = {"denyRead": hidden, "denyWrite": [*hidden, *(str(path) for path in read_only)]}
+    credentials = ({"credentials": {"envVars": [{"name": name, "mode": "deny"} for name in OWN_CREDENTIALS]}}
+                   if sys.platform.startswith("linux") else {})
     if temp is not None:
         temp, workspace, home = os.path.realpath(temp), os.path.realpath(workspace), os.path.realpath(Path.home())
+        linux = sys.platform.startswith("linux")
         # The checkout and the folder holding the workspace (the other runs), also outside the home folder.
         outside = [path for path in dict.fromkeys((os.path.realpath(providers.ROOT), os.path.dirname(workspace)))
                    if os.path.commonpath((path, home)) != home and os.path.dirname(path) != path]
+        denied = confinement.claude_denied_reads()
+        if linux:
+            # The home folder, the checkout and the other runs lie in a denied folder of the root, unless one
+            # of them is in the system's folders.
+            denied = [*denied, *(path for path in dict.fromkeys((home, *outside))
+                                 if os.path.dirname(path) != path
+                                 and not any(confinement.inside(Path(path), Path(folder)) for folder in denied))]
+        else:
+            denied = [home, *denied, *outside]
+        programs = (*confinement.claude_versions(), *confinement.toolchain_folders(home_only=not linux),
+                    *confinement.system_files())
         filesystem = {
-            "denyRead": [home, *confinement.CLAUDE_DENIED_READS, *outside, *hidden],
-            "allowRead": [workspace, temp,
-                          *(str(path) for path in (*confinement.claude_versions(),
-                                                   *confinement.toolchain_folders(home_only=True)))],
+            "denyRead": [*denied, *hidden],
+            "allowRead": [workspace, temp, *dict.fromkeys(str(path) for path in programs)],
             "allowWrite": [temp],
             "denyWrite": [*hidden, *(str(path) for path in read_only), *confinement.CLAUDE_DENIED_WRITES],
         }
@@ -346,11 +376,13 @@ def sandbox_settings(hidden, read_only=(), *, workspace=None, temp=None, live=Fa
         "autoAllowBashIfSandboxed": True,
         "network": {"allowedDomains": list(SANDBOX_ALL_HOSTS) if live else [], "strictAllowlist": True},
         "filesystem": filesystem,
+        **credentials,
     }
 
 
 def bash_temp(tools, workspace, runtime):
-    """The private temp folder (confinement.claude_temp()) of a CLI that offers Bash on macOS, else None.
+    """The private temp folder (confinement.claude_temp()) of a CLI that offers Bash where its shell runs confined
+    (confinement.claude_supported()), else None.
 
     The CLI's PrivateSettings remove it with the settings file.
     """
@@ -448,6 +480,21 @@ def subscription_environment(base):
     return environment
 
 
+def without_credentials(environment, keep=()):
+    """``environment`` without the variables that look like credentials, except those named in ``keep``.
+
+    A variable looks like one by its name (CREDENTIAL_NAME) or by a value
+    that is a URL with a password; the proxy variables stay, as Claude Code
+    itself needs them, and so does git's configuration from the environment
+    (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_<n>, GIT_CONFIG_VALUE_<n>), which git
+    refuses to read in part. Claude Code's own scrub keeps both as well.
+    """
+
+    return {name: value for name, value in environment.items()
+            if name in keep or name.lower() in PROXY_VARIABLES or name.startswith("GIT_CONFIG_")
+            or not (CREDENTIAL_NAME.search(name) or URL_PASSWORD.search(str(value)))}
+
+
 def child_environment(base, effort, *, api, config=None, temp=None, subagent_tool=False, subagents=None):
     """Start from the runner environment without any inherited Claude/Anthropic setting.
 
@@ -457,18 +504,29 @@ def child_environment(base, effort, *, api, config=None, temp=None, subagent_too
     git config. Like every confined process, the CLI is not told where the
     user's SSH and GPG agents listen (confinement.AGENT_VARIABLES). A
     subscription model starts from subscription_environment().
+
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB keeps credentials out of the commands
+    Claude Code starts, except on Linux, where it also opens the Bash sandbox
+    to the user's files (see runner/confinement.py). There the CLI is not
+    given the credentials in the first place (without_credentials()), its own
+    ones are unset by the sandbox (sandbox_settings()), and ``temp`` is the
+    CLI's own TMPDIR too, where it keeps the sockets of its network proxy.
     ``subagent_tool`` says that the CLI offers the subagent tool (Task, see
     tool_permissions()), and ``subagents`` (1 or more, or None for a node
     that declares no number) how many subagents may run at once: see
     SUBAGENT_ENVIRONMENT.
     """
 
+    linux = sys.platform.startswith("linux")
     environment = _without_claude_settings(base) if api else subscription_environment(base)
+    if linux:
+        environment = without_credentials(environment, SUBSCRIPTION_ENVIRONMENT)
     if config is not None:
         environment["CLAUDE_CONFIG_DIR"] = str(config)
     # The environment value takes precedence over --effort, so both agree.
     environment["CLAUDE_CODE_EFFORT_LEVEL"] = effort
-    environment["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+    if not linux:
+        environment["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
     environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
     # 429 and 529 responses are waited out inside the same request (Anthropic's own
     # runners set this too) rather than failing after a few minutes of retries.
@@ -476,6 +534,8 @@ def child_environment(base, effort, *, api, config=None, temp=None, subagent_too
     if temp is not None:
         environment["CLAUDE_CODE_TMPDIR"] = str(temp)
         environment["GIT_CONFIG_GLOBAL"] = os.devnull
+        if linux:
+            environment["TMPDIR"] = str(temp)
     if subagent_tool:
         # Set after the filter above, which removed every inherited CLAUDE* variable.
         environment.update(SUBAGENT_ENVIRONMENT)

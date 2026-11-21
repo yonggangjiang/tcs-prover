@@ -8,7 +8,7 @@ and that temp folder. Other runs, the checkout, the home folder, /tmp,
 /var/tmp and the shared $TMPDIR stay out of reach. Codex enforces this with a
 permission profile (workflow_runner.private_permissions()), with Seatbelt on
 macOS and with bubblewrap on Linux; Claude's Bash with its sandbox settings
-(claude_cli.sandbox_settings(); on macOS only, see claude_supported()), while
+(claude_cli.sandbox_settings(); Seatbelt on macOS, bubblewrap on Linux), while
 --restricted keeps Claude's file tools in the working directory and deny rules
 keep them off the protected entries (claude_cli.protected_settings()). Other
 platforms, and Linux without a bubblewrap that can make its sandbox, keep their
@@ -45,6 +45,22 @@ systems, needs its target granted for any name to resolve (system_files()).
 Commands get their own process namespace, so `lsof -U` lists no other
 process's sockets, and reach a Unix socket only in a folder they can read; with
 network access they share the computer's network, localhost included.
+
+Verified with Claude Code 2.1.330 and its real Bash tool on Linux (Ubuntu
+24.04, bubblewrap 0.9): a folder its sandbox may not read is an empty folder
+there, which commands can write without anything reaching the disk, and a
+folder allowed inside one is mounted back, so denying every folder of the root
+but the system's (claude_denied_reads()) leaves a command the same view as
+Codex's profile. The sockets of its network proxy lie in the temp folder of
+the Claude Code process, so that process gets the private temp folder as its
+TMPDIR, and /tmp can be denied like the rest. With
+CLAUDE_CODE_SUBPROCESS_ENV_SCRUB set, Claude Code (2.1.301 and 2.1.330) mounts
+/home, /root, /tmp, /var, /opt, /run and /mnt writable in that sandbox, over a
+rule that denies one of them: a shell then reads and writes the user's files.
+So on Linux a Claude process runs without that variable, and TCS Prover keeps
+credentials out of its shell itself (claude_cli.child_environment(),
+claude_cli.sandbox_settings()); the sandbox has its own process namespace
+either way.
 """
 
 import atexit
@@ -110,23 +126,27 @@ CLAUDE_VERSIONS = "~/.local/share/claude/versions"
 # folder of a process killed before it removed it is swept at the next start (sweep_temps()):
 # a runner's own one without a run temp folder from the controller, one per structured call
 # attempt, and one per Claude Code process.
-RUN_TEMP_PREFIX, CALL_TEMP_PREFIX, CLAUDE_TEMP_PREFIX = "tcs-run-tmp-", "tcs-call-tmp-", "tcs-prover-"
-OWNED_TEMP_NAME = re.compile(r"(?:tcs-run-tmp|tcs-call-tmp|tcs-prover)-(\d+)-[A-Za-z0-9_]{8}\Z")
+RUN_TEMP_PREFIX, CALL_TEMP_PREFIX, CLAUDE_TEMP_PREFIX = "tcs-run-tmp-", "tcs-call-tmp-", "tcs-"
+# Earlier versions named a Claude Code process's folder tcs-prover-<PID>-…; one left behind is still swept.
+OWNED_TEMP_NAME = re.compile(r"(?:tcs-run-tmp|tcs-call-tmp|tcs-prover|tcs)-(\d+)-[A-Za-z0-9_]{8}\Z")
 # Claude Code gives Bash $TMPDIR=<CLAUDE_CODE_TMPDIR>/claude-<uid> only when that path has at
-# most 44 bytes, and /tmp/claude-<uid> otherwise (Claude Code 2.1.289), so a Claude role's
-# private temp folder is a short one in /tmp: /tmp/tcs-prover-<PID>-<8 characters>.
+# most 44 bytes, and /tmp/claude-<uid>, which every Claude process of the user shares, otherwise
+# (Claude Code 2.1.289 and 2.1.330). So a Claude role's private temp folder is a short one in
+# /tmp, /tmp/tcs-<PID>-<8 characters>: 39 bytes with a seven-digit process ID and a six-digit
+# user ID, as Linux has them, and 43 with a ten-digit user ID.
 CLAUDE_TEMP_PARENT = "/tmp"
-# Folders Claude Code's Bash sandbox may otherwise read: the home folder is added at run time.
+# Folders Claude Code's Bash sandbox may otherwise read on macOS: the home folder is added at run time.
 CLAUDE_DENIED_READS = ("/Volumes", "/private/tmp", "/private/var/tmp", "/private/var/folders")
+# The folders of the root its sandbox keeps readable on Linux, where every other one is denied
+# (claude_denied_reads()): the system as Codex's ":minimal" has it, with /dev and /proc, which Claude
+# Code's sandbox makes anew, and the Nix store, where NixOS keeps the system's programs.
+LINUX_CLAUDE_SYSTEM = (*LINUX_MINIMAL, "/dev", "/proc", "/nix")
 # Shared folders Claude Code's Bash sandbox may otherwise write.
 CLAUDE_DENIED_WRITES = ("/tmp/claude", "/private/tmp/claude")
 # The command of the startup check may take this long.
 CHECK_TIMEOUT_MS = 10000
 UNSUPPORTED_NOTICE = ("Run confinement is enforced on macOS, and on Linux with bubblewrap (bwrap); this run's "
                       "model can read files outside its folder.")
-# On Linux the Codex roles are confined, Claude Code's shell not yet (claude_supported()).
-CLAUDE_UNSUPPORTED_NOTICE = ("On Linux run confinement covers Codex roles only; this run's Claude Code shell can "
-                             "read files outside its folder.")
 # A bubblewrap that cannot make its sandbox (no user namespaces) answers within this time.
 BUBBLEWRAP_CHECK_SECONDS = 10
 
@@ -147,9 +167,14 @@ def supported():
 
 
 def claude_supported():
-    """Whether Claude Code's shell runs confined: macOS only (its Linux sandbox is not verified with these rules)."""
+    """Whether Claude Code's shell runs confined: where Codex's model processes do (supported()).
 
-    return sys.platform == "darwin"
+    Claude Code's Linux sandbox runs `bwrap` from PATH as Codex's does, so the
+    same bubblewrap decides both; without one that works its shell keeps
+    Claude Code's default reads, as the legacy sandboxes do (UNSUPPORTED_NOTICE).
+    """
+
+    return supported()
 
 
 _BUBBLEWRAP = {}
@@ -324,6 +349,28 @@ def claude_versions():
     return [path] if path.is_dir() else []
 
 
+def claude_denied_reads():
+    """The folders Claude Code's Bash sandbox may otherwise read, besides the home folder on macOS.
+
+    On macOS CLAUDE_DENIED_READS. On Linux every folder of the root except
+    the system's (LINUX_CLAUDE_SYSTEM): the home folders, /tmp, /var, /run,
+    /opt, /mnt, /srv and whatever volumes are mounted there, found when a
+    Claude process starts (a link in the root, such as /bin on a merged-/usr
+    system, is not a folder of its own). That is what Codex's profile leaves
+    out. What a command may read inside them is allowed again by name
+    (claude_cli.sandbox_settings()).
+    """
+
+    if not sys.platform.startswith("linux"):
+        return list(CLAUDE_DENIED_READS)
+    try:
+        with os.scandir("/") as entries:
+            folders = sorted(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+    return [folder for folder in folders if folder not in LINUX_CLAUDE_SYSTEM]
+
+
 def temp_environment(temp):
     """The environment of a confined Codex process: TMPDIR and zsh heredocs in its temp folder, no global git config."""
 
@@ -459,7 +506,7 @@ def runner_folder(workspace):
 
 
 def claude_temp(workspace=None):
-    """A short private temp folder for one Claude Code process (CLAUDE_CODE_TMPDIR), as /tmp/... (see CLAUDE_TEMP_PARENT).
+    """A short private temp folder for one Claude Code process (CLAUDE_CODE_TMPDIR), as /tmp/tcs-... (see CLAUDE_TEMP_PARENT).
 
     Its name carries this process's ID: sweep_temps() removes the folders
     of processes that ended without removing theirs.
