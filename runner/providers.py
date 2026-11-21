@@ -51,6 +51,7 @@ BUILTIN_MODELS = (
     {"id": "gpt-6-astra", "label": "GPT 6 Astra", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-sol", "label": "GPT 6 Sol", "provider": CODEX, "efforts": CODEX_EFFORTS},
     {"id": "gpt-6-luna", "label": "GPT 6 Luna", "provider": CODEX, "efforts": CODEX_EFFORTS},
+    {"id": "claude-fable-5-2", "label": "Claude Fable 5.2", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
     {"id": "claude-fable-5-1", "label": "Claude Fable 5.1", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
     {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},
     {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": CLAUDE, "efforts": CLAUDE_EFFORTS},

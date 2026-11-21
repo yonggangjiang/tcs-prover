@@ -18,7 +18,7 @@ API connection; each model offers only the reasoning levels it supports.
 | Source | Models | Needs |
 | --- | --- | --- |
 | Codex CLI | `gpt-6.2-sol` (GPT 6.2 Sol, the default), `gpt-6.2-astra`, `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | the Codex CLI, signed in with ChatGPT (on the Setup page, or `codex login`) |
-| Claude Code | `claude-fable-5-1` (Claude Fable 5.1), `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | Claude Code, signed in with your Claude subscription |
+| Claude Code | `claude-fable-5-2` (Claude Fable 5.2), `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | Claude Code, signed in with your Claude subscription |
 | API connection | the models your endpoint lists | a saved key, and the program for its format installed but not signed in: OpenAI format through the Codex CLI, Anthropic format through Claude Code |
 
 Install and sign in on the [Setup page](#the-setup-page); the commands to run in a
