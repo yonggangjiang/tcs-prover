@@ -86,10 +86,12 @@ _GOAL_LIFECYCLE = ("goal", "continuation", "compaction", "repair", "resume")
 # conversation, the paused author's conversation turns (--converse), the
 # framing of a chat message sent to the working author (the controller
 # renders it into a live instruction), the block of the first prompt that
-# points to related works and the note that tells a resumed author why the
-# controller refused its last submission.
+# points to related works, the note that tells a resumed author why the
+# controller refused its last submission, the note on the subagents it may
+# start, and the note that tells it of its examiner (appended to the first
+# prompt while the run's examiner is on).
 _GOAL_OPTIONAL_LIFECYCLE = ("pause", "reopen", "summary", "conversation", "chat", "related_works", "handoff_refused",
-                            "subagents")
+                            "subagents", "examiner_note")
 # The lifecycle prompts a goal node's coordinator binding may replace (the author coordinator, see author_mode()),
 # and "report", the answer to a reply that is not a hand-in (the continuation when absent), which only a
 # coordinator binding has. The chat framing (rendered by the controller) and the subagents note of an author that
@@ -8043,7 +8045,7 @@ def _lifecycle_fields(key, fields):
     return ({"reason"} if key == "handoff_refused" else {"author_subagents"} if key == "subagents"
             else {"message", "answer_file"} if key == "chat"
             else {"message"} if key == "conversation" else set() if key == "summary"
-            else None if key == "related_works" else fields)
+            else None if key in ("related_works", "examiner_note") else fields)
 
 
 def prompt_rules(workflow):
@@ -9412,11 +9414,12 @@ def _execute(workflow, state, options, prompts):
                     inline = "\n\n" + INLINE_PROOF_NOTE if not proof_handoff.file_handoff_supported() else ""
                     directory = options.get("goal_cwd") or str(Path.cwd())
 
-                    def plan(coordinating, appendix, note=""):
+                    def plan(coordinating, appendix, note="", examined=False):
                         """How the author starts: its first prompt, its lifecycle prompts and any recovered critic
                         feedback, as the author coordinator (``coordinating``, the node's coordinator binding) or
                         as the author alone, with the subagents note when ``appendix`` says so; ``note`` is the
-                        team note of a coordinator with TCS Prover's team."""
+                        team note of a coordinator with TCS Prover's team. ``examined``: the author has an examiner
+                        (see ``examined`` below), which the examiner note tells it."""
 
                         bound = ({**lifecycle, **_lifecycle_map(node["coordinator"]["lifecycle"])} if coordinating
                                  else lifecycle)
@@ -9435,13 +9438,17 @@ def _execute(workflow, state, options, prompts):
                             # The author may start subagents: the first prompt says how many, like the related
                             # works, and {original_prompt} carries it into the later prompts.
                             prompt += "\n\n" + render_template(prompts[bound["subagents"]], {"author_subagents": count})
+                        if examined and "examiner_note" in bound:
+                            # An examiner reports to the author: the first prompt says so, as written, and
+                            # {original_prompt} carries it into the later prompts.
+                            prompt += "\n\n" + prompts[bound["examiner_note"]]
                         if note:
                             # The coordinator's team, after the related works and before the inline proof note;
                             # {original_prompt} carries it into the later prompts.
                             prompt += "\n\n" + note
                         prompt += inline
                         session_prompts = {key: prompts[ref] + (inline if key in INLINE_PROOF_PROMPTS else "")
-                                           for key, ref in bound.items() if key != "subagents"}
+                                           for key, ref in bound.items() if key not in ("subagents", "examiner_note")}
                         recovery = node.get("recovery")
                         instruction = ""
                         if recovery and evaluate(recovery["when"], context):
@@ -9460,6 +9467,10 @@ def _execute(workflow, state, options, prompts):
                         # The most subagents at once (Codex's own limits, see subagent_limits()).
                         settings["subagents"] = count
                     texts = {name: prompts[name] for name in HARNESS_TEXTS if name in prompts}
+                    # Whether an author that proves the statement itself gets an examiner: the run's ``examiner``
+                    # option (the job's Examiner setting; on unless it says otherwise) with an author_examiner text.
+                    examined = (options.get("examiner", True) is not False
+                                and bool(str(texts.get("author_examiner") or "").strip()))
                     crew, members = None, []
                     if coordinator and options.get("author_team", "builtin") == "tcs":
                         if retrieval_policy(directory, features):
@@ -9511,7 +9522,7 @@ def _execute(workflow, state, options, prompts):
                         coordinator = False
                         features = [feature for feature in features if feature != "multi_agent"]
                         note_no_subagent_tool(stage_name, settings["model"], count, coordinator=True)
-                        start = plan(False, False)
+                        start = plan(False, False, examined=examined)
                     elif coordinator:
                         start = plan(True, False)
                         prepare_memory_folder(directory, stage_name)
@@ -9520,19 +9531,17 @@ def _execute(workflow, state, options, prompts):
                             # (claude_cli.goal_session): the author then works alone like this.
                             alone = plan(False, False)
                     else:
-                        start = plan(False, True)
+                        start = plan(False, True, examined=examined)
                         if count is not None:
                             note_no_subagent_tool(stage_name, settings["model"], count)
                     prompt, session_prompts, instruction = start["prompt"], start["prompts"], start["recovery"]
                     if alone is not None:
                         alone.pop("bound")
-                    # The author's examiner (the run's ``examiner`` option, the job's Examiner setting; on unless
-                    # it says otherwise), with an author_examiner text: TCS Prover starts it about once an hour and
-                    # its reports go into the author's running turn (the goal session's ``examiner``). The earlier
-                    # team design has the team's own examiner instead.
+                    # The author's examiner (``examined`` above): TCS Prover starts it about once an hour and its
+                    # reports go into the author's running turn (the goal session's ``examiner``). The earlier team
+                    # design has the team's own examiner instead.
                     lone_examiner = None
-                    if (crew is None and not coordinator and options.get("examiner", True) is not False
-                            and str(texts.get("author_examiner") or "").strip()):
+                    if crew is None and not coordinator and examined:
                         lone_examiner = examiners.get(current)
                         if lone_examiner is None or lone_examiner.closed is not None:
                             seat = {**team_module.team_members(None, settings["model"], settings["effort"], 1)[0],

@@ -495,7 +495,8 @@ that every prompt and tool text is the user's to adjust. What the code does:
   (`team_tool_*`). `prompt_rules()` says what each prompt may use, as `prepare()`
   checks it, as the code fills each text in (`_lifecycle_fields()`: a reply
   turn fills in `{message}` and nothing in a progress summary; the related works
-  note and a verify-only round's instruction are used as written);
+  note, the examiner note and a verify-only round's instruction are used as
+  written);
   `runner/prompt_catalog.py` names, groups and describes every text for the
   Prompts dialog (`GET /prompt-catalog`, `POST /prompt-catalog/check`), each
   entry's `template` saying whether it is filled in (a brace that is no

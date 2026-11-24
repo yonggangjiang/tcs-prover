@@ -7,7 +7,7 @@ nodes:
     role: author
     stage: solve
     prompt: author
-    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents]
+    lifecycle: [goal, continuation, compaction, repair, resume, reopen, summary, conversation, chat, related_works, handoff_refused, subagents, examiner_note]
     # The run's Parallel agents setting, as the number of subagents the author may start (author_subagents, 0 to 10:
     # one fewer than Parallel agents). 0, the default: the author works alone and has no subagent tool. 1 or more:
     # it gets its program's own subagent tool, limited to that many at a time, and the subagents note below.
@@ -85,16 +85,13 @@ prompts:
   # On a computer where TCS Prover cannot read proof.md safely (Windows), the runner adds a short note
   # after this prompt, the continuation prompt and the repair prompt asking for the proof in the reply.
   author: |-
-    The following is the statement to prove. Do not give up just because a problem is hard or open.
+    The following is the statement to prove. Try hard and do not give up just because a problem is hard or open.
 
     YOUR MEMORY
     Your conversation will be compacted from time to time, and whatever is not written down is lost. Keep your memory in the memory folder of your working directory, organized as you see fit; you are responsible for maintaining it.
 
-    Think deeply and hard. Explore substantially diversified approaches: when one line of attack stalls, try a genuinely different idea instead of small variations of the same one, and keep track of what you have ruled out. Submit only a proof you have checked.
-
     When your proof is complete, write it to proof.md and reply with exactly:
     PROOF_FILE: proof.md
-    The critic reads only proof.md and the statement, so make the proof complete and self-contained.
 
     STATEMENT:
     [STATEMENT]
@@ -379,13 +376,19 @@ prompts:
   # author's model in the author's folder; its report is saved in team/ and sent into the author's running turn
   # framed by author_examiner_report. Empty: no examiner, whatever the setting.
   author_examiner: |-
-    You are the examiner of an author who works on the statement in checked-statement.md in this folder and chooses its own approaches. This folder is the author's working directory: its memory folder holds the author's notes, team/ holds your previous reports, and transcript.jsonl is the complete raw record of every step (it is very large, so search it rather than read it whole).
+    You are the examiner of an author who is trying to prove the statement in checked-statement.md. This folder is the author's working directory: team/ holds your earlier reports, and transcript.jsonl is the complete record of its work (very large: search it rather than read it whole).
 
-    Examine the whole trajectory, not only the latest work. Judge whether progress towards a complete proof of the statement is growing steadily with the time spent: what is still missing between the author's work and a complete proof, and how that has changed since several hours ago and since your previous reports.
+    Work out what is still missing between the author's work and a complete proof, checking for yourself what you rely on. Judge whether it is shrinking, also since your earlier reports, and whether it is any easier than the statement itself.
 
-    Examine how the author works and keeps its memory, and how that shapes the trajectory. Where progress is not growing, find what causes it and say what should change. Check whether changes made after your earlier reports helped.
+    Tell the author plainly what you found. If what is missing is no easier than the statement, ask the author to step back and reconsider, from the statement itself, which overall approach could lead to a complete proof.
 
-    Your final reply is your report to the author: your conclusion and your suggestions.
+    Your final reply is your report to the author.
+  # EDIT EXAMINER NOTE HERE: appended as written.
+  # Appended to the author's first prompt while the job's Examiner is on (with an author_examiner text): it tells the
+  # author that an examiner reports to it, and what its reports are.
+  examiner_note: |-
+    YOUR EXAMINER
+    About once an hour an examiner reads your whole record and your memory folder and sends you a report, which arrives as a message headed [REPORT FROM THE EXAMINER]. It sees the whole run from outside, so take seriously what it says about your progress and about what is still missing. Its report is advice, not a new task: the mathematics stays yours, and your task is still a complete proof of the statement.
   # How the examiner's report reaches the author: {report} is the report.
   author_examiner_report: |-
     [REPORT FROM THE EXAMINER]

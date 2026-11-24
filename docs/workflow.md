@@ -162,14 +162,23 @@ With **Examiner** on (the default), TCS Prover starts an examiner beside the
 author about once an hour while the author works, from the first hour on. Each
 examination is a fresh conversation of the author's model in the author's
 folder, with the `author_examiner` text as its whole instruction (**Edit
-prompts → Author → Examiner instructions**): it examines the whole run and
-judges whether progress towards a complete proof keeps growing. Its final reply
-is saved as `team/member-1/<k>-report.md` and sent into the author's running
-turn, framed by `author_examiner_report` (by default `[REPORT FROM THE
-EXAMINER]` and the report), the way a chat message is; the author goes on
-working with it, and the activity log shows *Examiner report delivered*. Codex
-and Claude Code authors both get it. **Examiner** off, or an empty
-`author_examiner` text, runs the author without one.
+prompts → Author → Examiner instructions**): it works out what is still missing
+between the author's work and a complete proof, judges whether that is shrinking
+and whether it is any easier than the statement itself, and tells the author; if
+what is missing is no easier than the statement, it asks the author to step back
+and reconsider the overall approach. Its final reply is saved as
+`team/member-1/<k>-report.md` and sent into the author's running turn, framed by
+`author_examiner_report` (by default `[REPORT FROM THE EXAMINER]` and the
+report), the way a chat message is; the author goes on working with it, and the
+activity log shows *Examiner report delivered*. Codex and Claude Code authors
+both get it.
+
+The author is told of its examiner: while the examiner is on, the author's first
+prompt ends with the `examiner_note` text (**Edit prompts → Author → Examiner
+note**), which says that a report arrives about once an hour under that heading,
+that it is advice and not a new task, and that the task is still a complete
+proof of the statement. **Examiner** off, or an empty `author_examiner` text,
+runs the author without an examiner and without the note.
 
 ### The goal loop
 

@@ -52,6 +52,9 @@ ENTRIES = (
      "report into the author's running turn. Empty: no examiner."),
     ("author_examiner_report", "Author", "Examiner report",
      "Frames the examiner's report as it reaches the author: {report} is the report."),
+    ("examiner_note", "Author", "Examiner note",
+     "Appended to the author's first prompt while the job's Examiner is on: it tells the author that an examiner "
+     "reports to it and what its reports are."),
     ("chat", "Author", "Chat message",
      "Frames a chat message sent to the working author or coordinator: {message}, and {answer_file} for an answer."),
     ("related_works", "Author", "Related works",
