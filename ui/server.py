@@ -1310,6 +1310,40 @@ class SleepWatch:
         return gap if gap > self.MARGIN_SECONDS else 0.0
 
 
+_OUTPUT_END = object()
+
+
+def runner_lines(stream):
+    """The lines of a runner's output, read on a thread of their own and handed out in order.
+
+    Reading never waits for the caller. A caller that is slow to handle a line, for example while saving it to a
+    run folder whose network filesystem stopped answering, would otherwise stop reading the pipe. The runner's
+    every thread writes its events to that pipe, its watchdog included, so once the pipe is full they all block:
+    the run stops without a failure, a pause or a check that could notice it (a job stalled 5 hours this way on
+    an NFS home, 23 Nov 2026). An error reading the stream is raised to the caller after the lines before it.
+    """
+
+    lines = queue.SimpleQueue()
+
+    def pump():
+        try:
+            for line in stream:
+                lines.put(line)
+        except (OSError, ValueError) as exc:
+            lines.put(exc)
+        finally:
+            lines.put(_OUTPUT_END)
+
+    threading.Thread(target=pump, name="runner-output", daemon=True).start()
+    while True:
+        line = lines.get()
+        if line is _OUTPUT_END:
+            return
+        if isinstance(line, BaseException):
+            raise line
+        yield line
+
+
 def reap_runner(process):
     """Wait for a runner, then kill what it left behind in its process group.
 
@@ -4063,8 +4097,14 @@ class App:
             }
             # Run settings: where each role's model runs, from this response's catalog.
             state["modelSources"] = role_model_sources(state, state["workflow"]["settings"]["model_catalog"])
-            state["checkpoints"] = [dict(item, resumable=False) if not saved_workflow_stages(state)["critic"]
-                                    else item for item in self._checkpoint_cache]
+            # The critic's checkpoint needs the critic stage; the Writing one continues in a new run, which a
+            # web-cutoff run's policy forbids.
+            historical = bool(state.get("retrievalPolicyPath") or state.get("retrievalMode") == "historical")
+            critic_stage = saved_workflow_stages(state)["critic"]
+            state["checkpoints"] = [
+                item if (not historical if item.get("stage") == "writing" else critic_stage)
+                else dict(item, resumable=False)
+                for item in self._checkpoint_cache]
             state["canDownloadTex"] = bool(
                 state["phase"] == "done" and not self.has_active_worker()
                 and self.run_dir and (self.run_dir / "final.tex").is_file()
@@ -9395,7 +9435,8 @@ def checkpoint_artifact_signature(run_dir):
         return ()
     run_dir = Path(run_dir)
     signature = []
-    for name in ("checked-statement.md", "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME):
+    for name in ("checked-statement.md", "SOLUTION.md", runtime.SAVED_CANDIDATE_FILENAME,
+                 runtime.FINAL_INPUT_FILENAME, "final.tex", "latex-source.tex"):
         try:
             stat = (run_dir / name).stat()
             signature.append((name, stat.st_mtime_ns, stat.st_size))
@@ -9404,11 +9445,24 @@ def checkpoint_artifact_signature(run_dir):
     return tuple(signature)
 
 
-def saved_run_checkpoints(run_dir):
-    """Describe every durable, resumable critic checkpoint in one run.
+def critic_accepted(run_dir):
+    """Whether the run's critic accepted its proof: the run holds the final input saved at approval (final-input.json).
 
-    The saved proof candidate is the only one; every listed continuation is a
-    new run, whose critic starts afresh.
+    Only a stat: a damaged file still counts, and saved_run_checkpoints() then offers the candidate again.
+    """
+
+    path = Path(run_dir) / runtime.FINAL_INPUT_FILENAME
+    return path.is_file() and not path.is_symlink()
+
+
+def saved_run_checkpoints(run_dir):
+    """Describe every durable, resumable checkpoint in one run; every listed continuation is a new run.
+
+    The saved proof candidate continues at the critic, whose critic starts
+    afresh, until the critic has accepted it. An accepted proof that was
+    never written up (final-input.json, with no final.tex or
+    latex-source.tex: the job ran without Writing & polishing) continues at
+    the Writing step (Server.resume_writing_job()).
     """
 
     run_dir = Path(run_dir)
@@ -9431,8 +9485,17 @@ def saved_run_checkpoints(run_dir):
             source = saved_critic_source(run_dir)
         except ValueError:
             pass
+    accepted = False
+    if statement_ready and critic_accepted(run_dir):
+        try:
+            # The file itself only: the run records are not read here (this runs at every change of the files).
+            saved_final_input(run_dir, records=())
+            accepted = True
+        except ValueError:
+            pass
     checkpoints = []
-    if source is not None:
+    if source is not None and not accepted:
+        # Once the critic has accepted the proof, running it again from here is not offered.
         checkpoints.append({
             "id": "candidate",
             "label": "Saved proof candidate",
@@ -9445,6 +9508,22 @@ def saved_run_checkpoints(run_dir):
             ),
             "resumable": True,
             "resumeLabel": "Continue at critic",
+        })
+    final_input = run_dir / runtime.FINAL_INPUT_FILENAME
+    written = any((run_dir / name).exists() for name in ("final.tex", "latex-source.tex"))
+    if accepted and not written:
+        checkpoints.insert(0, {
+            "id": "writing",
+            "label": "Accepted proof",
+            "stage": "writing",
+            "status": "ready",
+            "completedAt": _artifact_time(final_input),
+            "description": (
+                "Continue at Writing & polishing: the LaTeX paper and its PDF from the accepted proof, "
+                "without rerunning the proof author or the critic."
+            ),
+            "resumable": True,
+            "resumeLabel": "Continue at writing",
         })
     return checkpoints
 
@@ -12108,8 +12187,12 @@ class Server(ThreadingHTTPServer):
         }
         return self.start_saved_critic_job(source_app.run_dir, settings)
 
-    def resume_checkpoint_job(self, run_id, checkpoint_id):
-        """Continue one explicit durable checkpoint in a new browser job."""
+    def resume_checkpoint_job(self, run_id, checkpoint_id, writer=None):
+        """Continue one explicit durable checkpoint in a new browser job.
+
+        ``writer`` ({"writerModel", "writerEffort"}, either optional) chooses another writer for the Writing
+        checkpoint; the job's own writer is the default.
+        """
 
         source_app = self.get_job(run_id)
         source_state = source_app.snapshot()
@@ -12124,7 +12207,45 @@ class Server(ThreadingHTTPServer):
         )
         if not checkpoint or not checkpoint.get("resumable"):
             raise ValueError("That checkpoint is not available for continuation.")
+        if checkpoint.get("stage") == "writing":
+            return self.resume_writing_job(run_id, writer)
+        if writer:
+            raise ValueError("Only the Writing checkpoint takes a writer model.")
         return self.resume_critic_job(run_id)
+
+    def resume_writing_job(self, run_id, writer=None):
+        """Write up an idle job's accepted proof in a new job of its batch: the Writing & polishing step alone.
+
+        The new job starts from the exact saved final input (final-input.json), as a stopped LaTeX editor's
+        continuation does, with the job's writer model, reasoning, speed and LaTeX prompt; the proof author and the
+        critic do not run again. ``writer`` ({"writerModel", "writerEffort"}, either optional) writes it with
+        another model or effort, checked like any job's writer. A web-cutoff run cannot be continued in a new run
+        (its policy binds its folder).
+        """
+
+        with self.jobs_lock:
+            source_app = self.get_job(run_id)
+            with source_app.lock:
+                validated_continuation_source(source_app.run_dir, self.runs)
+                source_state = source_app.snapshot()
+                if source_state["phase"] in {"reviewing", "running", "stopping", "pausing", "paused"}:
+                    raise ValueError("Stop this job before writing up its proof.")
+                if source_state.get("retrievalPolicyPath") or source_state.get("retrievalMode") == "historical":
+                    raise ValueError("A web-cutoff run cannot continue in a new run.")
+                unknown = set(writer or {}) - {"writerModel", "writerEffort"}
+                if unknown:
+                    raise ValueError(f"Unknown writer setting: {', '.join(sorted(unknown))}.")
+                source_state = {**source_state, **{key: str(value) for key, value in (writer or {}).items()}}
+                app = self._new_app(source_app.batch_id, from_job=True)
+                self._start_final_continuation(app, source_app.run_dir, source_state, {
+                    "speed_mode": source_state["speedMode"],
+                    "reasoning_summary": source_state["reasoningSummary"],
+                    "continuation_source": source_app.run_dir,
+                    "stopped_stage": "final",
+                })
+                self.jobs[app.state["runId"]] = app
+        self._settle_shared_works(app)
+        return app
 
     @staticmethod
     def _stopped_continuation_plan(source_app, state=None):
@@ -12509,45 +12630,45 @@ class Server(ThreadingHTTPServer):
             )
             self._queue_saved_author_instructions(source_app, app)
         else:
-            # A saved LaTeX source is compiled again instead of paying for another editor request.
-            latex = source_run / "latex-source.tex"
-            common["latex_source"] = (read_utf8(latex, "saved LaTeX source")
-                                      if latex.is_file() and not latex.is_symlink() else "")
-            if source_state["problemMode"] == "latex":
-                final_source = read_utf8(
-                    source_run / "latex-input.md", "saved LaTeX input",
-                )
-            else:
-                final_input = saved_final_input(source_run)
-                final_source = (
-                    f"STATEMENT:\n{final_input['statement']}\n\n"
-                    f"PROOF:\n{final_input['solution']}"
-                )
-            if source_state["problemMode"] == "latex":
-                app.start_latex_only(
-                    source=final_source,
-                    writer_model=source_state["writerModel"],
-                    reasoning_effort=source_state["reasoningEffort"],
-                    writer_effort=source_state["writerEffort"],
-                    final_prompt=source_state["finalPrompt"],
-                    **common,
-                )
-            else:
-                app.start_final_resume(
-                    statement=final_input["statement"],
-                    solution=final_input["solution"],
-                    writer_model=source_state["writerModel"],
-                    critic_model=source_state["criticModel"],
-                    critic_effort=source_state["criticEffort"],
-                    reasoning_effort=source_state["reasoningEffort"],
-                    writer_effort=source_state["writerEffort"],
-                    final_prompt=source_state["finalPrompt"],
-                    **common,
-                )
+            self._start_final_continuation(app, source_run, source_state, common)
         with self.jobs_lock:
             self.jobs[app.state["runId"]] = app
         self._settle_shared_works(app)
         return app
+
+    @staticmethod
+    def _start_final_continuation(app, source_run, source_state, common):
+        """Start ``app`` at the Writing step of ``source_run``, from its saved input, with its writer settings.
+
+        A saved LaTeX source is compiled again instead of paying for another editor request. ``common`` holds the
+        speed, reasoning summary and continuation source; ``source_state`` is the source job's snapshot.
+        """
+
+        latex = source_run / "latex-source.tex"
+        common = {**common, "latex_source": (read_utf8(latex, "saved LaTeX source")
+                                             if latex.is_file() and not latex.is_symlink() else "")}
+        if source_state["problemMode"] == "latex":
+            app.start_latex_only(
+                source=read_utf8(source_run / "latex-input.md", "saved LaTeX input"),
+                writer_model=source_state["writerModel"],
+                reasoning_effort=source_state["reasoningEffort"],
+                writer_effort=source_state["writerEffort"],
+                final_prompt=source_state["finalPrompt"],
+                **common,
+            )
+            return
+        final_input = saved_final_input(source_run)
+        app.start_final_resume(
+            statement=final_input["statement"],
+            solution=final_input["solution"],
+            writer_model=source_state["writerModel"],
+            critic_model=source_state["criticModel"],
+            critic_effort=source_state["criticEffort"],
+            reasoning_effort=source_state["reasoningEffort"],
+            writer_effort=source_state["writerEffort"],
+            final_prompt=source_state["finalPrompt"],
+            **common,
+        )
 
     def job_list(self, batch=None):
         """Return only the fields needed by the home-page job switcher: of every job, or of the jobs of ``batch``."""
@@ -12616,6 +12737,8 @@ class Server(ThreadingHTTPServer):
                     or (run_dir / runtime.SAVED_CANDIDATE_FILENAME).is_file()
                 )
                 and controlled_path(run_dir, "checked-statement.md").is_file()
+                # A proof the critic already accepted is not offered to the critic again.
+                and not critic_accepted(run_dir)
             )
             continuation = self._stopped_continuation_plan(app, state)
             job["canContinueStopped"] = continuation is not None
@@ -13545,6 +13668,7 @@ class Handler(BaseHTTPRequestHandler):
             elif request.path == "/resume-checkpoint":
                 app = self.server.resume_checkpoint_job(
                     run_id, str(body.get("checkpoint", "")),
+                    writer={key: body[key] for key in ("writerModel", "writerEffort") if body.get(key)},
                 )
             elif request.path == "/continue-stopped":
                 app = self.server.continue_stopped_job(run_id)

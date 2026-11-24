@@ -234,11 +234,24 @@ latest complete argument. A checkpoint exists only once a complete artifact has
 been written; it cannot restore the middle of a model response or its private
 reasoning. To continue from one, open the job's batch, find the job by its start
 and finish time, and click the continuation button beside the checkpoint (the
-job's page also lists it under **Continue from saved work**). After you confirm,
+job's page also lists it under **Continue from saved work**). A job lists its
+checkpoints only once it has ended: while it runs or is paused, none is shown. After you confirm,
 TCS Prover creates a new job in the same batch that copies the candidate, the
 role prompts, the models, reasoning, speed, critic rounds, number of critics and
 time limit, and starts a fresh critic round with new independent critics. The old
-job's inputs and transcripts are kept. A role whose API model was removed reports
+job's inputs and transcripts are kept.
+
+Once the critic has accepted the proof, the saved candidate is no longer offered to
+the critic again (no **Continue at critic** or **Resume at critic**). A job that ran
+without **Writing & polishing** and whose critic accepted the proof has an
+**Accepted proof** checkpoint instead: **Continue at writing**
+creates a new job in the same batch that runs only the Writing step (the LaTeX
+editor, its repairs and the PDF) on the exact accepted proof (`final-input.json`),
+with the job's writer model, reasoning, speed and LaTeX prompt. The proof author
+and the critic do not run again. The job's own page offers it too, also when the
+job finished well. It is not offered once the job has a paper (`final.tex` or
+`latex-source.tex`), nor for a web-cutoff run, whose policy keeps it in its own
+folder. A role whose API model was removed reports
 it before any new request; an error-paused job then checks every minute and
 continues once the model is configured again. Very old runs from before
 `job-settings.json` restore only the choices visible in their transcript: a role

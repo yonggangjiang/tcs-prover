@@ -1127,7 +1127,9 @@ function renderJobs(jobs) {
     retrieval.textContent = retrievalSummary(job);
     copy.append(retrieval);
     const checkpoints = job.checkpoints || [];
-    if (checkpoints.length) {
+    // A job that is still running or paused lists no checkpoints: none can be continued until it ends.
+    const live = ["reviewing", "running", "stopping", "pausing", "paused"].includes(job.phase);
+    if (checkpoints.length && !live) {
       const checkpointHeading = document.createElement("span");
       checkpointHeading.className = "checkpoint-heading";
       checkpointHeading.textContent = `Checkpoints (${checkpoints.length})`;
@@ -1155,8 +1157,6 @@ function renderJobs(jobs) {
           const continueButton = document.createElement("button");
           continueButton.className = "secondary compact checkpoint-resume";
           continueButton.textContent = checkpoint.resumeLabel || "Continue";
-          continueButton.disabled = ["reviewing", "running", "stopping", "pausing", "paused"]
-            .includes(job.phase);
           continueButton.onclick = () => resumeCheckpoint(
             job, checkpoint, title.textContent,
           );
@@ -5861,7 +5861,8 @@ function checkEdited() {
 }
 
 // Offer a finished job's continue and checkpoint actions on its own page, using
-// the same summaries (and handlers) as the batch list.
+// the same summaries (and handlers) as the batch list. A job that ended well offers
+// only its Writing checkpoint: an accepted proof that was never written up.
 async function loadJobRecovery() {
   const job = currentJob, batch = currentBatch;
   const key = JSON.stringify([batch, job, state.phase, state.readOnly, state.manuallyStopped,
@@ -5870,7 +5871,9 @@ async function loadJobRecovery() {
   ui.jobRecovery.dataset.key = key;
   ui.jobRecovery.replaceChildren();
   show(ui.jobRecovery, false);
-  if (!job || state.readOnly || state.phase !== "done" || completedRunOutcome(state).tone === "done") return;
+  const succeeded = completedRunOutcome(state).tone === "done";
+  const writable = (state.checkpoints || []).some(item => item.stage === "writing" && item.resumable);
+  if (!job || state.readOnly || state.phase !== "done" || (succeeded && !writable)) return;
   let summary;
   try {
     summary = ((await request(jobPath("/jobs"))).jobs || []).find(item => item.runId === job);
@@ -5894,9 +5897,10 @@ async function loadJobRecovery() {
     }
     return row;
   };
-  const checkpoints = (summary.checkpoints || []).filter(item => item.resumable);
+  const checkpoints = (summary.checkpoints || [])
+    .filter(item => item.resumable && (!succeeded || item.stage === "writing"));
   const rows = [];
-  if (summary.canContinueStopped) {
+  if (summary.canContinueStopped && !succeeded) {
     rows.push(action(summary.continueStoppedLabel || "Continue stopped job", true,
       () => continueStopped(summary, title), summary.continueStoppedDescription || ""));
   }
@@ -5905,7 +5909,7 @@ async function loadJobRecovery() {
       () => resumeCheckpoint(summary, checkpoint, title),
       [checkpoint.label, checkpoint.description].filter(Boolean).join(" · ")));
   }
-  if (summary.canResumeCritic && !(summary.checkpoints || []).length) {
+  if (summary.canResumeCritic && !succeeded && !(summary.checkpoints || []).length) {
     rows.push(action("Resume at critic", !rows.length, () => resumeCritic(summary, title),
       "Start a new critic job from the complete saved proof."));
   }
